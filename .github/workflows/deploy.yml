@@ -1,0 +1,37 @@
+name: Deploy to Cloudflare Workers
+
+# Cloudflare Git 集成已接管自动部署，此 workflow 仅作手动备选。
+# 需要时在 Actions 页面点 "Run workflow" 手动触发。
+on:
+  workflow_dispatch:
+
+# 需要配置的 Secrets:
+#   CF_API_TOKEN   - Cloudflare API Token (Workers Scripts Edit)
+#   CF_ACCOUNT_ID  - Cloudflare Account ID
+# 需要配置的 Variables (可选):
+#   ADMIN_USERNAME - 管理后台用户名
+#   ADMIN_PASSWORD - 管理后台密码
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build
+        run: npm run build
+        env:
+          CF_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
+
+      - name: Deploy
+        run: npx wrangler deploy
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
