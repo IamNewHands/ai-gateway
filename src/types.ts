@@ -62,6 +62,13 @@ export interface OAuthDeviceConfig {
   tokenHeaderPrefix?: string
   /** 转发时额外注入的固定请求头 */
   extraHeaders?: Record<string, string>
+  /**
+   * 模型列表发现端点（绝对 URL，GET）。
+   * 留空则回退到 `${baseUrl}/models`（OpenAI 标准）。
+   * WorkBuddy 等自定义 API 需填写，例如：
+   * https://copilot.tencent.com/console/enterprises/personal/models
+   */
+  modelsUrl?: string
 }
 
 /** KV 中保存的 OAuth token 状态 */

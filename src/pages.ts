@@ -381,6 +381,7 @@ ${H('管理')}
                 <div class="fg"><label>Token 注入头（默认 x-api-key）</label><input type="text" id="ao6" placeholder="x-api-key"></div>
                 <div class="fg"><label>Token 注入前缀（可选，如 Bearer ）</label><input type="text" id="ao9" placeholder="如 Bearer （含尾空格）"></div>
                 <div class="fg"><label>额外请求头（JSON，可选）</label><textarea id="ao7" rows="3" placeholder='{"x-app-name":"codebuddy-code","x-app-version":"1.0.2"}'></textarea></div>
+                <div class="fg"><label>模型列表 URL（可选）</label><input type="url" id="ao10" placeholder="留空 = 用 baseUrl/models（OpenAI 标准）"><span class="form-helper">登录后从此地址动态拉取可用模型；WorkBuddy 等自定义 API 需填写。</span></div>
                 <div class="fg"><label>预置模板</label><select class="select-sm" onchange="applyOauthPreset(this.value)"><option value="">— 选择 —</option><option value="codebuddy">CodeBuddy（设备码）</option><option value="workbuddy">WorkBuddy（浏览器登录）</option></select></div>
               </fieldset>
             </div>
@@ -416,8 +417,9 @@ ${H('管理')}
                   <div class="fg"><label>Token 注入头（默认 x-api-key）</label><input type="text" id="eao6-${escapePageHtml(p.id)}" value="${escapePageHtml((p.oauth&&p.oauth.tokenHeader)||'x-api-key')}" placeholder="x-api-key"></div>
                   <div class="fg"><label>Token 注入前缀（可选，如 Bearer ）</label><input type="text" id="eao9-${escapePageHtml(p.id)}" value="${escapePageHtml((p.oauth&&p.oauth.tokenHeaderPrefix)||'')}" placeholder="如 Bearer （含尾空格）"></div>
                   <div class="fg"><label>额外请求头（JSON，可选）</label><textarea id="eao7-${escapePageHtml(p.id)}" rows="3" placeholder='{"x-app-name":"codebuddy-code"}'>${escapePageHtml((p.oauth&&JSON.stringify(p.oauth.extraHeaders||{}))||'')}</textarea></div>
+                  <div class="fg"><label>模型列表 URL（可选）</label><input type="url" id="eao10-${escapePageHtml(p.id)}" value="${escapePageHtml((p.oauth&&p.oauth.modelsUrl)||'')}" placeholder="留空 = 用 baseUrl/models（OpenAI 标准）"></div>
                   <div class="fg"><label>预置模板</label><select class="select-sm" onchange="applyOauthPresetEdit('${p.id}',this.value)"><option value="">— 选择 —</option><option value="codebuddy">CodeBuddy（设备码）</option><option value="workbuddy">WorkBuddy（浏览器登录）</option></select></div>
-                  <div class="fc mt-1 field-row"><button class="btn btn-s" onclick="oauthConnect('${p.id}')"><i class="fas fa-plug" aria-hidden="true"></i>发起连接</button><button class="btn btn-gh" onclick="oauthStatus('${p.id}')"><i class="fas fa-sync" aria-hidden="true"></i>状态</button><button class="btn btn-gh" onclick="oauthDisconnect('${p.id}')"><i class="fas fa-unlink" aria-hidden="true"></i>断开</button><span id="oauth-st-${escapePageHtml(p.id)}" class="oauth-status"></span></div>
+                  <div class="fc mt-1 field-row"><button class="btn btn-s" onclick="oauthConnect('${p.id}')"><i class="fas fa-plug" aria-hidden="true"></i>发起连接</button><button class="btn btn-gh" onclick="fetchOauthModels('${p.id}')"><i class="fas fa-cloud-download-alt" aria-hidden="true"></i>获取模型</button><button class="btn btn-gh" onclick="oauthStatus('${p.id}')"><i class="fas fa-sync" aria-hidden="true"></i>状态</button><button class="btn btn-gh" onclick="oauthDisconnect('${p.id}')"><i class="fas fa-unlink" aria-hidden="true"></i>断开</button><span id="oauth-st-${escapePageHtml(p.id)}" class="oauth-status"></span></div>
                 </fieldset>
               </div>
               <fieldset class="form-group"><legend>上游 API Keys</legend><div id="keys-${escapePageHtml(p.id)}">${p.apiKeys.map((k, ki)=>`<div class="fc mb-3 field-row" data-kidx="${ki}"><input type="password" value="${escapePageHtml(k.key)}" class="fx1" id="k-${escapePageHtml(p.id)}-${ki}" placeholder="API Key" aria-label="API Key"><label class="tg"><input type="checkbox" ${k.enabled?'checked':''} id="ken-${escapePageHtml(p.id)}-${ki}" aria-label="启用 Key"><span class="sl"></span></label><button class="btn btn-gh btn-xs" onclick="testKeyRow('${p.id}',${ki})" title="测试 Key"><i class="fas fa-plug" aria-hidden="true"></i><span>测试</span></button><button class="icon-btn" onclick="rmKeyRow('${p.id}',${ki})" aria-label="移除 Key"><i class="fas fa-times" aria-hidden="true"></i></button></div>`).join('')}</div><div class="fc mt-1 field-row"><input type="password" id="nk-${escapePageHtml(p.id)}" placeholder="新的 API Key" class="fx1"><button class="btn btn-s btn-xs" onclick="addKeyRow('${p.id}')"><i class="fas fa-plus" aria-hidden="true"></i>添加</button></div></fieldset>
@@ -648,6 +650,7 @@ function collectOauthNew() {
     tokenHeader: g('ao6') || 'x-api-key',
     tokenHeaderPrefix: g('ao9') || undefined,
     extraHeaders,
+    modelsUrl: g('ao10') || undefined,
   }
 }
 
@@ -665,6 +668,7 @@ function collectOauthEdit(id) {
     tokenHeader: g('6') || 'x-api-key',
     tokenHeaderPrefix: g('9') || undefined,
     extraHeaders,
+    modelsUrl: g('10') || undefined,
   }
 }
 
@@ -688,7 +692,7 @@ const PROVIDER_PRESETS = {
   deepinfra:    { name: 'DeepInfra',          id: 'deepinfra',    baseUrl: 'https://api.deepinfra.com/v1/openai',               apiType: 'openai' },
   mistral:      { name: 'Mistral AI',         id: 'mistral',      baseUrl: 'https://api.mistral.ai/v1',                         apiType: 'openai' },
   xai:          { name: 'xAI (Grok)',         id: 'xai',          baseUrl: 'https://api.x.ai/v1',                               apiType: 'openai' },
-  workbuddy:    { name: 'WorkBuddy (OAuth)',  id: 'workbuddy',    baseUrl: 'https://copilot.tencent.com',                       apiType: 'openai', authType: 'oauth-device', oauthPreset: 'workbuddy' },
+  workbuddy:    { name: 'WorkBuddy (OAuth)',  id: 'workbuddy',    baseUrl: 'https://copilot.tencent.com/v2',                    apiType: 'openai', authType: 'oauth-device', oauthPreset: 'workbuddy' },
 }
 function applyProviderPreset(name) {
   const p = PROVIDER_PRESETS[name]
@@ -751,11 +755,10 @@ const OAUTH_PRESETS = {
       'Referer': 'https://www.codebuddy.cn/',
       'User-Agent': 'CLI/2.63.2 CodeBuddy/2.63.2',
     },
-    _baseUrl: 'https://copilot.tencent.com',
-    _models: [
-      'glm-5.2', 'glm-5.1', 'glm-5v-turbo', 'kimi-k2.7', 'minimax-m3',
-      'hy3', 'hy3-preview', 'hy3-preview-agent', 'deepseek-v4-pro', 'deepseek-v4-flash',
-    ],
+    // chat 端点在 /v2/chat/completions，故 baseUrl 带 /v2，转发时拼 chat/completions 即可
+    _baseUrl: 'https://copilot.tencent.com/v2',
+    // 模型发现端点（非 OpenAI 标准 /models），登录后动态拉取真实可用模型
+    _modelsUrl: 'https://copilot.tencent.com/console/enterprises/personal/models',
   },
 }
 function applyOauthPreset(name) {
@@ -770,10 +773,9 @@ function applyOauthPreset(name) {
   document.getElementById('ao7').value = JSON.stringify(p.extraHeaders || {}, null, 2)
   const ft = document.getElementById('ao8'); if (ft) ft.value = p.flowType || 'device'
   const tp = document.getElementById('ao9'); if (tp) tp.value = p.tokenHeaderPrefix || ''
+  const mu = document.getElementById('ao10'); if (mu) mu.value = p._modelsUrl || ''
   // 强制覆盖 baseUrl（不再仅在空时填）
   if (p._baseUrl) { const bu = document.getElementById('aurl'); if (bu) bu.value = p._baseUrl }
-  // 预置模型自动填充
-  if (p._models && p._models.length > 0) fillPresetModels(p._models)
   document.getElementById('aat').value = 'oauth-device'
   toggleAuthType()
 }
@@ -789,10 +791,9 @@ function applyOauthPresetEdit(id, name) {
   document.getElementById('eao7-' + id).value = JSON.stringify(p.extraHeaders || {}, null, 2)
   const ft = document.getElementById('eao8-' + id); if (ft) ft.value = p.flowType || 'device'
   const tp = document.getElementById('eao9-' + id); if (tp) tp.value = p.tokenHeaderPrefix || ''
+  const mu = document.getElementById('eao10-' + id); if (mu) mu.value = p._modelsUrl || ''
   // 强制覆盖 baseUrl
   if (p._baseUrl) { const bu = document.getElementById('url-' + id); if (bu) bu.value = p._baseUrl }
-  // 预置模型自动填充（编辑模式）
-  if (p._models && p._models.length > 0) fillPresetModelsEdit(id, p._models)
   document.getElementById('auth-' + id).value = 'oauth-device'
   toggleAuthTypeEdit(id)
 }
@@ -870,8 +871,10 @@ function oauthPoll(id) {
   return fetch('/admin/api/oauth/' + encodeURIComponent(id) + '/poll', { method: 'POST' }).then(r => r.json()).then(d => {
     if (d.success) {
       if (window._oauthPollTimer) { clearInterval(window._oauthPollTimer); window._oauthPollTimer = null }
-      if (pollSt) { pollSt.textContent = '授权成功！'; setTimeout(closeM, 800) }
+      if (pollSt) { pollSt.textContent = '授权成功！正在拉取模型列表…'; setTimeout(closeM, 1200) }
       if (st) st.textContent = '已连接'
+      // 登录成功后自动拉取上游真实模型列表（替代写死的预设模型）
+      setTimeout(function() { fetchOauthModels(id) }, 1300)
       return true
     }
     if (pollSt) pollSt.textContent = d.message || '等待授权…'
@@ -885,6 +888,28 @@ function oauthDisconnect(id) {
   return fetch('/admin/api/oauth/' + encodeURIComponent(id) + '/disconnect', { method: 'POST' }).then(r => r.json()).then(d => {
     st.textContent = d.success ? '已断开' : (d.message || '断开失败')
   }).catch(() => { st.textContent = '断开失败' })
+}
+
+// OAuth 提供商：用 KV 中的 token 拉取上游模型列表，动态填入编辑表单
+async function fetchOauthModels(id) {
+  const tr = document.getElementById('tr-' + id)
+  if (tr) showSpinner(tr)
+  const st = document.getElementById('oauth-st-' + id)
+  try {
+    const r = await fetch('/admin/api/oauth/' + encodeURIComponent(id) + '/models')
+    const d = await r.json()
+    if (d.success && d.data && d.data.data) {
+      showEditModelsList(id, d.data.data || [])
+      if (tr) showResult(tr, true, '已拉取 ' + (d.data.data.length || 0) + ' 个模型，点击 + 添加到下方')
+      if (st) st.textContent = '已拉取 ' + (d.data.data.length || 0) + ' 个模型'
+    } else {
+      if (tr) showResult(tr, false, escapeHtml(d.message || '拉取模型失败'))
+      if (st) st.textContent = d.message || '拉取失败'
+    }
+  } catch (e) {
+    if (tr) showResult(tr, false, '请求失败')
+    if (st) st.textContent = '拉取失败'
+  }
 }
 
 // provider api keys (edit)

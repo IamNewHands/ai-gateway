@@ -20,6 +20,7 @@ import {
   handleOAuthConnect,
   handleOAuthPoll,
   handleOAuthDisconnect,
+  handleOAuthModels,
 } from './admin'
 import { renderHomePage, renderLoginPage, renderAdminPage } from './pages'
 import { seedInitialData, getSession, getProviders } from './storage'
@@ -87,6 +88,7 @@ app.get('/admin/api/oauth/:id/status', handleOAuthStatus)
 app.post('/admin/api/oauth/:id/connect', handleOAuthConnect)
 app.post('/admin/api/oauth/:id/poll', handleOAuthPoll)
 app.post('/admin/api/oauth/:id/disconnect', handleOAuthDisconnect)
+app.get('/admin/api/oauth/:id/models', handleOAuthModels)
 
 // ===== API 转发路由（需转发 Key 验证） =====
 app.use('/v1/*', proxyKeyAuthMiddleware)

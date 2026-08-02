@@ -26,6 +26,22 @@ export async function deleteOauthToken(env: Env, providerId: string): Promise<vo
   await env.KV.delete(tokenKey(providerId))
 }
 
+/**
+ * 构造转发到上游时使用的认证头：注入 tokenHeader + prefix + extraHeaders。
+ * 供 proxy 转发、模型列表拉取、模型连通性测试复用，保证三者一致。
+ */
+export function buildOauthHeaders(cfg: OAuthDeviceConfig, token: string, contentType = 'application/json'): Record<string, string> {
+  const tokenHeader = cfg.tokenHeader || 'x-api-key'
+  const prefix = cfg.tokenHeaderPrefix || ''
+  const headers: Record<string, string> = {
+    'Content-Type': contentType,
+    'Accept': 'application/json',
+    [tokenHeader]: prefix + token,
+    ...(cfg.extraHeaders || {}),
+  }
+  return headers
+}
+
 // ===== OAuth 流程入口（根据 flowType 分发） =====
 
 export interface DeviceFlowResult {

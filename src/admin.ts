@@ -13,7 +13,7 @@ import {
 import { testModelConnection } from './proxy'
 import { fetchOpenCodeModels, isOpenCodeProvider, resolveOpenCodeUrls, testOpenCodeModel } from './opencode'
 import { PROXY_KEY_PREFIX, EXPIRY_OPTIONS, OPENCODE_DEFAULT_URL } from './config'
-import { startOauthDeviceFlow, pollOauthDeviceFlow, readOauthToken, deleteOauthToken } from './oauth'
+import { startOauthDeviceFlow, pollOauthDeviceFlow, readOauthToken, deleteOauthToken, getOauthAccessToken, buildOauthHeaders } from './oauth'
 import type {
   Env,
   ApiResponse,
@@ -164,6 +164,30 @@ export async function handleTestModel(c: Context<{ Bindings: Env }>) {
   const modelConfig = provider.models.find((m) => m.id === modelId)
   if (!modelConfig) {
     return c.json<ApiResponse>({ success: false, message: `模型 "${modelId}" 不存在于提供商 "${provider.name}"` }, 404)
+  }
+
+  // OAuth 提供商：用 KV 中的 access_token 测试，无需 API Key
+  if (provider.authType === 'oauth-device' && provider.oauth) {
+    const cfg = provider.oauth
+    const token = await getOauthAccessToken(c.env, provider.id, cfg)
+    if (!token) {
+      return c.json<ApiResponse>({ success: false, message: 'OAuth 未连接或 Token 已失效，请先发起连接' }, 400)
+    }
+    const cleanBase = provider.baseUrl.replace(/\/$/, '')
+    const endpoint = provider.apiType === 'anthropic' ? 'messages' : 'chat/completions'
+    const url = `${cleanBase}/${endpoint}`
+    try {
+      const response = await fetch(url, {
+        method: 'POST',
+        headers: buildOauthHeaders(cfg, token),
+        body: JSON.stringify({ model: modelId, messages: [{ role: 'user', content: 'hi' }], max_tokens: 1, stream: true }),
+        signal: AbortSignal.timeout(20000),
+      })
+      // OAuth 上游（如 WorkBuddy）强制 stream，2xx 即视为连通
+      return c.json<ApiResponse>({ success: true, data: { success: response.ok, statusCode: response.status, message: response.ok ? '' : `HTTP ${response.status}` } })
+    } catch (err) {
+      return c.json<ApiResponse>({ success: true, data: { success: false, statusCode: 0, message: (err as Error).message || '连接失败' } })
+    }
   }
 
   const enabledKeys = provider.apiKeys.filter(k => k.enabled)
@@ -427,4 +451,91 @@ export async function handleOAuthDisconnect(c: Context<{ Bindings: Env }>) {
   if (!id) return c.json<ApiResponse>({ success: false, message: '缺少 id 参数' }, 400)
   await deleteOauthToken(c.env, id)
   return c.json<ApiResponse>({ success: true, message: '已断开 OAuth 连接' })
+}
+
+/**
+ * 拉取 OAuth 提供商的上游模型列表（登录后动态发现，替代写死的预设模型）。
+ * - 优先使用 cfg.modelsUrl；留空则回退 ${baseUrl}/models（OpenAI 标准）
+ * - 兼容三种响应格式：WorkBuddy（data.agents[cli].models）、OpenAI（data[]）、根级 models[]
+ */
+export async function handleOAuthModels(c: Context<{ Bindings: Env }>) {
+  const id = c.req.param('id')
+  if (!id) return c.json<ApiResponse>({ success: false, message: '缺少 id 参数' }, 400)
+
+  const provider = await getProvider(c.env, id)
+  if (!provider) return c.json<ApiResponse>({ success: false, message: '提供商不存在' }, 404)
+  if (provider.authType !== 'oauth-device' || !provider.oauth) {
+    return c.json<ApiResponse>({ success: false, message: '该提供商未配置 OAuth 认证' }, 400)
+  }
+
+  const cfg = provider.oauth
+  const token = await getOauthAccessToken(c.env, provider.id, cfg)
+  if (!token) {
+    return c.json<ApiResponse>({ success: false, message: 'OAuth 未连接或 Token 已失效，请先发起连接' }, 400)
+  }
+
+  const cleanBase = provider.baseUrl.replace(/\/$/, '')
+  const modelsUrl = cfg.modelsUrl || `${cleanBase}/models`
+
+  try {
+    const response = await fetch(modelsUrl, {
+      method: 'GET',
+      headers: buildOauthHeaders(cfg, token),
+      signal: AbortSignal.timeout(20000),
+    })
+
+    if (!response.ok) {
+      let detail = ''
+      try { detail = (await response.text()).substring(0, 200) } catch { /* ignore */ }
+      return c.json<ApiResponse>({
+        success: false,
+        message: `上游返回 HTTP ${response.status}${detail ? '：' + detail : ''}`,
+      })
+    }
+
+    const json: any = await response.json().catch(() => null)
+    if (!json) {
+      return c.json<ApiResponse>({ success: false, message: '上游响应不是有效 JSON' })
+    }
+
+    const models: Array<{ id: string }> = []
+
+    // ① WorkBuddy 格式：{ code, data: { agents:[{name,models:[]}], models:[{id,disabled}] } }
+    if (json?.data?.agents && Array.isArray(json.data.agents)) {
+      const cliAgent = json.data.agents.find((a: any) => a && a.name === 'cli' && Array.isArray(a.models))
+      const cliModelIds: string[] = cliAgent?.models || []
+      const modelMeta = new Map<string, any>(
+        (json.data.models || []).map((m: any) => [m?.id, m]).filter(([k]) => k)
+      )
+      if (cliModelIds.length > 0) {
+        // CLI 可用模型 = cli agent 声明的模型，且在 models 元数据中存在、未被禁用
+        models.push(...cliModelIds
+          .filter((mid) => modelMeta.has(mid) && !modelMeta.get(mid)?.disabled)
+          .map((mid) => ({ id: mid })))
+      }
+      // 兜底：没有 cli agent 时，用全部未禁用模型
+      if (models.length === 0) {
+        models.push(...(json.data.models || [])
+          .filter((m: any) => m && m.id && !m.disabled)
+          .map((m: any) => ({ id: m.id })))
+      }
+    }
+    // ② OpenAI 格式：{ data: [{id}] }
+    else if (Array.isArray(json?.data)) {
+      models.push(...json.data.filter((m: any) => m && m.id).map((m: any) => ({ id: m.id })))
+    }
+    // ③ 根级 models 数组：{ models: [{id}] }
+    else if (Array.isArray(json?.models)) {
+      models.push(...json.models.filter((m: any) => m && m.id).map((m: any) => ({ id: m.id })))
+    }
+
+    if (models.length === 0) {
+      return c.json<ApiResponse>({ success: false, message: '上游未返回任何模型' })
+    }
+
+    // 响应结构对齐 test-key，便于前端 renderModelGrid 复用
+    return c.json<ApiResponse>({ success: true, data: { data: models } })
+  } catch (err) {
+    return c.json<ApiResponse>({ success: false, message: (err as Error).message || '拉取模型列表失败' })
+  }
 }
