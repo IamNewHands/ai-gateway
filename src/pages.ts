@@ -812,7 +812,7 @@ function fillPresetModelsEdit(id, models) {
   models.forEach(function(mid) {
     const d = document.createElement('div')
     d.className = 'fc mb-3 field-row'
-    d.innerHTML = '<input type="text" value="' + escapeHtml(mid) + '" class="fx1" id="mid-' + id + '-' + Math.random().toString(36).substr(2,9) + '" placeholder="模型 ID"><label class="tg"><input type="checkbox" checked aria-label="启用模型"><span class="sl"></span></label><button class="btn btn-gh btn-xs" onclick="testMdl(\'' + id + '\',\'' + escapeHtml(mid) + '\')"><i class="fas fa-plug"></i></button><button class="btn btn-gh btn-xs" onclick="this.parentElement.remove()"><i class="fas fa-times c-l"></i></button>'
+    d.innerHTML = '<input type="text" value="' + escapeHtml(mid) + '" class="fx1" id="mid-' + id + '-' + Math.random().toString(36).substr(2,9) + '" placeholder="模型 ID"><label class="tg"><input type="checkbox" checked aria-label="启用模型"><span class="sl"></span></label><button class="btn btn-gh btn-xs" onclick="testMdl(\\'' + id + '\\',\\'' + escapeHtml(mid) + '\\')"><i class="fas fa-plug"></i></button><button class="btn btn-gh btn-xs" onclick="this.parentElement.remove()"><i class="fas fa-times c-l"></i></button>'
     c.appendChild(d)
   })
 }
@@ -1042,7 +1042,7 @@ async function editKeyModels(keyId) {
     groups[m.group].push(m)
   })
   let html = '<h3><i class="fas fa-filter c-p" aria-hidden="true"></i> 模型筛选</h3><p>不勾选的模型将无法通过此 Key 访问。全部勾选 = 允许全部。</p>'
-  html += '<div style="margin-bottom:8px"><button class="btn btn-gh btn-xs" onclick="document.querySelectorAll(\'.mdl-chk input\').forEach(function(el){el.checked=true})">全选</button> <button class="btn btn-gh btn-xs" onclick="document.querySelectorAll(\'.mdl-chk input\').forEach(function(el){el.checked=false})">全不选</button></div>'
+  html += '<div style="margin-bottom:8px"><button class="btn btn-gh btn-xs" onclick="keyModelsToggle(true)">全选</button> <button class="btn btn-gh btn-xs" onclick="keyModelsToggle(false)">全不选</button></div>'
   html += '<div class="mdl-list" style="max-height:50vh;overflow-y:auto">'
   Object.keys(groups).forEach(function(g) {
     html += '<div style="margin-bottom:8px"><strong>' + escapeHtml(g) + '</strong></div>'
@@ -1052,8 +1052,11 @@ async function editKeyModels(keyId) {
     })
   })
   html += '</div>'
-  html += '<div class="fa" style="margin-top:12px"><button class="btn btn-s" onclick="closeM()">取消</button><button class="btn btn-p" onclick="saveKeyModels(\'' + keyId + '\')">保存</button></div>'
+  html += '<div class="fa" style="margin-top:12px"><button class="btn btn-s" onclick="closeM()">取消</button><button class="btn btn-p" onclick="saveKeyModels(\\'' + keyId + '\\')">保存</button></div>'
   showM(html)
+}
+function keyModelsToggle(checked) {
+  document.querySelectorAll('.mdl-chk input').forEach(function(el) { el.checked = checked })
 }
 async function saveKeyModels(keyId) {
   var checked = Array.from(document.querySelectorAll('.mdl-chk input:checked')).map(function(el) { return el.value })
