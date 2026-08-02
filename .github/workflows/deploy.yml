@@ -39,17 +39,7 @@ jobs:
           if [ -n "$EXTRA_URLS" ]; then
             MIRRORS_URL="${MIRRORS_URL}\n${EXTRA_URLS}"
           fi
-          # 管理员账号：优先取 GitHub Actions 变量；未配置时留空，沿用 Cloudflare 侧已有变量（keep_vars = true）
-          if [ -n "${{ vars.ADMIN_USERNAME }}" ]; then
-            ADMIN_USERNAME_LINE="ADMIN_USERNAME = \"${{ vars.ADMIN_USERNAME }}\""
-          else
-            ADMIN_USERNAME_LINE=""
-          fi
-          if [ -n "${{ vars.ADMIN_PASSWORD }}" ]; then
-            ADMIN_PASSWORD_LINE="ADMIN_PASSWORD = \"${{ vars.ADMIN_PASSWORD }}\""
-          else
-            ADMIN_PASSWORD_LINE=""
-          fi
+          # 管理员账号不写入 wrangler.toml：依赖 keep_vars = true 保留 Cloudflare 侧已有变量
           cat > wrangler.toml << EOF
           name = "ai-gateway"
           main = "src/index.ts"
@@ -64,8 +54,6 @@ jobs:
           crons = ["0 */2 * * *"]
 
           [vars]
-          ${ADMIN_USERNAME_LINE}
-          ${ADMIN_PASSWORD_LINE}
           OPENCODE_MIRRORS_URL = "${MIRRORS_URL}"
           EOF
 
