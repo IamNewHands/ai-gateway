@@ -45,6 +45,27 @@ function parseModelId(model: string): { providerId: string; modelId: string } | 
   }
 }
 
+/**
+ * 透传上游响应，保留 Content-Type（含 SSE text/event-stream）等关键头。
+ * 修复 SSE 流式响应被截断/解码失败的问题：
+ * - 不硬编码 application/json 作为 fallback（SSE 流的 Content-Type 是 text/event-stream）
+ * - 添加 X-Accel-Buffering: no 防止中间代理缓冲 SSE 流
+ * - 保留上游的 Transfer-Encoding 相关行为（Workers 自动处理 chunked）
+ */
+function passthroughResponse(response: Response): Response {
+  const headers: Record<string, string> = {
+    'Cache-Control': 'no-store',
+    'X-Accel-Buffering': 'no',
+  }
+  const ct = response.headers.get('Content-Type')
+  if (ct) headers['Content-Type'] = ct
+  return new Response(response.body, {
+    status: response.status,
+    statusText: response.statusText,
+    headers,
+  })
+}
+
 /** 测试模型连接，发送最小请求验证 */
 export async function testModelConnection(
   baseUrl: string,
@@ -267,14 +288,7 @@ export async function handleProxy(c: Context<{ Bindings: Env }>) {
           }
           if (healthUpdated) await writeHealth(c.env, providerId, healthData)
 
-          const responseHeaders: Record<string, string> = {
-            'Content-Type': response.headers.get('Content-Type') || 'application/json',
-            'Cache-Control': 'no-store',
-          }
-          return new Response(response.body, {
-            status: response.status,
-            headers: responseHeaders,
-          })
+          return passthroughResponse(response)
         }
 
         // 429 限流：跳过当前 key，不标记失败
@@ -360,9 +374,10 @@ async function proxyOAuthRequest(
 
   const buildHeaders = (token: string): Record<string, string> => {
     const tokenHeader = cfg.tokenHeader || 'x-api-key'
+    const prefix = cfg.tokenHeaderPrefix || ''
     const headers: Record<string, string> = {
       'Content-Type': 'application/json',
-      [tokenHeader]: token,
+      [tokenHeader]: prefix + token,
       ...cfg.extraHeaders,
     }
     if (provider.apiType === 'anthropic') headers['anthropic-version'] = '2023-06-01'
@@ -399,11 +414,7 @@ async function proxyOAuthRequest(
       }
     }
 
-    const headers: Record<string, string> = {
-      'Content-Type': response.headers.get('Content-Type') || 'application/json',
-      'Cache-Control': 'no-store',
-    }
-    return new Response(response.body, { status: response.status, statusText: response.statusText, headers })
+    return passthroughResponse(response)
   } catch (err) {
     const error = err as Error
     return c.json({

@@ -17,7 +17,7 @@ export async function readOauthToken(env: Env, providerId: string): Promise<OAut
 }
 
 async function writeOauthToken(env: Env, providerId: string, state: OAuthTokenState): Promise<void> {
-  // token 有效期最长 1 年，KV 到期自清理（避免残留）
+  // token 有效期最长 30 天，KV 到期自清理（避免残留）
   const ttlSeconds = Math.min(Math.max(Math.floor((state.expires_at - Date.now()) / 1000), 60), 86400 * 30)
   await env.KV.put(tokenKey(providerId), JSON.stringify(state), { expirationTtl: ttlSeconds })
 }
@@ -26,7 +26,7 @@ export async function deleteOauthToken(env: Env, providerId: string): Promise<vo
   await env.KV.delete(tokenKey(providerId))
 }
 
-// ===== 设备码流程（RFC 8628） =====
+// ===== OAuth 流程入口（根据 flowType 分发） =====
 
 export interface DeviceFlowResult {
   success: boolean
@@ -35,10 +35,39 @@ export interface DeviceFlowResult {
 }
 
 /**
- * 发起设备码申请，返回用户在浏览器打开的授权信息（verification_uri + user_code）。
- * 流程状态以 providerId 为 key 存入 KV，供轮询阶段使用。
+ * 发起 OAuth 登录流程。根据 cfg.flowType 分发到设备码或浏览器登录模式。
  */
 export async function startOauthDeviceFlow(env: Env, providerId: string, cfg: OAuthDeviceConfig): Promise<DeviceFlowResult> {
+  if (cfg.flowType === 'browser') {
+    return startOauthBrowserFlow(env, providerId, cfg)
+  }
+  return startOauthDeviceCodeFlow(env, providerId, cfg)
+}
+
+export type PollResult =
+  | { status: 'pending'; message: string }
+  | { status: 'success'; message: string }
+  | { status: 'failed'; message: string }
+  | { status: 'error'; message: string }
+
+/**
+ * 轮询 OAuth 授权结果。根据 KV 中存储的 flowType 分发。
+ */
+export async function pollOauthDeviceFlow(env: Env, providerId: string, cfg: OAuthDeviceConfig): Promise<PollResult> {
+  const device = await readJson<DeviceFlowState>(env, deviceKey(providerId))
+  if (!device) return { status: 'error', message: '没有进行中的登录流程，请重新发起' }
+
+  // KV 中有 flowType 就按它走；没有则按 cfg 走（兼容旧数据）
+  const flowType = device.flowType || cfg.flowType || 'device'
+  if (flowType === 'browser') {
+    return pollOauthBrowserFlow(env, providerId, cfg, device)
+  }
+  return pollOauthDeviceCodeFlow(env, providerId, cfg, device)
+}
+
+// ===== 设备码流程（RFC 8628） =====
+
+async function startOauthDeviceCodeFlow(env: Env, providerId: string, cfg: OAuthDeviceConfig): Promise<DeviceFlowResult> {
   try {
     const params = new URLSearchParams({ client_id: cfg.clientId })
     if (cfg.scope) params.set('scope', cfg.scope)
@@ -71,6 +100,7 @@ export async function startOauthDeviceFlow(env: Env, providerId: string, cfg: OA
       verification_uri: data.verification_uri || cfg.deviceCodeUrl,
       interval: data.interval || 5,
       expires_at: Date.now() + (data.expires_in || 600) * 1000,
+      flowType: 'device',
     }
     await env.KV.put(deviceKey(providerId), JSON.stringify(device), { expirationTtl: 900 })
     return { success: true, message: '设备码已生成', device }
@@ -79,18 +109,7 @@ export async function startOauthDeviceFlow(env: Env, providerId: string, cfg: OA
   }
 }
 
-export type PollResult =
-  | { status: 'pending'; message: string }
-  | { status: 'success'; message: string }
-  | { status: 'failed'; message: string }
-  | { status: 'error'; message: string }
-
-/**
- * 轮询设备码授权结果。成功时将 access_token 存入 KV。
- */
-export async function pollOauthDeviceFlow(env: Env, providerId: string, cfg: OAuthDeviceConfig): Promise<PollResult> {
-  const device = await readJson<DeviceFlowState>(env, deviceKey(providerId))
-  if (!device) return { status: 'error', message: '没有进行中的设备码流程，请重新发起' }
+async function pollOauthDeviceCodeFlow(env: Env, providerId: string, cfg: OAuthDeviceConfig, device: DeviceFlowState): Promise<PollResult> {
   if (Date.now() > device.expires_at) {
     await env.KV.delete(deviceKey(providerId))
     return { status: 'failed', message: '设备码已过期，请重新发起' }
@@ -143,12 +162,135 @@ export async function pollOauthDeviceFlow(env: Env, providerId: string, cfg: OAu
   }
 }
 
+// ===== 浏览器登录流程（WorkBuddy/CodeBuddy 自定义 OAuth） =====
+//
+// 流程参考 cpa-plugin/workbuddy：
+//   1. POST {deviceCodeUrl} body={}  → {code:0, data:{state, authUrl}}
+//   2. 用户在浏览器打开 authUrl 完成登录
+//   3. GET  {deviceTokenUrl}?state=xxx  → {code:0, data:{accessToken, refreshToken, expiresIn, domain}}
+//   4. 刷新 POST {refreshTokenUrl} header X-Refresh-Token  → 同上
+
+/** 构造 browser 模式的公共请求头 */
+function browserCommonHeaders(cfg: OAuthDeviceConfig): Record<string, string> {
+  return {
+    'Content-Type': 'application/json',
+    'Accept': 'application/json, text/plain, */*',
+    'X-Requested-With': 'XMLHttpRequest',
+    ...cfg.extraHeaders,
+  }
+}
+
+/** CodeBuddy/WorkBuddy 的响应信封：{code, msg, data} */
+interface CodeBuddyEnvelope<T = unknown> {
+  code: number
+  msg: string
+  data?: T
+}
+
+interface CodeBuddyTokenData {
+  accessToken: string
+  refreshToken?: string
+  expiresIn?: number
+  domain?: string
+}
+
+interface CodeBuddyAuthStateData {
+  state: string
+  authUrl: string
+}
+
+async function startOauthBrowserFlow(env: Env, providerId: string, cfg: OAuthDeviceConfig): Promise<DeviceFlowResult> {
+  try {
+    const res = await fetch(cfg.deviceCodeUrl, {
+      method: 'POST',
+      headers: browserCommonHeaders(cfg),
+      body: JSON.stringify({}),
+      signal: AbortSignal.timeout(15000),
+    })
+    if (!res.ok) {
+      return { success: false, message: `发起登录失败 HTTP ${res.status}: ${(await res.text()).substring(0, 200)}` }
+    }
+
+    const env_resp = (await res.json()) as CodeBuddyEnvelope<CodeBuddyAuthStateData>
+    if (env_resp.code !== 0 || !env_resp.data?.state || !env_resp.data?.authUrl) {
+      return { success: false, message: `登录发起返回异常: code=${env_resp.code} msg=${env_resp.msg}` }
+    }
+
+    const { state, authUrl } = env_resp.data
+    const device: DeviceFlowState = {
+      device_code: state,        // browser 模式下 device_code 字段存 state
+      user_code: '',             // browser 模式无用户码
+      verification_uri: authUrl, // 存登录页 URL
+      interval: cfg.pollInterval || 5,
+      expires_at: Date.now() + 5 * 60 * 1000, // 5 分钟超时（参考插件 loginTTL）
+      flowType: 'browser',
+    }
+    await env.KV.put(deviceKey(providerId), JSON.stringify(device), { expirationTtl: 900 })
+    return { success: true, message: '登录链接已生成', device }
+  } catch (err) {
+    return { success: false, message: `发起登录异常: ${(err as Error).message || '未知错误'}` }
+  }
+}
+
+async function pollOauthBrowserFlow(env: Env, providerId: string, cfg: OAuthDeviceConfig, device: DeviceFlowState): Promise<PollResult> {
+  if (Date.now() > device.expires_at) {
+    await env.KV.delete(deviceKey(providerId))
+    return { status: 'failed', message: '登录已超时（5 分钟），请重新发起' }
+  }
+
+  const state = device.device_code // browser 模式下存的是 state
+  try {
+    const sep = cfg.deviceTokenUrl.includes('?') ? '&' : '?'
+    const pollUrl = `${cfg.deviceTokenUrl}${sep}state=${encodeURIComponent(state)}`
+    const res = await fetch(pollUrl, {
+      method: 'GET',
+      headers: {
+        'Accept': 'application/json, text/plain, */*',
+        'X-Requested-With': 'XMLHttpRequest',
+        ...cfg.extraHeaders,
+      },
+      signal: AbortSignal.timeout(15000),
+    })
+
+    // 4xx 或业务码非 0 = 还在等待用户登录
+    if (!res.ok) {
+      return { status: 'pending', message: '等待用户在浏览器完成登录…' }
+    }
+
+    const env_resp = (await res.json().catch(() => null)) as CodeBuddyEnvelope<CodeBuddyTokenData> | null
+    if (!env_resp || env_resp.code !== 0 || !env_resp.data?.accessToken) {
+      return { status: 'pending', message: '等待用户在浏览器完成登录…' }
+    }
+
+    const tok = env_resp.data
+    const expiresInSec = tok.expiresIn || 7200
+    await writeOauthToken(env, providerId, {
+      access_token: tok.accessToken,
+      refresh_token: tok.refreshToken,
+      expires_at: Date.now() + expiresInSec * 1000,
+      updated_at: Date.now(),
+    })
+    await env.KV.delete(deviceKey(providerId))
+    return { status: 'success', message: 'OAuth 连接成功' }
+  } catch (err) {
+    return { status: 'error', message: `轮询异常: ${(err as Error).message || '未知错误'}` }
+  }
+}
+
 // ===== Token 刷新 =====
 
 /**
- * 使用 refresh_token 刷新 access_token。成功返回 true 并写回 KV。
+ * 使用 refresh_token 刷新 access_token。根据 flowType 分发。
  */
 export async function refreshOauthToken(env: Env, providerId: string, cfg: OAuthDeviceConfig): Promise<boolean> {
+  if (cfg.flowType === 'browser') {
+    return refreshOauthTokenBrowser(env, providerId, cfg)
+  }
+  return refreshOauthTokenDevice(env, providerId, cfg)
+}
+
+/** 设备码模式的 token 刷新（POST JSON: {refresh_token, client_id}） */
+async function refreshOauthTokenDevice(env: Env, providerId: string, cfg: OAuthDeviceConfig): Promise<boolean> {
   const state = await readOauthToken(env, providerId)
   if (!state?.refresh_token) return false
 
@@ -168,6 +310,39 @@ export async function refreshOauthToken(env: Env, providerId: string, cfg: OAuth
       access_token: data.access_token,
       refresh_token: data.refresh_token || state.refresh_token,
       expires_at: Date.now() + (data.expires_in || 3600) * 1000,
+      updated_at: Date.now(),
+    })
+    return true
+  } catch {
+    return false
+  }
+}
+
+/** 浏览器登录模式的 token 刷新（POST header X-Refresh-Token） */
+async function refreshOauthTokenBrowser(env: Env, providerId: string, cfg: OAuthDeviceConfig): Promise<boolean> {
+  const state = await readOauthToken(env, providerId)
+  if (!state?.refresh_token) return false
+
+  try {
+    const res = await fetch(cfg.refreshTokenUrl, {
+      method: 'POST',
+      headers: {
+        ...browserCommonHeaders(cfg),
+        'X-Refresh-Token': state.refresh_token,
+      },
+      body: '',
+      signal: AbortSignal.timeout(15000),
+    })
+    if (!res.ok) return false
+
+    const env_resp = (await res.json().catch(() => null)) as CodeBuddyEnvelope<CodeBuddyTokenData> | null
+    if (!env_resp || env_resp.code !== 0 || !env_resp.data?.accessToken) return false
+
+    const tok = env_resp.data
+    await writeOauthToken(env, providerId, {
+      access_token: tok.accessToken,
+      refresh_token: tok.refreshToken || state.refresh_token,
+      expires_at: Date.now() + (tok.expiresIn || 7200) * 1000,
       updated_at: Date.now(),
     })
     return true

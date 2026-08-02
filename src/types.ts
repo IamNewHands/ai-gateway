@@ -24,22 +24,42 @@ export interface Provider {
   updatedAt: string
 }
 
-/** OAuth 设备码（RFC 8628）认证配置 */
+/** OAuth 认证配置（authType === 'oauth-device' 时生效） */
 export interface OAuthDeviceConfig {
-  /** 设备码申请端点（POST, x-www-form-urlencoded, 需 client_id） */
+  /**
+   * 登录流程类型：
+   * - device：标准设备码（RFC 8628）— 申请 device_code，用户在浏览器输入 user_code
+   * - browser：浏览器登录 — POST deviceCodeUrl 拿到登录链接（authUrl），用户打开网页登录后轮询拿 token
+   */
+  flowType?: 'device' | 'browser'
+  /**
+   * 设备码申请端点 / 浏览器登录发起端点：
+   * - device 模式：POST, x-www-form-urlencoded, 需 client_id，返回 device_code/user_code
+   * - browser 模式：POST, JSON body {}，返回 {code,msg,data:{state, authUrl}}
+   */
   deviceCodeUrl: string
-  /** 设备码轮询端点（POST, x-www-form-urlencoded） */
+  /**
+   * 轮询端点：
+   * - device 模式：POST, x-www-form-urlencoded, 提交 device_code
+   * - browser 模式：GET，追加 ?state=xxx 轮询，返回 {code,msg,data:{accessToken,refreshToken,expiresIn,domain}}
+   */
   deviceTokenUrl: string
-  /** token 刷新端点（POST, JSON: {refresh_token, client_id}） */
+  /**
+   * token 刷新端点：
+   * - device 模式：POST, JSON: {refresh_token, client_id}
+   * - browser 模式：POST, header X-Refresh-Token: <refresh_token>
+   */
   refreshTokenUrl: string
-  /** OAuth 应用 client_id */
+  /** OAuth 应用 client_id（browser 模式可留空） */
   clientId: string
   /** 申请的 scope（可选） */
   scope?: string
   /** 轮询间隔（秒），默认 5 */
   pollInterval?: number
-  /** access_token 注入到上游请求的哪个头，默认 x-api-key */
+  /** access_token 注入到上游请求的哪个头，默认 x-api-key；browser 模式建议 Authorization */
   tokenHeader?: string
+  /** token 注入时的值前缀，例如 "Bearer "（配合 Authorization 使用） */
+  tokenHeaderPrefix?: string
   /** 转发时额外注入的固定请求头 */
   extraHeaders?: Record<string, string>
 }
@@ -53,13 +73,18 @@ export interface OAuthTokenState {
   updated_at: number
 }
 
-/** 进行中的设备码流程状态 */
+/** 进行中的设备码/浏览器登录流程状态 */
 export interface DeviceFlowState {
+  /** device 模式：device_code；browser 模式：state */
   device_code: string
+  /** device 模式：用户码；browser 模式：空 */
   user_code: string
+  /** device 模式：验证链接；browser 模式：登录页 authUrl */
   verification_uri: string
   interval: number
   expires_at: number
+  /** 流程类型，用于轮询时分发 */
+  flowType?: 'device' | 'browser'
 }
 
 export interface ProxyKey {
