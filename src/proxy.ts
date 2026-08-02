@@ -256,7 +256,7 @@ export async function handleProxy(c: Context<{ Bindings: Env }>) {
           method: c.req.method,
           headers: forwardHeaders,
           body: JSON.stringify(forwardBody),
-          signal: AbortSignal.timeout(60000),
+          signal: AbortSignal.timeout(300000),
         })
 
         if (response.ok) {
@@ -373,7 +373,7 @@ async function proxyOAuthRequest(
     method: c.req.method,
     headers: buildHeaders(token),
     body: c.req.method === 'GET' || c.req.method === 'HEAD' ? undefined : JSON.stringify(forwardBody),
-    signal: AbortSignal.timeout(60000),
+    signal: AbortSignal.timeout(300000),
   })
 
   try {

@@ -3,7 +3,8 @@ import type { ApiKeyEntry, Env } from './types'
 export const OPENCODE_PROVIDER_ID = 'opencode'
 
 const OPENCODE_VERSION = '1.17.8'
-const OPENCODE_TIMEOUT_MS = 60000
+// 转发超时：LLM 长响应/流式容易超过 60s，放宽到 5 分钟避免中途被掐断
+const OPENCODE_TIMEOUT_MS = 300000
 
 interface OpenCodeRequestOptions {
   baseUrl: string
