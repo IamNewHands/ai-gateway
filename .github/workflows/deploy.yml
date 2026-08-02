@@ -2,9 +2,9 @@ name: Deploy to Cloudflare Workers
 
 on:
   workflow_dispatch: # 允许手动触发
-  # push:
-  #   branches:
-  #     - main
+  push:
+    branches:
+      - main
 
 # 部署所需权限
 permissions:
