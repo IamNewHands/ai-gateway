@@ -146,6 +146,17 @@ export async function handleProxy(c: Context<{ Bindings: Env }>) {
     }
 
     const { providerId, modelId } = parsed
+
+    // 转发 Key 模型权限检查
+    const proxyKey = (c as any).get('proxyKey') as import('./types').ProxyKey | undefined
+    if (proxyKey?.allowedModels && proxyKey.allowedModels.length > 0) {
+      if (!proxyKey.allowedModels.includes(model)) {
+        return c.json({
+          error: { message: `模型 "${model}" 不在当前 Key 的允许列表中`, type: 'permission_error' },
+        }, 403)
+      }
+    }
+
     const provider = await getProvider(c.env, providerId)
 
     if (!provider) {
@@ -426,6 +437,10 @@ async function proxyOAuthRequest(
 /** 处理 /v1/models — 返回所有已启用的模型（含提供商前缀） */
 export async function handleModels(c: Context<{ Bindings: Env }>) {
   const providers = await getProviders(c.env)
+  // 从中间件获取转发 Key（可能带有 allowedModels 过滤）
+  const proxyKey = (c as any).get('proxyKey') as import('./types').ProxyKey | undefined
+  const allowed = proxyKey?.allowedModels
+  const allowSet = allowed && allowed.length > 0 ? new Set(allowed) : null
 
   const models: Array<{
     id: string
@@ -440,8 +455,11 @@ export async function handleModels(c: Context<{ Bindings: Env }>) {
     if (!provider.enabled) continue
     for (const model of provider.models) {
       if (!model.enabled) continue
+      const fullId = `${provider.id}/${model.id}`
+      // 如果转发 Key 配置了 allowedModels，只返回允许的模型
+      if (allowSet && !allowSet.has(fullId)) continue
       models.push({
-        id: `${provider.id}/${model.id}`,
+        id: fullId,
         provider: provider.id,
         provider_name: provider.name,
         object: 'model',

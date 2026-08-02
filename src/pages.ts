@@ -366,7 +366,7 @@ ${H('管理')}
               <div class="fg"><label for="anm">名称</label><input type="text" id="anm" placeholder="DeepSeek"></div>
               <div class="fg"><label for="aid">提供商 ID</label><input type="text" id="aid" placeholder="deepseek"><span class="form-helper">用于模型前缀，创建后不可修改。</span></div>
             </div>
-            <div class="fg"><label for="apreset">厂商预设</label><select id="apreset" class="select-sm" onchange="applyProviderPreset(this.value)"><option value="">— 自定义 —</option><option value="deepseek">DeepSeek</option><option value="openai">OpenAI</option><option value="anthropic">Anthropic (Claude)</option><option value="zhipu">智谱 AI (GLM)</option><option value="qwen">通义千问 (DashScope)</option><option value="moonshot">月之暗面 (Kimi)</option><option value="baichuan">百川</option><option value="lingyi">零一万物 (Yi)</option><option value="stepfun">阶跃星辰 (StepFun)</option><option value="siliconflow">硅基流动 (SiliconFlow)</option><option value="volcengine">火山方舟 (豆包)</option><option value="qianfan">百度千帆 (文心)</option><option value="openrouter">OpenRouter</option><option value="together">Together AI</option><option value="groq">Groq</option><option value="deepinfra">DeepInfra</option><option value="mistral">Mistral AI</option><option value="xai">xAI (Grok)</option></select><span class="form-helper">选择后自动填充名称/地址/格式，只需填 API Key 即可测试。</span></div>
+            <div class="fg"><label for="apreset">厂商预设</label><select id="apreset" class="select-sm" onchange="applyProviderPreset(this.value)"><option value="">— 自定义 —</option><option value="deepseek">DeepSeek</option><option value="openai">OpenAI</option><option value="anthropic">Anthropic (Claude)</option><option value="zhipu">智谱 AI (GLM)</option><option value="qwen">通义千问 (DashScope)</option><option value="moonshot">月之暗面 (Kimi)</option><option value="baichuan">百川</option><option value="lingyi">零一万物 (Yi)</option><option value="stepfun">阶跃星辰 (StepFun)</option><option value="siliconflow">硅基流动 (SiliconFlow)</option><option value="volcengine">火山方舟 (豆包)</option><option value="qianfan">百度千帆 (文心)</option><option value="openrouter">OpenRouter</option><option value="together">Together AI</option><option value="groq">Groq</option><option value="deepinfra">DeepInfra</option><option value="mistral">Mistral AI</option><option value="xai">xAI (Grok)</option><option value="workbuddy">WorkBuddy (OAuth 登录)</option></select><span class="form-helper">选择后自动填充名称/地址/格式，只需填 API Key 即可测试。</span></div>
             <div class="fg"><label for="aurl">API 地址</label><input type="url" id="aurl" placeholder="https://api.deepseek.com"></div>
             <div class="fg"><label for="afmt">API 格式</label><select id="afmt" class="select-sm"><option value="openai">OpenAI 兼容</option><option value="anthropic">Anthropic 兼容</option></select></div>
             <div class="fg"><label for="aat">认证方式</label><select id="aat" class="select-sm" onchange="toggleAuthType()"><option value="api-key">API Key</option><option value="oauth-device">OAuth 设备码登录</option></select></div>
@@ -432,7 +432,7 @@ ${H('管理')}
         <div class="section-heading section-heading--admin"><div><h2 id="proxy-keys-title">转发 Key</h2><p>客户端使用这些 Key 访问统一的 <code>/v1</code> 接口。</p></div><button class="btn btn-p" onclick="genKey()"><i class="fas fa-plus" aria-hidden="true"></i>生成转发 Key</button></div>
         <div class="key-list">
           ${proxyKeys.length===0?'<div class="empty-state"><i class="fas fa-key" aria-hidden="true"></i><h3>暂无转发 Key</h3><p>生成一个 Key 后，客户端才能访问网关。</p><button class="btn btn-p" onclick="genKey()">生成转发 Key</button></div>':''}
-          ${proxyKeys.map(k=>`<article class="ki" data-id="${escapePageHtml(k.id)}"><div class="key-main"><span class="key-icon" aria-hidden="true"><i class="fas fa-key"></i></span><div><div class="kv"><span id="kv-${escapePageHtml(k.id)}" data-full="${escapePageHtml(k.key)}">${escapePageHtml(k.key.length>12?k.key.substring(0,8)+'••••'+k.key.substring(k.key.length-4):k.key)}</span><button class="icon-btn" onclick="toggleKeyVis('${k.id}')" title="显示或隐藏" aria-label="显示或隐藏 Key"><i class="far fa-eye" aria-hidden="true"></i></button><button class="icon-btn" onclick='copyText("${escapePageHtml(k.key)}",this)' title="复制" aria-label="复制 Key"><i class="far fa-copy" aria-hidden="true"></i></button></div><h3>${escapePageHtml(k.name)}</h3><p>创建于 ${new Date(k.createdAt).toLocaleDateString()} · ${k.expiresAt?'有效至 '+new Date(k.expiresAt).toLocaleDateString():'永久有效'}</p></div></div><div class="key-actions"><label class="tg"><input type="checkbox" ${k.enabled?'checked':''} onchange="toggleProxyKey('${k.id}',this.checked)" aria-label="启用 ${escapePageHtml(k.name)}"><span class="sl"></span></label><span class="bd ${k.enabled?'bd-on':'bd-off'}">${k.enabled?'已启用':'已禁用'}</span><button class="btn btn-d btn-xs" onclick="rmKey('${k.id}')"><i class="fas fa-trash" aria-hidden="true"></i>删除</button></div></article>`).join('')}
+          ${proxyKeys.map(k=>`<article class="ki" data-id="${escapePageHtml(k.id)}"><div class="key-main"><span class="key-icon" aria-hidden="true"><i class="fas fa-key"></i></span><div><div class="kv"><span id="kv-${escapePageHtml(k.id)}" data-full="${escapePageHtml(k.key)}">${escapePageHtml(k.key.length>12?k.key.substring(0,8)+'••••'+k.key.substring(k.key.length-4):k.key)}</span><button class="icon-btn" onclick="toggleKeyVis('${k.id}')" title="显示或隐藏" aria-label="显示或隐藏 Key"><i class="far fa-eye" aria-hidden="true"></i></button><button class="icon-btn" onclick='copyText("${escapePageHtml(k.key)}",this)' title="复制" aria-label="复制 Key"><i class="far fa-copy" aria-hidden="true"></i></button></div><h3>${escapePageHtml(k.name)}</h3><p>创建于 ${new Date(k.createdAt).toLocaleDateString()} · ${k.expiresAt?'有效至 '+new Date(k.expiresAt).toLocaleDateString():'永久有效'} · <span class="bd ${k.allowedModels&&k.allowedModels.length>0?'bd-on':'bd-off'}">${k.allowedModels&&k.allowedModels.length>0?k.allowedModels.length+' 个模型':'全部模型'}</span></p></div></div><div class="key-actions"><label class="tg"><input type="checkbox" ${k.enabled?'checked':''} onchange="toggleProxyKey('${k.id}',this.checked)" aria-label="启用 ${escapePageHtml(k.name)}"><span class="sl"></span></label><span class="bd ${k.enabled?'bd-on':'bd-off'}">${k.enabled?'已启用':'已禁用'}</span><button class="btn btn-gh btn-xs" onclick="editKeyModels('${k.id}')" title="模型筛选"><i class="fas fa-filter" aria-hidden="true"></i>模型筛选</button><button class="btn btn-d btn-xs" onclick="rmKey('${k.id}')"><i class="fas fa-trash" aria-hidden="true"></i>删除</button></div></article>`).join('')}
         </div>
       </section>
     </main>
@@ -688,6 +688,7 @@ const PROVIDER_PRESETS = {
   deepinfra:    { name: 'DeepInfra',          id: 'deepinfra',    baseUrl: 'https://api.deepinfra.com/v1/openai',               apiType: 'openai' },
   mistral:      { name: 'Mistral AI',         id: 'mistral',      baseUrl: 'https://api.mistral.ai/v1',                         apiType: 'openai' },
   xai:          { name: 'xAI (Grok)',         id: 'xai',          baseUrl: 'https://api.x.ai/v1',                               apiType: 'openai' },
+  workbuddy:    { name: 'WorkBuddy (OAuth)',  id: 'workbuddy',    baseUrl: 'https://copilot.tencent.com',                       apiType: 'openai', authType: 'oauth-device', oauthPreset: 'workbuddy' },
 }
 function applyProviderPreset(name) {
   const p = PROVIDER_PRESETS[name]
@@ -696,8 +697,14 @@ function applyProviderPreset(name) {
   document.getElementById('aid').value = p.id
   document.getElementById('aurl').value = p.baseUrl
   document.getElementById('afmt').value = p.apiType
-  document.getElementById('aat').value = 'api-key'
-  toggleAuthType()
+  if (p.authType === 'oauth-device') {
+    document.getElementById('aat').value = 'oauth-device'
+    toggleAuthType()
+    if (p.oauthPreset) applyOauthPreset(p.oauthPreset)
+  } else {
+    document.getElementById('aat').value = 'api-key'
+    toggleAuthType()
+  }
 }
 
 function toggleAuthType() {
@@ -745,6 +752,10 @@ const OAUTH_PRESETS = {
       'User-Agent': 'CLI/2.63.2 CodeBuddy/2.63.2',
     },
     _baseUrl: 'https://copilot.tencent.com',
+    _models: [
+      'glm-5.2', 'glm-5.1', 'glm-5v-turbo', 'kimi-k2.7', 'minimax-m3',
+      'hy3', 'hy3-preview', 'hy3-preview-agent', 'deepseek-v4-pro', 'deepseek-v4-flash',
+    ],
   },
 }
 function applyOauthPreset(name) {
@@ -759,7 +770,10 @@ function applyOauthPreset(name) {
   document.getElementById('ao7').value = JSON.stringify(p.extraHeaders || {}, null, 2)
   const ft = document.getElementById('ao8'); if (ft) ft.value = p.flowType || 'device'
   const tp = document.getElementById('ao9'); if (tp) tp.value = p.tokenHeaderPrefix || ''
-  if (p._baseUrl) { const bu = document.getElementById('aurl'); if (bu && !bu.value.trim()) bu.value = p._baseUrl }
+  // 强制覆盖 baseUrl（不再仅在空时填）
+  if (p._baseUrl) { const bu = document.getElementById('aurl'); if (bu) bu.value = p._baseUrl }
+  // 预置模型自动填充
+  if (p._models && p._models.length > 0) fillPresetModels(p._models)
   document.getElementById('aat').value = 'oauth-device'
   toggleAuthType()
 }
@@ -775,9 +789,32 @@ function applyOauthPresetEdit(id, name) {
   document.getElementById('eao7-' + id).value = JSON.stringify(p.extraHeaders || {}, null, 2)
   const ft = document.getElementById('eao8-' + id); if (ft) ft.value = p.flowType || 'device'
   const tp = document.getElementById('eao9-' + id); if (tp) tp.value = p.tokenHeaderPrefix || ''
+  // 强制覆盖 baseUrl
   if (p._baseUrl) { const bu = document.getElementById('url-' + id); if (bu) bu.value = p._baseUrl }
+  // 预置模型自动填充（编辑模式）
+  if (p._models && p._models.length > 0) fillPresetModelsEdit(id, p._models)
   document.getElementById('auth-' + id).value = 'oauth-device'
   toggleAuthTypeEdit(id)
+}
+
+// 预置模型填充 — 新建模式
+function fillPresetModels(models) {
+  const c = document.getElementById('amodels')
+  if (!c) return
+  c.innerHTML = ''
+  models.forEach(function(mid) { addMdlToForm(mid) })
+}
+// 预置模型填充 — 编辑模式
+function fillPresetModelsEdit(id, models) {
+  const c = document.getElementById('ml-' + id)
+  if (!c) return
+  c.innerHTML = ''
+  models.forEach(function(mid) {
+    const d = document.createElement('div')
+    d.className = 'fc mb-3 field-row'
+    d.innerHTML = '<input type="text" value="' + escapeHtml(mid) + '" class="fx1" id="mid-' + id + '-' + Math.random().toString(36).substr(2,9) + '" placeholder="模型 ID"><label class="tg"><input type="checkbox" checked aria-label="启用模型"><span class="sl"></span></label><button class="btn btn-gh btn-xs" onclick="testMdl(\'' + id + '\',\'' + escapeHtml(mid) + '\')"><i class="fas fa-plug"></i></button><button class="btn btn-gh btn-xs" onclick="this.parentElement.remove()"><i class="fas fa-times c-l"></i></button>'
+    c.appendChild(d)
+  })
 }
 
 function oauthStatus(id) {
@@ -974,6 +1011,63 @@ async function del(id) {
   const d = await r.json()
   if (d.success) { toast('已删除', 'success'); location.reload() }
   else toast(d.message || '删除失败', 'error')
+}
+
+// ===== 转发 Key 模型筛选 =====
+async function editKeyModels(keyId) {
+  // 获取所有提供商和模型
+  const res = await fetch('/admin/api/providers')
+  const d = await res.json()
+  if (!d.success) { toast('获取模型列表失败', 'error'); return }
+  const providers = d.data || []
+  const allModels = []
+  providers.forEach(function(p) {
+    if (!p.enabled) return
+    ;(p.models || []).forEach(function(m) {
+      if (!m.enabled) return
+      allModels.push({ id: p.id + '/' + m.id, label: p.name + ' / ' + m.id, group: p.name })
+    })
+  })
+  if (allModels.length === 0) { toast('暂无可用模型，请先添加提供商和模型', 'error'); return }
+  // 获取当前 Key 的 allowedModels
+  const keyRes = await fetch('/admin/api/proxy-keys')
+  const kd = await keyRes.json()
+  const key = (kd.data || []).find(function(k) { return k.id === keyId })
+  const allowed = (key && key.allowedModels) || []
+  const isAll = allowed.length === 0
+  // 按提供商分组
+  const groups = {}
+  allModels.forEach(function(m) {
+    if (!groups[m.group]) groups[m.group] = []
+    groups[m.group].push(m)
+  })
+  let html = '<h3><i class="fas fa-filter c-p" aria-hidden="true"></i> 模型筛选</h3><p>不勾选的模型将无法通过此 Key 访问。全部勾选 = 允许全部。</p>'
+  html += '<div style="margin-bottom:8px"><button class="btn btn-gh btn-xs" onclick="document.querySelectorAll(\'.mdl-chk input\').forEach(function(el){el.checked=true})">全选</button> <button class="btn btn-gh btn-xs" onclick="document.querySelectorAll(\'.mdl-chk input\').forEach(function(el){el.checked=false})">全不选</button></div>'
+  html += '<div class="mdl-list" style="max-height:50vh;overflow-y:auto">'
+  Object.keys(groups).forEach(function(g) {
+    html += '<div style="margin-bottom:8px"><strong>' + escapeHtml(g) + '</strong></div>'
+    groups[g].forEach(function(m) {
+      const checked = isAll || allowed.indexOf(m.id) !== -1 ? ' checked' : ''
+      html += '<label class="mdl-chk" style="display:block;padding:2px 0 2px 16px;cursor:pointer"><input type="checkbox" value="' + escapeHtml(m.id) + '"' + checked + '> ' + escapeHtml(m.id) + '</label>'
+    })
+  })
+  html += '</div>'
+  html += '<div class="fa" style="margin-top:12px"><button class="btn btn-s" onclick="closeM()">取消</button><button class="btn btn-p" onclick="saveKeyModels(\'' + keyId + '\')">保存</button></div>'
+  showM(html)
+}
+async function saveKeyModels(keyId) {
+  var checked = Array.from(document.querySelectorAll('.mdl-chk input:checked')).map(function(el) { return el.value })
+  var all = Array.from(document.querySelectorAll('.mdl-chk input')).map(function(el) { return el.value })
+  // 全部勾选 = 存空数组（= 全部允许）
+  var allowedModels = checked.length === all.length ? [] : checked
+  var res = await fetch('/admin/api/proxy-keys/' + encodeURIComponent(keyId), {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ allowedModels: allowedModels })
+  })
+  var d = await res.json()
+  if (d.success) { toast('已保存', 'success'); closeM(); setTimeout(function() { location.reload() }, 500) }
+  else toast(d.message || '保存失败', 'error')
 }
 
 function addMdl(id) {

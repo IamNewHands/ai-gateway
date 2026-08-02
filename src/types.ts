@@ -94,6 +94,8 @@ export interface ProxyKey {
   enabled: boolean
   createdAt: string
   expiresAt?: string | null
+  /** 允许的模型列表（含提供商前缀，如 "deepseek/deepseek-chat"）。空或不存在 = 全部允许 */
+  allowedModels?: string[]
 }
 
 export interface Session {

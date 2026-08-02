@@ -100,12 +100,14 @@ export async function proxyKeyAuthMiddleware(c: Context<{ Bindings: Env }>, next
   }
 
   const token = authHeader.slice(7)
-  const isValid = await validateProxyKey(c.env, token)
-  if (!isValid) {
+  const proxyKey = await validateProxyKey(c.env, token)
+  if (!proxyKey) {
     return c.json({
       error: { message: 'API Key 无效或已禁用', type: 'authentication_error' },
     }, 401)
   }
 
+  // 将 ProxyKey 存入 context，供 handleModels/handleProxy 按模型过滤
+  ;(c as any).set('proxyKey', proxyKey)
   return next()
 }

@@ -349,9 +349,10 @@ export async function handleDeleteProxyKey(c: Context<{ Bindings: Env }>) {
 export async function handleUpdateProxyKey(c: Context<{ Bindings: Env }>) {
   const id = c.req.param('id')
   if (!id) return c.json<ApiResponse>({ success: false, message: '缺少 id 参数' }, 400)
-  const body = await c.req.json<{ enabled?: boolean }>()
+  const body = await c.req.json<{ enabled?: boolean; allowedModels?: string[] }>()
   const updates: Partial<import('./types').ProxyKey> = {}
   if (body.enabled !== undefined) updates.enabled = body.enabled
+  if (body.allowedModels !== undefined) updates.allowedModels = body.allowedModels
   const updated = await updateProxyKey(c.env, id, updates)
   if (!updated) {
     return c.json<ApiResponse>({ success: false, message: '转发 Key 不存在' }, 404)

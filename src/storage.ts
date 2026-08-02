@@ -103,9 +103,9 @@ export async function updateProxyKey(env: Env, id: string, updates: Partial<Prox
   return keys[idx]
 }
 
-export async function validateProxyKey(env: Env, key: string): Promise<boolean> {
+export async function validateProxyKey(env: Env, key: string): Promise<ProxyKey | null> {
   const keys = await getProxyKeys(env)
-  return keys.some((k) => {
+  const found = keys.find((k) => {
     if (k.key !== key || !k.enabled) return false
     if (k.expiresAt) {
       const now = Date.now()
@@ -114,6 +114,7 @@ export async function validateProxyKey(env: Env, key: string): Promise<boolean> 
     }
     return true
   })
+  return found || null
 }
 
 // ===== 初始数据填充 =====
