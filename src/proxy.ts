@@ -3,7 +3,7 @@ import { getProvider, getProviders } from './storage'
 import { KV_KEYS, KEY_HEALTH_COOLDOWN_MS, KEY_HEALTH_MAX_FAILURES } from './config'
 import type { Env, ProxyRequestBody } from './types'
 import { isOpenCodeProvider, proxyOpenCodeRequest, resolveOpenCodeUrls } from './opencode'
-import { getOauthAccessToken, readOauthToken, refreshOauthToken } from './oauth'
+import { getOauthAccessToken, readOauthToken, refreshOauthToken, detectTokenRealm, buildOauthHeaders } from './oauth'
 
 // ===== Key 健康状态类型和辅助函数 =====
 
@@ -380,24 +380,22 @@ async function proxyOAuthRequest(
   forwardBody: object
 ): Promise<Response> {
   const cfg = provider.oauth!
-  const cleanBase = provider.baseUrl.replace(/\/$/, '')
-  const forwardUrl = `${cleanBase}/${subPath}${search}`
 
-  const buildHeaders = (token: string): Record<string, string> => {
-    const tokenHeader = cfg.tokenHeader || 'x-api-key'
-    const prefix = cfg.tokenHeaderPrefix || ''
-    const headers: Record<string, string> = {
-      'Content-Type': 'application/json',
-      [tokenHeader]: prefix + token,
-      ...cfg.extraHeaders,
-    }
-    if (provider.apiType === 'anthropic') headers['anthropic-version'] = '2023-06-01'
-    return headers
+  // 域路由：根据 token 的 JWT iss 决定走 CN (copilot.tencent.com) 还是 Global (www.workbuddy.ai)。
+  // Global token 打到 copilot.tencent.com 会被 APISIX 返回 401。
+  const resolveForwardUrl = (token: string) => {
+    const isGlobal = detectTokenRealm(token) === 'global'
+    const realmBase = (isGlobal && cfg.globalBaseUrl ? cfg.globalBaseUrl : provider.baseUrl).replace(/\/$/, '')
+    return `${realmBase}/${subPath}${search}`
+  }
+  const resolveOrigin = (token: string) => {
+    const isGlobal = detectTokenRealm(token) === 'global'
+    return isGlobal && cfg.globalOrigin ? cfg.globalOrigin : (cfg.extraHeaders?.Origin)
   }
 
-  const doFetch = (token: string) => fetch(forwardUrl, {
+  const doFetch = (token: string) => fetch(resolveForwardUrl(token), {
     method: c.req.method,
-    headers: buildHeaders(token),
+    headers: buildOauthHeaders(cfg, token, { origin: resolveOrigin(token), apiType: provider.apiType }),
     body: c.req.method === 'GET' || c.req.method === 'HEAD' ? undefined : JSON.stringify(forwardBody),
     signal: AbortSignal.timeout(300000),
   })

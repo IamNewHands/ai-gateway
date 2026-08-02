@@ -29,17 +29,55 @@ export async function deleteOauthToken(env: Env, providerId: string): Promise<vo
 /**
  * 构造转发到上游时使用的认证头：注入 tokenHeader + prefix + extraHeaders。
  * 供 proxy 转发、模型列表拉取、模型连通性测试复用，保证三者一致。
+ * opts.origin 可覆盖 Origin/Referer（用于 Global 域路由）。
  */
-export function buildOauthHeaders(cfg: OAuthDeviceConfig, token: string, contentType = 'application/json'): Record<string, string> {
+export function buildOauthHeaders(
+  cfg: OAuthDeviceConfig,
+  token: string,
+  opts?: { contentType?: string; origin?: string; apiType?: string }
+): Record<string, string> {
   const tokenHeader = cfg.tokenHeader || 'x-api-key'
   const prefix = cfg.tokenHeaderPrefix || ''
   const headers: Record<string, string> = {
-    'Content-Type': contentType,
+    'Content-Type': opts?.contentType ?? 'application/json',
     'Accept': 'application/json',
     [tokenHeader]: prefix + token,
     ...(cfg.extraHeaders || {}),
   }
+  if (opts?.origin) {
+    headers['Origin'] = opts.origin
+    headers['Referer'] = opts.origin + '/'
+  }
+  if (opts?.apiType === 'anthropic') headers['anthropic-version'] = '2023-06-01'
   return headers
+}
+
+/**
+ * 解析 access_token (JWT) 的 iss 判断账户领域。
+ * WorkBuddy: Global (iss 含 workbuddy.ai) 必须走 www.workbuddy.ai，
+ *            否则 copilot.tencent.com 的 APISIX 会返回 401；
+ *            CN (iss 含 codebuddy.cn) 走 copilot.tencent.com。
+ * 非 JWT 或无法解析时返回 null，调用方按 CN 默认处理。
+ */
+export function detectTokenRealm(token: string): 'global' | 'cn' | null {
+  try {
+    const parts = token.split('.')
+    if (parts.length < 2) return null
+    let b64 = parts[1].replace(/-/g, '+').replace(/_/g, '/')
+    while (b64.length % 4) b64 += '='
+    const payload = JSON.parse(atob(b64)) as { iss?: string }
+    const iss = String(payload?.iss || '').toLowerCase()
+    if (iss.includes('workbuddy.ai')) return 'global'
+    if (iss.includes('codebuddy.cn')) return 'cn'
+    return null
+  } catch {
+    return null
+  }
+}
+
+/** 是否为 Global 域 token（便捷封装） */
+export function isGlobalToken(token: string): boolean {
+  return detectTokenRealm(token) === 'global'
 }
 
 // ===== OAuth 流程入口（根据 flowType 分发） =====

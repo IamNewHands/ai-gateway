@@ -13,7 +13,7 @@ import {
 import { testModelConnection } from './proxy'
 import { fetchOpenCodeModels, isOpenCodeProvider, resolveOpenCodeUrls, testOpenCodeModel } from './opencode'
 import { PROXY_KEY_PREFIX, EXPIRY_OPTIONS, OPENCODE_DEFAULT_URL } from './config'
-import { startOauthDeviceFlow, pollOauthDeviceFlow, readOauthToken, deleteOauthToken, getOauthAccessToken, buildOauthHeaders } from './oauth'
+import { startOauthDeviceFlow, pollOauthDeviceFlow, readOauthToken, deleteOauthToken, getOauthAccessToken, buildOauthHeaders, detectTokenRealm } from './oauth'
 import type {
   Env,
   ApiResponse,
@@ -173,13 +173,16 @@ export async function handleTestModel(c: Context<{ Bindings: Env }>) {
     if (!token) {
       return c.json<ApiResponse>({ success: false, message: 'OAuth 未连接或 Token 已失效，请先发起连接' }, 400)
     }
-    const cleanBase = provider.baseUrl.replace(/\/$/, '')
+    // 域路由：Global token 走 globalBaseUrl，否则走 provider.baseUrl
+    const isGlobal = detectTokenRealm(token) === 'global'
+    const realmBase = (isGlobal && cfg.globalBaseUrl ? cfg.globalBaseUrl : provider.baseUrl).replace(/\/$/, '')
+    const origin = isGlobal && cfg.globalOrigin ? cfg.globalOrigin : (cfg.extraHeaders?.Origin)
     const endpoint = provider.apiType === 'anthropic' ? 'messages' : 'chat/completions'
-    const url = `${cleanBase}/${endpoint}`
+    const url = `${realmBase}/${endpoint}`
     try {
       const response = await fetch(url, {
         method: 'POST',
-        headers: buildOauthHeaders(cfg, token),
+        headers: buildOauthHeaders(cfg, token, { origin, apiType: provider.apiType }),
         body: JSON.stringify({ model: modelId, messages: [{ role: 'user', content: 'hi' }], max_tokens: 1, stream: true }),
         signal: AbortSignal.timeout(20000),
       })
@@ -474,13 +477,21 @@ export async function handleOAuthModels(c: Context<{ Bindings: Env }>) {
     return c.json<ApiResponse>({ success: false, message: 'OAuth 未连接或 Token 已失效，请先发起连接' }, 400)
   }
 
+  // 域路由：Global token (iss=workbuddy.ai) 必须走 www.workbuddy.ai，
+  // 否则 copilot.tencent.com 的 APISIX 返回 401
+  const isGlobal = detectTokenRealm(token) === 'global'
   const cleanBase = provider.baseUrl.replace(/\/$/, '')
-  const modelsUrl = cfg.modelsUrl || `${cleanBase}/models`
+  const modelsUrl = isGlobal && cfg.globalModelsUrl
+    ? cfg.globalModelsUrl
+    : (cfg.modelsUrl || `${cleanBase}/models`)
+  const origin = isGlobal && cfg.globalOrigin
+    ? cfg.globalOrigin
+    : (cfg.extraHeaders?.Origin)
 
   try {
     const response = await fetch(modelsUrl, {
       method: 'GET',
-      headers: buildOauthHeaders(cfg, token),
+      headers: buildOauthHeaders(cfg, token, { origin }),
       signal: AbortSignal.timeout(20000),
     })
 

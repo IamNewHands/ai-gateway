@@ -69,6 +69,14 @@ export interface OAuthDeviceConfig {
    * https://copilot.tencent.com/console/enterprises/personal/models
    */
   modelsUrl?: string
+  /**
+   * Global 域（海外账户，JWT iss 含 workbuddy.ai）的备选端点。
+   * WorkBuddy 的 Global token 必须走 www.workbuddy.ai，否则
+   * copilot.tencent.com 的 APISIX 会返回 401。留空则不区分域。
+   */
+  globalBaseUrl?: string
+  globalModelsUrl?: string
+  globalOrigin?: string
 }
 
 /** KV 中保存的 OAuth token 状态 */
