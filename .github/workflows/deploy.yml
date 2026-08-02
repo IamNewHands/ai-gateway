@@ -49,6 +49,9 @@ jobs:
           [[kv_namespaces]]
           binding = "KV"
 
+          [triggers]
+          crons = ["0 */2 * * *"]
+
           [vars]
           ADMIN_USERNAME = ${{ vars.ADMIN_USERNAME }}
           ADMIN_PASSWORD = ${{ vars.ADMIN_PASSWORD }}

@@ -368,6 +368,19 @@ ${H('管理')}
             </div>
             <div class="fg"><label for="aurl">API 地址</label><input type="url" id="aurl" placeholder="https://api.deepseek.com"></div>
             <div class="fg"><label for="afmt">API 格式</label><select id="afmt" class="select-sm"><option value="openai">OpenAI 兼容</option><option value="anthropic">Anthropic 兼容</option></select></div>
+            <div class="fg"><label for="aat">认证方式</label><select id="aat" class="select-sm" onchange="toggleAuthType()"><option value="api-key">API Key</option><option value="oauth-device">OAuth 设备码登录</option></select></div>
+            <div id="oauth-new" class="hd form-group">
+              <fieldset class="form-group"><legend>OAuth 设备码配置</legend>
+                <div class="fg"><label>设备码申请端点 (deviceCodeUrl)</label><input type="url" id="ao1" placeholder="https://.../auth/device/code"></div>
+                <div class="fg"><label>设备码轮询端点 (deviceTokenUrl)</label><input type="url" id="ao2" placeholder="https://.../auth/device/token"></div>
+                <div class="fg"><label>Token 刷新端点 (refreshTokenUrl)</label><input type="url" id="ao3" placeholder="https://.../auth/oauth_token/refresh"></div>
+                <div class="fg"><label>Client ID</label><input type="text" id="ao4" placeholder="OAuth client_id"></div>
+                <div class="fg"><label>Scope（可选）</label><input type="text" id="ao5" placeholder="如 user"></div>
+                <div class="fg"><label>Token 注入头（默认 x-api-key）</label><input type="text" id="ao6" placeholder="x-api-key"></div>
+                <div class="fg"><label>额外请求头（JSON，可选）</label><textarea id="ao7" rows="3" placeholder='{"x-app-name":"codebuddy-code","x-app-version":"1.0.2"}'></textarea></div>
+                <div class="fg"><label>预置模板</label><select class="select-sm" onchange="applyOauthPreset(this.value)"><option value="">— 选择 —</option><option value="codebuddy">CodeBuddy</option></select></div>
+              </fieldset>
+            </div>
             <fieldset class="form-group"><legend>上游 API Keys</legend><div id="akeys"><div class="fc mb-4 field-row"><input type="password" placeholder="sk-xxx" class="fx1 aki" aria-label="上游 API Key"><label class="tg" title="启用 Key"><input type="checkbox" checked class="ake" aria-label="启用 Key"><span class="sl"></span></label><button class="btn btn-gh btn-xs" onclick="testNewAKey(this)" title="测试 Key"><i class="fas fa-plug" aria-hidden="true"></i><span>测试</span></button><button class="icon-btn" onclick="this.parentElement.remove()" aria-label="移除 Key"><i class="fas fa-times" aria-hidden="true"></i></button></div></div><button class="btn btn-s btn-xs" onclick="addAKeyRow()"><i class="fas fa-plus" aria-hidden="true"></i>添加 Key</button></fieldset>
             <fieldset class="form-group"><legend>模型 ID</legend><div id="amodels"><div class="fc mb-4 field-row"><input type="text" placeholder="deepseek-chat" class="fx1 ami" aria-label="模型 ID"><label class="tg" title="启用模型"><input type="checkbox" checked class="ame" aria-label="启用模型"><span class="sl"></span></label><button class="btn btn-gh btn-xs" onclick="testNewMdl(this)" title="测试模型"><i class="fas fa-plug" aria-hidden="true"></i><span>测试</span></button><button class="icon-btn" onclick="this.parentElement.remove()" aria-label="移除模型"><i class="fas fa-times" aria-hidden="true"></i></button></div></div><button class="btn btn-s btn-xs" onclick="addMdlRow()"><i class="fas fa-plus" aria-hidden="true"></i>添加模型</button></fieldset>
             <div class="panel-actions"><label class="switch-label"><span>创建后立即启用</span><span class="tg"><input type="checkbox" checked id="aen"><span class="sl"></span></span></label><div><button class="btn btn-s" onclick="hideAdd()">取消</button><button class="btn btn-p" onclick="createProv()"><i class="fas fa-check" aria-hidden="true"></i>创建提供商</button></div></div>
@@ -388,6 +401,20 @@ ${H('管理')}
               <div class="fr"><div class="fg"><label>名称</label><input type="text" id="nm-${escapePageHtml(p.id)}" value="${escapePageHtml(p.name)}"></div><div class="fg"><label>ID</label><input type="text" value="${escapePageHtml(p.id)}" disabled></div></div>
               <div class="fg"><label>API 地址</label><input type="url" id="url-${escapePageHtml(p.id)}" value="${escapePageHtml(p.baseUrl)}"></div>
               <div class="fg"><label>API 格式</label><select id="at-${escapePageHtml(p.id)}" class="select-sm"><option value="openai" ${(p.apiType||'openai')==='openai'?'selected':''}>OpenAI 兼容</option><option value="anthropic" ${p.apiType==='anthropic'?'selected':''}>Anthropic 兼容</option></select></div>
+              <div class="fg"><label>认证方式</label><select id="auth-${escapePageHtml(p.id)}" class="select-sm" onchange="toggleAuthTypeEdit('${p.id}')"><option value="api-key" ${(p.authType||'api-key')==='api-key'?'selected':''}>API Key</option><option value="oauth-device" ${p.authType==='oauth-device'?'selected':''}>OAuth 设备码登录</option></select></div>
+              <div id="oauth-edit-${escapePageHtml(p.id)}" class="${p.authType==='oauth-device'?'form-group':'hd form-group'}">
+                <fieldset class="form-group"><legend>OAuth 设备码配置</legend>
+                  <div class="fg"><label>设备码申请端点</label><input type="url" id="eao1-${escapePageHtml(p.id)}" value="${escapePageHtml((p.oauth&&p.oauth.deviceCodeUrl)||'')}" placeholder="https://.../auth/device/code"></div>
+                  <div class="fg"><label>设备码轮询端点</label><input type="url" id="eao2-${escapePageHtml(p.id)}" value="${escapePageHtml((p.oauth&&p.oauth.deviceTokenUrl)||'')}" placeholder="https://.../auth/device/token"></div>
+                  <div class="fg"><label>Token 刷新端点</label><input type="url" id="eao3-${escapePageHtml(p.id)}" value="${escapePageHtml((p.oauth&&p.oauth.refreshTokenUrl)||'')}" placeholder="https://.../auth/oauth_token/refresh"></div>
+                  <div class="fg"><label>Client ID</label><input type="text" id="eao4-${escapePageHtml(p.id)}" value="${escapePageHtml((p.oauth&&p.oauth.clientId)||'')}" placeholder="OAuth client_id"></div>
+                  <div class="fg"><label>Scope（可选）</label><input type="text" id="eao5-${escapePageHtml(p.id)}" value="${escapePageHtml((p.oauth&&p.oauth.scope)||'')}" placeholder="如 user"></div>
+                  <div class="fg"><label>Token 注入头（默认 x-api-key）</label><input type="text" id="eao6-${escapePageHtml(p.id)}" value="${escapePageHtml((p.oauth&&p.oauth.tokenHeader)||'x-api-key')}" placeholder="x-api-key"></div>
+                  <div class="fg"><label>额外请求头（JSON，可选）</label><textarea id="eao7-${escapePageHtml(p.id)}" rows="3" placeholder='{"x-app-name":"codebuddy-code"}'>${escapePageHtml((p.oauth&&JSON.stringify(p.oauth.extraHeaders||{}))||'')}</textarea></div>
+                  <div class="fg"><label>预置模板</label><select class="select-sm" onchange="applyOauthPresetEdit('${p.id}',this.value)"><option value="">— 选择 —</option><option value="codebuddy">CodeBuddy</option></select></div>
+                  <div class="fc mt-1 field-row"><button class="btn btn-s" onclick="oauthConnect('${p.id}')"><i class="fas fa-plug" aria-hidden="true"></i>发起连接</button><button class="btn btn-gh" onclick="oauthStatus('${p.id}')"><i class="fas fa-sync" aria-hidden="true"></i>状态</button><button class="btn btn-gh" onclick="oauthDisconnect('${p.id}')"><i class="fas fa-unlink" aria-hidden="true"></i>断开</button><span id="oauth-st-${escapePageHtml(p.id)}" class="oauth-status"></span></div>
+                </fieldset>
+              </div>
               <fieldset class="form-group"><legend>上游 API Keys</legend><div id="keys-${escapePageHtml(p.id)}">${p.apiKeys.map((k, ki)=>`<div class="fc mb-3 field-row" data-kidx="${ki}"><input type="password" value="${escapePageHtml(k.key)}" class="fx1" id="k-${escapePageHtml(p.id)}-${ki}" placeholder="API Key" aria-label="API Key"><label class="tg"><input type="checkbox" ${k.enabled?'checked':''} id="ken-${escapePageHtml(p.id)}-${ki}" aria-label="启用 Key"><span class="sl"></span></label><button class="btn btn-gh btn-xs" onclick="testKeyRow('${p.id}',${ki})" title="测试 Key"><i class="fas fa-plug" aria-hidden="true"></i><span>测试</span></button><button class="icon-btn" onclick="rmKeyRow('${p.id}',${ki})" aria-label="移除 Key"><i class="fas fa-times" aria-hidden="true"></i></button></div>`).join('')}</div><div class="fc mt-1 field-row"><input type="password" id="nk-${escapePageHtml(p.id)}" placeholder="新的 API Key" class="fx1"><button class="btn btn-s btn-xs" onclick="addKeyRow('${p.id}')"><i class="fas fa-plus" aria-hidden="true"></i>添加</button></div></fieldset>
               <fieldset class="form-group"><legend>模型</legend><div id="ml-${escapePageHtml(p.id)}">${p.models.map((m,mi)=>`<div class="fc mb-3 field-row" data-idx="${mi}"><input type="text" value="${escapePageHtml(m.id)}" class="fx1" id="mid-${escapePageHtml(p.id)}-${mi}" placeholder="模型 ID"><label class="tg"><input type="checkbox" ${m.enabled?'checked':''} id="men-${escapePageHtml(p.id)}-${mi}" aria-label="启用模型"><span class="sl"></span></label><button class="btn btn-gh btn-xs" onclick="testMdl('${p.id}','${m.id}',${mi})" title="测试模型"><i class="fas fa-plug" aria-hidden="true"></i><span>测试</span></button><button class="icon-btn" onclick="rmMdl('${p.id}',${mi})" aria-label="移除模型"><i class="fas fa-times" aria-hidden="true"></i></button></div>`).join('')}</div><div class="fc mt-1 field-row"><input type="text" id="nmid-${escapePageHtml(p.id)}" placeholder="新的模型 ID" class="fx1"><button class="btn btn-s btn-xs" onclick="addMdl('${p.id}')"><i class="fas fa-plus" aria-hidden="true"></i>添加</button></div></fieldset>
               <div class="detail-actions"><div id="tr-${escapePageHtml(p.id)}" aria-live="polite"></div><div>${p.id === 'opencode' ? '<button class="btn btn-s" onclick="fetchEditModels(\'' + p.id + '\')"><i class="fas fa-download" aria-hidden="true"></i>获取模型</button>' : ''}<button class="btn btn-d" onclick="del('${p.id}')"><i class="fas fa-trash" aria-hidden="true"></i>删除</button><button class="btn btn-p" onclick="save('${p.id}')"><i class="fas fa-save" aria-hidden="true"></i>保存更改</button></div></div>
@@ -570,6 +597,8 @@ function testNewMdl(btn) {
 async function createProv() {
   const nm = document.getElementById('anm').value.trim(), id = document.getElementById('aid').value.trim()
   const url = document.getElementById('aurl').value.trim(), apiType = document.getElementById('afmt').value
+  const authType = document.getElementById('aat').value
+  const oauth = collectOauthNew()
   const aki = document.querySelectorAll('#akeys .aki')
   const keys = Array.from(aki).map((inp, i) => {
     const k = inp.value.trim()
@@ -584,14 +613,154 @@ async function createProv() {
   }).filter(Boolean)
   const enabled = document.getElementById('aen').checked
   if (!nm || !id || !url) { toast('请填写名称、ID 和 API 地址', 'error'); return }
+  if (authType === 'oauth-device' && (!oauth.deviceCodeUrl || !oauth.deviceTokenUrl || !oauth.refreshTokenUrl || !oauth.clientId)) {
+    toast('OAuth 模式下请填写完整的设备码配置（三个端点 + Client ID）', 'error'); return
+  }
   const r = await fetch('/admin/api/providers', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ id, name: nm, baseUrl: url, apiType, apiKeys: keys, models, enabled })
+    body: JSON.stringify({ id, name: nm, baseUrl: url, apiType, authType, oauth: authType === 'oauth-device' ? oauth : undefined, apiKeys: keys, models, enabled })
   })
   const d = await r.json()
   if (d.success) { toast('已创建', 'success'); location.reload() }
   else toast(d.message || '创建失败', 'error')
+}
+
+function collectOauthNew() {
+  const g = function(id) { return (document.getElementById(id) || {}).value?.trim() ?? '' }
+  let extraHeaders
+  try { extraHeaders = g('ao7') ? JSON.parse(g('ao7')) : undefined } catch { extraHeaders = undefined }
+  return {
+    deviceCodeUrl: g('ao1'),
+    deviceTokenUrl: g('ao2'),
+    refreshTokenUrl: g('ao3'),
+    clientId: g('ao4'),
+    scope: g('ao5') || undefined,
+    tokenHeader: g('ao6') || 'x-api-key',
+    extraHeaders,
+  }
+}
+
+function collectOauthEdit(id) {
+  const g = function(suffix) { return (document.getElementById('eao' + suffix + '-' + id) || {}).value?.trim() ?? '' }
+  let extraHeaders
+  try { extraHeaders = g('7') ? JSON.parse(g('7')) : undefined } catch { extraHeaders = undefined }
+  return {
+    deviceCodeUrl: g('1'),
+    deviceTokenUrl: g('2'),
+    refreshTokenUrl: g('3'),
+    clientId: g('4'),
+    scope: g('5') || undefined,
+    tokenHeader: g('6') || 'x-api-key',
+    extraHeaders,
+  }
+}
+
+function toggleAuthType() {
+  const v = document.getElementById('aat').value
+  document.getElementById('oauth-new').classList.toggle('hd', v !== 'oauth-device')
+}
+function toggleAuthTypeEdit(id) {
+  const v = document.getElementById('auth-' + id).value
+  document.getElementById('oauth-edit-' + id).classList.toggle('hd', v !== 'oauth-device')
+}
+
+const OAUTH_PRESETS = {
+  codebuddy: {
+    deviceCodeUrl: 'https://copilot.code.woa.com/api/v2/auth/device/code',
+    deviceTokenUrl: 'https://copilot.code.woa.com/api/v2/auth/device/token',
+    refreshTokenUrl: 'https://copilot.code.woa.com/api/v2/auth/oauth_token/refresh',
+    clientId: 'd15f1aada3db4be2be622afed0019a29',
+    scope: 'user',
+    tokenHeader: 'x-api-key',
+    extraHeaders: {
+      'x-app-version': '1.0.2',
+      'x-app-name': 'codebuddy-code',
+      'x-request-platform': 'CodeBuddy-Code',
+      'x-scene-name': 'common_chat',
+      'user-agent': 'Claude-Code-Internal/1.0.2',
+      'x-request-platform-v2': 'Claude-Code-Internal',
+      'x-app-name-v2': 'claude-code-internal',
+      'x-claude-code-internal': 'true',
+      'x-channel': 'claude-code-internal',
+    },
+  },
+}
+function applyOauthPreset(name) {
+  const p = OAUTH_PRESETS[name]
+  if (!p) return
+  document.getElementById('ao1').value = p.deviceCodeUrl
+  document.getElementById('ao2').value = p.deviceTokenUrl
+  document.getElementById('ao3').value = p.refreshTokenUrl
+  document.getElementById('ao4').value = p.clientId
+  document.getElementById('ao5').value = p.scope || ''
+  document.getElementById('ao6').value = p.tokenHeader || 'x-api-key'
+  document.getElementById('ao7').value = JSON.stringify(p.extraHeaders || {}, null, 2)
+  document.getElementById('aat').value = 'oauth-device'
+  toggleAuthType()
+}
+function applyOauthPresetEdit(id, name) {
+  const p = OAUTH_PRESETS[name]
+  if (!p) return
+  document.getElementById('eao1-' + id).value = p.deviceCodeUrl
+  document.getElementById('eao2-' + id).value = p.deviceTokenUrl
+  document.getElementById('eao3-' + id).value = p.refreshTokenUrl
+  document.getElementById('eao4-' + id).value = p.clientId
+  document.getElementById('eao5-' + id).value = p.scope || ''
+  document.getElementById('eao6-' + id).value = p.tokenHeader || 'x-api-key'
+  document.getElementById('eao7-' + id).value = JSON.stringify(p.extraHeaders || {}, null, 2)
+  document.getElementById('auth-' + id).value = 'oauth-device'
+  toggleAuthTypeEdit(id)
+}
+
+function oauthStatus(id) {
+  const st = document.getElementById('oauth-st-' + id)
+  st.textContent = '查询中…'
+  return fetch('/admin/api/oauth/' + encodeURIComponent(id) + '/status').then(r => r.json()).then(d => {
+    if (!d.success) { st.textContent = d.message || '查询失败'; return }
+    st.textContent = d.data.connected ? ('已连接，到期 ' + (d.data.expiresAt ? new Date(d.data.expiresAt).toLocaleString() : '未知')) : '未连接'
+  }).catch(() => { st.textContent = '查询失败' })
+}
+
+function oauthConnect(id) {
+  const st = document.getElementById('oauth-st-' + id)
+  const oauth = collectOauthEdit(id)
+  if (!oauth.deviceCodeUrl || !oauth.deviceTokenUrl || !oauth.clientId) {
+    st.textContent = '请先填写设备码端点与 Client ID 并保存'
+    return
+  }
+  st.textContent = '发起中…'
+  fetch('/admin/api/oauth/' + encodeURIComponent(id) + '/connect', { method: 'POST' }).then(r => r.json()).then(d => {
+    if (!d.success) { st.textContent = d.message || '发起失败'; return }
+    const dev = d.data
+    const code = (dev && dev.user_code) || ''
+    const uri = (dev && dev.verification_uri) || ''
+    st.textContent = '请在浏览器打开授权页面并输入授权码'
+    showM('<h3><i class="fas fa-mobile-alt c-p" aria-hidden="true"></i> OAuth 授权</h3><p>打开以下链接并输入授权码：</p><p><code style="word-break:break-all">' + escapeHtml(uri) + '</code></p><p>授权码：<strong class="c-p" style="font-size:1.6em;letter-spacing:.2em">' + escapeHtml(code) + '</strong></p><p class="oauth-status" id="oauth-poll-st">等待授权…</p><div class="fa"><button class="btn btn-s" onclick="closeM()">取消</button><button class="btn btn-p" onclick="oauthPoll(' + JSON.stringify(id) + ')">刷新状态</button></div>')
+  }).catch(() => { st.textContent = '发起失败' })
+}
+
+function oauthPoll(id) {
+  const pollSt = document.getElementById('oauth-poll-st')
+  const st = document.getElementById('oauth-st-' + id)
+  if (pollSt) pollSt.textContent = '轮询中…'
+  return fetch('/admin/api/oauth/' + encodeURIComponent(id) + '/poll', { method: 'POST' }).then(r => r.json()).then(d => {
+    if (d.success) {
+      if (pollSt) { pollSt.textContent = '授权成功！'; setTimeout(closeM, 800) }
+      if (st) st.textContent = '已连接'
+      return true
+    }
+    if (pollSt) pollSt.textContent = d.message || '等待授权…'
+    if (st) st.textContent = d.message || '等待授权…'
+    return false
+  }).catch(() => { if (pollSt) pollSt.textContent = '轮询失败，请重试' })
+}
+
+function oauthDisconnect(id) {
+  const st = document.getElementById('oauth-st-' + id)
+  return fetch('/admin/api/oauth/' + encodeURIComponent(id) + '/disconnect', { method: 'POST' }).then(r => r.json()).then(d => {
+    st.textContent = d.success ? '已断开' : (d.message || '断开失败')
+  }).catch(() => { st.textContent = '断开失败' })
 }
 
 // provider api keys (edit)
@@ -692,12 +861,17 @@ function getMdl(id) {
 async function save(id) {
   const nm = document.getElementById('nm-' + id).value.trim(), url = document.getElementById('url-' + id).value.trim()
   const apiType = document.getElementById('at-' + id).value
+  const authType = document.getElementById('auth-' + id).value
+  const oauth = collectOauthEdit(id)
   const keys = getKeys(id)
   const models = getMdl(id), enabled = document.getElementById('en-' + id).checked
+  if (authType === 'oauth-device' && (!oauth.deviceCodeUrl || !oauth.deviceTokenUrl || !oauth.refreshTokenUrl || !oauth.clientId)) {
+    toast('OAuth 模式下请填写完整的设备码配置（三个端点 + Client ID）', 'error'); return
+  }
   const r = await fetch('/admin/api/providers/' + encodeURIComponent(id), {
     method: 'PUT',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ name: nm, baseUrl: url, apiType, apiKeys: keys, models, enabled })
+    body: JSON.stringify({ name: nm, baseUrl: url, apiType, authType, oauth: authType === 'oauth-device' ? oauth : undefined, apiKeys: keys, models, enabled })
   })
   const d = await r.json()
   if (d.success) { toast('已保存', 'success'); location.reload() }

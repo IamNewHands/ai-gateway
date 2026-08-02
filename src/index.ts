@@ -1,7 +1,6 @@
 import { Hono } from 'hono'
 import { cors } from 'hono/cors'
 import { logger } from 'hono/logger'
-import type { Env } from './types'
 import { adminAuthMiddleware, proxyKeyAuthMiddleware, handleLogin, handleLogout } from './auth'
 import { handleProxy, handleModels } from './proxy'
 import {
@@ -17,9 +16,15 @@ import {
   handleCreateProxyKey,
   handleUpdateProxyKey,
   handleDeleteProxyKey,
+  handleOAuthStatus,
+  handleOAuthConnect,
+  handleOAuthPoll,
+  handleOAuthDisconnect,
 } from './admin'
 import { renderHomePage, renderLoginPage, renderAdminPage } from './pages'
-import { seedInitialData, getSession } from './storage'
+import { seedInitialData, getSession, getProviders } from './storage'
+import { refreshAllOauthTokens } from './oauth'
+import type { Env, Provider } from './types'
 
 const app = new Hono<{ Bindings: Env }>()
 
@@ -77,6 +82,12 @@ app.post('/admin/api/proxy-keys', handleCreateProxyKey)
 app.delete('/admin/api/proxy-keys/:id', handleDeleteProxyKey)
 app.patch('/admin/api/proxy-keys/:id', handleUpdateProxyKey)
 
+// OAuth 设备码管理
+app.get('/admin/api/oauth/:id/status', handleOAuthStatus)
+app.post('/admin/api/oauth/:id/connect', handleOAuthConnect)
+app.post('/admin/api/oauth/:id/poll', handleOAuthPoll)
+app.post('/admin/api/oauth/:id/disconnect', handleOAuthDisconnect)
+
 // ===== API 转发路由（需转发 Key 验证） =====
 app.use('/v1/*', proxyKeyAuthMiddleware)
 app.get('/v1/models', handleModels)
@@ -94,3 +105,11 @@ app.onError((err, c) => {
 })
 
 export default app
+
+// ===== Cron：定时刷新 OAuth token =====
+export async function scheduled(event: ScheduledEvent, env: Env, ctx: ExecutionContext) {
+  const providers = (await getProviders(env)) as Provider[]
+  const oauthProviders = providers.filter((p) => p.authType === 'oauth-device' && p.oauth)
+  const result = await refreshAllOauthTokens(env, oauthProviders)
+  console.log(`[oauth] cron refresh done: ${result.ok} ok, ${result.fail} fail`)
+}

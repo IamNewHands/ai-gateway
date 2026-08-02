@@ -8,6 +8,10 @@ keep_vars = true
 [[kv_namespaces]]
 binding = "KV"
 
+# OAuth token 定时刷新（每 2 小时）
+[triggers]
+crons = ["0 */2 * * *"]
+
 # Admin credentials (set these in Cloudflare Dashboard > Workers > Variables)
 # [vars]
 # ADMIN_USERNAME = "admin"

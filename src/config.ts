@@ -29,7 +29,12 @@ export const KV_KEYS = {
   SESSION_PREFIX: 'admin:session:',
   KEY_HEALTH_PREFIX: 'key:health:',
   OPENCODE_MIGRATION: 'migration:opencode-default:v1',
+  OAUTH_TOKEN_PREFIX: 'oauth:token:',
+  OAUTH_DEVICE_PREFIX: 'oauth:device:',
 } as const
+
+// access_token 过期前多少毫秒触发惰性刷新（默认提前 60 秒）
+export const OAUTH_TOKEN_REFRESH_MARGIN_MS = 60 * 1000
 
 // 有效期选项（秒）
 export const EXPIRY_OPTIONS: Record<string, number | null> = {

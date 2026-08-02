@@ -13,6 +13,7 @@ import {
 import { testModelConnection } from './proxy'
 import { fetchOpenCodeModels, isOpenCodeProvider, resolveOpenCodeUrls, testOpenCodeModel } from './opencode'
 import { PROXY_KEY_PREFIX, EXPIRY_OPTIONS, OPENCODE_DEFAULT_URL } from './config'
+import { startOauthDeviceFlow, pollOauthDeviceFlow, readOauthToken, deleteOauthToken } from './oauth'
 import type {
   Env,
   ApiResponse,
@@ -21,6 +22,7 @@ import type {
   UpdateProviderRequest,
   CreateProxyKeyRequest,
   TestModelRequest,
+  OAuthDeviceConfig,
 } from './types'
 
 // ===== 系统状态 =====
@@ -93,7 +95,9 @@ export async function handleCreateProvider(c: Context<{ Bindings: Env }>) {
     name: body.name,
     baseUrl: body.baseUrl.replace(/\/$/, ''),
     apiType: body.apiType || 'openai',
-apiKeys: normalizeArray(body.apiKeys, (k) => ({ key: k, enabled: true })),
+    authType: body.authType || 'api-key',
+    oauth: body.oauth,
+    apiKeys: normalizeArray(body.apiKeys, (k) => ({ key: k, enabled: true })),
     models: body.models
       ? normalizeArray(body.models, (m) => ({ id: m, enabled: true }))
       : [],
@@ -115,6 +119,8 @@ export async function handleUpdateProvider(c: Context<{ Bindings: Env }>) {
   if (body.name !== undefined) updates.name = body.name
   if (body.baseUrl !== undefined) updates.baseUrl = body.baseUrl.replace(/\/$/, '')
   if (body.apiType !== undefined) updates.apiType = body.apiType
+  if (body.authType !== undefined) updates.authType = body.authType
+  if (body.oauth !== undefined) updates.oauth = body.oauth
 if (body.apiKeys !== undefined) {
     updates.apiKeys = normalizeArray(body.apiKeys, (k) => ({ key: k, enabled: true }))
   }
@@ -351,4 +357,73 @@ export async function handleUpdateProxyKey(c: Context<{ Bindings: Env }>) {
     return c.json<ApiResponse>({ success: false, message: '转发 Key 不存在' }, 404)
   }
   return c.json<ApiResponse>({ success: true, data: updated })
+}
+
+// ===== OAuth 设备码管理 =====
+
+/** 查询某 OAuth 提供商的连接状态（token 是否存在/过期时间） */
+export async function handleOAuthStatus(c: Context<{ Bindings: Env }>) {
+  const id = c.req.param('id')
+  if (!id) return c.json<ApiResponse>({ success: false, message: '缺少 id 参数' }, 400)
+
+  const provider = await getProvider(c.env, id)
+  if (!provider) return c.json<ApiResponse>({ success: false, message: '提供商不存在' }, 404)
+  if (provider.authType !== 'oauth-device') {
+    return c.json<ApiResponse>({ success: false, message: '该提供商未启用 OAuth 认证' }, 400)
+  }
+
+  const token = await readOauthToken(c.env, id)
+  return c.json<ApiResponse>({
+    success: true,
+    data: {
+      connected: !!token,
+      expiresAt: token?.expires_at ?? null,
+      updatedAt: token?.updated_at ?? null,
+    },
+  })
+}
+
+/** 发起 OAuth 设备码授权流程，返回授权链接与用户码 */
+export async function handleOAuthConnect(c: Context<{ Bindings: Env }>) {
+  const id = c.req.param('id')
+  if (!id) return c.json<ApiResponse>({ success: false, message: '缺少 id 参数' }, 400)
+
+  const provider = await getProvider(c.env, id)
+  if (!provider) return c.json<ApiResponse>({ success: false, message: '提供商不存在' }, 404)
+  if (provider.authType !== 'oauth-device' || !provider.oauth) {
+    return c.json<ApiResponse>({ success: false, message: '该提供商未配置 OAuth 认证' }, 400)
+  }
+
+  const result = await startOauthDeviceFlow(c.env, id, provider.oauth)
+  if (!result.success) {
+    return c.json<ApiResponse>({ success: false, message: result.message }, 500)
+  }
+  return c.json<ApiResponse>({ success: true, data: result.device })
+}
+
+/** 轮询 OAuth 设备码授权结果 */
+export async function handleOAuthPoll(c: Context<{ Bindings: Env }>) {
+  const id = c.req.param('id')
+  if (!id) return c.json<ApiResponse>({ success: false, message: '缺少 id 参数' }, 400)
+
+  const provider = await getProvider(c.env, id)
+  if (!provider) return c.json<ApiResponse>({ success: false, message: '提供商不存在' }, 404)
+  if (provider.authType !== 'oauth-device' || !provider.oauth) {
+    return c.json<ApiResponse>({ success: false, message: '该提供商未配置 OAuth 认证' }, 400)
+  }
+
+  const result = await pollOauthDeviceFlow(c.env, id, provider.oauth)
+  return c.json<ApiResponse>({
+    success: result.status === 'success',
+    message: result.message,
+    data: result.status === 'success' ? { connected: true } : { connected: false },
+  })
+}
+
+/** 断开 OAuth 连接，删除 KV 中的 token */
+export async function handleOAuthDisconnect(c: Context<{ Bindings: Env }>) {
+  const id = c.req.param('id')
+  if (!id) return c.json<ApiResponse>({ success: false, message: '缺少 id 参数' }, 400)
+  await deleteOauthToken(c.env, id)
+  return c.json<ApiResponse>({ success: true, message: '已断开 OAuth 连接' })
 }

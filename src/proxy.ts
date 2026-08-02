@@ -3,6 +3,7 @@ import { getProvider, getProviders } from './storage'
 import { KV_KEYS, KEY_HEALTH_COOLDOWN_MS, KEY_HEALTH_MAX_FAILURES } from './config'
 import type { Env, ProxyRequestBody } from './types'
 import { isOpenCodeProvider, proxyOpenCodeRequest, resolveOpenCodeUrls } from './opencode'
+import { getOauthAccessToken, readOauthToken, refreshOauthToken } from './oauth'
 
 // ===== Key 健康状态类型和辅助函数 =====
 
@@ -172,6 +173,11 @@ export async function handleProxy(c: Context<{ Bindings: Env }>) {
       })
     }
 
+    // OAuth 设备码提供商：使用 KV 中保存的 access_token 转发，401 时尝试刷新后重试
+    if (provider.authType === 'oauth-device' && provider.oauth) {
+      return await proxyOAuthRequest(c, provider, subPath, url.search, forwardBody)
+    }
+
     if (enabledKeys.length === 0) {
       return c.json({
         error: { message: `提供商 "${provider.name}" 未配置可用的 API Key`, type: 'configuration_error' },
@@ -335,6 +341,74 @@ export async function handleProxy(c: Context<{ Bindings: Env }>) {
     return c.json({
       error: { message: error.message || '代理转发内部错误', type: 'server_error' },
     }, 500)
+  }
+}
+
+/**
+ * OAuth 设备码提供商转发：取 token → 注入请求头 → 转发；401 时刷新 token 重试一次。
+ */
+async function proxyOAuthRequest(
+  c: Context<{ Bindings: Env }>,
+  provider: import('./types').Provider,
+  subPath: string,
+  search: string,
+  forwardBody: object
+): Promise<Response> {
+  const cfg = provider.oauth!
+  const cleanBase = provider.baseUrl.replace(/\/$/, '')
+  const forwardUrl = `${cleanBase}/${subPath}${search}`
+
+  const buildHeaders = (token: string): Record<string, string> => {
+    const tokenHeader = cfg.tokenHeader || 'x-api-key'
+    const headers: Record<string, string> = {
+      'Content-Type': 'application/json',
+      [tokenHeader]: token,
+      ...cfg.extraHeaders,
+    }
+    if (provider.apiType === 'anthropic') headers['anthropic-version'] = '2023-06-01'
+    return headers
+  }
+
+  const doFetch = (token: string) => fetch(forwardUrl, {
+    method: c.req.method,
+    headers: buildHeaders(token),
+    body: c.req.method === 'GET' || c.req.method === 'HEAD' ? undefined : JSON.stringify(forwardBody),
+    signal: AbortSignal.timeout(60000),
+  })
+
+  try {
+    let token = await getOauthAccessToken(c.env, provider.id, cfg)
+    if (!token) {
+      // 尝试用 refresh_token 刷新一次
+      const refreshed = await refreshOauthToken(c.env, provider.id, cfg)
+      if (refreshed) token = (await readOauthToken(c.env, provider.id))?.access_token ?? null
+    }
+    if (!token) {
+      return c.json({
+        error: { message: 'OAuth 未连接或 Token 已失效，请在管理后台重新授权', type: 'oauth_not_connected' },
+      }, 502)
+    }
+
+    let response = await doFetch(token)
+    // 401/403：可能 token 过期，刷新后重试一次
+    if ((response.status === 401 || response.status === 403) && (await readOauthToken(c.env, provider.id))?.refresh_token) {
+      const refreshed = await refreshOauthToken(c.env, provider.id, cfg)
+      if (refreshed) {
+        const fresh = (await readOauthToken(c.env, provider.id))?.access_token
+        if (fresh) response = await doFetch(fresh)
+      }
+    }
+
+    const headers: Record<string, string> = {
+      'Content-Type': response.headers.get('Content-Type') || 'application/json',
+      'Cache-Control': 'no-store',
+    }
+    return new Response(response.body, { status: response.status, statusText: response.statusText, headers })
+  } catch (err) {
+    const error = err as Error
+    return c.json({
+      error: { message: `OAuth 转发失败: ${error.message || '未知错误'}`, type: 'proxy_error' },
+    }, 502)
   }
 }
 
