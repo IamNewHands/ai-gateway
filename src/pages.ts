@@ -941,8 +941,23 @@ async function fetchOauthModels(id) {
       if (tr) showResult(tr, true, '已拉取 ' + (d.data.data.length || 0) + ' 个模型，点击 + 添加到下方')
       if (st) st.textContent = '已拉取 ' + (d.data.data.length || 0) + ' 个模型'
     } else {
-      if (tr) showResult(tr, false, escapeHtml(d.message || '拉取模型失败'))
-      if (st) st.textContent = d.message || '拉取失败'
+      const msg = d.message || '拉取模型失败'
+      // 拼接调试信息
+      let debugInfo = ''
+      if (d.data) {
+        const dbg = d.data.debug || d.data
+        debugInfo = '\n\n--- 调试信息 ---\n'
+        if (dbg.realm) debugInfo += 'Token 域: ' + dbg.realm + '\n'
+        if (dbg.tokenHeader) debugInfo += '认证头: ' + dbg.tokenHeader + (dbg.tokenHeaderPrefix ? ' ' + dbg.tokenHeaderPrefix + '<token>' : ' <token>') + '\n'
+        debugInfo += '有 Cookie: ' + (dbg.hasCookies ? '是 (' + (dbg.cookiesPreview || '') + ')' : '否') + '\n'
+        if (dbg.modelsUrl) debugInfo += '模型 URL: ' + dbg.modelsUrl + '\n'
+        if (dbg.requestUrl) debugInfo += '请求 URL: ' + dbg.requestUrl + '\n'
+        if (dbg.requestHeaders) debugInfo += '请求头: ' + JSON.stringify(dbg.requestHeaders, null, 2) + '\n'
+        if (dbg.tokenExpiresAt) debugInfo += 'Token 过期: ' + dbg.tokenExpiresAt + '\n'
+        if (d.data.allErrors) debugInfo += '所有错误: ' + JSON.stringify(d.data.allErrors) + '\n'
+      }
+      if (tr) showResult(tr, false, escapeHtml(msg + debugInfo))
+      if (st) st.textContent = msg
     }
   } catch (e) {
     if (tr) showResult(tr, false, '请求失败')

@@ -530,7 +530,18 @@ export async function handleOAuthModels(c: Context<{ Bindings: Env }>) {
   }
   const tokenState = await readOauthToken(c.env, provider.id)
   const cookies = tokenState?.cookies
-  console.log(`[oauth-models] provider=${id} cookies from KV: ${cookies ? cookies.substring(0, 100) + '...' : '(none)'}`)
+
+  const debug = {
+    realm: detectTokenRealm(token),
+    tokenHeader: cfg.tokenHeader || 'x-api-key',
+    tokenHeaderPrefix: cfg.tokenHeaderPrefix || '',
+    hasCookies: !!cookies,
+    cookiesPreview: cookies ? cookies.substring(0, 80) + '...' : '(none)',
+    modelsUrl: cfg.modelsUrl || `${provider.baseUrl.replace(/\/$/, '')}/models`,
+    baseUrl: provider.baseUrl,
+    extraHeaders: cfg.extraHeaders,
+    tokenExpiresAt: tokenState?.expires_at ? new Date(tokenState.expires_at).toISOString() : 'unknown',
+  }
 
   const cleanBase = provider.baseUrl.replace(/\/$/, '')
   const realm = detectTokenRealm(token)
@@ -552,62 +563,62 @@ export async function handleOAuthModels(c: Context<{ Bindings: Env }>) {
   const candidates = realm === 'global' && globalEndpoint
     ? [globalEndpoint, cnEndpoint]
     : realm === 'cn'
-      ? [cnEndpoint]  // CN 账户只试 CN 域，不浪费请求
+      ? [cnEndpoint]
       : [cnEndpoint, globalEndpoint].filter(Boolean) as typeof cnEndpoint[]
 
   const errors: string[] = []
   for (const ep of candidates) {
     try {
+      const reqHeaders = buildOauthHeaders(cfg, token, { origin: ep.origin, cookies })
+      debug['requestUrl'] = ep.url
+      debug['requestHeaders'] = Object.keys(reqHeaders).reduce((acc, k) => {
+        acc[k] = k.toLowerCase() === 'cookie' ? (reqHeaders[k] || '').substring(0, 80) + '...' : reqHeaders[k]
+        return acc
+      }, {} as Record<string, string>)
+
       const response = await fetch(ep.url, {
         method: 'GET',
-        headers: buildOauthHeaders(cfg, token, { origin: ep.origin, cookies }),
+        headers: reqHeaders,
         signal: AbortSignal.timeout(20000),
       })
 
       if (response.ok) {
         const json: any = await response.json().catch(() => null)
         if (!json) {
-          return c.json<ApiResponse>({ success: false, message: '上游响应不是有效 JSON' })
+          return c.json<ApiResponse>({ success: false, message: '上游响应不是有效 JSON', data: debug }, 502)
         }
         const models = parseModelList(json)
         if (models.length === 0) {
-          return c.json<ApiResponse>({ success: false, message: '上游未返回任何模型' })
+          return c.json<ApiResponse>({ success: false, message: '上游未返回任何模型', data: debug }, 502)
         }
         return c.json<ApiResponse>({ success: true, data: { data: models } })
       }
 
-      // 读取错误详情
       let detail = ''
-      try { detail = (await response.text()).substring(0, 200) } catch { /* ignore */ }
+      try { detail = (await response.text()).substring(0, 500) } catch { /* ignore */ }
       const errMsg = `[${ep.label}] HTTP ${response.status}${detail ? '：' + detail : ''}`
       errors.push(errMsg)
 
-      // 401 且还有备用域 → 自动切换重试
       if (response.status === 401 && candidates.length > 1) {
-        console.log(`[oauth-models] ${ep.label} 域返回 401，自动切换到下一个候选端点`)
         continue
       }
 
-      // 非 401 或只有一个候选，直接返回错误
       return c.json<ApiResponse>({
         success: false,
         message: `上游返回 HTTP ${response.status}${detail ? '：' + detail : ''}`,
-      })
+        data: { debug, allErrors: errors },
+      }, 502)
     } catch (err) {
       const errMsg = `[${ep.label}] ${(err as Error).message || '请求异常'}`
       errors.push(errMsg)
-      // 网络错误也尝试下一个候选
-      if (candidates.length > 1) {
-        console.log(`[oauth-models] ${ep.label} 域请求异常，尝试下一个候选端点: ${errMsg}`)
-        continue
-      }
-      return c.json<ApiResponse>({ success: false, message: (err as Error).message || '拉取模型列表失败' })
+      if (candidates.length > 1) continue
+      return c.json<ApiResponse>({ success: false, message: (err as Error).message || '拉取模型列表失败', data: { debug, allErrors: errors } }, 502)
     }
   }
 
-  // 所有候选端点都失败
   return c.json<ApiResponse>({
     success: false,
     message: `所有域均请求失败: ${errors.join(' | ')}`,
-  })
+    data: { debug, allErrors: errors },
+  }, 502)
 }
