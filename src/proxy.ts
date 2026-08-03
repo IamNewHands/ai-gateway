@@ -192,11 +192,22 @@ function cleanWorkbuddyChunk(chunk: string): string {
       for (const choice of choices) {
         const delta = choice?.delta
         if (!delta || typeof delta !== 'object') continue
-        // 去掉空的 function_call
-        if (delta.function_call === null || (typeof delta.function_call === 'object' && Object.keys(delta.function_call).length === 0)) {
-          delete delta.function_call
-          changed = true
+
+        // 去掉空的/全空值的 function_call（WorkBuddy 终端 chunk 常有
+        // function_call: {"name":"","arguments":""}，2 个 key 但全是空值）
+        if (delta.function_call !== undefined) {
+          if (delta.function_call === null) {
+            delete delta.function_call
+            changed = true
+          } else if (typeof delta.function_call === 'object') {
+            const vals = Object.values(delta.function_call)
+            if (vals.length === 0 || vals.every((v: any) => v === null || v === '')) {
+              delete delta.function_call
+              changed = true
+            }
+          }
         }
+
         // 去掉空的 tool_calls 数组（WorkBuddy 终端 chunk 的标志性问题）
         if (Array.isArray(delta.tool_calls) && delta.tool_calls.length === 0) {
           delete delta.tool_calls
