@@ -489,7 +489,7 @@ function parseModelList(json: any): Array<{ id: string }> {
     const cliAgent = json.data.agents.find((a: any) => a && a.name === 'cli' && Array.isArray(a.models))
     const cliModelIds: string[] = cliAgent?.models || []
     const modelMeta = new Map<string, any>(
-      (json.data.models || []).map((m: any) => [m?.id, m]).filter(([k]) => k)
+      (json.data.models || []).map((m: any) => [m?.id, m] as [string, any]).filter(([k]: [string, any]) => k)
     )
     if (cliModelIds.length > 0) {
       models.push(...cliModelIds
