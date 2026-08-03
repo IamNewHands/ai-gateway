@@ -40,6 +40,35 @@ export async function adminAuthMiddleware(c: Context<{ Bindings: Env }>, next: N
   return next()
 }
 
+/**
+ * 对外管理 API（/api/manage/*）的 Token 认证中间件。
+ * 校验 Authorization: Bearer <token> 是否匹配环境变量 MANAGEMENT_TOKEN。
+ * - 未配置 MANAGEMENT_TOKEN → 503（功能未启用）
+ * - 缺失/格式错/不匹配 → 401
+ * 与浏览器 session 认证互不影响，独立应用于 /api/manage/* 路由。
+ */
+export async function managementAuthMiddleware(c: Context<{ Bindings: Env }>, next: Next) {
+  const configured = c.env.MANAGEMENT_TOKEN
+  if (!configured) {
+    return c.json({ success: false, message: '管理 API 未启用（未配置 MANAGEMENT_TOKEN）' }, 503)
+  }
+
+  const authHeader = c.req.header('Authorization')
+  if (!authHeader || !authHeader.startsWith('Bearer ')) {
+    return c.json({ success: false, message: '缺少或无效的 Authorization 头，格式: Bearer <token>' }, 401)
+  }
+
+  const token = authHeader.slice(7)
+  // 沿用 handleLogin 的哈希比对模式（SHA-256 hex），不另造加密套路
+  const tokenHash = await hashPassword(token)
+  const configuredHash = await hashPassword(configured)
+  if (tokenHash !== configuredHash) {
+    return c.json({ success: false, message: '管理 Token 无效' }, 401)
+  }
+
+  return next()
+}
+
 /** 管理员登录 */
 export async function handleLogin(c: Context<{ Bindings: Env }>) {
   const { username, password } = await c.req.json()

@@ -18,8 +18,11 @@ import type {
   Env,
   ApiResponse,
   Provider,
+  ApiKeyEntry,
+  Model,
   CreateProviderRequest,
   UpdateProviderRequest,
+  UpsertProviderRequest,
   CreateProxyKeyRequest,
   TestModelRequest,
   OAuthDeviceConfig,
@@ -134,6 +137,101 @@ if (body.apiKeys !== undefined) {
     return c.json<ApiResponse>({ success: false, message: '提供商不存在' }, 404)
   }
 
+  return c.json<ApiResponse<Provider>>({ success: true, data: updated })
+}
+
+/**
+ * 对外管理 API：upsert + 合并。
+ * - id 不存在 → 创建（需 name + baseUrl）
+ * - id 存在 → 合并：name/baseUrl/apiType/authType/enabled 传了覆盖；
+ *   apiKeys 按 key 字符串去重追加（保留原 enabled，永不删除）；
+ *   models 按 id 去重追加（永不删除）；oauth 保留不动。
+ * 供 /api/manage/providers/upsert 使用（需 managementAuthMiddleware）。
+ */
+export async function handleUpsertProvider(c: Context<{ Bindings: Env }>) {
+  const body = await c.req.json<UpsertProviderRequest>()
+  if (!body.id) {
+    return c.json<ApiResponse>({ success: false, message: 'id 为必填项' }, 400)
+  }
+
+  // opencode 未传地址时自动填充（与 handleCreateProvider 一致）
+  if (body.id === 'opencode' && !body.baseUrl) {
+    body.baseUrl = OPENCODE_DEFAULT_URL
+  }
+
+  // 归一化入参 keys/models 为对象数组，确保 enabled 有值（normalizeArray 对象路径不补 enabled）
+  const incomingKeys: ApiKeyEntry[] = (body.apiKeys || []).map((k) =>
+    typeof k === 'string'
+      ? { key: k, enabled: true }
+      : { key: k.key, enabled: k.enabled !== undefined ? k.enabled : true }
+  )
+  const incomingModels: Model[] = (body.models || []).map((m) =>
+    typeof m === 'string'
+      ? { id: m, enabled: true }
+      : { id: m.id, enabled: m.enabled !== undefined ? m.enabled : true }
+  )
+
+  const existing = await getProvider(c.env, body.id)
+
+  // ===== 不存在 → 创建 =====
+  if (!existing) {
+    if (!body.name || !body.baseUrl) {
+      return c.json<ApiResponse>({ success: false, message: '新建时 name、baseUrl 为必填项' }, 400)
+    }
+    const now = new Date().toISOString()
+    const provider: Provider = {
+      id: body.id,
+      name: body.name,
+      baseUrl: body.baseUrl.replace(/\/$/, ''),
+      apiType: body.apiType || 'openai',
+      authType: body.authType || 'api-key',
+      apiKeys: incomingKeys,
+      models: incomingModels,
+      enabled: body.enabled !== undefined ? body.enabled : true,
+      createdAt: now,
+      updatedAt: now,
+    }
+    await addProvider(c.env, provider)
+    return c.json<ApiResponse<Provider>>({ success: true, data: provider }, 201)
+  }
+
+  // ===== 存在 → 合并 =====
+  const updates: Partial<Provider> = {}
+  if (body.name !== undefined) updates.name = body.name
+  if (body.baseUrl !== undefined) updates.baseUrl = body.baseUrl.replace(/\/$/, '')
+  if (body.apiType !== undefined) updates.apiType = body.apiType
+  if (body.authType !== undefined) updates.authType = body.authType
+  if (body.enabled !== undefined) updates.enabled = body.enabled
+
+  // keys 合并：以现有为底，按 key 字符串去重追加，保留原 enabled
+  if (body.apiKeys !== undefined) {
+    const merged: ApiKeyEntry[] = [...existing.apiKeys]
+    const existingKeySet = new Set(merged.map((k) => k.key))
+    for (const k of incomingKeys) {
+      if (existingKeySet.has(k.key)) continue  // 已存在：保留原项，不覆盖、不重复
+      merged.push({ key: k.key, enabled: k.enabled })
+      existingKeySet.add(k.key)
+    }
+    updates.apiKeys = merged
+  }
+
+  // models 合并：以现有为底，按 id 去重追加
+  if (body.models !== undefined) {
+    const merged: Model[] = [...existing.models]
+    const existingModelSet = new Set(merged.map((m) => m.id))
+    for (const m of incomingModels) {
+      if (existingModelSet.has(m.id)) continue
+      merged.push({ id: m.id, enabled: m.enabled })
+      existingModelSet.add(m.id)
+    }
+    updates.models = merged
+  }
+
+  // oauth 不在 updates 中 → updateProvider 浅合并时保留 existing.oauth
+  const updated = await updateProvider(c.env, body.id, updates)
+  if (!updated) {
+    return c.json<ApiResponse>({ success: false, message: '提供商不存在' }, 404)
+  }
   return c.json<ApiResponse<Provider>>({ success: true, data: updated })
 }
 

@@ -16,4 +16,5 @@ crons = ["0 */2 * * *"]
 # [vars]
 # ADMIN_USERNAME = "admin"
 # ADMIN_PASSWORD = "your-password"
+# MANAGEMENT_TOKEN = "对外管理 API (/api/manage/*) 的 Bearer Token；不配置则该 API 返回 503"
 # OPENCODE_MIRRORS_URL = "https://opencode.ai.cmliussss.net/zen/v1\nhttps://opencode.fastly.cmliussss.net/zen/v1\nhttps://opencode.gcore.cmliussss.net/zen/v1"

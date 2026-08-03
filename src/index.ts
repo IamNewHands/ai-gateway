@@ -1,13 +1,14 @@
 import { Hono } from 'hono'
 import { cors } from 'hono/cors'
 import { logger } from 'hono/logger'
-import { adminAuthMiddleware, proxyKeyAuthMiddleware, handleLogin, handleLogout } from './auth'
+import { adminAuthMiddleware, proxyKeyAuthMiddleware, managementAuthMiddleware, handleLogin, handleLogout } from './auth'
 import { handleProxy, handleModels, handleAnthropicMessages, handleResponses } from './proxy'
 import {
   handleStatus,
   handleGetProviders,
   handleCreateProvider,
   handleUpdateProvider,
+  handleUpsertProvider,
   handleDeleteProvider,
   handleTestModel,
   handleTestKeyNew,
@@ -102,6 +103,12 @@ app.get('/admin/api/logs', handleLogs)
 app.delete('/admin/api/logs', handleLogsClear)
 app.get('/admin/api/logs/config', handleLogConfig)
 app.post('/admin/api/logs/config', handleLogConfig)
+
+// ===== 对外管理 API（需管理 Token 验证，供手机脚本等外部调用） =====
+app.use('/api/manage/*', managementAuthMiddleware)
+app.get('/api/manage/providers', handleGetProviders)
+app.post('/api/manage/providers/upsert', handleUpsertProvider)
+app.delete('/api/manage/providers/:id', handleDeleteProvider)
 
 // ===== API 转发路由（需转发 Key 验证） =====
 app.use('/v1/*', proxyKeyAuthMiddleware)

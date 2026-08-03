@@ -159,6 +159,25 @@ export interface UpdateProviderRequest {
   enabled?: boolean
 }
 
+/**
+ * 对外管理 API 的 upsert 请求体。
+ * - id 必填：存在则合并，不存在则创建。
+ * - 不含 oauth：OAuth 走管理后台 UI，脚本不碰。
+ * - apiKeys/models 既支持字符串（追加为 enabled:true），也支持完整对象。
+ * - key 元素不带 enabled：脚本只负责增 key，启停交给 UI。
+ * 合并语义：keys/models 只增不删，key 字符串去重。
+ */
+export interface UpsertProviderRequest {
+  id: string
+  name?: string
+  baseUrl?: string
+  apiType?: 'openai' | 'anthropic'
+  authType?: 'api-key' | 'oauth-device'
+  apiKeys?: Array<ApiKeyEntry | string>
+  models?: Array<Model | string>
+  enabled?: boolean
+}
+
 export interface CreateProxyKeyRequest {
   name?: string
   expiresIn?: string // '30d' | '90d' | '180d' | '1y' | 'forever'
@@ -175,4 +194,6 @@ export interface Env {
   ADMIN_USERNAME?: string
   ADMIN_PASSWORD?: string
   OPENCODE_MIRRORS_URL?: string
+  /** 对外管理 API 的认证 Token；未配置时 /api/manage/* 返回 503 */
+  MANAGEMENT_TOKEN?: string
 }
