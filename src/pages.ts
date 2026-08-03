@@ -1435,7 +1435,7 @@ async function loadCheckin() {
       var streak = (c.streakDays !== undefined && c.streakDays !== null) ? c.streakDays + ' 天' : '—'
       var credits = (c.totalCredits !== undefined && c.totalCredits !== null) ? c.totalCredits : '—'
       var realmBadge = c.realm === 'cn' ? '<span class="bd bd-on">CN</span>' : c.realm === 'global' ? '<span class="bd bd-off">Global</span>' : '<span class="bd bd-off">未知</span>'
-      html += '<article class="ki"><div class="key-main"><span class="key-icon" aria-hidden="true"><i class="fas fa-calendar-check"></i></span><div><div class="kv"><h3>' + escapeHtml(c.name) + '</h3>' + realmBadge + badge + '</div><p>连续签到：' + streak + ' · 总积分：' + credits + ' · 上次签到：' + escapeHtml(lastTime) + '</p>' + (c.message ? '<p class="mu" style="margin-top:2px">' + escapeHtml(c.message) + '</p>' : '') + '</div></div><div class="key-actions"><button class="btn btn-gh btn-xs" onclick="triggerCheckin(\'' + c.providerId + '\')"><i class="fas fa-calendar-check" aria-hidden="true"></i>签到</button></div></article>'
+      html += '<article class="ki"><div class="key-main"><span class="key-icon" aria-hidden="true"><i class="fas fa-calendar-check"></i></span><div><div class="kv"><h3>' + escapeHtml(c.name) + '</h3>' + realmBadge + badge + '</div><p>连续签到：' + streak + ' · 总积分：' + credits + ' · 上次签到：' + escapeHtml(lastTime) + '</p>' + (c.message ? '<p class="mu" style="margin-top:2px">' + escapeHtml(c.message) + '</p>' : '') + '</div></div><div class="key-actions"><button class="btn btn-gh btn-xs" onclick="triggerCheckin(\\'' + c.providerId + '\\')"><i class="fas fa-calendar-check" aria-hidden="true"></i>签到</button></div></article>'
     })
     el.innerHTML = html
   } catch(e) {
