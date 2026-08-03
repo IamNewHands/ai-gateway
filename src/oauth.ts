@@ -38,10 +38,12 @@ export function buildOauthHeaders(
 ): Record<string, string> {
   const tokenHeader = cfg.tokenHeader || 'x-api-key'
   const prefix = cfg.tokenHeaderPrefix || ''
+  // 自动补全：如果 prefix 非空且不以空格结尾，补一个空格（常见错误：Bearer 漏了空格）
+  const safePrefix = prefix && !prefix.endsWith(' ') ? prefix + ' ' : prefix
   const headers: Record<string, string> = {
     'Content-Type': opts?.contentType ?? 'application/json',
     'Accept': 'application/json',
-    [tokenHeader]: prefix + token,
+    [tokenHeader]: safePrefix + token,
     ...(cfg.extraHeaders || {}),
   }
   if (opts?.origin) {
