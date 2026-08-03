@@ -1108,10 +1108,10 @@ async function editKeyModels(keyId) {
   html += '<div style="margin-bottom:8px"><button class="btn btn-gh btn-xs" onclick="keyModelsToggle(true)">全选</button> <button class="btn btn-gh btn-xs" onclick="keyModelsToggle(false)">全不选</button></div>'
   html += '<div class="mdl-list" style="max-height:50vh;overflow-y:auto">'
   Object.keys(groups).forEach(function(g) {
-    html += '<div style="margin-bottom:8px"><strong>' + escapeHtml(g) + '</strong></div>'
+    html += '<div><strong>' + escapeHtml(g) + '</strong></div>'
     groups[g].forEach(function(m) {
       const checked = isAll || allowed.indexOf(m.id) !== -1 ? ' checked' : ''
-      html += '<label class="mdl-chk" style="display:block;padding:2px 0 2px 16px;cursor:pointer"><input type="checkbox" value="' + escapeHtml(m.id) + '"' + checked + '> ' + escapeHtml(m.id) + '</label>'
+      html += '<label class="mdl-chk"><input type="checkbox" value="' + escapeHtml(m.id) + '"' + checked + '> ' + escapeHtml(m.id) + '</label>'
     })
   })
   html += '</div>'
@@ -1127,7 +1127,7 @@ async function saveKeyModels(keyId) {
   // 全部勾选 = 存空数组（= 全部允许）
   var allowedModels = checked.length === all.length ? [] : checked
   var res = await fetch('/admin/api/proxy-keys/' + encodeURIComponent(keyId), {
-    method: 'PUT',
+    method: 'PATCH',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ allowedModels: allowedModels })
   })

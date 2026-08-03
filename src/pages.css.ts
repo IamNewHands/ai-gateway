@@ -191,6 +191,12 @@ label, legend { color: var(--color-ink-2); font-size: var(--text-xs); font-weigh
 .tg input:focus-visible + .sl { outline: .125rem solid var(--color-focus); outline-offset: .125rem; }
 .tg input:disabled + .sl { opacity: .55; cursor: not-allowed; }
 
+/* 模型筛选勾选框：覆盖全局 input 宽高，恢复原生尺寸并与文字同行对齐 */
+.mdl-chk { display: flex; align-items: center; gap: .375rem; padding: .25rem 0 .25rem 0; cursor: pointer; font-size: var(--text-xs); color: var(--color-ink); }
+.mdl-chk input { width: auto; height: auto; flex: 0 0 auto; min-width: 0; accent-color: var(--color-accent); }
+.mdl-list { display: grid; gap: .125rem; }
+.mdl-list > div { margin-block-end: var(--space-2xs); }
+
 /* home workbench */
 .home-page { background: var(--color-paper); }
 .home-hero { display: grid; grid-template-columns: minmax(0, 1fr); gap: var(--space-xl); padding-block: var(--space-2xl); }
