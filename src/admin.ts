@@ -173,24 +173,35 @@ export async function handleTestModel(c: Context<{ Bindings: Env }>) {
     if (!token) {
       return c.json<ApiResponse>({ success: false, message: 'OAuth 未连接或 Token 已失效，请先发起连接' }, 400)
     }
-    // 域路由：Global token 走 globalBaseUrl，否则走 provider.baseUrl
-    const isGlobal = detectTokenRealm(token) === 'global'
-    const realmBase = (isGlobal && cfg.globalBaseUrl ? cfg.globalBaseUrl : provider.baseUrl).replace(/\/$/, '')
-    const origin = isGlobal && cfg.globalOrigin ? cfg.globalOrigin : (cfg.extraHeaders?.Origin)
+    // 域路由 + 401 自动切换：先尝试主域，401 时自动切换到备用域
     const endpoint = provider.apiType === 'anthropic' ? 'messages' : 'chat/completions'
-    const url = `${realmBase}/${endpoint}`
-    try {
-      const response = await fetch(url, {
-        method: 'POST',
-        headers: buildOauthHeaders(cfg, token, { origin, apiType: provider.apiType }),
-        body: JSON.stringify({ model: modelId, messages: [{ role: 'user', content: 'hi' }], max_tokens: 1, stream: true }),
-        signal: AbortSignal.timeout(20000),
-      })
-      // OAuth 上游（如 WorkBuddy）强制 stream，2xx 即视为连通
-      return c.json<ApiResponse>({ success: true, data: { success: response.ok, statusCode: response.status, message: response.ok ? '' : `HTTP ${response.status}` } })
-    } catch (err) {
-      return c.json<ApiResponse>({ success: true, data: { success: false, statusCode: 0, message: (err as Error).message || '连接失败' } })
+    const realms: Array<'cn' | 'global'> = detectTokenRealm(token) === 'global' && cfg.globalBaseUrl
+      ? ['global', 'cn']
+      : ['cn', ...(cfg.globalBaseUrl ? ['global' as const] : [])]
+    const testBody = JSON.stringify({ model: modelId, messages: [{ role: 'user', content: 'hi' }], max_tokens: 1, stream: true })
+    for (const realm of realms) {
+      const realmBase = (realm === 'global' && cfg.globalBaseUrl ? cfg.globalBaseUrl : provider.baseUrl).replace(/\/$/, '')
+      const origin = realm === 'global' && cfg.globalOrigin ? cfg.globalOrigin : (cfg.extraHeaders?.Origin)
+      const url = `${realmBase}/${endpoint}`
+      try {
+        const response = await fetch(url, {
+          method: 'POST',
+          headers: buildOauthHeaders(cfg, token, { origin, apiType: provider.apiType }),
+          body: testBody,
+          signal: AbortSignal.timeout(20000),
+        })
+        // 401 且有备用域 → 自动切换重试
+        if (response.status === 401 && realms.length > 1 && realm !== realms[realms.length - 1]) {
+          console.log(`[test-model] ${realm} 域返回 401，自动切换到下一个域`)
+          continue
+        }
+        return c.json<ApiResponse>({ success: true, data: { success: response.ok, statusCode: response.status, message: response.ok ? '' : `HTTP ${response.status}` } })
+      } catch (err) {
+        if (realms.length > 1 && realm !== realms[realms.length - 1]) continue
+        return c.json<ApiResponse>({ success: true, data: { success: false, statusCode: 0, message: (err as Error).message || '连接失败' } })
+      }
     }
+    return c.json<ApiResponse>({ success: true, data: { success: false, statusCode: 0, message: '所有域均请求失败' } })
   }
 
   const enabledKeys = provider.apiKeys.filter(k => k.enabled)
@@ -457,9 +468,42 @@ export async function handleOAuthDisconnect(c: Context<{ Bindings: Env }>) {
 }
 
 /**
+ * 解析上游模型列表响应，兼容三种格式：
+ * ① WorkBuddy：{ code, data: { agents:[{name,models:[]}], models:[{id,disabled}] } }
+ * ② OpenAI：{ data: [{id}] }
+ * ③ 根级 models 数组：{ models: [{id}] }
+ */
+function parseModelList(json: any): Array<{ id: string }> {
+  const models: Array<{ id: string }> = []
+  if (json?.data?.agents && Array.isArray(json.data.agents)) {
+    const cliAgent = json.data.agents.find((a: any) => a && a.name === 'cli' && Array.isArray(a.models))
+    const cliModelIds: string[] = cliAgent?.models || []
+    const modelMeta = new Map<string, any>(
+      (json.data.models || []).map((m: any) => [m?.id, m]).filter(([k]) => k)
+    )
+    if (cliModelIds.length > 0) {
+      models.push(...cliModelIds
+        .filter((mid) => modelMeta.has(mid) && !modelMeta.get(mid)?.disabled)
+        .map((mid) => ({ id: mid })))
+    }
+    if (models.length === 0) {
+      models.push(...(json.data.models || [])
+        .filter((m: any) => m && m.id && !m.disabled)
+        .map((m: any) => ({ id: m.id })))
+    }
+  } else if (Array.isArray(json?.data)) {
+    models.push(...json.data.filter((m: any) => m && m.id).map((m: any) => ({ id: m.id })))
+  } else if (Array.isArray(json?.models)) {
+    models.push(...json.models.filter((m: any) => m && m.id).map((m: any) => ({ id: m.id })))
+  }
+  return models
+}
+
+/**
  * 拉取 OAuth 提供商的上游模型列表（登录后动态发现，替代写死的预设模型）。
- * - 优先使用 cfg.modelsUrl；留空则回退 ${baseUrl}/models（OpenAI 标准）
- * - 兼容三种响应格式：WorkBuddy（data.agents[cli].models）、OpenAI（data[]）、根级 models[]
+ * - 401 自动域切换：Global token 打到 CN 域会被 APISIX 拒绝（反之亦然），
+ *   当 JWT 域判断不确定或配置缺失时，自动尝试另一个域。
+ * - 参考 cpa-plugin/models.go 的 callModelsAPI 实现。
  */
 export async function handleOAuthModels(c: Context<{ Bindings: Env }>) {
   const id = c.req.param('id')
@@ -477,76 +521,77 @@ export async function handleOAuthModels(c: Context<{ Bindings: Env }>) {
     return c.json<ApiResponse>({ success: false, message: 'OAuth 未连接或 Token 已失效，请先发起连接' }, 400)
   }
 
-  // 域路由：Global token (iss=workbuddy.ai) 必须走 www.workbuddy.ai，
-  // 否则 copilot.tencent.com 的 APISIX 返回 401
-  const isGlobal = detectTokenRealm(token) === 'global'
   const cleanBase = provider.baseUrl.replace(/\/$/, '')
-  const modelsUrl = isGlobal && cfg.globalModelsUrl
-    ? cfg.globalModelsUrl
-    : (cfg.modelsUrl || `${cleanBase}/models`)
-  const origin = isGlobal && cfg.globalOrigin
-    ? cfg.globalOrigin
-    : (cfg.extraHeaders?.Origin)
+  const realm = detectTokenRealm(token)
 
-  try {
-    const response = await fetch(modelsUrl, {
-      method: 'GET',
-      headers: buildOauthHeaders(cfg, token, { origin }),
-      signal: AbortSignal.timeout(20000),
-    })
+  // 构建候选端点：主域优先，备用域兜底（401 时自动切换）
+  const cnEndpoint = {
+    url: cfg.modelsUrl || `${cleanBase}/models`,
+    origin: cfg.extraHeaders?.Origin as string | undefined,
+    label: 'CN',
+  }
+  const globalUrl = cfg.globalModelsUrl
+    || (cfg.globalBaseUrl ? `${cfg.globalBaseUrl.replace(/\/$/, '')}/models` : '')
+  const globalEndpoint = globalUrl
+    ? { url: globalUrl, origin: cfg.globalOrigin as string | undefined, label: 'Global' }
+    : null
 
-    if (!response.ok) {
+  // JWT 明确判定域时，对应端点优先；null/不确定时 CN 优先（baseUrl 默认 CN）
+  const candidates = realm === 'global' && globalEndpoint
+    ? [globalEndpoint, cnEndpoint]
+    : [cnEndpoint, globalEndpoint].filter(Boolean) as typeof cnEndpoint[]
+
+  let lastError = ''
+  for (const ep of candidates) {
+    try {
+      const response = await fetch(ep.url, {
+        method: 'GET',
+        headers: buildOauthHeaders(cfg, token, { origin: ep.origin }),
+        signal: AbortSignal.timeout(20000),
+      })
+
+      if (response.ok) {
+        const json: any = await response.json().catch(() => null)
+        if (!json) {
+          return c.json<ApiResponse>({ success: false, message: '上游响应不是有效 JSON' })
+        }
+        const models = parseModelList(json)
+        if (models.length === 0) {
+          return c.json<ApiResponse>({ success: false, message: '上游未返回任何模型' })
+        }
+        return c.json<ApiResponse>({ success: true, data: { data: models } })
+      }
+
+      // 读取错误详情
       let detail = ''
       try { detail = (await response.text()).substring(0, 200) } catch { /* ignore */ }
+      lastError = `[${ep.label}] HTTP ${response.status}${detail ? '：' + detail : ''}`
+
+      // 401 且还有备用域 → 自动切换重试
+      if (response.status === 401 && candidates.length > 1) {
+        console.log(`[oauth-models] ${ep.label} 域返回 401，自动切换到下一个候选端点`)
+        continue
+      }
+
+      // 非 401 或只有一个候选，直接返回错误
       return c.json<ApiResponse>({
         success: false,
         message: `上游返回 HTTP ${response.status}${detail ? '：' + detail : ''}`,
       })
-    }
-
-    const json: any = await response.json().catch(() => null)
-    if (!json) {
-      return c.json<ApiResponse>({ success: false, message: '上游响应不是有效 JSON' })
-    }
-
-    const models: Array<{ id: string }> = []
-
-    // ① WorkBuddy 格式：{ code, data: { agents:[{name,models:[]}], models:[{id,disabled}] } }
-    if (json?.data?.agents && Array.isArray(json.data.agents)) {
-      const cliAgent = json.data.agents.find((a: any) => a && a.name === 'cli' && Array.isArray(a.models))
-      const cliModelIds: string[] = cliAgent?.models || []
-      const modelMeta = new Map<string, any>(
-        (json.data.models || []).map((m: any) => [m?.id, m]).filter(([k]) => k)
-      )
-      if (cliModelIds.length > 0) {
-        // CLI 可用模型 = cli agent 声明的模型，且在 models 元数据中存在、未被禁用
-        models.push(...cliModelIds
-          .filter((mid) => modelMeta.has(mid) && !modelMeta.get(mid)?.disabled)
-          .map((mid) => ({ id: mid })))
+    } catch (err) {
+      lastError = `[${ep.label}] ${(err as Error).message || '请求异常'}`
+      // 网络错误也尝试下一个候选
+      if (candidates.length > 1) {
+        console.log(`[oauth-models] ${ep.label} 域请求异常，尝试下一个候选端点: ${lastError}`)
+        continue
       }
-      // 兜底：没有 cli agent 时，用全部未禁用模型
-      if (models.length === 0) {
-        models.push(...(json.data.models || [])
-          .filter((m: any) => m && m.id && !m.disabled)
-          .map((m: any) => ({ id: m.id })))
-      }
+      return c.json<ApiResponse>({ success: false, message: (err as Error).message || '拉取模型列表失败' })
     }
-    // ② OpenAI 格式：{ data: [{id}] }
-    else if (Array.isArray(json?.data)) {
-      models.push(...json.data.filter((m: any) => m && m.id).map((m: any) => ({ id: m.id })))
-    }
-    // ③ 根级 models 数组：{ models: [{id}] }
-    else if (Array.isArray(json?.models)) {
-      models.push(...json.models.filter((m: any) => m && m.id).map((m: any) => ({ id: m.id })))
-    }
-
-    if (models.length === 0) {
-      return c.json<ApiResponse>({ success: false, message: '上游未返回任何模型' })
-    }
-
-    // 响应结构对齐 test-key，便于前端 renderModelGrid 复用
-    return c.json<ApiResponse>({ success: true, data: { data: models } })
-  } catch (err) {
-    return c.json<ApiResponse>({ success: false, message: (err as Error).message || '拉取模型列表失败' })
   }
+
+  // 所有候选端点都失败
+  return c.json<ApiResponse>({
+    success: false,
+    message: `所有域均请求失败，最后错误: ${lastError}`,
+  })
 }

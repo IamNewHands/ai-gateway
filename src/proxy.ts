@@ -370,7 +370,9 @@ export async function handleProxy(c: Context<{ Bindings: Env }>) {
 }
 
 /**
- * OAuth 设备码提供商转发：取 token → 注入请求头 → 转发；401 时刷新 token 重试一次。
+ * OAuth 设备码提供商转发：取 token → 注入请求头 → 转发；401 时刷新 token 重试，
+ * 刷新后仍 401 则自动切换域重试（Global ↔ CN）。
+ * 参考 cpa-plugin/models.go 的域路由逻辑。
  */
 async function proxyOAuthRequest(
   c: Context<{ Bindings: Env }>,
@@ -382,23 +384,32 @@ async function proxyOAuthRequest(
   const cfg = provider.oauth!
 
   // 域路由：根据 token 的 JWT iss 决定走 CN (copilot.tencent.com) 还是 Global (www.workbuddy.ai)。
-  // Global token 打到 copilot.tencent.com 会被 APISIX 返回 401。
-  const resolveForwardUrl = (token: string) => {
-    const isGlobal = detectTokenRealm(token) === 'global'
-    const realmBase = (isGlobal && cfg.globalBaseUrl ? cfg.globalBaseUrl : provider.baseUrl).replace(/\/$/, '')
+  const resolveRealm = (token: string): 'cn' | 'global' => {
+    return detectTokenRealm(token) === 'global' ? 'global' : 'cn'
+  }
+  const buildForwardUrl = (realm: 'cn' | 'global') => {
+    const realmBase = (realm === 'global' && cfg.globalBaseUrl ? cfg.globalBaseUrl : provider.baseUrl).replace(/\/$/, '')
     return `${realmBase}/${subPath}${search}`
   }
-  const resolveOrigin = (token: string) => {
-    const isGlobal = detectTokenRealm(token) === 'global'
-    return isGlobal && cfg.globalOrigin ? cfg.globalOrigin : (cfg.extraHeaders?.Origin)
+  const buildOrigin = (realm: 'cn' | 'global') => {
+    return realm === 'global' && cfg.globalOrigin ? cfg.globalOrigin : (cfg.extraHeaders?.Origin)
+  }
+  // 备用域（401 自动切换用）
+  const altRealm = (realm: 'cn' | 'global'): 'cn' | 'global' | null => {
+    if (realm === 'cn' && cfg.globalBaseUrl) return 'global'
+    if (realm === 'global') return 'cn'
+    return null
   }
 
-  const doFetch = (token: string) => fetch(resolveForwardUrl(token), {
-    method: c.req.method,
-    headers: buildOauthHeaders(cfg, token, { origin: resolveOrigin(token), apiType: provider.apiType }),
-    body: c.req.method === 'GET' || c.req.method === 'HEAD' ? undefined : JSON.stringify(forwardBody),
-    signal: AbortSignal.timeout(300000),
-  })
+  const doFetch = (token: string, realm?: 'cn' | 'global') => {
+    const r = realm || resolveRealm(token)
+    return fetch(buildForwardUrl(r), {
+      method: c.req.method,
+      headers: buildOauthHeaders(cfg, token, { origin: buildOrigin(r), apiType: provider.apiType }),
+      body: c.req.method === 'GET' || c.req.method === 'HEAD' ? undefined : JSON.stringify(forwardBody),
+      signal: AbortSignal.timeout(300000),
+    })
+  }
 
   try {
     let token = await getOauthAccessToken(c.env, provider.id, cfg)
@@ -413,13 +424,27 @@ async function proxyOAuthRequest(
       }, 502)
     }
 
+    const primaryRealm = resolveRealm(token)
     let response = await doFetch(token)
+
     // 401/403：可能 token 过期，刷新后重试一次
     if ((response.status === 401 || response.status === 403) && (await readOauthToken(c.env, provider.id))?.refresh_token) {
       const refreshed = await refreshOauthToken(c.env, provider.id, cfg)
       if (refreshed) {
         const fresh = (await readOauthToken(c.env, provider.id))?.access_token
         if (fresh) response = await doFetch(fresh)
+      }
+    }
+
+    // 刷新后仍 401：自动切换域重试（Global ↔ CN）
+    if (response.status === 401) {
+      const alt = altRealm(primaryRealm)
+      if (alt) {
+        console.log(`[proxy-oauth] ${primaryRealm} 域 401，自动切换到 ${alt} 域重试`)
+        const altResponse = await doFetch(token, alt)
+        if (altResponse.ok || altResponse.status !== 401) {
+          return passthroughResponse(altResponse)
+        }
       }
     }
 
