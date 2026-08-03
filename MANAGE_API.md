@@ -187,6 +187,46 @@ curl -X DELETE -H "Authorization: Bearer <TOKEN>" https://gateway.example.com/ap
 
 ---
 
+### 6.4 POST `/api/manage/checkin` — WorkBuddy 每日签到（手动触发）
+
+触发所有 WorkBuddy/CodeBuddy OAuth 账号签到（领取免费积分）。仅 CN 账号签到，国际版自动跳过。定时任务每天 09:00/21:00（北京时间）自动执行，此接口供脚本手动触发。
+
+**全量签到**：
+```bash
+curl -X POST -H "Authorization: Bearer <TOKEN>" \
+  https://gateway.example.com/api/manage/checkin
+```
+
+**单个账号签到**（指定 provider id）：
+```bash
+curl -X POST -H "Authorization: Bearer <TOKEN>" -H "Content-Type: application/json" \
+  https://gateway.example.com/api/manage/checkin \
+  -d '{"id":"workbuddy"}'
+```
+或 `POST /api/manage/checkin/:id`（路径参数形式）。
+
+**全量响应** (`200`)：
+```json
+{
+  "success": true,
+  "data": {
+    "total": 2, "success": 1, "already": 1, "fail": 0, "skipped": 0,
+    "results": [
+      { "providerId": "workbuddy", "name": "WorkBuddy", "realm": "cn",
+        "success": true, "reason": "ok", "message": "签到成功",
+        "todayCheckedIn": true, "streakDays": 5, "totalCredits": 1200,
+        "lastCheckinAt": 1785770000000, "updatedAt": 1785770000000 }
+    ]
+  }
+}
+```
+
+`reason` 取值：`ok`（本次签到成功）| `already`（今日已签）| `skipped_global`（国际版跳过）| `skipped_no_token`（未登录）| `fail`（失败，看 `message`）。
+
+> 签到结果同时写入管理后台「签到」面板与系统日志。多账号：每个 WorkBuddy 账号是一个独立 provider（如 workbuddy、workbuddy-2），全量签到会遍历所有 OAuth provider。
+
+---
+
 ## 7. 完整对接流程 / End-to-end flow
 
 ```
@@ -414,6 +454,8 @@ A：已发出的请求继续完成；之后的请求会因 provider 不存在返
 | GET | `/api/manage/providers` | Bearer MANAGEMENT_TOKEN | 查询全部 provider |
 | POST | `/api/manage/providers/upsert` | Bearer MANAGEMENT_TOKEN | upsert + 合并 provider |
 | DELETE | `/api/manage/providers/:id` | Bearer MANAGEMENT_TOKEN | 删除 provider |
+| POST | `/api/manage/checkin` | Bearer MANAGEMENT_TOKEN | WorkBuddy 全量签到（可选 body `{id}` 单个） |
+| POST | `/api/manage/checkin/:id` | Bearer MANAGEMENT_TOKEN | 单个账号签到 |
 | GET | `/v1/models` | Bearer `sk_cf_*` | 查询可用模型（给客户端用） |
 | POST | `/v1/chat/completions` | Bearer `sk_cf_*` | OpenAI 格式调用模型 |
 | POST | `/v1/messages` | Bearer `sk_cf_*` | Anthropic 格式调用模型 |

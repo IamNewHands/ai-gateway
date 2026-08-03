@@ -31,10 +31,14 @@ export const KV_KEYS = {
   OPENCODE_MIGRATION: 'migration:opencode-default:v1',
   OAUTH_TOKEN_PREFIX: 'oauth:token:',
   OAUTH_DEVICE_PREFIX: 'oauth:device:',
+  CHECKIN_RESULT_PREFIX: 'checkin:result:',
 } as const
 
 // access_token 过期前多少毫秒触发惰性刷新（默认提前 60 秒）
 export const OAUTH_TOKEN_REFRESH_MARGIN_MS = 60 * 1000
+
+// 签到结果在 KV 中的保留时间（2 天，足够展示当日状态）
+export const CHECKIN_RESULT_TTL_SEC = 2 * 24 * 60 * 60
 
 // 有效期选项（秒）
 export const EXPIRY_OPTIONS: Record<string, number | null> = {

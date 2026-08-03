@@ -337,6 +337,7 @@ ${H('管理')}
       <a class="admin-nav__link" href="#providers"><i class="fas fa-server" aria-hidden="true"></i><span>提供商</span><b>${providers.length}</b></a>
       <a class="admin-nav__link" href="#proxy-keys"><i class="fas fa-key" aria-hidden="true"></i><span>转发 Key</span><b>${proxyKeys.length}</b></a>
       <a class="admin-nav__link" href="#logs"><i class="fas fa-list-alt" aria-hidden="true"></i><span>日志</span></a>
+<a class="admin-nav__link" href="#checkin"><i class="fas fa-calendar-check" aria-hidden="true"></i><span>签到</span><b>${providers.filter((p:any)=>p.authType==='oauth-device'&&p.oauth).length}</b></a>
     </nav>
     <div class="admin-rail__foot">
       <a href="/" class="admin-nav__link"><i class="fas fa-arrow-left" aria-hidden="true"></i><span>返回首页</span></a>
@@ -347,7 +348,7 @@ ${H('管理')}
   <div class="admin-main">
     <header class="admin-topbar">
       <a class="brand" href="/"><span class="brand__mark" aria-hidden="true"><i class="fas fa-cloud"></i></span><span class="brand__name">${SITE_CONFIG.title}</span></a>
-      <nav aria-label="移动端控制台导航"><a href="#overview">概览</a><a href="#providers">提供商</a><a href="#proxy-keys">Key</a></nav>
+      <nav aria-label="移动端控制台导航"><a href="#overview">概览</a><a href="#providers">提供商</a><a href="#proxy-keys">Key</a><a href="#checkin">签到</a><a href="#logs">日志</a></nav>
       <a class="icon-btn" href="/admin/logout" aria-label="退出登录"><i class="fas fa-sign-out-alt" aria-hidden="true"></i></a>
     </header>
 
@@ -463,6 +464,12 @@ ${H('管理')}
         <div class="section-heading section-heading--admin"><div><h2 id="logs-title">系统日志</h2><p>记录 API 请求、错误等关键信息。</p></div><div><label class="tg"><input type="checkbox" id="log-switch" onchange="toggleLog(this.checked)"><span class="sl"></span></label><span id="log-status">已关闭</span><button class="btn btn-gh btn-xs" onclick="refreshLogs()" style="margin-left:8px"><i class="fas fa-sync-alt"></i></button><button class="btn btn-d btn-xs" onclick="clearLogs()" style="margin-left:4px">清除</button></div></div>
         <div id="log-list" class="key-list">
           <div class="empty-state"><i class="fas fa-list-alt" aria-hidden="true"></i><h3>暂无日志</h3><p>开启日志开关后，API 请求和错误会被记录。</p></div>
+        </div>
+      </section>
+      <section id="checkin" class="workspace-section" aria-labelledby="checkin-title">
+        <div class="section-heading section-heading--admin"><div><h2 id="checkin-title">WorkBuddy 签到</h2><p>每日签到领取免费积分。仅 CN 账号可签到，国际版自动跳过。定时任务每天 09:00/21:00 自动执行。</p></div><div><button class="btn btn-gh btn-xs" onclick="loadCheckin()" style="margin-left:8px"><i class="fas fa-sync-alt"></i></button><button class="btn btn-p btn-xs" onclick="triggerCheckin()"><i class="fas fa-calendar-check" aria-hidden="true"></i>全部签到</button></div></div>
+        <div id="checkin-list" class="key-list">
+          <div class="empty-state"><i class="fas fa-calendar-check" aria-hidden="true"></i><h3>暂无签到数据</h3><p>配置 WorkBuddy OAuth 提供商后，点击「全部签到」。</p></div>
         </div>
       </section>
     </main>
@@ -1330,6 +1337,16 @@ adminNavLinks.forEach(function (link) {
 window.addEventListener('hashchange', function () { setActiveAdminNav(location.hash) })
 setActiveAdminNav(location.hash)
 
+// 进入签到区块时懒加载签到状态（首次访问 #checkin 触发）
+function maybeLoadCheckin(hash) { if (hash === '#checkin') loadCheckin() }
+window.addEventListener('hashchange', function () { maybeLoadCheckin(location.hash) })
+adminNavLinks.forEach(function (link) {
+  if (link.getAttribute('href') === '#checkin') {
+    link.addEventListener('click', function () { setTimeout(loadCheckin, 50) })
+  }
+})
+maybeLoadCheckin(location.hash)
+
 // 通过 ?connect=id 进入时自动发起 OAuth 登录（"创建并发起连接"按钮创建后跳转过来）
 ;(function () {
   var cid = new URLSearchParams(location.search).get('connect')
@@ -1392,6 +1409,56 @@ async function clearLogs() {
   await fetch('/admin/api/logs', { method: 'DELETE' })
   document.getElementById('log-list').innerHTML = '<div class="empty-state"><i class="fas fa-list-alt" aria-hidden="true"></i><h3>暂无日志</h3><p>日志已清除。</p></div>'
   toast('日志已清除', 'success')
+}
+
+// ===== WorkBuddy 签到 =====
+async function loadCheckin() {
+  const el = document.getElementById('checkin-list')
+  if (!el) return
+  el.innerHTML = '<div class="empty-state"><i class="fas fa-spinner fa-pulse"></i><h3>加载中…</h3></div>'
+  try {
+    const r = await fetch('/admin/api/checkin/status')
+    const d = await r.json()
+    if (!d.success || !d.data || d.data.length === 0) {
+      el.innerHTML = '<div class="empty-state"><i class="fas fa-calendar-check" aria-hidden="true"></i><h3>暂无签到数据</h3><p>配置 WorkBuddy OAuth 提供商后，点击「全部签到」。</p></div>'
+      return
+    }
+    var html = ''
+    d.data.forEach(function(c) {
+      var reason = c.reason || 'fail'
+      var badge = reason === 'ok' ? '<span class="bd bd-on">签到成功</span>'
+        : reason === 'already' ? '<span class="bd bd-on">今日已签</span>'
+        : reason === 'skipped_global' ? '<span class="bd bd-off">国际版跳过</span>'
+        : reason === 'skipped_no_token' ? '<span class="bd bd-off">未签到</span>'
+        : '<span class="bd bd-off">失败</span>'
+      var lastTime = c.lastCheckinAt ? new Date(c.lastCheckinAt).toLocaleString() : '—'
+      var streak = (c.streakDays !== undefined && c.streakDays !== null) ? c.streakDays + ' 天' : '—'
+      var credits = (c.totalCredits !== undefined && c.totalCredits !== null) ? c.totalCredits : '—'
+      var realmBadge = c.realm === 'cn' ? '<span class="bd bd-on">CN</span>' : c.realm === 'global' ? '<span class="bd bd-off">Global</span>' : '<span class="bd bd-off">未知</span>'
+      html += '<article class="ki"><div class="key-main"><span class="key-icon" aria-hidden="true"><i class="fas fa-calendar-check"></i></span><div><div class="kv"><h3>' + escapeHtml(c.name) + '</h3>' + realmBadge + badge + '</div><p>连续签到：' + streak + ' · 总积分：' + credits + ' · 上次签到：' + escapeHtml(lastTime) + '</p>' + (c.message ? '<p class="mu" style="margin-top:2px">' + escapeHtml(c.message) + '</p>' : '') + '</div></div><div class="key-actions"><button class="btn btn-gh btn-xs" onclick="triggerCheckin(\'' + c.providerId + '\')"><i class="fas fa-calendar-check" aria-hidden="true"></i>签到</button></div></article>'
+    })
+    el.innerHTML = html
+  } catch(e) {
+    el.innerHTML = '<div class="empty-state"><i class="fas fa-exclamation-triangle c-l"></i><h3>加载失败</h3></div>'
+  }
+}
+
+async function triggerCheckin(id) {
+  toast('签到中…', 'info')
+  try {
+    const body = id ? JSON.stringify({ id: id }) : '{}'
+    const r = await fetch('/admin/api/checkin', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: body })
+    const d = await r.json()
+    if (d.success) {
+      var msg = id ? '签到完成' : '签到完成：成功 ' + (d.data.success||0) + ' / 已签 ' + (d.data.already||0) + ' / 失败 ' + (d.data.fail||0) + ' / 跳过 ' + (d.data.skipped||0)
+      toast(msg, 'success')
+    } else {
+      toast(d.message || '签到失败', 'error')
+    }
+    await loadCheckin()
+  } catch(e) {
+    toast('签到请求失败', 'error')
+  }
 }
 </script>
 </body></html>`)

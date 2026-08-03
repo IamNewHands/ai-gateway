@@ -8,9 +8,9 @@ keep_vars = true
 [[kv_namespaces]]
 binding = "KV"
 
-# OAuth token 定时刷新（每 2 小时）
+# 定时任务：OAuth token 刷新（每 2 小时）+ WorkBuddy 签到（每日 09:00/21:00 北京时间 = 01:00/13:00 UTC）
 [triggers]
-crons = ["0 */2 * * *"]
+crons = ["0 */2 * * *", "0 1,13 * * *"]
 
 # Admin credentials (set these in Cloudflare Dashboard > Workers > Variables)
 # [vars]

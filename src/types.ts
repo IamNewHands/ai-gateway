@@ -178,6 +178,28 @@ export interface UpsertProviderRequest {
   enabled?: boolean
 }
 
+/**
+ * WorkBuddy/CodeBuddy 每日签到结果。
+ * 存于 KV（CHECKIN_RESULT_PREFIX + providerId），管理后台面板展示。
+ */
+export interface CheckinResult {
+  providerId: string
+  name: string
+  /** 账号领域：cn 可签到，global 跳过 */
+  realm: 'cn' | 'global' | 'unknown'
+  success: boolean
+  /** ok | already | skipped_global | skipped_no_token | fail */
+  reason: string
+  message: string
+  todayCheckedIn: boolean
+  streakDays?: number
+  totalCredits?: number
+  dailyCredit?: number
+  /** 上次签到时间（epoch ms） */
+  lastCheckinAt?: number
+  updatedAt: number
+}
+
 export interface CreateProxyKeyRequest {
   name?: string
   expiresIn?: string // '30d' | '90d' | '180d' | '1y' | 'forever'

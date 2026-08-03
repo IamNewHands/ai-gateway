@@ -30,6 +30,7 @@ import {
 import { renderHomePage, renderLoginPage, renderAdminPage } from './pages'
 import { seedInitialData, getSession, getProviders } from './storage'
 import { refreshAllOauthTokens } from './oauth'
+import { runAllCheckins, handleCheckinTrigger, handleCheckinStatus } from './checkin'
 import type { Env, Provider } from './types'
 
 const app = new Hono<{ Bindings: Env }>()
@@ -104,11 +105,18 @@ app.delete('/admin/api/logs', handleLogsClear)
 app.get('/admin/api/logs/config', handleLogConfig)
 app.post('/admin/api/logs/config', handleLogConfig)
 
+// 签到（浏览器面板用，需 session 认证）
+app.get('/admin/api/checkin/status', handleCheckinStatus)
+app.post('/admin/api/checkin', handleCheckinTrigger)
+
 // ===== 对外管理 API（需管理 Token 验证，供手机脚本等外部调用） =====
 app.use('/api/manage/*', managementAuthMiddleware)
 app.get('/api/manage/providers', handleGetProviders)
 app.post('/api/manage/providers/upsert', handleUpsertProvider)
 app.delete('/api/manage/providers/:id', handleDeleteProvider)
+// 签到（手机脚本手动触发，需管理 Token）
+app.post('/api/manage/checkin', handleCheckinTrigger)
+app.post('/api/manage/checkin/:id', handleCheckinTrigger)
 
 // ===== API 转发路由（需转发 Key 验证） =====
 app.use('/v1/*', proxyKeyAuthMiddleware)
@@ -136,8 +144,18 @@ app.onError((err, c) => {
 
 export default app
 
-// ===== Cron：定时刷新 OAuth token =====
+// ===== Cron：定时任务（按 event.cron 分发） =====
+// crons（见 wrangler.toml）：
+//   "0 */2 * * *"   —— 每 2 小时刷新 OAuth token
+//   "0 1,13 * * *"  —— 每日 09:00/21:00（北京时间）WorkBuddy 签到
 export async function scheduled(event: ScheduledEvent, env: Env, ctx: ExecutionContext) {
+  if (event.cron === '0 1,13 * * *') {
+    // 签到
+    const summary = await runAllCheckins(env)
+    console.log(`[checkin] cron done: total=${summary.total} ok=${summary.success} already=${summary.already} fail=${summary.fail} skipped=${summary.skipped}`)
+    return
+  }
+  // token 刷新（默认 / "0 */2 * * *"）
   const providers = (await getProviders(env)) as Provider[]
   const oauthProviders = providers.filter((p) => p.authType === 'oauth-device' && p.oauth)
   const result = await refreshAllOauthTokens(env, oauthProviders)
