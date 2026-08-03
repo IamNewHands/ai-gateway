@@ -857,6 +857,7 @@ export function openAIChunkToResponsesSSE(
     inputTokens: number
     outputTokens: number
     hasStarted: boolean
+    completed: boolean
   }
 ): string {
   const events: string[] = []
@@ -886,6 +887,7 @@ export function openAIChunkToResponsesSSE(
   const delta = choice.delta
   if (!delta) {
     if (choice.finish_reason) {
+      acc.completed = true
       events.push(`event: response.completed`)
       events.push(`data: ${JSON.stringify({
         type: 'response.completed',
@@ -1014,6 +1016,7 @@ export function openAIChunkToResponsesSSE(
       })}`)
     }
 
+    acc.completed = true
     events.push(`event: response.completed`)
     events.push(`data: ${JSON.stringify({
       type: 'response.completed',

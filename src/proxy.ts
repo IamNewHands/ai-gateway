@@ -109,6 +109,31 @@ function sanitizeBlockedTemplates(body: Record<string, unknown>): void {
   }
 }
 
+/**
+ * 清理上游不支持的请求体字段：
+ * - developer role → system（WorkBuddy 不支持 developer）
+ * - 删除 reasoning_effort（上游 OpenAI 兼容 API 不支持）
+ * - 空 content 数组 → 空字符串
+ */
+function sanitizeUpstreamBody(body: Record<string, unknown>): void {
+  // 删除 reasoning_effort
+  delete body['reasoning_effort']
+
+  const messages = body['messages'] as any[]
+  if (!Array.isArray(messages)) return
+  for (const msg of messages) {
+    if (!msg || typeof msg !== 'object') continue
+    // developer → system
+    if (msg.role === 'developer') {
+      msg.role = 'system'
+    }
+    // 空 content 数组 → 空字符串（OpenAI API 不接受 content: []）
+    if (Array.isArray(msg.content) && msg.content.length === 0) {
+      msg.content = ''
+    }
+  }
+}
+
 /** 在匹配的屏蔽短语中插入零宽空格来绕过精确匹配过滤 */
 function sanitizeText(s: string): string {
   // "You are Claude Code, Anthropic's official CLI tool for Claude." 中的 "Claude" 后插入 \u200B
@@ -920,8 +945,9 @@ export async function handleAnthropicMessages(c: Context<{ Bindings: Env }>) {
       const cfg = provider.oauth
       // 强制流式（WorkBuddy 只支持流式）
       const upstreamBody: Record<string, unknown> = { ...openaiBody, stream: true }
-      // 移除 Anthropic 特有字段（上游 OpenAI API 不支持）
-      delete upstreamBody['reasoning_effort']
+      // 清理上游不支持的字段 + 被屏蔽的 Claude Code 模板短语
+      sanitizeUpstreamBody(upstreamBody)
+      sanitizeBlockedTemplates(upstreamBody)
       // max_completion_tokens → max_tokens（部分上游只认 max_tokens）
       if (upstreamBody['max_completion_tokens'] !== undefined && upstreamBody['max_tokens'] === undefined) {
         upstreamBody['max_tokens'] = upstreamBody['max_completion_tokens']
@@ -1054,6 +1080,15 @@ export async function handleAnthropicMessages(c: Context<{ Bindings: Env }>) {
                 }
               }
             } catch { /* stream error */ }
+            // 确保发送 message_stop（防止上游不发送 finish_reason）
+            if (!acc.stopReason) {
+              acc.stopReason = 'end_turn'
+              try {
+                controller.enqueue(new TextEncoder().encode(
+                  `event: message_delta\ndata: ${JSON.stringify({ type: 'message_delta', delta: { stop_reason: 'end_turn', stop_sequence: null }, usage: { output_tokens: acc.outputTokens } })}\n\nevent: message_stop\ndata: ${JSON.stringify({ type: 'message_stop' })}\n\n`
+                ))
+              } catch { /* enqueue failed */ }
+            }
             controller.close()
           },
         })
@@ -1111,14 +1146,16 @@ export async function handleAnthropicMessages(c: Context<{ Bindings: Env }>) {
     const cleanBase = provider.baseUrl.replace(/\/$/, '')
     const forwardUrl = `${cleanBase}/chat/completions`
     const upstreamBody: Record<string, unknown> = { ...openaiBody, stream: true }
-    // 移除 Anthropic 特有字段（上游 OpenAI API 不支持）
-    delete upstreamBody['reasoning_effort']
+    // 清理上游不支持的字段 + 被屏蔽的 Claude Code 模板短语
+    sanitizeUpstreamBody(upstreamBody)
+    sanitizeBlockedTemplates(upstreamBody)
     // max_completion_tokens → max_tokens（部分上游只认 max_tokens）
     if (upstreamBody['max_completion_tokens'] !== undefined && upstreamBody['max_tokens'] === undefined) {
       upstreamBody['max_tokens'] = upstreamBody['max_completion_tokens']
       delete upstreamBody['max_completion_tokens']
     }
-    // 清理被 CodeBuddy 内容过滤器屏蔽的 Claude Code 模板短语
+    // 清理上游不支持的字段 + 被屏蔽的 Claude Code 模板短语
+    sanitizeUpstreamBody(upstreamBody)
     sanitizeBlockedTemplates(upstreamBody)
     const apiKey = enabledKeys[0].key
 
@@ -1177,6 +1214,15 @@ export async function handleAnthropicMessages(c: Context<{ Bindings: Env }>) {
               }
             }
           } catch { /* stream error */ }
+          // 确保发送 message_stop（防止上游不发送 finish_reason）
+          if (!acc.stopReason) {
+            acc.stopReason = 'end_turn'
+            try {
+              controller.enqueue(new TextEncoder().encode(
+                `event: message_delta\ndata: ${JSON.stringify({ type: 'message_delta', delta: { stop_reason: 'end_turn', stop_sequence: null }, usage: { output_tokens: acc.outputTokens } })}\n\nevent: message_stop\ndata: ${JSON.stringify({ type: 'message_stop' })}\n\n`
+              ))
+            } catch { /* enqueue failed */ }
+          }
           controller.close()
         },
       })
@@ -1283,6 +1329,8 @@ export async function handleResponses(c: Context<{ Bindings: Env }>) {
     if (provider.authType === 'oauth-device' && provider.oauth) {
       const cfg = provider.oauth
       const upstreamBody: Record<string, unknown> = { ...openaiBody, stream: true }
+      // 清理上游不支持的字段（developer → system, 删除 reasoning_effort 等）
+      sanitizeUpstreamBody(upstreamBody)
 
       // 读取 token 状态
       let tokenState = await readOauthToken(c.env, providerId)
@@ -1366,6 +1414,7 @@ export async function handleResponses(c: Context<{ Bindings: Env }>) {
           inputTokens: 0,
           outputTokens: 0,
           hasStarted: false,
+          completed: false,
         }
 
         const readable = new ReadableStream({
@@ -1399,6 +1448,14 @@ export async function handleResponses(c: Context<{ Bindings: Env }>) {
                 }
               }
             } catch { /* stream error */ }
+            // 确保发送 response.completed
+            if (!acc.completed) {
+              try {
+                controller.enqueue(new TextEncoder().encode(
+                  `event: response.completed\ndata: ${JSON.stringify({ type: 'response.completed', response: { id: acc.responseId || 'resp_unknown', output: [] } })}\n\n`
+                ))
+              } catch { /* enqueue failed */ }
+            }
             controller.close()
           },
         })
@@ -1456,6 +1513,9 @@ export async function handleResponses(c: Context<{ Bindings: Env }>) {
     const cleanBase = provider.baseUrl.replace(/\/$/, '')
     const forwardUrl = `${cleanBase}/chat/completions`
     const upstreamBody: Record<string, unknown> = { ...openaiBody, stream: true }
+    // 清理上游不支持的字段 + 被屏蔽的 Claude Code 模板短语
+    sanitizeUpstreamBody(upstreamBody)
+    sanitizeBlockedTemplates(upstreamBody)
     const apiKey = enabledKeys[0].key
 
     const response = await fetch(forwardUrl, {
@@ -1489,6 +1549,7 @@ export async function handleResponses(c: Context<{ Bindings: Env }>) {
         inputTokens: 0,
         outputTokens: 0,
         hasStarted: false,
+        completed: false,
       }
 
       const readable = new ReadableStream({
@@ -1522,6 +1583,14 @@ export async function handleResponses(c: Context<{ Bindings: Env }>) {
               }
             }
           } catch { /* stream error */ }
+          // 确保发送 response.completed
+          if (!acc.completed) {
+            try {
+              controller.enqueue(new TextEncoder().encode(
+                `event: response.completed\ndata: ${JSON.stringify({ type: 'response.completed', response: { id: acc.responseId || 'resp_unknown', output: [] } })}\n\n`
+              ))
+            } catch { /* enqueue failed */ }
+          }
           controller.close()
         },
       })
