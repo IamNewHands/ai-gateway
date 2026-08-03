@@ -686,6 +686,24 @@ export async function handleOAuthModels(c: Context<{ Bindings: Env }>) {
         if (models.length === 0) {
           return c.json<ApiResponse>({ success: false, message: '上游未返回任何模型', data: debug }, 502)
         }
+        // 自动合并保存到 provider.models（按 id 去重追加，保留已有 enabled 状态）
+        // 避免"获取模型→测试"时因未手动保存而报"模型 xxx 不存在于提供商"
+        try {
+          const existing = provider.models || []
+          const existingIds = new Set(existing.map((m) => m.id))
+          const merged = [...existing]
+          for (const m of models) {
+            if (!existingIds.has(m.id)) {
+              merged.push({ id: m.id, enabled: true })
+              existingIds.add(m.id)
+            }
+          }
+          if (merged.length !== existing.length) {
+            await updateProvider(c.env, id, { models: merged })
+          }
+        } catch (e) {
+          console.warn(`[oauth-models] auto-save failed: ${(e as Error).message}`)
+        }
         return c.json<ApiResponse>({ success: true, data: { data: models } })
       }
 
