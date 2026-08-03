@@ -968,7 +968,8 @@ async function fetchOauthModels(id) {
       if (st) st.textContent = msg
     }
   } catch (e) {
-    if (tr) showResult(tr, false, '请求失败')
+    console.error('fetchOauthModels error:', e)
+    if (tr) showResult(tr, false, '请求失败: ' + (e.message || '未知错误'))
     if (st) st.textContent = '拉取失败'
   }
 }
@@ -1042,14 +1043,20 @@ function showEditModelsList(id, models) {
     el.id = cid
     el.className = 'fg'
     const pd = document.getElementById('dt-' + id)
-    if (!pd) return
+    if (!pd) { console.error('showEditModelsList: dt-' + id + ' not found'); return }
     const sections = pd.querySelectorAll('.fg, fieldset.form-group')
+    let inserted = false
     for (var i = 0; i < sections.length; i++) {
       var lbl = sections[i].querySelector('label') || sections[i].querySelector('legend')
-      if (lbl && (lbl.textContent === '模型' || lbl.textContent.includes('模型'))) {
+      if (lbl && (lbl.textContent.trim() === '模型' || lbl.textContent.includes('模型'))) {
         pd.insertBefore(el, sections[i])
+        inserted = true
         break
       }
+    }
+    if (!inserted) {
+      // fallback: 插入到 pd 末尾
+      pd.appendChild(el)
     }
   }
   el.innerHTML = '<label>可用模型 <span class="mu">（点击 + 添加单个，或 <a href="javascript:void(0)" onclick="addAllModels(&apos;' + id + '&apos;)">一键全部添加</a>）</span></label>' + renderModelGrid(models, id, id)
