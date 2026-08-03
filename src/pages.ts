@@ -1,7 +1,7 @@
 import { Context } from 'hono'
 import { getProviders, getProxyKeys } from './storage'
 import { SITE_CONFIG, OPENCODE_DEFAULT_URL } from './config'
-import type { Env } from './types'
+import type { Env, OAuthDeviceConfig } from './types'
 import { CSS_CONTENT } from './pages.css'
 import { SHARED_JS } from './shared.js'
 
@@ -12,6 +12,19 @@ const escapePageHtml = (value: unknown) => String(value ?? '')
   .replace(/>/g, '&gt;')
   .replace(/"/g, '&quot;')
   .replace(/'/g, '&#39;')
+
+/**
+ * 根据已保存的 OAuth 配置反推匹配的预置模板名称（用于编辑表单回显选中项）。
+ * 预置模板本身不作为字段存储，但 deviceCodeUrl 是每个预置的唯一标识，
+ * 据此即可稳定反推。返回 'codebuddy' | 'workbuddy' | ''（空 = 自定义/未匹配）。
+ */
+const detectOauthPreset = (oauth?: OAuthDeviceConfig): string => {
+  const url = oauth?.deviceCodeUrl || ''
+  if (!url) return ''
+  if (url.includes('copilot.code.woa.com')) return 'codebuddy'
+  if (url.includes('copilot.tencent.com/v2/plugin/auth/state')) return 'workbuddy'
+  return ''
+}
 
 const H = (title: string) => `
 <head>
@@ -427,7 +440,7 @@ ${H('管理')}
                   <div class="fg"><label>Global 域 baseUrl（海外账户，可选）</label><input type="url" id="eao11-${escapePageHtml(p.id)}" value="${escapePageHtml((p.oauth&&p.oauth.globalBaseUrl)||'')}" placeholder="https://www.workbuddy.ai/v2"></div>
                   <div class="fg"><label>Global 域模型 URL（可选）</label><input type="url" id="eao12-${escapePageHtml(p.id)}" value="${escapePageHtml((p.oauth&&p.oauth.globalModelsUrl)||'')}" placeholder="https://www.workbuddy.ai/console/enterprises/personal/models"></div>
                   <div class="fg"><label>Global 域 Origin（可选）</label><input type="url" id="eao13-${escapePageHtml(p.id)}" value="${escapePageHtml((p.oauth&&p.oauth.globalOrigin)||'')}" placeholder="https://www.workbuddy.ai"></div>
-                  <div class="fg"><label>预置模板</label><select class="select-sm" onchange="applyOauthPresetEdit('${p.id}',this.value)"><option value="">— 选择 —</option><option value="codebuddy">CodeBuddy（设备码）</option><option value="workbuddy">WorkBuddy（浏览器登录）</option></select></div>
+                  <div class="fg"><label>预置模板</label><select class="select-sm" onchange="applyOauthPresetEdit('${p.id}',this.value)"><option value="" ${detectOauthPreset(p.oauth)===''?'selected':''}>— 选择 —</option><option value="codebuddy" ${detectOauthPreset(p.oauth)==='codebuddy'?'selected':''}>CodeBuddy（设备码）</option><option value="workbuddy" ${detectOauthPreset(p.oauth)==='workbuddy'?'selected':''}>WorkBuddy（浏览器登录）</option></select></div>
                   <div class="fc mt-1 field-row"><button class="btn btn-s" onclick="oauthConnect('${p.id}')"><i class="fas fa-plug" aria-hidden="true"></i>发起连接</button><button class="btn btn-gh" onclick="fetchOauthModels('${p.id}')"><i class="fas fa-cloud-download-alt" aria-hidden="true"></i>获取模型</button><button class="btn btn-gh" onclick="oauthStatus('${p.id}')"><i class="fas fa-sync" aria-hidden="true"></i>状态</button><button class="btn btn-gh" onclick="oauthDisconnect('${p.id}')"><i class="fas fa-unlink" aria-hidden="true"></i>断开</button><span id="oauth-st-${escapePageHtml(p.id)}" class="oauth-status"></span></div>
                 </fieldset>
               </div>
