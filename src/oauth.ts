@@ -331,6 +331,9 @@ async function pollOauthBrowserFlow(env: Env, providerId: string, cfg: OAuthDevi
     const expiresInSec = tok.expiresIn || 7200
     // 保存 cookies 到 token 状态，后续模型拉取和 API 转发需要复用
     const newCookies = res.headers.get('Set-Cookie') || device.cookies || undefined
+    console.log(`[oauth-poll] provider=${providerId} set-cookie from poll response: ${res.headers.get('Set-Cookie') || '(none)'}`)
+    console.log(`[oauth-poll] provider=${providerId} device.cookies from login: ${device.cookies || '(none)'}`)
+    console.log(`[oauth-poll] provider=${providerId} final cookies saved: ${newCookies || '(none)'}`)
     await writeOauthToken(env, providerId, {
       access_token: tok.accessToken,
       refresh_token: tok.refreshToken,

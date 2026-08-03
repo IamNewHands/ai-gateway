@@ -144,6 +144,8 @@ export async function handleDeleteProvider(c: Context<{ Bindings: Env }>) {
   if (!deleted) {
     return c.json<ApiResponse>({ success: false, message: '提供商不存在' }, 404)
   }
+  // 同时删除 OAuth token 和设备码状态，避免残留数据干扰
+  await deleteOauthToken(c.env, id)
   return c.json<ApiResponse>({ success: true, message: '提供商已删除' })
 }
 
@@ -528,6 +530,7 @@ export async function handleOAuthModels(c: Context<{ Bindings: Env }>) {
   }
   const tokenState = await readOauthToken(c.env, provider.id)
   const cookies = tokenState?.cookies
+  console.log(`[oauth-models] provider=${id} cookies from KV: ${cookies ? cookies.substring(0, 100) + '...' : '(none)'}`)
 
   const cleanBase = provider.baseUrl.replace(/\/$/, '')
   const realm = detectTokenRealm(token)
