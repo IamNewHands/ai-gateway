@@ -1051,7 +1051,7 @@ function showEditModelsList(id, models) {
       }
     }
   }
-  el.innerHTML = '<label>可用模型 <span class="mu">（点击 + 添加单个，或 <a href="javascript:void(0)" onclick="addAllModels(\'' + id + '\')">一键全部添加</a>）</span></label>' + renderModelGrid(models, id, id)
+  el.innerHTML = '<label>可用模型 <span class="mu">（点击 + 添加单个，或 <a href="javascript:void(0)" onclick="addAllModels(' + JSON.stringify(id) + ')">一键全部添加</a>）</span></label>' + renderModelGrid(models, id, id)
 }
 
 // 一键添加所有拉取的模型

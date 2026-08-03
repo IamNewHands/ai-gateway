@@ -1,23 +1,37 @@
 import fs from 'fs'
-const c = fs.readFileSync('dist/_test.js', 'utf8')
-// Find the HTML content section - search for script tag content
-const scriptMatch = c.match(/<script>([\s\S]*?)<\/script>/)
-if (!scriptMatch) { console.log('No script tag found'); process.exit(0) }
-const js = scriptMatch[1]
-// Check for unterminated single-quote strings
-const lines = js.split('\n')
-for (let i = 0; i < lines.length; i++) {
-  const l = lines[i]
-  let inStr = false, esc = false
-  for (let j = 0; j < l.length; j++) {
-    const ch = l[j]
-    if (esc) { esc = false; continue }
-    if (ch === '\\') { esc = true; continue }
-    if (ch === "'" && !inStr) { inStr = true }
-    else if (ch === "'" && inStr) { inStr = false }
-  }
-  if (inStr) {
-    console.log(`Line ${i + 1} has unterminated single-quote: ${l.substring(0, 150)}`)
-  }
+
+// Load the esbuild output and evaluate the module to get renderAdminPage
+const code = fs.readFileSync('dist/_test.js', 'utf8')
+
+// Mock Cloudflare Workers globals
+globalThis.crypto = { randomUUID: () => 'mock-uuid' }
+globalThis.Request = class Request {
+  constructor(url, init) { this.url = url; this.headers = new Map(Object.entries(init?.headers || {})) }
 }
-console.log('Check complete')
+globalThis.Response = class Response {
+  constructor(body, init) {
+    this._body = body
+    this.status = init?.status || 200
+    this.headers = new Map(Object.entries(init?.headers || {}))
+  }
+  async json() { return JSON.parse(this._body) }
+  async text() { return this._body }
+}
+
+// Execute the module
+try {
+  const module = { exports: {} }
+  // Wrap in a way that captures the default export
+  const fn = new Function('module', 'exports', 'require', code + '\nreturn module.exports')
+  // Actually the esbuild output uses ESM... let's just search for the HTML content
+  console.log('Code length:', code.length)
+  
+  // Search for renderAdminPage in the code
+  const idx = code.indexOf('renderAdminPage')
+  if (idx >= 0) {
+    console.log('renderAdminPage found at', idx)
+    console.log('Context:', code.substring(idx, idx + 200))
+  }
+} catch (e) {
+  console.log('Error:', e.message)
+}
