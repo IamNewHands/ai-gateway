@@ -3,8 +3,8 @@ import { getProvider, getProviders } from './storage'
 import { KV_KEYS, KEY_HEALTH_COOLDOWN_MS, KEY_HEALTH_MAX_FAILURES } from './config'
 import type { Env, ProxyRequestBody } from './types'
 import { isOpenCodeProvider, proxyOpenCodeRequest, resolveOpenCodeUrls } from './opencode'
-import { getOauthAccessToken, readOauthToken, refreshOauthToken, detectTokenRealm, buildOauthHeaders } from './oauth'
 import { writeLog } from './admin'
+import { getOauthAccessToken, readOauthToken, refreshOauthToken, detectTokenRealm, buildOauthHeaders } from './oauth'
 import {
   anthropicToOpenAI,
   openAIToAnthropic,
@@ -571,7 +571,7 @@ export async function handleProxy(c: Context<{ Bindings: Env }>) {
 
         // 其他错误（400/404 等）直接返回
         const errorData = await response.json().catch(async () => ({ error: { message: await response.text() } }))
-        c.executionCtx.waitUntil(writeLog(c.env, 'error', `[${provider.name}] ${model} → ${response.status}`, JSON.stringify(errorData).substring(0, 500)))
+        c.executionCtx.waitUntil(writeLog(c.env, 'error', `[${provider.name}] ${model} → ${response.status} ${forwardUrl}`, JSON.stringify({ error: errorData, body: forwardBody, url: forwardUrl }).substring(0, 3000)))
         return c.json(errorData, response.status as Parameters<typeof c.json>[1])
       } catch (err) {
         const error = err as Error
@@ -853,6 +853,13 @@ export async function handleAnthropicMessages(c: Context<{ Bindings: Env }>) {
       const cfg = provider.oauth
       // 强制流式（WorkBuddy 只支持流式）
       const upstreamBody: Record<string, unknown> = { ...openaiBody, stream: true }
+      // 移除 Anthropic 特有字段（上游 OpenAI API 不支持）
+      delete upstreamBody['reasoning_effort']
+      // max_completion_tokens → max_tokens（部分上游只认 max_tokens）
+      if (upstreamBody['max_completion_tokens'] !== undefined && upstreamBody['max_tokens'] === undefined) {
+        upstreamBody['max_tokens'] = upstreamBody['max_completion_tokens']
+        delete upstreamBody['max_completion_tokens']
+      }
 
       // 读取 token 状态
       let tokenState = await readOauthToken(c.env, providerId)
@@ -917,11 +924,14 @@ export async function handleAnthropicMessages(c: Context<{ Bindings: Env }>) {
 
       if (!response.ok) {
         const errText = await response.text()
+        c.executionCtx.waitUntil(writeLog(c.env, 'error', `[anthropic] ${model} → ${response.status} ${upstreamUrl}`, JSON.stringify({ error: errText, body: upstreamBody, url: upstreamUrl }).substring(0, 3000)))
         return c.json({
           type: 'error',
           error: { type: 'upstream_error', message: `Upstream error: ${errText}` },
         }, response.status as Parameters<typeof c.json>[1])
       }
+
+      c.executionCtx.waitUntil(writeLog(c.env, 'request', `[anthropic] ${model} → 200 ${upstreamUrl}`, `stream=${originalStream}`))
 
       // 流式：OpenAI SSE → Anthropic SSE 实时转换
       if (originalStream && response.body) {
@@ -1029,6 +1039,13 @@ export async function handleAnthropicMessages(c: Context<{ Bindings: Env }>) {
     const cleanBase = provider.baseUrl.replace(/\/$/, '')
     const forwardUrl = `${cleanBase}/chat/completions`
     const upstreamBody: Record<string, unknown> = { ...openaiBody, stream: true }
+    // 移除 Anthropic 特有字段（上游 OpenAI API 不支持）
+    delete upstreamBody['reasoning_effort']
+    // max_completion_tokens → max_tokens（部分上游只认 max_tokens）
+    if (upstreamBody['max_completion_tokens'] !== undefined && upstreamBody['max_tokens'] === undefined) {
+      upstreamBody['max_tokens'] = upstreamBody['max_completion_tokens']
+      delete upstreamBody['max_completion_tokens']
+    }
     const apiKey = enabledKeys[0].key
 
     const response = await fetch(forwardUrl, {
@@ -1043,11 +1060,14 @@ export async function handleAnthropicMessages(c: Context<{ Bindings: Env }>) {
 
     if (!response.ok) {
       const errText = await response.text()
+      c.executionCtx.waitUntil(writeLog(c.env, 'error', `[anthropic] ${model} → ${response.status} ${forwardUrl}`, JSON.stringify({ error: errText, body: upstreamBody, url: forwardUrl }).substring(0, 3000)))
       return c.json({
         type: 'error',
         error: { type: 'upstream_error', message: `Upstream error: ${errText}` },
       }, response.status as Parameters<typeof c.json>[1])
     }
+
+    c.executionCtx.waitUntil(writeLog(c.env, 'request', `[anthropic] ${model} → 200 ${forwardUrl}`, `stream=${originalStream}`))
 
     // 流式：OpenAI SSE → Anthropic SSE 实时转换
     if (originalStream && response.body) {
@@ -1253,10 +1273,13 @@ export async function handleResponses(c: Context<{ Bindings: Env }>) {
 
       if (!response.ok) {
         const errText = await response.text()
+        c.executionCtx.waitUntil(writeLog(c.env, 'error', `[responses] ${model} → ${response.status} ${upstreamUrl}`, JSON.stringify({ error: errText, body: upstreamBody, url: upstreamUrl }).substring(0, 3000)))
         return c.json({
           error: { message: `Upstream error: ${errText}`, type: 'upstream_error' },
         }, response.status as Parameters<typeof c.json>[1])
       }
+
+      c.executionCtx.waitUntil(writeLog(c.env, 'request', `[responses] ${model} → 200 ${upstreamUrl}`, `stream=${originalStream}`))
 
       // 流式
       if (originalStream && response.body) {
@@ -1373,10 +1396,13 @@ export async function handleResponses(c: Context<{ Bindings: Env }>) {
 
     if (!response.ok) {
       const errText = await response.text()
+      c.executionCtx.waitUntil(writeLog(c.env, 'error', `[responses] ${model} → ${response.status} ${forwardUrl}`, JSON.stringify({ error: errText, body: upstreamBody, url: forwardUrl }).substring(0, 3000)))
       return c.json({
         error: { message: `Upstream error: ${errText}`, type: 'upstream_error' },
       }, response.status as Parameters<typeof c.json>[1])
     }
+
+    c.executionCtx.waitUntil(writeLog(c.env, 'request', `[responses] ${model} → 200 ${forwardUrl}`, `stream=${originalStream}`))
 
     // 流式：OpenAI SSE → Responses SSE 实时转换
     if (originalStream && response.body) {
