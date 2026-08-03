@@ -549,26 +549,10 @@ export async function handleOAuthModels(c: Context<{ Bindings: Env }>) {
   const realm = detectTokenRealm(token)
 
   // 构建候选端点：主域优先，备用域兜底（401 时自动切换）
-  // 多个备选 URL：无 Cookie 时 console 端点会 400，fallback 到其他端点
-  const cnEndpoints: Array<{ url: string; origin?: string; label: string }> = []
-  // 主端点：console/enterprises/personal/models（需要 Cookie）
-  cnEndpoints.push({
+  const cnEndpoint = {
     url: cfg.modelsUrl || `${cleanBase}/models`,
     origin: cfg.extraHeaders?.Origin as string | undefined,
-    label: 'CN(console)',
-  })
-  // 备用端点：尝试各种可能不需要 Cookie 的路径
-  const altPaths = [
-    '/v2/plugin/models',
-    '/v2/plugin/enterprises/personal/models',
-    '/console/enterprises/personal/models',
-  ]
-  for (const path of altPaths) {
-    cnEndpoints.push({
-      url: `https://copilot.tencent.com${path}`,
-      origin: cfg.extraHeaders?.Origin as string | undefined,
-      label: `CN(${path})`,
-    })
+    label: 'CN',
   }
   const globalUrl = cfg.globalModelsUrl
     || (cfg.globalBaseUrl ? `${cfg.globalBaseUrl.replace(/\/$/, '')}/models` : '')
@@ -579,10 +563,10 @@ export async function handleOAuthModels(c: Context<{ Bindings: Env }>) {
   // JWT 明确判定域时，对应端点优先；null/不确定时 CN 优先（baseUrl 默认 CN）
   // CN token 不应尝试 Global 域（iss 不匹配，APISIX 必然 401）
   const candidates = realm === 'global' && globalEndpoint
-    ? [globalEndpoint, ...cnEndpoints]
+    ? [globalEndpoint, cnEndpoint]
     : realm === 'cn'
-      ? cnEndpoints
-      : [...cnEndpoints, globalEndpoint].filter(Boolean) as typeof cnEndpoints[number][]
+      ? [cnEndpoint]
+      : [cnEndpoint, globalEndpoint].filter(Boolean) as typeof cnEndpoint[]
 
   const errors: string[] = []
   for (const ep of candidates) {

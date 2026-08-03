@@ -776,8 +776,8 @@ const OAUTH_PRESETS = {
     deviceTokenUrl: 'https://copilot.tencent.com/v2/plugin/auth/token',
     refreshTokenUrl: 'https://copilot.tencent.com/v2/plugin/auth/token/refresh',
     clientId: '',
-    tokenHeader: 'x-api-key',
-    tokenHeaderPrefix: '',
+    tokenHeader: 'Authorization',
+    tokenHeaderPrefix: 'Bearer ',
     extraHeaders: {
       'Origin': 'https://www.codebuddy.cn',
       'Referer': 'https://www.codebuddy.cn/',
