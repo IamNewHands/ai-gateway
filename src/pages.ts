@@ -1042,10 +1042,11 @@ function showEditModelsList(id, models) {
     el.id = cid
     el.className = 'fg'
     const pd = document.getElementById('dt-' + id)
-    const sections = pd.querySelectorAll('.fg')
+    if (!pd) return
+    const sections = pd.querySelectorAll('.fg, fieldset.form-group')
     for (var i = 0; i < sections.length; i++) {
-      var lbl = sections[i].querySelector('label')
-      if (lbl && lbl.textContent === '模型') {
+      var lbl = sections[i].querySelector('label') || sections[i].querySelector('legend')
+      if (lbl && (lbl.textContent === '模型' || lbl.textContent.includes('模型'))) {
         pd.insertBefore(el, sections[i])
         break
       }
