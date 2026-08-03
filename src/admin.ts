@@ -549,7 +549,7 @@ export async function handleOAuthModels(c: Context<{ Bindings: Env }>) {
   const realm = detectTokenRealm(token)
 
   // 构建候选端点：主域优先，备用域兜底（401 时自动切换）
-  // 多个备选 URL：无 Cookie 时 console 端点会 400，fallback 到 /v2/models 或 baseUrl/models
+  // 多个备选 URL：无 Cookie 时 console 端点会 400，fallback 到其他端点
   const cnEndpoints: Array<{ url: string; origin?: string; label: string }> = []
   // 主端点：console/enterprises/personal/models（需要 Cookie）
   cnEndpoints.push({
@@ -557,12 +557,17 @@ export async function handleOAuthModels(c: Context<{ Bindings: Env }>) {
     origin: cfg.extraHeaders?.Origin as string | undefined,
     label: 'CN(console)',
   })
-  // 备用端点 1：/v2/models（可能不需要 Cookie）
-  if (cleanBase) {
+  // 备用端点：尝试各种可能不需要 Cookie 的路径
+  const altPaths = [
+    '/v2/plugin/models',
+    '/v2/plugin/enterprises/personal/models',
+    '/console/enterprises/personal/models',
+  ]
+  for (const path of altPaths) {
     cnEndpoints.push({
-      url: `${cleanBase}/models`,
+      url: `https://copilot.tencent.com${path}`,
       origin: cfg.extraHeaders?.Origin as string | undefined,
-      label: 'CN(/v2/models)',
+      label: `CN(${path})`,
     })
   }
   const globalUrl = cfg.globalModelsUrl
