@@ -553,7 +553,7 @@ function renderModelGrid(models, editId, providerId) {
     var modelId = String(m.id || '')
     var safeId = escapeHtml(modelId)
     var addFn = editId
-      ? "addMdlToEdit('" + modelId + "','" + editId + "')"
+      ? "addMdlToEdit('" + editId + "','" + modelId + "')"
       : "addMdlToForm('" + modelId + "')"
     return '<div class="mdl-item">' +
       '<i class="fas fa-cube"></i>' +
