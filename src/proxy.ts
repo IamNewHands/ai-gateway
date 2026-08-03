@@ -57,6 +57,33 @@ function parseModelId(model: string): { providerId: string; modelId: string } | 
   }
 }
 
+/** 生成请求体摘要：保留顶层字段名和结构，但截断 messages 内容 */
+function summarizeRequestBody(body: Record<string, unknown>): Record<string, unknown> {
+  const summary: Record<string, unknown> = {}
+  for (const [key, value] of Object.entries(body)) {
+    if (key === 'messages' && Array.isArray(value)) {
+      summary[key] = value.map((msg: any) => ({
+        role: msg.role,
+        content_length: typeof msg.content === 'string'
+          ? msg.content.length
+          : Array.isArray(msg.content)
+            ? msg.content.length + ' blocks'
+            : String(msg.content).length,
+        ...(msg.tool_calls ? { tool_calls_count: msg.tool_calls.length } : {}),
+        ...(msg.tool_call_id ? { tool_call_id: msg.tool_call_id } : {}),
+      }))
+    } else if (key === 'tools' && Array.isArray(value)) {
+      summary[key] = value.map((t: any) => ({
+        type: t.type,
+        function_name: t.function?.name,
+      }))
+    } else {
+      summary[key] = value
+    }
+  }
+  return summary
+}
+
 /**
  * WorkBuddy SSE 流聚合：收集所有 chunk 拼接为非流式 chat.completion 响应。
  * 参考 cpa-plugin stream.go 的 aggregateCompletion 实现。
@@ -571,7 +598,7 @@ export async function handleProxy(c: Context<{ Bindings: Env }>) {
 
         // 其他错误（400/404 等）直接返回
         const errorData = await response.json().catch(async () => ({ error: { message: await response.text() } }))
-        c.executionCtx.waitUntil(writeLog(c.env, 'error', `[${provider.name}] ${model} → ${response.status} ${forwardUrl}`, JSON.stringify({ error: errorData, body: forwardBody, url: forwardUrl }).substring(0, 3000)))
+        c.executionCtx.waitUntil(writeLog(c.env, 'error', `[${provider.name}] ${model} → ${response.status} ${forwardUrl}`, JSON.stringify({ error: errorData, body: summarizeRequestBody(forwardBody), url: forwardUrl }).substring(0, 4000)))
         return c.json(errorData, response.status as Parameters<typeof c.json>[1])
       } catch (err) {
         const error = err as Error
@@ -924,7 +951,9 @@ export async function handleAnthropicMessages(c: Context<{ Bindings: Env }>) {
 
       if (!response.ok) {
         const errText = await response.text()
-        c.executionCtx.waitUntil(writeLog(c.env, 'error', `[anthropic] ${model} → ${response.status} ${upstreamUrl}`, JSON.stringify({ error: errText, body: upstreamBody, url: upstreamUrl }).substring(0, 3000)))
+        // 记录请求体摘要：去掉 messages 内容，只保留结构字段名
+        const bodySummary = summarizeRequestBody(upstreamBody)
+        c.executionCtx.waitUntil(writeLog(c.env, 'error', `[anthropic] ${model} → ${response.status} ${upstreamUrl}`, JSON.stringify({ error: errText, body: bodySummary, url: upstreamUrl }).substring(0, 4000)))
         return c.json({
           type: 'error',
           error: { type: 'upstream_error', message: `Upstream error: ${errText}` },
@@ -1060,7 +1089,7 @@ export async function handleAnthropicMessages(c: Context<{ Bindings: Env }>) {
 
     if (!response.ok) {
       const errText = await response.text()
-      c.executionCtx.waitUntil(writeLog(c.env, 'error', `[anthropic] ${model} → ${response.status} ${forwardUrl}`, JSON.stringify({ error: errText, body: upstreamBody, url: forwardUrl }).substring(0, 3000)))
+      c.executionCtx.waitUntil(writeLog(c.env, 'error', `[anthropic] ${model} → ${response.status} ${forwardUrl}`, JSON.stringify({ error: errText, body: summarizeRequestBody(upstreamBody), url: forwardUrl }).substring(0, 4000)))
       return c.json({
         type: 'error',
         error: { type: 'upstream_error', message: `Upstream error: ${errText}` },
@@ -1273,7 +1302,7 @@ export async function handleResponses(c: Context<{ Bindings: Env }>) {
 
       if (!response.ok) {
         const errText = await response.text()
-        c.executionCtx.waitUntil(writeLog(c.env, 'error', `[responses] ${model} → ${response.status} ${upstreamUrl}`, JSON.stringify({ error: errText, body: upstreamBody, url: upstreamUrl }).substring(0, 3000)))
+        c.executionCtx.waitUntil(writeLog(c.env, 'error', `[responses] ${model} → ${response.status} ${upstreamUrl}`, JSON.stringify({ error: errText, body: summarizeRequestBody(upstreamBody), url: upstreamUrl }).substring(0, 4000)))
         return c.json({
           error: { message: `Upstream error: ${errText}`, type: 'upstream_error' },
         }, response.status as Parameters<typeof c.json>[1])
@@ -1396,7 +1425,7 @@ export async function handleResponses(c: Context<{ Bindings: Env }>) {
 
     if (!response.ok) {
       const errText = await response.text()
-      c.executionCtx.waitUntil(writeLog(c.env, 'error', `[responses] ${model} → ${response.status} ${forwardUrl}`, JSON.stringify({ error: errText, body: upstreamBody, url: forwardUrl }).substring(0, 3000)))
+      c.executionCtx.waitUntil(writeLog(c.env, 'error', `[responses] ${model} → ${response.status} ${forwardUrl}`, JSON.stringify({ error: errText, body: summarizeRequestBody(upstreamBody), url: forwardUrl }).substring(0, 4000)))
       return c.json({
         error: { message: `Upstream error: ${errText}`, type: 'upstream_error' },
       }, response.status as Parameters<typeof c.json>[1])
