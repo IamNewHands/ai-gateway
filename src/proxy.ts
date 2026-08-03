@@ -505,10 +505,15 @@ async function proxyOAuthRequest(
 
   const doFetch = (token: string, realm?: 'cn' | 'global') => {
     const r = realm || resolveRealm(token)
+    const body = { ...forwardBody } as Record<string, unknown>
+    // WorkBuddy 只支持流式请求，强制 stream: true
+    if (provider.id === 'workbuddy' && body.stream !== true) {
+      body.stream = true
+    }
     return fetch(buildForwardUrl(r), {
       method: c.req.method,
       headers: buildOauthHeaders(cfg, token, { origin: buildOrigin(r), apiType: provider.apiType, cookies: tokenState?.cookies }),
-      body: c.req.method === 'GET' || c.req.method === 'HEAD' ? undefined : JSON.stringify(forwardBody),
+      body: c.req.method === 'GET' || c.req.method === 'HEAD' ? undefined : JSON.stringify(body),
       signal: AbortSignal.timeout(300000),
     })
   }
