@@ -47,6 +47,127 @@ function parseModelId(model: string): { providerId: string; modelId: string } | 
 }
 
 /**
+ * WorkBuddy SSE 流聚合：收集所有 chunk 拼接为非流式 chat.completion 响应。
+ * 参考 cpa-plugin stream.go 的 aggregateCompletion 实现。
+ */
+async function aggregateWorkbuddySSE(body: ReadableStream<Uint8Array>, model: string): Promise<string> {
+  const reader = body.getReader()
+  const decoder = new TextDecoder()
+  let content = '', reasoning = '', role = '', respModel = '', respID = '', finish = ''
+  let created = 0
+  let usage: Record<string, unknown> | null = null
+  const toolCalls: Map<number, Record<string, unknown>> = new Map()
+  const toolOrder: number[] = []
+
+  // 按 index 合并 tool_call delta
+  function mergeToolCallDelta(merged: Record<string, unknown>, delta: Record<string, unknown>) {
+    for (const k of ['id', 'type']) {
+      if (!(k in merged) && typeof delta[k] === 'string' && delta[k] !== '') {
+        merged[k] = delta[k]
+      }
+    }
+    // function.name 可能分片，拼接
+    if (delta.function && typeof delta.function === 'object') {
+      const df = delta.function as Record<string, unknown>
+      if (!merged.function) merged.function = {}
+      const mf = merged.function as Record<string, unknown>
+      if (typeof df.name === 'string') {
+        mf.name = (mf.name as string || '') + df.name
+      }
+      if (typeof df.arguments === 'string') {
+        mf.arguments = (mf.arguments as string || '') + df.arguments
+      }
+    }
+  }
+
+  let buffer = ''
+  while (true) {
+    const { done, value } = await reader.read()
+    if (done) break
+    buffer += decoder.decode(value, { stream: true })
+    // 按行处理
+    const lines = buffer.split('\n')
+    buffer = lines.pop() || '' // 保留未完成的行
+    for (const line of lines) {
+      let data = line.trim()
+      if (!data) continue
+      if (data.startsWith('data:')) data = data.slice(5).trim()
+      if (!data || data === '[DONE]') continue
+
+      try {
+        const chunk = JSON.parse(data)
+        if (chunk.id) respID = chunk.id
+        if (chunk.model) respModel = chunk.model
+        if (chunk.created) created = chunk.created
+        if (chunk.usage) usage = chunk.usage
+
+        const choices = chunk.choices as any[]
+        if (Array.isArray(choices)) {
+          for (const choice of choices) {
+            const delta = choice?.delta
+            if (delta && typeof delta === 'object') {
+              if (delta.role) role = delta.role
+              if (typeof delta.content === 'string') content += delta.content
+              if (typeof delta.reasoning_content === 'string') reasoning += delta.reasoning_content
+              if (Array.isArray(delta.tool_calls)) {
+                for (const tc of delta.tool_calls) {
+                  if (!tc || typeof tc !== 'object') continue
+                  const idx = typeof tc.index === 'number' ? tc.index : 0
+                  if (!toolCalls.has(idx)) {
+                    toolCalls.set(idx, { index: idx })
+                    toolOrder.push(idx)
+                  }
+                  mergeToolCallDelta(toolCalls.get(idx)!, tc)
+                }
+              }
+            }
+            if (choice.finish_reason) finish = choice.finish_reason
+          }
+        }
+      } catch {
+        // 跳过无法解析的行
+      }
+    }
+  }
+  // 处理 buffer 中剩余的行
+  if (buffer.trim()) {
+    let data = buffer.trim()
+    if (data.startsWith('data:')) data = data.slice(5).trim()
+    if (data && data !== '[DONE]') {
+      try {
+        const chunk = JSON.parse(data)
+        if (chunk.usage) usage = chunk.usage
+      } catch { /* ignore */ }
+    }
+  }
+
+  const message: Record<string, unknown> = {
+    role: role || 'assistant',
+    content: content,
+  }
+  if (reasoning) message.reasoning_content = reasoning
+  if (toolOrder.length > 0) {
+    toolOrder.sort((a, b) => a - b)
+    message.tool_calls = toolOrder.map(idx => toolCalls.get(idx)!)
+  }
+
+  const result: Record<string, unknown> = {
+    id: respID || 'chatcmpl-workbuddy',
+    object: 'chat.completion',
+    created: created || Math.floor(Date.now() / 1000),
+    model: respModel || model || 'unknown',
+    choices: [{
+      index: 0,
+      message: message,
+      finish_reason: finish || 'stop',
+    }],
+  }
+  if (usage) result.usage = usage
+
+  return JSON.stringify(result)
+}
+
+/**
  * WorkBuddy SSE chunk 清洗：去掉空 tool_calls/function_call 等噪音字段。
  * 参考 cpa-plugin stream.go 的 cleanChunkJSON 实现。
  * 不清洗这些字段会导致 strict 客户端（如某些 OpenAI SDK）解码失败：
@@ -507,6 +628,7 @@ async function proxyOAuthRequest(
     const r = realm || resolveRealm(token)
     const body = { ...forwardBody } as Record<string, unknown>
     // WorkBuddy 只支持流式请求，强制 stream: true
+    const originalStream = body.stream
     if (provider.id === 'workbuddy' && body.stream !== true) {
       body.stream = true
     }
@@ -515,7 +637,7 @@ async function proxyOAuthRequest(
       headers: buildOauthHeaders(cfg, token, { origin: buildOrigin(r), apiType: provider.apiType, cookies: tokenState?.cookies }),
       body: c.req.method === 'GET' || c.req.method === 'HEAD' ? undefined : JSON.stringify(body),
       signal: AbortSignal.timeout(300000),
-    })
+    }).then(resp => ({ resp, originalStream }))
   }
 
   try {
@@ -538,7 +660,7 @@ async function proxyOAuthRequest(
     }
 
     const primaryRealm = resolveRealm(token)
-    let response = await doFetch(token)
+    let { resp: response, originalStream } = await doFetch(token)
 
     // 401/403：可能 token 过期，刷新后重试一次
     if ((response.status === 401 || response.status === 403) && tokenState?.refresh_token) {
@@ -547,7 +669,9 @@ async function proxyOAuthRequest(
         const freshState = await readOauthToken(c.env, provider.id)
         if (freshState) {
           tokenState = freshState
-          response = await doFetch(freshState.access_token)
+          const retry = await doFetch(freshState.access_token)
+          response = retry.resp
+          originalStream = retry.originalStream
         }
       }
     }
@@ -557,10 +681,25 @@ async function proxyOAuthRequest(
       const alt = altRealm(primaryRealm)
       if (alt) {
         console.log(`[proxy-oauth] ${primaryRealm} 域 401，自动切换到 ${alt} 域重试`)
-        const altResponse = await doFetch(token, alt)
-        if (altResponse.ok || altResponse.status !== 401) {
-          return passthroughResponse(altResponse, cleanWorkbuddyChunk)
+        const altResult = await doFetch(token, alt)
+        if (altResult.resp.ok || altResult.resp.status !== 401) {
+          response = altResult.resp
+          originalStream = altResult.originalStream
         }
+      }
+    }
+
+    // WorkBuddy 非流式请求：收集 SSE 流并聚合成非流式 chat.completion 返回
+    if (response.ok && originalStream !== true && provider.id === 'workbuddy' && response.body) {
+      try {
+        const aggregated = await aggregateWorkbuddySSE(response.body, (forwardBody as Record<string, unknown>).model as string)
+        return new Response(aggregated, {
+          status: 200,
+          headers: { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' },
+        })
+      } catch (aggErr) {
+        console.error('[proxy-oauth] SSE aggregation failed:', aggErr)
+        // 聚合失败，回退到透传（客户端可能能处理）
       }
     }
 
