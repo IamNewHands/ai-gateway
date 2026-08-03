@@ -198,6 +198,19 @@ export interface CheckinResult {
   /** 上次签到时间（epoch ms） */
   lastCheckinAt?: number
   updatedAt: number
+  // ===== 额度信息（来自 get-user-resource，仅 CN 有效） =====
+  /** 可用余额 */
+  totalRemain?: number
+  /** 已用 */
+  totalUsed?: number
+  /** 额度池（总容量） */
+  totalSize?: number
+  /** 包数量 */
+  packCount?: number
+  /** 套餐类型：free / paid 等 */
+  paymentType?: string
+  /** 账号昵称（JWT 解出，解不出则留空） */
+  nickname?: string
 }
 
 export interface CreateProxyKeyRequest {

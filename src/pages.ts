@@ -1435,9 +1435,21 @@ async function loadCheckin() {
       var streak = (c.streakDays !== undefined && c.streakDays !== null) ? c.streakDays + ' 天' : '—'
       var credits = (c.totalCredits !== undefined && c.totalCredits !== null) ? c.totalCredits : '—'
       var realmBadge = c.realm === 'cn' ? '<span class="bd bd-on">CN</span>' : c.realm === 'global' ? '<span class="bd bd-off">Global</span>' : '<span class="bd bd-off">未知</span>'
-      html += '<article class="ki"><div class="key-main"><span class="key-icon" aria-hidden="true"><i class="fas fa-calendar-check"></i></span><div><div class="kv"><h3>' + escapeHtml(c.name) + '</h3>' + realmBadge + badge + '</div><p>连续签到：' + streak + ' · 总积分：' + credits + ' · 上次签到：' + escapeHtml(lastTime) + '</p>' + (c.message ? '<p class="mu" style="margin-top:2px">' + escapeHtml(c.message) + '</p>' : '') + '</div></div><div class="key-actions"><button class="btn btn-gh btn-xs" onclick="triggerCheckin(\\'' + c.providerId + '\\')"><i class="fas fa-calendar-check" aria-hidden="true"></i>签到</button></div></article>'
+      var payBadge = c.paymentType ? '<span class="bd bd-on">' + escapeHtml(c.paymentType) + '</span>' : ''
+      var title = c.nickname ? escapeHtml(c.nickname) + ' <small style="color:var(--muted)">' + escapeHtml(c.name) + '</small>' : escapeHtml(c.name)
+      var remain = (c.totalRemain !== undefined && c.totalRemain !== null) ? c.totalRemain : '—'
+      var used = (c.totalUsed !== undefined && c.totalUsed !== null) ? c.totalUsed : '—'
+      var size = (c.totalSize !== undefined && c.totalSize !== null) ? c.totalSize : '—'
+      var packs = (c.packCount !== undefined && c.packCount !== null) ? c.packCount + ' 个包' : '—'
+      var pct = (c.totalSize > 0 && c.totalUsed !== undefined && c.totalUsed !== null) ? Math.round(c.totalUsed / c.totalSize * 100) + '%' : ''
+      var creditLine = '可用 ' + remain + ' · 已用 ' + used + (pct ? ' · ' + pct : '') + ' · 额度池 ' + size + ' · ' + packs
+      var checkinLine = '连续签到：' + streak + ' · 总积分：' + credits + ' · 上次签到：' + escapeHtml(lastTime)
+      html += '<article class="ki"><div class="key-main"><span class="key-icon" aria-hidden="true"><i class="fas fa-calendar-check"></i></span><div><div class="kv"><h3>' + title + '</h3>' + realmBadge + payBadge + badge + '</div><p>' + creditLine + '</p><p style="margin-top:2px">' + checkinLine + '</p>' + (c.message ? '<p class="mu" style="margin-top:2px">' + escapeHtml(c.message) + '</p>' : '') + '</div></div><div class="key-actions"><button class="btn btn-gh btn-xs" data-cid="' + escapeHtml(c.providerId) + '"><i class="fas fa-calendar-check" aria-hidden="true"></i>签到</button></div></article>'
     })
     el.innerHTML = html
+    el.querySelectorAll('[data-cid]').forEach(function(btn) {
+      btn.addEventListener('click', function() { triggerCheckin(btn.getAttribute('data-cid')) })
+    })
   } catch(e) {
     el.innerHTML = '<div class="empty-state"><i class="fas fa-exclamation-triangle c-l"></i><h3>加载失败</h3></div>'
   }

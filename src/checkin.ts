@@ -49,24 +49,29 @@ function pickNum(obj: Record<string, any>, ...keys: string[]): number | undefine
 }
 
 /**
- * 发起一次 billing 请求。POST {}，带 Bearer + X-Domain。
+ * 发起一次 billing 请求。POST，带 Bearer + X-Domain。
+ * opts.body 传入则序列化为请求体（否则默认 {}）；opts.extraHeaders 合并额外头（X-User-Id 等）。
  * code!==0 抛业务错误（含 msg）；5xx/网络错误抛 Error。
  */
 async function billingCall(
   token: string,
   path: string,
-  realm: 'cn' | 'global'
+  realm: 'cn' | 'global',
+  opts?: { body?: any; extraHeaders?: Record<string, string> }
 ): Promise<any> {
   const base = realm === 'global' ? 'https://www.workbuddy.ai' : CHECKIN_BASE_CN
+  const headers: Record<string, string> = {
+    Authorization: `Bearer ${token}`,
+    Accept: 'application/json',
+    'Content-Type': 'application/json',
+    'X-Domain': realm === 'global' ? 'workbuddy.ai' : 'codebuddy.cn',
+  }
+  if (opts?.extraHeaders) Object.assign(headers, opts.extraHeaders)
+  const body = opts && opts.body !== undefined ? JSON.stringify(opts.body) : '{}'
   const res = await fetch(base + path, {
     method: 'POST',
-    headers: {
-      Authorization: `Bearer ${token}`,
-      Accept: 'application/json',
-      'Content-Type': 'application/json',
-      'X-Domain': realm === 'global' ? 'workbuddy.ai' : 'codebuddy.cn',
-    },
-    body: '{}',
+    headers,
+    body,
     signal: AbortSignal.timeout(30000),
   })
 
@@ -132,6 +137,163 @@ async function performCheckin(
   }
 }
 
+// ===== JWT 解码 / 额度拉取 =====
+
+/** 解码 JWT payload（不验签），用于取 uid / enterpriseId / nickname。 */
+function decodeJwtClaims(token: string): Record<string, any> | null {
+  const parts = token.split('.')
+  if (parts.length < 2) return null
+  let payload = parts[1].replace(/-/g, '+').replace(/_/g, '/')
+  switch (payload.length % 4) {
+    case 0: break
+    case 2: payload += '=='; break
+    case 3: payload += '='; break
+    default: return null
+  }
+  try {
+    return JSON.parse(atob(payload))
+  } catch {
+    return null
+  }
+}
+
+/** 从 claims 里按多个候选键名取第一个非空字符串值。 */
+function pickClaim(claims: Record<string, any> | null, ...keys: string[]): string {
+  if (!claims) return ''
+  for (const k of keys) {
+    const v = claims[k]
+    if (v !== undefined && v !== null && String(v).trim() !== '') return String(v).trim()
+  }
+  return ''
+}
+
+/**
+ * 单个资源包的 remain/used/size 计算（移植自 CPA packageRemainUsed）。
+ * 优先 Cycle 字段，回退 Capacity 字段；used = size − remain，避免漏报消耗。
+ */
+function packageRemainUsed(a: any): { remain: number; used: number; size: number } {
+  const num = (v: any) => (v === undefined || v === null || v === '') ? 0 : (Number(v) || 0)
+  if (num(a.CycleCapacitySize) > 0) {
+    let remain = num(a.CycleCapacityRemain)
+    const size = num(a.CycleCapacitySize)
+    if (remain < 0) remain = 0
+    if (remain > size) remain = size
+    let used = size - remain
+    if (num(a.CycleCapacityUsed) > used) {
+      used = num(a.CycleCapacityUsed)
+      if (size >= used) remain = size - used
+    }
+    return { remain, used, size }
+  }
+  if (num(a.CycleCapacityRemain) > 0 || num(a.CycleCapacityUsed) > 0) {
+    let remain = num(a.CycleCapacityRemain)
+    let used = num(a.CycleCapacityUsed)
+    if (remain < 0) remain = 0
+    if (used < 0) used = 0
+    let size = remain + used
+    if (num(a.CapacitySize) > size) {
+      size = num(a.CapacitySize)
+      if (size >= remain) used = size - remain
+    }
+    return { remain, used, size }
+  }
+  let remain = num(a.CapacityRemain)
+  let used = num(a.CapacityUsed)
+  let size = num(a.CapacitySize)
+  if (remain < 0) remain = 0
+  if (used < 0) used = 0
+  if (size <= 0) size = remain + used
+  if (used === 0 && size > remain) used = size - remain
+  return { remain, used, size }
+}
+
+/** 格式化为 CodeBuddy 接口期望的 "YYYY-MM-DD HH:mm:ss"（本地时间）。 */
+function fmtLocalTime(d: Date): string {
+  const p = (n: number) => String(n).padStart(2, '0')
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`
+}
+
+/**
+ * 拉取用户资源（额度）：POST /v2/billing/meter/get-user-resource
+ * 聚合所有包得到 totalRemain/totalUsed/totalSize/packCount（移植自 CPA fetchUserResource）。
+ * uid/enterpriseId 非空时补 X-User-Id / X-Enterprise-Id / X-Tenant-Id 头。
+ */
+async function fetchUserResource(
+  token: string,
+  realm: 'cn' | 'global',
+  uid: string,
+  enterpriseId: string
+): Promise<{ totalRemain: number; totalUsed: number; totalSize: number; packCount: number } | null> {
+  const now = new Date()
+  const end = new Date(now.getTime() + 365 * 101 * 24 * 60 * 60 * 1000)
+  const body = {
+    PageNumber: 1,
+    PageSize: 100,
+    ProductCode: 'p_tcaca',
+    Status: [0, 3],
+    PackageEndTimeRangeBegin: fmtLocalTime(now),
+    PackageEndTimeRangeEnd: fmtLocalTime(end),
+  }
+  const extraHeaders: Record<string, string> = {}
+  if (uid) extraHeaders['X-User-Id'] = uid
+  if (enterpriseId) {
+    extraHeaders['X-Enterprise-Id'] = enterpriseId
+    extraHeaders['X-Tenant-Id'] = enterpriseId
+  }
+  try {
+    const data = await billingCall(token, '/v2/billing/meter/get-user-resource', realm, { body, extraHeaders })
+    const resp = data && data.Response && data.Response.Data ? data.Response.Data : null
+    if (!resp) return null
+    const accounts: any[] = Array.isArray(resp.Accounts) ? resp.Accounts : []
+    let totalRemain = 0, totalUsed = 0, totalSize = 0
+    for (const a of accounts) {
+      const { remain, used, size } = packageRemainUsed(a)
+      totalRemain += remain
+      totalUsed += used
+      totalSize += size
+    }
+    const packCount = accounts.length
+    // 用 size−remain 对齐 used，保证 UI 总计自洽
+    if (totalSize > 0) {
+      const derived = Math.max(0, totalSize - totalRemain)
+      if (derived > totalUsed) totalUsed = derived
+    }
+    // TotalDosage 是额度池下限，包 size 不全时用它兜底
+    const dosage = Number(resp.TotalDosage) || 0
+    if (dosage > totalSize) {
+      totalSize = dosage
+      const derived = Math.max(0, totalSize - totalRemain)
+      if (derived > totalUsed) totalUsed = derived
+    }
+    return { totalRemain, totalUsed, totalSize, packCount }
+  } catch (e) {
+    console.warn(`[checkin] fetchUserResource failed: ${(e as Error).message}`)
+    return null
+  }
+}
+
+/** 拉取套餐类型：POST /v2/billing/meter/get-payment-type → paymentType（free/paid…）。 */
+async function fetchPaymentType(
+  token: string,
+  realm: 'cn' | 'global',
+  uid: string,
+  enterpriseId: string
+): Promise<string> {
+  const extraHeaders: Record<string, string> = {}
+  if (uid) extraHeaders['X-User-Id'] = uid
+  if (enterpriseId) {
+    extraHeaders['X-Enterprise-Id'] = enterpriseId
+    extraHeaders['X-Tenant-Id'] = enterpriseId
+  }
+  try {
+    const data = await billingCall(token, '/v2/billing/meter/get-payment-type', realm, { extraHeaders })
+    if (data && typeof data.paymentType === 'string') return data.paymentType
+    return ''
+  } catch {
+    return ''
+  }
+}
+
 // ===== KV 结果读写 =====
 
 const resultKey = (providerId: string) => KV_KEYS.CHECKIN_RESULT_PREFIX + providerId
@@ -176,12 +338,30 @@ export async function checkinOneAccount(env: Env, provider: Provider): Promise<C
     return base
   }
 
+  // 从 JWT 解出 uid / enterpriseId / nickname（额度接口与面板展示用）
+  const claims = decodeJwtClaims(token)
+  const uid = pickClaim(claims, 'uid', 'user_id', 'userId', 'sub')
+  const enterpriseId = pickClaim(claims, 'enterprise_id', 'enterpriseId', 'tenant_id', 'tenantId')
+  const nickname = pickClaim(claims, 'nickname', 'name', 'username', 'nick')
+  if (nickname) base.nickname = nickname
+
   const realm = detectTokenRealm(token)
   if (realm === 'global') {
     base.realm = 'global'
     base.reason = 'skipped_global'
     base.message = '国际版账号无签到功能'
     base.success = true
+    // 国际版也拉额度信息（对齐 CPA 面板展示）
+    const credits = await fetchUserResource(token, 'global', uid, enterpriseId)
+    if (credits) {
+      base.totalRemain = credits.totalRemain
+      base.totalUsed = credits.totalUsed
+      base.totalSize = credits.totalSize
+      base.packCount = credits.packCount
+    }
+    const pt = await fetchPaymentType(token, 'global', uid, enterpriseId)
+    if (pt) base.paymentType = pt
+    await writeCheckinResult(env, provider.id, base)
     return base
   }
   if (realm !== 'cn') {
@@ -225,6 +405,17 @@ export async function checkinOneAccount(env: Env, provider: Provider): Promise<C
     base.totalCredits = status2.totalCredits
     base.dailyCredit = status2.dailyCredit
   }
+
+  // 额度信息（可用/已用/额度池/包数 + 套餐类型）
+  const credits = await fetchUserResource(token, 'cn', uid, enterpriseId)
+  if (credits) {
+    base.totalRemain = credits.totalRemain
+    base.totalUsed = credits.totalUsed
+    base.totalSize = credits.totalSize
+    base.packCount = credits.packCount
+  }
+  const pt = await fetchPaymentType(token, 'cn', uid, enterpriseId)
+  if (pt) base.paymentType = pt
 
   await writeCheckinResult(env, provider.id, base)
   return base
