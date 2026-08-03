@@ -73,6 +73,22 @@ Authorization: Bearer sk_cf_xxxxxxxxxxxxxxxxxxxxxxxxxxxx
 }
 ```
 
+### 对外管理 API 认证 (Management Token)
+
+`/api/manage/*` 端点供外部脚本（手机、CI 等）维护 provider，使用独立的 `MANAGEMENT_TOKEN`（环境变量）做 Bearer 认证，与上述两套凭证无关：
+
+```
+Authorization: Bearer <MANAGEMENT_TOKEN>
+```
+
+未配置 `MANAGEMENT_TOKEN` → `503`；缺失/不匹配 → `401`。完整对接说明与多语言 demo 代码见 [MANAGE_API.md](./MANAGE_API.md)。
+
+| 端点 | 方法 | 说明 |
+|------|------|------|
+| `/api/manage/providers` | GET | 查询全部 provider |
+| `/api/manage/providers/upsert` | POST | upsert + 合并 provider（存在则合并 keys/models，不存在则创建） |
+| `/api/manage/providers/:id` | DELETE | 删除 provider |
+
 ## API 端点
 
 ### 公开端点
