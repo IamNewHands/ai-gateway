@@ -1044,18 +1044,19 @@ function showEditModelsList(id, models) {
     el.className = 'fg'
     const pd = document.getElementById('dt-' + id)
     if (!pd) { console.error('showEditModelsList: dt-' + id + ' not found'); return }
-    const sections = pd.querySelectorAll('.fg, fieldset.form-group')
-    let inserted = false
+    // 找到模型 fieldset 并插入到它前面
+    const sections = pd.querySelectorAll('fieldset.form-group')
+    let target = null
     for (var i = 0; i < sections.length; i++) {
-      var lbl = sections[i].querySelector('label') || sections[i].querySelector('legend')
+      var lbl = sections[i].querySelector('legend')
       if (lbl && (lbl.textContent.trim() === '模型' || lbl.textContent.includes('模型'))) {
-        pd.insertBefore(el, sections[i])
-        inserted = true
+        target = sections[i]
         break
       }
     }
-    if (!inserted) {
-      // fallback: 插入到 pd 末尾
+    if (target && target.parentNode === pd) {
+      pd.insertBefore(el, target)
+    } else {
       pd.appendChild(el)
     }
   }
