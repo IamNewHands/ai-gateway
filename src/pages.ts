@@ -1419,40 +1419,59 @@ async function loadCheckin() {
   try {
     const r = await fetch('/admin/api/checkin/status')
     const d = await r.json()
-    if (!d.success || !d.data || d.data.length === 0) {
-      el.innerHTML = '<div class="empty-state"><i class="fas fa-calendar-check" aria-hidden="true"></i><h3>暂无签到数据</h3><p>配置 WorkBuddy OAuth 提供商后，点击「全部签到」。</p></div>'
-      return
-    }
-    var html = ''
-    d.data.forEach(function(c) {
-      var reason = c.reason || 'fail'
-      var badge = reason === 'ok' ? '<span class="bd bd-on">签到成功</span>'
-        : reason === 'already' ? '<span class="bd bd-on">今日已签</span>'
-        : reason === 'skipped_global' ? '<span class="bd bd-off">国际版跳过</span>'
-        : reason === 'skipped_no_token' ? '<span class="bd bd-off">未签到</span>'
-        : '<span class="bd bd-off">失败</span>'
-      var lastTime = c.lastCheckinAt ? new Date(c.lastCheckinAt).toLocaleString() : '—'
-      var streak = (c.streakDays !== undefined && c.streakDays !== null) ? c.streakDays + ' 天' : '—'
-      var credits = (c.totalCredits !== undefined && c.totalCredits !== null) ? c.totalCredits : '—'
-      var realmBadge = c.realm === 'cn' ? '<span class="bd bd-on">CN</span>' : c.realm === 'global' ? '<span class="bd bd-off">Global</span>' : '<span class="bd bd-off">未知</span>'
-      var payBadge = c.paymentType ? '<span class="bd bd-on">' + escapeHtml(c.paymentType) + '</span>' : ''
-      var title = c.nickname ? escapeHtml(c.nickname) + ' <small style="color:var(--muted)">' + escapeHtml(c.name) + '</small>' : escapeHtml(c.name)
-      var remain = (c.totalRemain !== undefined && c.totalRemain !== null) ? c.totalRemain : '—'
-      var used = (c.totalUsed !== undefined && c.totalUsed !== null) ? c.totalUsed : '—'
-      var size = (c.totalSize !== undefined && c.totalSize !== null) ? c.totalSize : '—'
-      var packs = (c.packCount !== undefined && c.packCount !== null) ? c.packCount + ' 个包' : '—'
-      var pct = (c.totalSize > 0 && c.totalUsed !== undefined && c.totalUsed !== null) ? Math.round(c.totalUsed / c.totalSize * 100) + '%' : ''
-      var creditLine = '可用 ' + remain + ' · 已用 ' + used + (pct ? ' · ' + pct : '') + ' · 额度池 ' + size + ' · ' + packs
-      var checkinLine = '连续签到：' + streak + ' · 总积分：' + credits + ' · 上次签到：' + escapeHtml(lastTime)
-      html += '<article class="ki"><div class="key-main"><span class="key-icon" aria-hidden="true"><i class="fas fa-calendar-check"></i></span><div><div class="kv"><h3>' + title + '</h3>' + realmBadge + payBadge + badge + '</div><p>' + creditLine + '</p><p style="margin-top:2px">' + checkinLine + '</p>' + (c.message ? '<p class="mu" style="margin-top:2px">' + escapeHtml(c.message) + '</p>' : '') + '</div></div><div class="key-actions"><button class="btn btn-gh btn-xs" data-cid="' + escapeHtml(c.providerId) + '"><i class="fas fa-calendar-check" aria-hidden="true"></i>签到</button></div></article>'
-    })
-    el.innerHTML = html
-    el.querySelectorAll('[data-cid]').forEach(function(btn) {
-      btn.addEventListener('click', function() { triggerCheckin(btn.getAttribute('data-cid')) })
-    })
+    renderCheckinList(d)
   } catch(e) {
     el.innerHTML = '<div class="empty-state"><i class="fas fa-exclamation-triangle c-l"></i><h3>加载失败</h3></div>'
+    return
   }
+  // 后台静默刷新最新状态（签到状态+额度），完成后更新显示，不写日志
+  refreshCheckinInBackground()
+}
+
+function renderCheckinList(d) {
+  const el = document.getElementById('checkin-list')
+  if (!el) return
+  if (!d || !d.success || !d.data || d.data.length === 0) {
+    el.innerHTML = '<div class="empty-state"><i class="fas fa-calendar-check" aria-hidden="true"></i><h3>暂无签到数据</h3><p>配置 WorkBuddy OAuth 提供商后，点击「全部签到」。</p></div>'
+    return
+  }
+  var html = ''
+  d.data.forEach(function(c) {
+    var reason = c.reason || 'fail'
+    var badge = reason === 'ok' ? '<span class="bd bd-on">签到成功</span>'
+      : reason === 'already' ? '<span class="bd bd-on">今日已签</span>'
+      : reason === 'skipped_global' ? '<span class="bd bd-off">国际版跳过</span>'
+      : reason === 'skipped_no_token' ? '<span class="bd bd-off">未签到</span>'
+      : '<span class="bd bd-off">失败</span>'
+    var lastTime = c.lastCheckinAt ? new Date(c.lastCheckinAt).toLocaleString() : '—'
+    var streak = (c.streakDays !== undefined && c.streakDays !== null) ? c.streakDays + ' 天' : '—'
+    var credits = (c.totalCredits !== undefined && c.totalCredits !== null) ? c.totalCredits : '—'
+    var realmBadge = c.realm === 'cn' ? '<span class="bd bd-on">CN</span>' : c.realm === 'global' ? '<span class="bd bd-off">Global</span>' : '<span class="bd bd-off">未知</span>'
+    var payBadge = c.paymentType ? '<span class="bd bd-on">' + escapeHtml(c.paymentType) + '</span>' : ''
+    var title = c.nickname ? escapeHtml(c.nickname) + ' <small style="color:var(--muted)">' + escapeHtml(c.name) + '</small>' : escapeHtml(c.name)
+    var remain = (c.totalRemain !== undefined && c.totalRemain !== null) ? c.totalRemain : '—'
+    var used = (c.totalUsed !== undefined && c.totalUsed !== null) ? c.totalUsed : '—'
+    var size = (c.totalSize !== undefined && c.totalSize !== null) ? c.totalSize : '—'
+    var packs = (c.packCount !== undefined && c.packCount !== null) ? c.packCount + ' 个包' : '—'
+    var pct = (c.totalSize > 0 && c.totalUsed !== undefined && c.totalUsed !== null) ? Math.round(c.totalUsed / c.totalSize * 100) + '%' : ''
+    var creditLine = '可用 ' + remain + ' · 已用 ' + used + (pct ? ' · ' + pct : '') + ' · 额度池 ' + size + ' · ' + packs
+    var checkinLine = '连续签到：' + streak + ' · 总积分：' + credits + ' · 上次签到：' + escapeHtml(lastTime)
+    html += '<article class="ki"><div class="key-main"><span class="key-icon" aria-hidden="true"><i class="fas fa-calendar-check"></i></span><div><div class="kv"><h3>' + title + '</h3>' + realmBadge + payBadge + badge + '</div><p>' + creditLine + '</p><p style="margin-top:2px">' + checkinLine + '</p>' + (c.message ? '<p class="mu" style="margin-top:2px">' + escapeHtml(c.message) + '</p>' : '') + '</div></div><div class="key-actions"><button class="btn btn-gh btn-xs" data-cid="' + escapeHtml(c.providerId) + '"><i class="fas fa-calendar-check" aria-hidden="true"></i>签到</button></div></article>'
+  })
+  el.innerHTML = html
+  el.querySelectorAll('[data-cid]').forEach(function(btn) {
+    btn.addEventListener('click', function() { triggerCheckin(btn.getAttribute('data-cid')) })
+  })
+}
+
+async function refreshCheckinInBackground() {
+  try {
+    const r = await fetch('/admin/api/checkin', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ silent: true }) })
+    const d = await r.json()
+    if (d.success && d.data && d.data.results) {
+      renderCheckinList({ success: true, data: d.data.results })
+    }
+  } catch(e) { /* 静默刷新失败不提示 */ }
 }
 
 async function triggerCheckin(id) {
@@ -1464,10 +1483,11 @@ async function triggerCheckin(id) {
     if (d.success) {
       var msg = id ? '签到完成' : '签到完成：成功 ' + (d.data.success||0) + ' / 已签 ' + (d.data.already||0) + ' / 失败 ' + (d.data.fail||0) + ' / 跳过 ' + (d.data.skipped||0)
       toast(msg, 'success')
+      var results = id ? [d.data] : (d.data.results || [])
+      renderCheckinList({ success: true, data: results })
     } else {
       toast(d.message || '签到失败', 'error')
     }
-    await loadCheckin()
   } catch(e) {
     toast('签到请求失败', 'error')
   }

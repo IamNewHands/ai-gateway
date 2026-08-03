@@ -429,7 +429,7 @@ export async function checkinOneAccount(env: Env, provider: Provider): Promise<C
 
 // ===== 全量签到 =====
 
-export async function runAllCheckins(env: Env): Promise<{
+export async function runAllCheckins(env: Env, silent = false): Promise<{
   total: number
   success: number
   already: number
@@ -446,10 +446,12 @@ export async function runAllCheckins(env: Env): Promise<{
     try {
       const r = await checkinOneAccount(env, p)
       results.push(r)
-      // 写日志
-      try {
-        await writeLog(env, 'info', `[checkin] ${p.name} → ${r.reason}`, JSON.stringify(r))
-      } catch { /* ignore */ }
+      // 写日志（silent 模式跳过，用于面板后台静默刷新，避免日志噪音）
+      if (!silent) {
+        try {
+          await writeLog(env, 'info', `[checkin] ${p.name} → ${r.reason}`, JSON.stringify(r))
+        } catch { /* ignore */ }
+      }
     } catch (e) {
       const r: CheckinResult = {
         providerId: p.id, name: p.name, realm: 'unknown',
@@ -472,7 +474,7 @@ export async function runAllCheckins(env: Env): Promise<{
 
 /** POST /admin/api/checkin 或 /api/manage/checkin：手动触发签到。body 可选 {id} 单个。 */
 export async function handleCheckinTrigger(c: Context<{ Bindings: Env }>) {
-  let body: { id?: string } = {}
+  let body: { id?: string; silent?: boolean } = {}
   try { body = await c.req.json() } catch { /* 空 body，全量 */ }
   const id = body.id?.trim()
 
@@ -481,11 +483,13 @@ export async function handleCheckinTrigger(c: Context<{ Bindings: Env }>) {
     const p = providers.find((x) => x.id === id)
     if (!p) return c.json<ApiResponse>({ success: false, message: '提供商不存在' }, 404)
     const result = await checkinOneAccount(c.env, p)
-    try { await writeLog(c.env, 'info', `[checkin] ${p.name} → ${result.reason}（手动）`, JSON.stringify(result)) } catch { /* ignore */ }
+    if (!body.silent) {
+      try { await writeLog(c.env, 'info', `[checkin] ${p.name} → ${result.reason}（手动）`, JSON.stringify(result)) } catch { /* ignore */ }
+    }
     return c.json<ApiResponse<CheckinResult>>({ success: true, data: result })
   }
 
-  const summary = await runAllCheckins(c.env)
+  const summary = await runAllCheckins(c.env, !!body.silent)
   return c.json<ApiResponse>({ success: true, data: summary })
 }
 
