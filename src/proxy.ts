@@ -59,29 +59,32 @@ function parseModelId(model: string): { providerId: string; modelId: string } | 
 
 /** 生成请求体摘要：保留顶层字段名和结构，但截断 messages 内容 */
 function summarizeRequestBody(body: Record<string, unknown>): Record<string, unknown> {
-  const summary: Record<string, unknown> = {}
-  for (const [key, value] of Object.entries(body)) {
-    if (key === 'messages' && Array.isArray(value)) {
-      summary[key] = value.map((msg: any) => ({
-        role: msg.role,
-        content_length: typeof msg.content === 'string'
-          ? msg.content.length
-          : Array.isArray(msg.content)
-            ? msg.content.length + ' blocks'
-            : String(msg.content).length,
-        ...(msg.tool_calls ? { tool_calls_count: msg.tool_calls.length } : {}),
-        ...(msg.tool_call_id ? { tool_call_id: msg.tool_call_id } : {}),
-      }))
-    } else if (key === 'tools' && Array.isArray(value)) {
-      summary[key] = value.map((t: any) => ({
-        type: t.type,
-        function_name: t.function?.name,
-      }))
-    } else {
-      summary[key] = value
+  try {
+    const summary: Record<string, unknown> = {}
+    for (const [key, value] of Object.entries(body)) {
+      if (key === 'messages' && Array.isArray(value)) {
+        summary[key] = value.map((msg: any) => {
+          if (!msg || typeof msg !== 'object') return String(msg)
+          const entry: Record<string, unknown> = { role: msg.role || 'unknown' }
+          if (typeof msg.content === 'string') {
+            entry.content_length = msg.content.length
+          } else if (Array.isArray(msg.content)) {
+            entry.content_blocks = msg.content.length
+          }
+          if (Array.isArray(msg.tool_calls)) entry.tool_calls_count = msg.tool_calls.length
+          if (typeof msg.tool_call_id === 'string') entry.tool_call_id = msg.tool_call_id
+          return entry
+        })
+      } else if (key === 'tools' && Array.isArray(value)) {
+        summary[key] = value.map((t: any) => (t && t.function ? { name: t.function.name } : String(t)))
+      } else {
+        summary[key] = value
+      }
     }
+    return summary
+  } catch {
+    return { _error: 'summarize failed', keys: Object.keys(body) }
   }
-  return summary
 }
 
 /**
@@ -572,7 +575,7 @@ export async function handleProxy(c: Context<{ Bindings: Env }>) {
           }
           if (healthUpdated) await writeHealth(c.env, providerId, healthData)
 
-          c.executionCtx.waitUntil(writeLog(c.env, 'request', `[${provider.name}] ${model} → 200 (key: ${apiKey.substring(0, 8)}...)`, `provider=${providerId}`))
+          try { c.executionCtx.waitUntil(writeLog(c.env, 'request', `[${provider.name}] ${model} → 200 (key: ${apiKey.substring(0, 8)}...)`, `provider=${providerId}`)) } catch {}
           return passthroughResponse(response)
         }
 
@@ -598,7 +601,7 @@ export async function handleProxy(c: Context<{ Bindings: Env }>) {
 
         // 其他错误（400/404 等）直接返回
         const errorData = await response.json().catch(async () => ({ error: { message: await response.text() } }))
-        c.executionCtx.waitUntil(writeLog(c.env, 'error', `[${provider.name}] ${model} → ${response.status} ${forwardUrl}`, JSON.stringify({ error: errorData, body: summarizeRequestBody(forwardBody), url: forwardUrl }).substring(0, 4000)))
+        try { c.executionCtx.waitUntil(writeLog(c.env, 'error', `[${provider.name}] ${model} → ${response.status} ${forwardUrl}`, JSON.stringify({ error: errorData, body: summarizeRequestBody(forwardBody), url: forwardUrl }).substring(0, 4000))) } catch {}
         return c.json(errorData, response.status as Parameters<typeof c.json>[1])
       } catch (err) {
         const error = err as Error
@@ -951,16 +954,17 @@ export async function handleAnthropicMessages(c: Context<{ Bindings: Env }>) {
 
       if (!response.ok) {
         const errText = await response.text()
-        // 记录请求体摘要：去掉 messages 内容，只保留结构字段名
-        const bodySummary = summarizeRequestBody(upstreamBody)
-        c.executionCtx.waitUntil(writeLog(c.env, 'error', `[anthropic] ${model} → ${response.status} ${upstreamUrl}`, JSON.stringify({ error: errText, body: bodySummary, url: upstreamUrl }).substring(0, 4000)))
+        try {
+          const bodySummary = summarizeRequestBody(upstreamBody)
+          c.executionCtx.waitUntil(writeLog(c.env, 'error', `[anthropic] ${model} → ${response.status} ${upstreamUrl}`, JSON.stringify({ error: errText, body: bodySummary, url: upstreamUrl }).substring(0, 4000)))
+        } catch { /* log failure must not break request */ }
         return c.json({
           type: 'error',
           error: { type: 'upstream_error', message: `Upstream error: ${errText}` },
         }, response.status as Parameters<typeof c.json>[1])
       }
 
-      c.executionCtx.waitUntil(writeLog(c.env, 'request', `[anthropic] ${model} → 200 ${upstreamUrl}`, `stream=${originalStream}`))
+      try { c.executionCtx.waitUntil(writeLog(c.env, 'request', `[anthropic] ${model} → 200 ${upstreamUrl}`, `stream=${originalStream}`)) } catch {}
 
       // 流式：OpenAI SSE → Anthropic SSE 实时转换
       if (originalStream && response.body) {
@@ -1089,14 +1093,14 @@ export async function handleAnthropicMessages(c: Context<{ Bindings: Env }>) {
 
     if (!response.ok) {
       const errText = await response.text()
-      c.executionCtx.waitUntil(writeLog(c.env, 'error', `[anthropic] ${model} → ${response.status} ${forwardUrl}`, JSON.stringify({ error: errText, body: summarizeRequestBody(upstreamBody), url: forwardUrl }).substring(0, 4000)))
+      try { c.executionCtx.waitUntil(writeLog(c.env, 'error', `[anthropic] ${model} → ${response.status} ${forwardUrl}`, JSON.stringify({ error: errText, body: summarizeRequestBody(upstreamBody), url: forwardUrl }).substring(0, 4000))) } catch {}
       return c.json({
         type: 'error',
         error: { type: 'upstream_error', message: `Upstream error: ${errText}` },
       }, response.status as Parameters<typeof c.json>[1])
     }
 
-    c.executionCtx.waitUntil(writeLog(c.env, 'request', `[anthropic] ${model} → 200 ${forwardUrl}`, `stream=${originalStream}`))
+    try { c.executionCtx.waitUntil(writeLog(c.env, 'request', `[anthropic] ${model} → 200 ${forwardUrl}`, `stream=${originalStream}`)) } catch {}
 
     // 流式：OpenAI SSE → Anthropic SSE 实时转换
     if (originalStream && response.body) {
@@ -1302,13 +1306,13 @@ export async function handleResponses(c: Context<{ Bindings: Env }>) {
 
       if (!response.ok) {
         const errText = await response.text()
-        c.executionCtx.waitUntil(writeLog(c.env, 'error', `[responses] ${model} → ${response.status} ${upstreamUrl}`, JSON.stringify({ error: errText, body: summarizeRequestBody(upstreamBody), url: upstreamUrl }).substring(0, 4000)))
+        try { c.executionCtx.waitUntil(writeLog(c.env, 'error', `[responses] ${model} → ${response.status} ${upstreamUrl}`, JSON.stringify({ error: errText, body: summarizeRequestBody(upstreamBody), url: upstreamUrl }).substring(0, 4000))) } catch {}
         return c.json({
           error: { message: `Upstream error: ${errText}`, type: 'upstream_error' },
         }, response.status as Parameters<typeof c.json>[1])
       }
 
-      c.executionCtx.waitUntil(writeLog(c.env, 'request', `[responses] ${model} → 200 ${upstreamUrl}`, `stream=${originalStream}`))
+      try { c.executionCtx.waitUntil(writeLog(c.env, 'request', `[responses] ${model} → 200 ${upstreamUrl}`, `stream=${originalStream}`)) } catch {}
 
       // 流式
       if (originalStream && response.body) {
@@ -1425,13 +1429,13 @@ export async function handleResponses(c: Context<{ Bindings: Env }>) {
 
     if (!response.ok) {
       const errText = await response.text()
-      c.executionCtx.waitUntil(writeLog(c.env, 'error', `[responses] ${model} → ${response.status} ${forwardUrl}`, JSON.stringify({ error: errText, body: summarizeRequestBody(upstreamBody), url: forwardUrl }).substring(0, 4000)))
+      try { c.executionCtx.waitUntil(writeLog(c.env, 'error', `[responses] ${model} → ${response.status} ${forwardUrl}`, JSON.stringify({ error: errText, body: summarizeRequestBody(upstreamBody), url: forwardUrl }).substring(0, 4000))) } catch {}
       return c.json({
         error: { message: `Upstream error: ${errText}`, type: 'upstream_error' },
       }, response.status as Parameters<typeof c.json>[1])
     }
 
-    c.executionCtx.waitUntil(writeLog(c.env, 'request', `[responses] ${model} → 200 ${forwardUrl}`, `stream=${originalStream}`))
+    try { c.executionCtx.waitUntil(writeLog(c.env, 'request', `[responses] ${model} → 200 ${forwardUrl}`, `stream=${originalStream}`)) } catch {}
 
     // 流式：OpenAI SSE → Responses SSE 实时转换
     if (originalStream && response.body) {
