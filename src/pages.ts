@@ -946,15 +946,16 @@ async function fetchOauthModels(id) {
       let debugInfo = ''
       if (d.data) {
         const dbg = d.data.debug || d.data
-        debugInfo = '\n\n--- 调试信息 ---\n'
-        if (dbg.realm) debugInfo += 'Token 域: ' + dbg.realm + '\n'
-        if (dbg.tokenHeader) debugInfo += '认证头: ' + dbg.tokenHeader + (dbg.tokenHeaderPrefix ? ' ' + dbg.tokenHeaderPrefix + '<token>' : ' <token>') + '\n'
-        debugInfo += '有 Cookie: ' + (dbg.hasCookies ? '是 (' + (dbg.cookiesPreview || '') + ')' : '否') + '\n'
-        if (dbg.modelsUrl) debugInfo += '模型 URL: ' + dbg.modelsUrl + '\n'
-        if (dbg.requestUrl) debugInfo += '请求 URL: ' + dbg.requestUrl + '\n'
-        if (dbg.requestHeaders) debugInfo += '请求头: ' + JSON.stringify(dbg.requestHeaders, null, 2) + '\n'
-        if (dbg.tokenExpiresAt) debugInfo += 'Token 过期: ' + dbg.tokenExpiresAt + '\n'
-        if (d.data.allErrors) debugInfo += '所有错误: ' + JSON.stringify(d.data.allErrors) + '\n'
+        const NL = String.fromCharCode(10)
+        debugInfo = NL + NL + '--- 调试信息 ---' + NL
+        if (dbg.realm) debugInfo += 'Token 域: ' + dbg.realm + NL
+        if (dbg.tokenHeader) debugInfo += '认证头: ' + dbg.tokenHeader + (dbg.tokenHeaderPrefix ? ' ' + dbg.tokenHeaderPrefix + '<token>' : ' <token>') + NL
+        debugInfo += '有 Cookie: ' + (dbg.hasCookies ? '是 (' + (dbg.cookiesPreview || '') + ')' : '否') + NL
+        if (dbg.modelsUrl) debugInfo += '模型 URL: ' + dbg.modelsUrl + NL
+        if (dbg.requestUrl) debugInfo += '请求 URL: ' + dbg.requestUrl + NL
+        if (dbg.requestHeaders) debugInfo += '请求头: ' + JSON.stringify(dbg.requestHeaders, null, 2) + NL
+        if (dbg.tokenExpiresAt) debugInfo += 'Token 过期: ' + dbg.tokenExpiresAt + NL
+        if (d.data.allErrors) debugInfo += '所有错误: ' + JSON.stringify(d.data.allErrors) + NL
       }
       if (tr) showResult(tr, false, escapeHtml(msg + debugInfo))
       if (st) st.textContent = msg
