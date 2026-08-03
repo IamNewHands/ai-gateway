@@ -27,14 +27,14 @@ export async function deleteOauthToken(env: Env, providerId: string): Promise<vo
 }
 
 /**
- * 构造转发到上游时使用的认证头：注入 tokenHeader + prefix + extraHeaders。
+ * 构造转发到上游时使用的认证头：注入 tokenHeader + prefix + extraHeaders + cookies。
  * 供 proxy 转发、模型列表拉取、模型连通性测试复用，保证三者一致。
  * opts.origin 可覆盖 Origin/Referer（用于 Global 域路由）。
  */
 export function buildOauthHeaders(
   cfg: OAuthDeviceConfig,
   token: string,
-  opts?: { contentType?: string; origin?: string; apiType?: string }
+  opts?: { contentType?: string; origin?: string; apiType?: string; cookies?: string }
 ): Record<string, string> {
   const tokenHeader = cfg.tokenHeader || 'x-api-key'
   const prefix = cfg.tokenHeaderPrefix || ''
@@ -47,6 +47,9 @@ export function buildOauthHeaders(
   if (opts?.origin) {
     headers['Origin'] = opts.origin
     headers['Referer'] = opts.origin + '/'
+  }
+  if (opts?.cookies) {
+    headers['Cookie'] = opts.cookies
   }
   if (opts?.apiType === 'anthropic') headers['anthropic-version'] = '2023-06-01'
   return headers
@@ -326,11 +329,14 @@ async function pollOauthBrowserFlow(env: Env, providerId: string, cfg: OAuthDevi
 
     const tok = env_resp.data
     const expiresInSec = tok.expiresIn || 7200
+    // 保存 cookies 到 token 状态，后续模型拉取和 API 转发需要复用
+    const newCookies = res.headers.get('Set-Cookie') || device.cookies || undefined
     await writeOauthToken(env, providerId, {
       access_token: tok.accessToken,
       refresh_token: tok.refreshToken,
       expires_at: Date.now() + expiresInSec * 1000,
       updated_at: Date.now(),
+      cookies: newCookies,
     })
     await env.KV.delete(deviceKey(providerId))
     return { status: 'success', message: 'OAuth 连接成功' }

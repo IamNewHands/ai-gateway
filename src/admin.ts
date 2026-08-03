@@ -173,6 +173,8 @@ export async function handleTestModel(c: Context<{ Bindings: Env }>) {
     if (!token) {
       return c.json<ApiResponse>({ success: false, message: 'OAuth 未连接或 Token 已失效，请先发起连接' }, 400)
     }
+    const tokenState = await readOauthToken(c.env, provider.id)
+    const cookies = tokenState?.cookies
     // 域路由 + 401 自动切换：先尝试主域，401 时自动切换到备用域
     // CN token 不应尝试 Global 域（iss 不匹配，APISIX 必然 401）
     const endpoint = provider.apiType === 'anthropic' ? 'messages' : 'chat/completions'
@@ -190,7 +192,7 @@ export async function handleTestModel(c: Context<{ Bindings: Env }>) {
       try {
         const response = await fetch(url, {
           method: 'POST',
-          headers: buildOauthHeaders(cfg, token, { origin, apiType: provider.apiType }),
+          headers: buildOauthHeaders(cfg, token, { origin, apiType: provider.apiType, cookies }),
           body: testBody,
           signal: AbortSignal.timeout(20000),
         })
@@ -524,6 +526,8 @@ export async function handleOAuthModels(c: Context<{ Bindings: Env }>) {
   if (!token) {
     return c.json<ApiResponse>({ success: false, message: 'OAuth 未连接或 Token 已失效，请先发起连接' }, 400)
   }
+  const tokenState = await readOauthToken(c.env, provider.id)
+  const cookies = tokenState?.cookies
 
   const cleanBase = provider.baseUrl.replace(/\/$/, '')
   const realm = detectTokenRealm(token)
@@ -553,7 +557,7 @@ export async function handleOAuthModels(c: Context<{ Bindings: Env }>) {
     try {
       const response = await fetch(ep.url, {
         method: 'GET',
-        headers: buildOauthHeaders(cfg, token, { origin: ep.origin }),
+        headers: buildOauthHeaders(cfg, token, { origin: ep.origin, cookies }),
         signal: AbortSignal.timeout(20000),
       })
 

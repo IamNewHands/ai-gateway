@@ -479,6 +479,9 @@ async function proxyOAuthRequest(
 ): Promise<Response> {
   const cfg = provider.oauth!
 
+  // 先从 KV 读取 token 状态（含 cookies）
+  let tokenState = await readOauthToken(c.env, provider.id)
+
   // 域路由：根据 token 的 JWT iss 决定走 CN (copilot.tencent.com) 还是 Global (www.workbuddy.ai)。
   const resolveRealm = (token: string): 'cn' | 'global' => {
     return detectTokenRealm(token) === 'global' ? 'global' : 'cn'
@@ -501,18 +504,24 @@ async function proxyOAuthRequest(
     const r = realm || resolveRealm(token)
     return fetch(buildForwardUrl(r), {
       method: c.req.method,
-      headers: buildOauthHeaders(cfg, token, { origin: buildOrigin(r), apiType: provider.apiType }),
+      headers: buildOauthHeaders(cfg, token, { origin: buildOrigin(r), apiType: provider.apiType, cookies: tokenState?.cookies }),
       body: c.req.method === 'GET' || c.req.method === 'HEAD' ? undefined : JSON.stringify(forwardBody),
       signal: AbortSignal.timeout(300000),
     })
   }
 
   try {
-    let token = await getOauthAccessToken(c.env, provider.id, cfg)
+    let token = tokenState?.access_token ?? null
     if (!token) {
       // 尝试用 refresh_token 刷新一次
       const refreshed = await refreshOauthToken(c.env, provider.id, cfg)
-      if (refreshed) token = (await readOauthToken(c.env, provider.id))?.access_token ?? null
+      if (refreshed) {
+        const freshState = await readOauthToken(c.env, provider.id)
+        if (freshState) {
+          tokenState = freshState
+          token = freshState.access_token ?? null
+        }
+      }
     }
     if (!token) {
       return c.json({
@@ -524,11 +533,14 @@ async function proxyOAuthRequest(
     let response = await doFetch(token)
 
     // 401/403：可能 token 过期，刷新后重试一次
-    if ((response.status === 401 || response.status === 403) && (await readOauthToken(c.env, provider.id))?.refresh_token) {
+    if ((response.status === 401 || response.status === 403) && tokenState?.refresh_token) {
       const refreshed = await refreshOauthToken(c.env, provider.id, cfg)
       if (refreshed) {
-        const fresh = (await readOauthToken(c.env, provider.id))?.access_token
-        if (fresh) response = await doFetch(fresh)
+        const freshState = await readOauthToken(c.env, provider.id)
+        if (freshState) {
+          tokenState = freshState
+          response = await doFetch(freshState.access_token)
+        }
       }
     }
 

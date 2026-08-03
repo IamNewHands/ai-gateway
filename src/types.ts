@@ -86,6 +86,8 @@ export interface OAuthTokenState {
   /** 过期时间（epoch ms） */
   expires_at: number
   updated_at: number
+  /** browser 模式：发起登录时上游返回的 Set-Cookie，后续请求需复用 */
+  cookies?: string
 }
 
 /** 进行中的设备码/浏览器登录流程状态 */
