@@ -395,6 +395,23 @@ export function createAnthropicSSEAccumulator(): AnthropicSSEAccumulator {
 }
 
 /**
+ * 将 events 数组（event/data 交替成对）格式化为 Anthropic SSE 字符串。
+ * 每个 event+data 对内部用 \n 连接，事件对之间用 \n\n 分隔，整体以 \n\n 结尾。
+ * 注意：不能用 events.join('\n') —— 多事件时会缺失事件间空行，
+ * 客户端解析不到后续的 message_stop，报 "truncated: stream ended"。
+ * file tool 的 tool_use 响应在 finish_reason 时会同时发 content_block_stop +
+ * message_delta + message_stop 三个事件，必现此问题。
+ */
+function formatAnthropicSSE(events: string[]): string {
+  if (events.length === 0) return ''
+  const blocks: string[] = []
+  for (let i = 0; i < events.length; i += 2) {
+    blocks.push(events[i] + (events[i + 1] !== undefined ? '\n' + events[i + 1] : ''))
+  }
+  return blocks.join('\n\n') + '\n\n'
+}
+
+/**
  * 将一个 OpenAI SSE chunk 转换为零个或多个 Anthropic SSE 事件行。
  * 返回 Anthropic SSE 格式的字符串（多行）。
  * 第一个 chunk 会触发 message_start + content_block_start。
@@ -427,7 +444,7 @@ export function openAIChunkToAnthropicSSE(
   }
 
   const choice = chunk.choices?.[0]
-  if (!choice) return events.join('\n')
+  if (!choice) return formatAnthropicSSE(events)
 
   const delta = choice.delta
   if (!delta) {
@@ -446,7 +463,7 @@ export function openAIChunkToAnthropicSSE(
       events.push(`event: message_stop`)
       events.push(`data: ${JSON.stringify({ type: 'message_stop' })}`)
     }
-    return events.join('\n')
+    return formatAnthropicSSE(events)
   }
 
   // 处理 text delta
@@ -544,8 +561,8 @@ export function openAIChunkToAnthropicSSE(
     events.push(`data: ${JSON.stringify({ type: 'message_stop' })}`)
   }
 
-  // Anthropic SSE: events separated by double newline, terminated with double newline
-  return events.length > 0 ? events.join('\n') + '\n\n' : ''
+  // Anthropic SSE: 每个 event+data 对用 \n 连接，事件对间用 \n\n 分隔（见 formatAnthropicSSE）
+  return formatAnthropicSSE(events)
 }
 
 /** 确保当前 block 是 text 类型，若不是则创建新的。返回是否新建了 block。 */
@@ -882,7 +899,7 @@ export function openAIChunkToResponsesSSE(
   }
 
   const choice = chunk.choices?.[0]
-  if (!choice) return events.join('\n')
+  if (!choice) return formatAnthropicSSE(events)
 
   const delta = choice.delta
   if (!delta) {
@@ -904,7 +921,7 @@ export function openAIChunkToResponsesSSE(
         },
       })}`)
     }
-    return events.join('\n')
+    return formatAnthropicSSE(events)
   }
 
   // text delta
@@ -1035,5 +1052,5 @@ export function openAIChunkToResponsesSSE(
   }
 
   // SSE: events separated by double newline
-  return events.length > 0 ? events.join('\n') + '\n\n' : ''
+  return formatAnthropicSSE(events)
 }
