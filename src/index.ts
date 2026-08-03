@@ -2,7 +2,7 @@ import { Hono } from 'hono'
 import { cors } from 'hono/cors'
 import { logger } from 'hono/logger'
 import { adminAuthMiddleware, proxyKeyAuthMiddleware, handleLogin, handleLogout } from './auth'
-import { handleProxy, handleModels } from './proxy'
+import { handleProxy, handleModels, handleAnthropicMessages, handleResponses } from './proxy'
 import {
   handleStatus,
   handleGetProviders,
@@ -106,6 +106,14 @@ app.post('/admin/api/logs/config', handleLogConfig)
 // ===== API 转发路由（需转发 Key 验证） =====
 app.use('/v1/*', proxyKeyAuthMiddleware)
 app.get('/v1/models', handleModels)
+
+// Anthropic Messages API — 必须在 /v1/* 通配之前注册
+app.post('/v1/messages', handleAnthropicMessages)
+
+// OpenAI Responses API — 必须在 /v1/* 通配之前注册
+app.post('/v1/responses', handleResponses)
+
+// 通用转发（Chat Completions 及其他）
 app.all('/v1/*', handleProxy)
 
 // ===== 404 处理 =====

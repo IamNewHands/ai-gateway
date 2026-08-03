@@ -5,6 +5,17 @@ import type { Env, ProxyRequestBody } from './types'
 import { isOpenCodeProvider, proxyOpenCodeRequest, resolveOpenCodeUrls } from './opencode'
 import { getOauthAccessToken, readOauthToken, refreshOauthToken, detectTokenRealm, buildOauthHeaders } from './oauth'
 import { writeLog } from './admin'
+import {
+  anthropicToOpenAI,
+  openAIToAnthropic,
+  createAnthropicSSEAccumulator,
+  openAIChunkToAnthropicSSE,
+  aggregateOpenAIToAnthropic,
+  responsesToOpenAI,
+  openAIToResponses,
+  openAIChunkToResponsesSSE,
+  aggregateOpenAIToResponses,
+} from './formats'
 
 // ===== Key 健康状态类型和辅助函数 =====
 
@@ -776,4 +787,512 @@ export async function handleModels(c: Context<{ Bindings: Env }>) {
     object: 'list',
     data: models,
   })
+}
+
+// ============================================================
+//  Anthropic Messages API 代理  /v1/messages
+//  将 Anthropic 格式请求转为 OpenAI Chat Completions，
+//  调用 WorkBuddy 上游，再将响应转回 Anthropic 格式。
+// ============================================================
+
+export async function handleAnthropicMessages(c: Context<{ Bindings: Env }>) {
+  try {
+    const anthropicBody = await c.req.json<Record<string, unknown>>()
+    const model = anthropicBody['model'] as string
+
+    if (!model) {
+      return c.json({ type: 'error', error: { type: 'invalid_request_error', message: 'Missing model' } }, 400)
+    }
+
+    // 解析 providerId/modelId 格式
+    const parsed = parseModelId(model)
+    if (!parsed) {
+      return c.json({
+        type: 'error',
+        error: { type: 'invalid_request_error', message: `Invalid model format "${model}", use providerId/modelId` },
+      }, 400)
+    }
+
+    const { providerId, modelId } = parsed
+
+    // 权限检查
+    const proxyKey = (c as any).get('proxyKey') as import('./types').ProxyKey | undefined
+    if (proxyKey?.allowedModels && proxyKey.allowedModels.length > 0) {
+      if (!proxyKey.allowedModels.includes(model)) {
+        return c.json({
+          type: 'error',
+          error: { type: 'permission_error', message: `Model "${model}" not allowed for this key` },
+        }, 403)
+      }
+    }
+
+    const provider = await getProvider(c.env, providerId)
+    if (!provider) {
+      return c.json({
+        type: 'error',
+        error: { type: 'invalid_request_error', message: `Provider "${providerId}" not found` },
+      }, 404)
+    }
+    if (!provider.enabled) {
+      return c.json({
+        type: 'error',
+        error: { type: 'provider_disabled', message: `Provider "${provider.name}" is disabled` },
+      }, 403)
+    }
+
+    const modelConfig = provider.models.find((m) => m.id === modelId)
+    if (!modelConfig) {
+      return c.json({
+        type: 'error',
+        error: { type: 'invalid_request_error', message: `Model "${modelId}" not configured` },
+      }, 404)
+    }
+
+    // Anthropic → OpenAI 转换
+    const anthropicReq = anthropicBody as any
+    const openaiBody = anthropicToOpenAI(anthropicReq)
+    // 替换为上游模型 ID
+    openaiBody['model'] = modelId
+
+    const originalStream = anthropicReq.stream === true
+
+    // OAuth 提供商走 OAuth 代理路径
+    if (provider.authType === 'oauth-device' && provider.oauth) {
+      const cfg = provider.oauth
+      // 强制流式（WorkBuddy 只支持流式）
+      const upstreamBody: Record<string, unknown> = { ...openaiBody, stream: true }
+
+      // 读取 token 状态
+      let tokenState = await readOauthToken(c.env, providerId)
+      if (!tokenState?.access_token) {
+        // 尝试刷新
+        const refreshed = await refreshOauthToken(c.env, providerId, cfg)
+        if (refreshed) tokenState = await readOauthToken(c.env, providerId)
+      }
+      if (!tokenState?.access_token) {
+        return c.json({
+          type: 'error',
+          error: { type: 'authentication_error', message: 'OAuth token not available. Please login first.' },
+        }, 401)
+      }
+
+      // 域路由：根据 JWT iss 判断 CN vs Global
+      const realm = detectTokenRealm(tokenState.access_token)
+      const isGlobal = realm === 'global'
+      const realmBase = (isGlobal && cfg.globalBaseUrl ? cfg.globalBaseUrl : provider.baseUrl).replace(/\/$/, '')
+      const origin = isGlobal && cfg.globalOrigin ? cfg.globalOrigin : (cfg.extraHeaders?.Origin)
+      const upstreamUrl = `${realmBase}/v1/chat/completions`
+
+      // Global 域需要 system message
+      if (isGlobal) {
+        const msgs = upstreamBody['messages'] as any[]
+        if (msgs && !msgs.some((m: any) => m.role === 'system')) {
+          msgs.unshift({ role: 'system', content: 'You are a helpful assistant.' })
+        }
+      }
+
+      const headers = buildOauthHeaders(cfg, tokenState.access_token, {
+        origin,
+        apiType: 'anthropic',
+        cookies: tokenState.cookies,
+      })
+
+      let response = await fetch(upstreamUrl, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify(upstreamBody),
+        signal: AbortSignal.timeout(300000),
+      })
+
+      // 401/403 时刷新 token 重试
+      if ((response.status === 401 || response.status === 403) && tokenState.refresh_token) {
+        const refreshed = await refreshOauthToken(c.env, providerId, cfg)
+        if (refreshed) {
+          const freshState = await readOauthToken(c.env, providerId)
+          if (freshState?.access_token) {
+            const retryHeaders = buildOauthHeaders(cfg, freshState.access_token, {
+              origin,
+              apiType: 'anthropic',
+              cookies: freshState.cookies,
+            })
+            response = await fetch(upstreamUrl, {
+              method: 'POST',
+              headers: retryHeaders,
+              body: JSON.stringify(upstreamBody),
+              signal: AbortSignal.timeout(300000),
+            })
+          }
+        }
+      }
+
+      if (!response.ok) {
+        const errText = await response.text()
+        return c.json({
+          type: 'error',
+          error: { type: 'upstream_error', message: `Upstream error: ${errText}` },
+        }, response.status as Parameters<typeof c.json>[1])
+      }
+
+      // 流式：OpenAI SSE → Anthropic SSE 实时转换
+      if (originalStream && response.body) {
+        const acc = createAnthropicSSEAccumulator()
+        const readable = new ReadableStream({
+          async start(controller) {
+            const decoder = new TextDecoderStream()
+            const textReader = response.body!.pipeThrough(decoder).getReader()
+            let lineBuffer = ''
+
+            try {
+              while (true) {
+                const { done, value } = await textReader.read()
+                if (done) break
+                const combined = lineBuffer + value
+                const lines = combined.split('\n')
+                lineBuffer = lines.pop() || ''
+
+                for (const line of lines) {
+                  const trimmed = line.trim()
+                  if (!trimmed.startsWith('data:')) continue
+                  const data = trimmed.slice(5).trim()
+                  if (!data || data === '[DONE]') continue
+
+                  try {
+                    const chunk = JSON.parse(data)
+                    // 清洗 WorkBuddy 噪音
+                    cleanChunkDelta(chunk)
+                    const anthropicSSE = openAIChunkToAnthropicSSE(chunk, acc)
+                    if (anthropicSSE) {
+                      controller.enqueue(new TextEncoder().encode(anthropicSSE))
+                    }
+                  } catch { /* skip malformed */ }
+                }
+              }
+              // 处理剩余缓冲
+              if (lineBuffer.trim().startsWith('data:')) {
+                const data = lineBuffer.trim().slice(5).trim()
+                if (data && data !== '[DONE]') {
+                  try {
+                    const chunk = JSON.parse(data)
+                    cleanChunkDelta(chunk)
+                    const anthropicSSE = openAIChunkToAnthropicSSE(chunk, acc)
+                    if (anthropicSSE) {
+                      controller.enqueue(new TextEncoder().encode(anthropicSSE))
+                    }
+                  } catch { /* skip */ }
+                }
+              }
+            } catch { /* stream error */ }
+            controller.close()
+          },
+        })
+
+        return new Response(readable, {
+          status: 200,
+          headers: {
+            'Content-Type': 'text/event-stream',
+            'Cache-Control': 'no-store',
+            'X-Accel-Buffering': 'no',
+          },
+        })
+      }
+
+      // 非流式：收集所有 OpenAI SSE → 聚合 → Anthropic
+      const allChunks: any[] = []
+      const decoder2 = new TextDecoderStream()
+      const textReader2 = response.body!.pipeThrough(decoder2).getReader()
+      let lineBuffer2 = ''
+
+      try {
+        while (true) {
+          const { done, value } = await textReader2.read()
+          if (done) break
+          const combined = lineBuffer2 + value
+          const lines = combined.split('\n')
+          lineBuffer2 = lines.pop() || ''
+          for (const line of lines) {
+            const trimmed = line.trim()
+            if (!trimmed.startsWith('data:')) continue
+            const data = trimmed.slice(5).trim()
+            if (!data || data === '[DONE]') continue
+            try {
+              const chunk = JSON.parse(data)
+              cleanChunkDelta(chunk)
+              allChunks.push(chunk)
+            } catch { /* skip */ }
+          }
+        }
+      } catch { /* stream error */ }
+
+      const anthropicResp = aggregateOpenAIToAnthropic(allChunks)
+      return c.json(anthropicResp)
+    }
+
+    // 非 OAuth 提供商：标准转发
+    return c.json({
+      type: 'error',
+      error: { type: 'unsupported', message: 'Anthropic format currently only supports OAuth providers' },
+    }, 400)
+  } catch (err) {
+    console.error('[anthropic] error:', err)
+    return c.json({ type: 'error', error: { type: 'server_error', message: 'Internal server error' } }, 500)
+  }
+}
+
+// ============================================================
+//  OpenAI Responses API 代理  /v1/responses
+//  将 Responses 格式请求转为 Chat Completions，调用上游，
+//  再将响应转回 Responses 格式。
+// ============================================================
+
+export async function handleResponses(c: Context<{ Bindings: Env }>) {
+  try {
+    const responsesBody = await c.req.json<Record<string, unknown>>()
+    const model = responsesBody['model'] as string
+
+    if (!model) {
+      return c.json({ error: { message: 'Missing model', type: 'invalid_request_error' } }, 400)
+    }
+
+    const parsed = parseModelId(model)
+    if (!parsed) {
+      return c.json({
+        error: { message: `Invalid model format "${model}", use providerId/modelId`, type: 'invalid_request_error' },
+      }, 400)
+    }
+
+    const { providerId, modelId } = parsed
+
+    const proxyKey = (c as any).get('proxyKey') as import('./types').ProxyKey | undefined
+    if (proxyKey?.allowedModels && proxyKey.allowedModels.length > 0) {
+      if (!proxyKey.allowedModels.includes(model)) {
+        return c.json({
+          error: { message: `Model "${model}" not allowed for this key`, type: 'permission_error' },
+        }, 403)
+      }
+    }
+
+    const provider = await getProvider(c.env, providerId)
+    if (!provider) {
+      return c.json({ error: { message: `Provider "${providerId}" not found`, type: 'invalid_request_error' } }, 404)
+    }
+    if (!provider.enabled) {
+      return c.json({ error: { message: `Provider "${provider.name}" is disabled`, type: 'provider_disabled' } }, 403)
+    }
+
+    const modelConfig = provider.models.find((m) => m.id === modelId)
+    if (!modelConfig) {
+      return c.json({ error: { message: `Model "${modelId}" not configured`, type: 'invalid_request_error' } }, 404)
+    }
+
+    // Responses → OpenAI 转换
+    const responsesReq = responsesBody as any
+    const openaiBody = responsesToOpenAI(responsesReq)
+    openaiBody['model'] = modelId
+
+    const originalStream = responsesReq.stream === true
+
+    // OAuth 提供商
+    if (provider.authType === 'oauth-device' && provider.oauth) {
+      const cfg = provider.oauth
+      const upstreamBody: Record<string, unknown> = { ...openaiBody, stream: true }
+
+      // 读取 token 状态
+      let tokenState = await readOauthToken(c.env, providerId)
+      if (!tokenState?.access_token) {
+        const refreshed = await refreshOauthToken(c.env, providerId, cfg)
+        if (refreshed) tokenState = await readOauthToken(c.env, providerId)
+      }
+      if (!tokenState?.access_token) {
+        return c.json({
+          error: { message: 'OAuth token not available. Please login first.', type: 'authentication_error' },
+        }, 401)
+      }
+
+      // 域路由
+      const realm = detectTokenRealm(tokenState.access_token)
+      const isGlobal = realm === 'global'
+      const realmBase = (isGlobal && cfg.globalBaseUrl ? cfg.globalBaseUrl : provider.baseUrl).replace(/\/$/, '')
+      const origin = isGlobal && cfg.globalOrigin ? cfg.globalOrigin : (cfg.extraHeaders?.Origin)
+      const upstreamUrl = `${realmBase}/v1/chat/completions`
+
+      // Global 域需要 system message
+      if (isGlobal) {
+        const msgs = upstreamBody['messages'] as any[]
+        if (msgs && !msgs.some((m: any) => m.role === 'system')) {
+          msgs.unshift({ role: 'system', content: 'You are a helpful assistant.' })
+        }
+      }
+
+      const headers = buildOauthHeaders(cfg, tokenState.access_token, {
+        origin,
+        apiType: provider.apiType,
+        cookies: tokenState.cookies,
+      })
+
+      let response = await fetch(upstreamUrl, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify(upstreamBody),
+        signal: AbortSignal.timeout(300000),
+      })
+
+      // 401/403 时刷新重试
+      if ((response.status === 401 || response.status === 403) && tokenState.refresh_token) {
+        const refreshed = await refreshOauthToken(c.env, providerId, cfg)
+        if (refreshed) {
+          const freshState = await readOauthToken(c.env, providerId)
+          if (freshState?.access_token) {
+            const retryHeaders = buildOauthHeaders(cfg, freshState.access_token, {
+              origin,
+              apiType: provider.apiType,
+              cookies: freshState.cookies,
+            })
+            response = await fetch(upstreamUrl, {
+              method: 'POST',
+              headers: retryHeaders,
+              body: JSON.stringify(upstreamBody),
+              signal: AbortSignal.timeout(300000),
+            })
+          }
+        }
+      }
+
+      if (!response.ok) {
+        const errText = await response.text()
+        return c.json({
+          error: { message: `Upstream error: ${errText}`, type: 'upstream_error' },
+        }, response.status as Parameters<typeof c.json>[1])
+      }
+
+      // 流式
+      if (originalStream && response.body) {
+        const acc = {
+          responseId: '',
+          model: '',
+          itemId: null as string | null,
+          textContent: '',
+          toolCalls: new Map<number, { id: string; name: string; args: string }>(),
+          inputTokens: 0,
+          outputTokens: 0,
+          hasStarted: false,
+        }
+
+        const readable = new ReadableStream({
+          async start(controller) {
+            const decoder = new TextDecoderStream()
+            const textReader = response.body!.pipeThrough(decoder).getReader()
+            let lineBuffer = ''
+
+            try {
+              while (true) {
+                const { done, value } = await textReader.read()
+                if (done) break
+                const combined = lineBuffer + value
+                const lines = combined.split('\n')
+                lineBuffer = lines.pop() || ''
+
+                for (const line of lines) {
+                  const trimmed = line.trim()
+                  if (!trimmed.startsWith('data:')) continue
+                  const data = trimmed.slice(5).trim()
+                  if (!data || data === '[DONE]') continue
+
+                  try {
+                    const chunk = JSON.parse(data)
+                    cleanChunkDelta(chunk)
+                    const responsesSSE = openAIChunkToResponsesSSE(chunk, acc)
+                    if (responsesSSE) {
+                      controller.enqueue(new TextEncoder().encode(responsesSSE))
+                    }
+                  } catch { /* skip */ }
+                }
+              }
+            } catch { /* stream error */ }
+            controller.close()
+          },
+        })
+
+        return new Response(readable, {
+          status: 200,
+          headers: {
+            'Content-Type': 'text/event-stream',
+            'Cache-Control': 'no-store',
+            'X-Accel-Buffering': 'no',
+          },
+        })
+      }
+
+      // 非流式：聚合 OpenAI SSE → chat.completion → Responses
+      const allChunks: any[] = []
+      const decoder3 = new TextDecoderStream()
+      const textReader3 = response.body!.pipeThrough(decoder3).getReader()
+      let lineBuffer3 = ''
+
+      try {
+        while (true) {
+          const { done, value } = await textReader3.read()
+          if (done) break
+          const combined = lineBuffer3 + value
+          const lines = combined.split('\n')
+          lineBuffer3 = lines.pop() || ''
+          for (const line of lines) {
+            const trimmed = line.trim()
+            if (!trimmed.startsWith('data:')) continue
+            const data = trimmed.slice(5).trim()
+            if (!data || data === '[DONE]') continue
+            try {
+              const chunk = JSON.parse(data)
+              cleanChunkDelta(chunk)
+              allChunks.push(chunk)
+            } catch { /* skip */ }
+          }
+        }
+      } catch { /* stream error */ }
+
+      // 聚合为 OpenAI chat.completion 再转为 Responses
+      const openaiResp = aggregateOpenAIToResponses(allChunks)
+      return c.json(openaiResp)
+    }
+
+    return c.json({
+      error: { message: 'Responses API currently only supports OAuth providers', type: 'unsupported' },
+    }, 400)
+  } catch (err) {
+    console.error('[responses] error:', err)
+    return c.json({ error: { message: 'Internal server error', type: 'server_error' } }, 500)
+  }
+}
+
+/**
+ * 对单个 chunk 的 delta 做轻量清洗（去掉空 function_call 等噪音），
+ * 不修改原始 JSON 字符串，直接操作对象。
+ */
+function cleanChunkDelta(chunk: any): void {
+  const choices = chunk?.choices
+  if (!Array.isArray(choices)) return
+  for (const choice of choices) {
+    const delta = choice?.delta
+    if (!delta || typeof delta !== 'object') continue
+    // 去掉全空 function_call
+    if (delta.function_call !== undefined) {
+      if (delta.function_call === null) {
+        delete delta.function_call
+      } else if (typeof delta.function_call === 'object') {
+        const vals = Object.values(delta.function_call)
+        if (vals.length === 0 || vals.every((v: any) => v === null || v === '')) {
+          delete delta.function_call
+        }
+      }
+    }
+    // 去掉空 tool_calls 数组
+    if (Array.isArray(delta.tool_calls) && delta.tool_calls.length === 0) {
+      delete delta.tool_calls
+    }
+    // 去掉噪音字段
+    for (const noise of ['extra_fields', 'refusal', 'reasoning_content']) {
+      if (delta[noise] === null || delta[noise] === '' || delta[noise] === undefined) {
+        delete delta[noise]
+      }
+    }
+  }
 }
