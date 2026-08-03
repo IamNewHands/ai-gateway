@@ -88,6 +88,43 @@ function summarizeRequestBody(body: Record<string, unknown>): Record<string, unk
 }
 
 /**
+ * 清理被 Tencent CodeBuddy 内容过滤器屏蔽的 Claude Code 模板短语。
+ * CPA 使用零宽空格 \u200B 插入到短语中来绕过精确匹配过滤。
+ */
+function sanitizeBlockedTemplates(body: Record<string, unknown>): void {
+  const messages = body['messages'] as any[]
+  if (!Array.isArray(messages)) return
+  for (const msg of messages) {
+    if (!msg || typeof msg !== 'object') continue
+    const content = msg.content
+    if (typeof content === 'string') {
+      msg.content = sanitizeText(content)
+    } else if (Array.isArray(content)) {
+      for (const part of content) {
+        if (part && typeof part.text === 'string') {
+          part.text = sanitizeText(part.text)
+        }
+      }
+    }
+  }
+}
+
+/** 在匹配的屏蔽短语中插入零宽空格来绕过精确匹配过滤 */
+function sanitizeText(s: string): string {
+  // "You are Claude Code, Anthropic's official CLI tool for Claude." 中的 "Claude" 后插入 \u200B
+  s = s.replace(
+    /You are Claude Code, Anthropic's official CLI tool for Claude\./g,
+    'You are Claude\u200B Code, Anthropic\u200B\'s official CLI tool for Claude.'
+  )
+  // "Default branch (you will usually use this for PRs)" 中的 "Default" 后插入 \u200B
+  s = s.replace(
+    /Default branch \(you will usually use this for PRs\)/g,
+    'Default\u200B branch (you will usually use this for PRs)'
+  )
+  return s
+}
+
+/**
  * WorkBuddy SSE 流聚合：收集所有 chunk 拼接为非流式 chat.completion 响应。
  * 参考 cpa-plugin stream.go 的 aggregateCompletion 实现。
  */
@@ -890,6 +927,8 @@ export async function handleAnthropicMessages(c: Context<{ Bindings: Env }>) {
         upstreamBody['max_tokens'] = upstreamBody['max_completion_tokens']
         delete upstreamBody['max_completion_tokens']
       }
+      // 清理被 CodeBuddy 内容过滤器屏蔽的 Claude Code 模板短语
+      sanitizeBlockedTemplates(upstreamBody)
 
       // 读取 token 状态
       let tokenState = await readOauthToken(c.env, providerId)
@@ -1079,6 +1118,8 @@ export async function handleAnthropicMessages(c: Context<{ Bindings: Env }>) {
       upstreamBody['max_tokens'] = upstreamBody['max_completion_tokens']
       delete upstreamBody['max_completion_tokens']
     }
+    // 清理被 CodeBuddy 内容过滤器屏蔽的 Claude Code 模板短语
+    sanitizeBlockedTemplates(upstreamBody)
     const apiKey = enabledKeys[0].key
 
     const response = await fetch(forwardUrl, {

@@ -196,7 +196,9 @@ function anthropicUserToOpenAI(msg: AnthropicMessage): Record<string, unknown> |
 
   const userMsg: Record<string, unknown> = { role: 'user', content: parts.length === 1 && parts[0].type === 'text'
     ? parts[0].text
-    : parts }
+    : parts.length === 0
+      ? ''
+      : parts }
 
   // 如果有 tool_results，将它们放在 user 消息之前
   if (toolResults.length > 0) {
