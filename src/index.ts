@@ -67,7 +67,10 @@ app.get('/admin/logout', handleLogout)
 // ===== 管理后台（需 Session 验证） =====
 app.use('/admin/*', adminAuthMiddleware)
 
-app.get('/admin', async (c) => renderAdminPage(c))
+app.get('/admin', async (c) => {
+  c.header('Cache-Control', 'no-store, no-cache, must-revalidate')
+  return renderAdminPage(c)
+})
 
 // 系统状态
 app.get('/admin/api/status', handleStatus)
