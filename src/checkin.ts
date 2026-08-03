@@ -240,36 +240,31 @@ async function fetchUserResource(
     extraHeaders['X-Enterprise-Id'] = enterpriseId
     extraHeaders['X-Tenant-Id'] = enterpriseId
   }
-  try {
-    const data = await billingCall(token, '/v2/billing/meter/get-user-resource', realm, { body, extraHeaders })
-    const resp = data && data.Response && data.Response.Data ? data.Response.Data : null
-    if (!resp) return null
-    const accounts: any[] = Array.isArray(resp.Accounts) ? resp.Accounts : []
-    let totalRemain = 0, totalUsed = 0, totalSize = 0
-    for (const a of accounts) {
-      const { remain, used, size } = packageRemainUsed(a)
-      totalRemain += remain
-      totalUsed += used
-      totalSize += size
-    }
-    const packCount = accounts.length
-    // 用 size−remain 对齐 used，保证 UI 总计自洽
-    if (totalSize > 0) {
-      const derived = Math.max(0, totalSize - totalRemain)
-      if (derived > totalUsed) totalUsed = derived
-    }
-    // TotalDosage 是额度池下限，包 size 不全时用它兜底
-    const dosage = Number(resp.TotalDosage) || 0
-    if (dosage > totalSize) {
-      totalSize = dosage
-      const derived = Math.max(0, totalSize - totalRemain)
-      if (derived > totalUsed) totalUsed = derived
-    }
-    return { totalRemain, totalUsed, totalSize, packCount }
-  } catch (e) {
-    console.warn(`[checkin] fetchUserResource failed: ${(e as Error).message}`)
-    return null
+  const data = await billingCall(token, '/v2/billing/meter/get-user-resource', realm, { body, extraHeaders })
+  const resp = data && data.Response && data.Response.Data ? data.Response.Data : null
+  if (!resp) return null
+  const accounts: any[] = Array.isArray(resp.Accounts) ? resp.Accounts : []
+  let totalRemain = 0, totalUsed = 0, totalSize = 0
+  for (const a of accounts) {
+    const { remain, used, size } = packageRemainUsed(a)
+    totalRemain += remain
+    totalUsed += used
+    totalSize += size
   }
+  const packCount = accounts.length
+  // 用 size−remain 对齐 used，保证 UI 总计自洽
+  if (totalSize > 0) {
+    const derived = Math.max(0, totalSize - totalRemain)
+    if (derived > totalUsed) totalUsed = derived
+  }
+  // TotalDosage 是额度池下限，包 size 不全时用它兜底
+  const dosage = Number(resp.TotalDosage) || 0
+  if (dosage > totalSize) {
+    totalSize = dosage
+    const derived = Math.max(0, totalSize - totalRemain)
+    if (derived > totalUsed) totalUsed = derived
+  }
+  return { totalRemain, totalUsed, totalSize, packCount }
 }
 
 /** 拉取套餐类型：POST /v2/billing/meter/get-payment-type → paymentType（free/paid…）。 */
@@ -292,6 +287,30 @@ async function fetchPaymentType(
   } catch {
     return ''
   }
+}
+
+/**
+ * 拉取额度 + 套餐类型并填充到 base。fetchUserResource 抛错时写日志（含 uid/eid 诊断）。
+ * 在所有 return 前调用，确保"今日已签"也能拿到额度。
+ */
+async function fillCredits(env: Env, base: CheckinResult, token: string, realm: 'cn' | 'global', uid: string, enterpriseId: string) {
+  try {
+    const credits = await fetchUserResource(token, realm, uid, enterpriseId)
+    if (credits) {
+      base.totalRemain = credits.totalRemain
+      base.totalUsed = credits.totalUsed
+      base.totalSize = credits.totalSize
+      base.packCount = credits.packCount
+    } else {
+      try { await writeLog(env, 'warn', `[checkin] ${base.name} 额度无数据（get-user-resource 响应缺 Response.Data.Accounts）`, `uid=${uid || '(空)'} eid=${enterpriseId || '(空)'}`) } catch { /* ignore */ }
+    }
+  } catch (e) {
+    try { await writeLog(env, 'warn', `[checkin] ${base.name} 额度拉取失败: ${(e as Error).message}`, `uid=${uid || '(空)'} eid=${enterpriseId || '(空)'}`) } catch { /* ignore */ }
+  }
+  try {
+    const pt = await fetchPaymentType(token, realm, uid, enterpriseId)
+    if (pt) base.paymentType = pt
+  } catch { /* ignore */ }
 }
 
 // ===== KV 结果读写 =====
@@ -344,6 +363,8 @@ export async function checkinOneAccount(env: Env, provider: Provider): Promise<C
   const enterpriseId = pickClaim(claims, 'enterprise_id', 'enterpriseId', 'tenant_id', 'tenantId')
   const nickname = pickClaim(claims, 'nickname', 'name', 'username', 'nick')
   if (nickname) base.nickname = nickname
+  // 诊断：记录 JWT 字段名，定位 uid/enterpriseId 是否解出（额度接口依赖）
+  try { await writeLog(env, 'info', `[checkin-diag] ${provider.name} jwt_keys=[${claims ? Object.keys(claims).join(',') : '(无)'}] uid=${uid ? '有' : '无'} eid=${enterpriseId ? '有' : '无'}`, '') } catch { /* ignore */ }
 
   const realm = detectTokenRealm(token)
   if (realm === 'global') {
@@ -352,15 +373,7 @@ export async function checkinOneAccount(env: Env, provider: Provider): Promise<C
     base.message = '国际版账号无签到功能'
     base.success = true
     // 国际版也拉额度信息（对齐 CPA 面板展示）
-    const credits = await fetchUserResource(token, 'global', uid, enterpriseId)
-    if (credits) {
-      base.totalRemain = credits.totalRemain
-      base.totalUsed = credits.totalUsed
-      base.totalSize = credits.totalSize
-      base.packCount = credits.packCount
-    }
-    const pt = await fetchPaymentType(token, 'global', uid, enterpriseId)
-    if (pt) base.paymentType = pt
+    await fillCredits(env, base, token, 'global', uid, enterpriseId)
     await writeCheckinResult(env, provider.id, base)
     return base
   }
@@ -384,6 +397,7 @@ export async function checkinOneAccount(env: Env, provider: Provider): Promise<C
       base.reason = 'already'
       base.message = '今日已签到'
       base.lastCheckinAt = now
+      await fillCredits(env, base, token, 'cn', uid, enterpriseId)
       await writeCheckinResult(env, provider.id, base)
       return base
     }
@@ -407,15 +421,7 @@ export async function checkinOneAccount(env: Env, provider: Provider): Promise<C
   }
 
   // 额度信息（可用/已用/额度池/包数 + 套餐类型）
-  const credits = await fetchUserResource(token, 'cn', uid, enterpriseId)
-  if (credits) {
-    base.totalRemain = credits.totalRemain
-    base.totalUsed = credits.totalUsed
-    base.totalSize = credits.totalSize
-    base.packCount = credits.packCount
-  }
-  const pt = await fetchPaymentType(token, 'cn', uid, enterpriseId)
-  if (pt) base.paymentType = pt
+  await fillCredits(env, base, token, 'cn', uid, enterpriseId)
 
   await writeCheckinResult(env, provider.id, base)
   return base
