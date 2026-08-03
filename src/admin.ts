@@ -612,7 +612,7 @@ export async function handleOAuthModels(c: Context<{ Bindings: Env }>) {
       const errMsg = `[${ep.label}] HTTP ${response.status}${detail ? '：' + detail : ''}`
       errors.push(errMsg)
 
-      if (response.status === 401 && candidates.length > 1) {
+      if ((response.status === 401 || response.status === 400) && candidates.length > 1) {
         continue
       }
 
