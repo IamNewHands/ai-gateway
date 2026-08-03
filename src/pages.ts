@@ -323,6 +323,7 @@ ${H('管理')}
       <a class="admin-nav__link is-active" href="#overview"><i class="fas fa-chart-pie" aria-hidden="true"></i><span>概览</span></a>
       <a class="admin-nav__link" href="#providers"><i class="fas fa-server" aria-hidden="true"></i><span>提供商</span><b>${providers.length}</b></a>
       <a class="admin-nav__link" href="#proxy-keys"><i class="fas fa-key" aria-hidden="true"></i><span>转发 Key</span><b>${proxyKeys.length}</b></a>
+      <a class="admin-nav__link" href="#logs"><i class="fas fa-list-alt" aria-hidden="true"></i><span>日志</span></a>
     </nav>
     <div class="admin-rail__foot">
       <a href="/" class="admin-nav__link"><i class="fas fa-arrow-left" aria-hidden="true"></i><span>返回首页</span></a>
@@ -443,6 +444,12 @@ ${H('管理')}
         <div class="key-list">
           ${proxyKeys.length===0?'<div class="empty-state"><i class="fas fa-key" aria-hidden="true"></i><h3>暂无转发 Key</h3><p>生成一个 Key 后，客户端才能访问网关。</p><button class="btn btn-p" onclick="genKey()">生成转发 Key</button></div>':''}
           ${proxyKeys.map(k=>`<article class="ki" data-id="${escapePageHtml(k.id)}"><div class="key-main"><span class="key-icon" aria-hidden="true"><i class="fas fa-key"></i></span><div><div class="kv"><span id="kv-${escapePageHtml(k.id)}" data-full="${escapePageHtml(k.key)}">${escapePageHtml(k.key.length>12?k.key.substring(0,8)+'••••'+k.key.substring(k.key.length-4):k.key)}</span><button class="icon-btn" onclick="toggleKeyVis('${k.id}')" title="显示或隐藏" aria-label="显示或隐藏 Key"><i class="far fa-eye" aria-hidden="true"></i></button><button class="icon-btn" onclick='copyText("${escapePageHtml(k.key)}",this)' title="复制" aria-label="复制 Key"><i class="far fa-copy" aria-hidden="true"></i></button></div><h3>${escapePageHtml(k.name)}</h3><p>创建于 ${new Date(k.createdAt).toLocaleDateString()} · ${k.expiresAt?'有效至 '+new Date(k.expiresAt).toLocaleDateString():'永久有效'} · <span class="bd ${k.allowedModels&&k.allowedModels.length>0?'bd-on':'bd-off'}">${k.allowedModels&&k.allowedModels.length>0?k.allowedModels.length+' 个模型':'全部模型'}</span></p></div></div><div class="key-actions"><label class="tg"><input type="checkbox" ${k.enabled?'checked':''} onchange="toggleProxyKey('${k.id}',this.checked)" aria-label="启用 ${escapePageHtml(k.name)}"><span class="sl"></span></label><span class="bd ${k.enabled?'bd-on':'bd-off'}">${k.enabled?'已启用':'已禁用'}</span><button class="btn btn-gh btn-xs" onclick="editKeyModels('${k.id}')" title="模型筛选"><i class="fas fa-filter" aria-hidden="true"></i>模型筛选</button><button class="btn btn-d btn-xs" onclick="rmKey('${k.id}')"><i class="fas fa-trash" aria-hidden="true"></i>删除</button></div></article>`).join('')}
+        </div>
+      </section>
+      <section id="logs" class="workspace-section" aria-labelledby="logs-title">
+        <div class="section-heading section-heading--admin"><div><h2 id="logs-title">系统日志</h2><p>记录 API 请求、错误等关键信息。</p></div><div><label class="tg"><input type="checkbox" id="log-switch" onchange="toggleLog(this.checked)"><span class="sl"></span></label><span id="log-status">已关闭</span><button class="btn btn-gh btn-xs" onclick="refreshLogs()" style="margin-left:8px"><i class="fas fa-sync-alt"></i></button><button class="btn btn-d btn-xs" onclick="clearLogs()" style="margin-left:4px">清除</button></div></div>
+        <div id="log-list" class="key-list">
+          <div class="empty-state"><i class="fas fa-list-alt" aria-hidden="true"></i><h3>暂无日志</h3><p>开启日志开关后，API 请求和错误会被记录。</p></div>
         </div>
       </section>
     </main>
@@ -1044,7 +1051,26 @@ function showEditModelsList(id, models) {
       }
     }
   }
-  el.innerHTML = '<label>可用模型 <span class="mu">（点击 + 添加到下方）</span></label>' + renderModelGrid(models, id, id)
+  el.innerHTML = '<label>可用模型 <span class="mu">（点击 + 添加单个，或 <a href="javascript:void(0)" onclick="addAllModels(\'' + id + '\')">一键全部添加</a>）</span></label>' + renderModelGrid(models, id, id)
+}
+
+// 一键添加所有拉取的模型
+function addAllModels(id) {
+  const grid = document.getElementById('mel-' + id)
+  if (!grid) return
+  const btns = grid.querySelectorAll('[onclick^="addMdlToEdit"]')
+  const ids = []
+  btns.forEach(function(btn) {
+    const onclick = btn.getAttribute('onclick') || ''
+    const match = onclick.match(/addMdlToEdit\('([^']+)','([^']+)'\)/)
+    if (match) ids.push(match[2])
+  })
+  if (ids.length === 0) { toast('没有可添加的模型', 'error'); return }
+  // 清除现有模型列表
+  const ml = document.getElementById('ml-' + id)
+  if (ml) ml.innerHTML = ''
+  ids.forEach(function(mid) { addMdlToEdit(id, mid) })
+  toast('已添加 ' + ids.length + ' 个模型，请点击保存', 'success')
 }
 
 function addMdlToEdit(id, mid) {
@@ -1290,6 +1316,61 @@ setActiveAdminNav(location.hash)
     setTimeout(function () { oauthConnect(cid) }, 300)
   }
 })()
+
+// ===== 日志系统 =====
+var logAutoRefreshTimer = null
+;(function initLogs() {
+  fetch('/admin/api/logs/config').then(r => r.json()).then(d => {
+    if (d.success) {
+      document.getElementById('log-switch').checked = d.data.enabled
+      document.getElementById('log-status').textContent = d.data.enabled ? '已开启' : '已关闭'
+      if (d.data.enabled) refreshLogs()
+    }
+  })
+})()
+
+async function toggleLog(on) {
+  const r = await fetch('/admin/api/logs/config', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({enabled:on}) })
+  const d = await r.json()
+  if (d.success) {
+    document.getElementById('log-status').textContent = on ? '已开启' : '已关闭'
+    if (on) refreshLogs()
+    else document.getElementById('log-list').innerHTML = '<div class="empty-state"><i class="fas fa-list-alt" aria-hidden="true"></i><h3>日志已关闭</h3><p>开启开关后开始记录。</p></div>'
+  }
+}
+
+async function refreshLogs() {
+  const el = document.getElementById('log-list')
+  el.innerHTML = '<div class="empty-state"><i class="fas fa-spinner fa-pulse"></i><h3>加载中…</h3></div>'
+  try {
+    const r = await fetch('/admin/api/logs?limit=100')
+    const d = await r.json()
+    if (!d.success || !d.data.logs || d.data.logs.length === 0) {
+      el.innerHTML = '<div class="empty-state"><i class="fas fa-list-alt" aria-hidden="true"></i><h3>暂无日志</h3><p>开启开关后 API 请求会被记录。</p></div>'
+      return
+    }
+    var html = ''
+    d.data.logs.forEach(function(log) {
+      var icon = log.type === 'error' ? '<i class="fas fa-times-circle c-l"></i>'
+        : log.type === 'warn' ? '<i class="fas fa-exclamation-triangle c-o"></i>'
+        : log.type === 'request' ? '<i class="fas fa-check-circle c-g"></i>'
+        : '<i class="fas fa-info-circle c-p"></i>'
+      var time = new Date(log.time).toLocaleString()
+      html += '<article class="ki" style="font-size:12px;padding:6px 10px"><div><span style="margin-right:8px">' + icon + '</span><span class="mu" style="margin-right:8px">' + escapeHtml(time) + '</span><span class="bd bd-' + (log.type==='error'?'off':'on') + '">' + log.type + '</span></div><div style="margin-top:4px">' + escapeHtml(log.message) + '</div>' + (log.details ? '<details style="margin-top:4px"><summary>详情</summary><pre style="white-space:pre-wrap;font-size:11px;max-height:200px;overflow:auto">' + escapeHtml(log.details) + '</pre></details>' : '') + '</article>'
+    })
+    html += '<div style="padding:8px;text-align:center" class="mu">共 ' + d.data.total + ' 条日志，显示最近 ' + d.data.logs.length + ' 条</div>'
+    el.innerHTML = html
+  } catch(e) {
+    el.innerHTML = '<div class="empty-state"><i class="fas fa-exclamation-triangle c-l"></i><h3>加载失败</h3></div>'
+  }
+}
+
+async function clearLogs() {
+  if (!await cM('确定要清除所有日志吗？此操作不可撤销。')) return
+  await fetch('/admin/api/logs', { method: 'DELETE' })
+  document.getElementById('log-list').innerHTML = '<div class="empty-state"><i class="fas fa-list-alt" aria-hidden="true"></i><h3>暂无日志</h3><p>日志已清除。</p></div>'
+  toast('日志已清除', 'success')
+}
 </script>
 </body></html>`)
 }

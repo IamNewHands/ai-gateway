@@ -624,3 +624,81 @@ export async function handleOAuthModels(c: Context<{ Bindings: Env }>) {
     data: { debug, allErrors: errors },
   }, 502)
 }
+
+// ===== 日志系统 =====
+
+export interface LogEntry {
+  id: string
+  time: string
+  type: 'info' | 'error' | 'warn' | 'request' | 'response'
+  message: string
+  details?: string
+}
+
+const LOG_PREFIX = 'log:'
+const LOG_TTL = 60 * 60 * 24 * 7 // 7 天
+
+/** 写日志到 KV */
+export async function writeLog(env: Env, type: LogEntry['type'], message: string, details?: string) {
+  // 检查是否启用日志
+  const enabled = await env.KV.get('config:log_enabled')
+  if (enabled !== 'true') return
+
+  const id = Date.now().toString(36) + Math.random().toString(36).slice(2, 8)
+  const entry: LogEntry = {
+    id,
+    time: new Date().toISOString(),
+    type,
+    message,
+    details: details ? details.substring(0, 4000) : undefined,
+  }
+  await env.KV.put(LOG_PREFIX + id, JSON.stringify(entry), { expirationTtl: LOG_TTL })
+}
+
+/** 获取日志列表 */
+export async function handleLogs(c: Context<{ Bindings: Env }>) {
+  const limit = Math.min(Math.max(parseInt(c.req.query('limit') || '50'), 1), 200)
+  const type = c.req.query('type') || ''
+
+  const list = await c.env.KV.list({ prefix: LOG_PREFIX })
+  const keys = list.keys
+    .filter(k => k.name.startsWith(LOG_PREFIX))
+    .sort((a, b) => b.name.localeCompare(a.name))
+    .slice(0, limit)
+
+  const logs: LogEntry[] = []
+  for (const k of keys) {
+    const raw = await c.env.KV.get(k.name)
+    if (raw) {
+      try {
+        const entry = JSON.parse(raw) as LogEntry
+        if (!type || entry.type === type) {
+          logs.push(entry)
+        }
+      } catch { /* skip corrupt entries */ }
+    }
+  }
+
+  return c.json<ApiResponse>({ success: true, data: { logs, total: list.keys.length } })
+}
+
+/** 清除日志 */
+export async function handleLogsClear(c: Context<{ Bindings: Env }>) {
+  const list = await c.env.KV.list({ prefix: LOG_PREFIX })
+  for (const k of list.keys) {
+    await c.env.KV.delete(k.name)
+  }
+  return c.json<ApiResponse>({ success: true, message: '日志已清除' })
+}
+
+/** 获取/设置日志开关状态 */
+export async function handleLogConfig(c: Context<{ Bindings: Env }>) {
+  if (c.req.method === 'POST') {
+    const body = await c.req.json().catch(() => ({}))
+    const enabled = body.enabled ? 'true' : 'false'
+    await c.env.KV.put('config:log_enabled', enabled)
+    return c.json<ApiResponse>({ success: true, data: { enabled: body.enabled } })
+  }
+  const enabled = await c.env.KV.get('config:log_enabled')
+  return c.json<ApiResponse>({ success: true, data: { enabled: enabled === 'true' } })
+}

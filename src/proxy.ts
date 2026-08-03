@@ -4,6 +4,7 @@ import { KV_KEYS, KEY_HEALTH_COOLDOWN_MS, KEY_HEALTH_MAX_FAILURES } from './conf
 import type { Env, ProxyRequestBody } from './types'
 import { isOpenCodeProvider, proxyOpenCodeRequest, resolveOpenCodeUrls } from './opencode'
 import { getOauthAccessToken, readOauthToken, refreshOauthToken, detectTokenRealm, buildOauthHeaders } from './oauth'
+import { writeLog } from './admin'
 
 // ===== Key 健康状态类型和辅助函数 =====
 
@@ -395,6 +396,7 @@ export async function handleProxy(c: Context<{ Bindings: Env }>) {
           }
           if (healthUpdated) await writeHealth(c.env, providerId, healthData)
 
+          c.executionCtx.waitUntil(writeLog(c.env, 'request', `[${provider.name}] ${model} → 200 (key: ${apiKey.substring(0, 8)}...)`, `provider=${providerId}`))
           return passthroughResponse(response)
         }
 
@@ -420,6 +422,7 @@ export async function handleProxy(c: Context<{ Bindings: Env }>) {
 
         // 其他错误（400/404 等）直接返回
         const errorData = await response.json().catch(async () => ({ error: { message: await response.text() } }))
+        c.executionCtx.waitUntil(writeLog(c.env, 'error', `[${provider.name}] ${model} → ${response.status}`, JSON.stringify(errorData).substring(0, 500)))
         return c.json(errorData, response.status as Parameters<typeof c.json>[1])
       } catch (err) {
         const error = err as Error

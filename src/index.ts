@@ -21,6 +21,10 @@ import {
   handleOAuthPoll,
   handleOAuthDisconnect,
   handleOAuthModels,
+  handleLogs,
+  handleLogsClear,
+  handleLogConfig,
+  writeLog,
 } from './admin'
 import { renderHomePage, renderLoginPage, renderAdminPage } from './pages'
 import { seedInitialData, getSession, getProviders } from './storage'
@@ -89,6 +93,12 @@ app.post('/admin/api/oauth/:id/connect', handleOAuthConnect)
 app.post('/admin/api/oauth/:id/poll', handleOAuthPoll)
 app.post('/admin/api/oauth/:id/disconnect', handleOAuthDisconnect)
 app.get('/admin/api/oauth/:id/models', handleOAuthModels)
+
+// 日志管理
+app.get('/admin/api/logs', handleLogs)
+app.delete('/admin/api/logs', handleLogsClear)
+app.get('/admin/api/logs/config', handleLogConfig)
+app.post('/admin/api/logs/config', handleLogConfig)
 
 // ===== API 转发路由（需转发 Key 验证） =====
 app.use('/v1/*', proxyKeyAuthMiddleware)
