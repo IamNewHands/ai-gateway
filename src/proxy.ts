@@ -873,7 +873,7 @@ export async function handleAnthropicMessages(c: Context<{ Bindings: Env }>) {
       const isGlobal = realm === 'global'
       const realmBase = (isGlobal && cfg.globalBaseUrl ? cfg.globalBaseUrl : provider.baseUrl).replace(/\/$/, '')
       const origin = isGlobal && cfg.globalOrigin ? cfg.globalOrigin : (cfg.extraHeaders?.Origin)
-      const upstreamUrl = `${realmBase}/v1/chat/completions`
+      const upstreamUrl = `${realmBase}/chat/completions`
 
       // Global 域需要 system message
       if (isGlobal) {
@@ -885,7 +885,6 @@ export async function handleAnthropicMessages(c: Context<{ Bindings: Env }>) {
 
       const headers = buildOauthHeaders(cfg, tokenState.access_token, {
         origin,
-        apiType: 'anthropic',
         cookies: tokenState.cookies,
       })
 
@@ -904,7 +903,6 @@ export async function handleAnthropicMessages(c: Context<{ Bindings: Env }>) {
           if (freshState?.access_token) {
             const retryHeaders = buildOauthHeaders(cfg, freshState.access_token, {
               origin,
-              apiType: 'anthropic',
               cookies: freshState.cookies,
             })
             response = await fetch(upstreamUrl, {
@@ -1209,7 +1207,7 @@ export async function handleResponses(c: Context<{ Bindings: Env }>) {
       const isGlobal = realm === 'global'
       const realmBase = (isGlobal && cfg.globalBaseUrl ? cfg.globalBaseUrl : provider.baseUrl).replace(/\/$/, '')
       const origin = isGlobal && cfg.globalOrigin ? cfg.globalOrigin : (cfg.extraHeaders?.Origin)
-      const upstreamUrl = `${realmBase}/v1/chat/completions`
+      const upstreamUrl = `${realmBase}/chat/completions`
 
       // Global 域需要 system message
       if (isGlobal) {

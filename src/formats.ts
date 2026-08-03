@@ -80,7 +80,13 @@ export function anthropicToOpenAI(anthropicReq: AnthropicRequest): Record<string
   // messages 转换
   for (const msg of anthropicReq.messages) {
     if (msg.role === 'user') {
-      openaiMessages.push(anthropicUserToOpenAI(msg))
+      const result = anthropicUserToOpenAI(msg)
+      // 如果 user 消息中包含 tool_result，拆分出 tool 消息
+      if (Array.isArray(result)) {
+        openaiMessages.push(...result)
+      } else {
+        openaiMessages.push(result)
+      }
     } else if (msg.role === 'assistant') {
       openaiMessages.push(anthropicAssistantToOpenAI(msg))
     }
@@ -154,34 +160,49 @@ export function anthropicToOpenAI(anthropicReq: AnthropicRequest): Record<string
   return body
 }
 
-function anthropicUserToOpenAI(msg: AnthropicMessage): Record<string, unknown> {
+/**
+ * 将 Anthropic user 消息转为 OpenAI 消息。
+ * 如果包含 tool_result content block，返回数组：[...toolResults, userContent]，
+ * 确保 tool 消息紧跟在 assistant tool_calls 之后（OpenAI 要求）。
+ */
+function anthropicUserToOpenAI(msg: AnthropicMessage): Record<string, unknown> | Record<string, unknown>[] {
   if (typeof msg.content === 'string') {
     return { role: 'user', content: msg.content }
   }
 
-  // 多模态 content 数组
+  // 分离 tool_result 和其他 content
+  const toolResults: Record<string, unknown>[] = []
   const parts: Record<string, unknown>[] = []
+
   for (const block of msg.content) {
-    if (block.type === 'text') {
+    if (block.type === 'tool_result') {
+      const content = typeof block.content === 'string'
+        ? block.content
+        : (block.content || []).map((c: AnthropicContentBlock) => c.text || '').join('\n')
+      toolResults.push({
+        role: 'tool',
+        tool_call_id: block.tool_use_id || '',
+        content: content,
+      })
+    } else if (block.type === 'text') {
       parts.push({ type: 'text', text: block.text || '' })
     } else if (block.type === 'image' && block.source) {
       parts.push({
         type: 'image_url',
         image_url: { url: `data:${block.source.media_type};base64,${block.source.data}` },
       })
-    } else if (block.type === 'tool_result') {
-      // tool_result 不在这里处理，它们在 assistant 消息中
-      // 但 Anthropic 的 tool_result 可能在 user 消息中
-      // 这种情况下，我们将其作为 text 传递
-      const content = typeof block.content === 'string'
-        ? block.content
-        : (block.content || []).map((c: AnthropicContentBlock) => c.text || '').join('\n')
-      parts.push({ type: 'text', text: `[Tool Result: ${content}]` })
     }
   }
-  return { role: 'user', content: parts.length === 1 && parts[0].type === 'text'
+
+  const userMsg: Record<string, unknown> = { role: 'user', content: parts.length === 1 && parts[0].type === 'text'
     ? parts[0].text
     : parts }
+
+  // 如果有 tool_results，将它们放在 user 消息之前
+  if (toolResults.length > 0) {
+    return [...toolResults, userMsg]
+  }
+  return userMsg
 }
 
 function anthropicAssistantToOpenAI(msg: AnthropicMessage): Record<string, unknown> {
