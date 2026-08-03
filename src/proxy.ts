@@ -46,20 +46,116 @@ function parseModelId(model: string): { providerId: string; modelId: string } | 
 }
 
 /**
+ * WorkBuddy SSE chunk 清洗：去掉空 tool_calls/function_call 等噪音字段。
+ * 参考 cpa-plugin stream.go 的 cleanChunkJSON 实现。
+ * 不清洗这些字段会导致 strict 客户端（如某些 OpenAI SDK）解码失败：
+ * "SSE stream error: Transport error: error decoding response body"
+ */
+function cleanWorkbuddyChunk(chunk: string): string {
+  // 只处理 SSE data: 行
+  let data = chunk.trim()
+  if (!data) return chunk
+
+  const hasPrefix = data.startsWith('data:')
+  if (hasPrefix) {
+    data = data.slice(5).trim()
+  }
+  if (!data || data === '[DONE]') return chunk
+
+  try {
+    const obj = JSON.parse(data)
+    let changed = false
+    const choices = obj?.choices as any[]
+    if (Array.isArray(choices)) {
+      for (const choice of choices) {
+        const delta = choice?.delta
+        if (!delta || typeof delta !== 'object') continue
+        // 去掉空的 function_call
+        if (delta.function_call === null || (typeof delta.function_call === 'object' && Object.keys(delta.function_call).length === 0)) {
+          delete delta.function_call
+          changed = true
+        }
+        // 去掉空的 tool_calls 数组（WorkBuddy 终端 chunk 的标志性问题）
+        if (Array.isArray(delta.tool_calls) && delta.tool_calls.length === 0) {
+          delete delta.tool_calls
+          changed = true
+        }
+        // 去掉空的噪音字段
+        for (const noise of ['extra_fields', 'refusal', 'reasoning_content']) {
+          if (delta[noise] === null || delta[noise] === '' || delta[noise] === undefined) {
+            delete delta[noise]
+            changed = true
+          }
+        }
+        // 如果 delta 完全为空且没有 finish_reason，整个 chunk 丢弃
+        if (Object.keys(delta).length === 0 && !choice.finish_reason) {
+          return ''
+        }
+      }
+    }
+    if (!changed) return chunk
+    const cleaned = JSON.stringify(obj)
+    return hasPrefix ? `data: ${cleaned}` : cleaned
+  } catch {
+    // 非 JSON 行原样返回
+    return chunk
+  }
+}
+
+/**
  * 透传上游响应，保留 Content-Type（含 SSE text/event-stream）等关键头。
  * 修复 SSE 流式响应被截断/解码失败的问题：
  * - 不硬编码 application/json 作为 fallback（SSE 流的 Content-Type 是 text/event-stream）
  * - 添加 X-Accel-Buffering: no 防止中间代理缓冲 SSE 流
  * - 保留上游的 Transfer-Encoding 相关行为（Workers 自动处理 chunked）
  */
-function passthroughResponse(response: Response): Response {
+function passthroughResponse(response: Response, cleanFn?: (chunk: string) => string): Response {
   const headers: Record<string, string> = {
     'Cache-Control': 'no-store',
     'X-Accel-Buffering': 'no',
   }
   const ct = response.headers.get('Content-Type')
   if (ct) headers['Content-Type'] = ct
-  return new Response(response.body, {
+
+  // 无清洗函数或 body 不存在，直接透传
+  if (!cleanFn || !response.body) {
+    return new Response(response.body, {
+      status: response.status,
+      statusText: response.statusText,
+      headers,
+    })
+  }
+
+  // 通过 TransformStream 对 SSE 文本流做逐行清洗
+  const { readable, writable } = new TransformStream<string, Uint8Array>({
+    transform(chunk, controller) {
+      const cleaned = cleanFn(chunk)
+      if (cleaned) {
+        const encoder = new TextEncoder()
+        controller.enqueue(encoder.encode(cleaned + '\n'))
+      }
+    },
+  })
+
+  // 使用 pipeTo 将上游 body 通过 TextDecoderStream 管道化到清洗流
+  const writer = writable.getWriter()
+  const decoder = new TextDecoderStream()
+  const reader = response.body.pipeThrough(decoder).getReader()
+  ;(async () => {
+    try {
+      while (true) {
+        const { done, value } = await reader.read()
+        if (done) break
+        // 按 SSE 行分割
+        for (const line of value.split('\n')) {
+          if (line) await writer.write(line)
+        }
+      }
+    } catch { /* 流异常，忽略 */ }
+    try { await writer.close() } catch { /* already closed */ }
+  })()
+
+  return new Response(readable, {
     status: response.status,
     statusText: response.statusText,
     headers,
@@ -443,12 +539,12 @@ async function proxyOAuthRequest(
         console.log(`[proxy-oauth] ${primaryRealm} 域 401，自动切换到 ${alt} 域重试`)
         const altResponse = await doFetch(token, alt)
         if (altResponse.ok || altResponse.status !== 401) {
-          return passthroughResponse(altResponse)
+          return passthroughResponse(altResponse, cleanWorkbuddyChunk)
         }
       }
     }
 
-    return passthroughResponse(response)
+    return passthroughResponse(response, cleanWorkbuddyChunk)
   } catch (err) {
     const error = err as Error
     return c.json({

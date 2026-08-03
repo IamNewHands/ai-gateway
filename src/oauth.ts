@@ -270,6 +270,8 @@ async function startOauthBrowserFlow(env: Env, providerId: string, cfg: OAuthDev
       return { success: false, message: `登录发起返回异常: code=${env_resp.code} msg=${env_resp.msg}` }
     }
 
+    // cpa-plugin 核心要求：保存 Set-Cookie，轮询时必须复用同一个 cookie jar
+    const setCookie = res.headers.get('Set-Cookie') || ''
     const { state, authUrl } = env_resp.data
     const device: DeviceFlowState = {
       device_code: state,        // browser 模式下 device_code 字段存 state
@@ -278,6 +280,7 @@ async function startOauthBrowserFlow(env: Env, providerId: string, cfg: OAuthDev
       interval: cfg.pollInterval || 5,
       expires_at: Date.now() + 5 * 60 * 1000, // 5 分钟超时（参考插件 loginTTL）
       flowType: 'browser',
+      cookies: setCookie || undefined,
     }
     await env.KV.put(deviceKey(providerId), JSON.stringify(device), { expirationTtl: 900 })
     return { success: true, message: '登录链接已生成', device }
@@ -296,13 +299,18 @@ async function pollOauthBrowserFlow(env: Env, providerId: string, cfg: OAuthDevi
   try {
     const sep = cfg.deviceTokenUrl.includes('?') ? '&' : '?'
     const pollUrl = `${cfg.deviceTokenUrl}${sep}state=${encodeURIComponent(state)}`
+    const pollHeaders: Record<string, string> = {
+      'Accept': 'application/json, text/plain, */*',
+      'X-Requested-With': 'XMLHttpRequest',
+      ...cfg.extraHeaders,
+    }
+    // cpa-plugin 核心要求：轮询必须复用同一个 cookie jar，否则 token 无效导致 401
+    if (device.cookies) {
+      pollHeaders['Cookie'] = device.cookies
+    }
     const res = await fetch(pollUrl, {
       method: 'GET',
-      headers: {
-        'Accept': 'application/json, text/plain, */*',
-        'X-Requested-With': 'XMLHttpRequest',
-        ...cfg.extraHeaders,
-      },
+      headers: pollHeaders,
       signal: AbortSignal.timeout(15000),
     })
 

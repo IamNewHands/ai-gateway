@@ -100,6 +100,12 @@ export interface DeviceFlowState {
   expires_at: number
   /** 流程类型，用于轮询时分发 */
   flowType?: 'device' | 'browser'
+  /**
+   * browser 模式：发起登录时上游返回的 Set-Cookie。
+   * cpa-plugin 强调 must reuse the same cookie jar，否则 token 无效导致 401。
+   * 多个 cookie 用 "; " 分隔存储。
+   */
+  cookies?: string
 }
 
 export interface ProxyKey {
