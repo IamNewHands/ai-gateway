@@ -531,7 +531,7 @@ export async function handleOAuthModels(c: Context<{ Bindings: Env }>) {
   const tokenState = await readOauthToken(c.env, provider.id)
   const cookies = tokenState?.cookies
 
-  const debug = {
+  const debug: Record<string, unknown> = {
     realm: detectTokenRealm(token),
     tokenHeader: cfg.tokenHeader || 'x-api-key',
     tokenHeaderPrefix: cfg.tokenHeaderPrefix || '',
