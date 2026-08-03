@@ -259,19 +259,33 @@ function passthroughResponse(response: Response, cleanFn?: (chunk: string) => st
     },
   })
 
-  // 使用 pipeTo 将上游 body 通过 TextDecoderStream 管道化到清洗流
+  // 使用 pipeTo 将上游 body 通过 TextDecoderStream 管道化到清洗流。
+  // 关键：TextDecoderStream 按底层缓冲区切分 chunk，可能在任何位置切断。
+  // 必须维护行缓冲区，将不完整的行与下一个 chunk 拼接，否则 SSE data: 行
+  // 的 JSON 可能被换行符截断（如 data: {"id":"xxx-\n yyy"...}），导致
+  // 客户端 SSE 解析器（如 OpenMinis 的 ssePayload）收到不以 "data:" 开头
+  // 的行而丢弃，最终造成内容不完整。
   const writer = writable.getWriter()
   const decoder = new TextDecoderStream()
   const reader = response.body.pipeThrough(decoder).getReader()
   ;(async () => {
+    let lineBuffer = ''
     try {
       while (true) {
         const { done, value } = await reader.read()
         if (done) break
-        // 按 SSE 行分割
-        for (const line of value.split('\n')) {
+        // 将缓冲区与当前 chunk 拼接
+        const combined = lineBuffer + value
+        const lines = combined.split('\n')
+        // 最后一行可能不完整，保留到缓冲区
+        lineBuffer = lines.pop() || ''
+        for (const line of lines) {
           if (line) await writer.write(line)
         }
+      }
+      // 流结束后，处理缓冲区中剩余的最后一行
+      if (lineBuffer.trim()) {
+        await writer.write(lineBuffer)
       }
     } catch { /* 流异常，忽略 */ }
     try { await writer.close() } catch { /* already closed */ }
