@@ -490,9 +490,9 @@ async function proxyOAuthRequest(
   const buildOrigin = (realm: 'cn' | 'global') => {
     return realm === 'global' && cfg.globalOrigin ? cfg.globalOrigin : (cfg.extraHeaders?.Origin)
   }
-  // 备用域（401 自动切换用）
+  // 备用域（401 自动切换用）：CN token 不尝试 Global 域
   const altRealm = (realm: 'cn' | 'global'): 'cn' | 'global' | null => {
-    if (realm === 'cn' && cfg.globalBaseUrl) return 'global'
+    if (realm === 'cn') return null  // CN token 在 Global 域必然 401，不浪费请求
     if (realm === 'global') return 'cn'
     return null
   }

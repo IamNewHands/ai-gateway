@@ -174,10 +174,14 @@ export async function handleTestModel(c: Context<{ Bindings: Env }>) {
       return c.json<ApiResponse>({ success: false, message: 'OAuth 未连接或 Token 已失效，请先发起连接' }, 400)
     }
     // 域路由 + 401 自动切换：先尝试主域，401 时自动切换到备用域
+    // CN token 不应尝试 Global 域（iss 不匹配，APISIX 必然 401）
     const endpoint = provider.apiType === 'anthropic' ? 'messages' : 'chat/completions'
-    const realms: Array<'cn' | 'global'> = detectTokenRealm(token) === 'global' && cfg.globalBaseUrl
+    const tokenRealm = detectTokenRealm(token)
+    const realms: Array<'cn' | 'global'> = tokenRealm === 'global' && cfg.globalBaseUrl
       ? ['global', 'cn']
-      : ['cn', ...(cfg.globalBaseUrl ? ['global' as const] : [])]
+      : tokenRealm === 'cn'
+        ? ['cn']
+        : ['cn', ...(cfg.globalBaseUrl ? ['global' as const] : [])]
     const testBody = JSON.stringify({ model: modelId, messages: [{ role: 'user', content: 'hi' }], max_tokens: 1, stream: true })
     for (const realm of realms) {
       const realmBase = (realm === 'global' && cfg.globalBaseUrl ? cfg.globalBaseUrl : provider.baseUrl).replace(/\/$/, '')
@@ -537,11 +541,14 @@ export async function handleOAuthModels(c: Context<{ Bindings: Env }>) {
     : null
 
   // JWT 明确判定域时，对应端点优先；null/不确定时 CN 优先（baseUrl 默认 CN）
+  // CN token 不应尝试 Global 域（iss 不匹配，APISIX 必然 401）
   const candidates = realm === 'global' && globalEndpoint
     ? [globalEndpoint, cnEndpoint]
-    : [cnEndpoint, globalEndpoint].filter(Boolean) as typeof cnEndpoint[]
+    : realm === 'cn'
+      ? [cnEndpoint]  // CN 账户只试 CN 域，不浪费请求
+      : [cnEndpoint, globalEndpoint].filter(Boolean) as typeof cnEndpoint[]
 
-  let lastError = ''
+  const errors: string[] = []
   for (const ep of candidates) {
     try {
       const response = await fetch(ep.url, {
@@ -565,7 +572,8 @@ export async function handleOAuthModels(c: Context<{ Bindings: Env }>) {
       // 读取错误详情
       let detail = ''
       try { detail = (await response.text()).substring(0, 200) } catch { /* ignore */ }
-      lastError = `[${ep.label}] HTTP ${response.status}${detail ? '：' + detail : ''}`
+      const errMsg = `[${ep.label}] HTTP ${response.status}${detail ? '：' + detail : ''}`
+      errors.push(errMsg)
 
       // 401 且还有备用域 → 自动切换重试
       if (response.status === 401 && candidates.length > 1) {
@@ -579,10 +587,11 @@ export async function handleOAuthModels(c: Context<{ Bindings: Env }>) {
         message: `上游返回 HTTP ${response.status}${detail ? '：' + detail : ''}`,
       })
     } catch (err) {
-      lastError = `[${ep.label}] ${(err as Error).message || '请求异常'}`
+      const errMsg = `[${ep.label}] ${(err as Error).message || '请求异常'}`
+      errors.push(errMsg)
       // 网络错误也尝试下一个候选
       if (candidates.length > 1) {
-        console.log(`[oauth-models] ${ep.label} 域请求异常，尝试下一个候选端点: ${lastError}`)
+        console.log(`[oauth-models] ${ep.label} 域请求异常，尝试下一个候选端点: ${errMsg}`)
         continue
       }
       return c.json<ApiResponse>({ success: false, message: (err as Error).message || '拉取模型列表失败' })
@@ -592,6 +601,6 @@ export async function handleOAuthModels(c: Context<{ Bindings: Env }>) {
   // 所有候选端点都失败
   return c.json<ApiResponse>({
     success: false,
-    message: `所有域均请求失败，最后错误: ${lastError}`,
+    message: `所有域均请求失败: ${errors.join(' | ')}`,
   })
 }
