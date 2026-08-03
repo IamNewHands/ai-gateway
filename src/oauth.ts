@@ -275,6 +275,11 @@ async function startOauthBrowserFlow(env: Env, providerId: string, cfg: OAuthDev
 
     // cpa-plugin 核心要求：保存 Set-Cookie，轮询时必须复用同一个 cookie jar
     const setCookie = res.headers.get('Set-Cookie') || ''
+    const allSetCookies: string[] = []
+    res.headers.forEach((value, key) => {
+      if (key.toLowerCase() === 'set-cookie') allSetCookies.push(value)
+    })
+    console.log(`[oauth-start] provider=${providerId} Set-Cookie count: ${allSetCookies.length}, raw: "${setCookie.substring(0, 200)}"`)
     const { state, authUrl } = env_resp.data
     const device: DeviceFlowState = {
       device_code: state,        // browser 模式下 device_code 字段存 state

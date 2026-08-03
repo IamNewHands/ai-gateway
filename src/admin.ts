@@ -426,6 +426,8 @@ export async function handleOAuthStatus(c: Context<{ Bindings: Env }>) {
       connected: !!token,
       expiresAt: token?.expires_at ?? null,
       updatedAt: token?.updated_at ?? null,
+      hasCookies: !!(token?.cookies),
+      cookiesPreview: token?.cookies ? token.cookies.substring(0, 100) : null,
     },
   })
 }
