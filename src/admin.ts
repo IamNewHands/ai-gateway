@@ -179,7 +179,8 @@ export async function handleTestModel(c: Context<{ Bindings: Env }>) {
     const cookies = tokenState?.cookies
     // 域路由 + 401 自动切换：先尝试主域，401 时自动切换到备用域
     // CN token 不应尝试 Global 域（iss 不匹配，APISIX 必然 401）
-    const endpoint = provider.apiType === 'anthropic' ? 'messages' : 'chat/completions'
+    // aigateway 内部始终用 OpenAI chat/completions 格式与上游通信
+    const endpoint = 'chat/completions'
     const tokenRealm = detectTokenRealm(token)
     const realms: Array<'cn' | 'global'> = tokenRealm === 'global' && cfg.globalBaseUrl
       ? ['global', 'cn']
@@ -229,13 +230,6 @@ export async function handleTestModel(c: Context<{ Bindings: Env }>) {
 
 // ===== Key / 模型连通性测试（通过服务端代理，避免 CORS） =====
 
-function buildAuthHeaders(apiKey: string, apiType?: string): Record<string, string> {
-  if (apiType === 'anthropic') {
-    return { 'x-api-key': apiKey, 'anthropic-version': '2023-06-01' }
-  }
-  return { 'Authorization': `Bearer ${apiKey}` }
-}
-
 export async function handleTestKeyNew(c: Context<{ Bindings: Env }>) {
   const { url, apiKey, apiType, providerId } = await c.req.json<{
     url: string
@@ -273,7 +267,7 @@ export async function handleTestKeyNew(c: Context<{ Bindings: Env }>) {
   const cleanBase = url.replace(/\/$/, '')
   try {
     const response = await fetch(`${cleanBase}/models`, {
-      method: 'GET', headers: buildAuthHeaders(apiKey, apiType), signal: AbortSignal.timeout(15000),
+      method: 'GET', headers: { 'Authorization': `Bearer ${apiKey}` }, signal: AbortSignal.timeout(15000),
     })
 
     let data: unknown = null
@@ -315,12 +309,13 @@ export async function handleTestModelNew(c: Context<{ Bindings: Env }>) {
   }
 
   const cleanBase = url.replace(/\/$/, '')
-  const endpoint = apiType === 'anthropic' ? 'messages' : 'chat/completions'
+  // aigateway 内部始终用 OpenAI chat/completions 格式与上游通信
+  const endpoint = 'chat/completions'
 
   try {
     const response = await fetch(`${cleanBase}/${endpoint}`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json', ...buildAuthHeaders(apiKey, apiType) },
+      headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${apiKey}` },
       body: JSON.stringify({ model, messages: [{ role: 'user', content: 'hi' }], max_tokens: 1 }),
       signal: AbortSignal.timeout(15000),
     })

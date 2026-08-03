@@ -329,18 +329,15 @@ export async function testModelConnection(
 ): Promise<{ success: boolean; message: string; statusCode?: number }> {
   try {
     const cleanBase = baseUrl.replace(/\/$/, '')
-    const endpoint = apiType === 'anthropic' ? 'messages' : 'chat/completions'
-    const url = `${cleanBase}/${endpoint}`
+    // aigateway 内部始终用 OpenAI chat/completions 格式与上游通信，
+    // apiType 只影响客户端侧暴露的 API 格式（Anthropic/Responses 等）。
+    const url = `${cleanBase}/chat/completions`
 
     const headers: Record<string, string> = {
       'Content-Type': 'application/json',
     }
-    if (apiType === 'anthropic') {
-      headers['x-api-key'] = apiKey
-      headers['anthropic-version'] = '2023-06-01'
-    } else {
-      headers['Authorization'] = `Bearer ${apiKey}`
-    }
+    // 始终用 Bearer Authorization 发 OpenAI 格式请求到上游
+    headers['Authorization'] = `Bearer ${apiKey}`
 
     const response = await fetch(url, {
       method: 'POST',
@@ -530,12 +527,7 @@ export async function handleProxy(c: Context<{ Bindings: Env }>) {
       try {
         const forwardHeaders: Record<string, string> = {
           'Content-Type': 'application/json',
-        }
-        if (provider.apiType === 'anthropic') {
-          forwardHeaders['x-api-key'] = apiKey
-          forwardHeaders['anthropic-version'] = '2023-06-01'
-        } else {
-          forwardHeaders['Authorization'] = `Bearer ${apiKey}`
+          'Authorization': `Bearer ${apiKey}`,
         }
 
         const response = await fetch(forwardUrl, {
@@ -1027,11 +1019,115 @@ export async function handleAnthropicMessages(c: Context<{ Bindings: Env }>) {
       return c.json(anthropicResp)
     }
 
-    // 非 OAuth 提供商：标准转发
-    return c.json({
-      type: 'error',
-      error: { type: 'unsupported', message: 'Anthropic format currently only supports OAuth providers' },
-    }, 400)
+    // 非 OAuth 提供商：用 apiKey 标准转发，始终发 OpenAI 格式到上游
+    const enabledKeys = provider.apiKeys.filter(k => k.enabled)
+    if (enabledKeys.length === 0) {
+      return c.json({
+        type: 'error',
+        error: { type: 'configuration_error', message: `Provider "${provider.name}" has no enabled API keys` },
+      }, 500)
+    }
+
+    const cleanBase = provider.baseUrl.replace(/\/$/, '')
+    const forwardUrl = `${cleanBase}/chat/completions`
+    const upstreamBody: Record<string, unknown> = { ...openaiBody, stream: true }
+    const apiKey = enabledKeys[0].key
+
+    const response = await fetch(forwardUrl, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${apiKey}`,
+      },
+      body: JSON.stringify(upstreamBody),
+      signal: AbortSignal.timeout(300000),
+    })
+
+    if (!response.ok) {
+      const errText = await response.text()
+      return c.json({
+        type: 'error',
+        error: { type: 'upstream_error', message: `Upstream error: ${errText}` },
+      }, response.status as Parameters<typeof c.json>[1])
+    }
+
+    // 流式：OpenAI SSE → Anthropic SSE 实时转换
+    if (originalStream && response.body) {
+      const acc = createAnthropicSSEAccumulator()
+      const readable = new ReadableStream({
+        async start(controller) {
+          const decoder = new TextDecoderStream()
+          const textReader = response.body!.pipeThrough(decoder).getReader()
+          let lineBuffer = ''
+
+          try {
+            while (true) {
+              const { done, value } = await textReader.read()
+              if (done) break
+              const combined = lineBuffer + value
+              const lines = combined.split('\n')
+              lineBuffer = lines.pop() || ''
+
+              for (const line of lines) {
+                const trimmed = line.trim()
+                if (!trimmed.startsWith('data:')) continue
+                const data = trimmed.slice(5).trim()
+                if (!data || data === '[DONE]') continue
+
+                try {
+                  const chunk = JSON.parse(data)
+                  cleanChunkDelta(chunk)
+                  const anthropicSSE = openAIChunkToAnthropicSSE(chunk, acc)
+                  if (anthropicSSE) {
+                    controller.enqueue(new TextEncoder().encode(anthropicSSE))
+                  }
+                } catch { /* skip malformed */ }
+              }
+            }
+          } catch { /* stream error */ }
+          controller.close()
+        },
+      })
+
+      return new Response(readable, {
+        status: 200,
+        headers: {
+          'Content-Type': 'text/event-stream',
+          'Cache-Control': 'no-store',
+          'X-Accel-Buffering': 'no',
+        },
+      })
+    }
+
+    // 非流式：收集所有 OpenAI SSE → 聚合 → Anthropic
+    const allChunks: any[] = []
+    const decoder = new TextDecoderStream()
+    const textReader = response.body!.pipeThrough(decoder).getReader()
+    let lineBuffer2 = ''
+
+    try {
+      while (true) {
+        const { done, value } = await textReader.read()
+        if (done) break
+        const combined = lineBuffer2 + value
+        const lines = combined.split('\n')
+        lineBuffer2 = lines.pop() || ''
+        for (const line of lines) {
+          const trimmed = line.trim()
+          if (!trimmed.startsWith('data:')) continue
+          const data = trimmed.slice(5).trim()
+          if (!data || data === '[DONE]') continue
+          try {
+            const chunk = JSON.parse(data)
+            cleanChunkDelta(chunk)
+            allChunks.push(chunk)
+          } catch { /* skip */ }
+        }
+      }
+    } catch { /* stream error */ }
+
+    const anthropicResp = aggregateOpenAIToAnthropic(allChunks)
+    return c.json(anthropicResp)
   } catch (err) {
     console.error('[anthropic] error:', err)
     return c.json({ type: 'error', error: { type: 'server_error', message: 'Internal server error' } }, 500)
@@ -1254,9 +1350,123 @@ export async function handleResponses(c: Context<{ Bindings: Env }>) {
       return c.json(openaiResp)
     }
 
-    return c.json({
-      error: { message: 'Responses API currently only supports OAuth providers', type: 'unsupported' },
-    }, 400)
+    // 非 OAuth 提供商：用 apiKey 标准转发，始终发 OpenAI 格式到上游
+    const enabledKeys = provider.apiKeys.filter(k => k.enabled)
+    if (enabledKeys.length === 0) {
+      return c.json({
+        error: { type: 'configuration_error', message: `Provider "${provider.name}" has no enabled API keys` },
+      }, 500)
+    }
+
+    const cleanBase = provider.baseUrl.replace(/\/$/, '')
+    const forwardUrl = `${cleanBase}/chat/completions`
+    const upstreamBody: Record<string, unknown> = { ...openaiBody, stream: true }
+    const apiKey = enabledKeys[0].key
+
+    const response = await fetch(forwardUrl, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${apiKey}`,
+      },
+      body: JSON.stringify(upstreamBody),
+      signal: AbortSignal.timeout(300000),
+    })
+
+    if (!response.ok) {
+      const errText = await response.text()
+      return c.json({
+        error: { message: `Upstream error: ${errText}`, type: 'upstream_error' },
+      }, response.status as Parameters<typeof c.json>[1])
+    }
+
+    // 流式：OpenAI SSE → Responses SSE 实时转换
+    if (originalStream && response.body) {
+      const acc = {
+        responseId: '',
+        model: '',
+        itemId: null as string | null,
+        textContent: '',
+        toolCalls: new Map<number, { id: string; name: string; args: string }>(),
+        inputTokens: 0,
+        outputTokens: 0,
+        hasStarted: false,
+      }
+
+      const readable = new ReadableStream({
+        async start(controller) {
+          const decoder = new TextDecoderStream()
+          const textReader = response.body!.pipeThrough(decoder).getReader()
+          let lineBuffer = ''
+
+          try {
+            while (true) {
+              const { done, value } = await textReader.read()
+              if (done) break
+              const combined = lineBuffer + value
+              const lines = combined.split('\n')
+              lineBuffer = lines.pop() || ''
+
+              for (const line of lines) {
+                const trimmed = line.trim()
+                if (!trimmed.startsWith('data:')) continue
+                const data = trimmed.slice(5).trim()
+                if (!data || data === '[DONE]') continue
+
+                try {
+                  const chunk = JSON.parse(data)
+                  cleanChunkDelta(chunk)
+                  const responsesSSE = openAIChunkToResponsesSSE(chunk, acc)
+                  if (responsesSSE) {
+                    controller.enqueue(new TextEncoder().encode(responsesSSE))
+                  }
+                } catch { /* skip */ }
+              }
+            }
+          } catch { /* stream error */ }
+          controller.close()
+        },
+      })
+
+      return new Response(readable, {
+        status: 200,
+        headers: {
+          'Content-Type': 'text/event-stream',
+          'Cache-Control': 'no-store',
+          'X-Accel-Buffering': 'no',
+        },
+      })
+    }
+
+    // 非流式：聚合 OpenAI SSE → Responses
+    const allChunks: any[] = []
+    const decoder = new TextDecoderStream()
+    const textReader = response.body!.pipeThrough(decoder).getReader()
+    let lineBuffer3 = ''
+
+    try {
+      while (true) {
+        const { done, value } = await textReader.read()
+        if (done) break
+        const combined = lineBuffer3 + value
+        const lines = combined.split('\n')
+        lineBuffer3 = lines.pop() || ''
+        for (const line of lines) {
+          const trimmed = line.trim()
+          if (!trimmed.startsWith('data:')) continue
+          const data = trimmed.slice(5).trim()
+          if (!data || data === '[DONE]') continue
+          try {
+            const chunk = JSON.parse(data)
+            cleanChunkDelta(chunk)
+            allChunks.push(chunk)
+          } catch { /* skip */ }
+        }
+      }
+    } catch { /* stream error */ }
+
+    const openaiResp = aggregateOpenAIToResponses(allChunks)
+    return c.json(openaiResp)
   } catch (err) {
     console.error('[responses] error:', err)
     return c.json({ error: { message: 'Internal server error', type: 'server_error' } }, 500)
