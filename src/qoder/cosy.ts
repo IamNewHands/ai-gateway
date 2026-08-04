@@ -204,6 +204,7 @@ export interface CosySession {
   cosyKey: string
   info: string
   uid: string
+  identityJSON: string
 }
 
 export interface CosyIdentity {
@@ -257,6 +258,7 @@ async function newCosySession(id: CosyIdentity): Promise<CosySession> {
     cosyKey,
     info,
     uid: id.uid,
+    identityJSON,
   }
 }
 

@@ -427,6 +427,8 @@ export async function fetchQoderModels(
   debug.cosyKeyLen = session.cosyKey.length
   debug.cosyKeyHead = session.cosyKey.substring(0, 40)
   debug.uid = session.uid || '(empty)'
+  debug.identityJSON = session.identityJSON
+  debug.tempKey = session.tempKey
 
   let encodedBody: string
   try {
