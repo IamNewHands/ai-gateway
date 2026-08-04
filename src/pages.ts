@@ -461,7 +461,7 @@ ${H('管理')}
         </div>
       </section>
       <section id="logs" class="workspace-section" aria-labelledby="logs-title">
-        <div class="section-heading section-heading--admin"><div><h2 id="logs-title">系统日志</h2><p>记录 API 请求、错误等关键信息。</p></div><div><label class="tg"><input type="checkbox" id="log-switch" onchange="toggleLog(this.checked)"><span class="sl"></span></label><span id="log-status">已关闭</span><button class="btn btn-gh btn-xs" onclick="refreshLogs()" style="margin-left:8px"><i class="fas fa-sync-alt"></i></button><button class="btn btn-d btn-xs" onclick="clearLogs()" style="margin-left:4px">清除</button></div></div>
+        <div class="section-heading section-heading--admin"><div><h2 id="logs-title">系统日志</h2><p>记录 API 请求、错误等关键信息。</p></div><div><label class="tg"><input type="checkbox" id="log-switch" onchange="toggleLog(this.checked)"><span class="sl"></span></label><span id="log-status">已关闭</span><button class="btn btn-gh btn-xs" onclick="logPageChange(1)" style="margin-left:8px" title="刷新（回到第一页）"><i class="fas fa-sync-alt"></i></button><button class="btn btn-d btn-xs" onclick="clearLogs()" style="margin-left:4px">清除</button></div></div>
         <div id="log-list" class="key-list">
           <div class="empty-state"><i class="fas fa-list-alt" aria-hidden="true"></i><h3>暂无日志</h3><p>开启日志开关后，API 请求和错误会被记录。</p></div>
         </div>
@@ -1358,6 +1358,8 @@ maybeLoadCheckin(location.hash)
 
 // ===== 日志系统 =====
 var logAutoRefreshTimer = null
+var logPage = 1
+var logPageSize = 50
 ;(function initLogs() {
   fetch('/admin/api/logs/config').then(r => r.json()).then(d => {
     if (d.success) {
@@ -1373,7 +1375,7 @@ async function toggleLog(on) {
   const d = await r.json()
   if (d.success) {
     document.getElementById('log-status').textContent = on ? '已开启' : '已关闭'
-    if (on) refreshLogs()
+    if (on) { logPage = 1; refreshLogs() }
     else document.getElementById('log-list').innerHTML = '<div class="empty-state"><i class="fas fa-list-alt" aria-hidden="true"></i><h3>日志已关闭</h3><p>开启开关后开始记录。</p></div>'
   }
 }
@@ -1382,9 +1384,11 @@ async function refreshLogs() {
   const el = document.getElementById('log-list')
   el.innerHTML = '<div class="empty-state"><i class="fas fa-spinner fa-pulse"></i><h3>加载中…</h3></div>'
   try {
-    const r = await fetch('/admin/api/logs?limit=100')
+    const r = await fetch('/admin/api/logs?limit=' + logPageSize + '&offset=' + ((logPage - 1) * logPageSize))
     const d = await r.json()
     if (!d.success || !d.data.logs || d.data.logs.length === 0) {
+      // 当前页无数据：若不在第一页则回退一页重新加载（如日志被清除）
+      if (logPage > 1) { logPage--; refreshLogs(); return }
       el.innerHTML = '<div class="empty-state"><i class="fas fa-list-alt" aria-hidden="true"></i><h3>暂无日志</h3><p>开启开关后 API 请求会被记录。</p></div>'
       return
     }
@@ -1397,11 +1401,23 @@ async function refreshLogs() {
       var time = new Date(log.time).toLocaleString()
       html += '<article class="ki" style="font-size:12px;padding:6px 10px"><div><span style="margin-right:8px">' + icon + '</span><span class="mu" style="margin-right:8px">' + escapeHtml(time) + '</span><span class="bd bd-' + (log.type==='error'?'off':'on') + '">' + log.type + '</span></div><div style="margin-top:4px">' + escapeHtml(log.message) + '</div>' + (log.details ? '<details style="margin-top:4px"><summary>详情</summary><pre style="white-space:pre-wrap;font-size:11px;max-height:200px;overflow:auto">' + escapeHtml(log.details) + '</pre></details>' : '') + '</article>'
     })
-    html += '<div style="padding:8px;text-align:center" class="mu">共 ' + d.data.total + ' 条日志，显示最近 ' + d.data.logs.length + ' 条</div>'
+    // 分页条
+    var totalPages = Math.max(1, Math.ceil(d.data.total / logPageSize))
+    html += '<div style="padding:10px;display:flex;align-items:center;justify-content:center;gap:8px;flex-wrap:wrap">'
+    html += '<button class="btn btn-gh btn-xs" onclick="logPageChange(' + (logPage - 1) + ')" ' + (logPage <= 1 ? 'disabled' : '') + '><i class="fas fa-chevron-left"></i>上一页</button>'
+    html += '<span class="mu" style="font-size:12px">第 ' + logPage + ' / ' + totalPages + ' 页 · 共 ' + d.data.total + ' 条</span>'
+    html += '<button class="btn btn-gh btn-xs" onclick="logPageChange(' + (logPage + 1) + ')" ' + (logPage >= totalPages ? 'disabled' : '') + '>下一页<i class="fas fa-chevron-right"></i></button>'
+    html += '</div>'
     el.innerHTML = html
   } catch(e) {
     el.innerHTML = '<div class="empty-state"><i class="fas fa-exclamation-triangle c-l"></i><h3>加载失败</h3></div>'
   }
+}
+
+function logPageChange(p) {
+  if (p < 1) return
+  logPage = p
+  refreshLogs()
 }
 
 async function clearLogs() {
