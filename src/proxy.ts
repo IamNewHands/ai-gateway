@@ -471,13 +471,34 @@ export async function testModelConnection(
   }
 }
 
-/** 处理 /v1/chat/completions 等 API 转发 */
+/** 处理 /v1/chat/completions 等 API 转发（HTTP 路径） */
 export async function handleProxy(c: Context<{ Bindings: Env }>) {
   try {
     const body = await c.req.json<ProxyRequestBody>()
-    const model = body.model
+    return await forwardProxy(c, body, c.req.method)
+  } catch (err) {
+    const error = err as Error
+    return c.json({
+      error: { message: error.message || '代理转发内部错误', type: 'server_error' },
+    }, 500)
+  }
+}
 
-    if (!model) {
+/**
+ * 转发核心逻辑：校验模型 → 路由到对应上游（opencode / qoder / oauth / 通用 Key 轮询），
+ * 返回上游 Response。HTTP 路径由 handleProxy 直接返回；WS 桥接路径（ws.ts）读取其
+ * 响应体并分块以 WS 文本帧回推。
+ *
+ * @param method 请求方法，HTTP 路径默认取 c.req.method；WS 桥接强制传 'POST'
+ */
+export async function forwardProxy(
+  c: Context<{ Bindings: Env }>,
+  body: ProxyRequestBody,
+  method: string = c.req.method
+): Promise<Response> {
+  const model = body.model
+
+  if (!model) {
       return c.json({ error: { message: '缺少 model 参数', type: 'invalid_request_error' } }, 400)
     }
 
@@ -538,7 +559,7 @@ export async function handleProxy(c: Context<{ Bindings: Env }>) {
       const response = await proxyOpenCodeRequest({
         baseUrl: provider.baseUrl,
         apiKeys: enabledKeys,
-        method: c.req.method,
+        method,
         subPath,
         search: url.search,
         body: JSON.stringify(forwardBody),
@@ -577,7 +598,7 @@ export async function handleProxy(c: Context<{ Bindings: Env }>) {
 
     // OAuth 设备码提供商：使用 KV 中保存的 access_token 转发，401 时尝试刷新后重试
     if (provider.authType === 'oauth-device' && provider.oauth) {
-      return await proxyOAuthRequest(c, provider, subPath, url.search, forwardBody)
+      return await proxyOAuthRequest(c, provider, subPath, url.search, forwardBody, method)
     }
 
     if (enabledKeys.length === 0) {
@@ -650,7 +671,7 @@ export async function handleProxy(c: Context<{ Bindings: Env }>) {
         }
 
         const response = await fetch(forwardUrl, {
-          method: c.req.method,
+          method,
           headers: forwardHeaders,
           body: JSON.stringify(forwardBody),
           signal: AbortSignal.timeout(300000),
@@ -728,12 +749,6 @@ export async function handleProxy(c: Context<{ Bindings: Env }>) {
     return c.json({
       error: { message: '没有可用的 API Key', type: 'configuration_error' },
     }, 500)
-  } catch (err) {
-    const error = err as Error
-    return c.json({
-      error: { message: error.message || '代理转发内部错误', type: 'server_error' },
-    }, 500)
-  }
 }
 
 /**
@@ -746,7 +761,8 @@ async function proxyOAuthRequest(
   provider: import('./types').Provider,
   subPath: string,
   search: string,
-  forwardBody: object
+  forwardBody: object,
+  method: string = c.req.method
 ): Promise<Response> {
   const cfg = provider.oauth!
 
@@ -780,9 +796,9 @@ async function proxyOAuthRequest(
       body.stream = true
     }
     return fetch(buildForwardUrl(r), {
-      method: c.req.method,
+      method,
       headers: buildOauthHeaders(cfg, token, { origin: buildOrigin(r), apiType: provider.apiType, cookies: tokenState?.cookies }),
-      body: c.req.method === 'GET' || c.req.method === 'HEAD' ? undefined : JSON.stringify(body),
+      body: method === 'GET' || method === 'HEAD' ? undefined : JSON.stringify(body),
       signal: AbortSignal.timeout(300000),
     }).then(resp => ({ resp, originalStream }))
   }

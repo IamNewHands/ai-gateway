@@ -3,6 +3,7 @@ import { cors } from 'hono/cors'
 import { logger } from 'hono/logger'
 import { adminAuthMiddleware, proxyKeyAuthMiddleware, managementAuthMiddleware, handleLogin, handleLogout } from './auth'
 import { handleProxy, handleModels, handleAnthropicMessages, handleResponses } from './proxy'
+import { handleProxyWebSocket } from './ws'
 import {
   handleStatus,
   handleGetProviders,
@@ -127,6 +128,17 @@ app.post('/v1/messages', handleAnthropicMessages)
 
 // OpenAI Responses API — 必须在 /v1/* 通配之前注册
 app.post('/v1/responses', handleResponses)
+
+// WebSocket 桥接 — Trae 等客户端自定义模型直连网关时用 WS 传输（GET 升级请求无 body，
+// 不能让 handleProxy 用 c.req.json() 读取，否则抛 "Unexpected end of JSON input" → 500 → 握手失败）。
+// 必须在通用转发 handleProxy 之前注册。
+app.all('/v1/*', async (c, next) => {
+  const upgrade = (c.req.header('Upgrade') || '').toLowerCase()
+  if (upgrade === 'websocket' || c.req.header('Sec-WebSocket-Key')) {
+    return handleProxyWebSocket(c)
+  }
+  return next()
+})
 
 // 通用转发（Chat Completions 及其他）
 app.all('/v1/*', handleProxy)
