@@ -623,7 +623,7 @@ export async function handleOAuthModels(c: Context<{ Bindings: Env }>) {
 
   // QoderWork：模型发现走 COSY 签名的网关端点（GET /algo/api/v2/model/list），
   // 返回 {chat:[{key,display_name,enable}]}，只取启用模型。
-  if (isQoderProvider(provider.id) || cfg.flowType === 'qoder') {
+  if (isQoderProvider(provider.id) || cfg.flowType === 'qoder' || (provider.baseUrl && provider.baseUrl.includes('qoder'))) {
     try {
       const result = await fetchQoderModels(c.env, provider)
       if (!result.ok) {
@@ -756,7 +756,7 @@ export async function handleOAuthModels(c: Context<{ Bindings: Env }>) {
 
       return c.json<ApiResponse>({
         success: false,
-        message: `上游返回 HTTP ${response.status}${detail ? '：' + detail : ''}`,
+        message: `上游返回 HTTP ${response.status}${detail ? '：' + detail : ''} --- 调试信息 --- ${JSON.stringify(debug)}`,
         data: { debug, allErrors: errors },
       }, 502)
     } catch (err) {
