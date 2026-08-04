@@ -1403,10 +1403,17 @@ async function refreshLogs() {
     })
     // 分页条
     var totalPages = Math.max(1, Math.ceil(d.data.total / logPageSize))
+    var sizeOpts = [20, 50, 100, 200]
+    var sizeHtml = '<select onchange="logPageSizeChange(this.value)" style="font-size:12px;padding:2px 4px;border-radius:6px;border:1px solid var(--border,#e2e8f0);background:var(--card,#fff);color:inherit">'
+    for (var s = 0; s < sizeOpts.length; s++) {
+      sizeHtml += '<option value="' + sizeOpts[s] + '"' + (sizeOpts[s] === logPageSize ? ' selected' : '') + '>' + sizeOpts[s] + ' 条/页</option>'
+    }
+    sizeHtml += '</select>'
     html += '<div style="padding:10px;display:flex;align-items:center;justify-content:center;gap:8px;flex-wrap:wrap">'
     html += '<button class="btn btn-gh btn-xs" onclick="logPageChange(' + (logPage - 1) + ')" ' + (logPage <= 1 ? 'disabled' : '') + '><i class="fas fa-chevron-left"></i>上一页</button>'
     html += '<span class="mu" style="font-size:12px">第 ' + logPage + ' / ' + totalPages + ' 页 · 共 ' + d.data.total + ' 条</span>'
     html += '<button class="btn btn-gh btn-xs" onclick="logPageChange(' + (logPage + 1) + ')" ' + (logPage >= totalPages ? 'disabled' : '') + '>下一页<i class="fas fa-chevron-right"></i></button>'
+    html += '<span class="mu" style="font-size:12px">' + sizeHtml + '</span>'
     html += '</div>'
     el.innerHTML = html
   } catch(e) {
@@ -1417,6 +1424,14 @@ async function refreshLogs() {
 function logPageChange(p) {
   if (p < 1) return
   logPage = p
+  refreshLogs()
+}
+
+function logPageSizeChange(v) {
+  v = parseInt(v) || 50
+  if (v === logPageSize) return
+  logPageSize = v
+  logPage = 1  // 切换每页条数后回到第一页
   refreshLogs()
 }
 
