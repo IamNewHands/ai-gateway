@@ -16,12 +16,11 @@ const escapePageHtml = (value: unknown) => String(value ?? '')
 /**
  * 根据已保存的 OAuth 配置反推匹配的预置模板名称（用于编辑表单回显选中项）。
  * 预置模板本身不作为字段存储，但 deviceCodeUrl 是每个预置的唯一标识，
- * 据此即可稳定反推。返回 'codebuddy' | 'workbuddy' | ''（空 = 自定义/未匹配）。
+ * 据此即可稳定反推。返回 'workbuddy' | 'qoder' | ''（空 = 自定义/未匹配）。
  */
 const detectOauthPreset = (oauth?: OAuthDeviceConfig): string => {
   const url = oauth?.deviceCodeUrl || ''
   if (!url) return ''
-  if (url.includes('copilot.code.woa.com')) return 'codebuddy'
   if (url.includes('copilot.tencent.com/v2/plugin/auth/state')) return 'workbuddy'
   if (url.includes('qoder.com.cn/device/selectAccounts')) return 'qoder'
   return ''
@@ -396,13 +395,13 @@ ${H('管理')}
                 <div class="fg"><label>Scope（可选）</label><input type="text" id="ao5" placeholder="如 user"></div>
                 <div class="fg"><label>Token 注入头（默认 x-api-key）</label><input type="text" id="ao6" placeholder="x-api-key"></div>
                 <div class="fg"><label>Token 注入前缀（可选，如 Bearer ）</label><input type="text" id="ao9" placeholder="如 Bearer （含尾空格）"></div>
-                <div class="fg"><label>额外请求头（JSON，可选）</label><textarea id="ao7" rows="3" placeholder='{"x-app-name":"codebuddy-code","x-app-version":"1.0.2"}'></textarea></div>
+                <div class="fg"><label>额外请求头（JSON，可选）</label><textarea id="ao7" rows="3" placeholder='{"x-app-name":"my-app","x-app-version":"1.0.0"}'></textarea></div>
                 <div class="fg"><label>模型列表 URL（可选）</label><input type="url" id="ao10" placeholder="留空 = 用 baseUrl/models（OpenAI 标准）"><span class="form-helper">登录后从此地址动态拉取可用模型；WorkBuddy 等自定义 API 需填写。</span></div>
                 <div class="fg"><label>Global 域配置（海外账户，可选）</label><span class="form-helper">Token 为 workbuddy.ai 域时使用以下端点，留空则不区分域。WorkBuddy 预设会自动填充。</span></div>
                 <div class="fg"><label>Global 域 baseUrl</label><input type="url" id="ao11" placeholder="https://www.workbuddy.ai/v2"></div>
                 <div class="fg"><label>Global 域模型 URL</label><input type="url" id="ao12" placeholder="https://www.workbuddy.ai/console/enterprises/personal/models"></div>
                 <div class="fg"><label>Global 域 Origin</label><input type="url" id="ao13" placeholder="https://www.workbuddy.ai"></div>
-                <div class="fg"><label>预置模板</label><select class="select-sm" onchange="applyOauthPreset(this.value)"><option value="">— 选择 —</option><option value="codebuddy">CodeBuddy（设备码）</option><option value="workbuddy">WorkBuddy（浏览器登录）</option><option value="qoder">QoderWork（Qoder 设备授权）</option></select></div>
+                <div class="fg"><label>预置模板</label><select class="select-sm" onchange="applyOauthPreset(this.value)"><option value="">— 选择 —</option><option value="workbuddy">WorkBuddy（浏览器登录）</option><option value="qoder">QoderWork（Qoder 设备授权）</option></select></div>
                 <div class="fc mt-1 field-row"><button class="btn btn-p" onclick="createProv({afterCreate:function(id){location.href='/admin?connect='+encodeURIComponent(id)}})"><i class="fas fa-plug" aria-hidden="true"></i>创建并发起连接</button><span class="form-helper">先创建提供商，保存后自动弹出 OAuth 登录链接；登录成功会自动拉取模型。</span></div>
               </fieldset>
             </div>
@@ -437,12 +436,12 @@ ${H('管理')}
                   <div class="fg"><label>Scope（可选）</label><input type="text" id="eao5-${escapePageHtml(p.id)}" value="${escapePageHtml((p.oauth&&p.oauth.scope)||'')}" placeholder="如 user"></div>
                   <div class="fg"><label>Token 注入头（默认 x-api-key）</label><input type="text" id="eao6-${escapePageHtml(p.id)}" value="${escapePageHtml((p.oauth&&p.oauth.tokenHeader)||'x-api-key')}" placeholder="x-api-key"></div>
                   <div class="fg"><label>Token 注入前缀（可选，如 Bearer ）</label><input type="text" id="eao9-${escapePageHtml(p.id)}" value="${escapePageHtml((p.oauth&&p.oauth.tokenHeaderPrefix)||'')}" placeholder="如 Bearer （含尾空格）"></div>
-                  <div class="fg"><label>额外请求头（JSON，可选）</label><textarea id="eao7-${escapePageHtml(p.id)}" rows="3" placeholder='{"x-app-name":"codebuddy-code"}'>${escapePageHtml((p.oauth&&JSON.stringify(p.oauth.extraHeaders||{}))||'')}</textarea></div>
+                  <div class="fg"><label>额外请求头（JSON，可选）</label><textarea id="eao7-${escapePageHtml(p.id)}" rows="3" placeholder='{"x-app-name":"my-app"}'>${escapePageHtml((p.oauth&&JSON.stringify(p.oauth.extraHeaders||{}))||'')}</textarea></div>
                   <div class="fg"><label>模型列表 URL（可选）</label><input type="url" id="eao10-${escapePageHtml(p.id)}" value="${escapePageHtml((p.oauth&&p.oauth.modelsUrl)||'')}" placeholder="留空 = 用 baseUrl/models（OpenAI 标准）"></div>
                   <div class="fg"><label>Global 域 baseUrl（海外账户，可选）</label><input type="url" id="eao11-${escapePageHtml(p.id)}" value="${escapePageHtml((p.oauth&&p.oauth.globalBaseUrl)||'')}" placeholder="https://www.workbuddy.ai/v2"></div>
                   <div class="fg"><label>Global 域模型 URL（可选）</label><input type="url" id="eao12-${escapePageHtml(p.id)}" value="${escapePageHtml((p.oauth&&p.oauth.globalModelsUrl)||'')}" placeholder="https://www.workbuddy.ai/console/enterprises/personal/models"></div>
                   <div class="fg"><label>Global 域 Origin（可选）</label><input type="url" id="eao13-${escapePageHtml(p.id)}" value="${escapePageHtml((p.oauth&&p.oauth.globalOrigin)||'')}" placeholder="https://www.workbuddy.ai"></div>
-                  <div class="fg"><label>预置模板</label><select class="select-sm" onchange="applyOauthPresetEdit('${p.id}',this.value)"><option value="" ${detectOauthPreset(p.oauth)===''?'selected':''}>— 选择 —</option><option value="codebuddy" ${detectOauthPreset(p.oauth)==='codebuddy'?'selected':''}>CodeBuddy（设备码）</option><option value="workbuddy" ${detectOauthPreset(p.oauth)==='workbuddy'?'selected':''}>WorkBuddy（浏览器登录）</option><option value="qoder" ${detectOauthPreset(p.oauth)==='qoder'?'selected':''}>QoderWork（Qoder 设备授权）</option></select></div>
+                  <div class="fg"><label>预置模板</label><select class="select-sm" onchange="applyOauthPresetEdit('${p.id}',this.value)"><option value="" ${detectOauthPreset(p.oauth)===''?'selected':''}>— 选择 —</option><option value="workbuddy" ${detectOauthPreset(p.oauth)==='workbuddy'?'selected':''}>WorkBuddy（浏览器登录）</option><option value="qoder" ${detectOauthPreset(p.oauth)==='qoder'?'selected':''}>QoderWork（Qoder 设备授权）</option></select></div>
                   <div class="fc mt-1 field-row"><button class="btn btn-s" onclick="oauthConnect('${p.id}')"><i class="fas fa-plug" aria-hidden="true"></i>发起连接</button><button class="btn btn-gh" onclick="fetchOauthModels('${p.id}')"><i class="fas fa-cloud-download-alt" aria-hidden="true"></i>获取模型</button><button class="btn btn-gh" onclick="oauthStatus('${p.id}')"><i class="fas fa-sync" aria-hidden="true"></i>状态</button><button class="btn btn-gh" onclick="oauthDisconnect('${p.id}')"><i class="fas fa-unlink" aria-hidden="true"></i>断开</button><span id="oauth-st-${escapePageHtml(p.id)}" class="oauth-status"></span></div>
                 </fieldset>
               </div>
@@ -778,27 +777,6 @@ function toggleAuthTypeEdit(id) {
 }
 
 const OAUTH_PRESETS = {
-  codebuddy: {
-    flowType: 'device',
-    deviceCodeUrl: 'https://copilot.code.woa.com/api/v2/auth/device/code',
-    deviceTokenUrl: 'https://copilot.code.woa.com/api/v2/auth/device/token',
-    refreshTokenUrl: 'https://copilot.code.woa.com/api/v2/auth/oauth_token/refresh',
-    clientId: 'd15f1aada3db4be2be622afed0019a29',
-    scope: 'user',
-    tokenHeader: 'x-api-key',
-    extraHeaders: {
-      'x-app-version': '1.0.2',
-      'x-app-name': 'codebuddy-code',
-      'x-request-platform': 'CodeBuddy-Code',
-      'x-scene-name': 'common_chat',
-      'user-agent': 'Claude-Code-Internal/1.0.2',
-      'x-request-platform-v2': 'Claude-Code-Internal',
-      'x-app-name-v2': 'claude-code-internal',
-      'x-claude-code-internal': 'true',
-      'x-channel': 'claude-code-internal',
-    },
-    _baseUrl: 'https://copilot.code.woa.com',
-  },
   workbuddy: {
     flowType: 'browser',
     deviceCodeUrl: 'https://copilot.tencent.com/v2/plugin/auth/state?platform=CLI',
