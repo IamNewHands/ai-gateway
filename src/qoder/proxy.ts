@@ -16,7 +16,7 @@
 import type { Env, Provider } from '../types'
 import { getOauthAccessToken, readOauthToken, refreshOauthToken } from '../oauth'
 import { buildQoderBody, cpaToUpstreamKey } from './body'
-import { qoderEncode, cosySessionFor, cosyHeaders, type CosySession } from './cosy'
+import { qoderEncode, cosySessionFor, cosyHeaders, buildBearer, type CosySession } from './cosy'
 
 export const QODER_PROVIDER_ID = 'qoder'
 export const QODER_GATEWAY = 'https://gateway.qoder.com.cn'
@@ -400,40 +400,63 @@ export async function proxyQoderChatRequest(
 export async function fetchQoderModels(
   env: Env,
   provider: Provider
-): Promise<{ ok: boolean; message: string; models?: Array<{ id: string }>; status?: number }> {
+): Promise<{ ok: boolean; message: string; models?: Array<{ id: string }>; status?: number; debug?: Record<string, unknown> }> {
+  const debug: Record<string, unknown> = {}
   console.log(`[qoder-models] start provider=${provider.id} flowType=${provider.oauth?.flowType}`)
   let data: { session: CosySession; accessToken: string } | null
   try {
     data = await buildQoderSession(env, provider)
   } catch (err) {
     console.error(`[qoder-models] buildQoderSession threw:`, err)
-    return { ok: false, message: `构建 COSY 会话失败: ${(err as Error).stack || (err as Error).message || err}` }
+    return { ok: false, message: `构建 COSY 会话失败: ${(err as Error).stack || (err as Error).message || err}`, debug }
   }
   if (!data) {
     console.warn(`[qoder-models] no valid token (缺失或刷新失败)`)
-    return { ok: false, message: 'OAuth 未连接或 Token 已失效，请先发起连接' }
+    return { ok: false, message: 'OAuth 未连接或 Token 已失效，请先发起连接', debug }
   }
-  console.log(`[qoder-models] session ok uid=${data.session.uid || '(empty)'} machineType=${data.session.machineType.slice(0, 8)}...`)
-  console.log(`[qoder-models] machineId=${data.session.machineId} machineToken=${data.session.machineToken.substring(0, 20)}...`)
-  console.log(`[qoder-models] info len=${data.session.info.length} head=${data.session.info.substring(0, 40)}`)
-  console.log(`[qoder-models] cosyKey len=${data.session.cosyKey.length} head=${data.session.cosyKey.substring(0, 40)}`)
+  const { session } = data
+  console.log(`[qoder-models] session ok uid=${session.uid || '(empty)'} machineType=${session.machineType.slice(0, 8)}...`)
+  console.log(`[qoder-models] machineId=${session.machineId} machineToken=${session.machineToken.substring(0, 20)}...`)
+  console.log(`[qoder-models] info len=${session.info.length} head=${session.info.substring(0, 40)}`)
+  console.log(`[qoder-models] cosyKey len=${session.cosyKey.length} head=${session.cosyKey.substring(0, 40)}`)
+  debug.machineId = session.machineId
+  debug.machineType = session.machineType
+  debug.machineToken = session.machineToken.substring(0, 20) + '...'
+  debug.infoLen = session.info.length
+  debug.infoHead = session.info.substring(0, 40)
+  debug.cosyKeyLen = session.cosyKey.length
+  debug.cosyKeyHead = session.cosyKey.substring(0, 40)
+  debug.uid = session.uid || '(empty)'
 
   let encodedBody: string
   try {
     encodedBody = qoderEncode('{}')
     console.log(`[qoder-models] encodedBody=${encodedBody}`)
+    debug.encodedBody = encodedBody
   } catch (err) {
     console.error(`[qoder-models] qoderEncode threw:`, err)
-    return { ok: false, message: `QoderEncoding 失败: ${(err as Error).message || err}` }
+    return { ok: false, message: `QoderEncoding 失败: ${(err as Error).message || err}`, debug }
   }
 
   let headers: Record<string, string>
   try {
-    headers = cosyHeaders(data.session, encodedBody, QODER_MODELS_URL, 'application/json', false)
+    // 先单独调用 buildBearer 获取签名中间值用于调试
+    const bearerInfo = buildBearer(session, encodedBody, QODER_MODELS_URL)
+    debug.bearerPayloadB64 = bearerInfo.payloadB64.substring(0, 40) + '...'
+    debug.bearerDate = bearerInfo.date
+    debug.bearerSig = bearerInfo.bearer.substring(bearerInfo.bearer.lastIndexOf('.') + 1)
+    
+    headers = cosyHeaders(session, encodedBody, QODER_MODELS_URL, 'application/json', false)
     console.log(`[qoder-models] request headers:`, JSON.stringify(headers, null, 2).substring(0, 2000))
+    debug.cosyHeaders = Object.fromEntries(
+      Object.entries(headers).map(([k, v]) => [
+        k,
+        v.length > 200 ? v.substring(0, 200) + '...' : v,
+      ])
+    )
   } catch (err) {
     console.error(`[qoder-models] cosyHeaders threw:`, err)
-    return { ok: false, message: `COSY 签名失败: ${(err as Error).message || err}` }
+    return { ok: false, message: `COSY 签名失败: ${(err as Error).message || err}`, debug }
   }
 
   let resp: Response
@@ -445,28 +468,31 @@ export async function fetchQoderModels(
     })
   } catch (err) {
     console.error(`[qoder-models] fetch threw:`, err)
-    return { ok: false, message: (err as Error).message || '请求失败' }
+    debug.fetchError = (err as Error).message
+    return { ok: false, message: (err as Error).message || '请求失败', debug }
   }
   const rawText = await resp.text().catch(() => '')
   console.log(`[qoder-models] upstream status=${resp.status} body=${rawText.substring(0, 300)}`)
+  debug.upstreamStatus = resp.status
+  debug.upstreamBody = rawText.substring(0, 500)
   if (!resp.ok) {
-    return { ok: false, message: `HTTP ${resp.status}: ${rawText.substring(0, 300)}`, status: resp.status }
+    return { ok: false, message: `HTTP ${resp.status}: ${rawText.substring(0, 300)}`, status: resp.status, debug }
   }
   let json: any = null
   try {
     json = JSON.parse(rawText)
   } catch {
-    return { ok: false, message: `响应不是合法 JSON: ${rawText.substring(0, 200)}` }
+    return { ok: false, message: `响应不是合法 JSON: ${rawText.substring(0, 200)}`, debug }
   }
   const chat = json && Array.isArray(json.chat) ? json.chat : null
   if (!chat) {
-    return { ok: false, message: `响应缺少 chat 场景，keys=${Object.keys(json || {}).join(',') || '(empty)'}` }
+    return { ok: false, message: `响应缺少 chat 场景，keys=${Object.keys(json || {}).join(',') || '(empty)'}`, debug }
   }
   const models = chat
     .filter((m: any) => m && m.enable === true && m.key)
     .map((m: any) => ({ id: m.key }))
   if (models.length === 0) {
-    return { ok: false, message: '没有启用的 chat 模型' }
+    return { ok: false, message: '没有启用的 chat 模型', debug }
   }
-  return { ok: true, message: 'success', models }
+  return { ok: true, message: 'success', models, debug }
 }

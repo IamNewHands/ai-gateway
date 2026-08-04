@@ -628,7 +628,8 @@ export async function handleOAuthModels(c: Context<{ Bindings: Env }>) {
       const result = await fetchQoderModels(c.env, provider)
       if (!result.ok) {
         const status = result.status && result.status >= 400 ? result.status : 502
-        return c.json<ApiResponse>({ success: false, message: result.message, data: { providerId: provider.id } }, status)
+        const debugInfo = result.debug ? ` --- 调试信息 --- ${JSON.stringify(result.debug)}` : ''
+        return c.json<ApiResponse>({ success: false, message: result.message + debugInfo, data: { providerId: provider.id } }, status)
       }
       const models = result.models || []
       // 自动合并保存到 provider.models（按 id 去重追加，保留已有 enabled 状态）
