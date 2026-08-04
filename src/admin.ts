@@ -771,16 +771,23 @@ export async function handleLogs(c: Context<{ Bindings: Env }>) {
   const limit = Math.min(Math.max(parseInt(c.req.query('limit') || '50'), 1), 200)
   const type = c.req.query('type') || ''
 
-  const list = await c.env.KV.list({ prefix: LOG_PREFIX })
-  const keys = list.keys
-    .filter(k => k.name.startsWith(LOG_PREFIX))
-    .sort((a, b) => b.name.localeCompare(a.name))
-    .slice(0, limit)
+  // KV.list 返回按 key 名字典序升序的 key（已排序，无需再 sort）。
+  // key 名 = 'log:' + Date.now().toString(36) + 随机，字典序等价于时间序，
+  // 故 reverse() 后即为最新在前。多取 limit*3 条以补偿 type 过滤后的数量不足。
+  const listLimit = Math.min(Math.max(limit * 3, 100), 1000)
+  const list = await c.env.KV.list({ prefix: LOG_PREFIX, limit: listLimit })
+  const keys = list.keys.slice().reverse()
 
+  // 分批并行读取，避免一次性发起过多 subrequest（Cloudflare Workers 限制）。
+  // 串行 100 条 ≈ 5-15s（每条 KV.get 一次网络往返），分批并行 25 条/批 ≈ 0.5-1.5s。
+  const BATCH = 25
   const logs: LogEntry[] = []
-  for (const k of keys) {
-    const raw = await c.env.KV.get(k.name)
-    if (raw) {
+  for (let i = 0; i < keys.length; i += BATCH) {
+    if (logs.length >= limit) break  // 够用即停
+    const batch = keys.slice(i, i + BATCH)
+    const raws = await Promise.all(batch.map(k => c.env.KV.get(k.name)))
+    for (const raw of raws) {
+      if (!raw) continue
       try {
         const entry = JSON.parse(raw) as LogEntry
         if (!type || entry.type === type) {
@@ -790,7 +797,7 @@ export async function handleLogs(c: Context<{ Bindings: Env }>) {
     }
   }
 
-  return c.json<ApiResponse>({ success: true, data: { logs, total: list.keys.length } })
+  return c.json<ApiResponse>({ success: true, data: { logs: logs.slice(0, limit), total: list.keys.length } })
 }
 
 /** 清除日志 */
