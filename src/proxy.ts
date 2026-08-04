@@ -543,6 +543,15 @@ export async function handleProxy(c: Context<{ Bindings: Env }>) {
         body: JSON.stringify(forwardBody),
         mirrorUrls: resolveOpenCodeUrls(c.env),
       })
+      // OpenCode 路径之前缺少日志记录，导致请求成功但后台无记录
+      const logLevel = response.ok ? 'request' : (response.status >= 500 ? 'error' : 'warn')
+      try {
+        const bodySummary = summarizeRequestBody(forwardBody)
+        c.executionCtx.waitUntil(writeLog(c.env, logLevel,
+          `[${provider.name}] ${model} → ${response.status}`,
+          JSON.stringify({ providerId, subPath, body: bodySummary }).substring(0, 4000)
+        ))
+      } catch { /* log failure must not break */ }
       return new Response(response.body, {
         status: response.status,
         statusText: response.statusText,
