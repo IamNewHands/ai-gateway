@@ -442,9 +442,12 @@ export async function fetchQoderModels(
   try {
     // 先单独调用 buildBearer 获取签名中间值用于调试
     const bearerInfo = buildBearer(session, encodedBody, QODER_MODELS_URL)
-    debug.bearerPayloadB64 = bearerInfo.payloadB64.substring(0, 40) + '...'
+    debug.bearerPayloadB64Full = bearerInfo.payloadB64
     debug.bearerDate = bearerInfo.date
     debug.bearerSig = bearerInfo.bearer.substring(bearerInfo.bearer.lastIndexOf('.') + 1)
+    debug.cosyKeyFull = session.cosyKey
+    debug.bodyForSign = encodedBody
+    debug.sigInput = bearerInfo.sigInput
     
     headers = cosyHeaders(session, encodedBody, QODER_MODELS_URL, 'application/json', false)
     console.log(`[qoder-models] request headers:`, JSON.stringify(headers, null, 2).substring(0, 2000))

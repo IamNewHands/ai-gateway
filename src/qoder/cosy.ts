@@ -266,6 +266,7 @@ export interface CosyBearer {
   payloadB64: string
   date: string
   bearer: string
+  sigInput: string
 }
 
 /** buildBearer：构造 Authorization 头。pathSig 为 URL path 去掉 /algo 前缀。 */
@@ -292,7 +293,7 @@ export function buildBearer(sess: CosySession, body: string, rawUrl: string): Co
   console.log('[cosy:sign] body len=', body.length, 'body head=', body.substring(0, 100))
   console.log('[cosy:sign] pathSig=', pathSig)
   console.log('[cosy:sign] sigInput len=', sigInput.length, 'md5=', sig)
-  return { payloadB64, date, bearer: 'Bearer COSY.' + payloadB64 + '.' + sig }
+  return { payloadB64, date, bearer: 'Bearer COSY.' + payloadB64 + '.' + sig, sigInput }
 }
 
 /** cosyHeaders：一次推理/模型请求的完整头集合。sse=true 时加 cache-control。 */
