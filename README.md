@@ -45,7 +45,7 @@
 - **OpenAI Responses**（`/v1/responses`）↔ OpenAI Chat Completions 双向转换
 - **流式 SSE 实时转换**：OpenAI SSE → Anthropic named-event SSE / Responses SSE
 - **修复 SSE 多事件格式**：单 chunk 触发多个事件时正确用空行（`\n\n`）分隔，避免 `message_stop` 被客户端吞掉（`truncated: stream ended`，file tool 调用必现）
-- **流结束兜底**：上游缺失 `finish_reason` 时强制发送 `message_delta` + `message_stop`
+- **流结束兜底**：上游缺失 `finish_reason` 或 `tool_use` 块未关闭时，强制补发 `content_block_stop` + `message_delta` + `message_stop`，并通过 `messageStopSent` / `currentBlockClosed` 标志保证幂等；触发兜底时记录 `warn` 诊断日志（含 providerId / model / tool_use 名称与 id），便于定位偶发的 `truncated: stream ended` 问题
 - **上游请求体清洗**：去除 WorkBuddy 不支持字段（`reasoning_effort`、`developer` 角色转 `system`、空 `content` 数组处理）
 
 ### 5. 其他改进

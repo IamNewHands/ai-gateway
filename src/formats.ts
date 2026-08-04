@@ -380,6 +380,10 @@ interface AnthropicSSEAccumulator {
   stopReason: string | null
   inputTokens: number
   outputTokens: number
+  /** message_stop 是否已发送（流结束兜底用，避免重复/遗漏） */
+  messageStopSent: boolean
+  /** 当前 content block 的 content_block_stop 是否已发送 */
+  currentBlockClosed: boolean
 }
 
 export function createAnthropicSSEAccumulator(): AnthropicSSEAccumulator {
@@ -391,6 +395,8 @@ export function createAnthropicSSEAccumulator(): AnthropicSSEAccumulator {
     stopReason: null,
     inputTokens: 0,
     outputTokens: 0,
+    messageStopSent: false,
+    currentBlockClosed: true,
   }
 }
 
@@ -454,6 +460,11 @@ export function openAIChunkToAnthropicSSE(
       if (chunk.usage) {
         acc.outputTokens = chunk.usage.completion_tokens ?? chunk.usage.total_tokens ?? acc.outputTokens
       }
+      // 关闭当前未关闭的 content block（text 或 tool_use），
+      // 否则客户端会因 content_block 缺少 stop 事件而报 "truncated: stream ended"
+      if (!acc.currentBlockClosed) {
+        closeCurrentBlock(acc, events)
+      }
       events.push(`event: message_delta`)
       events.push(`data: ${JSON.stringify({
         type: 'message_delta',
@@ -462,6 +473,7 @@ export function openAIChunkToAnthropicSSE(
       })}`)
       events.push(`event: message_stop`)
       events.push(`data: ${JSON.stringify({ type: 'message_stop' })}`)
+      acc.messageStopSent = true
     }
     return formatAnthropicSSE(events)
   }
@@ -477,6 +489,7 @@ export function openAIChunkToAnthropicSSE(
         index: acc.currentBlockIndex,
         content_block: { type: 'text', text: '' },
       })}`)
+      acc.currentBlockClosed = false
     }
     acc.contentBlocks[acc.currentBlockIndex].text += delta.content
     events.push(`event: content_block_delta`)
@@ -514,6 +527,7 @@ export function openAIChunkToAnthropicSSE(
           index: blockIndex,
           content_block: { type: 'tool_use', id: tc.id, name: tc.function.name, input: {} },
         })}`)
+        acc.currentBlockClosed = false
       } else if (tc.function?.arguments) {
         // 累积 arguments
         const block = acc.contentBlocks[acc.currentBlockIndex]
@@ -537,18 +551,9 @@ export function openAIChunkToAnthropicSSE(
       acc.outputTokens = chunk.usage.completion_tokens ?? chunk.usage.total_tokens ?? acc.outputTokens
     }
 
-    // 关闭当前 content block
-    if (acc.currentBlockIndex >= 0 && acc.currentBlockIndex < acc.contentBlocks.length) {
-      const block = acc.contentBlocks[acc.currentBlockIndex]
-      if (block.type === 'tool_use') {
-        // 解析累积的 input JSON
-        try {
-          const parsed = JSON.parse(block.input)
-          block.input = JSON.stringify(parsed)
-        } catch { /* 保留原始字符串 */ }
-      }
-      events.push(`event: content_block_stop`)
-      events.push(`data: ${JSON.stringify({ type: 'content_block_stop', index: acc.currentBlockIndex })}`)
+    // 关闭当前未关闭的 content block（text 或 tool_use）
+    if (!acc.currentBlockClosed) {
+      closeCurrentBlock(acc, events)
     }
 
     events.push(`event: message_delta`)
@@ -559,6 +564,7 @@ export function openAIChunkToAnthropicSSE(
     })}`)
     events.push(`event: message_stop`)
     events.push(`data: ${JSON.stringify({ type: 'message_stop' })}`)
+    acc.messageStopSent = true
   }
 
   // Anthropic SSE: 每个 event+data 对用 \n 连接，事件对间用 \n\n 分隔（见 formatAnthropicSSE）
@@ -580,7 +586,28 @@ function closeCurrentTextBlock(acc: AnthropicSSEAccumulator, events: string[]): 
   if (acc.currentBlockIndex >= 0 && acc.contentBlocks[acc.currentBlockIndex]?.type === 'text') {
     events.push(`event: content_block_stop`)
     events.push(`data: ${JSON.stringify({ type: 'content_block_stop', index: acc.currentBlockIndex })}`)
+    acc.currentBlockClosed = true
   }
+}
+
+/**
+ * 关闭当前未关闭的 content block（text 或 tool_use）。
+ * 对 tool_use 块会先尝试解析累积的 input JSON 为规范字符串。
+ * 发送 content_block_stop 事件并标记 currentBlockClosed = true。
+ */
+function closeCurrentBlock(acc: AnthropicSSEAccumulator, events: string[]): void {
+  if (acc.currentBlockIndex < 0 || acc.currentBlockIndex >= acc.contentBlocks.length) return
+  const block = acc.contentBlocks[acc.currentBlockIndex]
+  if (block.type === 'tool_use') {
+    // 解析累积的 input JSON 为规范字符串（便于非流式聚合/调试）
+    try {
+      const parsed = JSON.parse(block.input)
+      block.input = JSON.stringify(parsed)
+    } catch { /* 保留原始字符串 */ }
+  }
+  events.push(`event: content_block_stop`)
+  events.push(`data: ${JSON.stringify({ type: 'content_block_stop', index: acc.currentBlockIndex })}`)
+  acc.currentBlockClosed = true
 }
 
 function mapFinishReason(fr: string): string {
@@ -589,6 +616,61 @@ function mapFinishReason(fr: string): string {
     case 'tool_calls': return 'tool_use'
     case 'length': return 'max_tokens'
     default: return 'end_turn'
+  }
+}
+
+/**
+ * 流结束兜底：检查并补发缺失的 content_block_stop 和 message_stop 事件。
+ *
+ * 适用场景：
+ *   - 上游流提前结束（未发送 finish_reason，stopReason 为 null）
+ *   - finish_reason 已收到但 content_block 未正常关闭（currentBlockClosed=false）
+ *   - 任何导致 message_stop 未发送的边界情况
+ *
+ * 通过 messageStopSent / currentBlockClosed 标志保证幂等：
+ * 已发送过的事件不会重复发送。返回 Anthropic SSE 字符串（可能为空）。
+ * 调用方可根据返回值是否为空判断是否触发了兜底，据此记录诊断日志。
+ */
+export function finalizeAnthropicStream(acc: AnthropicSSEAccumulator): string {
+  const events: string[] = []
+  // 1. 关闭未关闭的 content block（text 或 tool_use）
+  if (!acc.currentBlockClosed && acc.currentBlockIndex >= 0) {
+    closeCurrentBlock(acc, events)
+  }
+  // 2. 发送未发送的 message_stop
+  if (!acc.messageStopSent) {
+    acc.stopReason = acc.stopReason || 'end_turn'
+    events.push(`event: message_delta`)
+    events.push(`data: ${JSON.stringify({
+      type: 'message_delta',
+      delta: { stop_reason: acc.stopReason, stop_sequence: null },
+      usage: { output_tokens: acc.outputTokens },
+    })}`)
+    events.push(`event: message_stop`)
+    events.push(`data: ${JSON.stringify({ type: 'message_stop' })}`)
+    acc.messageStopSent = true
+  }
+  return events.length > 0 ? formatAnthropicSSE(events) : ''
+}
+
+/**
+ * 返回累积器的诊断快照（用于日志），包含每个 content block 的类型/索引/名称/id
+ * 以及流结束状态标志，便于定位是哪个 tool_use 调用触发了兜底。
+ */
+export function diagnoseAnthropicAccumulator(acc: AnthropicSSEAccumulator): Record<string, unknown> {
+  return {
+    stopReason: acc.stopReason,
+    messageStopSent: acc.messageStopSent,
+    currentBlockClosed: acc.currentBlockClosed,
+    currentBlockIndex: acc.currentBlockIndex,
+    contentBlocks: acc.contentBlocks.map(b => ({
+      type: b.type,
+      index: b.index,
+      name: b.name,
+      id: b.id,
+      textLength: b.text?.length ?? 0,
+      inputLength: b.input?.length ?? 0,
+    })),
   }
 }
 

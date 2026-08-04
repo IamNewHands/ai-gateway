@@ -15,6 +15,8 @@ import {
   openAIToResponses,
   openAIChunkToResponsesSSE,
   aggregateOpenAIToResponses,
+  finalizeAnthropicStream,
+  diagnoseAnthropicAccumulator,
 } from './formats'
 
 // ===== Key 健康状态类型和辅助函数 =====
@@ -1080,14 +1082,23 @@ export async function handleAnthropicMessages(c: Context<{ Bindings: Env }>) {
                 }
               }
             } catch { /* stream error */ }
-            // 确保发送 message_stop（防止上游不发送 finish_reason）
-            if (!acc.stopReason) {
-              acc.stopReason = 'end_turn'
+            // 流结束兜底：补发缺失的 content_block_stop / message_stop 事件。
+            // 上游偶尔未正常发送 finish_reason，或在 tool_use 块未关闭时就结束流，
+            // 会导致客户端报 "truncated: stream ended"。此处保证流的正确结束，
+            // 并在触发兜底时记录诊断日志（含 tool_use 名称/id），便于定位问题工具调用。
+            const finalizeDiag = diagnoseAnthropicAccumulator(acc)
+            const finalized = finalizeAnthropicStream(acc)
+            if (finalized) {
               try {
-                controller.enqueue(new TextEncoder().encode(
-                  `event: message_delta\ndata: ${JSON.stringify({ type: 'message_delta', delta: { stop_reason: 'end_turn', stop_sequence: null }, usage: { output_tokens: acc.outputTokens } })}\n\nevent: message_stop\ndata: ${JSON.stringify({ type: 'message_stop' })}\n\n`
-                ))
+                controller.enqueue(new TextEncoder().encode(finalized))
               } catch { /* enqueue failed */ }
+              // 仅在确实补发了事件时记录 warn 日志（正常结束不会触发）
+              try {
+                c.executionCtx.waitUntil(writeLog(c.env, 'warn',
+                  `[anthropic] 流结束兜底触发 ${model}`,
+                  JSON.stringify({ providerId: provider.id, model, ...finalizeDiag })
+                ))
+              } catch { /* log failure must not break */ }
             }
             controller.close()
           },
@@ -1214,14 +1225,23 @@ export async function handleAnthropicMessages(c: Context<{ Bindings: Env }>) {
               }
             }
           } catch { /* stream error */ }
-          // 确保发送 message_stop（防止上游不发送 finish_reason）
-          if (!acc.stopReason) {
-            acc.stopReason = 'end_turn'
+          // 流结束兜底：补发缺失的 content_block_stop / message_stop 事件。
+          // 上游偶尔未正常发送 finish_reason，或在 tool_use 块未关闭时就结束流，
+          // 会导致客户端报 "truncated: stream ended"。此处保证流的正确结束，
+          // 并在触发兜底时记录诊断日志（含 tool_use 名称/id），便于定位问题工具调用。
+          const finalizeDiag = diagnoseAnthropicAccumulator(acc)
+          const finalized = finalizeAnthropicStream(acc)
+          if (finalized) {
             try {
-              controller.enqueue(new TextEncoder().encode(
-                `event: message_delta\ndata: ${JSON.stringify({ type: 'message_delta', delta: { stop_reason: 'end_turn', stop_sequence: null }, usage: { output_tokens: acc.outputTokens } })}\n\nevent: message_stop\ndata: ${JSON.stringify({ type: 'message_stop' })}\n\n`
-              ))
+              controller.enqueue(new TextEncoder().encode(finalized))
             } catch { /* enqueue failed */ }
+            // 仅在确实补发了事件时记录 warn 日志（正常结束不会触发）
+            try {
+              c.executionCtx.waitUntil(writeLog(c.env, 'warn',
+                `[anthropic] 流结束兜底触发 ${model}`,
+                JSON.stringify({ providerId: provider.id, model, ...finalizeDiag })
+              ))
+            } catch { /* log failure must not break */ }
           }
           controller.close()
         },
