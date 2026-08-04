@@ -414,10 +414,14 @@ export async function fetchQoderModels(
     return { ok: false, message: 'OAuth 未连接或 Token 已失效，请先发起连接' }
   }
   console.log(`[qoder-models] session ok uid=${data.session.uid || '(empty)'} machineType=${data.session.machineType.slice(0, 8)}...`)
+  console.log(`[qoder-models] machineId=${data.session.machineId} machineToken=${data.session.machineToken.substring(0, 20)}...`)
+  console.log(`[qoder-models] info len=${data.session.info.length} head=${data.session.info.substring(0, 40)}`)
+  console.log(`[qoder-models] cosyKey len=${data.session.cosyKey.length} head=${data.session.cosyKey.substring(0, 40)}`)
 
   let encodedBody: string
   try {
     encodedBody = qoderEncode('{}')
+    console.log(`[qoder-models] encodedBody=${encodedBody}`)
   } catch (err) {
     console.error(`[qoder-models] qoderEncode threw:`, err)
     return { ok: false, message: `QoderEncoding 失败: ${(err as Error).message || err}` }
@@ -426,6 +430,7 @@ export async function fetchQoderModels(
   let headers: Record<string, string>
   try {
     headers = cosyHeaders(data.session, encodedBody, QODER_MODELS_URL, 'application/json', false)
+    console.log(`[qoder-models] request headers:`, JSON.stringify(headers, null, 2).substring(0, 2000))
   } catch (err) {
     console.error(`[qoder-models] cosyHeaders threw:`, err)
     return { ok: false, message: `COSY 签名失败: ${(err as Error).message || err}` }

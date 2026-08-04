@@ -240,8 +240,14 @@ async function newCosySession(id: CosyIdentity): Promise<CosySession> {
     security_oauth_token: id.securityOauthToken,
     refresh_token: id.refreshToken,
   }
-  const infoBytes = await aesCbcEncrypt(jsonSortedCompact(identityMap), new TextEncoder().encode(tempKey))
+  const identityJSON = jsonSortedCompact(identityMap)
+  console.log('[cosy:session] identityJSON=', identityJSON.substring(0, 200))
+  console.log('[cosy:session] identityJSON len=', identityJSON.length)
+  console.log('[cosy:session] tempKey=', tempKey, 'len=', tempKey.length)
+  const infoBytes = await aesCbcEncrypt(identityJSON, new TextEncoder().encode(tempKey))
   const info = base64Std(infoBytes)
+  console.log('[cosy:session] info len=', info.length, 'info head=', info.substring(0, 40))
+  console.log('[cosy:session] cosyKey len=', cosyKey.length, 'cosyKey head=', cosyKey.substring(0, 40))
 
   return {
     machineId: machineID,
@@ -274,9 +280,18 @@ export function buildBearer(sess: CosySession, body: string, rawUrl: string): Co
     requestId: uuid(),
     version: 'v1',
   }
-  const payloadB64 = utf8ToBase64(jsonSortedCompact(payload))
+  const payloadJSON = jsonSortedCompact(payload)
+  const payloadB64 = utf8ToBase64(payloadJSON)
   const date = String(Math.floor(Date.now() / 1000))
-  const sig = md5Hex(payloadB64 + '\n' + sess.cosyKey + '\n' + date + '\n' + body + '\n' + pathSig)
+  const sigInput = payloadB64 + '\n' + sess.cosyKey + '\n' + date + '\n' + body + '\n' + pathSig
+  const sig = md5Hex(sigInput)
+  console.log('[cosy:sign] payloadJSON=', payloadJSON.substring(0, 200))
+  console.log('[cosy:sign] payloadB64 len=', payloadB64.length, 'head=', payloadB64.substring(0, 40))
+  console.log('[cosy:sign] cosyKey len=', sess.cosyKey.length, 'head=', sess.cosyKey.substring(0, 40))
+  console.log('[cosy:sign] date=', date)
+  console.log('[cosy:sign] body len=', body.length, 'body head=', body.substring(0, 100))
+  console.log('[cosy:sign] pathSig=', pathSig)
+  console.log('[cosy:sign] sigInput len=', sigInput.length, 'md5=', sig)
   return { payloadB64, date, bearer: 'Bearer COSY.' + payloadB64 + '.' + sig }
 }
 
