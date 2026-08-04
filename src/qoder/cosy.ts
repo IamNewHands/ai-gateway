@@ -68,18 +68,6 @@ function uuid(): string {
   return crypto.randomUUID()
 }
 
-/** jsonSortedCompact：按键排序的紧凑 JSON（与 Go jsonSortedCompact 一致）。 */
-export function jsonSortedCompact(m: Record<string, string>): string {
-  const keys = Object.keys(m).sort()
-  let out = '{'
-  for (let i = 0; i < keys.length; i++) {
-    if (i > 0) out += ','
-    out += JSON.stringify(keys[i]) + ':' + JSON.stringify(m[keys[i]])
-  }
-  out += '}'
-  return out
-}
-
 // ===== RSA / AES（Web Crypto） =====
 
 // Qoder 服务器 RSA 公钥（来自桌面客户端 main.js，1024-bit SPKI）。
@@ -232,18 +220,16 @@ async function newCosySession(id: CosyIdentity): Promise<CosySession> {
   const cosyKeyBytes = rsaEncrypt(new TextEncoder().encode(tempKey))
   const cosyKey = base64Std(cosyKeyBytes)
 
-  const identityMap: Record<string, string> = {
+  // 对标 9router/cosy.js encryptUserInfo：只传 uid/security_oauth_token/name/aid/email，
+  // 用普通 JSON.stringify 序列化（非按键排序），与 Qoder 服务端签名验证一致。
+  const userInfo: Record<string, string> = {
+    uid: id.uid,
+    security_oauth_token: id.securityOauthToken,
     name: id.name,
     aid: id.aid,
-    uid: id.uid,
-    yx_uid: id.yxUid,
-    organization_id: id.organizationId,
-    organization_name: id.organizationName,
-    user_type: id.userType,
-    security_oauth_token: id.securityOauthToken,
-    refresh_token: id.refreshToken,
+    email: '',
   }
-  const infoBytes = await aesCbcEncrypt(jsonSortedCompact(identityMap), new TextEncoder().encode(tempKey))
+  const infoBytes = await aesCbcEncrypt(JSON.stringify(userInfo), new TextEncoder().encode(tempKey))
   const info = base64Std(infoBytes)
 
   return {
@@ -277,7 +263,7 @@ export function buildBearer(sess: CosySession, body: string, rawUrl: string): Co
     requestId: uuid(),
     version: 'v1',
   }
-  const payloadB64 = utf8ToBase64(jsonSortedCompact(payload))
+  const payloadB64 = utf8ToBase64(JSON.stringify(payload))
   const date = String(Math.floor(Date.now() / 1000))
   const sig = md5Hex(payloadB64 + '\n' + sess.cosyKey + '\n' + date + '\n' + body + '\n' + pathSig)
   return { payloadB64, date, bearer: 'Bearer COSY.' + payloadB64 + '.' + sig }
