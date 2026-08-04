@@ -624,30 +624,36 @@ export async function handleOAuthModels(c: Context<{ Bindings: Env }>) {
   // QoderWork：模型发现走 COSY 签名的网关端点（GET /algo/api/v2/model/list），
   // 返回 {chat:[{key,display_name,enable}]}，只取启用模型。
   if (isQoderProvider(provider.id) || cfg.flowType === 'qoder') {
-    const result = await fetchQoderModels(c.env, provider)
-    if (!result.ok) {
-      const status = result.status && result.status >= 400 ? result.status : 502
-      return c.json<ApiResponse>({ success: false, message: result.message, data: { providerId: provider.id } }, status)
-    }
-    const models = result.models || []
-    // 自动合并保存到 provider.models（按 id 去重追加，保留已有 enabled 状态）
     try {
-      const existing = provider.models || []
-      const existingIds = new Set(existing.map((m) => m.id))
-      const merged = [...existing]
-      for (const m of models) {
-        if (!existingIds.has(m.id)) {
-          merged.push({ id: m.id, enabled: true })
-          existingIds.add(m.id)
+      const result = await fetchQoderModels(c.env, provider)
+      if (!result.ok) {
+        const status = result.status && result.status >= 400 ? result.status : 502
+        return c.json<ApiResponse>({ success: false, message: result.message, data: { providerId: provider.id } }, status)
+      }
+      const models = result.models || []
+      // 自动合并保存到 provider.models（按 id 去重追加，保留已有 enabled 状态）
+      try {
+        const existing = provider.models || []
+        const existingIds = new Set(existing.map((m) => m.id))
+        const merged = [...existing]
+        for (const m of models) {
+          if (!existingIds.has(m.id)) {
+            merged.push({ id: m.id, enabled: true })
+            existingIds.add(m.id)
+          }
         }
+        if (merged.length !== existing.length) {
+          await updateProvider(c.env, id, { models: merged })
+        }
+      } catch (e) {
+        console.warn(`[oauth-models] auto-save failed: ${(e as Error).message}`)
       }
-      if (merged.length !== existing.length) {
-        await updateProvider(c.env, id, { models: merged })
-      }
-    } catch (e) {
-      console.warn(`[oauth-models] auto-save failed: ${(e as Error).message}`)
+      return c.json<ApiResponse>({ success: true, data: { data: models } })
+    } catch (err) {
+      console.error(`[oauth-models] qoder exception:`, err)
+      const msg = (err as Error)?.stack || (err as Error)?.message || String(err)
+      return c.json<ApiResponse>({ success: false, message: `Qoder 模型拉取异常: ${msg}` }, 500)
     }
-    return c.json<ApiResponse>({ success: true, data: { data: models } })
   }
 
   const token = await getOauthAccessToken(c.env, provider.id, cfg)

@@ -401,12 +401,35 @@ export async function fetchQoderModels(
   env: Env,
   provider: Provider
 ): Promise<{ ok: boolean; message: string; models?: Array<{ id: string }>; status?: number }> {
-  const data = await buildQoderSession(env, provider)
+  console.log(`[qoder-models] start provider=${provider.id} flowType=${provider.oauth?.flowType}`)
+  let data: { session: CosySession; accessToken: string } | null
+  try {
+    data = await buildQoderSession(env, provider)
+  } catch (err) {
+    console.error(`[qoder-models] buildQoderSession threw:`, err)
+    return { ok: false, message: `构建 COSY 会话失败: ${(err as Error).stack || (err as Error).message || err}` }
+  }
   if (!data) {
+    console.warn(`[qoder-models] no valid token (缺失或刷新失败)`)
     return { ok: false, message: 'OAuth 未连接或 Token 已失效，请先发起连接' }
   }
-  const encodedBody = qoderEncode('{}')
-  const headers = cosyHeaders(data.session, encodedBody, QODER_MODELS_URL, 'application/json', false)
+  console.log(`[qoder-models] session ok uid=${data.session.uid || '(empty)'} machineType=${data.session.machineType.slice(0, 8)}...`)
+
+  let encodedBody: string
+  try {
+    encodedBody = qoderEncode('{}')
+  } catch (err) {
+    console.error(`[qoder-models] qoderEncode threw:`, err)
+    return { ok: false, message: `QoderEncoding 失败: ${(err as Error).message || err}` }
+  }
+
+  let headers: Record<string, string>
+  try {
+    headers = cosyHeaders(data.session, encodedBody, QODER_MODELS_URL, 'application/json', false)
+  } catch (err) {
+    console.error(`[qoder-models] cosyHeaders threw:`, err)
+    return { ok: false, message: `COSY 签名失败: ${(err as Error).message || err}` }
+  }
 
   let resp: Response
   try {
@@ -416,15 +439,23 @@ export async function fetchQoderModels(
       signal: AbortSignal.timeout(20000),
     })
   } catch (err) {
+    console.error(`[qoder-models] fetch threw:`, err)
     return { ok: false, message: (err as Error).message || '请求失败' }
   }
+  const rawText = await resp.text().catch(() => '')
+  console.log(`[qoder-models] upstream status=${resp.status} body=${rawText.substring(0, 300)}`)
   if (!resp.ok) {
-    return { ok: false, message: `HTTP ${resp.status}: ${(await resp.text().catch(() => '')).substring(0, 200)}`, status: resp.status }
+    return { ok: false, message: `HTTP ${resp.status}: ${rawText.substring(0, 300)}`, status: resp.status }
   }
-  const json: any = await resp.json().catch(() => null)
+  let json: any = null
+  try {
+    json = JSON.parse(rawText)
+  } catch {
+    return { ok: false, message: `响应不是合法 JSON: ${rawText.substring(0, 200)}` }
+  }
   const chat = json && Array.isArray(json.chat) ? json.chat : null
   if (!chat) {
-    return { ok: false, message: '响应缺少 chat 场景' }
+    return { ok: false, message: `响应缺少 chat 场景，keys=${Object.keys(json || {}).join(',') || '(empty)'}` }
   }
   const models = chat
     .filter((m: any) => m && m.enable === true && m.key)
