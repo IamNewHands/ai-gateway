@@ -212,9 +212,8 @@ export interface CosyIdentity {
 
 async function newCosySession(id: CosyIdentity): Promise<CosySession> {
   const machineID = uuid()
-  const seed = (uuid() + uuid()).slice(0, 50)
-  const machineToken = base64UrlNoPad(new TextEncoder().encode(seed))
-  const machineType = uuid().replace(/-/g, '').slice(0, 18)
+  const machineToken = machineID
+  const machineType = '5'
   const tempKey = uuid().replace(/-/g, '').slice(0, 16)
 
   const cosyKeyBytes = rsaEncrypt(new TextEncoder().encode(tempKey))
@@ -257,11 +256,11 @@ export function buildBearer(sess: CosySession, body: string, rawUrl: string): Co
   let pathSig = u.pathname
   if (pathSig.startsWith('/algo')) pathSig = pathSig.slice('/algo'.length)
   const payload: Record<string, string> = {
-    cosyVersion: '0.1.43',
-    ideVersion: '',
-    info: sess.info,
-    requestId: uuid(),
     version: 'v1',
+    requestId: uuid(),
+    info: sess.info,
+    cosyVersion: '1.1.3',
+    ideVersion: '',
   }
   const payloadB64 = utf8ToBase64(JSON.stringify(payload))
   const date = String(Math.floor(Date.now() / 1000))
@@ -272,23 +271,36 @@ export function buildBearer(sess: CosySession, body: string, rawUrl: string): Co
 /** cosyHeaders：一次推理/模型请求的完整头集合。sse=true 时加 cache-control。 */
 export function cosyHeaders(sess: CosySession, body: string, rawUrl: string, accept: string, sse: boolean): Record<string, string> {
   const { date, bearer } = buildBearer(sess, body, rawUrl)
+  const bodyBytes = new TextEncoder().encode(body)
+  const bodyHash = md5Hex(bodyBytes)
+  const bodyLen = String(bodyBytes.length)
+  const sigPath = (() => {
+    const p = new URL(rawUrl).pathname
+    return p.startsWith('/algo') ? p.slice('/algo'.length) : p
+  })()
   const h: Record<string, string> = {
-    'cosy-data-policy': 'AGREE',
+    'cosy-data-policy': 'disagree',
     'content-type': 'application/json',
     'cosy-machinetype': sess.machineType,
+    'cosy-machineos': 'x86_64_windows',
     'cosy-clienttype': '5',
     'cosy-date': date,
     'cosy-user': sess.uid,
     'cosy-key': sess.cosyKey,
     'accept': accept,
-    'cosy-clientip': '169.254.198.161',
+    'cosy-clientip': '127.0.0.1',
     'authorization': bearer,
     'accept-encoding': 'identity',
-    'cosy-version': '0.1.43',
+    'cosy-version': '1.1.3',
     'cosy-machineid': sess.machineId,
     'cosy-machinetoken': sess.machineToken,
+    'cosy-bodyhash': bodyHash,
+    'cosy-bodylength': bodyLen,
+    'cosy-sigpath': sigPath,
+    'cosy-organization-id': '',
+    'cosy-organization-tags': '',
     'login-version': 'v2',
-    'user-agent': 'Go-http-client/2.0',
+    'x-request-id': uuid(),
   }
   if (sse) h['cache-control'] = 'no-cache'
   return h
