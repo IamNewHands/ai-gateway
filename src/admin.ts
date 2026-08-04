@@ -801,7 +801,7 @@ export async function handleLogs(c: Context<{ Bindings: Env }>) {
     }
   }
 
-  return c.json<ApiResponse>({ success: true, data: { logs, total: allNames.length, offset } })
+  return c.json<ApiResponse>({ success: true, data: { logs: logs.slice(0, limit), total: allNames.length, offset } })
 }
 
 /** 清除日志 */
