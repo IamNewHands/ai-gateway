@@ -911,8 +911,10 @@ function oauthStatus(id) {
 function oauthConnect(id) {
   const st = document.getElementById('oauth-st-' + id)
   const oauth = collectOauthEdit(id)
-  const isBrowser = oauth.flowType === 'browser'
-  if (!oauth.deviceCodeUrl || !oauth.deviceTokenUrl) {
+  // browser（WorkBuddy）与 qoder（QoderWork 设备授权）都是"跳转登录页授权"的交互：
+  // 直接打开登录链接，用户确认后由后台轮询 token，无需输入授权码
+  const isBrowser = oauth.flowType === 'browser' || oauth.flowType === 'qoder'
+  if (!oauth.deviceCodeUrl || !oauth.deviceTokenUrl || !oauth.refreshTokenUrl) {
     st.textContent = '请先填写 OAuth 端点并保存'
     return
   }
