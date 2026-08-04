@@ -98,16 +98,81 @@ function pemToBytes(pem: string): Uint8Array {
   return bytes
 }
 
-async function rsaEncrypt(data: Uint8Array): Promise<Uint8Array> {
-  const key = await crypto.subtle.importKey(
-    'spki',
-    pemToBytes(SERVER_PUB_KEY_PEM) as unknown as ArrayBuffer,
-    { name: 'RSAES-PKCS1-v1_5' },
-    false,
-    ['encrypt']
-  )
-  const out = await crypto.subtle.encrypt({ name: 'RSAES-PKCS1-v1_5' }, key, data)
-  return new Uint8Array(out)
+// ===== 纯 JS RSA-PKCS1v1.5（Workers 未注册 RSAES-PKCS1-v1_5 算法，改用 BigInt） =====
+
+interface TLVNode { tag: number; value: Uint8Array; next: number }
+/** 简易 DER TLV 读取。 */
+function readTLV(buf: Uint8Array, pos: number): TLVNode {
+  let p = pos
+  const tag = buf[p++]
+  let len = buf[p++]
+  if (len & 0x80) {
+    const count = len & 0x7f
+    len = 0
+    for (let i = 0; i < count; i++) len = len * 256 + buf[p++]
+  }
+  return { tag, value: buf.slice(p, p + len), next: p + len }
+}
+
+function bytesToBigInt(b: Uint8Array): bigint {
+  let x = 0n
+  let start = 0
+  if (b[0] === 0) start = 1
+  for (let i = start; i < b.length; i++) x = (x << 8n) | BigInt(b[i])
+  return x
+}
+
+function bigIntToBytes(x: bigint, length: number): Uint8Array {
+  const out = new Uint8Array(length)
+  let v = x
+  for (let i = length - 1; i >= 0; i--) {
+    out[i] = Number(v & 0xffn)
+    v >>= 8n
+  }
+  return out
+}
+
+function modPow(base: bigint, exp: bigint, mod: bigint): bigint {
+  let result = 1n
+  base = base % mod
+  while (exp > 0n) {
+    if (exp & 1n) result = (result * base) % mod
+    base = (base * base) % mod
+    exp >>= 1n
+  }
+  return result
+}
+
+/** 从 SPKI 解析 RSA 公钥 (n, e)。 */
+function parseRSAPublicKey(bytes: Uint8Array): { n: bigint; e: bigint } {
+  const top = readTLV(bytes, 0) // SEQUENCE
+  const alg = readTLV(top.value, 0) // SEQUENCE { OID, NULL }
+  const bitStr = readTLV(top.value, alg.next) // BIT STRING
+  const inner = bitStr.value.slice(1) // 跳过 unused-bits
+  const seq = readTLV(inner, 0) // SEQUENCE（RSAPublicKey: { INTEGER n, INTEGER e }）
+  const nTlv = readTLV(seq.value, 0) // INTEGER n
+  const eTlv = readTLV(seq.value, nTlv.next) // INTEGER e
+  return { n: bytesToBigInt(nTlv.value), e: bytesToBigInt(eTlv.value) }
+}
+
+const SERVER_RSA_PUB = parseRSAPublicKey(pemToBytes(SERVER_PUB_KEY_PEM))
+
+/** RSA-1024 PKCS1 v1.5 (type 2) 加密。data 为首部 0x00 0x02 对齐后的消息。 */
+function rsaEncrypt(data: Uint8Array): Uint8Array {
+  const k = 128 // 1024-bit → 128 字节输出
+  const padLen = k - data.length - 3 // 0x00 0x02 + PS(nonzero) + 0x00
+  if (padLen < 8) throw new Error('RSA: message too long')
+  const em = new Uint8Array(k)
+  em[0] = 0x00
+  em[1] = 0x02
+  const rnd = crypto.getRandomValues(new Uint8Array(padLen))
+  for (let i = 0; i < padLen; i++) em[2 + i] = rnd[i] === 0 ? 1 : rnd[i] // PS 需全部非零
+  em[2 + padLen] = 0x00
+  em.set(data, 3 + padLen)
+
+  const m = bytesToBigInt(em) // em[0]=0x00 保证 m < 2^1016 < n
+  const c = modPow(m, SERVER_RSA_PUB.e, SERVER_RSA_PUB.n)
+  return bigIntToBytes(c, k)
 }
 
 /** AES-128-CBC 加密，key = iv = tempKey（16 字节），PKCS7 padding。 */
@@ -164,7 +229,7 @@ async function newCosySession(id: CosyIdentity): Promise<CosySession> {
   const machineType = uuid().replace(/-/g, '').slice(0, 18)
   const tempKey = uuid().replace(/-/g, '').slice(0, 16)
 
-  const cosyKeyBytes = await rsaEncrypt(new TextEncoder().encode(tempKey))
+  const cosyKeyBytes = rsaEncrypt(new TextEncoder().encode(tempKey))
   const cosyKey = base64Std(cosyKeyBytes)
 
   const identityMap: Record<string, string> = {
