@@ -18,8 +18,10 @@ import { Context } from 'hono'
 import type { Env, Provider, CheckinResult, ApiResponse } from './types'
 import { KV_KEYS, CHECKIN_RESULT_TTL_SEC } from './config'
 import { getProviders } from './storage'
-import { getOauthAccessToken, detectTokenRealm } from './oauth'
+import { getOauthAccessToken, detectTokenRealm, readOauthToken } from './oauth'
 import { writeLog } from './admin'
+import { isQoderProvider } from './qoder/proxy'
+import { fetchQoderCheckinStatus, performQoderCheckin, fetchQoderUserResource, fetchQoderPaymentType } from './qoder/billing'
 
 const CHECKIN_BASE_CN = 'https://www.codebuddy.cn'
 
@@ -313,6 +315,78 @@ async function fillCredits(env: Env, base: CheckinResult, token: string, realm: 
   } catch { /* ignore */ }
 }
 
+// ===== QoderWork 签到（flowType=qoder，dt- token） =====
+
+/** 拉取 Qoder 额度 + 套餐填充到 base（失败只写日志，不影响签到结果）。 */
+async function fillQoderCredits(env: Env, base: CheckinResult, token: string) {
+  try {
+    const credits = await fetchQoderUserResource(token)
+    if (credits) {
+      base.totalRemain = credits.totalRemain
+      base.totalUsed = credits.totalUsed
+      base.totalSize = credits.totalSize
+      base.packCount = credits.packCount
+    } else {
+      try { await writeLog(env, 'warn', `[checkin] ${base.name} 额度无数据（quota/usage 响应为空）`, '') } catch { /* ignore */ }
+    }
+  } catch (e) {
+    try { await writeLog(env, 'warn', `[checkin] ${base.name} 额度拉取失败: ${(e as Error).message}`, '') } catch { /* ignore */ }
+  }
+  try {
+    const pt = await fetchQoderPaymentType(token)
+    if (pt) base.paymentType = pt
+  } catch { /* ignore */ }
+}
+
+/**
+ * QoderWork 单账号签到：GET status → 已签则跳过 → 否则 POST claim → 刷新额度。
+ * dt- token 非 JWT，昵称从 OAuthTokenState.nickname 取。
+ */
+async function checkinQoderAccount(env: Env, provider: Provider, base: CheckinResult, token: string): Promise<CheckinResult> {
+  base.realm = 'cn'
+  try {
+    const st = await readOauthToken(env, provider.id)
+    if (st?.nickname) base.nickname = st.nickname
+  } catch { /* ignore */ }
+
+  // 状态探测
+  let status: Awaited<ReturnType<typeof fetchQoderCheckinStatus>> = null
+  try {
+    status = await fetchQoderCheckinStatus(token)
+  } catch (e) {
+    console.warn(`[checkin] ${provider.name} qoder status fetch failed: ${(e as Error).message}`)
+  }
+  if (status) {
+    base.todayCheckedIn = status.todayCheckedIn
+    base.streakDays = status.streakDays
+    base.totalCredits = status.totalCredits
+    base.dailyCredit = status.dailyCredit
+    if (status.todayCheckedIn) {
+      base.success = true
+      base.reason = 'already'
+      base.message = '今日已签到'
+      base.lastCheckinAt = Date.now()
+      await fillQoderCredits(env, base, token)
+      await writeCheckinResult(env, provider.id, base)
+      return base
+    }
+  }
+
+  // 执行签到
+  const res = await performQoderCheckin(token)
+  base.success = res.success
+  base.message = res.message
+  base.reason = res.success ? 'ok' : 'fail'
+  base.lastCheckinAt = Date.now()
+  if (res.success) base.todayCheckedIn = true
+
+  // 签到成功后额度已变化，拉最新额度
+  await fillQoderCredits(env, base, token)
+
+  await writeCheckinResult(env, provider.id, base)
+  return base
+}
+
 // ===== KV 结果读写 =====
 
 const resultKey = (providerId: string) => KV_KEYS.CHECKIN_RESULT_PREFIX + providerId
@@ -355,6 +429,11 @@ export async function checkinOneAccount(env: Env, provider: Provider): Promise<C
     base.reason = 'skipped_no_token'
     base.message = '无可用 token（未登录或刷新失败）'
     return base
+  }
+
+  // QoderWork：dt- token 非 JWT，走独立的签到/额度协议
+  if (provider.oauth?.flowType === 'qoder' || isQoderProvider(provider.id)) {
+    return await checkinQoderAccount(env, provider, base, token)
   }
 
   // 从 JWT 解出 uid / enterpriseId / nickname（额度接口与面板展示用）

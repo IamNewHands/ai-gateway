@@ -97,6 +97,9 @@ export interface DeviceFlowResult {
  * 发起 OAuth 登录流程。根据 cfg.flowType 分发到设备码或浏览器登录模式。
  */
 export async function startOauthDeviceFlow(env: Env, providerId: string, cfg: OAuthDeviceConfig): Promise<DeviceFlowResult> {
+  if (cfg.flowType === 'qoder') {
+    return startOauthQoderFlow(env, providerId, cfg)
+  }
   if (cfg.flowType === 'browser') {
     return startOauthBrowserFlow(env, providerId, cfg)
   }
@@ -118,6 +121,9 @@ export async function pollOauthDeviceFlow(env: Env, providerId: string, cfg: OAu
 
   // KV 中有 flowType 就按它走；没有则按 cfg 走（兼容旧数据）
   const flowType = device.flowType || cfg.flowType || 'device'
+  if (flowType === 'qoder') {
+    return pollOauthQoderFlow(env, providerId, cfg, device)
+  }
   if (flowType === 'browser') {
     return pollOauthBrowserFlow(env, providerId, cfg, device)
   }
@@ -355,12 +361,183 @@ async function pollOauthBrowserFlow(env: Env, providerId: string, cfg: OAuthDevi
   }
 }
 
+// ===== QoderWork 设备授权流程（PKCE，参考 cpa-plugin/qoderwork/oauth.go） =====
+//
+// 流程（无需 PAT）：
+//   1. 本地生成 PKCE verifier/challenge (S256) + nonce + machine_id，
+//      构造授权链接 https://qoder.com.cn/device/selectAccounts?challenge=...&client_id=...&redirect_uri=qoder-work-cn://
+//   2. 用户在浏览器打开链接完成授权
+//   3. GET  {deviceTokenUrl}?nonce&verifier&challenge_method=S256  → 404/202=待授权；200 返回 {token:dt-, refresh_token:drt-, user_id}
+//   4. 刷新 POST {refreshTokenUrl} body {refresh_token: drt-}  → 新的 dt-/drt- 对
+//
+// 常量与桌面客户端一致：client_id=1c5e33e1-364d-4ce6-b02c-acaa81274a5c、redirect_uri=qoder-work-cn://
+
+const QODER_WEBSITE_CN = 'https://qoder.com.cn'
+const QODER_REDIRECT_URI = 'qoder-work-cn://'
+
+/** 生成 PKCE verifier/challenge（RFC 7636 S256）。 */
+async function makeQoderPKCE(): Promise<{ verifier: string; challenge: string }> {
+  const alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~'
+  const raw = crypto.getRandomValues(new Uint8Array(64))
+  let verifier = ''
+  for (let i = 0; i < 64; i++) verifier += alphabet[raw[i] % alphabet.length]
+  const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(verifier))
+  const bytes = new Uint8Array(digest)
+  let bin = ''
+  for (const b of bytes) bin += String.fromCharCode(b)
+  const challenge = btoa(bin).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '')
+  return { verifier, challenge }
+}
+
+/** 解析 deviceToken 响应中的过期时间（expires_in 为毫秒，或 expires_at RFC3339）。默认 30 天。 */
+function qoderExpiryUnix(data: { expires_in?: number; expires_at?: string }): number {
+  if (data.expires_in && data.expires_in > 0) {
+    return Date.now() + data.expires_in
+  }
+  if (data.expires_at) {
+    const t = Date.parse(data.expires_at)
+    if (!Number.isNaN(t)) return t
+  }
+  return Date.now() + 30 * 24 * 60 * 60 * 1000
+}
+
+async function startOauthQoderFlow(env: Env, providerId: string, cfg: OAuthDeviceConfig): Promise<DeviceFlowResult> {
+  try {
+    const { verifier, challenge } = await makeQoderPKCE()
+    const nonce = crypto.randomUUID()
+    const machineId = crypto.randomUUID()
+
+    const params = new URLSearchParams({
+      challenge,
+      challenge_method: 'S256',
+      nonce,
+      machine_id: machineId,
+      client_id: cfg.clientId || '1c5e33e1-364d-4ce6-b02c-acaa81274a5c',
+      redirect_uri: QODER_REDIRECT_URI,
+    })
+    const authUrl = `${QODER_WEBSITE_CN}/device/selectAccounts?${params.toString()}`
+
+    const device: DeviceFlowState = {
+      device_code: '',
+      user_code: '',
+      verification_uri: authUrl,
+      interval: cfg.pollInterval || 5,
+      expires_at: Date.now() + 10 * 60 * 1000, // 10 分钟超时（参考插件 loginTTL）
+      flowType: 'qoder',
+      verifier,
+      nonce,
+    }
+    await env.KV.put(deviceKey(providerId), JSON.stringify(device), { expirationTtl: 900 })
+    return { success: true, message: '登录链接已生成', device }
+  } catch (err) {
+    return { success: false, message: `发起登录异常: ${(err as Error).message || '未知错误'}` }
+  }
+}
+
+async function pollOauthQoderFlow(env: Env, providerId: string, cfg: OAuthDeviceConfig, device: DeviceFlowState): Promise<PollResult> {
+  if (Date.now() > device.expires_at) {
+    await env.KV.delete(deviceKey(providerId))
+    return { status: 'failed', message: '登录已超时（10 分钟），请重新发起' }
+  }
+
+  try {
+    const params = new URLSearchParams({
+      nonce: device.nonce || '',
+      verifier: device.verifier || '',
+      challenge_method: 'S256',
+    })
+    const sep = cfg.deviceTokenUrl.includes('?') ? '&' : '?'
+    const pollUrl = `${cfg.deviceTokenUrl}${sep}${params.toString()}`
+    const res = await fetch(pollUrl, {
+      method: 'GET',
+      headers: { Accept: 'application/json', 'User-Agent': 'QoderWork' },
+      signal: AbortSignal.timeout(15000),
+    })
+
+    // 404 / 202 = 用户尚未完成授权
+    if (res.status === 404 || res.status === 202) {
+      return { status: 'pending', message: '等待用户完成 QoderWork 设备授权…' }
+    }
+    if (!res.ok) {
+      return { status: 'error', message: `轮询异常 HTTP ${res.status}: ${(await res.text()).substring(0, 200)}` }
+    }
+
+    const data = (await res.json().catch(() => null)) as {
+      token?: string
+      device_token?: string
+      refresh_token?: string
+      user_id?: string
+      expires_in?: number
+      expires_at?: string
+    } | null
+    const token = data?.token || data?.device_token
+    if (!token) {
+      return { status: 'pending', message: '等待用户完成 QoderWork 设备授权…' }
+    }
+
+    await writeOauthToken(env, providerId, {
+      access_token: token,
+      refresh_token: data.refresh_token,
+      expires_at: qoderExpiryUnix(data),
+      updated_at: Date.now(),
+      user_id: data.user_id || undefined,
+    })
+    await env.KV.delete(deviceKey(providerId))
+    return { status: 'success', message: 'OAuth 连接成功' }
+  } catch (err) {
+    return { status: 'error', message: `轮询异常: ${(err as Error).message || '未知错误'}` }
+  }
+}
+
+/** Qoder 设备 token 刷新（POST JSON: {refresh_token: drt-}）。 */
+async function refreshOauthTokenQoder(env: Env, providerId: string, cfg: OAuthDeviceConfig): Promise<boolean> {
+  const state = await readOauthToken(env, providerId)
+  if (!state?.refresh_token) return false
+
+  try {
+    const res = await fetch(cfg.refreshTokenUrl, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+      body: JSON.stringify({ refresh_token: state.refresh_token }),
+      signal: AbortSignal.timeout(15000),
+    })
+    if (!res.ok) return false
+
+    const data = (await res.json().catch(() => null)) as {
+      token?: string
+      device_token?: string
+      refresh_token?: string
+      user_id?: string
+      expires_in?: number
+      expires_at?: string
+    } | null
+    const token = data?.token || data?.device_token
+    if (!token || !data?.refresh_token) return false
+
+    await writeOauthToken(env, providerId, {
+      access_token: token,
+      refresh_token: data.refresh_token,
+      expires_at: qoderExpiryUnix(data),
+      updated_at: Date.now(),
+      // 刷新响应一般不带 user_id，保留原值
+      user_id: state.user_id,
+      nickname: state.nickname,
+    })
+    return true
+  } catch {
+    return false
+  }
+}
+
 // ===== Token 刷新 =====
 
 /**
  * 使用 refresh_token 刷新 access_token。根据 flowType 分发。
  */
 export async function refreshOauthToken(env: Env, providerId: string, cfg: OAuthDeviceConfig): Promise<boolean> {
+  if (cfg.flowType === 'qoder') {
+    return refreshOauthTokenQoder(env, providerId, cfg)
+  }
   if (cfg.flowType === 'browser') {
     return refreshOauthTokenBrowser(env, providerId, cfg)
   }

@@ -30,8 +30,9 @@ export interface OAuthDeviceConfig {
    * 登录流程类型：
    * - device：标准设备码（RFC 8628）— 申请 device_code，用户在浏览器输入 user_code
    * - browser：浏览器登录 — POST deviceCodeUrl 拿到登录链接（authUrl），用户打开网页登录后轮询拿 token
+   * - qoder：QoderWork 设备授权（PKCE）— 本地构造 selectAccounts 授权链接，用户浏览器授权后轮询拿 dt-/drt- token
    */
-  flowType?: 'device' | 'browser'
+  flowType?: 'device' | 'browser' | 'qoder'
   /**
    * 设备码申请端点 / 浏览器登录发起端点：
    * - device 模式：POST, x-www-form-urlencoded, 需 client_id，返回 device_code/user_code
@@ -88,9 +89,13 @@ export interface OAuthTokenState {
   updated_at: number
   /** browser 模式：发起登录时上游返回的 Set-Cookie，后续请求需复用 */
   cookies?: string
+  /** qoder 设备授权返回的用户 ID（轮询/刷新响应携带），用于 COSY 签名 uid */
+  user_id?: string
+  /** qoder 账号昵称（轮询/刷新后按需回填） */
+  nickname?: string
 }
 
-/** 进行中的设备码/浏览器登录流程状态 */
+/** 进行中的设备码/浏览器/Qoder 登录流程状态 */
 export interface DeviceFlowState {
   /** device 模式：device_code；browser 模式：state */
   device_code: string
@@ -101,13 +106,17 @@ export interface DeviceFlowState {
   interval: number
   expires_at: number
   /** 流程类型，用于轮询时分发 */
-  flowType?: 'device' | 'browser'
+  flowType?: 'device' | 'browser' | 'qoder'
   /**
    * browser 模式：发起登录时上游返回的 Set-Cookie。
    * cpa-plugin 强调 must reuse the same cookie jar，否则 token 无效导致 401。
    * 多个 cookie 用 "; " 分隔存储。
    */
   cookies?: string
+  /** qoder 模式：PKCE code_verifier（轮询端点必须提交） */
+  verifier?: string
+  /** qoder 模式：设备授权 nonce（与授权链接配对） */
+  nonce?: string
 }
 
 export interface ProxyKey {
