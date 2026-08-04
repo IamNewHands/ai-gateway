@@ -369,6 +369,8 @@ interface AnthropicSSEAccumulator {
   contentBlocks: Array<{
     type: string
     index: number
+    /** OpenAI tool_call 的 index。多条工具调用时 arguments 增量必须按此匹配，不能依赖 currentBlockIndex */
+    callIndex?: number
     text: string
     id?: string
     name?: string
@@ -478,8 +480,43 @@ export function openAIChunkToAnthropicSSE(
     return formatAnthropicSSE(events)
   }
 
+  // 处理 reasoning delta（思考流 → Anthropic thinking block）。
+  // 上游（如 opencode）思考阶段长时间只发 reasoning_content，若不转换，
+  // 客户端会长时间收不到任何事件而触发 idle 超时，表现为"思考到一半停住"。
+  if (delta.reasoning_content || delta.reasoning) {
+    const reasoning = (delta.reasoning_content || delta.reasoning) as unknown
+    if (typeof reasoning === 'string' && reasoning.length > 0) {
+      if (acc.currentBlockIndex < 0 || acc.contentBlocks[acc.currentBlockIndex]?.type !== 'thinking') {
+        // 关闭当前 text/tool_use 块，开启 thinking 块
+        closeCurrentBlockForSwitch(acc, events)
+        const blockIndex = acc.contentBlocks.length
+        acc.contentBlocks.push({ type: 'thinking', index: blockIndex, text: '', input: '', thinking: '' })
+        acc.currentBlockIndex = blockIndex
+        events.push(`event: content_block_start`)
+        events.push(`data: ${JSON.stringify({
+          type: 'content_block_start',
+          index: blockIndex,
+          content_block: { type: 'thinking', thinking: '' },
+        })}`)
+        acc.currentBlockClosed = false
+      }
+      const thinkingBlock = acc.contentBlocks[acc.currentBlockIndex]
+      thinkingBlock.thinking = (thinkingBlock.thinking || '') + reasoning
+      events.push(`event: content_block_delta`)
+      events.push(`data: ${JSON.stringify({
+        type: 'content_block_delta',
+        index: acc.currentBlockIndex,
+        delta: { type: 'thinking_delta', thinking: reasoning },
+      })}`)
+    }
+  }
+
   // 处理 text delta
   if (delta.content) {
+    // 若当前是 thinking 块，先关闭再进入正文
+    if (acc.currentBlockIndex >= 0 && acc.contentBlocks[acc.currentBlockIndex]?.type === 'thinking') {
+      closeCurrentBlock(acc, events)
+    }
     const isNewTextBlock = ensureTextBlock(acc)
     if (isNewTextBlock) {
       // 发送 content_block_start 事件
@@ -505,38 +542,46 @@ export function openAIChunkToAnthropicSSE(
     for (const tc of delta.tool_calls) {
       const idx = tc.index ?? 0
 
-      // 新的 tool call
-      if (tc.id && tc.function?.name) {
-        // 如果之前是 text block，先关闭
-        closeCurrentTextBlock(acc, events)
+      // 按 tool_call 序号（tc.index）查找已存在的 tool_use 块。
+      // 多条工具调用时增量会交错到达，绝不能依赖 currentBlockIndex（只指向最后创建的块），
+      // 否则第一条工具调用的 arguments 会被追加到别的块上，导致 input JSON 残缺、
+      // 客户端解析失败报 "truncated: stream ended"。
+      let block = acc.contentBlocks.find((b) => b.type === 'tool_use' && b.callIndex === idx)
+
+      if (!block && (tc.id || tc.function?.name)) {
+        // 新的 tool call：先关闭当前 text/thinking 块
+        closeCurrentBlockForSwitch(acc, events)
 
         const blockIndex = acc.contentBlocks.length
-        acc.contentBlocks.push({
+        block = {
           type: 'tool_use',
           index: blockIndex,
+          callIndex: idx,
           text: '',
-          id: tc.id,
-          name: tc.function.name,
-          input: tc.function.arguments || '',
-        })
+          id: tc.id || '',
+          name: tc.function?.name || '',
+          input: tc.function?.arguments || '',
+        }
+        acc.contentBlocks.push(block)
         acc.currentBlockIndex = blockIndex
 
         events.push(`event: content_block_start`)
         events.push(`data: ${JSON.stringify({
           type: 'content_block_start',
           index: blockIndex,
-          content_block: { type: 'tool_use', id: tc.id, name: tc.function.name, input: {} },
+          content_block: { type: 'tool_use', id: block.id, name: block.name, input: {} },
         })}`)
         acc.currentBlockClosed = false
-      } else if (tc.function?.arguments) {
-        // 累积 arguments
-        const block = acc.contentBlocks[acc.currentBlockIndex]
-        if (block && block.type === 'tool_use') {
+      } else if (block) {
+        // 已存在的块：补全 id/name，累积 arguments
+        if (tc.id) block.id = tc.id
+        if (tc.function?.name) block.name = tc.function.name
+        if (tc.function?.arguments) {
           block.input += tc.function.arguments
           events.push(`event: content_block_delta`)
           events.push(`data: ${JSON.stringify({
             type: 'content_block_delta',
-            index: acc.currentBlockIndex,
+            index: block.index,
             delta: { type: 'input_json_delta', partial_json: tc.function.arguments },
           })}`)
         }
@@ -582,11 +627,13 @@ function ensureTextBlock(acc: AnthropicSSEAccumulator): boolean {
   return false
 }
 
-function closeCurrentTextBlock(acc: AnthropicSSEAccumulator, events: string[]): void {
-  if (acc.currentBlockIndex >= 0 && acc.contentBlocks[acc.currentBlockIndex]?.type === 'text') {
-    events.push(`event: content_block_stop`)
-    events.push(`data: ${JSON.stringify({ type: 'content_block_stop', index: acc.currentBlockIndex })}`)
-    acc.currentBlockClosed = true
+/**
+ * 切换 block 类型（text → tool_use / text ↔ thinking）前关闭当前打开的块。
+ * 仅当块未关闭时发送 content_block_stop；块已关闭则跳过（幂等）。
+ */
+function closeCurrentBlockForSwitch(acc: AnthropicSSEAccumulator, events: string[]): void {
+  if (acc.currentBlockIndex >= 0 && !acc.currentBlockClosed) {
+    closeCurrentBlock(acc, events)
   }
 }
 
@@ -679,6 +726,7 @@ export function diagnoseAnthropicAccumulator(acc: AnthropicSSEAccumulator): Reco
  */
 export function aggregateOpenAIToAnthropic(chunks: OpenAIChunk[]): Record<string, unknown> {
   let content = ''
+  let reasoning = ''
   const toolCalls: Array<{ id: string; name: string; input: Record<string, unknown> }> = []
   const toolCallAccum: Map<number, { id: string; name: string; args: string }> = new Map()
   let finishReason = ''
@@ -701,6 +749,7 @@ export function aggregateOpenAIToAnthropic(chunks: OpenAIChunk[]): Record<string
     const delta = choice.delta
     if (!delta) continue
     if (delta.content) content += delta.content
+    if (delta.reasoning_content) reasoning += delta.reasoning_content
     if (delta.tool_calls) {
       for (const tc of delta.tool_calls) {
         const idx = tc.index ?? 0
@@ -716,6 +765,9 @@ export function aggregateOpenAIToAnthropic(chunks: OpenAIChunk[]): Record<string
   }
 
   const contentBlocks: AnthropicContentBlock[] = []
+  if (reasoning) {
+    contentBlocks.push({ type: 'thinking', thinking: reasoning })
+  }
   if (content) {
     contentBlocks.push({ type: 'text', text: content })
   }

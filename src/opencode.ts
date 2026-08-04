@@ -3,8 +3,17 @@ import type { ApiKeyEntry, Env } from './types'
 export const OPENCODE_PROVIDER_ID = 'opencode'
 
 const OPENCODE_VERSION = '1.17.8'
-// 转发超时：LLM 长响应/流式容易超过 60s，放宽到 5 分钟避免中途被掐断
-const OPENCODE_TIMEOUT_MS = 300000
+// POST 连接/首字节超时：思考模型首字节前可能长时间无输出，放宽到 90s。
+// 连接建立后（流式）不再受整体超时限制，改由 withSSEKeepAlive 的 idle 兜底，
+// 避免长思考中途被 5 分钟整体超时掐断（"思考到一半停住"）。
+const OPENCODE_CONNECT_TIMEOUT_MS = 90000
+// 流式期间上游完全无数据的最长容忍时间（防止挂死），正常思考持续输出不会触发
+const OPENCODE_STREAM_IDLE_TIMEOUT_MS = 240000
+// 向客户端注入 SSE 心跳注释行的空闲阈值：距上次输出超过该值即发 `: keep-alive`，
+// 防止客户端因长时间无事件触发 idle 超时
+const OPENCODE_KEEPALIVE_MS = 15000
+// GET（模型列表/连通性测试）保持整体超时，数据量小无需放宽
+const OPENCODE_GET_TIMEOUT_MS = 20000
 
 interface OpenCodeRequestOptions {
   baseUrl: string
@@ -116,6 +125,78 @@ function transportErrorResponse(error: unknown): Response {
   })
 }
 
+function isSSEResponse(response: Response): boolean {
+  const ct = (response.headers.get('content-type') || '').toLowerCase()
+  return ct.includes('text/event-stream') || ct.includes('application/x-ndjson')
+}
+
+/**
+ * 包装上游 SSE 流：
+ * 1. 心跳：距上次输出超过 keepAliveMs 时向客户端注入 `: keep-alive\n\n` 注释行。
+ *    SSE 注释行客户端会忽略但能重置 idle 计时器——思考模型长时间只吐 reasoning
+ *    或完全静默时，防止客户端（如 Trae）判定超时而中断流。
+ * 2. idle 兜底：上游超过 idleTimeoutMs 无任何数据时主动结束流，防止无限挂起。
+ */
+function withSSEKeepAlive(
+  body: ReadableStream<Uint8Array>,
+  keepAliveMs: number,
+  idleTimeoutMs: number
+): ReadableStream<Uint8Array> {
+  const reader = body.getReader()
+  const encoder = new TextEncoder()
+  let closed = false
+  let lastOutputAt = Date.now()
+
+  const finish = (controller: ReadableStreamDefaultController<Uint8Array>) => {
+    if (closed) return
+    closed = true
+    try { controller.close() } catch { /* ignore */ }
+    reader.cancel().catch(() => { /* ignore */ })
+  }
+
+  return new ReadableStream<Uint8Array>({
+    async start(controller) {
+      let idleTimer: ReturnType<typeof setTimeout> | null = null
+      let heartbeatTimer: ReturnType<typeof setTimeout> | null = null
+
+      const armIdle = () => {
+        if (idleTimer) clearTimeout(idleTimer)
+        idleTimer = setTimeout(() => finish(controller), idleTimeoutMs)
+      }
+      const armHeartbeat = () => {
+        if (heartbeatTimer) clearTimeout(heartbeatTimer)
+        heartbeatTimer = setTimeout(() => {
+          if (closed) return
+          const now = Date.now()
+          if (now - lastOutputAt >= keepAliveMs) {
+            try { controller.enqueue(encoder.encode(': keep-alive\n\n')) } catch { /* ignore */ }
+            lastOutputAt = Date.now()
+          }
+          armHeartbeat()
+        }, keepAliveMs)
+      }
+
+      armIdle()
+      armHeartbeat()
+
+      try {
+        while (!closed) {
+          const { done, value } = await reader.read()
+          if (done) break
+          lastOutputAt = Date.now()
+          armIdle()
+          controller.enqueue(value)
+        }
+      } catch { /* abort / 读错误：结束流 */ }
+      finish(controller)
+    },
+    cancel() {
+      closed = true
+      reader.cancel().catch(() => { /* ignore */ })
+    },
+  })
+}
+
 async function requestUpstream(
   fetcher: typeof fetch,
   url: string,
@@ -124,12 +205,34 @@ async function requestUpstream(
   requestId: string,
   sessionId: string
 ): Promise<Response> {
-  return fetcher(url, {
-    method: options.method,
-    headers: createRequestHeaders(apiKey, requestId, sessionId),
-    body: options.method === 'GET' || options.method === 'HEAD' ? undefined : options.body,
-    signal: AbortSignal.timeout(OPENCODE_TIMEOUT_MS),
-  })
+  const isStreamRequest = options.method !== 'GET' && options.method !== 'HEAD'
+  // POST：连接/首字节超时（见 OPENCODE_CONNECT_TIMEOUT_MS），拿到响应后超时不再作用于流式 body；
+  // GET：保持整体短超时。
+  const controller = new AbortController()
+  const timeoutMs = isStreamRequest ? OPENCODE_CONNECT_TIMEOUT_MS : OPENCODE_GET_TIMEOUT_MS
+  const timer = setTimeout(() => controller.abort(), timeoutMs)
+  try {
+    const response = await fetcher(url, {
+      method: options.method,
+      headers: createRequestHeaders(apiKey, requestId, sessionId),
+      body: options.method === 'GET' || options.method === 'HEAD' ? undefined : options.body,
+      signal: controller.signal,
+    })
+    clearTimeout(timer)
+    // 流式 SSE：包装 idle 超时 + 心跳；非 SSE（JSON 错误/普通响应）原样透传，避免污染
+    if (isStreamRequest && response.body && isSSEResponse(response)) {
+      const body = withSSEKeepAlive(response.body, OPENCODE_KEEPALIVE_MS, OPENCODE_STREAM_IDLE_TIMEOUT_MS)
+      return new Response(body, {
+        status: response.status,
+        statusText: response.statusText,
+        headers: response.headers,
+      })
+    }
+    return response
+  } catch (error) {
+    clearTimeout(timer)
+    throw error
+  }
 }
 
 export async function proxyOpenCodeRequest(options: OpenCodeRequestOptions): Promise<Response> {
