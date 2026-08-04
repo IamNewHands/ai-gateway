@@ -1403,7 +1403,7 @@ async function refreshLogs() {
     })
     // 分页条
     var totalPages = Math.max(1, Math.ceil(d.data.total / logPageSize))
-    var sizeOpts = [20, 50, 100, 200]
+    var sizeOpts = [5, 10, 15, 20, 50, 100]
     var sizeHtml = '<select onchange="logPageSizeChange(this.value)" style="font-size:12px;padding:2px 4px;border-radius:6px;border:1px solid var(--border,#e2e8f0);background:var(--card,#fff);color:inherit">'
     for (var s = 0; s < sizeOpts.length; s++) {
       sizeHtml += '<option value="' + sizeOpts[s] + '"' + (sizeOpts[s] === logPageSize ? ' selected' : '') + '>' + sizeOpts[s] + ' 条/页</option>'
