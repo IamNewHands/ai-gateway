@@ -2,7 +2,60 @@
 
 基于 Cloudflare Workers + Hono 的 AI 提供商 API 代理网关，统一 `/v1` 接口转发，支持多 Key 轮询、健康检查与自动故障转移。
 
-## 功能与特性
+> **二次开发说明**：本仓库基于 [yutian81/ai-gateway](https://github.com/yutian81/ai-gateway) 二次开发。在原有多 Key 轮询 / 健康检查 / OpenCode 故障转移的基础上，新增了 **WorkBuddy/CodeBuddy OAuth 接入**、**每日签到**、**对外管理 API**、**Anthropic/Responses 格式转换** 等能力，详见下方[「增量功能」](#增量功能基于源仓库的二次开发)。
+
+## 增量功能（基于源仓库的二次开发）
+
+### 1. WorkBuddy / CodeBuddy OAuth 接入
+
+- **设备码登录流程**：OAuth Device Code 登录，登录后自动拉取可用模型
+- **CN / Global 双域路由**：解码 JWT `iss` 自动判断账号域，CN 走 `copilot.tencent.com`，Global 走 `www.workbuddy.ai`；APISIX 401 时自动切换备用域
+- **access_token 自动刷新**：Cron 每 2 小时定时刷新 + 请求前惰性刷新（提前 60 秒），401/403 时刷新 token 重试
+- **模型发现端点可配置**：`oauth.modelsUrl` 支持 WorkBuddy 非标准端点 `/console/enterprises/personal/models`，留空回退 `${baseUrl}/models`
+- **预置模板**：CodeBuddy / WorkBuddy 一键填充 baseUrl/apiType/oauth 配置，编辑时自动回显已选模板
+- **创建并发起连接**：新建 OAuth 提供商时无需先保存即可发起登录（`?connect={id}` 自动触发）
+- **表单智能隐藏**：选择 OAuth 认证类型时自动隐藏"上游 API Keys"和"模型 ID"区块
+
+### 2. WorkBuddy 每日签到
+
+- **Cloudflare Cron 定时执行**：每天 09:00 / 21:00（北京时间）自动签到
+- **签到状态查询 + 执行**：仅 CN 账号可签到，国际版自动跳过；今日已签则跳过执行
+- **额度信息拉取**：`get-user-resource` 聚合所有资源包，显示 可用 / 已用 / 百分比 / 额度池 / 包数（移植自 CPA 的 `packageRemainUsed` 聚合逻辑）
+- **套餐类型识别**：`get-payment-type`（free / paid）
+- **JWT 身份解析**：从 access_token 解出 uid / enterpriseId / nickname，补全 billing 接口所需 `X-User-Id` / `X-Enterprise-Id` / `X-Tenant-Id` 请求头
+- **多账号支持**：维护多个 WorkBuddy 账号（多 provider），各自独立签到
+- **管理后台签到面板**：连续签到天数 / 总积分 / 额度 / 套餐 / 上次签到时间
+- **进入面板自动展示最新状态**：先读 KV 缓存快速渲染，再后台静默刷新（`silent` 模式不写日志，避免噪音）
+- **手动触发**：全部签到 / 单个签到；支持对外管理 API 远程触发
+
+### 3. 对外管理 API（`/api/manage/*`）
+
+独立于浏览器 Session 的 Bearer Token 认证（`MANAGEMENT_TOKEN` 环境变量，SHA-256 哈希比对），供手机脚本等外部调用，无需登录管理后台。
+
+- `POST /api/manage/providers/upsert` — 创建或合并提供商（apiKeys / models 按 id 去重追加，不覆盖已有 enabled 状态）
+- `GET /api/manage/providers` — 查询所有提供商
+- `DELETE /api/manage/providers/:id` — 删除提供商
+- `POST /api/manage/checkin` / `POST /api/manage/checkin/:id` — 远程触发签到
+
+> 三套凭证职责分离：`MANAGEMENT_TOKEN`（提供商管理）/ `sk_cf_*`（模型调用）/ admin 账号（UI 登录）。详细对接文档见 [MANAGE_API.md](./MANAGE_API.md)。
+
+### 4. API 格式双向转换
+
+- **Anthropic Messages**（`/v1/messages`）↔ OpenAI Chat Completions 双向转换
+- **OpenAI Responses**（`/v1/responses`）↔ OpenAI Chat Completions 双向转换
+- **流式 SSE 实时转换**：OpenAI SSE → Anthropic named-event SSE / Responses SSE
+- **修复 SSE 多事件格式**：单 chunk 触发多个事件时正确用空行（`\n\n`）分隔，避免 `message_stop` 被客户端吞掉（`truncated: stream ended`，file tool 调用必现）
+- **流结束兜底**：上游缺失 `finish_reason` 时强制发送 `message_delta` + `message_stop`
+- **上游请求体清洗**：去除 WorkBuddy 不支持字段（`reasoning_effort`、`developer` 角色转 `system`、空 `content` 数组处理）
+
+### 5. 其他改进
+
+- **OAuth 获取模型自动入库**：拉取模型列表后自动合并到 `provider.models`（按 id 去重追加），免手动保存即可测试
+- **日志改进**：请求体摘要（避免长消息内容截断）、writeLog 异常保护、错误日志含请求详情与 URL
+- **管理后台 UI 视觉重构**：卡片式布局、签到面板、移动端自适应导航
+- **GitHub Actions 部署**：workflow 仅允许手动触发（`workflow_dispatch`），禁止 push 事件自动触发
+
+## 功能与特性（源仓库）
 
 - **统一 API 接口** — 所有 AI 提供商通过 `https://你的域名/v1` 访问，兼容 OpenAI / Anthropic 协议
 - **多 Key 轮询 + 健康检查** — 每个提供商可配置多个 API Key，请求随机打乱；失败 Key 自动降权，连续失败 5 次后进入冷却
