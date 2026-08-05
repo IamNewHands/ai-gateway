@@ -2,7 +2,7 @@
 
 基于 Cloudflare Workers + Hono 的 AI 提供商 API 代理网关，统一 `/v1` 接口转发，支持多 Key 轮询、健康检查与自动故障转移。
 
-> **二次开发说明**：本仓库基于 [yutian81/ai-gateway](https://github.com/yutian81/ai-gateway) 二次开发。在原有多 Key 轮询 / 健康检查 / OpenCode 故障转移的基础上，新增了 **WorkBuddy/CodeBuddy OAuth 接入**、**每日签到**、**对外管理 API**、**Anthropic/Responses 格式转换** 等能力，详见下方[「增量功能」](#增量功能基于源仓库的二次开发)。
+> **二次开发说明**：本仓库基于 [yutian81/ai-gateway](https://github.com/yutian81/ai-gateway) 二次开发。在原有多 Key 轮询 / 健康检查 / OpenCode 故障转移的基础上，新增了 **WorkBuddy/CodeBuddy OAuth 接入**、**每日签到**、**对外管理 API**、**Anthropic/Responses 格式转换**、**Cline 白嫖模型反代（含一键授权）** 等能力，详见下方[「增量功能」](#增量功能基于源仓库的二次开发)。
 
 ## 增量功能（基于源仓库的二次开发）
 
@@ -54,6 +54,31 @@
 - **日志改进**：请求体摘要（避免长消息内容截断）、writeLog 异常保护、错误日志含请求详情与 URL
 - **管理后台 UI 视觉重构**：卡片式布局、签到面板、移动端自适应导航
 - **GitHub Actions 部署**：workflow 仅允许手动触发（`workflow_dispatch`），禁止 push 事件自动触发
+
+### 6. Cline 接入（移植自 [cline2api-workers](https://github.com/pingmike2/cline2api-workers)）
+
+将 Cline 白嫖模型反代能力集成进网关，作为内置特殊提供商 `cline`，无需独立部署 worker。
+
+- **RefreshToken 多账号池**：每行一个 refreshToken，轮询使用；额度用尽 / 刷新失败 / 401 自动冷却切号
+- **Token 缓存与惰性刷新**：refreshToken → accessToken 缓存（提前 60s 刷新），失败自动重试
+- **SSE 透传**：转发 `api.cline.bot/api/v1/chat/completions`，剥离 Cline `{data:{...}}` 包装后透传标准 OpenAI SSE
+- **串行限流**：免费通道并发 `>1` 会空响应，内部串行队列避免触发限流
+- **一键授权（与原项目 `cline_oauth.py` 一致）**：管理后台编辑 Cline 提供商 → 点「一键授权获取 Token」→ 弹出 WorkOS 设备码授权链接 → 浏览器登录 Cline 账号（Google / GitHub / 邮箱）→ 后台轮询并自动把 refreshToken 写入账号池，无需手动跑 Python 脚本
+- **同时支持 OpenAI 与 Anthropic 协议**：`/v1/chat/completions` 与 `/v1/messages` 均可调用
+- **可用模型**（2026-08 实测）：`poolside/laguna-s-2.1:free` 当前唯一稳定免费可用；`deepseek/deepseek-v4-flash`、`cline-free/glm-5.2` 被 Cline 官方锁定为「仅产品界面可用」（第三方 API 返回 403，原项目同样受限）；`cline-pass/*` 需付费订阅
+
+> 客户端调用：`POST /v1/chat/completions`，`model: cline/poolside/laguna-s-2.1:free`
+
+### 7. QoderWork 接入（实验性，未验证通过）
+
+移植自 `cpa-plugin/qoderwork`，作为内置特殊提供商 `qoder`，包含 COSY 签名、OAuth、请求体编码等完整实现（[src/qoder/](./src/qoder/)）。
+
+> ⚠️ **当前状态：未验证通过。** COSY 签名 / 编码链路已移植，但因 QoderWork 上游协议变动或签名校验升级，**实测未能成功跑通**，仅供后续调试参考。如不需要可忽略，不影响其他提供商正常使用。
+
+### 8. 管理后台体验优化
+
+- **首页隐私保护**：首页不再展示模型目录、提供商统计数字；BASE_URL 与 curl 示例统一改用占位符 `https://自定义的域名/v1`，不泄露真实部署域名
+- **新增模型免保存即可测试**：编辑已有提供商时，新加的模型行可直接点「测试」按钮验证连通性，无需先点保存（移除了 `/test-model` 端点对模型必须已入库的多余校验）
 
 ## 功能与特性（源仓库）
 
