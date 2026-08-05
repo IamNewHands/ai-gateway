@@ -43,8 +43,8 @@ const H = (title: string) => `
 // ===== 首页 =====
 
 export async function renderHomePage(c: Context<{ Bindings: Env }>, isLoggedIn: boolean) {
-  const host = c.req.header('host') || 'localhost:8787'
-  const apiBase = `https://${host}/v1`
+  // 首页仅展示占位示例，不暴露真实部署域名，避免泄露隐私链接
+  const apiBase = 'https://自定义的域名/v1'
 
   return c.html(`<!DOCTYPE html><html lang="zh-CN">
 ${H('首页')}
