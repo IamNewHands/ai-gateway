@@ -110,43 +110,6 @@ ${H('首页')}
     <div class="metric"><span class="metric__value">${allModelsCount}</span><span class="metric__label">模型总计</span></div>
     <div class="metric"><span class="metric__value">${enabledModelsCount}</span><span class="metric__label">可用模型</span></div>
   </section>
-
-  <section class="shell directory" aria-labelledby="directory-title">
-    <div class="section-heading">
-      <div>
-        <h2 id="directory-title">模型目录</h2>
-        <p>点击模型 ID 即可复制；这里只展示已启用的提供商与模型。</p>
-      </div>
-      <label class="search-field" for="model-search">
-        <i class="fas fa-search" aria-hidden="true"></i>
-        <span class="sr-only">搜索提供商或模型</span>
-        <input id="model-search" type="search" placeholder="搜索提供商或模型" autocomplete="off">
-      </label>
-    </div>
-
-    <div class="provider-index" id="provider-index">
-      ${enabledProviders.length ? enabledProviders.map((provider) => {
-        const models = provider.models.filter((model) => model.enabled)
-        return `<article class="provider-row" data-search="${escapePageHtml(`${provider.name} ${provider.id} ${models.map((model) => model.id).join(' ')}`.toLowerCase())}">
-          <div class="provider-row__identity">
-            <span class="provider-row__mark" aria-hidden="true">${escapePageHtml(provider.name.charAt(0).toUpperCase() || 'A')}</span>
-            <div>
-              <h3>${escapePageHtml(provider.name)}</h3>
-              <p><code>${escapePageHtml(provider.id)}</code><span>${(provider.apiType || 'openai') === 'anthropic' ? 'Anthropic' : 'OpenAI'} 兼容</span></p>
-            </div>
-          </div>
-          <div class="provider-row__models">
-            ${models.length ? models.map((model) => {
-              const fullModel = `${provider.id}/${model.id}`
-              return `<button class="model-token copy-control" type="button" data-copy="${escapePageHtml(fullModel)}"><code>${escapePageHtml(fullModel)}</code><i class="far fa-copy" aria-hidden="true"></i></button>`
-            }).join('') : '<span class="empty-inline">暂无启用模型</span>'}
-          </div>
-          <span class="status-badge status-badge--on"><i aria-hidden="true"></i>已启用</span>
-        </article>`
-      }).join('') : `<div class="empty-state"><i class="fas fa-cubes" aria-hidden="true"></i><h3>尚无可用模型</h3><p>管理员启用提供商和模型后，它们会出现在这里。</p>${isLoggedIn ? '<a class="btn btn-p" href="/admin">前往管理控制台</a>' : ''}</div>`}
-    </div>
-    <div id="search-empty" class="empty-state hd"><i class="fas fa-search" aria-hidden="true"></i><h3>没有匹配结果</h3><p>请尝试输入提供商名称、ID 或模型名称。</p></div>
-  </section>
 </main>
 
 <footer class="site-footer">
@@ -180,20 +143,6 @@ ${H('首页')}
         if (status) status.textContent = '复制失败，请手动选择文本。'
       }
     })
-  })
-
-  var search = document.getElementById('model-search')
-  var rows = Array.from(document.querySelectorAll('.provider-row'))
-  var empty = document.getElementById('search-empty')
-  if (search) search.addEventListener('input', function () {
-    var query = search.value.trim().toLowerCase()
-    var visible = 0
-    rows.forEach(function (row) {
-      var matched = !query || (row.getAttribute('data-search') || '').includes(query)
-      row.classList.toggle('hd', !matched)
-      if (matched) visible++
-    })
-    if (empty) empty.classList.toggle('hd', visible > 0 || !query)
   })
 })()
 </script>
