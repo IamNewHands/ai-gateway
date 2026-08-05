@@ -23,6 +23,8 @@ import {
   handleOAuthPoll,
   handleOAuthDisconnect,
   handleOAuthModels,
+  handleClineOAuthConnect,
+  handleClineOAuthPoll,
   handleLogs,
   handleLogsClear,
   handleLogConfig,
@@ -99,6 +101,10 @@ app.post('/admin/api/oauth/:id/connect', handleOAuthConnect)
 app.post('/admin/api/oauth/:id/poll', handleOAuthPoll)
 app.post('/admin/api/oauth/:id/disconnect', handleOAuthDisconnect)
 app.get('/admin/api/oauth/:id/models', handleOAuthModels)
+
+// Cline 一键授权（WorkOS 设备码流程，登录后自动把 refreshToken 存入账号池）
+app.post('/admin/api/cline/oauth/:id/connect', handleClineOAuthConnect)
+app.post('/admin/api/cline/oauth/:id/poll', handleClineOAuthPoll)
 
 // 日志管理
 app.get('/admin/api/logs', handleLogs)

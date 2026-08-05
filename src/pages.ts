@@ -385,7 +385,7 @@ ${H('管理')}
               </div>
               <fieldset class="form-group ${p.authType==='oauth-device'?'hd':''}" id="keys-fs-${escapePageHtml(p.id)}"><legend id="key-legend-${escapePageHtml(p.id)}">${p.id==='cline'?'Cline RefreshTokens（每个账号一行）':'上游 API Keys'}</legend><div id="keys-${escapePageHtml(p.id)}">${p.apiKeys.map((k, ki)=>`<div class="fc mb-3 field-row" data-kidx="${ki}"><input type="password" value="${escapePageHtml(k.key)}" class="fx1" id="k-${escapePageHtml(p.id)}-${ki}" placeholder="API Key" aria-label="API Key"><label class="tg"><input type="checkbox" ${k.enabled?'checked':''} id="ken-${escapePageHtml(p.id)}-${ki}" aria-label="启用 Key"><span class="sl"></span></label><button class="btn btn-gh btn-xs" onclick="testKeyRow('${p.id}',${ki})" title="测试 Key"><i class="fas fa-plug" aria-hidden="true"></i><span>测试</span></button><button class="icon-btn" onclick="rmKeyRow('${p.id}',${ki})" aria-label="移除 Key"><i class="fas fa-times" aria-hidden="true"></i></button></div>`).join('')}</div><div class="fc mt-1 field-row"><input type="password" id="nk-${escapePageHtml(p.id)}" placeholder="${p.id==='cline'?'新的 RefreshToken（一个账号一行）':'新的 API Key'}" class="fx1"><button class="btn btn-s btn-xs" onclick="addKeyRow('${p.id}')"><i class="fas fa-plus" aria-hidden="true"></i>添加</button></div><span id="key-hint-${escapePageHtml(p.id)}" class="form-helper">${p.id==='cline'?'Cline 使用 Cline 账号的 refreshToken（长期钥匙）。每个账号一行，额度用完自动切换；留空禁用某个账号。':' '}</span></fieldset>
               <fieldset class="form-group" id="models-fs-${escapePageHtml(p.id)}"><legend>模型</legend><div id="ml-${escapePageHtml(p.id)}">${p.models.map((m,mi)=>`<div class="fc mb-3 field-row" data-idx="${mi}"><input type="text" value="${escapePageHtml(m.id)}" class="fx1" id="mid-${escapePageHtml(p.id)}-${mi}" placeholder="模型 ID"><label class="tg"><input type="checkbox" ${m.enabled?'checked':''} id="men-${escapePageHtml(p.id)}-${mi}" aria-label="启用模型"><span class="sl"></span></label><button class="btn btn-gh btn-xs" onclick="testMdl('${p.id}','${m.id}',${mi})" title="测试模型"><i class="fas fa-plug" aria-hidden="true"></i><span>测试</span></button><button class="icon-btn" onclick="rmMdl('${p.id}',${mi})" aria-label="移除模型"><i class="fas fa-times" aria-hidden="true"></i></button></div>`).join('')}</div><div class="fc mt-1 field-row"><input type="text" id="nmid-${escapePageHtml(p.id)}" placeholder="新的模型 ID" class="fx1"><button class="btn btn-s btn-xs" onclick="addMdl('${p.id}')"><i class="fas fa-plus" aria-hidden="true"></i>添加</button></div></fieldset>
-              <div class="detail-actions"><div id="tr-${escapePageHtml(p.id)}" aria-live="polite"></div><div>${(p.id === 'opencode' || p.id === 'cline') ? '<button class="btn btn-s" onclick="fetchEditModels(\'' + p.id + '\')"><i class="fas fa-download" aria-hidden="true"></i>获取模型</button>' : ''}<button class="btn btn-d" onclick="del('${p.id}')"><i class="fas fa-trash" aria-hidden="true"></i>删除</button><button class="btn btn-p" onclick="save('${p.id}')"><i class="fas fa-save" aria-hidden="true"></i>保存更改</button></div></div>
+              <div class="detail-actions"><div id="tr-${escapePageHtml(p.id)}" aria-live="polite"></div><div>${(p.id === 'opencode' || p.id === 'cline') ? '<button class="btn btn-s" onclick="fetchEditModels(\'' + p.id + '\')"><i class="fas fa-download" aria-hidden="true"></i>获取模型</button>' : ''}${p.id === 'cline' ? '<button class="btn btn-s" onclick="clineOAuthConnect(\'' + p.id + '\')"><i class="fas fa-sign-in-alt" aria-hidden="true"></i>一键授权获取 Token</button>' : ''}<button class="btn btn-d" onclick="del('${p.id}')"><i class="fas fa-trash" aria-hidden="true"></i>删除</button><button class="btn btn-p" onclick="save('${p.id}')"><i class="fas fa-save" aria-hidden="true"></i>保存更改</button></div></div>
             </div>
           </article>`).join('') : `<div class="empty-state"><i class="fas fa-server" aria-hidden="true"></i><h3>还没有提供商</h3><p>添加第一个上游提供商，配置 API 地址、Key 和模型。</p><button class="btn btn-p" onclick="showAdd()">添加提供商</button></div>`}
         </div>
@@ -903,6 +903,45 @@ function oauthDisconnect(id) {
   return fetch('/admin/api/oauth/' + encodeURIComponent(id) + '/disconnect', { method: 'POST' }).then(r => r.json()).then(d => {
     st.textContent = d.success ? '已断开' : (d.message || '断开失败')
   }).catch(() => { st.textContent = '断开失败' })
+}
+
+// ===== Cline 一键授权（WorkOS 设备码流程，与原项目 cline_oauth.py 一致） =====
+// 发起后弹出授权链接 + 设备码，浏览器登录授权后由后台轮询并自动把 refreshToken 存入账号池。
+function clineOAuthConnect(id) {
+  const st = document.getElementById('tr-' + id)
+  if (st) st.textContent = '发起中…'
+  return fetch('/admin/api/cline/oauth/' + encodeURIComponent(id) + '/connect', { method: 'POST' }).then(r => r.json()).then(d => {
+    if (!d.success || !d.data) { if (st) showResult(st, false, d.message || '发起失败'); return }
+    const dev = d.data
+    const uri = dev.verification_uri || ''
+    if (st) showResult(st, true, '请在弹窗中打开授权链接完成登录')
+    showM('<h3><i class="fas fa-sign-in-alt c-p" aria-hidden="true"></i> Cline 一键授权</h3><p>用注册 Cline 的账号（Google / GitHub / 邮箱）登录并授权，授权成功后 RefreshToken 会自动加入上方账号列表：</p><p><a href="' + escapeHtml(uri) + '" target="_blank" rel="noreferrer" style="word-break:break-all;font-size:1.05em">' + escapeHtml(uri) + '</a></p><p>设备码：<strong class="c-p" style="font-size:1.4em;letter-spacing:.15em">' + escapeHtml(dev.user_code || '') + '</strong></p><p class="oauth-status" id="cline-oauth-poll-st">等待授权…</p><div class="fa"><button class="btn btn-s" onclick="closeM()">取消</button><button class="btn btn-p" onclick="clineOAuthPoll(' + JSON.stringify(id) + ')">刷新状态</button></div>')
+    // 自动轮询（每 5 秒，WorkOS interval 默认 5s）
+    if (window._clineOAuthTimer) clearInterval(window._clineOAuthTimer)
+    window._clineOAuthTimer = setInterval(function() {
+      const pollSt = document.getElementById('cline-oauth-poll-st')
+      if (!pollSt || pollSt.textContent.includes('成功')) { clearInterval(window._clineOAuthTimer); return }
+      clineOAuthPoll(id)
+    }, 5000)
+  }).catch(() => { if (st) showResult(st, false, '发起失败') })
+}
+
+function clineOAuthPoll(id) {
+  const pollSt = document.getElementById('cline-oauth-poll-st')
+  const st = document.getElementById('tr-' + id)
+  if (pollSt) pollSt.textContent = '轮询中…'
+  return fetch('/admin/api/cline/oauth/' + encodeURIComponent(id) + '/poll', { method: 'POST' }).then(r => r.json()).then(d => {
+    if (d.success) {
+      if (window._clineOAuthTimer) { clearInterval(window._clineOAuthTimer); window._clineOAuthTimer = null }
+      if (pollSt) { pollSt.textContent = '授权成功！正在刷新账号列表…'; setTimeout(closeM, 1200) }
+      if (st) showResult(st, true, '授权成功，RefreshToken 已加入账号池')
+      setTimeout(function () { location.reload() }, 1400)
+      return true
+    }
+    if (pollSt) pollSt.textContent = d.message || '等待授权…'
+    if (st) st.textContent = d.message || '等待授权…'
+    return false
+  }).catch(() => { if (pollSt) pollSt.textContent = '轮询失败，请重试' })
 }
 
 // OAuth 提供商：用 KV 中的 token 拉取上游模型列表，动态填入编辑表单

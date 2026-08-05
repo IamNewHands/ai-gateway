@@ -13,7 +13,7 @@ import {
 import { testModelConnection } from './proxy'
 import { fetchOpenCodeModels, isOpenCodeProvider, resolveOpenCodeUrls, testOpenCodeModel } from './opencode'
 import { isQoderProvider, fetchQoderModels } from './qoder/proxy'
-import { isClineProvider, fetchClineModels, testClineChat, testClineRefreshToken } from './cline/proxy'
+import { isClineProvider, fetchClineModels, testClineChat, testClineRefreshToken, startClineOAuth, pollClineOAuth } from './cline/proxy'
 import { PROXY_KEY_PREFIX, EXPIRY_OPTIONS, OPENCODE_DEFAULT_URL } from './config'
 import { startOauthDeviceFlow, pollOauthDeviceFlow, readOauthToken, deleteOauthToken, getOauthAccessToken, buildOauthHeaders, detectTokenRealm } from './oauth'
 import type {
@@ -601,6 +601,39 @@ export async function handleOAuthDisconnect(c: Context<{ Bindings: Env }>) {
   if (!id) return c.json<ApiResponse>({ success: false, message: '缺少 id 参数' }, 400)
   await deleteOauthToken(c.env, id)
   return c.json<ApiResponse>({ success: true, message: '已断开 OAuth 连接' })
+}
+
+/** Cline 一键授权：发起 WorkOS 设备码流程，返回授权链接与设备码（与原项目 cline_oauth.py 一致） */
+export async function handleClineOAuthConnect(c: Context<{ Bindings: Env }>) {
+  const id = c.req.param('id')
+  if (!id) return c.json<ApiResponse>({ success: false, message: '缺少 id 参数' }, 400)
+  const provider = await getProvider(c.env, id)
+  if (!provider) return c.json<ApiResponse>({ success: false, message: '提供商不存在' }, 404)
+  if (!isClineProvider(provider.id)) {
+    return c.json<ApiResponse>({ success: false, message: '仅支持 Cline 提供商一键授权' }, 400)
+  }
+  const result = await startClineOAuth(c.env, id)
+  if (!result.success) {
+    return c.json<ApiResponse>({ success: false, message: result.message }, 500)
+  }
+  return c.json<ApiResponse>({ success: true, data: result.device })
+}
+
+/** Cline 一键授权：轮询 WorkOS 授权结果，成功后自动把 refreshToken 存入账号池 */
+export async function handleClineOAuthPoll(c: Context<{ Bindings: Env }>) {
+  const id = c.req.param('id')
+  if (!id) return c.json<ApiResponse>({ success: false, message: '缺少 id 参数' }, 400)
+  const provider = await getProvider(c.env, id)
+  if (!provider) return c.json<ApiResponse>({ success: false, message: '提供商不存在' }, 404)
+  if (!isClineProvider(provider.id)) {
+    return c.json<ApiResponse>({ success: false, message: '仅支持 Cline 提供商一键授权' }, 400)
+  }
+  const result = await pollClineOAuth(c.env, provider)
+  return c.json<ApiResponse>({
+    success: result.status === 'success',
+    message: result.message,
+    data: result.status === 'success' ? { connected: true } : { connected: false },
+  })
 }
 
 /**

@@ -14,7 +14,8 @@
  *   cline-free/* 被官方锁定(403)，cline-pass/* 需付费订阅。
  */
 
-import type { Provider } from '../types'
+import type { Env, Provider } from '../types'
+import { updateProvider } from '../storage'
 
 export const CLINE_PROVIDER_ID = 'cline'
 export const CLINE_API_BASE = 'https://api.cline.bot/api/v1'
@@ -404,5 +405,167 @@ export async function testClineChat(
     return { success: false, statusCode: resp.status, message: `HTTP ${resp.status}: ${t}` }
   } catch (err) {
     return { success: false, message: (err as Error).message || '测试失败' }
+  }
+}
+
+// ===== 一键授权（WorkOS 设备码流程，与原项目 cline_oauth.py 一致） =====
+//
+// 流程（逆向自 cline2api/auth.go 和 cline_oauth.py）：
+//   1. POST api.workos.com/user_management/authorize/device（表单 client_id）
+//      → 返回 device_code + user_code + 授权链接
+//   2. 用户在浏览器打开链接，用 Google/GitHub/邮箱登录授权（即注册的 Cline 账号）
+//   3. 轮询 POST api.workos.com/user_management/authenticate
+//      → 授权成功后拿 WorkOS access_token + refresh_token
+//   4. POST api.cline.bot/api/v1/auth/register（{accessToken, refreshToken}）
+//      → 返回值 data.refreshToken 即 Cline 账号的"长期钥匙"
+//   5. 把 refreshToken 追加进该提供商的 apiKeys（启用），完成接入
+
+export const CLINE_WORKOS_CLIENT_ID = 'client_01K3A541FN8TA3EPPHTD2325AR'
+const CLINE_WORKOS_DEVICE = 'https://api.workos.com/user_management/authorize/device'
+const CLINE_WORKOS_AUTH = 'https://api.workos.com/user_management/authenticate'
+const CLINE_REGISTER = 'https://api.cline.bot/api/v1/auth/register'
+const CLINE_DEVICE_TTL_SEC = 900 // 设备码 15 分钟有效，到期自清理
+
+const clineDeviceKey = (providerId: string) => 'cline:device:' + providerId
+
+interface ClineDeviceState {
+  device_code: string
+  user_code: string
+  verification_uri: string
+  interval: number
+  expires_at: number
+}
+
+export interface StartClineOAuthResult {
+  success: boolean
+  message: string
+  device?: { user_code: string; verification_uri: string; interval: number; expires_at: number }
+}
+
+/** 发起 Cline 一键授权，生成 WorkOS 设备码与授权链接。 */
+export async function startClineOAuth(env: Env, providerId: string): Promise<StartClineOAuthResult> {
+  try {
+    const body = new URLSearchParams({ client_id: CLINE_WORKOS_CLIENT_ID })
+    const res = await fetch(CLINE_WORKOS_DEVICE, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: body.toString(),
+      signal: AbortSignal.timeout(15000),
+    })
+    if (!res.ok) {
+      return { success: false, message: `申请设备码失败 HTTP ${res.status}: ${(await res.text()).substring(0, 200)}` }
+    }
+    const data = (await res.json()) as {
+      device_code?: string
+      user_code?: string
+      verification_uri_complete?: string
+      verification_uri?: string
+      interval?: number
+      expires_in?: number
+    }
+    if (!data.device_code || !data.user_code) {
+      return { success: false, message: 'WorkOS 设备码接口返回格式异常' }
+    }
+    const state: ClineDeviceState = {
+      device_code: data.device_code,
+      user_code: data.user_code,
+      verification_uri: data.verification_uri_complete || data.verification_uri || '',
+      interval: Math.max(data.interval || 5, 5),
+      expires_at: Date.now() + (data.expires_in || 300) * 1000,
+    }
+    await env.KV.put(clineDeviceKey(providerId), JSON.stringify(state), { expirationTtl: CLINE_DEVICE_TTL_SEC })
+    return {
+      success: true,
+      message: '设备码已生成',
+      device: {
+        user_code: state.user_code,
+        verification_uri: state.verification_uri,
+        interval: state.interval,
+        expires_at: state.expires_at,
+      },
+    }
+  } catch (err) {
+    return { success: false, message: `申请设备码异常: ${(err as Error).message || '未知错误'}` }
+  }
+}
+
+export type ClineOAuthPollResult =
+  | { status: 'pending'; message: string }
+  | { status: 'success'; message: string; refreshToken: string }
+  | { status: 'failed'; message: string }
+  | { status: 'error'; message: string }
+
+/** 轮询 WorkOS 授权结果；授权成功后调 register 换 Cline refreshToken 并存入账号池。 */
+export async function pollClineOAuth(env: Env, provider: Provider): Promise<ClineOAuthPollResult> {
+  const raw = await env.KV.get(clineDeviceKey(provider.id))
+  if (!raw) return { status: 'error', message: '没有进行中的登录流程，请重新发起' }
+  let state: ClineDeviceState
+  try { state = JSON.parse(raw) as ClineDeviceState } catch {
+    await env.KV.delete(clineDeviceKey(provider.id))
+    return { status: 'error', message: '设备码数据异常，请重新发起' }
+  }
+  if (Date.now() > state.expires_at) {
+    await env.KV.delete(clineDeviceKey(provider.id))
+    return { status: 'failed', message: '设备码已过期，请重新发起' }
+  }
+
+  try {
+    const body = new URLSearchParams({
+      grant_type: 'urn:ietf:params:oauth:grant-type:device_code',
+      device_code: state.device_code,
+      client_id: CLINE_WORKOS_CLIENT_ID,
+    })
+    const res = await fetch(CLINE_WORKOS_AUTH, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: body.toString(),
+      signal: AbortSignal.timeout(15000),
+    })
+
+    if (!res.ok) {
+      const errorData = (await res.json().catch(() => ({ error: 'unknown' }))) as { error?: string; error_description?: string }
+      switch (errorData.error) {
+        case 'authorization_pending':
+          return { status: 'pending', message: '等待用户授权…' }
+        case 'slow_down':
+          return { status: 'pending', message: '轮询过快，请稍候重试' }
+        case 'expired_token':
+          await env.KV.delete(clineDeviceKey(provider.id))
+          return { status: 'failed', message: '设备码已过期，请重新发起' }
+        case 'access_denied':
+          await env.KV.delete(clineDeviceKey(provider.id))
+          return { status: 'failed', message: '用户拒绝了授权' }
+        default:
+          return { status: 'error', message: `轮询异常: ${errorData.error_description || errorData.error || res.status}` }
+      }
+    }
+
+    const workos = (await res.json()) as { access_token?: string; refresh_token?: string }
+    if (!workos.access_token) return { status: 'error', message: '轮询接口返回异常：缺少 access_token' }
+
+    // 用 WorkOS token 在 Cline 注册，换 Cline refreshToken
+    const regRes = await fetch(CLINE_REGISTER, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ accessToken: workos.access_token, refreshToken: workos.refresh_token || '' }),
+      signal: AbortSignal.timeout(20000),
+    })
+    const regData = (await regRes.json().catch(() => ({}))) as { data?: { refreshToken?: string } }
+    const clineRefreshToken = regData?.data?.refreshToken
+    if (!clineRefreshToken) {
+      return { status: 'error', message: 'Cline 注册失败，未获取到 refreshToken，请重试（可能需要稍后清理重发）' }
+    }
+
+    // 存入账号池（enabled 去重追加）
+    const apiKeys = [...(provider.apiKeys || [])]
+    if (!apiKeys.some((k) => k.key === clineRefreshToken)) {
+      apiKeys.push({ key: clineRefreshToken, enabled: true })
+      await updateProvider(env, provider.id, { apiKeys })
+    }
+
+    await env.KV.delete(clineDeviceKey(provider.id))
+    return { status: 'success', message: '授权成功，已添加 Cline 账号', refreshToken: clineRefreshToken }
+  } catch (err) {
+    return { status: 'error', message: `轮询异常: ${(err as Error).message || '未知错误'}` }
   }
 }
