@@ -667,7 +667,7 @@ export async function handleOAuthModels(c: Context<{ Bindings: Env }>) {
           `sigInput=${dbg.sigInput || '(missing)'}`,
           `full=${JSON.stringify(dbg).substring(0, 3000)}`,
         ].join(' | ')
-        return c.json<ApiResponse>({ success: false, message: result.message + ' --- 调试信息 --- ' + debugInfo, data: { providerId: provider.id } }, status)
+        return c.json<ApiResponse>({ success: false, message: result.message + ' --- 调试信息 --- ' + debugInfo, data: { providerId: provider.id } }, status as Parameters<typeof c.json>[1])
       }
       const models = result.models || []
       // 自动合并保存到 provider.models（按 id 去重追加，保留已有 enabled 状态）

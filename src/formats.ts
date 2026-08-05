@@ -261,6 +261,8 @@ interface OpenAIChunk {
     delta?: {
       role?: string
       content?: string
+      reasoning_content?: string
+      reasoning?: string
       tool_calls?: Array<{
         index?: number
         id?: string
