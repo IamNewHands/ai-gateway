@@ -263,10 +263,9 @@ export async function handleTestModel(c: Context<{ Bindings: Env }>) {
     return c.json<ApiResponse>({ success: false, message: '提供商不存在' }, 404)
   }
 
-  const modelConfig = provider.models.find((m) => m.id === modelId)
-  if (!modelConfig) {
-    return c.json<ApiResponse>({ success: false, message: `模型 "${modelId}" 不存在于提供商 "${provider.name}"` }, 404)
-  }
+  // 注意：不校验模型是否已保存到 KV。测试的目的是验证"这个模型 ID 能否在上游用"，
+  // 用户在编辑表单里新加的模型（尚未点保存）也应能直接测试，避免"先保存才能测"的割裂体验。
+  // modelId 仅作为字符串透传给上游 chat/completions，与是否已入库无关。
 
   // OAuth 提供商：用 KV 中的 access_token 测试，无需 API Key
   if (provider.authType === 'oauth-device' && provider.oauth) {
