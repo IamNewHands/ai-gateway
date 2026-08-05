@@ -43,12 +43,8 @@ const H = (title: string) => `
 // ===== 首页 =====
 
 export async function renderHomePage(c: Context<{ Bindings: Env }>, isLoggedIn: boolean) {
-  const providers = await getProviders(c.env)
   const host = c.req.header('host') || 'localhost:8787'
   const apiBase = `https://${host}/v1`
-  const enabledProviders = providers.filter((provider) => provider.enabled)
-  const allModelsCount = providers.reduce((total, provider) => total + provider.models.length, 0)
-  const enabledModelsCount = enabledProviders.reduce((total, provider) => total + provider.models.filter((model) => model.enabled).length, 0)
 
   return c.html(`<!DOCTYPE html><html lang="zh-CN">
 ${H('首页')}
@@ -102,13 +98,6 @@ ${H('首页')}
         <code>provider/model</code>
       </div>
     </figure>
-  </section>
-
-  <section class="shell metrics-strip" aria-label="网关配置概览">
-    <div class="metric"><span class="metric__value">${providers.length}</span><span class="metric__label">提供商总计</span></div>
-    <div class="metric"><span class="metric__value">${enabledProviders.length}</span><span class="metric__label">已启用提供商</span></div>
-    <div class="metric"><span class="metric__value">${allModelsCount}</span><span class="metric__label">模型总计</span></div>
-    <div class="metric"><span class="metric__value">${enabledModelsCount}</span><span class="metric__label">可用模型</span></div>
   </section>
 </main>
 
