@@ -277,7 +277,7 @@ export function buildBearer(sess: CosySession, body: string, rawUrl: string): Co
   let pathSig = u.pathname
   if (pathSig.startsWith('/algo')) pathSig = pathSig.slice('/algo'.length)
   const payload: Record<string, string> = {
-    cosyVersion: '1.1.3',
+    cosyVersion: '0.1.43',
     ideVersion: '',
     info: sess.info,
     requestId: uuid(),

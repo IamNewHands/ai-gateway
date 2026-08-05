@@ -4,6 +4,7 @@ import { KV_KEYS, KEY_HEALTH_COOLDOWN_MS, KEY_HEALTH_MAX_FAILURES } from './conf
 import type { Env, ProxyRequestBody } from './types'
 import { isOpenCodeProvider, proxyOpenCodeRequest, resolveOpenCodeUrls } from './opencode'
 import { isQoderProvider, proxyQoderChatRequest } from './qoder/proxy'
+import { isClineProvider, proxyClineChatRequest } from './cline/proxy'
 import { writeLog } from './admin'
 import { getOauthAccessToken, readOauthToken, refreshOauthToken, detectTokenRealm, buildOauthHeaders } from './oauth'
 import {
@@ -596,6 +597,21 @@ export async function forwardProxy(
       return response
     }
 
+    // Cline（cline2api）：refreshToken 换 accessToken 转发到 api.cline.bot，
+    // 账号池在 cline/proxy.ts 内部管理（多账号自动切换），不走普通 API Key 逻辑。
+    if (isClineProvider(providerId)) {
+      const response = await proxyClineChatRequest(c.env, provider, forwardBody as Record<string, unknown>)
+      const logLevel = response.ok ? 'request' : (response.status >= 500 ? 'error' : 'warn')
+      try {
+        const bodySummary = summarizeRequestBody(forwardBody)
+        c.executionCtx.waitUntil(writeLog(c.env, logLevel,
+          `[${provider.name}] ${model} → ${response.status}`,
+          JSON.stringify({ providerId, subPath, body: bodySummary }).substring(0, 4000)
+        ))
+      } catch { /* log failure must not break */ }
+      return response
+    }
+
     // OAuth 设备码提供商：使用 KV 中保存的 access_token 转发，401 时尝试刷新后重试
     if (provider.authType === 'oauth-device' && provider.oauth) {
       return await proxyOAuthRequest(c, provider, subPath, url.search, forwardBody, method)
@@ -987,6 +1003,11 @@ export async function handleAnthropicMessages(c: Context<{ Bindings: Env }>) {
     // 由 proxyQoderChatRequest 转发后返回 OpenAI SSE，这里再转回 Anthropic SSE。
     if (isQoderProvider(provider.id)) {
       return await handleAnthropicQoder(c, provider, model, openaiBody, originalStream)
+    }
+
+    // Cline：refreshToken 换 token 转发（OpenAI 格式），再转回 Anthropic SSE。
+    if (isClineProvider(provider.id)) {
+      return await handleAnthropicCline(c, provider, model, openaiBody, originalStream)
     }
 
     // OAuth 提供商走 OAuth 代理路径
@@ -1437,6 +1458,153 @@ async function handleAnthropicQoder(
           try {
             c.executionCtx.waitUntil(writeLog(c.env, 'warn',
               `[anthropic] 流结束兜底触发 ${model} (qoder)`,
+              JSON.stringify({ providerId: provider.id, model, ...finalizeDiag })
+            ))
+          } catch { /* log failure must not break */ }
+        }
+        controller.close()
+      },
+    })
+
+    return new Response(readable, {
+      status: 200,
+      headers: {
+        'Content-Type': 'text/event-stream',
+        'Cache-Control': 'no-store',
+        'X-Accel-Buffering': 'no',
+      },
+    })
+  }
+
+  // 非流式：收集所有 OpenAI SSE → 聚合 → Anthropic
+  const allChunks: any[] = []
+  const decoder2 = new TextDecoderStream()
+  const textReader2 = response.body.pipeThrough(decoder2).getReader()
+  let lineBuffer2 = ''
+
+  try {
+    while (true) {
+      const { done, value } = await textReader2.read()
+      if (done) break
+      const combined = lineBuffer2 + value
+      const lines = combined.split('\n')
+      lineBuffer2 = lines.pop() || ''
+      for (const line of lines) {
+        const trimmed = line.trim()
+        if (!trimmed.startsWith('data:')) continue
+        const data = trimmed.slice(5).trim()
+        if (!data || data === '[DONE]') continue
+        try {
+          const chunk = JSON.parse(data)
+          cleanChunkDelta(chunk)
+          allChunks.push(chunk)
+        } catch { /* skip */ }
+      }
+    }
+  } catch { /* stream error */ }
+
+  const anthropicResp = aggregateOpenAIToAnthropic(allChunks)
+  return c.json(anthropicResp)
+}
+
+/**
+ * Cline Anthropic 格式转发：OpenAI 请求体 → Cline 上游转发（proxyClineChatRequest
+ * 已把嵌套 SSE 解成 OpenAI SSE）→ 再转回 Anthropic SSE。转换逻辑与 qoder 分支一致。
+ */
+async function handleAnthropicCline(
+  c: Context<{ Bindings: Env }>,
+  provider: import('./types').Provider,
+  model: string,
+  openaiBody: Record<string, unknown>,
+  originalStream: boolean
+): Promise<Response> {
+  // Cline 上游支持流式，非流式时也先强制流式再由客户端格式决定转换
+  const upstreamBody: Record<string, unknown> = { ...openaiBody, stream: true }
+  // 清理上游不支持的字段 + 被屏蔽的 Claude Code 模板短语
+  sanitizeUpstreamBody(upstreamBody)
+  sanitizeBlockedTemplates(upstreamBody)
+  // max_completion_tokens → max_tokens（Cline 上游只认 max_tokens）
+  if (upstreamBody['max_completion_tokens'] !== undefined && upstreamBody['max_tokens'] === undefined) {
+    upstreamBody['max_tokens'] = upstreamBody['max_completion_tokens']
+    delete upstreamBody['max_completion_tokens']
+  }
+
+  const response = await proxyClineChatRequest(c.env, provider, upstreamBody, { stream: true })
+
+  if (!response.ok) {
+    const errText = await response.text().catch(() => '')
+    try {
+      const bodySummary = summarizeRequestBody(upstreamBody)
+      c.executionCtx.waitUntil(writeLog(c.env, 'error', `[anthropic] ${model} → ${response.status} Cline`, JSON.stringify({ error: errText, body: bodySummary }).substring(0, 4000)))
+    } catch { /* log failure must not break request */ }
+    return c.json({
+      type: 'error',
+      error: { type: 'upstream_error', message: `Upstream error: ${errText}` },
+    }, response.status as Parameters<typeof c.json>[1])
+  }
+
+  try { c.executionCtx.waitUntil(writeLog(c.env, 'request', `[anthropic] ${model} → 200 Cline`, `stream=${originalStream}`)) } catch {}
+
+  if (!response.body) {
+    return c.json({ type: 'error', error: { type: 'upstream_error', message: 'Upstream returned empty body' } }, 502)
+  }
+
+  // 流式：OpenAI SSE → Anthropic SSE 实时转换
+  if (originalStream) {
+    const acc = createAnthropicSSEAccumulator()
+    const readable = new ReadableStream({
+      async start(controller) {
+        const decoder = new TextDecoderStream()
+        const textReader = response.body!.pipeThrough(decoder).getReader()
+        let lineBuffer = ''
+
+        try {
+          while (true) {
+            const { done, value } = await textReader.read()
+            if (done) break
+            const combined = lineBuffer + value
+            const lines = combined.split('\n')
+            lineBuffer = lines.pop() || ''
+
+            for (const line of lines) {
+              const trimmed = line.trim()
+              if (!trimmed.startsWith('data:')) continue
+              const data = trimmed.slice(5).trim()
+              if (!data || data === '[DONE]') continue
+              try {
+                const chunk = JSON.parse(data)
+                cleanChunkDelta(chunk)
+                const anthropicSSE = openAIChunkToAnthropicSSE(chunk, acc)
+                if (anthropicSSE) {
+                  controller.enqueue(new TextEncoder().encode(anthropicSSE))
+                }
+              } catch { /* skip malformed */ }
+            }
+          }
+          if (lineBuffer.trim().startsWith('data:')) {
+            const data = lineBuffer.trim().slice(5).trim()
+            if (data && data !== '[DONE]') {
+              try {
+                const chunk = JSON.parse(data)
+                cleanChunkDelta(chunk)
+                const anthropicSSE = openAIChunkToAnthropicSSE(chunk, acc)
+                if (anthropicSSE) {
+                  controller.enqueue(new TextEncoder().encode(anthropicSSE))
+                }
+              } catch { /* skip */ }
+            }
+          }
+        } catch { /* stream error */ }
+        // 流结束兜底：补发缺失的 content_block_stop / message_stop 事件
+        const finalizeDiag = diagnoseAnthropicAccumulator(acc)
+        const finalized = finalizeAnthropicStream(acc)
+        if (finalized) {
+          try {
+            controller.enqueue(new TextEncoder().encode(finalized))
+          } catch { /* enqueue failed */ }
+          try {
+            c.executionCtx.waitUntil(writeLog(c.env, 'warn',
+              `[anthropic] 流结束兜底触发 ${model} (cline)`,
               JSON.stringify({ providerId: provider.id, model, ...finalizeDiag })
             ))
           } catch { /* log failure must not break */ }

@@ -13,6 +13,7 @@ import {
 import { testModelConnection } from './proxy'
 import { fetchOpenCodeModels, isOpenCodeProvider, resolveOpenCodeUrls, testOpenCodeModel } from './opencode'
 import { isQoderProvider, fetchQoderModels } from './qoder/proxy'
+import { isClineProvider, fetchClineModels, testClineChat, testClineRefreshToken } from './cline/proxy'
 import { PROXY_KEY_PREFIX, EXPIRY_OPTIONS, OPENCODE_DEFAULT_URL } from './config'
 import { startOauthDeviceFlow, pollOauthDeviceFlow, readOauthToken, deleteOauthToken, getOauthAccessToken, buildOauthHeaders, detectTokenRealm } from './oauth'
 import type {
@@ -312,6 +313,13 @@ export async function handleTestModel(c: Context<{ Bindings: Env }>) {
     return c.json<ApiResponse>({ success: true, data: { success: false, statusCode: 0, message: '所有域均请求失败' } })
   }
 
+  // Cline：用 refreshToken 账号池发送最小请求测试模型
+  if (isClineProvider(provider.id)) {
+    const tokens = provider.apiKeys.filter(k => k.enabled).map(k => k.key)
+    const result = await testClineChat(tokens, modelId)
+    return c.json<ApiResponse>({ success: true, data: result })
+  }
+
   const enabledKeys = provider.apiKeys.filter(k => k.enabled)
   if (!isOpenCodeProvider(provider.id) && enabledKeys.length === 0) {
     return c.json<ApiResponse>({ success: false, message: '该提供商未配置可用的 API Key' }, 400)
@@ -363,6 +371,20 @@ export async function handleTestKeyNew(c: Context<{ Bindings: Env }>) {
     })
   }
 
+  // Cline：校验 refreshToken 是否有效，成功时一并返回实测可用模型列表
+  if (providerId && isClineProvider(providerId)) {
+    const result = await testClineRefreshToken(apiKey || '')
+    return c.json<ApiResponse>({
+      success: true,
+      data: {
+        success: result.success,
+        statusCode: result.statusCode || 0,
+        message: result.message,
+        data: result.success ? fetchClineModels().models : null,
+      },
+    })
+  }
+
   const cleanBase = url.replace(/\/$/, '')
   try {
     const response = await fetch(`${cleanBase}/models`, {
@@ -401,6 +423,16 @@ export async function handleTestModelNew(c: Context<{ Bindings: Env }>) {
   if (providerId && isOpenCodeProvider(providerId)) {
     const apiKeys = apiKey ? [{ key: apiKey, enabled: true }] : []
     const result = await testOpenCodeModel(url, apiKeys, model, resolveOpenCodeUrls(c.env))
+    return c.json<ApiResponse>({
+      success: true,
+      data: { success: result.success, statusCode: result.statusCode || 0, message: result.message },
+    })
+  }
+
+  // Cline：用 refreshToken 发送最小请求测试模型可用性
+  if (providerId && isClineProvider(providerId)) {
+    const tokens = apiKey ? apiKey.split('\n').filter(Boolean) : []
+    const result = await testClineChat(tokens, model)
     return c.json<ApiResponse>({
       success: true,
       data: { success: result.success, statusCode: result.statusCode || 0, message: result.message },
