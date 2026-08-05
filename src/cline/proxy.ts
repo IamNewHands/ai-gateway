@@ -9,9 +9,10 @@
  * 多账号：provider.apiKeys（enabled）里一行一个 refreshToken，
  *   额度用尽(空响应)/刷失败/401 时自动冷却并切换到下一个账号。
  *
- * 可用模型（实测，见项目 README）：
- *   deepseek/deepseek-v4-flash、poolside/laguna-s-2.1:free 免费可用；
- *   cline-free/* 被官方锁定(403)，cline-pass/* 需付费订阅。
+ * 可用模型（2026-08 实测，见项目 README）：
+ *   poolside/laguna-s-2.1:free 为当前唯一稳定可用（API 免费）；
+ *   deepseek/deepseek-v4-flash 与 cline-free/* 被官方锁定(403，仅 Cline 产品界面)；
+ *   cline-pass/* 需付费订阅。
  */
 
 import type { Env, Provider } from '../types'
@@ -20,12 +21,12 @@ import { updateProvider } from '../storage'
 export const CLINE_PROVIDER_ID = 'cline'
 export const CLINE_API_BASE = 'https://api.cline.bot/api/v1'
 
-export const DEFAULT_MODEL = 'deepseek/deepseek-v4-flash'
+export const DEFAULT_MODEL = 'poolside/laguna-s-2.1:free'
 
-/** 实测可用的模型列表（免费白嫖主要用前两个）。 */
+/** 实测模型列表（poolside 免费可用；deepseek 已锁；cline-free 锁定；cline-pass 需订阅）。 */
 export const CLINE_MODELS: Array<{ id: string; provider: string; cost: string }> = [
-  { id: 'deepseek/deepseek-v4-flash', provider: 'deepseek', cost: 'free' },
   { id: 'poolside/laguna-s-2.1:free', provider: 'poolside', cost: 'free' },
+  { id: 'deepseek/deepseek-v4-flash', provider: 'deepseek', cost: 'locked' },
   { id: 'cline-free/glm-5.2', provider: 'zai', cost: 'locked' },
   { id: 'cline-pass/glm-5.2', provider: 'zai', cost: 'pass' },
   { id: 'cline-pass/deepseek-v4-flash', provider: 'deepseek', cost: 'pass' },
@@ -401,7 +402,14 @@ export async function testClineChat(
       1
     )
     if (resp.ok) return { success: true, statusCode: resp.status, message: '' }
-    const t = await resp.text().catch(() => '').then((s) => s.slice(0, 200))
+    const t = await resp.text().catch(() => '').then((s) => s.slice(0, 300))
+    // 官方锁定模型（仅 Cline 产品界面可用）与需订阅模型的 403，给出更明确的提示
+    if (resp.status === 403 && /only available via Cline product surfaces|not available/i.test(t)) {
+      return { success: false, statusCode: resp.status, message: '该模型已被 Cline 官方锁定（仅 Cline 产品界面可用），请改用 poolside/laguna-s-2.1:free' }
+    }
+    if (resp.status === 403 && /cline-pass/i.test(t)) {
+      return { success: false, statusCode: resp.status, message: '该模型需要付费订阅 cline-pass 才能使用' }
+    }
     return { success: false, statusCode: resp.status, message: `HTTP ${resp.status}: ${t}` }
   } catch (err) {
     return { success: false, message: (err as Error).message || '测试失败' }
