@@ -160,13 +160,14 @@ app.onError((err, c) => {
   return c.json({ error: { message: '服务器内部错误', type: 'server_error' } }, 500)
 })
 
-export default app
-
 // ===== Cron：定时任务（按 event.cron 分发） =====
 // crons（见 wrangler.toml）：
 //   "0 */2 * * *"   —— 每 2 小时刷新 OAuth token
 //   "0 1,13 * * *"  —— 每日 09:00/21:00（北京时间）WorkBuddy 签到
-export async function scheduled(event: ScheduledEvent, env: Env, ctx: ExecutionContext) {
+// ⚠️ Cloudflare ES Module Workers 只认 default export 上的 handler：
+//    scheduled 若写成 named export（export async function scheduled），运行时找不到
+//    default.scheduled，cron 触发后会被静默丢弃 → 定时签到/token 刷新均不执行。
+async function scheduled(event: ScheduledEvent, env: Env, ctx: ExecutionContext) {
   if (event.cron === '0 1,13 * * *') {
     // 签到
     const summary = await runAllCheckins(env)
@@ -178,4 +179,11 @@ export async function scheduled(event: ScheduledEvent, env: Env, ctx: ExecutionC
   const oauthProviders = providers.filter((p) => p.authType === 'oauth-device' && p.oauth)
   const result = await refreshAllOauthTokens(env, oauthProviders)
   console.log(`[oauth] cron refresh done: ${result.ok} ok, ${result.fail} fail`)
+}
+
+// fetch 与 scheduled 必须都挂在 default export 上，Cloudflare 才会注册并调用。
+// Hono 的 fetch 为实例箭头属性，解构后 this 仍绑定 app，可安全赋值。
+export default {
+  fetch: app.fetch,
+  scheduled,
 }
