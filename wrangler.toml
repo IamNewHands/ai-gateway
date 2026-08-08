@@ -4,6 +4,11 @@ compatibility_date = "2025-07-01"
 compatibility_flags = ["nodejs_compat"]
 keep_vars = true
 
+# Smart Placement：将 Worker 执行点自动调度到距离上游（如 Google Gemini）更近的 Cloudflare 节点，
+# 使出口 IP 落在受支持地区（Gemini API 有地域限制，就近节点可能返回 FAILED_PRECONDITION）。
+[placement]
+mode = "smart"
+
 # KV namespace — wrangler will auto-resolve by name
 [[kv_namespaces]]
 binding = "KV"
