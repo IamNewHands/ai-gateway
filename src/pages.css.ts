@@ -178,6 +178,10 @@ label, legend { color: var(--color-ink-2); font-size: var(--text-xs); font-weigh
 .fr, .fr3 { display: grid; grid-template-columns: minmax(0, 1fr); gap: 0 var(--space-sm); }
 .form-group { margin: 0 0 var(--space-md); padding: var(--space-sm); border: .0625rem solid var(--color-rule); border-radius: var(--radius-control); }
 .form-group legend { padding-inline: var(--space-2xs); }
+.model-check-list { display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); gap: 4px; max-height: 240px; overflow-y: auto; padding: 6px; border: 1px solid var(--color-rule); border-radius: var(--radius-control); }
+.model-check { display: flex; align-items: center; gap: 6px; padding: 3px 8px; border-radius: 6px; cursor: pointer; font-size: var(--text-xs); white-space: nowrap; }
+.model-check:hover { background: rgba(0, 0, 0, .05); }
+.model-check input { accent-color: #6366f1; flex-shrink: 0; }
 .field-row { min-width: 0; flex-wrap: nowrap; }
 .field-row input { min-width: 0; }
 

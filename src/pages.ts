@@ -261,11 +261,17 @@ export async function renderAdminPage(c: Context<{ Bindings: Env }>) {
   const enabledModelsCount = providers.reduce((total, provider) => total + provider.models.filter((model) => model.enabled).length, 0)
   const enabledProxyKeysCount = proxyKeys.filter((key) => key.enabled).length
 
-  // 全部已启用模型引用（providerId/modelId），供 Vision Bridge 视觉模型勾选（可跨厂商）
+  // 全部已启用模型引用（providerId/modelId），供 Vision Bridge 识图模型勾选（可跨厂商）
   const allModelRefs = providers.flatMap((provider) => provider.models.filter((m) => m.enabled).map((m) => `${provider.id}/${m.id}`))
-  const modelOptionHtml = (selected: string[] = []) => allModelRefs
-    .map((r) => `<option value="${escapePageHtml(r)}"${selected.includes(r) ? ' selected' : ''}>${escapePageHtml(r)}</option>`)
-    .join('')
+  // 主文本模型：单选框列表（留空 = 本提供商自身模型）
+  const modelRadioHtml = (name: string, checked = '') => [
+    `<label class="model-check"><input type="radio" name="${name}" value=""${!checked ? ' checked' : ''}><span>本提供商自身模型（共享识图，推荐）</span></label>`,
+    ...allModelRefs.map((r) => `<label class="model-check"><input type="radio" name="${name}" value="${escapePageHtml(r)}"${checked === r ? ' checked' : ''}><span>${escapePageHtml(r)}</span></label>`),
+  ].join('')
+  // 识图模型：复选框列表（视觉模型链，可多选）
+  const modelCheckboxHtml = (checked: string[] = []) => allModelRefs.length
+    ? `<div class="model-check-list">${allModelRefs.map((r) => `<label class="model-check"><input type="checkbox" value="${escapePageHtml(r)}"${checked.includes(r) ? ' checked' : ''}><span>${escapePageHtml(r)}</span></label>`).join('')}</div>`
+    : '<p class="form-helper">暂无已启用的模型，请先添加并启用模型。</p>'
 
   return c.html(`<!DOCTYPE html><html lang="zh-CN">
 ${H('管理')}
@@ -352,8 +358,8 @@ ${H('管理')}
             <fieldset class="form-group" id="akeys-fs"><legend id="akey-legend">上游 API Keys</legend><div id="akeys"><div class="fc mb-4 field-row"><input type="password" placeholder="sk-xxx" class="fx1 aki" aria-label="上游 API Key"><label class="tg" title="启用 Key"><input type="checkbox" checked class="ake" aria-label="启用 Key"><span class="sl"></span></label><button class="btn btn-gh btn-xs" onclick="testNewAKey(this)" title="测试 Key"><i class="fas fa-plug" aria-hidden="true"></i><span>测试</span></button><button class="icon-btn" onclick="this.parentElement.remove()" aria-label="移除 Key"><i class="fas fa-times" aria-hidden="true"></i></button></div></div><button class="btn btn-s btn-xs" onclick="addAKeyRow()"><i class="fas fa-plus" aria-hidden="true"></i>添加 Key</button><span id="akey-hint" class="form-helper"></span></fieldset>
             <fieldset class="form-group" id="amodels-fs"><legend>模型 ID</legend><div id="amodels"><div class="fc mb-4 field-row"><input type="text" placeholder="deepseek-chat" class="fx1 ami" aria-label="模型 ID"><label class="tg" title="启用模型"><input type="checkbox" checked class="ame" aria-label="启用模型"><span class="sl"></span></label><button class="btn btn-gh btn-xs" onclick="testNewMdl(this)" title="测试模型"><i class="fas fa-plug" aria-hidden="true"></i><span>测试</span></button><button class="icon-btn" onclick="this.parentElement.remove()" aria-label="移除模型"><i class="fas fa-times" aria-hidden="true"></i></button></div></div><button class="btn btn-s btn-xs" onclick="addMdlRow()"><i class="fas fa-plus" aria-hidden="true"></i>添加模型</button></fieldset>
             <fieldset class="form-group" id="avb-fs"><legend>识图模型配置（可选）</legend><span class="form-helper">让不支持图片的模型支持图片：请求含图时自动调用下方勾选的识图模型转写为文本。识图模型可从已维护的所有模型中选择（同厂商或跨厂商）。两种用法：①「主文本模型」留空 → 本提供商下所有模型自动共享识图能力；②「主文本模型」选了其它提供商/模型 → 本提供商作为图片转写桥，所有模型转发到该主文本模型。</span>
-              <div class="fg"><label>主文本模型（留空 = 转发到本提供商自身模型）</label><select id="avb-primary" class="select-sm"><option value="">本提供商自身模型（共享识图，推荐）</option>${modelOptionHtml()}</select></div>
-              <div class="fg"><label>识图模型（视觉模型链，可多选，Ctrl/Shift 勾选，按顺序回退）</label><select id="avb-vision" multiple size="6" class="select-sm">${modelOptionHtml()}</select></div>
+              <div class="fg"><label>主文本模型（留空 = 转发到本提供商自身模型）</label><div id="avb-primary">${modelRadioHtml('avb-primary')}</div></div>
+              <div class="fg"><label>识图模型（视觉模型链，勾选后请求含图时按勾选顺序依次转写，全部失败按下方策略处理）</label><div id="avb-vision">${modelCheckboxHtml()}</div></div>
               <div class="fg"><label>视觉转写失败策略</label><select id="avb-fail" class="select-sm"><option value="error">error（返回错误）</option><option value="text_only">text_only（丢弃图片仅转发文本）</option></select></div>
             </fieldset>
             <div class="panel-actions"><label class="switch-label"><span>创建后立即启用</span><span class="tg"><input type="checkbox" checked id="aen"><span class="sl"></span></span></label><div><button class="btn btn-s" onclick="hideAdd()">取消</button><button class="btn btn-p" onclick="createProv()"><i class="fas fa-check" aria-hidden="true"></i>创建提供商</button></div></div>
@@ -397,8 +403,8 @@ ${H('管理')}
               <fieldset class="form-group ${p.authType==='oauth-device'?'hd':''}" id="keys-fs-${escapePageHtml(p.id)}"><legend id="key-legend-${escapePageHtml(p.id)}">${p.id==='cline'?'Cline RefreshTokens（每个账号一行）':'上游 API Keys'}</legend><div id="keys-${escapePageHtml(p.id)}">${p.apiKeys.map((k, ki)=>`<div class="fc mb-3 field-row" data-kidx="${ki}"><input type="password" value="${escapePageHtml(k.key)}" class="fx1" id="k-${escapePageHtml(p.id)}-${ki}" placeholder="API Key" aria-label="API Key"><label class="tg"><input type="checkbox" ${k.enabled?'checked':''} id="ken-${escapePageHtml(p.id)}-${ki}" aria-label="启用 Key"><span class="sl"></span></label><button class="btn btn-gh btn-xs" onclick="testKeyRow('${p.id}',${ki})" title="测试 Key"><i class="fas fa-plug" aria-hidden="true"></i><span>测试</span></button><button class="icon-btn" onclick="rmKeyRow('${p.id}',${ki})" aria-label="移除 Key"><i class="fas fa-times" aria-hidden="true"></i></button></div>`).join('')}</div><div class="fc mt-1 field-row"><input type="password" id="nk-${escapePageHtml(p.id)}" placeholder="${p.id==='cline'?'新的 RefreshToken（一个账号一行）':'新的 API Key'}" class="fx1"><button class="btn btn-s btn-xs" onclick="addKeyRow('${p.id}')"><i class="fas fa-plus" aria-hidden="true"></i>添加</button></div><span id="key-hint-${escapePageHtml(p.id)}" class="form-helper">${p.id==='cline'?'Cline 使用 Cline 账号的 refreshToken（长期钥匙）。每个账号一行，额度用完自动切换；留空禁用某个账号。':' '}</span></fieldset>
               <fieldset class="form-group" id="models-fs-${escapePageHtml(p.id)}"><legend>模型</legend><div id="ml-${escapePageHtml(p.id)}">${p.models.map((m,mi)=>`<div class="fc mb-3 field-row" data-idx="${mi}"><input type="text" value="${escapePageHtml(m.id)}" class="fx1" id="mid-${escapePageHtml(p.id)}-${mi}" placeholder="模型 ID"><label class="tg"><input type="checkbox" ${m.enabled?'checked':''} id="men-${escapePageHtml(p.id)}-${mi}" aria-label="启用模型"><span class="sl"></span></label><button class="btn btn-gh btn-xs" onclick="testMdl('${p.id}','${m.id}',${mi})" title="测试模型"><i class="fas fa-plug" aria-hidden="true"></i><span>测试</span></button><button class="icon-btn" onclick="rmMdl('${p.id}',${mi})" aria-label="移除模型"><i class="fas fa-times" aria-hidden="true"></i></button></div>`).join('')}</div><div class="fc mt-1 field-row"><input type="text" id="nmid-${escapePageHtml(p.id)}" placeholder="新的模型 ID" class="fx1"><button class="btn btn-s btn-xs" onclick="addMdl('${p.id}')"><i class="fas fa-plus" aria-hidden="true"></i>添加</button></div></fieldset>
               <fieldset class="form-group"><legend>识图模型配置（可选）</legend><span class="form-helper">勾选识图模型后，本提供商所有模型都自动支持图片：请求含图时先由识图模型转写为文本再按原模型转发（留空主文本模型）。若选了主文本模型，则本提供商作为图片转写桥，全部请求转发到该主文本模型。全部取消勾选即恢复普通转发。</span>
-                <div class="fg"><label>主文本模型（留空 = 转发到本提供商自身模型）</label><select id="vb-primary-${escapePageHtml(p.id)}" class="select-sm"><option value="">本提供商自身模型（共享识图，推荐）</option>${modelOptionHtml(p.visionBridge&&p.visionBridge.primary?[p.visionBridge.primary]:[])}</select></div>
-                <div class="fg"><label>识图模型（视觉模型链，可多选，Ctrl/Shift 勾选，按顺序回退）</label><select id="vb-vision-${escapePageHtml(p.id)}" multiple size="6" class="select-sm">${modelOptionHtml((p.visionBridge&&p.visionBridge.vision)||[])}</select></div>
+                <div class="fg"><label>主文本模型（留空 = 转发到本提供商自身模型）</label><div id="vb-primary-${escapePageHtml(p.id)}">${modelRadioHtml('vb-primary-' + escapePageHtml(p.id), (p.visionBridge&&p.visionBridge.primary)||'')}</div></div>
+                <div class="fg"><label>识图模型（视觉模型链，勾选后请求含图时按勾选顺序依次转写，全部失败按下方策略处理）</label><div id="vb-vision-${escapePageHtml(p.id)}">${modelCheckboxHtml((p.visionBridge&&p.visionBridge.vision)||[])}</div></div>
                 <div class="fg"><label>视觉转写失败策略</label><select id="vb-fail-${escapePageHtml(p.id)}" class="select-sm"><option value="error" ${!p.visionBridge||p.visionBridge.onVisionFailure==='error'?'selected':''}>error（返回错误）</option><option value="text_only" ${p.visionBridge&&p.visionBridge.onVisionFailure==='text_only'?'selected':''}>text_only（丢弃图片仅转发文本）</option></select></div>
               </fieldset>
               <div class="detail-actions"><div id="tr-${escapePageHtml(p.id)}" aria-live="polite"></div><div>${(p.id === 'opencode' || p.id === 'cline') ? '<button class="btn btn-s" onclick="fetchEditModels(\'' + p.id + '\')"><i class="fas fa-download" aria-hidden="true"></i>获取模型</button>' : ''}${p.id === 'cline' ? '<button class="btn btn-s" onclick="clineOAuthConnect(\'' + p.id + '\')"><i class="fas fa-sign-in-alt" aria-hidden="true"></i>一键授权获取 Token</button>' : ''}<button class="btn btn-d" onclick="del('${p.id}')"><i class="fas fa-trash" aria-hidden="true"></i>删除</button><button class="btn btn-p" onclick="save('${p.id}')"><i class="fas fa-save" aria-hidden="true"></i>保存更改</button></div></div>
@@ -657,30 +663,36 @@ function collectOauthNew() {
   }
 }
 
-/** 收集「新建提供商」表单的 Vision Bridge 配置；未填写 primary/vision 时返回 undefined */
+/** 收集「新建提供商」表单的 Vision Bridge 配置；未勾选识图模型时返回 undefined */
 function collectVisionBridgeNew() {
-  const vision = selectedMultipleValues('avb-vision')
+  const vision = checkedValues('avb-vision')
   if (vision.length === 0) return undefined
-  const primary = (document.getElementById('avb-primary') || {}).value || ''
+  const primary = checkedRadioValue('avb-primary')
   return { primary: primary || undefined, vision, onVisionFailure: (document.getElementById('avb-fail') || {}).value || 'error' }
 }
 
 /** 收集「编辑提供商」表单的 Vision Bridge 配置；未勾选识图模型则清除配置 */
 function collectVisionBridgeEdit(id) {
-  const vision = selectedMultipleValues('vb-vision-' + id)
+  const vision = checkedValues('vb-vision-' + id)
   if (vision.length === 0) return undefined
-  const primary = (document.getElementById('vb-primary-' + id) || {}).value || ''
+  const primary = checkedRadioValue('vb-primary-' + id)
   return { primary: primary || undefined, vision, onVisionFailure: (document.getElementById('vb-fail-' + id) || {}).value || 'error' }
 }
 
-/** 取 <select multiple> 的全部选中项 value */
-function selectedMultipleValues(id) {
-  const sel = document.getElementById(id)
+/** 取容器内全部勾选的复选框 value（识图模型链，按 DOM 顺序 = 勾选顺序） */
+function checkedValues(id) {
+  const root = document.getElementById(id)
   const out = []
-  if (sel && sel.options) {
-    for (var i = 0; i < sel.options.length; i++) if (sel.options[i].selected) out.push(sel.options[i].value)
-  }
+  if (root) root.querySelectorAll('input[type="checkbox"]:checked').forEach(function (c) { out.push(c.value) })
   return out
+}
+
+/** 取容器内选中的单选框 value（主文本模型，空 = 本提供商自身模型） */
+function checkedRadioValue(id) {
+  const root = document.getElementById(id)
+  if (!root) return ''
+  const el = root.querySelector('input[type="radio"]:checked')
+  return el ? el.value : ''
 }
 
 function collectOauthEdit(id) {
@@ -762,17 +774,18 @@ function applyVisionBridgePreset() {
   const url = document.getElementById('aurl')
   if (url) url.value = 'https://example.com/v1'
   const hint = document.getElementById('akey-hint')
-  if (hint) hint.textContent = '识图模型从下拉直接勾选（可跨厂商，多选按顺序回退）。主文本模型留空时，本提供商下所有模型自动共享识图能力；本提供商 ID 下的模型 ID 为客户端选择时的名称。'
+  if (hint) hint.textContent = '识图模型直接在下方勾选（可跨厂商，多选按顺序回退）。主文本模型留空时，本提供商下所有模型自动共享识图能力；本提供商 ID 下的模型 ID 为客户端选择时的名称。'
   var refs = (typeof VB_MODELS !== 'undefined' && VB_MODELS) || []
-  var primary = document.getElementById('avb-primary')
-  if (primary) primary.value = refs.indexOf('deepseek/deepseek-chat') !== -1 ? 'deepseek/deepseek-chat' : (refs[0] || '')
+  var want = ['qwen/qwen3-vl-flash', 'openai/gpt-4o-mini']
+  var first = 'deepseek/deepseek-chat'
+  if (refs.indexOf(first) === -1 && refs.length > 0) first = refs[0]
+  var primaryBox = document.getElementById('avb-primary')
   var vision = document.getElementById('avb-vision')
-  if (vision && vision.options) {
-    for (var i = 0; i < vision.options.length; i++) vision.options[i].selected = false
-    var want = ['qwen/qwen3-vl-flash', 'openai/gpt-4o-mini']
-    for (var j = 0; j < vision.options.length; j++) {
-      if (want.indexOf(vision.options[j].value) !== -1) vision.options[j].selected = true
-    }
+  if (primaryBox) {
+    primaryBox.querySelectorAll('input[type="radio"]').forEach(function (rb) { rb.checked = rb.value === first })
+  }
+  if (vision) {
+    vision.querySelectorAll('input[type="checkbox"]').forEach(function (cb) { cb.checked = want.indexOf(cb.value) !== -1 })
   }
 }
 function applyClineKeyHint(on) {
@@ -1420,7 +1433,7 @@ var logAutoRefreshTimer = null
 var logAutoRefreshSec = 5
 var logRefreshing = false
 var logPage = 1
-var logPageSize = 50
+var logPageSize = 5
 function persistLogAuto() {
   try { localStorage.setItem('kv-log-auto', JSON.stringify({ on: document.getElementById('log-auto-on').checked, sec: Math.max(1, parseInt(document.getElementById('log-auto-sec').value) || 5) })) } catch (e) { /* 忽略 */ }
 }
