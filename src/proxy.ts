@@ -79,6 +79,13 @@ function summarizeRequestBody(body: Record<string, unknown>): Record<string, unk
             entry.content_length = msg.content.length
           } else if (Array.isArray(msg.content)) {
             entry.content_blocks = msg.content.length
+            // 记录每个 block 的类型和文本预览，便于定位上游不支持的 block 类型
+            entry.block_types = msg.content.map((b: any) => {
+              if (!b || typeof b !== 'object') return String(b)
+              const t = b.type || 'unknown'
+              const txt = (typeof b.text === 'string' ? b.text : b.output ? String(b.output) : '').slice(0, 50)
+              return txt ? `${t}:${txt}` : t
+            })
           }
           if (Array.isArray(msg.tool_calls)) entry.tool_calls_count = msg.tool_calls.length
           if (typeof msg.tool_call_id === 'string') entry.tool_call_id = msg.tool_call_id
