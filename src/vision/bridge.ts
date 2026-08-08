@@ -16,9 +16,9 @@
  * 不放入 system 提示，避免被诱导执行越权指令（原项目同策略）。
  */
 
-import type { Env, Provider, ProxyRequestBody, VisionBridgeConfig } from '../types'
+import type { Env, OAuthTokenState, Provider, ProxyRequestBody, VisionBridgeConfig } from '../types'
 import { getProvider } from '../storage'
-import { readOauthToken } from '../oauth'
+import { buildOauthHeaders, detectTokenRealm, readOauthToken, refreshOauthToken } from '../oauth'
 
 /** 视觉转写请求超时（秒） */
 const VISION_TIMEOUT_MS = 60000
@@ -92,9 +92,11 @@ async function transcribeWithProvider(
 
   // 取上游凭据：api-key 提供商取第一个启用 Key；OAuth 提供商读 KV token
   let auth: { header: string; prefix: string; value: string } | null = null
+  let tokenState: OAuthTokenState | null = null
   if (vp.authType === 'oauth-device' && vp.oauth) {
     const token = await readOauthToken(env, parsed.providerId)
     if (token?.access_token) {
+      tokenState = token
       auth = {
         header: vp.oauth.tokenHeader || 'x-api-key',
         prefix: vp.oauth.tokenHeaderPrefix || '',
@@ -125,22 +127,68 @@ async function transcribeWithProvider(
     stream: false,
   }
 
-  const base = vp.baseUrl.replace(/\/$/, '')
-  const url = `${base}/chat/completions`
+  // 与主请求路径保持一致：OAuth 提供商走域路由 + buildOauthHeaders 完整认证头。
+  // 否则（仅发 x-api-key）WorkBuddy/腾讯上游 APISIX 会返回 401。
+  let url: string
+  let headers: Record<string, string>
+  if (vp.authType === 'oauth-device' && vp.oauth && tokenState) {
+    const cfg = vp.oauth
+    const token = tokenState.access_token
+    const realm = detectTokenRealm(token)
+    const realmBase =
+      realm === 'global' && cfg.globalBaseUrl ? cfg.globalBaseUrl : vp.baseUrl
+    const origin =
+      realm === 'global' && cfg.globalOrigin
+        ? cfg.globalOrigin
+        : (cfg.extraHeaders?.Origin)
+    url = `${realmBase.replace(/\/$/, '')}/chat/completions`
+    headers = buildOauthHeaders(cfg, token, { origin, apiType: vp.apiType, cookies: tokenState?.cookies })
+  } else {
+    const base = vp.baseUrl.replace(/\/$/, '')
+    url = `${base}/chat/completions`
+    headers = {
+      'Content-Type': 'application/json',
+      [auth!.header]: auth!.prefix + auth!.value,
+    }
+  }
 
   let resp: Response
   try {
     resp = await fetch(url, {
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        [auth.header]: auth.prefix + auth.value,
-      },
+      headers,
       body: JSON.stringify(visionBody),
       signal: AbortSignal.timeout(VISION_TIMEOUT_MS),
     })
   } catch (e) {
     return { ok: false, error: `请求异常：${e instanceof Error ? e.message : String(e)}` }
+  }
+  // OAuth 上游 401：刷新 token 后重试一次（与主路径 refreshOauthToken 逻辑对齐）
+  if (resp.status === 401 && vp.authType === 'oauth-device' && vp.oauth && tokenState?.refresh_token) {
+    const refreshed = await refreshOauthToken(env, parsed.providerId, vp.oauth)
+    if (refreshed) {
+      const fresh = await readOauthToken(env, parsed.providerId)
+      if (fresh?.access_token) {
+        const cfg = vp.oauth
+        const realm = detectTokenRealm(fresh.access_token)
+        const realmBase =
+          realm === 'global' && cfg.globalBaseUrl ? cfg.globalBaseUrl : vp.baseUrl
+        const origin =
+          realm === 'global' && cfg.globalOrigin ? cfg.globalOrigin : (cfg.extraHeaders?.Origin)
+        url = `${realmBase.replace(/\/$/, '')}/chat/completions`
+        headers = buildOauthHeaders(cfg, fresh.access_token, { origin, apiType: vp.apiType, cookies: fresh?.cookies })
+        try {
+          resp = await fetch(url, {
+            method: 'POST',
+            headers,
+            body: JSON.stringify(visionBody),
+            signal: AbortSignal.timeout(VISION_TIMEOUT_MS),
+          })
+        } catch (e) {
+          return { ok: false, error: `请求异常：${e instanceof Error ? e.message : String(e)}` }
+        }
+      }
+    }
   }
   const respText = await resp.text()
   if (!resp.ok) {
