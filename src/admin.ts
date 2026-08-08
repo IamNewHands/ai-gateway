@@ -102,6 +102,8 @@ export async function handleCreateProvider(c: Context<{ Bindings: Env }>) {
     apiType: body.apiType || 'openai',
     authType: body.authType || 'api-key',
     oauth: body.oauth,
+    type: body.type,
+    visionBridge: body.visionBridge,
     apiKeys: normalizeArray(body.apiKeys, (k) => ({ key: k, enabled: true })),
     models: body.models
       ? normalizeArray(body.models, (m) => ({ id: m, enabled: true }))
@@ -126,6 +128,8 @@ export async function handleUpdateProvider(c: Context<{ Bindings: Env }>) {
   if (body.apiType !== undefined) updates.apiType = body.apiType
   if (body.authType !== undefined) updates.authType = body.authType
   if (body.oauth !== undefined) updates.oauth = body.oauth
+  if (body.type !== undefined) updates.type = body.type
+  if (body.visionBridge !== undefined) updates.visionBridge = body.visionBridge ?? undefined
 if (body.apiKeys !== undefined) {
     updates.apiKeys = normalizeArray(body.apiKeys, (k) => ({ key: k, enabled: true }))
   }

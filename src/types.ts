@@ -22,6 +22,27 @@ export interface Provider {
   enabled: boolean
   createdAt: string
   updatedAt: string
+  /**
+   * 提供商类型扩展（可选项）：
+   * - 'vision-bridge'：图片转写桥。自身不直连上游，将含图请求的图片先交给视觉模型链
+   *   （visionBridge.vision）转写为文本，再连同原文本一起转发给主文本模型（visionBridge.primary）。
+   *   对不支持图片输入的模型开放图片能力。
+   */
+  type?: 'vision-bridge'
+  /** type === 'vision-bridge' 时的桥配置 */
+  visionBridge?: VisionBridgeConfig
+}
+
+/** Vision Bridge（图片转写桥）配置，type === 'vision-bridge' 时生效 */
+export interface VisionBridgeConfig {
+  /** 主文本模型引用（providerId/modelId），负责最终回答；无图时直接转发给它 */
+  primary: string
+  /** 视觉模型链（providerId/modelId 数组），按顺序尝试，前一个失败自动回退下一个 */
+  vision: string[]
+  /** 视觉转写全部失败时的处理策略：error（直接报错，默认） | text_only（丢弃图片仅转发文本） */
+  onVisionFailure?: 'error' | 'text_only'
+  /** 发送给视觉模型的转写提示词（可选），默认：用中文详细描述图片内容 */
+  visionPrompt?: string
 }
 
 /** OAuth 认证配置（authType === 'oauth-device' 时生效） */
@@ -137,7 +158,11 @@ export interface Session {
 
 export interface ProxyRequestBody {
   model?: string
-  messages?: Array<{ role: string; content: string }>
+  /**
+   * 消息数组。content 可能是字符串，也可能是包含 text/image_url 等类型块的数组
+   * （Vision Bridge 等图片处理会改写 messages），故放宽为宽松记录类型。
+   */
+  messages?: Array<Record<string, unknown>>
   [key: string]: unknown
 }
 
@@ -155,6 +180,8 @@ export interface CreateProviderRequest {
   apiKeys?: Array<{ key: string; enabled: boolean }>
   models?: Array<{ id: string; enabled: boolean }> | string[]
   enabled?: boolean
+  type?: 'vision-bridge'
+  visionBridge?: VisionBridgeConfig
 }
 
 export interface UpdateProviderRequest {
@@ -166,6 +193,8 @@ export interface UpdateProviderRequest {
   apiKeys?: Array<{ key: string; enabled: boolean }>
   models?: Array<{ id: string; enabled: boolean }> | string[]
   enabled?: boolean
+  type?: 'vision-bridge'
+  visionBridge?: VisionBridgeConfig | null
 }
 
 /**

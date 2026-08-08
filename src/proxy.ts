@@ -5,6 +5,7 @@ import type { Env, ProxyRequestBody } from './types'
 import { isOpenCodeProvider, proxyOpenCodeRequest, resolveOpenCodeUrls } from './opencode'
 import { isQoderProvider, proxyQoderChatRequest } from './qoder/proxy'
 import { isClineProvider, proxyClineChatRequest } from './cline/proxy'
+import { isVisionBridgeProvider, buildVisionBridgeRequestBody } from './vision/bridge'
 import { writeLog } from './admin'
 import { getOauthAccessToken, readOauthToken, refreshOauthToken, detectTokenRealm, buildOauthHeaders } from './oauth'
 import {
@@ -612,6 +613,30 @@ export async function forwardProxy(
       return response
     }
 
+    // Vision Bridge（图片转写桥）：把图片转写为文本后转发给主文本模型，
+    // 让不支持图片输入的模型具备图片理解能力。见 src/vision/bridge.ts。
+    if (isVisionBridgeProvider(provider)) {
+      const vbResult = await buildVisionBridgeRequestBody(c.env, provider, forwardBody as ProxyRequestBody)
+      if (!vbResult.ok || !vbResult.body) {
+        return c.json({
+          error: { message: vbResult.error || 'Vision Bridge 配置错误', type: 'invalid_request_error' },
+        }, 422)
+      }
+      const logLevel = 'request'
+      try {
+        const hasImage = (Array.isArray(vbResult.body.messages) && (vbResult.body.messages as Array<{ content?: unknown }>).some(
+          (m) => Array.isArray(m.content) && (m.content as Array<Record<string, unknown>>).some((p) => p?.type === 'image_url')
+        ))
+        c.executionCtx.waitUntil(writeLog(c.env, logLevel,
+          `[vision-bridge] ${model} ${hasImage ? '含图' : '纯文本'} → primary ${vbResult.body.model}`,
+          JSON.stringify({ model, primary: vbResult.body.model }).substring(0, 4000)
+        ))
+      } catch { /* log failure must not break */ }
+      // 递归转发：vbResult.body.model 已是 primary 的 providerId/modelId 引用，
+      // 走通用转发逻辑（Key 健康轮询 / OAuth / 特殊提供商均被复用）
+      return await forwardProxy(c, vbResult.body as ProxyRequestBody, method)
+    }
+
     // OAuth 设备码提供商：使用 KV 中保存的 access_token 转发，401 时尝试刷新后重试
     if (provider.authType === 'oauth-device' && provider.oauth) {
       return await proxyOAuthRequest(c, provider, subPath, url.search, forwardBody, method)
@@ -1008,6 +1033,11 @@ export async function handleAnthropicMessages(c: Context<{ Bindings: Env }>) {
     // Cline：refreshToken 换 token 转发（OpenAI 格式），再转回 Anthropic SSE。
     if (isClineProvider(provider.id)) {
       return await handleAnthropicCline(c, provider, model, openaiBody, originalStream)
+    }
+
+    // Vision Bridge：图片转写后转发给主文本模型（OpenAI 格式），再转回 Anthropic 格式。
+    if (isVisionBridgeProvider(provider)) {
+      return await handleAnthropicVisionBridge(c, provider, model, openaiBody, originalStream)
     }
 
     // OAuth 提供商走 OAuth 代理路径
@@ -1508,6 +1538,142 @@ async function handleAnthropicQoder(
 }
 
 /**
+ * Anthropic 入口的 Vision Bridge 分支：
+ * 图片转写 → 替换图片块 → 递归 forwardProxy 发给 primary（OpenAI 格式）→
+ * 将 primary 的 OpenAI 响应转回 Anthropic 格式（流式 / 非流式）。
+ */
+async function handleAnthropicVisionBridge(
+  c: Context<{ Bindings: Env }>,
+  provider: import('./types').Provider,
+  model: string,
+  openaiBody: Record<string, unknown>,
+  originalStream: boolean
+): Promise<Response> {
+  // 1. 图片转写（含无图直通 primary），model 已被替换为 primary 的 providerId/modelId 引用
+  const vbResult = await buildVisionBridgeRequestBody(c.env, provider, openaiBody as ProxyRequestBody)
+  if (!vbResult.ok || !vbResult.body) {
+    return c.json({
+      type: 'error',
+      error: { type: 'invalid_request_error', message: vbResult.error || 'Vision Bridge 配置错误' },
+    }, 422)
+  }
+
+  // 2. 递归转发到 primary（强制流式，由 Anthropic 格式决定最终转换）
+  const upstreamBody: Record<string, unknown> = { ...(vbResult.body as Record<string, unknown>), stream: true }
+  sanitizeUpstreamBody(upstreamBody)
+  sanitizeBlockedTemplates(upstreamBody)
+  if (upstreamBody['max_completion_tokens'] !== undefined && upstreamBody['max_tokens'] === undefined) {
+    upstreamBody['max_tokens'] = upstreamBody['max_completion_tokens']
+    delete upstreamBody['max_completion_tokens']
+  }
+
+  const response = await forwardProxy(c, upstreamBody as ProxyRequestBody, 'POST')
+
+  if (!response.ok) {
+    const errText = await response.text().catch(() => '')
+    try {
+      c.executionCtx.waitUntil(writeLog(c.env, 'error', `[anthropic] ${model} → ${response.status} VisionBridge`, JSON.stringify({ error: errText, model, primary: upstreamBody['model'] }).substring(0, 4000)))
+    } catch { /* log failure must not break request */ }
+    return c.json({
+      type: 'error',
+      error: { type: 'upstream_error', message: `Upstream error: ${errText}` },
+    }, response.status as Parameters<typeof c.json>[1])
+  }
+
+  try { c.executionCtx.waitUntil(writeLog(c.env, 'request', `[anthropic] ${model} → 200 VisionBridge primary=${upstreamBody['model']}`, `stream=${originalStream}`)) } catch {}
+
+  if (!response.body) {
+    return c.json({ type: 'error', error: { type: 'upstream_error', message: 'Upstream returned empty body' } }, 502)
+  }
+
+  // 流式：OpenAI SSE → Anthropic SSE 实时转换
+  if (originalStream) {
+    const acc = createAnthropicSSEAccumulator()
+    const readable = new ReadableStream({
+      async start(controller) {
+        const decoder = new TextDecoderStream()
+        const textReader = response.body!.pipeThrough(decoder).getReader()
+        let lineBuffer = ''
+        try {
+          while (true) {
+            const { done, value } = await textReader.read()
+            if (done) break
+            const combined = lineBuffer + value
+            const lines = combined.split('\n')
+            lineBuffer = lines.pop() || ''
+            for (const line of lines) {
+              const trimmed = line.trim()
+              if (!trimmed.startsWith('data:')) continue
+              const data = trimmed.slice(5).trim()
+              if (!data || data === '[DONE]') continue
+              try {
+                const chunk = JSON.parse(data)
+                cleanChunkDelta(chunk)
+                const anthropicSSE = openAIChunkToAnthropicSSE(chunk, acc)
+                if (anthropicSSE) controller.enqueue(new TextEncoder().encode(anthropicSSE))
+              } catch { /* skip malformed */ }
+            }
+          }
+          if (lineBuffer.trim().startsWith('data:')) {
+            const data = lineBuffer.trim().slice(5).trim()
+            if (data && data !== '[DONE]') {
+              try {
+                const chunk = JSON.parse(data)
+                cleanChunkDelta(chunk)
+                const anthropicSSE = openAIChunkToAnthropicSSE(chunk, acc)
+                if (anthropicSSE) controller.enqueue(new TextEncoder().encode(anthropicSSE))
+              } catch { /* skip */ }
+            }
+          }
+        } catch { /* stream error */ }
+        const finalized = finalizeAnthropicStream(acc)
+        if (finalized) {
+          try { controller.enqueue(new TextEncoder().encode(finalized)) } catch { /* enqueue failed */ }
+        }
+        controller.close()
+      },
+    })
+    return new Response(readable, {
+      status: 200,
+      headers: {
+        'Content-Type': 'text/event-stream',
+        'Cache-Control': 'no-store',
+        'X-Accel-Buffering': 'no',
+      },
+    })
+  }
+
+  // 非流式：聚合所有 OpenAI SSE → Anthropic
+  const allChunks: any[] = []
+  const decoder2 = new TextDecoderStream()
+  const textReader2 = response.body.pipeThrough(decoder2).getReader()
+  let lineBuffer2 = ''
+  try {
+    while (true) {
+      const { done, value } = await textReader2.read()
+      if (done) break
+      const combined = lineBuffer2 + value
+      const lines = combined.split('\n')
+      lineBuffer2 = lines.pop() || ''
+      for (const line of lines) {
+        const trimmed = line.trim()
+        if (!trimmed.startsWith('data:')) continue
+        const data = trimmed.slice(5).trim()
+        if (!data || data === '[DONE]') continue
+        try {
+          const chunk = JSON.parse(data)
+          cleanChunkDelta(chunk)
+          allChunks.push(chunk)
+        } catch { /* skip */ }
+      }
+    }
+  } catch { /* stream error */ }
+
+  const anthropicResp = aggregateOpenAIToAnthropic(allChunks)
+  return c.json(anthropicResp)
+}
+
+/**
  * Cline Anthropic 格式转发：OpenAI 请求体 → Cline 上游转发（proxyClineChatRequest
  * 已把嵌套 SSE 解成 OpenAI SSE）→ 再转回 Anthropic SSE。转换逻辑与 qoder 分支一致。
  */
@@ -1706,6 +1872,11 @@ export async function handleResponses(c: Context<{ Bindings: Env }>) {
     openaiBody['model'] = modelId
 
     const originalStream = responsesReq.stream === true
+
+    // Vision Bridge：图片转写后转发给主文本模型（OpenAI 格式），再转回 Responses 格式。
+    if (isVisionBridgeProvider(provider)) {
+      return await handleResponsesVisionBridge(c, provider, model, openaiBody, originalStream)
+    }
 
     // OAuth 提供商
     if (provider.authType === 'oauth-device' && provider.oauth) {
@@ -2020,6 +2191,140 @@ export async function handleResponses(c: Context<{ Bindings: Env }>) {
     console.error('[responses] error:', err)
     return c.json({ error: { message: 'Internal server error', type: 'server_error' } }, 500)
   }
+}
+
+/**
+ * Responses 入口的 Vision Bridge 分支：
+ * 图片转写 → 替换图片块 → 递归 forwardProxy 发给 primary（OpenAI 格式）→
+ * 将 primary 的 OpenAI 响应转回 Responses 格式（流式 / 非流式）。
+ */
+async function handleResponsesVisionBridge(
+  c: Context<{ Bindings: Env }>,
+  provider: import('./types').Provider,
+  model: string,
+  openaiBody: Record<string, unknown>,
+  originalStream: boolean
+): Promise<Response> {
+  // 1. 图片转写（含无图直通 primary），model 已被替换为 primary 的 providerId/modelId 引用
+  const vbResult = await buildVisionBridgeRequestBody(c.env, provider, openaiBody as ProxyRequestBody)
+  if (!vbResult.ok || !vbResult.body) {
+    return c.json({
+      error: { message: vbResult.error || 'Vision Bridge 配置错误', type: 'invalid_request_error' },
+    }, 422)
+  }
+
+  // 2. 递归转发到 primary（强制流式，由 Responses 格式决定最终转换）
+  const upstreamBody: Record<string, unknown> = { ...(vbResult.body as Record<string, unknown>), stream: true }
+  sanitizeUpstreamBody(upstreamBody)
+  sanitizeBlockedTemplates(upstreamBody)
+
+  const response = await forwardProxy(c, upstreamBody as ProxyRequestBody, 'POST')
+
+  if (!response.ok) {
+    const errText = await response.text().catch(() => '')
+    try {
+      c.executionCtx.waitUntil(writeLog(c.env, 'error', `[responses] ${model} → ${response.status} VisionBridge`, JSON.stringify({ error: errText, model, primary: upstreamBody['model'] }).substring(0, 4000)))
+    } catch { /* log failure must not break request */ }
+    return c.json({
+      error: { message: `Upstream error: ${errText}`, type: 'upstream_error' },
+    }, response.status as Parameters<typeof c.json>[1])
+  }
+
+  try { c.executionCtx.waitUntil(writeLog(c.env, 'request', `[responses] ${model} → 200 VisionBridge primary=${upstreamBody['model']}`, `stream=${originalStream}`)) } catch {}
+
+  if (!response.body) {
+    return c.json({ error: { message: 'Upstream returned empty body', type: 'upstream_error' } }, 502)
+  }
+
+  // 流式：OpenAI SSE → Responses SSE 实时转换
+  if (originalStream) {
+    const acc = {
+      responseId: '',
+      model: '',
+      itemId: null as string | null,
+      textContent: '',
+      toolCalls: new Map<number, { id: string; name: string; args: string }>(),
+      inputTokens: 0,
+      outputTokens: 0,
+      hasStarted: false,
+      completed: false,
+    }
+
+    const readable = new ReadableStream({
+      async start(controller) {
+        const decoder = new TextDecoderStream()
+        const textReader = response.body!.pipeThrough(decoder).getReader()
+        let lineBuffer = ''
+        try {
+          while (true) {
+            const { done, value } = await textReader.read()
+            if (done) break
+            const combined = lineBuffer + value
+            const lines = combined.split('\n')
+            lineBuffer = lines.pop() || ''
+            for (const line of lines) {
+              const trimmed = line.trim()
+              if (!trimmed.startsWith('data:')) continue
+              const data = trimmed.slice(5).trim()
+              if (!data || data === '[DONE]') continue
+              try {
+                const chunk = JSON.parse(data)
+                cleanChunkDelta(chunk)
+                const responsesSSE = openAIChunkToResponsesSSE(chunk, acc)
+                if (responsesSSE) controller.enqueue(new TextEncoder().encode(responsesSSE))
+              } catch { /* skip */ }
+            }
+          }
+        } catch { /* stream error */ }
+        if (!acc.completed) {
+          try {
+            controller.enqueue(new TextEncoder().encode(
+              `event: response.completed\ndata: ${JSON.stringify({ type: 'response.completed', response: { id: acc.responseId || 'resp_unknown', output: [] } })}\n\n`
+            ))
+          } catch { /* enqueue failed */ }
+        }
+        controller.close()
+      },
+    })
+
+    return new Response(readable, {
+      status: 200,
+      headers: {
+        'Content-Type': 'text/event-stream',
+        'Cache-Control': 'no-store',
+        'X-Accel-Buffering': 'no',
+      },
+    })
+  }
+
+  // 非流式：聚合所有 OpenAI SSE → Responses
+  const allChunks: any[] = []
+  const decoder2 = new TextDecoderStream()
+  const textReader2 = response.body.pipeThrough(decoder2).getReader()
+  let lineBuffer2 = ''
+  try {
+    while (true) {
+      const { done, value } = await textReader2.read()
+      if (done) break
+      const combined = lineBuffer2 + value
+      const lines = combined.split('\n')
+      lineBuffer2 = lines.pop() || ''
+      for (const line of lines) {
+        const trimmed = line.trim()
+        if (!trimmed.startsWith('data:')) continue
+        const data = trimmed.slice(5).trim()
+        if (!data || data === '[DONE]') continue
+        try {
+          const chunk = JSON.parse(data)
+          cleanChunkDelta(chunk)
+          allChunks.push(chunk)
+        } catch { /* skip */ }
+      }
+    }
+  } catch { /* stream error */ }
+
+  const openaiResp = aggregateOpenAIToResponses(allChunks)
+  return c.json(openaiResp)
 }
 
 /**

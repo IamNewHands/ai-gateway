@@ -319,7 +319,7 @@ ${H('管理')}
               <div class="fg"><label for="anm">名称</label><input type="text" id="anm" placeholder="DeepSeek"></div>
               <div class="fg"><label for="aid">提供商 ID</label><input type="text" id="aid" placeholder="deepseek"><span class="form-helper">用于模型前缀，创建后不可修改。</span></div>
             </div>
-            <div class="fg"><label for="apreset">厂商预设</label><select id="apreset" class="select-sm" onchange="applyProviderPreset(this.value)"><option value="">— 自定义 —</option><option value="deepseek">DeepSeek</option><option value="openai">OpenAI</option><option value="anthropic">Anthropic (Claude)</option><option value="zhipu">智谱 AI (GLM)</option><option value="qwen">通义千问 (DashScope)</option><option value="moonshot">月之暗面 (Kimi)</option><option value="baichuan">百川</option><option value="lingyi">零一万物 (Yi)</option><option value="stepfun">阶跃星辰 (StepFun)</option><option value="siliconflow">硅基流动 (SiliconFlow)</option><option value="volcengine">火山方舟 (豆包)</option><option value="qianfan">百度千帆 (文心)</option><option value="openrouter">OpenRouter</option><option value="together">Together AI</option><option value="groq">Groq</option><option value="deepinfra">DeepInfra</option><option value="mistral">Mistral AI</option><option value="xai">xAI (Grok)</option><option value="workbuddy">WorkBuddy (OAuth 登录)</option><option value="qoder">QoderWork (OAuth 登录)</option><option value="cline">Cline (白嫖模型)</option></select><span class="form-helper">选择后自动填充名称/地址/格式，只需填 API Key 即可测试。</span></div>
+            <div class="fg"><label for="apreset">厂商预设</label><select id="apreset" class="select-sm" onchange="applyProviderPreset(this.value)"><option value="">— 自定义 —</option><option value="deepseek">DeepSeek</option><option value="openai">OpenAI</option><option value="anthropic">Anthropic (Claude)</option><option value="zhipu">智谱 AI (GLM)</option><option value="qwen">通义千问 (DashScope)</option><option value="moonshot">月之暗面 (Kimi)</option><option value="baichuan">百川</option><option value="lingyi">零一万物 (Yi)</option><option value="stepfun">阶跃星辰 (StepFun)</option><option value="siliconflow">硅基流动 (SiliconFlow)</option><option value="volcengine">火山方舟 (豆包)</option><option value="qianfan">百度千帆 (文心)</option><option value="openrouter">OpenRouter</option><option value="together">Together AI</option><option value="groq">Groq</option><option value="deepinfra">DeepInfra</option><option value="mistral">Mistral AI</option><option value="xai">xAI (Grok)</option><option value="workbuddy">WorkBuddy (OAuth 登录)</option><option value="qoder">QoderWork (OAuth 登录)</option><option value="cline">Cline (白嫖模型)</option><option value="visionbridge">Vision Bridge (图片转写桥)</option></select><span class="form-helper">选择后自动填充名称/地址/格式，只需填 API Key 即可测试。</span></div>
             <div class="fg"><label for="aurl">API 地址</label><input type="url" id="aurl" placeholder="https://api.deepseek.com"></div>
             <div class="fg"><label for="afmt">API 格式</label><select id="afmt" class="select-sm"><option value="openai">OpenAI 兼容</option><option value="anthropic">Anthropic 兼容</option></select></div>
             <div class="fg"><label for="aat">认证方式</label><select id="aat" class="select-sm" onchange="toggleAuthType()"><option value="api-key">API Key</option><option value="oauth-device">OAuth 设备码登录</option></select></div>
@@ -345,6 +345,11 @@ ${H('管理')}
             </div>
             <fieldset class="form-group" id="akeys-fs"><legend id="akey-legend">上游 API Keys</legend><div id="akeys"><div class="fc mb-4 field-row"><input type="password" placeholder="sk-xxx" class="fx1 aki" aria-label="上游 API Key"><label class="tg" title="启用 Key"><input type="checkbox" checked class="ake" aria-label="启用 Key"><span class="sl"></span></label><button class="btn btn-gh btn-xs" onclick="testNewAKey(this)" title="测试 Key"><i class="fas fa-plug" aria-hidden="true"></i><span>测试</span></button><button class="icon-btn" onclick="this.parentElement.remove()" aria-label="移除 Key"><i class="fas fa-times" aria-hidden="true"></i></button></div></div><button class="btn btn-s btn-xs" onclick="addAKeyRow()"><i class="fas fa-plus" aria-hidden="true"></i>添加 Key</button><span id="akey-hint" class="form-helper"></span></fieldset>
             <fieldset class="form-group" id="amodels-fs"><legend>模型 ID</legend><div id="amodels"><div class="fc mb-4 field-row"><input type="text" placeholder="deepseek-chat" class="fx1 ami" aria-label="模型 ID"><label class="tg" title="启用模型"><input type="checkbox" checked class="ame" aria-label="启用模型"><span class="sl"></span></label><button class="btn btn-gh btn-xs" onclick="testNewMdl(this)" title="测试模型"><i class="fas fa-plug" aria-hidden="true"></i><span>测试</span></button><button class="icon-btn" onclick="this.parentElement.remove()" aria-label="移除模型"><i class="fas fa-times" aria-hidden="true"></i></button></div></div><button class="btn btn-s btn-xs" onclick="addMdlRow()"><i class="fas fa-plus" aria-hidden="true"></i>添加模型</button></fieldset>
+            <fieldset class="form-group" id="avb-fs"><legend>Vision Bridge 配置（可选）</legend><span class="form-helper">让不支持图片输入的模型支持图片：客户端请求此提供商的任何模型时，若消息含图，先由下方视觉模型链转写为文本，再连同原文本发送给主文本模型。填写后该提供商即为图片转写桥，无需真实上游地址。</span>
+              <div class="fg"><label>主文本模型（primary，providerId/modelId）</label><input type="text" id="avb-primary" placeholder="deepseek/deepseek-chat"></div>
+              <div class="fg"><label>视觉模型链（vision，每行一个 providerId/modelId，按顺序回退）</label><textarea id="avb-vision" rows="3" placeholder="qwen/qwen3-vl-flash&#10;openai/gpt-4o-mini"></textarea></div>
+              <div class="fg"><label>视觉转写失败策略</label><select id="avb-fail" class="select-sm"><option value="error">error（返回错误）</option><option value="text_only">text_only（丢弃图片仅转发文本）</option></select></div>
+            </fieldset>
             <div class="panel-actions"><label class="switch-label"><span>创建后立即启用</span><span class="tg"><input type="checkbox" checked id="aen"><span class="sl"></span></span></label><div><button class="btn btn-s" onclick="hideAdd()">取消</button><button class="btn btn-p" onclick="createProv()"><i class="fas fa-check" aria-hidden="true"></i>创建提供商</button></div></div>
             <div id="atestR" class="mt-1" aria-live="polite"></div>
           </div>
@@ -385,6 +390,11 @@ ${H('管理')}
               </div>
               <fieldset class="form-group ${p.authType==='oauth-device'?'hd':''}" id="keys-fs-${escapePageHtml(p.id)}"><legend id="key-legend-${escapePageHtml(p.id)}">${p.id==='cline'?'Cline RefreshTokens（每个账号一行）':'上游 API Keys'}</legend><div id="keys-${escapePageHtml(p.id)}">${p.apiKeys.map((k, ki)=>`<div class="fc mb-3 field-row" data-kidx="${ki}"><input type="password" value="${escapePageHtml(k.key)}" class="fx1" id="k-${escapePageHtml(p.id)}-${ki}" placeholder="API Key" aria-label="API Key"><label class="tg"><input type="checkbox" ${k.enabled?'checked':''} id="ken-${escapePageHtml(p.id)}-${ki}" aria-label="启用 Key"><span class="sl"></span></label><button class="btn btn-gh btn-xs" onclick="testKeyRow('${p.id}',${ki})" title="测试 Key"><i class="fas fa-plug" aria-hidden="true"></i><span>测试</span></button><button class="icon-btn" onclick="rmKeyRow('${p.id}',${ki})" aria-label="移除 Key"><i class="fas fa-times" aria-hidden="true"></i></button></div>`).join('')}</div><div class="fc mt-1 field-row"><input type="password" id="nk-${escapePageHtml(p.id)}" placeholder="${p.id==='cline'?'新的 RefreshToken（一个账号一行）':'新的 API Key'}" class="fx1"><button class="btn btn-s btn-xs" onclick="addKeyRow('${p.id}')"><i class="fas fa-plus" aria-hidden="true"></i>添加</button></div><span id="key-hint-${escapePageHtml(p.id)}" class="form-helper">${p.id==='cline'?'Cline 使用 Cline 账号的 refreshToken（长期钥匙）。每个账号一行，额度用完自动切换；留空禁用某个账号。':' '}</span></fieldset>
               <fieldset class="form-group" id="models-fs-${escapePageHtml(p.id)}"><legend>模型</legend><div id="ml-${escapePageHtml(p.id)}">${p.models.map((m,mi)=>`<div class="fc mb-3 field-row" data-idx="${mi}"><input type="text" value="${escapePageHtml(m.id)}" class="fx1" id="mid-${escapePageHtml(p.id)}-${mi}" placeholder="模型 ID"><label class="tg"><input type="checkbox" ${m.enabled?'checked':''} id="men-${escapePageHtml(p.id)}-${mi}" aria-label="启用模型"><span class="sl"></span></label><button class="btn btn-gh btn-xs" onclick="testMdl('${p.id}','${m.id}',${mi})" title="测试模型"><i class="fas fa-plug" aria-hidden="true"></i><span>测试</span></button><button class="icon-btn" onclick="rmMdl('${p.id}',${mi})" aria-label="移除模型"><i class="fas fa-times" aria-hidden="true"></i></button></div>`).join('')}</div><div class="fc mt-1 field-row"><input type="text" id="nmid-${escapePageHtml(p.id)}" placeholder="新的模型 ID" class="fx1"><button class="btn btn-s btn-xs" onclick="addMdl('${p.id}')"><i class="fas fa-plus" aria-hidden="true"></i>添加</button></div></fieldset>
+              <fieldset class="form-group"><legend>Vision Bridge 配置（可选）</legend><span class="form-helper">让该提供商的（纯文本）模型支持图片：请求含图时先由视觉模型链转写为文本再发给主文本模型。填写后此提供商即为图片转写桥；清空 primary 则恢复普通提供商。</span>
+                <div class="fg"><label>主文本模型（primary，providerId/modelId）</label><input type="text" id="vb-primary-${escapePageHtml(p.id)}" value="${escapePageHtml((p.visionBridge&&p.visionBridge.primary)||'')}" placeholder="deepseek/deepseek-chat"></div>
+                <div class="fg"><label>视觉模型链（vision，每行一个 providerId/modelId，按顺序回退）</label><textarea id="vb-vision-${escapePageHtml(p.id)}" rows="3" placeholder="qwen/qwen3-vl-flash&#10;openai/gpt-4o-mini">${escapePageHtml((p.visionBridge&&p.visionBridge.vision&&p.visionBridge.vision.join('\n'))||'')}</textarea></div>
+                <div class="fg"><label>视觉转写失败策略</label><select id="vb-fail-${escapePageHtml(p.id)}" class="select-sm"><option value="error" ${!p.visionBridge||p.visionBridge.onVisionFailure==='error'?'selected':''}>error（返回错误）</option><option value="text_only" ${p.visionBridge&&p.visionBridge.onVisionFailure==='text_only'?'selected':''}>text_only（丢弃图片仅转发文本）</option></select></div>
+              </fieldset>
               <div class="detail-actions"><div id="tr-${escapePageHtml(p.id)}" aria-live="polite"></div><div>${(p.id === 'opencode' || p.id === 'cline') ? '<button class="btn btn-s" onclick="fetchEditModels(\'' + p.id + '\')"><i class="fas fa-download" aria-hidden="true"></i>获取模型</button>' : ''}${p.id === 'cline' ? '<button class="btn btn-s" onclick="clineOAuthConnect(\'' + p.id + '\')"><i class="fas fa-sign-in-alt" aria-hidden="true"></i>一键授权获取 Token</button>' : ''}<button class="btn btn-d" onclick="del('${p.id}')"><i class="fas fa-trash" aria-hidden="true"></i>删除</button><button class="btn btn-p" onclick="save('${p.id}')"><i class="fas fa-save" aria-hidden="true"></i>保存更改</button></div></div>
             </div>
           </article>`).join('') : `<div class="empty-state"><i class="fas fa-server" aria-hidden="true"></i><h3>还没有提供商</h3><p>添加第一个上游提供商，配置 API 地址、Key 和模型。</p><button class="btn btn-p" onclick="showAdd()">添加提供商</button></div>`}
@@ -599,10 +609,12 @@ async function createProv(opts) {
       toast('OAuth 模式下请填写完整的配置（三个端点' + (needsClientId ? ' + Client ID' : '') + '）', 'error'); return
     }
   }
+  // Vision Bridge：填写了 primary + vision 即按图片转写桥保存
+  const vb = collectVisionBridgeNew()
   const r = await fetch('/admin/api/providers', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ id, name: nm, baseUrl: url, apiType, authType, oauth: authType === 'oauth-device' ? oauth : undefined, apiKeys: keys, models, enabled })
+    body: JSON.stringify({ id, name: nm, baseUrl: url, apiType, authType, oauth: authType === 'oauth-device' ? oauth : undefined, apiKeys: keys, models, enabled, type: vb ? 'vision-bridge' : undefined, visionBridge: vb })
   })
   const d = await r.json()
   if (d.success) {
@@ -634,6 +646,24 @@ function collectOauthNew() {
     globalModelsUrl: g('ao12') || undefined,
     globalOrigin: g('ao13') || undefined,
   }
+}
+
+/** 收集「新建提供商」表单的 Vision Bridge 配置；未填写 primary/vision 时返回 undefined */
+function collectVisionBridgeNew() {
+  const primary = (document.getElementById('avb-primary') || {}).value?.trim() || ''
+  const vision = (document.getElementById('avb-vision') || {}).value
+    .split('\n').map(function(s) { return s.trim() }).filter(Boolean)
+  if (!primary || vision.length === 0) return undefined
+  return { primary, vision, onVisionFailure: (document.getElementById('avb-fail') || {}).value || 'error' }
+}
+
+/** 收集「编辑提供商」表单的 Vision Bridge 配置；清空 primary 则清除桥配置 */
+function collectVisionBridgeEdit(id) {
+  const primary = (document.getElementById('vb-primary-' + id) || {}).value?.trim() || ''
+  const vision = (document.getElementById('vb-vision-' + id) || {}).value
+    .split('\n').map(function(s) { return s.trim() }).filter(Boolean)
+  if (!primary || vision.length === 0) return undefined
+  return { primary, vision, onVisionFailure: (document.getElementById('vb-fail-' + id) || {}).value || 'error' }
 }
 
 function collectOauthEdit(id) {
@@ -682,6 +712,7 @@ const PROVIDER_PRESETS = {
   cline:        { name: 'Cline (白嫖模型)',    id: 'cline',        baseUrl: 'https://api.cline.bot/api/v1',                      apiType: 'openai',
     models: ['poolside/laguna-s-2.1:free', 'deepseek/deepseek-v4-flash', 'cline-free/glm-5.2', 'cline-pass/glm-5.2', 'cline-pass/deepseek-v4-flash', 'cline-pass/qwen3.7-max'],
   },
+  visionbridge: { name: 'Vision Bridge (图片转写桥)', id: 'visionbridge', baseUrl: 'https://example.com/v1', apiType: 'openai' },
 }
 function applyProviderPreset(name) {
   const p = PROVIDER_PRESETS[name]
@@ -702,9 +733,21 @@ function applyProviderPreset(name) {
   if (p.id === 'cline') {
     applyClineKeyHint(true)
     if (p.models && p.models.length) fillPresetModels(p.models)
+  } else if (p.id === 'visionbridge') {
+    applyVisionBridgePreset()
   } else {
     applyClineKeyHint(false)
   }
+}
+function applyVisionBridgePreset() {
+  applyClineKeyHint(false)
+  document.getElementById('avb-primary').value = 'deepseek/deepseek-chat'
+  document.getElementById('avb-vision').value = 'qwen/qwen3-vl-flash\nopenai/gpt-4o-mini'
+  document.getElementById('avb-fail').value = 'error'
+  const url = document.getElementById('aurl')
+  if (url) url.value = 'https://example.com/v1'
+  const hint = document.getElementById('akey-hint')
+  if (hint) hint.textContent = '图片转写桥无需真实上游地址与 API Key：primary / vision 引用网关内已有提供商（providerId/modelId，每行一个）即可；本提供商下填的模型 ID 为客户端选择时的名称。'
 }
 function applyClineKeyHint(on) {
   const hint = document.getElementById('akey-hint')
@@ -1121,7 +1164,7 @@ async function save(id) {
   const r = await fetch('/admin/api/providers/' + encodeURIComponent(id), {
     method: 'PUT',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ name: nm, baseUrl: url, apiType, authType, oauth: authType === 'oauth-device' ? oauth : undefined, apiKeys: keys, models, enabled })
+    body: JSON.stringify({ name: nm, baseUrl: url, apiType, authType, oauth: authType === 'oauth-device' ? oauth : undefined, apiKeys: keys, models, enabled, type: collectVisionBridgeEdit(id) ? 'vision-bridge' : undefined, visionBridge: collectVisionBridgeEdit(id) })
   })
   const d = await r.json()
   if (d.success) { toast('已保存', 'success'); location.reload() }
