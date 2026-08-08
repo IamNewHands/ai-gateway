@@ -124,7 +124,9 @@ async function transcribeWithProvider(
     ],
     temperature: 0.2,
     max_tokens: 2048,
-    stream: false,
+    // WorkBuddy 上游只支持流式请求（非流式返回 400 code 11101），
+    // 需发 stream:true 再收集 SSE 文本；其余提供商可直接非流式。
+    stream: vp.authType === 'oauth-device' && vp.oauth && vp.id.startsWith('workbuddy'),
   }
 
   // 与主请求路径保持一致：OAuth 提供商走域路由 + buildOauthHeaders 完整认证头。
@@ -195,11 +197,29 @@ async function transcribeWithProvider(
     return { ok: false, error: `HTTP ${resp.status}${respText ? ' ' + respText.slice(0, 300) : ''}` }
   }
   let text: string | null = null
-  try {
-    const data = JSON.parse(respText) as { choices?: Array<{ message?: { content?: string } }> }
-    text = data.choices?.[0]?.message?.content ?? null
-  } catch {
-    text = null
+  const isWorkbuddySse = vp.authType === 'oauth-device' && vp.oauth && vp.id.startsWith('workbuddy')
+  if (isWorkbuddySse) {
+    // WorkBuddy 流式响应：逐行解析 data: 块，累加 choices[].delta.content
+    let acc = ''
+    for (const line of respText.split('\n')) {
+      let data = line.trim()
+      if (!data) continue
+      if (data.startsWith('data:')) data = data.slice(5).trim()
+      if (!data || data === '[DONE]') continue
+      try {
+        const chunk = JSON.parse(data) as { choices?: Array<{ delta?: { content?: string } }> }
+        const c = chunk.choices?.[0]?.delta?.content
+        if (typeof c === 'string') acc += c
+      } catch { /* ignore */ }
+    }
+    text = acc || null
+  } else {
+    try {
+      const data = JSON.parse(respText) as { choices?: Array<{ message?: { content?: string } }> }
+      text = data.choices?.[0]?.message?.content ?? null
+    } catch {
+      text = null
+    }
   }
   if (!text || !text.trim()) return { ok: false, error: '返回内容为空（模型可能不支持图片输入）' }
   return { ok: true, text: text.trim() }
