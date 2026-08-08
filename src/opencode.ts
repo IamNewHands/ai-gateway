@@ -14,6 +14,14 @@ const OPENCODE_STREAM_IDLE_TIMEOUT_MS = 240000
 const OPENCODE_KEEPALIVE_MS = 15000
 // GET（模型列表/连通性测试）保持整体超时，数据量小无需放宽
 const OPENCODE_GET_TIMEOUT_MS = 20000
+// 429 限流重试：FreeUsageLimitError 多为短时限流（用户手动重发即恢复），
+// 碰到 429 时对同一 key 短暂等待后重试若干次，避免直接返回失败。
+const OPENCODE_RATE_LIMIT_RETRIES = 2
+const OPENCODE_RATE_LIMIT_RETRY_BASE_MS = 1200
+// 不同 key 之间 429 切换前的最小等待（避免并发触发同一限流窗口）
+const OPENCODE_RATE_LIMIT_KEY_GAP_MS = 800
+
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms))
 
 interface OpenCodeRequestOptions {
   baseUrl: string
@@ -260,7 +268,34 @@ export async function proxyOpenCodeRequest(options: OpenCodeRequestOptions): Pro
       if (response.ok) return response
 
       officialFailure = await storeFailure(response)
-      if (response.status !== 401 && response.status !== 403 && response.status !== 429) break
+      // 429 短时限流：对同一 key 短暂等待后重试，几次后仍失败再切换下一个 key
+      if (response.status === 429) {
+        let lastStatus = 429
+        for (let i = 1; i <= OPENCODE_RATE_LIMIT_RETRIES; i++) {
+          await sleep(OPENCODE_RATE_LIMIT_RETRY_BASE_MS * i)
+          const retry = await requestUpstream(
+            fetcher,
+            officialUrl,
+            entry.key,
+            options,
+            requestId,
+            sessionId
+          )
+          if (retry.ok) return retry
+          officialFailure = await storeFailure(retry)
+          lastStatus = retry.status
+          if (retry.status !== 429) break
+        }
+        // 重试后仍 429：等待后再尝试下一个 key（或镜像）
+        if (lastStatus === 429) {
+          await sleep(OPENCODE_RATE_LIMIT_KEY_GAP_MS)
+          continue
+        }
+        // 重试返回了其他错误：按该错误决定是否继续尝试下一个 key
+        if (lastStatus !== 401 && lastStatus !== 403) break
+        continue
+      }
+      if (response.status !== 401 && response.status !== 403) break
     } catch (error) {
       lastTransportError = error
       break
