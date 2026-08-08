@@ -744,7 +744,7 @@ const PROVIDER_PRESETS = {
   workbuddy:    { name: 'WorkBuddy (OAuth)',  id: 'workbuddy',    baseUrl: 'https://copilot.tencent.com/v2',                    apiType: 'openai', authType: 'oauth-device', oauthPreset: 'workbuddy' },
   qoder:        { name: 'QoderWork (OAuth)',  id: 'qoder',        baseUrl: 'https://gateway.qoder.com.cn',                      apiType: 'openai', authType: 'oauth-device', oauthPreset: 'qoder' },
   gemini:       { name: 'Gemini CLI (OAuth)', id: 'gemini',       baseUrl: 'https://cloudcode-pa.googleapis.com',               apiType: 'openai', authType: 'oauth-device', oauthPreset: 'gemini' },
-  gemini-api:   { name: 'Gemini (官方 API Key)', id: 'gemini-api',  baseUrl: 'https://generativelanguage.googleapis.com/v1beta/openai', apiType: 'openai',
+  'gemini-api':   { name: 'Gemini (官方 API Key)', id: 'gemini-api',  baseUrl: 'https://generativelanguage.googleapis.com/v1beta/openai', apiType: 'openai',
     models: ['gemini-2.5-flash', 'gemini-2.5-pro', 'gemini-2.5-flash-lite', 'gemini-2.0-flash', 'gemini-2.0-flash-lite', 'gemini-3-flash-preview', 'gemini-3-pro-preview', 'gemini-3.5-flash'],
   },
   cline:        { name: 'Cline (白嫖模型)',    id: 'cline',        baseUrl: 'https://api.cline.bot/api/v1',                      apiType: 'openai',
