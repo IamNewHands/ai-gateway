@@ -61,4 +61,16 @@ async function testModelConnection(url, apiType, key, modelId, providerId) {
     return { success: false, status: 0 }
   }
 }
+
+// 切换某个 API Key 输入框的明文/密文显示（btn 为触发的眼睛按钮）
+function toggleKeyText(btn) {
+  const row = btn.closest('.field-row')
+  if (!row) return
+  const inp = row.querySelector('input[type="password"], input[type="text"]')
+  if (!inp) return
+  const show = inp.type === 'password'
+  inp.type = show ? 'text' : 'password'
+  const ic = btn.querySelector('i')
+  if (ic) ic.className = show ? 'fas fa-eye-slash' : 'fas fa-eye'
+}
 `
