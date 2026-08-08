@@ -487,6 +487,27 @@ export async function handleProxy(c: Context<{ Bindings: Env }>) {
 }
 
 /**
+ * 提供商级共享识图（普通提供商模式）：provider.visionBridge 已配置且非独立桥时，
+ * 含图请求自动由视觉模型链转写为文本，请求仍转发给本提供商当前的模型（model 不变）。
+ * 一个提供商只配一次识图模型，其下所有模型自动受益。
+ * 返回转写后的 body；主文本模型未配置/转写失败时返回错误。
+ */
+async function transcribeImagesForProvider(
+  env: Env,
+  provider: import('./types').Provider,
+  forwardBody: Record<string, unknown>
+): Promise<{ ok: true; body: Record<string, unknown> } | { ok: false; error: string }> {
+  const vb = await buildVisionBridgeRequestBody(env, provider, forwardBody as ProxyRequestBody)
+  if (!vb.ok || !vb.body) {
+    return { ok: false, error: vb.error || '识图转写失败' }
+  }
+  // primary 留空时 body.model 与原始请求一致（可能是完整 provider/model 引用），
+  // 转发时 model 必须保持当前 modelId，故剔除 model 后再合并
+  const { model: _model, ...rest } = vb.body as Record<string, unknown>
+  return { ok: true, body: { ...forwardBody, ...rest } }
+}
+
+/**
  * 转发核心逻辑：校验模型 → 路由到对应上游（opencode / qoder / oauth / 通用 Key 轮询），
  * 返回上游 Response。HTTP 路径由 handleProxy 直接返回；WS 桥接路径（ws.ts）读取其
  * 响应体并分块以 WS 文本帧回推。
@@ -556,6 +577,16 @@ export async function forwardProxy(
     const forwardBody = { ...body, model: modelId }
     const url = new URL(c.req.url)
     const subPath = url.pathname.replace(/^\/v1\//, '') || 'chat/completions'
+
+    // 提供商级共享识图：普通提供商配置了识图模型（visionBridge，非独立桥）后，
+    // 其下所有模型自动获得图片能力——含图请求先转写为文本，再按原逻辑转发。
+    if (provider.visionBridge && provider.type !== 'vision-bridge') {
+      const vb = await transcribeImagesForProvider(c.env, provider, forwardBody)
+      if (!vb.ok) {
+        return c.json({ error: { message: vb.error, type: 'invalid_request_error' } }, 422)
+      }
+      Object.assign(forwardBody, vb.body)
+    }
 
     if (isOpenCodeProvider(providerId)) {
       const response = await proxyOpenCodeRequest({
@@ -1023,6 +1054,18 @@ export async function handleAnthropicMessages(c: Context<{ Bindings: Env }>) {
     openaiBody['model'] = modelId
 
     const originalStream = anthropicReq.stream === true
+
+    // 提供商级共享识图：普通提供商配置识图模型后，Anthropic 格式含图请求同样自动转写
+    if (provider.visionBridge && provider.type !== 'vision-bridge') {
+      const vb = await transcribeImagesForProvider(c.env, provider, openaiBody)
+      if (!vb.ok) {
+        return c.json({
+          type: 'error',
+          error: { type: 'invalid_request_error', message: vb.error },
+        }, 422)
+      }
+      Object.assign(openaiBody, vb.body)
+    }
 
     // QoderWork：COSY 签名转发（Anthropic 格式）。上游只收 OpenAI 格式流式，
     // 由 proxyQoderChatRequest 转发后返回 OpenAI SSE，这里再转回 Anthropic SSE。
@@ -1872,6 +1915,15 @@ export async function handleResponses(c: Context<{ Bindings: Env }>) {
     openaiBody['model'] = modelId
 
     const originalStream = responsesReq.stream === true
+
+    // 提供商级共享识图：普通提供商配置识图模型后，Responses 格式含图请求同样自动转写
+    if (provider.visionBridge && provider.type !== 'vision-bridge') {
+      const vb = await transcribeImagesForProvider(c.env, provider, openaiBody)
+      if (!vb.ok) {
+        return c.json({ error: { message: vb.error, type: 'invalid_request_error' } }, 422)
+      }
+      Object.assign(openaiBody, vb.body)
+    }
 
     // Vision Bridge：图片转写后转发给主文本模型（OpenAI 格式），再转回 Responses 格式。
     if (isVisionBridgeProvider(provider)) {

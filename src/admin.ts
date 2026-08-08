@@ -128,7 +128,7 @@ export async function handleUpdateProvider(c: Context<{ Bindings: Env }>) {
   if (body.apiType !== undefined) updates.apiType = body.apiType
   if (body.authType !== undefined) updates.authType = body.authType
   if (body.oauth !== undefined) updates.oauth = body.oauth
-  if (body.type !== undefined) updates.type = body.type
+  if (body.type !== undefined) updates.type = body.type ?? undefined
   if (body.visionBridge !== undefined) updates.visionBridge = body.visionBridge ?? undefined
 if (body.apiKeys !== undefined) {
     updates.apiKeys = normalizeArray(body.apiKeys, (k) => ({ key: k, enabled: true }))

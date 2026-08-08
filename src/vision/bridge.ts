@@ -159,9 +159,14 @@ export interface VisionBridgeResult {
 
 /**
  * Vision Bridge 核心：
- * 1. 无图 → 直接转发 primary（零差异经过）
+ * 1. 无图 → 直通 primary（primary 留空=本提供商自身模型，提供商级共享识图场景）
  * 2. 有图 → 依次尝试视觉链转写，成功后注入不可信文本并转发 primary
  * 3. 全失败 → 按 onVisionFailure：error 报错 | text_only 丢弃图片仅转发文本
+ *
+ * primary 语义：
+ * - 填写 providerId/modelId 引用 → 请求改写后转发到该引用（独立桥提供商模式）
+ * - 留空 → 请求仍转发到"本提供商当前的请求模型"（一个提供商配一次识图模型，
+ *   其下所有模型自动获得图片能力，无需逐个建桥）
  *
  * 不直接发起 upstream 请求，返回"下一跳转发的 body"，由调用方
  * （proxy.ts forwardProxy）用现有通用转发逻辑发给 primary。
@@ -175,19 +180,18 @@ export async function buildVisionBridgeRequestBody(
   if (!cfg) {
     return { ok: false, error: 'Vision Bridge 未配置（visionBridge 缺失）' }
   }
-  if (!cfg.primary) {
-    return { ok: false, error: 'Vision Bridge 未配置主文本模型 primary' }
-  }
   if (!Array.isArray(cfg.vision) || cfg.vision.length === 0) {
     return { ok: false, error: 'Vision Bridge 未配置视觉模型链 vision' }
   }
+  // primary 留空 = 转发到本提供商自身，此时不替换 model
+  const primary = (cfg.primary || '').trim()
 
   const messages = Array.isArray(body.messages) ? (body.messages as Array<Record<string, unknown>>) : []
   const images = extractImages(messages)
 
-  // 无图：直通 primary
+  // 无图：primary 有值则直达 primary，留空则原样放行（普通提供商零改动）
   if (images.length === 0) {
-    return { ok: true, body: { ...body, model: cfg.primary } }
+    return { ok: true, body: primary ? { ...body, model: primary } : { ...body } }
   }
 
   const prompt = cfg.visionPrompt || DEFAULT_VISION_PROMPT
@@ -206,7 +210,7 @@ export async function buildVisionBridgeRequestBody(
         if (!Array.isArray(msg.content)) return msg
         return { ...msg, content: (msg.content as Array<Record<string, unknown>>).filter((p) => p?.type !== 'image_url') }
       })
-      return { ok: true, body: { ...body, model: cfg.primary, messages: stripped } }
+      return { ok: true, body: { ...body, ...(primary ? { model: primary } : {}), messages: stripped } }
     }
     return {
       ok: false,
@@ -220,7 +224,7 @@ export async function buildVisionBridgeRequestBody(
     injectTranscript(nextMessages, im.msgIndex, transcript)
   }
 
-  return { ok: true, body: { ...body, model: cfg.primary, messages: nextMessages } }
+  return { ok: true, body: { ...body, ...(primary ? { model: primary } : {}), messages: nextMessages } }
 }
 
 /** 将多组图片分别用同一视觉模型转写（取第一个成功消息的转写片段兜底），

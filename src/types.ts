@@ -33,10 +33,16 @@ export interface Provider {
   visionBridge?: VisionBridgeConfig
 }
 
-/** Vision Bridge（图片转写桥）配置，type === 'vision-bridge' 时生效 */
+/**
+ * Vision Bridge（图片转写桥）配置。
+ * - 独立桥模式（type === 'vision-bridge'）：primary 必填，客户端请求该桥的任何模型
+ *   都会改写 model 后转发到 primary 引用。
+ * - 提供商级共享识图模式（type 不填）：primary 留空，请求仍转发到本提供商当前模型，
+ *   只把含图请求自动转写为文本——一个提供商配一次识图模型，其下所有模型自动受益。
+ */
 export interface VisionBridgeConfig {
-  /** 主文本模型引用（providerId/modelId），负责最终回答；无图时直接转发给它 */
-  primary: string
+  /** 主文本模型引用（providerId/modelId）。留空 = 转发到本提供商当前的请求模型 */
+  primary?: string
   /** 视觉模型链（providerId/modelId 数组），按顺序尝试，前一个失败自动回退下一个 */
   vision: string[]
   /** 视觉转写全部失败时的处理策略：error（直接报错，默认） | text_only（丢弃图片仅转发文本） */
@@ -193,7 +199,8 @@ export interface UpdateProviderRequest {
   apiKeys?: Array<{ key: string; enabled: boolean }>
   models?: Array<{ id: string; enabled: boolean }> | string[]
   enabled?: boolean
-  type?: 'vision-bridge'
+  /** 传 null 可清除已设置的 type（如从独立桥恢复为普通提供商） */
+  type?: 'vision-bridge' | null
   visionBridge?: VisionBridgeConfig | null
 }
 
