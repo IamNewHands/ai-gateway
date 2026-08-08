@@ -2,7 +2,7 @@
 
 基于 Cloudflare Workers + Hono 的 AI 提供商 API 代理网关，统一 `/v1` 接口转发，支持多 Key 轮询、健康检查与自动故障转移。
 
-> **二次开发说明**：本仓库基于 [yutian81/ai-gateway](https://github.com/yutian81/ai-gateway) 二次开发。在原有多 Key 轮询 / 健康检查 / OpenCode 故障转移的基础上，新增了 **WorkBuddy/CodeBuddy OAuth 接入**、**每日签到**、**对外管理 API**、**Anthropic/Responses 格式转换**、**Cline 白嫖模型反代（含一键授权）** 等能力，详见下方[「增量功能」](#增量功能基于源仓库的二次开发)。
+> **二次开发说明**：本仓库基于 [yutian81/ai-gateway](https://github.com/yutian81/ai-gateway) 二次开发。在原有多 Key 轮询 / 健康检查 / OpenCode 故障转移的基础上，新增了 **WorkBuddy/CodeBuddy OAuth 接入**、**每日签到**、**使用统计看板**、**对外管理 API**、**Anthropic/Responses 格式转换**、**Cline 白嫖模型反代（含一键授权）** 等能力，详见下方[「增量功能」](#增量功能基于源仓库的二次开发)。
 
 ## 增量功能（基于源仓库的二次开发）
 
@@ -69,7 +69,40 @@
 
 > 客户端调用：`POST /v1/chat/completions`，`model: cline/poolside/laguna-s-2.1:free`
 
-### 7. QoderWork 接入（实验性，未验证通过）
+### 7. 使用统计看板（Analytics Engine）
+
+集成 Cloudflare Analytics Engine，对每次代理请求自动采集用量数据，提供管理后台可视化看板，无需额外存储或数据库。
+
+#### 功能
+
+- **概览卡片**：请求总量、成功率、输入/输出 Token、平均延迟
+- **请求趋势图**：基于 SVG 的折线图，支持 24h / 7d / 30d / 90d 切换
+- **模型调用排行**：按 model 聚合请求量 + 成功率
+- **渠道调用排行**：按 Provider 实例聚合
+- **详细日志**：支持时间范围、模型/渠道/结果维度筛选、关键词搜索、分页查看每请求观测字段（模型、Token、延迟、状态码、IP、User-Agent、Colo 等）
+
+#### 配置步骤
+
+1. **创建 Analytics Engine 数据集**
+
+   在 Cloudflare Dashboard → **Analytics & Logs** → **Analytics Engine** → 点击 **Create Dataset**，输入名称 `ai_gateway_usage`，点击创建。
+
+2. **设置查询凭据**
+
+   在 Worker 的 **Settings** → **Variables** 中添加以下两个 **Secrets**（加密变量）：
+
+   | 变量名 | 值 | 说明 |
+   |--------|-----|------|
+   | `CF_ACCOUNT_ID` | 你的 Cloudflare Account ID | 可在 Dashboard 右侧找到 |
+   | `CF_API_TOKEN` | 拥有 `Analytics Engine:Read` 权限的 API Token | 在 API Tokens 页面创建 |
+
+3. **部署验证**
+
+   部署完成后，进入管理后台，左侧导航会看到 **统计** 和 **详细日志** 两个入口。首次使用数据为空是正常的，开始转发请求后自动采集。
+
+> 数据采集是自动的，每次通过网关的代理请求都会记录用量到 `ai_gateway_usage` 数据集。查询凭据仅在面板读取时使用，不影响代理性能。
+
+### 8. QoderWork 接入（实验性，未验证通过）
 
 移植自 `cpa-plugin/qoderwork`，作为内置特殊提供商 `qoder`，包含 COSY 签名、OAuth、请求体编码等完整实现（[src/qoder/](./src/qoder/)）。
 
@@ -170,17 +203,43 @@ OpenCode 默认不需要上游 Key。若在管理后台为 OpenCode 添加 Key�
 ```
 ai-gateway/
 ├── src/
-│   ├── index.ts       # 入口，路由注册
-│   ├── types.ts       # 类型定义
-│   ├── config.ts      # 默认配置
-│   ├── storage.ts     # KV 存储层
-│   ├── auth.ts        # 认证系统
-│   ├── proxy.ts       # API 转发核心（Key 轮询 + 健康检查 + 自动恢复）
-│   ├── opencode.ts    # OpenCode 官方 API 与公共镜像故障转移
-│   ├── admin.ts       # 管理 API（含服务端 Key/模型测试代理）
-│   ├── pages.ts       # 前端页面模板
-│   ├── pages.css.ts   # 样式
-│   └── shared.js.ts   # 共享 JS 工具函数
+│   ├── index.ts                 # 入口，路由注册
+│   ├── types.ts                 # 类型定义
+│   ├── config.ts                # 默认配置
+│   ├── storage.ts               # KV 存储层
+│   ├── auth.ts                  # 认证系统
+│   ├── proxy.ts                 # API 转发核心（Key 轮询 + 健康检查 + 自动恢复）
+│   ├── opencode.ts              # OpenCode 官方 API 与公共镜像故障转移
+│   ├── admin.ts                 # 管理 API（含服务端 Key/模型测试代理）
+│   ├── pages.ts                 # 前端页面模板
+│   ├── pages.css.ts             # 样式
+│   ├── shared.js.ts             # 共享 JS 工具函数
+│   ├── analytics/
+│   │   ├── types.ts             # Analytics Engine 类型定义
+│   │   ├── usage-logger.ts      # 用量数据采集
+│   │   ├── query.ts             # 分析引擎 SQL 查询
+│   │   └── admin-api.ts         # 分析 API 路由处理器
+│   ├── analytics-ui.js.ts       # 前端看板 JS
+│   ├── vision/                  # 识图转写桥接
+│   │   └── bridge.ts
+│   ├── cline/                   # Cline 白嫖模型反代
+│   │   └── proxy.ts
+│   ├── gemini/                  # Gemini 接入
+│   │   └── proxy.ts
+│   ├── qoder/                   # QoderWork 接入
+│   │   ├── proxy.ts
+│   │   ├── body.ts
+│   │   ├── cosy.ts
+│   │   ├── md5.ts
+│   │   ├── billing.ts
+│   │   └── baseprompt.json
+│   ├── oauth.ts                 # OAuth 设备码流程
+│   ├── checkin.ts               # 每日签到
+│   ├── ws.ts                    # WebSocket 桥接
+│   ├── formats.ts               # 格式转换工具
+│   ├── config.ts                # 默认配置
+│   └── storage.ts               # KV 存储层
+├── analytics-ui.js.ts           # 分析看板前端 JS
 ├── wrangler.toml
 ├── package.json
 ├── tsconfig.json
