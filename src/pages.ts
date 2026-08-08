@@ -369,7 +369,7 @@ ${H('管理')}
           </div>
         </div>
         <div class="analytics-log-filters">
-          <div class="fg"><label>时间范围</label><div class="fc"><input type="datetime-local" id="log-start" aria-label="开始时间"><span style="margin:0 4px;color:var(--color-muted)">至</span><input type="datetime-local" id="log-end" aria-label="结束时间"></div></div>
+          <div class="fg log-time-range"><label>时间范围</label><div class="fc"><input type="datetime-local" id="log-start" aria-label="开始时间"><span style="margin:0 4px;color:var(--color-muted)">至</span><input type="datetime-local" id="log-end" aria-label="结束时间"></div></div>
           <div class="fg"><label>筛选维度</label><select id="log-dimension" class="select-sm"><option value="model">模型</option><option value="channel">渠道</option><option value="result">结果</option></select></div>
           <div class="fg"><label>关键词</label><input type="text" id="log-keyword" placeholder="模型 ID / 渠道名称"></div>
           <div class="fg"><label>结果</label><select id="log-result" class="select-sm"><option value="all">全部</option><option value="success">成功</option><option value="failure">失败</option></select></div>
@@ -1570,6 +1570,7 @@ window.addEventListener('hashchange', function () { setActiveAdminNav(location.h
 setActiveAdminNav(location.hash)
 
 // 签到状态：页面加载后总是加载一次（区块同屏展示，避免签到区默认停在静态占位）；进入 #checkin 时再刷新
+// 注意：仅读取状态，不触发签到（签到只能通过手动点击按钮或 cron 定时触发）
 function maybeLoadCheckin(hash) { if (hash === '#checkin') loadCheckin() }
 window.addEventListener('hashchange', function () { maybeLoadCheckin(location.hash) })
 adminNavLinks.forEach(function (link) {
@@ -1724,8 +1725,6 @@ async function loadCheckin() {
     el.innerHTML = '<div class="empty-state"><i class="fas fa-exclamation-triangle c-l"></i><h3>加载失败</h3></div>'
     return
   }
-  // 后台静默刷新最新状态（签到状态+额度），完成后更新显示，不写日志
-  refreshCheckinInBackground()
 }
 
 function renderCheckinList(d) {
