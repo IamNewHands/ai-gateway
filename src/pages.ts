@@ -1173,7 +1173,7 @@ async function testKeyRow(id, idx) {
   const tr = document.getElementById('tr-' + id)
   showSpinner(tr)
   const result = await testKeyConnection(url, apiType, k, id)
-  showResult(tr, result.success, result.success ? '' : 'HTTP ' + result.status)
+  showResult(tr, result.success, result.success ? '' : (result.message && result.message.indexOf('HTTP') !== -1 ? result.message : 'HTTP ' + result.status + (result.message ? ': ' + result.message : '')))
   if (result.success && result.data) {
     showEditModelsList(id, result.data.data || [])
   }

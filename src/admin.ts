@@ -402,13 +402,26 @@ export async function handleTestKeyNew(c: Context<{ Bindings: Env }>) {
     })
 
     let data: unknown = null
+    let errBody = ''
     if (response.ok) {
       try { data = await response.json() } catch { /* ignore */ }
+    } else {
+      // 读取上游错误体，写入日志便于排查（如 400/401 的具体原因）
+      try {
+        const raw = await response.text()
+        errBody = raw.substring(0, 1000)
+        await writeLog(c.env, 'error', `[test-key] ${cleanBase}/models → ${response.status}`, errBody)
+      } catch { /* ignore */ }
     }
 
     return c.json<ApiResponse>({
       success: true,
-      data: { success: response.ok, statusCode: response.status, data },
+      data: {
+        success: response.ok,
+        statusCode: response.status,
+        data,
+        message: response.ok ? '' : `HTTP ${response.status}: ${errBody}`,
+      },
     })
   } catch (err) {
     return c.json<ApiResponse>({
@@ -461,9 +474,23 @@ export async function handleTestModelNew(c: Context<{ Bindings: Env }>) {
       signal: AbortSignal.timeout(15000),
     })
 
+    let errBody = ''
+    if (!response.ok) {
+      // 读取上游错误体并写日志，便于排查 4xx/5xx 具体原因
+      try {
+        const raw = await response.text()
+        errBody = raw.substring(0, 1000)
+        await writeLog(c.env, 'error', `[test-model] ${cleanBase}/${endpoint} model=${model} → ${response.status}`, errBody)
+      } catch { /* ignore */ }
+    }
+
     return c.json<ApiResponse>({
       success: true,
-      data: { success: response.ok, statusCode: response.status },
+      data: {
+        success: response.ok,
+        statusCode: response.status,
+        message: response.ok ? '' : `HTTP ${response.status}: ${errBody}`,
+      },
     })
   } catch (err) {
     return c.json<ApiResponse>({
