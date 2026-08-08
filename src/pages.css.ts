@@ -119,6 +119,17 @@ html:focus-within { scroll-behavior: smooth; }
 .site-page { display: flex; min-height: 100dvh; flex-direction: column; }
 .site-page > main { flex: 1; }
 .hd { display: none !important; }
+.collapse-section { margin-bottom: var(--space-sm); }
+.collapse-btn {
+  display: flex; align-items: center; gap: var(--space-2xs);
+  width: 100%; padding: var(--space-2xs) var(--space-xs);
+  background: var(--color-paper-2); border: 1px solid var(--color-rule);
+  border-radius: var(--radius-control); cursor: pointer;
+  font: inherit; font-size: var(--text-sm); color: var(--color-ink-2);
+  text-align: left; transition: background .15s;
+}
+.collapse-btn:hover { background: var(--color-paper-3); }
+.collapse-icon { transition: transform .2s; font-size: var(--text-xs); }
 .sr-only { position: absolute; width: .0625rem; height: .0625rem; padding: 0; margin: -.0625rem; overflow: hidden; clip: rect(0,0,0,0); white-space: nowrap; border: 0; }
 .sr-status { min-height: 1lh; color: var(--color-muted); font-size: var(--text-xs); }
 
