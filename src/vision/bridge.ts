@@ -72,22 +72,23 @@ function injectTranscript(
   )
 }
 
-/** 调用单个视觉模型（providerId/modelId）转写一组图片，返回文本；失败返回 null */
+/** 调用单个视觉模型（providerId/modelId）转写一组图片；成功返回文本，失败返回具体原因 */
 async function transcribeWithProvider(
   env: Env,
   ref: string,
   imageUrls: string[],
   prompt: string
-): Promise<string | null> {
+): Promise<{ ok: true; text: string } | { ok: false; error: string }> {
   const parsed = parseModelRef(ref)
-  if (!parsed) return null
+  if (!parsed) return { ok: false, error: '引用格式错误（应为 providerId/modelId）' }
 
   const vp = await getProvider(env, parsed.providerId)
-  if (!vp || !vp.enabled) return null
+  if (!vp) return { ok: false, error: `提供商 ${parsed.providerId} 不存在` }
+  if (!vp.enabled) return { ok: false, error: `提供商 ${parsed.providerId} 未启用` }
 
   // 仅支持 OpenAI 兼容格式的视觉提供商；Anthropic 原生不在这里处理
   const apiType = vp.apiType || 'openai'
-  if (apiType !== 'openai') return null
+  if (apiType !== 'openai') return { ok: false, error: `提供商 ${parsed.providerId} 非 OpenAI 兼容（不支持）` }
 
   // 取上游凭据：api-key 提供商取第一个启用 Key；OAuth 提供商读 KV token
   let auth: { header: string; prefix: string; value: string } | null = null
@@ -99,12 +100,14 @@ async function transcribeWithProvider(
         prefix: vp.oauth.tokenHeaderPrefix || '',
         value: token.access_token,
       }
+    } else {
+      return { ok: false, error: `提供商 ${parsed.providerId} 无可用 OAuth Token（请先发起连接）` }
     }
   } else {
     const key = vp.apiKeys.find((k) => k.enabled)?.key
     if (key) auth = { header: 'Authorization', prefix: 'Bearer ', value: key }
+    else return { ok: false, error: `提供商 ${parsed.providerId} 无可用 API Key` }
   }
-  if (!auth) return null
 
   const visionBody: Record<string, unknown> = {
     model: parsed.modelId,
@@ -125,8 +128,9 @@ async function transcribeWithProvider(
   const base = vp.baseUrl.replace(/\/$/, '')
   const url = `${base}/chat/completions`
 
+  let resp: Response
   try {
-    const resp = await fetch(url, {
+    resp = await fetch(url, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -135,15 +139,22 @@ async function transcribeWithProvider(
       body: JSON.stringify(visionBody),
       signal: AbortSignal.timeout(VISION_TIMEOUT_MS),
     })
-    if (!resp.ok) return null
-    const data = (await resp.json()) as {
-      choices?: Array<{ message?: { content?: string } }>
-    }
-    const text = data.choices?.[0]?.message?.content
-    return text && text.trim() ? text.trim() : null
-  } catch {
-    return null
+  } catch (e) {
+    return { ok: false, error: `请求异常：${e instanceof Error ? e.message : String(e)}` }
   }
+  const respText = await resp.text()
+  if (!resp.ok) {
+    return { ok: false, error: `HTTP ${resp.status}${respText ? ' ' + respText.slice(0, 300) : ''}` }
+  }
+  let text: string | null = null
+  try {
+    const data = JSON.parse(respText) as { choices?: Array<{ message?: { content?: string } }> }
+    text = data.choices?.[0]?.message?.content ?? null
+  } catch {
+    text = null
+  }
+  if (!text || !text.trim()) return { ok: false, error: '返回内容为空（模型可能不支持图片输入）' }
+  return { ok: true, text: text.trim() }
 }
 
 const DEFAULT_VISION_PROMPT =
@@ -196,11 +207,16 @@ export async function buildVisionBridgeRequestBody(
 
   const prompt = cfg.visionPrompt || DEFAULT_VISION_PROMPT
 
-  // 依次尝试视觉链，全部失败按策略处理
+  // 依次尝试视觉链，全部失败按策略处理；同时收集各模型失败原因便于排查
   let transcript: string | null = null
+  const failReasons: string[] = []
   for (const ref of cfg.vision) {
-    transcript = await transcribeAllImages(env, ref, images, prompt)
-    if (transcript) break
+    const res = await transcribeAllImages(env, ref, images, prompt)
+    if (res.ok) {
+      transcript = res.text
+      break
+    }
+    failReasons.push(`${ref} → ${res.error}`)
   }
 
   if (!transcript) {
@@ -214,7 +230,7 @@ export async function buildVisionBridgeRequestBody(
     }
     return {
       ok: false,
-      error: '视觉转写失败：视觉模型链全部不可用（请检查 vision 列表中的提供商/模型与 Key）',
+      error: `视觉转写失败：${failReasons.join('；') || '视觉模型链为空'}`,
     }
   }
 
@@ -234,9 +250,9 @@ async function transcribeAllImages(
   ref: string,
   images: Array<{ msgIndex: number; imageUrls: string[] }>,
   prompt: string
-): Promise<string | null> {
+): Promise<{ ok: true; text: string } | { ok: false; error: string }> {
   // 把所有图片汇总成一次调用最简单可靠（原 CLA 插件按会话粒度转写）
   const allUrls = images.flatMap((im) => im.imageUrls)
-  if (allUrls.length === 0) return null
+  if (allUrls.length === 0) return { ok: false, error: '请求中未检测到图片' }
   return await transcribeWithProvider(env, ref, allUrls, prompt)
 }
