@@ -23,6 +23,7 @@ import {
   handleOAuthPoll,
   handleOAuthDisconnect,
   handleOAuthModels,
+  handleOAuthGeminiCallback,
   handleClineOAuthConnect,
   handleClineOAuthPoll,
   handleLogs,
@@ -101,6 +102,8 @@ app.post('/admin/api/oauth/:id/connect', handleOAuthConnect)
 app.post('/admin/api/oauth/:id/poll', handleOAuthPoll)
 app.post('/admin/api/oauth/:id/disconnect', handleOAuthDisconnect)
 app.get('/admin/api/oauth/:id/models', handleOAuthModels)
+// Gemini 授权回调：浏览器授权后把地址栏 URL 粘贴回后台提交（POST { callbackUrl }）
+app.post('/admin/api/oauth/:id/callback', handleOAuthGeminiCallback)
 
 // Cline 一键授权（WorkOS 设备码流程，登录后自动把 refreshToken 存入账号池）
 app.post('/admin/api/cline/oauth/:id/connect', handleClineOAuthConnect)

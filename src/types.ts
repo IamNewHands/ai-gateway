@@ -58,8 +58,10 @@ export interface OAuthDeviceConfig {
    * - device：标准设备码（RFC 8628）— 申请 device_code，用户在浏览器输入 user_code
    * - browser：浏览器登录 — POST deviceCodeUrl 拿到登录链接（authUrl），用户打开网页登录后轮询拿 token
    * - qoder：QoderWork 设备授权（PKCE）— 本地构造 selectAccounts 授权链接，用户浏览器授权后轮询拿 dt-/drt- token
+   * - gemini：Gemini CLI（Google OAuth）— 标准授权码 + PKCE(S256) + offline/consent，
+   *   网关无法监听本地回调端口，用户授权后把回调 URL（含 code）粘贴回后台完成换 token
    */
-  flowType?: 'device' | 'browser' | 'qoder'
+  flowType?: 'device' | 'browser' | 'qoder' | 'gemini'
   /**
    * 设备码申请端点 / 浏览器登录发起端点：
    * - device 模式：POST, x-www-form-urlencoded, 需 client_id，返回 device_code/user_code
@@ -80,6 +82,8 @@ export interface OAuthDeviceConfig {
   refreshTokenUrl: string
   /** OAuth 应用 client_id（browser 模式可留空） */
   clientId: string
+  /** OAuth 应用 client_secret（gemini 模式必填；其余模式可留空） */
+  clientSecret?: string
   /** 申请的 scope（可选） */
   scope?: string
   /** 轮询间隔（秒），默认 5 */
@@ -120,6 +124,12 @@ export interface OAuthTokenState {
   user_id?: string
   /** qoder 账号昵称（轮询/刷新后按需回填） */
   nickname?: string
+  /** gemini 模式：已授权的 Google 账号邮箱（userinfo 拉取） */
+  email?: string
+  /** gemini 模式：CodeAssist 项目 ID，cloudcode-pa 请求包装（{"project": ...}）需要 */
+  projectId?: string
+  /** gemini 模式：该账号可用的项目 ID 列表（cloudresourcemanager 拉取） */
+  projectIds?: string[]
 }
 
 /** 进行中的设备码/浏览器/Qoder 登录流程状态 */
@@ -133,14 +143,14 @@ export interface DeviceFlowState {
   interval: number
   expires_at: number
   /** 流程类型，用于轮询时分发 */
-  flowType?: 'device' | 'browser' | 'qoder'
+  flowType?: 'device' | 'browser' | 'qoder' | 'gemini'
   /**
    * browser 模式：发起登录时上游返回的 Set-Cookie。
    * cpa-plugin 强调 must reuse the same cookie jar，否则 token 无效导致 401。
    * 多个 cookie 用 "; " 分隔存储。
    */
   cookies?: string
-  /** qoder 模式：PKCE code_verifier（轮询端点必须提交） */
+  /** qoder/gemini 模式：PKCE code_verifier（换 token / 轮询时必须提交） */
   verifier?: string
   /** qoder 模式：设备授权 nonce（与授权链接配对） */
   nonce?: string
@@ -276,4 +286,7 @@ export interface Env {
   OPENCODE_MIRRORS_URL?: string
   /** 对外管理 API 的认证 Token；未配置时 /api/manage/* 返回 503 */
   MANAGEMENT_TOKEN?: string
+  /** Gemini OAuth 客户端凭据（官方公开凭据，避免硬编码进代码） */
+  GEMINI_OAUTH_CLIENT_ID?: string
+  GEMINI_OAUTH_CLIENT_SECRET?: string
 }

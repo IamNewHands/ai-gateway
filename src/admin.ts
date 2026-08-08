@@ -14,8 +14,9 @@ import { testModelConnection } from './proxy'
 import { fetchOpenCodeModels, isOpenCodeProvider, resolveOpenCodeUrls, testOpenCodeModel } from './opencode'
 import { isQoderProvider, fetchQoderModels } from './qoder/proxy'
 import { isClineProvider, fetchClineModels, testClineChat, testClineRefreshToken, startClineOAuth, pollClineOAuth } from './cline/proxy'
+import { isGeminiProvider, testGeminiModel, GEMINI_MODELS } from './gemini/proxy'
 import { PROXY_KEY_PREFIX, EXPIRY_OPTIONS, OPENCODE_DEFAULT_URL } from './config'
-import { startOauthDeviceFlow, pollOauthDeviceFlow, readOauthToken, deleteOauthToken, getOauthAccessToken, buildOauthHeaders, detectTokenRealm } from './oauth'
+import { startOauthDeviceFlow, pollOauthDeviceFlow, readOauthToken, deleteOauthToken, getOauthAccessToken, buildOauthHeaders, detectTokenRealm, submitOauthGeminiCallback } from './oauth'
 import type {
   Env,
   ApiResponse,
@@ -270,6 +271,12 @@ export async function handleTestModel(c: Context<{ Bindings: Env }>) {
   // 注意：不校验模型是否已保存到 KV。测试的目的是验证"这个模型 ID 能否在上游用"，
   // 用户在编辑表单里新加的模型（尚未点保存）也应能直接测试，避免"先保存才能测"的割裂体验。
   // modelId 仅作为字符串透传给上游 chat/completions，与是否已入库无关。
+
+  // Gemini：走 cloudcode-pa 上游（OAuth token + project_id），发送最小请求验证
+  if (isGeminiProvider(provider)) {
+    const result = await testGeminiModel(c.env, provider, modelId)
+    return c.json<ApiResponse>({ success: true, data: result })
+  }
 
   // OAuth 提供商：用 KV 中的 access_token 测试，无需 API Key
   if (provider.authType === 'oauth-device' && provider.oauth) {
@@ -557,6 +564,8 @@ export async function handleOAuthStatus(c: Context<{ Bindings: Env }>) {
       updatedAt: token?.updated_at ?? null,
       hasCookies: !!(token?.cookies),
       cookiesPreview: token?.cookies ? token.cookies.substring(0, 100) : null,
+      email: token?.email ?? null,
+      projectId: token?.projectId ?? null,
     },
   })
 }
@@ -604,6 +613,41 @@ export async function handleOAuthDisconnect(c: Context<{ Bindings: Env }>) {
   if (!id) return c.json<ApiResponse>({ success: false, message: '缺少 id 参数' }, 400)
   await deleteOauthToken(c.env, id)
   return c.json<ApiResponse>({ success: true, message: '已断开 OAuth 连接' })
+}
+
+/**
+ * 提交 Gemini 授权回调 URL：用户在浏览器完成 Google 授权后，把地址栏的
+ * 回调 URL（含 ?code=...&state=...）粘贴回后台，此处校验 state 并换 token。
+ * 对应 startOauthGeminiFlow 生成的授权链接。
+ */
+export async function handleOAuthGeminiCallback(c: Context<{ Bindings: Env }>) {
+  const id = c.req.param('id')
+  if (!id) return c.json<ApiResponse>({ success: false, message: '缺少 id 参数' }, 400)
+
+  const provider = await getProvider(c.env, id)
+  if (!provider) return c.json<ApiResponse>({ success: false, message: '提供商不存在' }, 404)
+  if (provider.authType !== 'oauth-device' || !provider.oauth) {
+    return c.json<ApiResponse>({ success: false, message: '该提供商未配置 OAuth 认证' }, 400)
+  }
+  if (provider.oauth.flowType !== 'gemini') {
+    return c.json<ApiResponse>({ success: false, message: '该提供商不是 Gemini 授权模式' }, 400)
+  }
+
+  const body = await c.req.json<{ callbackUrl?: string }>()
+  const callbackUrl = String(body?.callbackUrl || '').trim()
+  if (!callbackUrl) {
+    return c.json<ApiResponse>({ success: false, message: 'callbackUrl 为必填项' }, 400)
+  }
+
+  const result = await submitOauthGeminiCallback(c.env, id, provider.oauth, callbackUrl)
+  if (!result.success) {
+    return c.json<ApiResponse>({ success: false, message: result.message }, 400)
+  }
+  return c.json<ApiResponse>({
+    success: true,
+    message: result.message,
+    data: { email: result.email, projectId: result.projectId },
+  })
 }
 
 /** Cline 一键授权：发起 WorkOS 设备码流程，返回授权链接与设备码（与原项目 cline_oauth.py 一致） */
@@ -729,6 +773,29 @@ export async function handleOAuthModels(c: Context<{ Bindings: Env }>) {
       const msg = (err as Error)?.stack || (err as Error)?.message || String(err)
       return c.json<ApiResponse>({ success: false, message: `Qoder 模型拉取异常: ${msg}` }, 500)
     }
+  }
+
+  // Gemini：模型列表为静态清单（参考 geminicli/internal/models/models.go），
+  // 无需请求上游；登录成功后一键拉取即可自动合并保存。
+  if (isGeminiProvider(provider)) {
+    const models = GEMINI_MODELS.map((m) => ({ id: m.id }))
+    try {
+      const existing = provider.models || []
+      const existingIds = new Set(existing.map((m) => m.id))
+      const merged = [...existing]
+      for (const m of models) {
+        if (!existingIds.has(m.id)) {
+          merged.push({ id: m.id, enabled: true })
+          existingIds.add(m.id)
+        }
+      }
+      if (merged.length !== existing.length) {
+        await updateProvider(c.env, id, { models: merged })
+      }
+    } catch (e) {
+      console.warn(`[oauth-models] gemini auto-save failed: ${(e as Error).message}`)
+    }
+    return c.json<ApiResponse>({ success: true, data: { data: models } })
   }
 
   const token = await getOauthAccessToken(c.env, provider.id, cfg)

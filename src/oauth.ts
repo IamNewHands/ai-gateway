@@ -97,6 +97,9 @@ export interface DeviceFlowResult {
  * 发起 OAuth 登录流程。根据 cfg.flowType 分发到设备码或浏览器登录模式。
  */
 export async function startOauthDeviceFlow(env: Env, providerId: string, cfg: OAuthDeviceConfig): Promise<DeviceFlowResult> {
+  if (cfg.flowType === 'gemini') {
+    return startOauthGeminiFlow(env, providerId, cfg)
+  }
   if (cfg.flowType === 'qoder') {
     return startOauthQoderFlow(env, providerId, cfg)
   }
@@ -121,6 +124,9 @@ export async function pollOauthDeviceFlow(env: Env, providerId: string, cfg: OAu
 
   // KV 中有 flowType 就按它走；没有则按 cfg 走（兼容旧数据）
   const flowType = device.flowType || cfg.flowType || 'device'
+  if (flowType === 'gemini') {
+    return pollOauthGeminiFlow(env, providerId, cfg, device)
+  }
   if (flowType === 'qoder') {
     return pollOauthQoderFlow(env, providerId, cfg, device)
   }
@@ -529,12 +535,408 @@ async function refreshOauthTokenQoder(env: Env, providerId: string, cfg: OAuthDe
   }
 }
 
+// ===== Gemini CLI 授权流程（Google OAuth，参考 cpa-plugin-gemini-cli/auth/oauth.go） =====
+//
+// 网关（Cloudflare Worker）无法监听本地端口，采用"手动粘贴回调 URL"模式：
+//   1. startOauthGeminiFlow 生成 PKCE verifier/challenge(S256) + state，
+//      构造 Google 授权链接（access_type=offline & prompt=consent）
+//   2. 用户在浏览器打开链接授权，Google 重定向到 http://127.0.0.1:<port>/oauth2callback?code=...&state=...
+//      （本地无监听服务，浏览器显示连接失败，但地址栏保留完整回调 URL）
+//   3. 用户把回调 URL 粘贴回管理后台，submitOauthGeminiCallback 校验 state 后换 token
+//   4. 换 token 成功后拉取账号邮箱 / CodeAssist 项目 ID（cloudcode-pa 请求需要 project），
+//      一并存入 KV token 状态
+//   5. 临近过期由 refreshOauthTokenGemini 自动刷新（POST oauth2.googleapis.com/token）
+
+export const GEMINI_OAUTH = {
+  authUrl: 'https://accounts.google.com/o/oauth2/v2/auth',
+  tokenUrl: 'https://oauth2.googleapis.com/token',
+  userInfoUrl: 'https://www.googleapis.com/oauth2/v1/userinfo?alt=json',
+  projectsUrl: 'https://cloudresourcemanager.googleapis.com/v1/projects',
+  codeAssistBaseUrl: 'https://cloudcode-pa.googleapis.com',
+  codeAssistVersion: 'v1internal',
+  redirectUri: 'http://127.0.0.1:8089/oauth2callback',
+  scope: [
+    'https://www.googleapis.com/auth/cloud-platform',
+    'https://www.googleapis.com/auth/userinfo.email',
+    'https://www.googleapis.com/auth/userinfo.profile',
+  ].join(' '),
+}
+
+/** Gemini OAuth 客户端凭据：优先取提供商表单（KV），其次取环境变量 */
+function geminiClientCreds(env: Env, cfg: OAuthDeviceConfig): { clientId: string; clientSecret: string } {
+  return {
+    clientId: cfg.clientId || env.GEMINI_OAUTH_CLIENT_ID || '',
+    clientSecret: cfg.clientSecret || env.GEMINI_OAUTH_CLIENT_SECRET || '',
+  }
+}
+
+/** Gemini CLI 指纹请求头（上游校验存在性，缺失会 403 preconditions failed） */
+export const GEMINI_API_CLIENT_HEADER = 'google-genai-sdk/1.41.0 gl-node/v22.19.0'
+export function geminiUserAgent(model = ''): string {
+  return `GeminiCLI/0.34.0/${model || 'unknown'} (win32; x64; terminal)`
+}
+
+function geminiRandomState(): string {
+  const raw = crypto.getRandomValues(new Uint8Array(24))
+  let bin = ''
+  for (const b of raw) bin += String.fromCharCode(b)
+  return btoa(bin).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '')
+}
+
+async function startOauthGeminiFlow(env: Env, providerId: string, cfg: OAuthDeviceConfig): Promise<DeviceFlowResult> {
+  try {
+    const { verifier, challenge } = await makeQoderPKCE()
+    const state = geminiRandomState()
+    const creds = geminiClientCreds(env, cfg)
+    if (!creds.clientId) {
+      return { success: false, message: '缺少 Gemini OAuth Client ID：请在表单填写或配置环境变量 GEMINI_OAUTH_CLIENT_ID' }
+    }
+    const params = new URLSearchParams({
+      client_id: creds.clientId,
+      redirect_uri: GEMINI_OAUTH.redirectUri,
+      response_type: 'code',
+      scope: cfg.scope || GEMINI_OAUTH.scope,
+      state,
+      access_type: 'offline',
+      prompt: 'consent',
+      code_challenge: challenge,
+      code_challenge_method: 'S256',
+    })
+    const authUrl = `${GEMINI_OAUTH.authUrl}?${params.toString()}`
+
+    const device: DeviceFlowState = {
+      device_code: state, // 复用字段存 state（与 browser 模式一致）
+      user_code: '',
+      verification_uri: authUrl, // 授权链接
+      interval: cfg.pollInterval || 5,
+      expires_at: Date.now() + 10 * 60 * 1000, // 10 分钟超时（参考插件 loginTimeout）
+      flowType: 'gemini',
+      verifier,
+    }
+    await env.KV.put(deviceKey(providerId), JSON.stringify(device), { expirationTtl: 900 })
+    return { success: true, message: '授权链接已生成', device }
+  } catch (err) {
+    return { success: false, message: `发起授权异常: ${(err as Error).message || '未知错误'}` }
+  }
+}
+
+async function pollOauthGeminiFlow(env: Env, providerId: string, cfg: OAuthDeviceConfig, device: DeviceFlowState): Promise<PollResult> {
+  if (Date.now() > device.expires_at) {
+    await env.KV.delete(deviceKey(providerId))
+    return { status: 'failed', message: '授权已超时（10 分钟），请重新发起' }
+  }
+  // 回调提交成功后 token 已写入且 device 已删除；此处仅兜底判断
+  const token = await readOauthToken(env, providerId)
+  if (token) return { status: 'success', message: 'OAuth 连接成功' }
+  return { status: 'pending', message: '请授权后把回调 URL 粘贴回后台' }
+}
+
+export interface GeminiCallbackResult {
+  success: boolean
+  message: string
+  email?: string
+  projectId?: string
+}
+
+/**
+ * 提交 Gemini 授权回调：解析回调 URL 中的 code/state → 校验 state →
+ * code 换 token（PKCE）→ 拉取邮箱与项目 ID → 写入 KV。
+ */
+export async function submitOauthGeminiCallback(
+  env: Env,
+  providerId: string,
+  cfg: OAuthDeviceConfig,
+  callbackUrl: string
+): Promise<GeminiCallbackResult> {
+  const device = await readJson<DeviceFlowState>(env, deviceKey(providerId))
+  if (!device || device.flowType !== 'gemini') {
+    return { success: false, message: '没有进行中的授权流程，请先点击「发起连接」' }
+  }
+  if (Date.now() > device.expires_at) {
+    await env.KV.delete(deviceKey(providerId))
+    return { success: false, message: '授权流程已超时（10 分钟），请重新发起' }
+  }
+
+  const parsed = parseGeminiCallbackUrl(callbackUrl)
+  if (!parsed) {
+    return { success: false, message: '无法从回调 URL 解析出 code，请核对粘贴内容（应包含 ?code=...）' }
+  }
+  if (parsed.error) {
+    return { success: false, message: `授权被拒绝：${parsed.error}` }
+  }
+  if (parsed.state && device.device_code && parsed.state !== device.device_code) {
+    return { success: false, message: 'OAuth state 校验失败，请确认粘贴的是本次发起的授权回调 URL' }
+  }
+
+  try {
+    const creds = geminiClientCreds(env, cfg)
+    const params = new URLSearchParams({
+      client_id: creds.clientId,
+      client_secret: creds.clientSecret,
+      code: parsed.code,
+      grant_type: 'authorization_code',
+      redirect_uri: GEMINI_OAUTH.redirectUri,
+      code_verifier: device.verifier || '',
+    })
+    const res = await fetch(GEMINI_OAUTH.tokenUrl, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded', Accept: 'application/json' },
+      body: params.toString(),
+      signal: AbortSignal.timeout(20000),
+    })
+    if (!res.ok) {
+      const text = await res.text()
+      return { success: false, message: `换 token 失败 HTTP ${res.status}: ${text.substring(0, 300)}` }
+    }
+    const data = (await res.json()) as { access_token: string; refresh_token?: string; expires_in?: number }
+    if (!data.access_token) {
+      return { success: false, message: '换取 token 的响应缺少 access_token' }
+    }
+
+    const tokenState: OAuthTokenState = {
+      access_token: data.access_token,
+      refresh_token: data.refresh_token,
+      expires_at: Date.now() + (data.expires_in || 3600) * 1000,
+      updated_at: Date.now(),
+    }
+
+    // 以 userinfo 邮箱作为账号标识（可选，失败不阻塞）
+    const email = await geminiFetchEmail(data.access_token)
+    if (email) tokenState.email = email
+
+    // CodeAssist 项目 ID：loadCodeAssist → onboardUser，失败回退到项目列表首个
+    const projects = await geminiFetchProjectIDs(data.access_token)
+    if (projects.length > 0) tokenState.projectIds = projects
+    const projectId = await geminiResolveProjectId(data.access_token, projects)
+    if (projectId) tokenState.projectId = projectId
+
+    await writeOauthToken(env, providerId, tokenState)
+    await env.KV.delete(deviceKey(providerId))
+    return {
+      success: true,
+      message: 'OAuth 连接成功' + (email ? `（${email}）` : ''),
+      email: email || undefined,
+      projectId: projectId || undefined,
+    }
+  } catch (err) {
+    return { success: false, message: `换 token 异常: ${(err as Error).message || '未知错误'}` }
+  }
+}
+
+async function refreshOauthTokenGemini(env: Env, providerId: string, cfg: OAuthDeviceConfig): Promise<boolean> {
+  const state = await readOauthToken(env, providerId)
+  if (!state?.refresh_token) return false
+
+  try {
+    const creds = geminiClientCreds(env, cfg)
+    const params = new URLSearchParams({
+      client_id: creds.clientId,
+      client_secret: creds.clientSecret,
+      refresh_token: state.refresh_token,
+      grant_type: 'refresh_token',
+    })
+    const res = await fetch(GEMINI_OAUTH.tokenUrl, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded', Accept: 'application/json' },
+      body: params.toString(),
+      signal: AbortSignal.timeout(20000),
+    })
+    if (!res.ok) return false
+    const data = (await res.json()) as { access_token: string; refresh_token?: string; expires_in?: number }
+    if (!data.access_token) return false
+
+    await writeOauthToken(env, providerId, {
+      access_token: data.access_token,
+      refresh_token: data.refresh_token || state.refresh_token,
+      expires_at: Date.now() + (data.expires_in || 3600) * 1000,
+      updated_at: Date.now(),
+      // 刷新响应不带账号信息，保留原值
+      email: state.email,
+      projectId: state.projectId,
+      projectIds: state.projectIds,
+    })
+    return true
+  } catch {
+    return false
+  }
+}
+
+/** 解析用户粘贴的回调 URL，兼容 ?query 与 #fragment 两种携带形式。 */
+interface GeminiCallbackPayload {
+  code: string
+  state: string
+  error: string
+}
+function parseGeminiCallbackUrl(input: string): GeminiCallbackPayload | null {
+  let trimmed = (input || '').trim()
+  if (!trimmed) return null
+
+  let candidate = trimmed
+  if (!candidate.includes('://')) {
+    if (candidate.startsWith('?')) {
+      candidate = 'http://localhost' + candidate
+    } else if (/[/?#:]/.test(candidate)) {
+      candidate = 'http://' + candidate
+    } else if (candidate.includes('=')) {
+      candidate = 'http://localhost/?' + candidate
+    } else {
+      return null
+    }
+  }
+
+  let url: URL
+  try { url = new URL(candidate) } catch { return null }
+
+  let code = url.searchParams.get('code') || ''
+  let state = url.searchParams.get('state') || ''
+  let error = url.searchParams.get('error') || ''
+  const errDesc = url.searchParams.get('error_description') || ''
+  if (!error && errDesc) error = errDesc
+
+  if (url.hash) {
+    const frag = new URLSearchParams(url.hash.replace(/^#/, ''))
+    if (!code) code = frag.get('code') || ''
+    if (!state) state = frag.get('state') || ''
+    if (!error) error = frag.get('error') || frag.get('error_description') || ''
+  }
+  // 个别场景 code 带 #state 粘在一起
+  if (code && !state && code.includes('#')) {
+    const parts = code.split('#')
+    code = parts[0]
+    state = parts[1] || ''
+  }
+  if (!code && !error) return null
+  return { code, state, error }
+}
+
+/** 拉取账号邮箱（userinfo）。失败返回 null。 */
+async function geminiFetchEmail(accessToken: string): Promise<string | null> {
+  try {
+    const res = await fetch(GEMINI_OAUTH.userInfoUrl, {
+      headers: {
+        Accept: 'application/json',
+        Authorization: `Bearer ${accessToken}`,
+        'User-Agent': geminiUserAgent(),
+        'X-Goog-Api-Client': GEMINI_API_CLIENT_HEADER,
+      },
+      signal: AbortSignal.timeout(15000),
+    })
+    if (!res.ok) return null
+    const data = (await res.json()) as { email?: string }
+    return data.email || null
+  } catch {
+    return null
+  }
+}
+
+/** 拉取账号可用项目 ID 列表（cloudresourcemanager）。失败返回空数组。 */
+async function geminiFetchProjectIDs(accessToken: string): Promise<string[]> {
+  try {
+    const res = await fetch(GEMINI_OAUTH.projectsUrl, {
+      headers: {
+        Accept: 'application/json',
+        Authorization: `Bearer ${accessToken}`,
+        'User-Agent': geminiUserAgent(),
+        'X-Goog-Api-Client': GEMINI_API_CLIENT_HEADER,
+      },
+      signal: AbortSignal.timeout(15000),
+    })
+    if (!res.ok) return []
+    const data = (await res.json()) as { projects?: Array<{ projectId?: string }> }
+    const ids = (data.projects || [])
+      .map((p) => (p.projectId || '').trim())
+      .filter((id) => id.length > 0)
+    return [...new Set(ids)]
+  } catch {
+    return []
+  }
+}
+
+/**
+ * 解析 CodeAssist 项目 ID（参考插件 auth/oauth.go setupCodeAssist）：
+ * loadCodeAssist 拿默认 tier 与已绑定项目 → 未绑定则 onboardUser 自动发现 →
+ * 仍失败回退到项目列表第一个。全部失败返回 null（不阻塞登录）。
+ */
+async function geminiResolveProjectId(accessToken: string, fallbackProjects: string[]): Promise<string> {
+  const base = `${GEMINI_OAUTH.codeAssistBaseUrl}/${GEMINI_OAUTH.codeAssistVersion}`
+  const metadata = { ideType: 'IDE_UNSPECIFIED', platform: 'PLATFORM_UNSPECIFIED', pluginType: 'GEMINI' }
+  const headers = {
+    Accept: 'application/json',
+    Authorization: `Bearer ${accessToken}`,
+    'Content-Type': 'application/json',
+    'User-Agent': geminiUserAgent(),
+    'X-Goog-Api-Client': GEMINI_API_CLIENT_HEADER,
+  }
+
+  const call = async (endpoint: string, body: unknown): Promise<any> => {
+    const res = await fetch(`${base}:${endpoint}`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify(body),
+      signal: AbortSignal.timeout(30000),
+    })
+    if (!res.ok) {
+      const text = await res.text()
+      throw new Error(`HTTP ${res.status}: ${text.substring(0, 200)}`)
+    }
+    return res.json()
+  }
+
+  try {
+    // 1. loadCodeAssist：老账号直接带出已绑定的 cloudaicompanionProject
+    const loadResp = await call('loadCodeAssist', { metadata }) as {
+      allowedTiers?: Array<{ id?: string; isDefault?: boolean }>
+      cloudaicompanionProject?: unknown
+    }
+    let projectId = geminiProjectFromValue(loadResp?.cloudaicompanionProject)
+    if (projectId) return projectId
+
+    // 2. onboardUser 自动发现项目（新账号需先绑定项目）
+    const tierId = geminiDefaultTierId(loadResp?.allowedTiers)
+    const onboardResp = await call('onboardUser', { tierId, metadata }) as { done?: boolean; response?: { cloudaicompanionProject?: unknown } }
+    if (onboardResp?.done) {
+      projectId = geminiProjectFromValue(onboardResp?.response?.cloudaicompanionProject)
+      if (projectId) return projectId
+    }
+  } catch { /* fall through to project list */ }
+
+  // 3. 回退：项目列表首个
+  if (fallbackProjects.length > 0) {
+    const first = fallbackProjects.find((id) => id.trim() !== '')
+    if (first) return first
+  }
+  return ''
+}
+
+function geminiDefaultTierId(tiers: unknown): string {
+  if (Array.isArray(tiers)) {
+    for (const t of tiers) {
+      if (t && typeof t === 'object' && (t as { isDefault?: boolean }).isDefault && (t as { id?: string }).id) {
+        return String((t as { id: string }).id).trim() || 'legacy-tier'
+      }
+    }
+  }
+  return 'legacy-tier'
+}
+
+function geminiProjectFromValue(value: unknown): string {
+  if (typeof value === 'string') return value.trim()
+  if (value && typeof value === 'object' && 'id' in (value as Record<string, unknown>)) {
+    const id = (value as Record<string, unknown>).id
+    if (typeof id === 'string') return id.trim()
+  }
+  return ''
+}
+
 // ===== Token 刷新 =====
 
 /**
  * 使用 refresh_token 刷新 access_token。根据 flowType 分发。
  */
 export async function refreshOauthToken(env: Env, providerId: string, cfg: OAuthDeviceConfig): Promise<boolean> {
+  if (cfg.flowType === 'gemini') {
+    return refreshOauthTokenGemini(env, providerId, cfg)
+  }
   if (cfg.flowType === 'qoder') {
     return refreshOauthTokenQoder(env, providerId, cfg)
   }

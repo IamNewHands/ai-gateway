@@ -19,6 +19,7 @@ const escapePageHtml = (value: unknown) => String(value ?? '')
  * 据此即可稳定反推。返回 'workbuddy' | 'qoder' | ''（空 = 自定义/未匹配）。
  */
 const detectOauthPreset = (oauth?: OAuthDeviceConfig): string => {
+  if (oauth?.flowType === 'gemini') return 'gemini'
   const url = oauth?.deviceCodeUrl || ''
   if (!url) return ''
   if (url.includes('copilot.tencent.com/v2/plugin/auth/state')) return 'workbuddy'
@@ -331,17 +332,18 @@ ${H('管理')}
               <div class="fg"><label for="anm">名称</label><input type="text" id="anm" placeholder="DeepSeek"></div>
               <div class="fg"><label for="aid">提供商 ID</label><input type="text" id="aid" placeholder="deepseek"><span class="form-helper">用于模型前缀，创建后不可修改。</span></div>
             </div>
-            <div class="fg"><label for="apreset">厂商预设</label><select id="apreset" class="select-sm" onchange="applyProviderPreset(this.value)"><option value="">— 自定义 —</option><option value="deepseek">DeepSeek</option><option value="openai">OpenAI</option><option value="anthropic">Anthropic (Claude)</option><option value="zhipu">智谱 AI (GLM)</option><option value="qwen">通义千问 (DashScope)</option><option value="moonshot">月之暗面 (Kimi)</option><option value="baichuan">百川</option><option value="lingyi">零一万物 (Yi)</option><option value="stepfun">阶跃星辰 (StepFun)</option><option value="siliconflow">硅基流动 (SiliconFlow)</option><option value="volcengine">火山方舟 (豆包)</option><option value="qianfan">百度千帆 (文心)</option><option value="openrouter">OpenRouter</option><option value="together">Together AI</option><option value="groq">Groq</option><option value="deepinfra">DeepInfra</option><option value="mistral">Mistral AI</option><option value="xai">xAI (Grok)</option><option value="workbuddy">WorkBuddy (OAuth 登录)</option><option value="qoder">QoderWork (OAuth 登录)</option><option value="cline">Cline (白嫖模型)</option><option value="visionbridge">Vision Bridge (图片转写桥)</option></select><span class="form-helper">选择后自动填充名称/地址/格式，只需填 API Key 即可测试。</span></div>
+            <div class="fg"><label for="apreset">厂商预设</label><select id="apreset" class="select-sm" onchange="applyProviderPreset(this.value)"><option value="">— 自定义 —</option><option value="deepseek">DeepSeek</option><option value="openai">OpenAI</option><option value="anthropic">Anthropic (Claude)</option><option value="zhipu">智谱 AI (GLM)</option><option value="qwen">通义千问 (DashScope)</option><option value="moonshot">月之暗面 (Kimi)</option><option value="baichuan">百川</option><option value="lingyi">零一万物 (Yi)</option><option value="stepfun">阶跃星辰 (StepFun)</option><option value="siliconflow">硅基流动 (SiliconFlow)</option><option value="volcengine">火山方舟 (豆包)</option><option value="qianfan">百度千帆 (文心)</option><option value="openrouter">OpenRouter</option><option value="together">Together AI</option><option value="groq">Groq</option><option value="deepinfra">DeepInfra</option><option value="mistral">Mistral AI</option><option value="xai">xAI (Grok)</option><option value="workbuddy">WorkBuddy (OAuth 登录)</option><option value="qoder">QoderWork (OAuth 登录)</option><option value="gemini">Gemini CLI (OAuth 登录)</option><option value="cline">Cline (白嫖模型)</option><option value="visionbridge">Vision Bridge (图片转写桥)</option></select><span class="form-helper">选择后自动填充名称/地址/格式，只需填 API Key 即可测试。</span></div>
             <div class="fg"><label for="aurl">API 地址</label><input type="url" id="aurl" placeholder="https://api.deepseek.com"></div>
             <div class="fg"><label for="afmt">API 格式</label><select id="afmt" class="select-sm"><option value="openai">OpenAI 兼容</option><option value="anthropic">Anthropic 兼容</option></select></div>
             <div class="fg"><label for="aat">认证方式</label><select id="aat" class="select-sm" onchange="toggleAuthType()"><option value="api-key">API Key</option><option value="oauth-device">OAuth 设备码登录</option></select></div>
             <div id="oauth-new" class="hd form-group">
               <fieldset class="form-group"><legend>OAuth 配置</legend>
-                <div class="fg"><label>登录流程类型</label><select id="ao8" class="select-sm"><option value="device">设备码（RFC 8628）</option><option value="browser">浏览器登录（WorkBuddy）</option><option value="qoder">Qoder 设备授权（QoderWork）</option></select></div>
+                <div class="fg"><label>登录流程类型</label><select id="ao8" class="select-sm"><option value="device">设备码（RFC 8628）</option><option value="browser">浏览器登录（WorkBuddy）</option><option value="qoder">Qoder 设备授权（QoderWork）</option><option value="gemini">Gemini 授权码（Gemini CLI）</option></select></div>
                 <div class="fg"><label>发起端点 (deviceCodeUrl)</label><input type="url" id="ao1" placeholder="https://.../auth/device/code"></div>
                 <div class="fg"><label>轮询端点 (deviceTokenUrl)</label><input type="url" id="ao2" placeholder="https://.../auth/device/token"></div>
                 <div class="fg"><label>Token 刷新端点 (refreshTokenUrl)</label><input type="url" id="ao3" placeholder="https://.../auth/oauth_token/refresh"></div>
-                <div class="fg"><label>Client ID</label><input type="text" id="ao4" placeholder="OAuth client_id（browser 模式可空）"></div>
+                <div class="fg"><label>Client ID</label><input type="text" id="ao4" placeholder="OAuth client_id（gemini 模式可留空走环境变量）"></div>
+                <div class="fg"><label>Client Secret（可选）</label><input type="text" id="ao14" placeholder="OAuth client_secret（未配置环境变量时粘贴官方凭据）"></div>
                 <div class="fg"><label>Scope（可选）</label><input type="text" id="ao5" placeholder="如 user"></div>
                 <div class="fg"><label>Token 注入头（默认 x-api-key）</label><input type="text" id="ao6" placeholder="x-api-key"></div>
                 <div class="fg"><label>Token 注入前缀（可选，如 Bearer ）</label><input type="text" id="ao9" placeholder="如 Bearer （含尾空格）"></div>
@@ -351,7 +353,7 @@ ${H('管理')}
                 <div class="fg"><label>Global 域 baseUrl</label><input type="url" id="ao11" placeholder="https://www.workbuddy.ai/v2"></div>
                 <div class="fg"><label>Global 域模型 URL</label><input type="url" id="ao12" placeholder="https://www.workbuddy.ai/console/enterprises/personal/models"></div>
                 <div class="fg"><label>Global 域 Origin</label><input type="url" id="ao13" placeholder="https://www.workbuddy.ai"></div>
-                <div class="fg"><label>预置模板</label><select class="select-sm" onchange="applyOauthPreset(this.value)"><option value="">— 选择 —</option><option value="workbuddy">WorkBuddy（浏览器登录）</option><option value="qoder">QoderWork（Qoder 设备授权）</option></select></div>
+                <div class="fg"><label>预置模板</label><select class="select-sm" onchange="applyOauthPreset(this.value)"><option value="">— 选择 —</option><option value="workbuddy">WorkBuddy（浏览器登录）</option><option value="qoder">QoderWork（Qoder 设备授权）</option><option value="gemini">Gemini（官方 OAuth）</option></select></div>
                 <div class="fc mt-1 field-row"><button class="btn btn-p" onclick="createProv({afterCreate:function(id){location.href='/admin?connect='+encodeURIComponent(id)}})"><i class="fas fa-plug" aria-hidden="true"></i>创建并发起连接</button><span class="form-helper">先创建提供商，保存后自动弹出 OAuth 登录链接；登录成功会自动拉取模型。</span></div>
               </fieldset>
             </div>
@@ -383,11 +385,12 @@ ${H('管理')}
               <div class="fg"><label>认证方式</label><select id="auth-${escapePageHtml(p.id)}" class="select-sm" onchange="toggleAuthTypeEdit('${p.id}')"><option value="api-key" ${(p.authType||'api-key')==='api-key'?'selected':''}>API Key</option><option value="oauth-device" ${p.authType==='oauth-device'?'selected':''}>OAuth 设备码登录</option></select></div>
               <div id="oauth-edit-${escapePageHtml(p.id)}" class="${p.authType==='oauth-device'?'form-group':'hd form-group'}">
                 <fieldset class="form-group"><legend>OAuth 配置</legend>
-                  <div class="fg"><label>登录流程类型</label><select id="eao8-${escapePageHtml(p.id)}" class="select-sm"><option value="device" ${(p.oauth&&p.oauth.flowType)||'device'==='device'?'selected':''}>设备码（RFC 8628）</option><option value="browser" ${(p.oauth&&p.oauth.flowType)==='browser'?'selected':''}>浏览器登录（WorkBuddy）</option><option value="qoder" ${(p.oauth&&p.oauth.flowType)==='qoder'?'selected':''}>Qoder 设备授权（QoderWork）</option></select></div>
+                  <div class="fg"><label>登录流程类型</label><select id="eao8-${escapePageHtml(p.id)}" class="select-sm"><option value="device" ${(p.oauth&&p.oauth.flowType)||'device'==='device'?'selected':''}>设备码（RFC 8628）</option><option value="browser" ${(p.oauth&&p.oauth.flowType)==='browser'?'selected':''}>浏览器登录（WorkBuddy）</option><option value="qoder" ${(p.oauth&&p.oauth.flowType)==='qoder'?'selected':''}>Qoder 设备授权（QoderWork）</option><option value="gemini" ${(p.oauth&&p.oauth.flowType)==='gemini'?'selected':''}>Gemini 授权码（Gemini CLI）</option></select></div>
                   <div class="fg"><label>发起端点</label><input type="url" id="eao1-${escapePageHtml(p.id)}" value="${escapePageHtml((p.oauth&&p.oauth.deviceCodeUrl)||'')}" placeholder="https://.../auth/device/code"></div>
                   <div class="fg"><label>轮询端点</label><input type="url" id="eao2-${escapePageHtml(p.id)}" value="${escapePageHtml((p.oauth&&p.oauth.deviceTokenUrl)||'')}" placeholder="https://.../auth/device/token"></div>
                   <div class="fg"><label>Token 刷新端点</label><input type="url" id="eao3-${escapePageHtml(p.id)}" value="${escapePageHtml((p.oauth&&p.oauth.refreshTokenUrl)||'')}" placeholder="https://.../auth/oauth_token/refresh"></div>
-                  <div class="fg"><label>Client ID</label><input type="text" id="eao4-${escapePageHtml(p.id)}" value="${escapePageHtml((p.oauth&&p.oauth.clientId)||'')}" placeholder="OAuth client_id（browser 模式可空）"></div>
+                  <div class="fg"><label>Client ID</label><input type="text" id="eao4-${escapePageHtml(p.id)}" value="${escapePageHtml((p.oauth&&p.oauth.clientId)||'')}" placeholder="OAuth client_id（gemini 模式可留空走环境变量）"></div>
+                  <div class="fg"><label>Client Secret（可选）</label><input type="text" id="eao14-${escapePageHtml(p.id)}" value="${escapePageHtml((p.oauth&&p.oauth.clientSecret)||'')}" placeholder="OAuth client_secret（未配置环境变量时粘贴官方凭据）"></div>
                   <div class="fg"><label>Scope（可选）</label><input type="text" id="eao5-${escapePageHtml(p.id)}" value="${escapePageHtml((p.oauth&&p.oauth.scope)||'')}" placeholder="如 user"></div>
                   <div class="fg"><label>Token 注入头（默认 x-api-key）</label><input type="text" id="eao6-${escapePageHtml(p.id)}" value="${escapePageHtml((p.oauth&&p.oauth.tokenHeader)||'x-api-key')}" placeholder="x-api-key"></div>
                   <div class="fg"><label>Token 注入前缀（可选，如 Bearer ）</label><input type="text" id="eao9-${escapePageHtml(p.id)}" value="${escapePageHtml((p.oauth&&p.oauth.tokenHeaderPrefix)||'')}" placeholder="如 Bearer （含尾空格）"></div>
@@ -396,7 +399,7 @@ ${H('管理')}
                   <div class="fg"><label>Global 域 baseUrl（海外账户，可选）</label><input type="url" id="eao11-${escapePageHtml(p.id)}" value="${escapePageHtml((p.oauth&&p.oauth.globalBaseUrl)||'')}" placeholder="https://www.workbuddy.ai/v2"></div>
                   <div class="fg"><label>Global 域模型 URL（可选）</label><input type="url" id="eao12-${escapePageHtml(p.id)}" value="${escapePageHtml((p.oauth&&p.oauth.globalModelsUrl)||'')}" placeholder="https://www.workbuddy.ai/console/enterprises/personal/models"></div>
                   <div class="fg"><label>Global 域 Origin（可选）</label><input type="url" id="eao13-${escapePageHtml(p.id)}" value="${escapePageHtml((p.oauth&&p.oauth.globalOrigin)||'')}" placeholder="https://www.workbuddy.ai"></div>
-                  <div class="fg"><label>预置模板</label><select class="select-sm" onchange="applyOauthPresetEdit('${p.id}',this.value)"><option value="" ${detectOauthPreset(p.oauth)===''?'selected':''}>— 选择 —</option><option value="workbuddy" ${detectOauthPreset(p.oauth)==='workbuddy'?'selected':''}>WorkBuddy（浏览器登录）</option><option value="qoder" ${detectOauthPreset(p.oauth)==='qoder'?'selected':''}>QoderWork（Qoder 设备授权）</option></select></div>
+                  <div class="fg"><label>预置模板</label><select class="select-sm" onchange="applyOauthPresetEdit('${p.id}',this.value)"><option value="" ${detectOauthPreset(p.oauth)===''?'selected':''}>— 选择 —</option><option value="workbuddy" ${detectOauthPreset(p.oauth)==='workbuddy'?'selected':''}>WorkBuddy（浏览器登录）</option><option value="qoder" ${detectOauthPreset(p.oauth)==='qoder'?'selected':''}>QoderWork（Qoder 设备授权）</option><option value="gemini" ${detectOauthPreset(p.oauth)==='gemini'?'selected':''}>Gemini（官方 OAuth）</option></select></div>
                   <div class="fc mt-1 field-row"><button class="btn btn-s" onclick="oauthConnect('${p.id}')"><i class="fas fa-plug" aria-hidden="true"></i>发起连接</button><button class="btn btn-gh" onclick="fetchOauthModels('${p.id}')"><i class="fas fa-cloud-download-alt" aria-hidden="true"></i>获取模型</button><button class="btn btn-gh" onclick="oauthStatus('${p.id}')"><i class="fas fa-sync" aria-hidden="true"></i>状态</button><button class="btn btn-gh" onclick="oauthDisconnect('${p.id}')"><i class="fas fa-unlink" aria-hidden="true"></i>断开</button><span id="oauth-st-${escapePageHtml(p.id)}" class="oauth-status"></span></div>
                 </fieldset>
               </div>
@@ -652,6 +655,7 @@ function collectOauthNew() {
     deviceTokenUrl: g('ao2'),
     refreshTokenUrl: g('ao3'),
     clientId: g('ao4'),
+    clientSecret: g('ao14') || undefined,
     scope: g('ao5') || undefined,
     tokenHeader: g('ao6') || 'x-api-key',
     tokenHeaderPrefix: g('ao9') || undefined,
@@ -705,6 +709,7 @@ function collectOauthEdit(id) {
     deviceTokenUrl: g('2'),
     refreshTokenUrl: g('3'),
     clientId: g('4'),
+    clientSecret: g('14') || undefined,
     scope: g('5') || undefined,
     tokenHeader: g('6') || 'x-api-key',
     tokenHeaderPrefix: g('9') || undefined,
@@ -738,6 +743,7 @@ const PROVIDER_PRESETS = {
   xai:          { name: 'xAI (Grok)',         id: 'xai',          baseUrl: 'https://api.x.ai/v1',                               apiType: 'openai' },
   workbuddy:    { name: 'WorkBuddy (OAuth)',  id: 'workbuddy',    baseUrl: 'https://copilot.tencent.com/v2',                    apiType: 'openai', authType: 'oauth-device', oauthPreset: 'workbuddy' },
   qoder:        { name: 'QoderWork (OAuth)',  id: 'qoder',        baseUrl: 'https://gateway.qoder.com.cn',                      apiType: 'openai', authType: 'oauth-device', oauthPreset: 'qoder' },
+  gemini:       { name: 'Gemini CLI (OAuth)', id: 'gemini',       baseUrl: 'https://cloudcode-pa.googleapis.com',               apiType: 'openai', authType: 'oauth-device', oauthPreset: 'gemini' },
   cline:        { name: 'Cline (白嫖模型)',    id: 'cline',        baseUrl: 'https://api.cline.bot/api/v1',                      apiType: 'openai',
     models: ['poolside/laguna-s-2.1:free', 'deepseek/deepseek-v4-flash', 'cline-free/glm-5.2', 'cline-pass/glm-5.2', 'cline-pass/deepseek-v4-flash', 'cline-pass/qwen3.7-max'],
   },
@@ -849,6 +855,23 @@ const OAUTH_PRESETS = {
     _baseUrl: 'https://openapi.qoder.com.cn',
     _modelsUrl: 'https://gateway.qoder.com.cn/algo/api/v2/model/list?Encode=1',
   },
+  gemini: {
+    flowType: 'gemini',
+    // 官方 Gemini CLI 的 OAuth 客户端凭据不硬编码：在下方表单粘贴，
+    // 或配置环境变量 GEMINI_OAUTH_CLIENT_ID / GEMINI_OAUTH_CLIENT_SECRET
+    deviceCodeUrl: '',
+    deviceTokenUrl: '',
+    refreshTokenUrl: '',
+    clientId: '',
+    clientSecret: '',
+    scope: 'https://www.googleapis.com/auth/cloud-platform https://www.googleapis.com/auth/userinfo.email https://www.googleapis.com/auth/userinfo.profile',
+    tokenHeader: 'Authorization',
+    tokenHeaderPrefix: 'Bearer ',
+    extraHeaders: {},
+    // Gemini 交互：后台生成授权链接，用户在浏览器授权后把地址栏 URL 粘贴回后台
+    _baseUrl: 'https://cloudcode-pa.googleapis.com',
+    _redirectUri: 'http://127.0.0.1:8089/oauth2callback',
+  },
 }
 function applyOauthPreset(name) {
   const p = OAUTH_PRESETS[name]
@@ -857,6 +880,7 @@ function applyOauthPreset(name) {
   document.getElementById('ao2').value = p.deviceTokenUrl
   document.getElementById('ao3').value = p.refreshTokenUrl
   document.getElementById('ao4').value = p.clientId
+  const cs = document.getElementById('ao14'); if (cs) cs.value = p.clientSecret || ''
   document.getElementById('ao5').value = p.scope || ''
   document.getElementById('ao6').value = p.tokenHeader || 'x-api-key'
   document.getElementById('ao7').value = JSON.stringify(p.extraHeaders || {}, null, 2)
@@ -878,6 +902,7 @@ function applyOauthPresetEdit(id, name) {
   document.getElementById('eao2-' + id).value = p.deviceTokenUrl
   document.getElementById('eao3-' + id).value = p.refreshTokenUrl
   document.getElementById('eao4-' + id).value = p.clientId
+  const cs = document.getElementById('eao14-' + id); if (cs) cs.value = p.clientSecret || ''
   document.getElementById('eao5-' + id).value = p.scope || ''
   document.getElementById('eao6-' + id).value = p.tokenHeader || 'x-api-key'
   document.getElementById('eao7-' + id).value = JSON.stringify(p.extraHeaders || {}, null, 2)
@@ -928,11 +953,20 @@ function oauthConnect(id) {
   // browser（WorkBuddy）与 qoder（QoderWork 设备授权）都是"跳转登录页授权"的交互：
   // 直接打开登录链接，用户确认后由后台轮询 token，无需输入授权码
   const isBrowser = oauth.flowType === 'browser' || oauth.flowType === 'qoder'
-  if (!oauth.deviceCodeUrl || !oauth.deviceTokenUrl || !oauth.refreshTokenUrl) {
+  // gemini（Gemini CLI）是"授权码"交互：后台生成授权链接，用户授权后把回调 URL 粘贴回来
+  const isGemini = oauth.flowType === 'gemini'
+  if (!isGemini && (!oauth.deviceCodeUrl || !oauth.deviceTokenUrl || !oauth.refreshTokenUrl)) {
     st.textContent = '请先填写 OAuth 端点并保存'
     return
   }
-  if (!isBrowser && !oauth.clientId) {
+  if (isGemini) {
+    // 凭据可从环境变量读取（GEMINI_OAUTH_CLIENT_ID / GEMINI_OAUTH_CLIENT_SECRET），
+    // 表单留空时后端回退环境变量，故这里不强制
+    if (!oauth.clientId && !oauth.clientSecret) {
+      st.textContent = '请填写 Gemini Client ID / Client Secret，或配置环境变量 GEMINI_OAUTH_CLIENT_ID / GEMINI_OAUTH_CLIENT_SECRET'
+      return
+    }
+  } else if (!isBrowser && !oauth.clientId) {
     st.textContent = '设备码模式需要 Client ID，请填写并保存'
     return
   }
@@ -941,7 +975,11 @@ function oauthConnect(id) {
     if (!d.success) { st.textContent = d.message || '发起失败'; return }
     const dev = d.data
     const uri = (dev && dev.verification_uri) || ''
-    if (isBrowser) {
+    if (isGemini) {
+      // Gemini 授权码模式：打开授权链接，授权后把地址栏（含 ?code=...&state=...）粘贴回来
+      st.textContent = '请在浏览器中完成授权后粘贴回调 URL'
+      showM('<h3><i class="fas fa-sign-in-alt c-p" aria-hidden="true"></i> Gemini OAuth 授权</h3><p>1. 点击下方链接在浏览器中登录并授权（授权后页面会跳转到 localhost，地址栏里含 <code>?code=...</code>&nbsp;<code>state=...</code>）：</p><p><a href="' + escapeHtml(uri) + '" target="_blank" rel="noreferrer" style="word-break:break-all;font-size:1.05em">' + escapeHtml(uri) + '</a></p><p>2. 复制浏览器地址栏的完整回调 URL，粘贴到下方后提交：</p><p><input type="text" id="gemini-cb-url" placeholder="http://127.0.0.1:8089/oauth2callback?code=...&state=..." style="width:100%;box-sizing:border-box"></p><p class="oauth-status" id="gemini-cb-st"></p><div class="fa"><button class="btn btn-s" onclick="closeM()">取消</button><button class="btn btn-p" onclick="oauthSubmitGemini(' + JSON.stringify(id) + ')">提交授权</button></div>')
+    } else if (isBrowser) {
       // 浏览器登录模式：显示登录链接，自动轮询
       st.textContent = '请在弹窗中打开登录链接完成授权'
       showM('<h3><i class="fas fa-sign-in-alt c-p" aria-hidden="true"></i> OAuth 浏览器登录</h3><p>点击下方链接在浏览器中完成登录：</p><p><a href="' + escapeHtml(uri) + '" target="_blank" rel="noreferrer" style="word-break:break-all;font-size:1.1em">' + escapeHtml(uri) + '</a></p><p class="oauth-status" id="oauth-poll-st">等待登录完成…</p><div class="fa"><button class="btn btn-s" onclick="closeM()">取消</button><button class="btn btn-p" onclick="oauthPoll(' + JSON.stringify(id) + ')">刷新状态</button></div>')
@@ -978,6 +1016,29 @@ function oauthPoll(id) {
     if (st) st.textContent = d.message || '等待授权…'
     return false
   }).catch(() => { if (pollSt) pollSt.textContent = '轮询失败，请重试' })
+}
+
+// Gemini 授权码模式：提交用户粘贴的回调 URL，后台换 token 并拉取模型
+function oauthSubmitGemini(id) {
+  const st = document.getElementById('gemini-cb-st')
+  const mainSt = document.getElementById('oauth-st-' + id)
+  const url = ((document.getElementById('gemini-cb-url') || {}).value || '').trim()
+  if (!url) { if (st) st.textContent = '请先粘贴授权后的回调 URL'; return }
+  if (st) st.textContent = '提交中…'
+  return fetch('/admin/api/oauth/' + encodeURIComponent(id) + '/callback', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ callbackUrl: url }),
+  }).then(r => r.json()).then(d => {
+    if (d.success) {
+      if (st) st.textContent = '授权成功！正在拉取模型列表…'
+      if (mainSt) mainSt.textContent = '已连接'
+      setTimeout(closeM, 1200)
+      setTimeout(function() { fetchOauthModels(id) }, 1300)
+    } else {
+      if (st) st.textContent = d.message || '提交失败'
+    }
+  }).catch(() => { if (st) st.textContent = '提交失败，请重试' })
 }
 
 function oauthDisconnect(id) {
