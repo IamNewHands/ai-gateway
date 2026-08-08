@@ -1054,6 +1054,37 @@ async function proxyOAuthRequest(
       }
     }
 
+    // 诊断：WorkBuddy 流式透传前，统计上游响应实际字节数。
+    // 用于区分 "Trae 收到的为空响应" 与 "上游正常返回但客户端解析为空"。
+    if (provider.id.startsWith('workbuddy') && originalStream === true && response.status === 200 && response.body) {
+      const [countStream, teeStream] = response.body.tee()
+      const counter = (async () => {
+        let bytes = 0
+        const rr = countStream.getReader()
+        try {
+          while (true) {
+            const { done, value } = await rr.read()
+            if (done) break
+            bytes += value?.byteLength || 0
+          }
+        } catch { /* ignore */ }
+        return bytes
+      })()
+      c.executionCtx.waitUntil(counter.then((bytes) =>
+        writeLog(c.env, 'request',
+          `[WorkBuddyDebug] ${model} → 上游响应字节`,
+          `HTTP ${response.status}, bytes=${bytes}, stream=${originalStream}`
+        ).catch(() => {})
+      ))
+      const respForLog = new Response(teeStream, {
+        status: response.status,
+        statusText: response.statusText,
+        headers: response.headers,
+      })
+      logOAuthRequest(c, provider, model, subPath, forwardBody, response.status)
+      return passthroughResponse(respForLog, cleanWorkbuddyChunk)
+    }
+
     logOAuthRequest(c, provider, model, subPath, forwardBody, response.status)
     return passthroughResponse(response, cleanWorkbuddyChunk)
   } catch (err) {
