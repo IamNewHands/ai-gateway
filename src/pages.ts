@@ -652,7 +652,7 @@ function collectOauthNew() {
 function collectVisionBridgeNew() {
   const primary = (document.getElementById('avb-primary') || {}).value?.trim() || ''
   const vision = (document.getElementById('avb-vision') || {}).value
-    .split('\n').map(function(s) { return s.trim() }).filter(Boolean)
+    .split('\\n').map(function(s) { return s.trim() }).filter(Boolean)
   if (!primary || vision.length === 0) return undefined
   return { primary, vision, onVisionFailure: (document.getElementById('avb-fail') || {}).value || 'error' }
 }
@@ -661,7 +661,7 @@ function collectVisionBridgeNew() {
 function collectVisionBridgeEdit(id) {
   const primary = (document.getElementById('vb-primary-' + id) || {}).value?.trim() || ''
   const vision = (document.getElementById('vb-vision-' + id) || {}).value
-    .split('\n').map(function(s) { return s.trim() }).filter(Boolean)
+    .split('\\n').map(function(s) { return s.trim() }).filter(Boolean)
   if (!primary || vision.length === 0) return undefined
   return { primary, vision, onVisionFailure: (document.getElementById('vb-fail-' + id) || {}).value || 'error' }
 }
@@ -742,7 +742,7 @@ function applyProviderPreset(name) {
 function applyVisionBridgePreset() {
   applyClineKeyHint(false)
   document.getElementById('avb-primary').value = 'deepseek/deepseek-chat'
-  document.getElementById('avb-vision').value = 'qwen/qwen3-vl-flash\nopenai/gpt-4o-mini'
+  document.getElementById('avb-vision').value = 'qwen/qwen3-vl-flash\\nopenai/gpt-4o-mini'
   document.getElementById('avb-fail').value = 'error'
   const url = document.getElementById('aurl')
   if (url) url.value = 'https://example.com/v1'
