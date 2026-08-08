@@ -920,6 +920,18 @@ export async function forwardProxy(
  * 刷新后仍 401 则自动切换域重试（Global ↔ CN）。
  * 参考 cpa-plugin/models.go 的域路由逻辑。
  */
+/** 记录 OAuth 代理请求日志（复用 forwardProxy 的日志格式，与 opencode/qoder 等一致） */
+function logOAuthRequest(c: Context<AppEnv>, provider: import('./types').Provider, model: string, subPath: string, forwardBody: object, status: number) {
+  const logLevel = status >= 200 && status < 300 ? 'request' : (status >= 500 ? 'error' : 'warn')
+  try {
+    const bodySummary = summarizeRequestBody(forwardBody as Record<string, unknown>)
+    c.executionCtx.waitUntil(writeLog(c.env, logLevel,
+      `[${provider.name}] ${model} → ${status}`,
+      JSON.stringify({ providerId: provider.id, subPath, body: bodySummary }).substring(0, 4000)
+    ))
+  } catch { /* log failure must not break */ }
+}
+
 async function proxyOAuthRequest(
   c: Context<AppEnv>,
   provider: import('./types').Provider,
@@ -929,6 +941,7 @@ async function proxyOAuthRequest(
   method: string = c.req.method
 ): Promise<Response> {
   const cfg = provider.oauth!
+  const model = (forwardBody as Record<string, unknown>).model as string
 
   // 先从 KV 读取 token 状态（含 cookies）
   let tokenState = await readOauthToken(c.env, provider.id)
@@ -981,6 +994,7 @@ async function proxyOAuthRequest(
       }
     }
     if (!token) {
+      logOAuthRequest(c, provider, model, subPath, forwardBody, 502)
       return c.json({
         error: { message: 'OAuth 未连接或 Token 已失效，请在管理后台重新授权', type: 'oauth_not_connected' },
       }, 502)
@@ -1020,6 +1034,7 @@ async function proxyOAuthRequest(
     if (response.ok && originalStream !== true && provider.id === 'workbuddy' && response.body) {
       try {
         const aggregated = await aggregateWorkbuddySSE(response.body, (forwardBody as Record<string, unknown>).model as string)
+        logOAuthRequest(c, provider, model, subPath, forwardBody, 200)
         return new Response(aggregated, {
           status: 200,
           headers: { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' },
@@ -1030,9 +1045,11 @@ async function proxyOAuthRequest(
       }
     }
 
+    logOAuthRequest(c, provider, model, subPath, forwardBody, response.status)
     return passthroughResponse(response, cleanWorkbuddyChunk)
   } catch (err) {
     const error = err as Error
+    logOAuthRequest(c, provider, model, subPath, forwardBody, 502)
     return c.json({
       error: { message: `OAuth 转发失败: ${error.message || '未知错误'}`, type: 'proxy_error' },
     }, 502)
