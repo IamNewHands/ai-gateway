@@ -182,7 +182,7 @@ label, legend { color: var(--color-ink-2); font-size: var(--text-xs); font-weigh
 .model-check { display: flex; align-items: flex-start; gap: 6px; min-width: 0; padding: 3px 8px; border-radius: 6px; cursor: pointer; font-size: var(--text-xs); }
 .model-check span { min-width: 0; word-break: break-all; }
 .model-check:hover { background: rgba(0, 0, 0, .05); }
-.model-check input { accent-color: #6366f1; flex-shrink: 0; margin-top: 2px; }
+.model-check input { width: auto; height: auto; flex: 0 0 auto; min-width: 0; accent-color: #6366f1; margin-top: 2px; }
 .field-row { min-width: 0; flex-wrap: nowrap; }
 .field-row input { min-width: 0; }
 
