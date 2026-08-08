@@ -381,9 +381,16 @@ function passthroughResponse(response: Response, cleanFn?: (chunk: string) => st
   // 通过 TransformStream 对 SSE 文本流做逐行清洗
   const { readable, writable } = new TransformStream<string, Uint8Array>({
     transform(chunk, controller) {
+      const encoder = new TextEncoder()
+      // 空行是 SSE 事件分隔符（\n\n 中的第二个 \n），必须原样保留，
+      // 否则严格 SSE 解析器（如 Trae/OpenCode）会把所有 data: 行合并成
+      // 一个事件，JSON 解析失败导致内容被整体丢弃。
+      if (chunk === '') {
+        controller.enqueue(encoder.encode('\n'))
+        return
+      }
       const cleaned = cleanFn(chunk)
       if (cleaned) {
-        const encoder = new TextEncoder()
         controller.enqueue(encoder.encode(cleaned + '\n'))
       }
     },
@@ -410,7 +417,8 @@ function passthroughResponse(response: Response, cleanFn?: (chunk: string) => st
         // 最后一行可能不完整，保留到缓冲区
         lineBuffer = lines.pop() || ''
         for (const line of lines) {
-          if (line) await writer.write(line)
+          // 空行也要传递（SSE 事件分隔符），不能过滤
+          await writer.write(line)
         }
       }
       // 流结束后，处理缓冲区中剩余的最后一行
