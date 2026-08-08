@@ -270,9 +270,9 @@ export async function renderAdminPage(c: Context<AppEnv>) {
     `<label class="model-check"><input type="radio" name="${name}" value=""${!checked ? ' checked' : ''}><span>本提供商自身模型（共享识图，推荐）</span></label>`,
     ...allModelRefs.map((r) => `<label class="model-check"><input type="radio" name="${name}" value="${escapePageHtml(r)}"${checked === r ? ' checked' : ''}><span>${escapePageHtml(r)}</span></label>`),
   ].join('')
-  // 识图模型：复选框列表（视觉模型链，可多选）
+  // 识图模型：复选框列表（视觉模型链，可多选，按勾选顺序转写）
   const modelCheckboxHtml = (checked: string[] = []) => allModelRefs.length
-    ? `<div class="model-check-list">${allModelRefs.map((r) => `<label class="model-check"><input type="checkbox" value="${escapePageHtml(r)}"${checked.includes(r) ? ' checked' : ''}><span>${escapePageHtml(r)}</span></label>`).join('')}</div>`
+    ? `<div class="model-check-list">${allModelRefs.map((r) => `<label class="model-check vb-item"><span class="vb-order" title="识图链顺序">-</span><input type="checkbox" value="${escapePageHtml(r)}"${checked.includes(r) ? ' checked' : ''}><span>${escapePageHtml(r)}</span></label>`).join('')}</div><p class="form-helper">按勾选顺序转写（序号 1 优先），全部失败才尝试下一个。</p>`
     : '<p class="form-helper">暂无已启用的模型，请先添加并启用模型。</p>'
 
   return c.html(`<!DOCTYPE html><html lang="zh-CN">
@@ -779,6 +779,33 @@ function checkedValues(id) {
   if (root) root.querySelectorAll('input[type="checkbox"]:checked').forEach(function (c) { out.push(c.value) })
   return out
 }
+
+/** 为每个识图模型链容器重排顺序序号（勾选项显示 1/2/3…，未勾选显示 -） */
+function renumberVisionOrders() {
+  document.querySelectorAll('.model-check-list').forEach(function (list) {
+    let n = 0
+    list.querySelectorAll('.vb-item').forEach(function (item) {
+      const badge = item.querySelector('.vb-order')
+      if (!badge) return
+      const cb = item.querySelector('input[type="checkbox"]')
+      if (cb && cb.checked) {
+        n += 1
+        badge.textContent = n
+        badge.classList.add('is-on')
+      } else {
+        badge.textContent = '-'
+        badge.classList.remove('is-on')
+      }
+    })
+  })
+}
+// 勾选识图模型时实时更新顺序序号（事件委托，覆盖新建/编辑表单）
+document.addEventListener('change', function (e) {
+  const t = e.target
+  if (t && t.matches && t.matches('.model-check-list input[type="checkbox"]')) {
+    renumberVisionOrders()
+  }
+})
 
 /** 取容器内选中的单选框 value（主文本模型，空 = 本提供商自身模型） */
 function checkedRadioValue(id) {
@@ -1791,6 +1818,8 @@ async function triggerCheckin(id) {
     toast('签到请求失败', 'error')
   }
 }
+// 页面加载后初始化识图模型顺序序号（处理编辑表单预勾选的模型）
+renumberVisionOrders();
 </script>
 </body></html>`)
 }

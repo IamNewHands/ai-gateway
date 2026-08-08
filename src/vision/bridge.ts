@@ -19,6 +19,7 @@
 import type { Env, OAuthTokenState, Provider, ProxyRequestBody, VisionBridgeConfig } from '../types'
 import { getProvider } from '../storage'
 import { buildOauthHeaders, detectTokenRealm, readOauthToken, refreshOauthToken } from '../oauth'
+import { writeLog } from '../admin'
 
 /** 视觉转写请求超时（秒） */
 const VISION_TIMEOUT_MS = 60000
@@ -277,14 +278,20 @@ export async function buildVisionBridgeRequestBody(
 
   // 依次尝试视觉链，全部失败按策略处理；同时收集各模型失败原因便于排查
   let transcript: string | null = null
+  let successRef: string | null = null
   const failReasons: string[] = []
   for (const ref of cfg.vision) {
     const res = await transcribeAllImages(env, ref, images, prompt)
     if (res.ok) {
       transcript = res.text
+      successRef = ref
       break
     }
     failReasons.push(`${ref} → ${res.error}`)
+  }
+
+  if (successRef) {
+    try { await writeLog(env, 'request', `[VisionBridge] 识图成功`, `识图模型=${successRef}，图片组数=${images.length}`) } catch {}
   }
 
   if (!transcript) {

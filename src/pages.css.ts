@@ -194,6 +194,9 @@ label, legend { color: var(--color-ink-2); font-size: var(--text-xs); font-weigh
 .model-check span { min-width: 0; word-break: break-all; }
 .model-check:hover { background: rgba(0, 0, 0, .05); }
 .model-check input { width: auto; height: auto; flex: 0 0 auto; min-width: 0; accent-color: #6366f1; margin-top: 2px; }
+.vb-order { display: inline-flex; align-items: center; justify-content: center; flex: 0 0 auto; width: 16px; height: 16px; margin-top: 1px; border-radius: 50%; font-size: 10px; font-weight: 700; line-height: 1; color: var(--color-text-dim, #9aa0aa); background: rgba(0, 0, 0, .06); }
+.vb-order.is-on { color: #fff; background: #6366f1; }
+.model-check.vb-item { gap: 5px; }
 .field-row { min-width: 0; flex-wrap: nowrap; }
 .field-row input { min-width: 0; }
 
