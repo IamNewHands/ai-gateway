@@ -967,9 +967,9 @@ async function proxyOAuthRequest(
   const doFetch = (token: string, realm?: 'cn' | 'global') => {
     const r = realm || resolveRealm(token)
     const body = { ...forwardBody } as Record<string, unknown>
-    // WorkBuddy 只支持流式请求，强制 stream: true
+    // WorkBuddy 只支持流式请求，强制 stream: true（所有以 workbuddy 开头的 provider ID）
     const originalStream = body.stream
-    if (provider.id === 'workbuddy' && body.stream !== true) {
+    if (provider.id.startsWith('workbuddy') && body.stream !== true) {
       body.stream = true
     }
     return fetch(buildForwardUrl(r), {
@@ -1031,7 +1031,9 @@ async function proxyOAuthRequest(
     }
 
     // WorkBuddy 非流式请求：收集 SSE 流并聚合成非流式 chat.completion 返回
-    if (response.ok && originalStream !== true && provider.id === 'workbuddy' && response.body) {
+    // 注意：WorkBuddy 上游 API 不直接支持非流式请求，必须发流式请求再聚合。
+    // 所有以 workbuddy 开头的 provider ID 均需此处理（workbuddy, workbuddy2 等）。
+    if (response.ok && originalStream !== true && provider.id.startsWith('workbuddy') && response.body) {
       try {
         const aggregated = await aggregateWorkbuddySSE(response.body, (forwardBody as Record<string, unknown>).model as string)
         logOAuthRequest(c, provider, model, subPath, forwardBody, 200)
