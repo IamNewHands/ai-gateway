@@ -18,7 +18,7 @@ import { isGeminiProvider, testGeminiModel, GEMINI_MODELS } from './gemini/proxy
 import { PROXY_KEY_PREFIX, EXPIRY_OPTIONS, OPENCODE_DEFAULT_URL } from './config'
 import { startOauthDeviceFlow, pollOauthDeviceFlow, readOauthToken, deleteOauthToken, getOauthAccessToken, buildOauthHeaders, detectTokenRealm, submitOauthGeminiCallback } from './oauth'
 import type {
-  Env,
+  AppEnv,
   ApiResponse,
   Provider,
   ApiKeyEntry,
@@ -48,7 +48,7 @@ function normalizeArray<T>(
   return items as T[]
 }
 
-export async function handleStatus(c: Context<{ Bindings: Env }>) {
+export async function handleStatus(c: Context<AppEnv>) {
   const providers = await getProviders(c.env)
   const proxyKeys = await getProxyKeys(c.env)
 
@@ -74,12 +74,12 @@ export async function handleStatus(c: Context<{ Bindings: Env }>) {
 
 // ===== 提供商 CRUD =====
 
-export async function handleGetProviders(c: Context<{ Bindings: Env }>) {
+export async function handleGetProviders(c: Context<AppEnv>) {
   const providers = await getProviders(c.env)
   return c.json<ApiResponse<Provider[]>>({ success: true, data: providers })
 }
 
-export async function handleCreateProvider(c: Context<{ Bindings: Env }>) {
+export async function handleCreateProvider(c: Context<AppEnv>) {
   const body = await c.req.json<CreateProviderRequest>()
   // opencode 未传地址时自动填充
   if (body.id === 'opencode' && !body.baseUrl) {
@@ -118,7 +118,7 @@ export async function handleCreateProvider(c: Context<{ Bindings: Env }>) {
   return c.json<ApiResponse<Provider>>({ success: true, data: provider }, 201)
 }
 
-export async function handleUpdateProvider(c: Context<{ Bindings: Env }>) {
+export async function handleUpdateProvider(c: Context<AppEnv>) {
   const id = c.req.param('id')
   if (!id) return c.json<ApiResponse>({ success: false, message: '缺少 id 参数' }, 400)
   const body = await c.req.json<UpdateProviderRequest>()
@@ -155,7 +155,7 @@ if (body.apiKeys !== undefined) {
  *   models 按 id 去重追加（永不删除）；oauth 保留不动。
  * 供 /api/manage/providers/upsert 使用（需 managementAuthMiddleware）。
  */
-export async function handleUpsertProvider(c: Context<{ Bindings: Env }>) {
+export async function handleUpsertProvider(c: Context<AppEnv>) {
   const body = await c.req.json<UpsertProviderRequest>()
   if (!body.id) {
     return c.json<ApiResponse>({ success: false, message: 'id 为必填项' }, 400)
@@ -242,7 +242,7 @@ export async function handleUpsertProvider(c: Context<{ Bindings: Env }>) {
   return c.json<ApiResponse<Provider>>({ success: true, data: updated })
 }
 
-export async function handleDeleteProvider(c: Context<{ Bindings: Env }>) {
+export async function handleDeleteProvider(c: Context<AppEnv>) {
   const id = c.req.param('id')
   if (!id) return c.json<ApiResponse>({ success: false, message: '缺少 id 参数' }, 400)
   const deleted = await deleteProvider(c.env, id)
@@ -254,7 +254,7 @@ export async function handleDeleteProvider(c: Context<{ Bindings: Env }>) {
   return c.json<ApiResponse>({ success: true, message: '提供商已删除' })
 }
 
-export async function handleTestModel(c: Context<{ Bindings: Env }>) {
+export async function handleTestModel(c: Context<AppEnv>) {
   const id = c.req.param('id')
   if (!id) return c.json<ApiResponse>({ success: false, message: '缺少 id 参数' }, 400)
   const { modelId } = await c.req.json<TestModelRequest>()
@@ -347,7 +347,7 @@ export async function handleTestModel(c: Context<{ Bindings: Env }>) {
 
 // ===== Key / 模型连通性测试（通过服务端代理，避免 CORS） =====
 
-export async function handleTestKeyNew(c: Context<{ Bindings: Env }>) {
+export async function handleTestKeyNew(c: Context<AppEnv>) {
   const { url, apiKey, apiType, providerId } = await c.req.json<{
     url: string
     apiKey: string
@@ -431,7 +431,7 @@ export async function handleTestKeyNew(c: Context<{ Bindings: Env }>) {
   }
 }
 
-export async function handleTestModelNew(c: Context<{ Bindings: Env }>) {
+export async function handleTestModelNew(c: Context<AppEnv>) {
   const { url, apiKey, apiType, model, providerId } = await c.req.json<{
     url: string
     apiKey: string
@@ -502,7 +502,7 @@ export async function handleTestModelNew(c: Context<{ Bindings: Env }>) {
 
 // ===== 转发 Key 管理 =====
 
-export async function handleGetProxyKeys(c: Context<{ Bindings: Env }>) {
+export async function handleGetProxyKeys(c: Context<AppEnv>) {
   const keys = await getProxyKeys(c.env)
   const maskedKeys = keys.map((k) => ({
     ...k,
@@ -513,7 +513,7 @@ export async function handleGetProxyKeys(c: Context<{ Bindings: Env }>) {
   return c.json<ApiResponse>({ success: true, data: maskedKeys })
 }
 
-export async function handleCreateProxyKey(c: Context<{ Bindings: Env }>) {
+export async function handleCreateProxyKey(c: Context<AppEnv>) {
   const body = await c.req.json<CreateProxyKeyRequest>()
   const id = crypto.randomUUID()
   const randomPart = crypto.randomUUID().replace(/-/g, '')
@@ -545,7 +545,7 @@ export async function handleCreateProxyKey(c: Context<{ Bindings: Env }>) {
   }, 201)
 }
 
-export async function handleDeleteProxyKey(c: Context<{ Bindings: Env }>) {
+export async function handleDeleteProxyKey(c: Context<AppEnv>) {
   const id = c.req.param('id')
   if (!id) return c.json<ApiResponse>({ success: false, message: '缺少 id 参数' }, 400)
   const deleted = await deleteProxyKey(c.env, id)
@@ -555,7 +555,7 @@ export async function handleDeleteProxyKey(c: Context<{ Bindings: Env }>) {
   return c.json<ApiResponse>({ success: true, message: '转发 Key 已删除' })
 }
 
-export async function handleUpdateProxyKey(c: Context<{ Bindings: Env }>) {
+export async function handleUpdateProxyKey(c: Context<AppEnv>) {
   const id = c.req.param('id')
   if (!id) return c.json<ApiResponse>({ success: false, message: '缺少 id 参数' }, 400)
   const body = await c.req.json<{ enabled?: boolean; allowedModels?: string[] }>()
@@ -572,7 +572,7 @@ export async function handleUpdateProxyKey(c: Context<{ Bindings: Env }>) {
 // ===== OAuth 设备码管理 =====
 
 /** 查询某 OAuth 提供商的连接状态（token 是否存在/过期时间） */
-export async function handleOAuthStatus(c: Context<{ Bindings: Env }>) {
+export async function handleOAuthStatus(c: Context<AppEnv>) {
   const id = c.req.param('id')
   if (!id) return c.json<ApiResponse>({ success: false, message: '缺少 id 参数' }, 400)
 
@@ -598,7 +598,7 @@ export async function handleOAuthStatus(c: Context<{ Bindings: Env }>) {
 }
 
 /** 发起 OAuth 设备码授权流程，返回授权链接与用户码 */
-export async function handleOAuthConnect(c: Context<{ Bindings: Env }>) {
+export async function handleOAuthConnect(c: Context<AppEnv>) {
   const id = c.req.param('id')
   if (!id) return c.json<ApiResponse>({ success: false, message: '缺少 id 参数' }, 400)
 
@@ -616,7 +616,7 @@ export async function handleOAuthConnect(c: Context<{ Bindings: Env }>) {
 }
 
 /** 轮询 OAuth 设备码授权结果 */
-export async function handleOAuthPoll(c: Context<{ Bindings: Env }>) {
+export async function handleOAuthPoll(c: Context<AppEnv>) {
   const id = c.req.param('id')
   if (!id) return c.json<ApiResponse>({ success: false, message: '缺少 id 参数' }, 400)
 
@@ -635,7 +635,7 @@ export async function handleOAuthPoll(c: Context<{ Bindings: Env }>) {
 }
 
 /** 断开 OAuth 连接，删除 KV 中的 token */
-export async function handleOAuthDisconnect(c: Context<{ Bindings: Env }>) {
+export async function handleOAuthDisconnect(c: Context<AppEnv>) {
   const id = c.req.param('id')
   if (!id) return c.json<ApiResponse>({ success: false, message: '缺少 id 参数' }, 400)
   await deleteOauthToken(c.env, id)
@@ -647,7 +647,7 @@ export async function handleOAuthDisconnect(c: Context<{ Bindings: Env }>) {
  * 回调 URL（含 ?code=...&state=...）粘贴回后台，此处校验 state 并换 token。
  * 对应 startOauthGeminiFlow 生成的授权链接。
  */
-export async function handleOAuthGeminiCallback(c: Context<{ Bindings: Env }>) {
+export async function handleOAuthGeminiCallback(c: Context<AppEnv>) {
   const id = c.req.param('id')
   if (!id) return c.json<ApiResponse>({ success: false, message: '缺少 id 参数' }, 400)
 
@@ -678,7 +678,7 @@ export async function handleOAuthGeminiCallback(c: Context<{ Bindings: Env }>) {
 }
 
 /** Cline 一键授权：发起 WorkOS 设备码流程，返回授权链接与设备码（与原项目 cline_oauth.py 一致） */
-export async function handleClineOAuthConnect(c: Context<{ Bindings: Env }>) {
+export async function handleClineOAuthConnect(c: Context<AppEnv>) {
   const id = c.req.param('id')
   if (!id) return c.json<ApiResponse>({ success: false, message: '缺少 id 参数' }, 400)
   const provider = await getProvider(c.env, id)
@@ -694,7 +694,7 @@ export async function handleClineOAuthConnect(c: Context<{ Bindings: Env }>) {
 }
 
 /** Cline 一键授权：轮询 WorkOS 授权结果，成功后自动把 refreshToken 存入账号池 */
-export async function handleClineOAuthPoll(c: Context<{ Bindings: Env }>) {
+export async function handleClineOAuthPoll(c: Context<AppEnv>) {
   const id = c.req.param('id')
   if (!id) return c.json<ApiResponse>({ success: false, message: '缺少 id 参数' }, 400)
   const provider = await getProvider(c.env, id)
@@ -748,7 +748,7 @@ function parseModelList(json: any): Array<{ id: string }> {
  *   当 JWT 域判断不确定或配置缺失时，自动尝试另一个域。
  * - 参考 cpa-plugin/models.go 的 callModelsAPI 实现。
  */
-export async function handleOAuthModels(c: Context<{ Bindings: Env }>) {
+export async function handleOAuthModels(c: Context<AppEnv>) {
   const id = c.req.param('id')
   if (!id) return c.json<ApiResponse>({ success: false, message: '缺少 id 参数' }, 400)
 
@@ -973,7 +973,7 @@ export async function writeLog(env: Env, type: LogEntry['type'], message: string
 }
 
 /** 获取日志列表（支持 limit / offset 分页） */
-export async function handleLogs(c: Context<{ Bindings: Env }>) {
+export async function handleLogs(c: Context<AppEnv>) {
   const limit = Math.min(Math.max(parseInt(c.req.query('limit') || '50'), 1), 200)
   const type = c.req.query('type') || ''
   const offset = Math.max(parseInt(c.req.query('offset') || '0'), 0)
@@ -1011,7 +1011,7 @@ export async function handleLogs(c: Context<{ Bindings: Env }>) {
 }
 
 /** 清除日志 */
-export async function handleLogsClear(c: Context<{ Bindings: Env }>) {
+export async function handleLogsClear(c: Context<AppEnv>) {
   const list = await c.env.KV.list({ prefix: LOG_PREFIX })
   for (const k of list.keys) {
     await c.env.KV.delete(k.name)
@@ -1020,7 +1020,7 @@ export async function handleLogsClear(c: Context<{ Bindings: Env }>) {
 }
 
 /** 获取/设置日志开关状态 */
-export async function handleLogConfig(c: Context<{ Bindings: Env }>) {
+export async function handleLogConfig(c: Context<AppEnv>) {
   if (c.req.method === 'POST') {
     const body = await c.req.json().catch(() => ({}))
     const enabled = body.enabled ? 'true' : 'false'

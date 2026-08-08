@@ -33,11 +33,17 @@ import {
 } from './admin'
 import { renderHomePage, renderLoginPage, renderAdminPage } from './pages'
 import { seedInitialData, getSession, getProviders } from './storage'
+import {
+  handleAnalyticsOverview,
+  handleAnalyticsTrend,
+  handleAnalyticsBreakdown,
+  handleUsageLogs,
+} from './analytics/admin-api'
 import { refreshAllOauthTokens } from './oauth'
 import { runAllCheckins, handleCheckinTrigger, handleCheckinStatus } from './checkin'
-import type { Env, Provider } from './types'
+import type { AppEnv, Env, Provider } from './types'
 
-const app = new Hono<{ Bindings: Env }>()
+const app = new Hono<AppEnv>()
 
 // ===== 全局中间件 =====
 app.use('*', cors())
@@ -108,6 +114,12 @@ app.post('/admin/api/oauth/:id/callback', handleOAuthGeminiCallback)
 // Cline 一键授权（WorkOS 设备码流程，登录后自动把 refreshToken 存入账号池）
 app.post('/admin/api/cline/oauth/:id/connect', handleClineOAuthConnect)
 app.post('/admin/api/cline/oauth/:id/poll', handleClineOAuthPoll)
+
+// Analytics Engine 总览与详细日志
+app.get('/admin/api/analytics/overview', handleAnalyticsOverview)
+app.get('/admin/api/analytics/trend', handleAnalyticsTrend)
+app.get('/admin/api/analytics/breakdown', handleAnalyticsBreakdown)
+app.get('/admin/api/usage-logs', handleUsageLogs)
 
 // 日志管理
 app.get('/admin/api/logs', handleLogs)

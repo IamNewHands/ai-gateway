@@ -13,6 +13,14 @@ mode = "smart"
 [[kv_namespaces]]
 binding = "KV"
 
+# Analytics Engine 数据集 — 记录代理请求用量统计
+[vars]
+USAGE_ANALYTICS_DATASET = "ai_gateway_usage"
+
+[[analytics_engine_datasets]]
+binding = "USAGE_ANALYTICS"
+dataset = "ai_gateway_usage"
+
 # 定时任务：OAuth token 刷新（每 2 小时）+ WorkBuddy 签到（每日 09:00/21:00 北京时间 = 01:00/13:00 UTC）
 [triggers]
 crons = ["0 */2 * * *", "0 1,13 * * *"]

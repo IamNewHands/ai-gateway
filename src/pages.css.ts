@@ -486,6 +486,72 @@ label, legend { color: var(--color-ink-2); font-size: var(--text-xs); font-weigh
   .btn, .icon-btn, .model-token, .password-toggle, input, select { min-height: var(--control-h); }
 }
 
+/* ===== Analytics Engine 面板 ===== */
+.analytics-metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+.analytics-metrics > div:nth-child(n+3) { border-block-end: 0; }
+.analytics-value { transition: opacity var(--dur-fast) ease; }
+.analytics-value.is-loading { opacity: .35; }
+.analytics-charts { display: grid; grid-template-columns: minmax(0, 1fr); gap: var(--space-sm); margin-block-start: var(--space-md); }
+.analytics-chart-panel { min-width: 0; padding: var(--space-md); border: .0625rem solid var(--color-rule-2); border-radius: var(--radius-panel); background: var(--color-paper-2); }
+.analytics-chart-panel .panel-heading { margin-block-end: var(--space-sm); }
+.analytics-empty { min-height: 8rem; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: var(--space-2xs); color: var(--color-muted); font-size: var(--text-xs); }
+.analytics-empty > i { font-size: var(--text-lg); }
+.trend-svg { width: 100%; height: auto; max-height: 14rem; overflow: visible; }
+.trend-axis { stroke: var(--color-rule-2); stroke-width: 1; }
+.trend-line { fill: none; stroke: var(--color-accent); stroke-width: 2; stroke-linejoin: round; stroke-linecap: round; }
+.trend-point { fill: var(--color-accent); cursor: pointer; }
+.ranking-row { min-width: 0; min-height: 2.5rem; padding: var(--space-2xs) 0; display: flex; align-items: center; gap: var(--space-xs); border-block-end: .0625rem solid var(--color-rule); }
+.ranking-row:last-child { border-block-end: 0; }
+.ranking-index { width: 1.5rem; flex: 0 0 auto; color: var(--color-muted); font-family: var(--font-mono); font-size: var(--text-xs); font-weight: 600; text-align: center; }
+.ranking-main { min-width: 0; flex: 1; }
+.ranking-main > div { min-width: 0; display: flex; align-items: center; justify-content: space-between; gap: var(--space-2xs); }
+.ranking-main code { min-width: 0; overflow: hidden; font-size: var(--text-xs); text-overflow: ellipsis; white-space: nowrap; }
+.ranking-main span { flex-shrink: 0; color: var(--color-muted); font-size: var(--text-xs); }
+.ranking-track { display: block; height: .375rem; margin-block-start: var(--space-3xs); border-radius: var(--radius-round); background: var(--color-paper-3); overflow: hidden; }
+.ranking-track i { display: block; height: 100%; border-radius: var(--radius-round); background: var(--color-accent-soft); transition: width var(--dur-panel) var(--ease-out); }
+.range-group { display: inline-flex; border: .0625rem solid var(--color-rule-2); border-radius: var(--radius-control); overflow: hidden; }
+.range-group .btn { min-height: 2rem; padding-inline: var(--space-xs); border: 0; border-radius: 0; font-size: var(--text-xs); }
+.range-group .btn.is-active { background: var(--color-accent-soft); color: var(--color-focus); }
+.range-group .btn + .btn { border-inline-start: .0625rem solid var(--color-rule-2); }
+.usage-log-table-wrap { min-width: 0; overflow-x: auto; margin-block-start: var(--space-sm); }
+.usage-log-table { width: 100%; border-collapse: collapse; font-size: var(--text-xs); }
+.usage-log-table th, .usage-log-table td { min-width: 0; padding: var(--space-2xs) var(--space-xs); border-block-end: .0625rem solid var(--color-rule); text-align: left; white-space: nowrap; }
+.usage-log-table th { background: var(--color-paper-2); color: var(--color-muted); font-weight: 600; }
+.usage-log-table td.numeric { text-align: right; font-family: var(--font-mono); }
+.usage-log-table code { font-size: var(--text-xs); }
+.usage-log-cards { display: none; }
+.analytics-log-filters { display: grid; grid-template-columns: minmax(0, 1fr); gap: var(--space-2xs); margin-block: var(--space-sm); padding: var(--space-sm); border: .0625rem solid var(--color-rule); border-radius: var(--radius-control); background: var(--color-paper-2); }
+.analytics-log-filters .fg { margin-block-end: 0; }
+.analytics-log-filters select, .analytics-log-filters input { height: 2.25rem; font-size: var(--text-xs); }
+.analytics-log-pagination { display: flex; align-items: center; justify-content: center; gap: var(--space-sm); margin-block-start: var(--space-sm); }
+.log-detail-grid { display: grid; grid-template-columns: minmax(6rem, auto) minmax(0, 1fr); gap: var(--space-2xs) var(--space-xs); font-size: var(--text-xs); }
+.log-detail-grid dt { color: var(--color-muted); font-weight: 600; }
+.log-detail-grid dd { min-width: 0; overflow-wrap: anywhere; }
+.log-detail-heading { display: flex; align-items: flex-start; justify-content: space-between; gap: var(--space-sm); margin-block-end: var(--space-sm); }
+.log-detail-heading h3 { font-size: var(--text-md); }
+.log-detail-heading p { color: var(--color-muted); font-size: var(--text-xs); }
+
+@media (min-width: 40rem) {
+  .analytics-metrics { grid-template-columns: repeat(5, minmax(0, 1fr)); }
+  .analytics-metrics > div:nth-child(even) { border-inline-end: .0625rem solid var(--color-rule); }
+  .analytics-metrics > div:last-child { border-inline-end: 0; }
+  .analytics-charts { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); }
+  .analytics-charts > .analytics-chart-panel:first-child { grid-column: 1 / -1; }
+  .analytics-log-filters { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+  .usage-log-table { display: table; }
+  .usage-log-cards { display: none; }
+}
+
+@media (max-width: 39.999rem) {
+  .usage-log-table { display: none; }
+  .usage-log-cards { display: grid; grid-template-columns: minmax(0, 1fr); gap: var(--space-2xs); }
+  .log-card { width: 100%; min-width: 0; padding: var(--space-sm); display: flex; flex-direction: column; gap: var(--space-3xs); border: .0625rem solid var(--color-rule); border-radius: var(--radius-control); background: var(--color-paper); color: var(--color-ink-2); font: inherit; font-size: var(--text-xs); cursor: pointer; text-align: left; }
+  .log-card:hover { border-color: var(--color-rule-2); }
+  .log-card > span { display: flex; align-items: center; justify-content: space-between; gap: var(--space-2xs); }
+  .log-card code { min-width: 0; overflow: hidden; font-size: var(--text-xs); text-overflow: ellipsis; white-space: nowrap; }
+  .log-card small { color: var(--color-muted); }
+}
+
 @media (prefers-reduced-motion: reduce) {
   html, body { scroll-behavior: auto; }
   *, *::before, *::after { animation-duration: .001ms !important; animation-iteration-count: 1 !important; transition-duration: .001ms !important; }

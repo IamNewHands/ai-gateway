@@ -1,7 +1,10 @@
 import { Context } from 'hono'
 import { getProvider, getProviders } from './storage'
 import { KV_KEYS, KEY_HEALTH_COOLDOWN_MS, KEY_HEALTH_MAX_FAILURES } from './config'
-import type { Env, ProxyRequestBody } from './types'
+import type { AppEnv, Env, ProxyRequestBody } from './types'
+import { createAnalyticsContext, normalizeAnthropicUsage, normalizeChatUsage, normalizeResponsesUsage, summarizeError } from './analytics/types'
+import type { AnalyticsContext, UsageMetrics } from './analytics/types'
+import { observeStreamUsage, writeAnalyticsEvent } from './analytics/usage-logger'
 import { isOpenCodeProvider, proxyOpenCodeRequest, resolveOpenCodeUrls } from './opencode'
 import { isQoderProvider, proxyQoderChatRequest } from './qoder/proxy'
 import { isClineProvider, proxyClineChatRequest } from './cline/proxy'
@@ -418,6 +421,68 @@ function passthroughResponse(response: Response, cleanFn?: (chunk: string) => st
   })
 }
 
+const isStreamRequest = (body: ProxyRequestBody): boolean => body.stream === true
+const getRoute = (url: URL): string => url.pathname.replace(/^\/v1\//, '') || 'chat/completions'
+
+const normalizeUsage = (route: string, provider: import('./types').Provider, payload: unknown): UsageMetrics | null => {
+  if (route === 'responses') return normalizeResponsesUsage(payload)
+  if (route === 'messages' || provider.apiType === 'anthropic') return normalizeAnthropicUsage(payload)
+  return normalizeChatUsage(payload)
+}
+
+const readErrorResponse = async (response: Response): Promise<{ payload: unknown; summary: string }> => {
+  const text = await response.text().catch(() => '')
+  try {
+    const payload: unknown = JSON.parse(text)
+    return { payload, summary: summarizeError(payload) }
+  } catch {
+    return { payload: { error: { message: text || `HTTP ${response.status}` } }, summary: summarizeError(text || `HTTP ${response.status}`) }
+  }
+}
+
+const finalizeProxyResponse = async (
+  c: Context<AppEnv>,
+  response: Response,
+  context: AnalyticsContext,
+  route: string,
+): Promise<Response> => {
+  const headers = new Headers(response.headers)
+  headers.set('Cache-Control', 'no-store')
+  if (!response.body) {
+    writeAnalyticsEvent(c, { context, result: 'success', upstreamStatus: response.status })
+    return new Response(null, { status: response.status, statusText: response.statusText, headers })
+  }
+
+  const [clientStream, observerStream] = response.body.tee()
+  c.executionCtx.waitUntil((async () => {
+    let usage: UsageMetrics | undefined
+    if (context.streamMode === 'stream') {
+      await observeStreamUsage(observerStream, '', (value) => {
+        usage = usage ? {
+          promptTokens: Math.max(usage.promptTokens, value.promptTokens),
+          completionTokens: Math.max(usage.completionTokens, value.completionTokens),
+          cachedTokens: Math.max(usage.cachedTokens, value.cachedTokens),
+          totalTokens: Math.max(usage.totalTokens, value.totalTokens),
+        } : value
+      })
+    } else {
+      const contentType = headers.get('Content-Type') || ''
+      if (contentType.includes('json')) {
+        const observerResponse = new Response(observerStream, { headers })
+        const payload = await observerResponse.json().catch(() => null) as unknown
+        usage = normalizeUsage(route, { apiType: 'openai' } as import('./types').Provider, payload) || undefined
+      } else {
+        await observerStream.cancel()
+      }
+    }
+    writeAnalyticsEvent(c, { context, result: 'success', usage, upstreamStatus: response.status })
+  })().catch((error) => {
+    writeAnalyticsEvent(c, { context, result: 'success', upstreamStatus: response.status, errorSummary: summarizeError(error) })
+  }))
+
+  return new Response(clientStream, { status: response.status, statusText: response.statusText, headers })
+}
+
 /** 测试模型连接，发送最小请求验证 */
 export async function testModelConnection(
   baseUrl: string,
@@ -475,12 +540,22 @@ export async function testModelConnection(
 }
 
 /** 处理 /v1/chat/completions 等 API 转发（HTTP 路径） */
-export async function handleProxy(c: Context<{ Bindings: Env }>) {
+export async function handleProxy(c: Context<AppEnv>): Promise<Response> {
+  const url = new URL(c.req.url)
+  const route = getRoute(url)
+  const proxyKey = c.get('proxyKey') || null
+  const proxyKeyHash = c.get('proxyKeyHash') || ''
+  let context = createAnalyticsContext(c, proxyKey, proxyKeyHash, route, '', 'sync')
+
   try {
     const body = await c.req.json<ProxyRequestBody>()
-    return await forwardProxy(c, body, c.req.method)
+    const model = body.model || ''
+    context = createAnalyticsContext(c, proxyKey, proxyKeyHash, route, model, isStreamRequest(body) ? 'stream' : 'sync')
+    const response = await forwardProxy(c, body, c.req.method)
+    return finalizeProxyResponse(c, response, context, route)
   } catch (err) {
     const error = err as Error
+    writeAnalyticsEvent(c, { context, result: 'failure', errorSummary: summarizeError(error) })
     return c.json({
       error: { message: error.message || '代理转发内部错误', type: 'server_error' },
     }, 500)
@@ -516,7 +591,7 @@ async function transcribeImagesForProvider(
  * @param method 请求方法，HTTP 路径默认取 c.req.method；WS 桥接强制传 'POST'
  */
 export async function forwardProxy(
-  c: Context<{ Bindings: Env }>,
+  c: Context<AppEnv>,
   body: ProxyRequestBody,
   method: string = c.req.method
 ): Promise<Response> {
@@ -846,7 +921,7 @@ export async function forwardProxy(
  * 参考 cpa-plugin/models.go 的域路由逻辑。
  */
 async function proxyOAuthRequest(
-  c: Context<{ Bindings: Env }>,
+  c: Context<AppEnv>,
   provider: import('./types').Provider,
   subPath: string,
   search: string,
@@ -965,7 +1040,7 @@ async function proxyOAuthRequest(
 }
 
 /** 处理 /v1/models — 返回所有已启用的模型（含提供商前缀） */
-export async function handleModels(c: Context<{ Bindings: Env }>) {
+export async function handleModels(c: Context<AppEnv>) {
   const providers = await getProviders(c.env)
   // 从中间件获取转发 Key（可能带有 allowedModels 过滤）
   const proxyKey = (c as any).get('proxyKey') as import('./types').ProxyKey | undefined
@@ -1011,7 +1086,7 @@ export async function handleModels(c: Context<{ Bindings: Env }>) {
 //  调用 WorkBuddy 上游，再将响应转回 Anthropic 格式。
 // ============================================================
 
-export async function handleAnthropicMessages(c: Context<{ Bindings: Env }>) {
+export async function handleAnthropicMessages(c: Context<AppEnv>) {
   try {
     const anthropicBody = await c.req.json<Record<string, unknown>>()
     const model = anthropicBody['model'] as string
@@ -1460,7 +1535,7 @@ export async function handleAnthropicMessages(c: Context<{ Bindings: Env }>) {
  * 已把嵌套 SSE 解成 OpenAI SSE）→ 再转回 Anthropic SSE。转换逻辑与 WorkBuddy 分支一致。
  */
 async function handleAnthropicQoder(
-  c: Context<{ Bindings: Env }>,
+  c: Context<AppEnv>,
   provider: import('./types').Provider,
   model: string,
   openaiBody: Record<string, unknown>,
@@ -1608,7 +1683,7 @@ async function handleAnthropicQoder(
  * 将 primary 的 OpenAI 响应转回 Anthropic 格式（流式 / 非流式）。
  */
 async function handleAnthropicVisionBridge(
-  c: Context<{ Bindings: Env }>,
+  c: Context<AppEnv>,
   provider: import('./types').Provider,
   model: string,
   openaiBody: Record<string, unknown>,
@@ -1743,7 +1818,7 @@ async function handleAnthropicVisionBridge(
  * 已把嵌套 SSE 解成 OpenAI SSE）→ 再转回 Anthropic SSE。转换逻辑与 qoder 分支一致。
  */
 async function handleAnthropicCline(
-  c: Context<{ Bindings: Env }>,
+  c: Context<AppEnv>,
   provider: import('./types').Provider,
   model: string,
   openaiBody: Record<string, unknown>,
@@ -1890,7 +1965,7 @@ async function handleAnthropicCline(
  * 已把 Gemini 响应解包成 OpenAI SSE）→ 再转回 Anthropic SSE。转换逻辑与 qoder 分支一致。
  */
 async function handleAnthropicGemini(
-  c: Context<{ Bindings: Env }>,
+  c: Context<AppEnv>,
   provider: import('./types').Provider,
   model: string,
   openaiBody: Record<string, unknown>,
@@ -2038,7 +2113,7 @@ async function handleAnthropicGemini(
 //  再将响应转回 Responses 格式。
 // ============================================================
 
-export async function handleResponses(c: Context<{ Bindings: Env }>) {
+export async function handleResponses(c: Context<AppEnv>) {
   try {
     const responsesBody = await c.req.json<Record<string, unknown>>()
     const model = responsesBody['model'] as string
@@ -2425,7 +2500,7 @@ export async function handleResponses(c: Context<{ Bindings: Env }>) {
  * 将 primary 的 OpenAI 响应转回 Responses 格式（流式 / 非流式）。
  */
 async function handleResponsesVisionBridge(
-  c: Context<{ Bindings: Env }>,
+  c: Context<AppEnv>,
   provider: import('./types').Provider,
   model: string,
   openaiBody: Record<string, unknown>,
@@ -2558,7 +2633,7 @@ async function handleResponsesVisionBridge(
  * 已把 Gemini 响应解包成 OpenAI SSE）→ 再转回 Responses SSE。转换逻辑与 OAuth 分支一致。
  */
 async function handleResponsesGemini(
-  c: Context<{ Bindings: Env }>,
+  c: Context<AppEnv>,
   provider: import('./types').Provider,
   model: string,
   openaiBody: Record<string, unknown>,

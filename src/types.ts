@@ -289,4 +289,27 @@ export interface Env {
   /** Gemini OAuth 客户端凭据（官方公开凭据，避免硬编码进代码） */
   GEMINI_OAUTH_CLIENT_ID?: string
   GEMINI_OAUTH_CLIENT_SECRET?: string
+  USAGE_ANALYTICS?: AnalyticsEngineDatasetBinding
+  USAGE_ANALYTICS_DATASET?: string
+  CF_ACCOUNT_ID?: string
+  CF_API_TOKEN?: string
+}
+
+export interface AnalyticsEngineDatasetBinding {
+  writeDataPoint(point: {
+    indexes?: string[]
+    blobs?: string[]
+    doubles?: number[]
+  }): void
+}
+
+export interface AppVariables {
+  username?: string
+  proxyKey?: ProxyKey
+  proxyKeyHash?: string
+}
+
+export type AppEnv = {
+  Bindings: Env
+  Variables: AppVariables
 }

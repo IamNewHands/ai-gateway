@@ -103,7 +103,7 @@ export async function updateProxyKey(env: Env, id: string, updates: Partial<Prox
   return keys[idx]
 }
 
-export async function validateProxyKey(env: Env, key: string): Promise<ProxyKey | null> {
+export async function getValidProxyKey(env: Env, key: string): Promise<ProxyKey | null> {
   const keys = await getProxyKeys(env)
   const found = keys.find((k) => {
     if (k.key !== key || !k.enabled) return false

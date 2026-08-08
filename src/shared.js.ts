@@ -1,3 +1,14 @@
+// 公共页脚渲染函数 — 主页与 /admin 页复用，保证两处页脚一致
+export const SITE_REPO_URL = 'https://github.com/IamNewHands/ai-gateway'
+export function renderSiteFooter(title: string): string {
+  return `<footer class="site-footer">
+  <div class="shell site-footer__inner">
+    <span>© \${new Date().getFullYear()} <a class="site-footer__link" href="\${SITE_REPO_URL}" target="_blank" rel="noreferrer">\${title}</a></span>
+    <span>Cloudflare Workers · Hono · KV</span>
+  </div>
+</footer>`
+}
+
 // 共享 JS 工具函数 — 注入到后台页面的 <script> 块中
 export const SHARED_JS = `
 // ── 工具函数 ──
