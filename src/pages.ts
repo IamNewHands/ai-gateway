@@ -415,7 +415,7 @@ ${H('管理')}
         </div>
       </section>
       <section id="logs" class="workspace-section" aria-labelledby="logs-title">
-        <div class="section-heading section-heading--admin"><div><h2 id="logs-title">系统日志</h2><p>记录 API 请求、错误等关键信息。</p></div><div><label class="tg"><input type="checkbox" id="log-switch" onchange="toggleLog(this.checked)"><span class="sl"></span></label><span id="log-status">已关闭</span><button class="btn btn-gh btn-xs" onclick="logPageChange(1)" style="margin-left:8px" title="刷新（回到第一页）"><i class="fas fa-sync-alt"></i></button><button class="btn btn-d btn-xs" onclick="clearLogs()" style="margin-left:4px">清除</button></div></div>
+        <div class="section-heading section-heading--admin"><div><h2 id="logs-title">系统日志</h2><p>记录 API 请求、错误等关键信息。</p></div><div><label class="tg"><input type="checkbox" id="log-switch" onchange="toggleLog(this.checked)"><span class="sl"></span></label><span id="log-status">已关闭</span><label class="tg" style="margin-left:8px" title="定时自动刷新日志，便于排查问题"><input type="checkbox" id="log-auto-on" onchange="logAutoToggle(this.checked)"><span class="sl"></span></label><input type="number" id="log-auto-sec" min="1" max="3600" value="5" style="width:58px;text-align:center;font-size:12px;padding:2px 4px;border-radius:6px;border:1px solid var(--border,#e2e8f0);background:var(--card,#fff);color:inherit;margin-left:6px" onchange="logAutoSecChange()"><span class="mu" style="font-size:12px;margin-left:4px">秒自动刷新</span><button class="btn btn-gh btn-xs" onclick="logPageChange(1)" style="margin-left:8px" title="刷新（回到第一页）"><i class="fas fa-sync-alt"></i></button><button class="btn btn-d btn-xs" onclick="clearLogs()" style="margin-left:4px">清除</button></div></div>
         <div id="log-list" class="key-list">
           <div class="empty-state"><i class="fas fa-list-alt" aria-hidden="true"></i><h3>暂无日志</h3><p>开启日志开关后，API 请求和错误会被记录。</p></div>
         </div>
@@ -1396,7 +1396,7 @@ adminNavLinks.forEach(function (link) {
 window.addEventListener('hashchange', function () { setActiveAdminNav(location.hash) })
 setActiveAdminNav(location.hash)
 
-// 进入签到区块时懒加载签到状态（首次访问 #checkin 触发）
+// 签到状态：页面加载后总是加载一次（区块同屏展示，避免签到区默认停在静态占位）；进入 #checkin 时再刷新
 function maybeLoadCheckin(hash) { if (hash === '#checkin') loadCheckin() }
 window.addEventListener('hashchange', function () { maybeLoadCheckin(location.hash) })
 adminNavLinks.forEach(function (link) {
@@ -1404,7 +1404,7 @@ adminNavLinks.forEach(function (link) {
     link.addEventListener('click', function () { setTimeout(loadCheckin, 50) })
   }
 })
-maybeLoadCheckin(location.hash)
+setTimeout(loadCheckin, 0)
 
 // 通过 ?connect=id 进入时自动发起 OAuth 登录（"创建并发起连接"按钮创建后跳转过来）
 ;(function () {
@@ -1417,8 +1417,31 @@ maybeLoadCheckin(location.hash)
 
 // ===== 日志系统 =====
 var logAutoRefreshTimer = null
+var logAutoRefreshSec = 5
+var logRefreshing = false
 var logPage = 1
 var logPageSize = 50
+function persistLogAuto() {
+  try { localStorage.setItem('kv-log-auto', JSON.stringify({ on: document.getElementById('log-auto-on').checked, sec: Math.max(1, parseInt(document.getElementById('log-auto-sec').value) || 5) })) } catch (e) { /* 忽略 */ }
+}
+function startLogAutoRefresh() {
+  stopLogAutoRefresh()
+  logAutoRefreshSec = Math.max(1, parseInt(document.getElementById('log-auto-sec').value) || 5)
+  logAutoRefreshTimer = setInterval(function () {
+    if (document.getElementById('log-switch').checked) refreshLogs()
+  }, logAutoRefreshSec * 1000)
+}
+function stopLogAutoRefresh() {
+  if (logAutoRefreshTimer) { clearInterval(logAutoRefreshTimer); logAutoRefreshTimer = null }
+}
+function logAutoToggle(on) {
+  if (on) startLogAutoRefresh(); else stopLogAutoRefresh()
+  persistLogAuto()
+}
+function logAutoSecChange() {
+  if (document.getElementById('log-auto-on').checked) startLogAutoRefresh()
+  persistLogAuto()
+}
 ;(function initLogs() {
   fetch('/admin/api/logs/config').then(r => r.json()).then(d => {
     if (d.success) {
@@ -1427,6 +1450,14 @@ var logPageSize = 50
       if (d.data.enabled) refreshLogs()
     }
   })
+  // 恢复上次的自动刷新设置
+  try {
+    const cfg = JSON.parse(localStorage.getItem('kv-log-auto') || 'null')
+    if (cfg) {
+      document.getElementById('log-auto-sec').value = cfg.sec || 5
+      if (cfg.on) { document.getElementById('log-auto-on').checked = true; startLogAutoRefresh() }
+    }
+  } catch (e) { /* 忽略 */ }
 })()
 
 async function toggleLog(on) {
@@ -1440,43 +1471,49 @@ async function toggleLog(on) {
 }
 
 async function refreshLogs() {
+  if (logRefreshing) return
+  logRefreshing = true
   const el = document.getElementById('log-list')
   el.innerHTML = '<div class="empty-state"><i class="fas fa-spinner fa-pulse"></i><h3>加载中…</h3></div>'
   try {
-    const r = await fetch('/admin/api/logs?limit=' + logPageSize + '&offset=' + ((logPage - 1) * logPageSize))
-    const d = await r.json()
-    if (!d.success || !d.data.logs || d.data.logs.length === 0) {
-      // 当前页无数据：若不在第一页则回退一页重新加载（如日志被清除）
-      if (logPage > 1) { logPage--; refreshLogs(); return }
-      el.innerHTML = '<div class="empty-state"><i class="fas fa-list-alt" aria-hidden="true"></i><h3>暂无日志</h3><p>开启开关后 API 请求会被记录。</p></div>'
-      return
+    try {
+      const r = await fetch('/admin/api/logs?limit=' + logPageSize + '&offset=' + ((logPage - 1) * logPageSize))
+      const d = await r.json()
+      if (!d.success || !d.data.logs || d.data.logs.length === 0) {
+        // 当前页无数据：若不在第一页则回退一页重新加载（如日志被清除）
+        if (logPage > 1) { logPage--; logRefreshing = false; refreshLogs(); return }
+        el.innerHTML = '<div class="empty-state"><i class="fas fa-list-alt" aria-hidden="true"></i><h3>暂无日志</h3><p>开启开关后 API 请求会被记录。</p></div>'
+        return
+      }
+      var html = ''
+      d.data.logs.forEach(function(log) {
+        var icon = log.type === 'error' ? '<i class="fas fa-times-circle c-l"></i>'
+          : log.type === 'warn' ? '<i class="fas fa-exclamation-triangle c-o"></i>'
+          : log.type === 'request' ? '<i class="fas fa-check-circle c-g"></i>'
+          : '<i class="fas fa-info-circle c-p"></i>'
+        var time = new Date(log.time).toLocaleString()
+        html += '<article class="ki" style="font-size:12px;padding:6px 10px"><div><span style="margin-right:8px">' + icon + '</span><span class="mu" style="margin-right:8px">' + escapeHtml(time) + '</span><span class="bd bd-' + (log.type==='error'?'off':'on') + '">' + log.type + '</span></div><div style="margin-top:4px">' + escapeHtml(log.message) + '</div>' + (log.details ? '<details style="margin-top:4px"><summary>详情</summary><pre style="white-space:pre-wrap;font-size:11px;max-height:200px;overflow:auto">' + escapeHtml(log.details) + '</pre></details>' : '') + '</article>'
+      })
+      // 分页条
+      var totalPages = Math.max(1, Math.ceil(d.data.total / logPageSize))
+      var sizeOpts = [5, 10, 15, 20, 50, 100]
+      var sizeHtml = '<select onchange="logPageSizeChange(this.value)" style="font-size:12px;padding:2px 4px;border-radius:6px;border:1px solid var(--border,#e2e8f0);background:var(--card,#fff);color:inherit">'
+      for (var s = 0; s < sizeOpts.length; s++) {
+        sizeHtml += '<option value="' + sizeOpts[s] + '"' + (sizeOpts[s] === logPageSize ? ' selected' : '') + '>' + sizeOpts[s] + ' 条/页</option>'
+      }
+      sizeHtml += '</select>'
+      html += '<div style="padding:10px;display:flex;align-items:center;justify-content:center;gap:8px;flex-wrap:wrap">'
+      html += '<button class="btn btn-gh btn-xs" onclick="logPageChange(' + (logPage - 1) + ')" ' + (logPage <= 1 ? 'disabled' : '') + '><i class="fas fa-chevron-left"></i>上一页</button>'
+      html += '<span class="mu" style="font-size:12px">第 ' + logPage + ' / ' + totalPages + ' 页 · 共 ' + d.data.total + ' 条</span>'
+      html += '<button class="btn btn-gh btn-xs" onclick="logPageChange(' + (logPage + 1) + ')" ' + (logPage >= totalPages ? 'disabled' : '') + '>下一页<i class="fas fa-chevron-right"></i></button>'
+      html += '<span class="mu" style="font-size:12px">' + sizeHtml + '</span>'
+      html += '</div>'
+      el.innerHTML = html
+    } catch(e) {
+      el.innerHTML = '<div class="empty-state"><i class="fas fa-exclamation-triangle c-l"></i><h3>加载失败</h3></div>'
     }
-    var html = ''
-    d.data.logs.forEach(function(log) {
-      var icon = log.type === 'error' ? '<i class="fas fa-times-circle c-l"></i>'
-        : log.type === 'warn' ? '<i class="fas fa-exclamation-triangle c-o"></i>'
-        : log.type === 'request' ? '<i class="fas fa-check-circle c-g"></i>'
-        : '<i class="fas fa-info-circle c-p"></i>'
-      var time = new Date(log.time).toLocaleString()
-      html += '<article class="ki" style="font-size:12px;padding:6px 10px"><div><span style="margin-right:8px">' + icon + '</span><span class="mu" style="margin-right:8px">' + escapeHtml(time) + '</span><span class="bd bd-' + (log.type==='error'?'off':'on') + '">' + log.type + '</span></div><div style="margin-top:4px">' + escapeHtml(log.message) + '</div>' + (log.details ? '<details style="margin-top:4px"><summary>详情</summary><pre style="white-space:pre-wrap;font-size:11px;max-height:200px;overflow:auto">' + escapeHtml(log.details) + '</pre></details>' : '') + '</article>'
-    })
-    // 分页条
-    var totalPages = Math.max(1, Math.ceil(d.data.total / logPageSize))
-    var sizeOpts = [5, 10, 15, 20, 50, 100]
-    var sizeHtml = '<select onchange="logPageSizeChange(this.value)" style="font-size:12px;padding:2px 4px;border-radius:6px;border:1px solid var(--border,#e2e8f0);background:var(--card,#fff);color:inherit">'
-    for (var s = 0; s < sizeOpts.length; s++) {
-      sizeHtml += '<option value="' + sizeOpts[s] + '"' + (sizeOpts[s] === logPageSize ? ' selected' : '') + '>' + sizeOpts[s] + ' 条/页</option>'
-    }
-    sizeHtml += '</select>'
-    html += '<div style="padding:10px;display:flex;align-items:center;justify-content:center;gap:8px;flex-wrap:wrap">'
-    html += '<button class="btn btn-gh btn-xs" onclick="logPageChange(' + (logPage - 1) + ')" ' + (logPage <= 1 ? 'disabled' : '') + '><i class="fas fa-chevron-left"></i>上一页</button>'
-    html += '<span class="mu" style="font-size:12px">第 ' + logPage + ' / ' + totalPages + ' 页 · 共 ' + d.data.total + ' 条</span>'
-    html += '<button class="btn btn-gh btn-xs" onclick="logPageChange(' + (logPage + 1) + ')" ' + (logPage >= totalPages ? 'disabled' : '') + '>下一页<i class="fas fa-chevron-right"></i></button>'
-    html += '<span class="mu" style="font-size:12px">' + sizeHtml + '</span>'
-    html += '</div>'
-    el.innerHTML = html
-  } catch(e) {
-    el.innerHTML = '<div class="empty-state"><i class="fas fa-exclamation-triangle c-l"></i><h3>加载失败</h3></div>'
+  } finally {
+    logRefreshing = false
   }
 }
 
