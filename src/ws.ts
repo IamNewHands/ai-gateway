@@ -1,7 +1,7 @@
 import { Context } from 'hono'
 import { forwardProxy } from './proxy'
 import { writeLog } from './admin'
-import type { Env } from './types'
+import type { AppEnv } from './types'
 
 /**
  * WS 首帧摘要：只记录 model/消息数量/内容长度等结构信息，
@@ -35,7 +35,7 @@ function summarizeWsFrame(text: string): string {
  *   4. 将上游响应体（SSE 流或 JSON）分块以 WS 文本帧回推
  *   5. 流结束后关闭连接
  */
-export async function handleProxyWebSocket(c: Context<{ Bindings: Env }>) {
+export async function handleProxyWebSocket(c: Context<AppEnv>) {
   const upgrade = (c.req.header('Upgrade') || '').toLowerCase()
   if (upgrade !== 'websocket' && !c.req.header('Sec-WebSocket-Key')) {
     return c.json({ error: { message: '需要 WebSocket 升级请求', type: 'invalid_request_error' } }, 400)

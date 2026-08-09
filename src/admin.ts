@@ -19,6 +19,7 @@ import { PROXY_KEY_PREFIX, EXPIRY_OPTIONS, OPENCODE_DEFAULT_URL } from './config
 import { startOauthDeviceFlow, pollOauthDeviceFlow, readOauthToken, deleteOauthToken, getOauthAccessToken, buildOauthHeaders, detectTokenRealm, submitOauthGeminiCallback } from './oauth'
 import type {
   AppEnv,
+  Env,
   ApiResponse,
   Provider,
   ApiKeyEntry,
