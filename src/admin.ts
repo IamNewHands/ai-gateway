@@ -140,8 +140,20 @@ export async function handleStatus(c: Context<AppEnv>) {
 
 // ===== 提供商 CRUD =====
 
+/** S8a：对外管理 API 脱敏——只保留 Key 末尾 4 位，绝不把完整 apiKey 泄出到 /api/manage/* */
+function maskApiKeys(providers: Provider[]): Provider[] {
+  return providers.map((p) => ({
+    ...p,
+    apiKeys: p.apiKeys.map((k) => ({ enabled: k.enabled, key: k.key.length > 4 ? `****${k.key.slice(-4)}` : '****' })),
+  }))
+}
+
 export async function handleGetProviders(c: Context<AppEnv>) {
   const providers = await getProviders(c.env)
+  // /api/manage/*（外部管理 API）一律脱敏；/admin/api/*（浏览器后台）保持原样以便编辑
+  if (new URL(c.req.url).pathname.startsWith('/api/manage/')) {
+    return c.json<ApiResponse<Provider[]>>({ success: true, data: maskApiKeys(providers) })
+  }
   return c.json<ApiResponse<Provider[]>>({ success: true, data: providers })
 }
 

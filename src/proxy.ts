@@ -127,6 +127,22 @@ function summarizeRequestBody(body: Record<string, unknown>): Record<string, unk
 }
 
 /**
+ * 清洗上游错误文本后再回显给客户端（S8）：
+ * - 截断到安全长度，避免上游返回超大/恶意 body 时整段回显
+ * - 仅保留可打印 ASCII 与常见 CJK，剥离控制字符/转义序列（防终端注入与日志逃逸）
+ * - 移除疑似内网/元数据地址与「Authorization/Bearer」等敏感字样的裸露段
+ */
+function sanitizeUpstreamError(text: string, max = 400): string {
+  const raw = String(text || '')
+  const noControl = raw.replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/g, '')
+  const cleaned = noControl
+    .replace(/https?:\/\/(?:[0-9]{1,3}\.){3}[0-9]{1,3}[^\s'"]*/gi, '')
+    .replace(/https?:\/\/(?:localhost|127\.0\.0\.1|10\.|172\.(?:1[6-9]|2\d|3[01])\.|192\.168\.)[^\s'"]*/gi, '')
+    .replace(/(authorization|proxy-authorization|api[_-]?key|bearer)\s*[:=]\s*\S+/gi, '$1: ***')
+  return cleaned.slice(0, max)
+}
+
+/**
  * 清理被 Tencent CodeBuddy 内容过滤器屏蔽的 Claude Code 模板短语。
  * CPA 使用零宽空格 \u200B 插入到短语中来绕过精确匹配过滤。
  */
@@ -1380,7 +1396,7 @@ export async function handleAnthropicMessages(c: Context<AppEnv>) {
         } catch { /* log failure must not break request */ }
         return c.json({
           type: 'error',
-          error: { type: 'upstream_error', message: `Upstream error: ${errText}` },
+          error: { type: 'upstream_error', message: `Upstream error: ${sanitizeUpstreamError(errText)}` },
         }, response.status as Parameters<typeof c.json>[1])
       }
 
@@ -1552,7 +1568,7 @@ export async function handleAnthropicMessages(c: Context<AppEnv>) {
       try { c.executionCtx.waitUntil(writeLog(c.env, 'error', `[anthropic] ${model} → failover 全部失败 ${forwardUrl}`, JSON.stringify({ error: lastErrText, body: summarizeRequestBody(upstreamBody), url: forwardUrl }).substring(0, 4000))) } catch {}
       return c.json({
         type: 'error',
-        error: { type: 'upstream_error', message: `Upstream error: ${lastErrText}` },
+        error: { type: 'upstream_error', message: `Upstream error: ${sanitizeUpstreamError(lastErrText)}` },
       }, lastStatus as Parameters<typeof c.json>[1])
     }
 
@@ -1691,7 +1707,7 @@ async function handleAnthropicQoder(
     } catch { /* log failure must not break request */ }
     return c.json({
       type: 'error',
-      error: { type: 'upstream_error', message: `Upstream error: ${errText}` },
+      error: { type: 'upstream_error', message: `Upstream error: ${sanitizeUpstreamError(errText)}` },
     }, response.status as Parameters<typeof c.json>[1])
   }
 
@@ -1845,7 +1861,7 @@ async function handleAnthropicVisionBridge(
     } catch { /* log failure must not break request */ }
     return c.json({
       type: 'error',
-      error: { type: 'upstream_error', message: `Upstream error: ${errText}` },
+      error: { type: 'upstream_error', message: `Upstream error: ${sanitizeUpstreamError(errText)}` },
     }, response.status as Parameters<typeof c.json>[1])
   }
 
@@ -1974,7 +1990,7 @@ async function handleAnthropicCline(
     } catch { /* log failure must not break request */ }
     return c.json({
       type: 'error',
-      error: { type: 'upstream_error', message: `Upstream error: ${errText}` },
+      error: { type: 'upstream_error', message: `Upstream error: ${sanitizeUpstreamError(errText)}` },
     }, response.status as Parameters<typeof c.json>[1])
   }
 
@@ -2121,7 +2137,7 @@ async function handleAnthropicGemini(
     } catch { /* log failure must not break request */ }
     return c.json({
       type: 'error',
-      error: { type: 'upstream_error', message: `Upstream error: ${errText}` },
+      error: { type: 'upstream_error', message: `Upstream error: ${sanitizeUpstreamError(errText)}` },
     }, response.status as Parameters<typeof c.json>[1])
   }
 
@@ -2378,7 +2394,7 @@ export async function handleResponses(c: Context<AppEnv>) {
         const errText = await response.text()
         try { c.executionCtx.waitUntil(writeLog(c.env, 'error', `[responses] ${model} → ${response.status} ${upstreamUrl}`, JSON.stringify({ error: errText, body: summarizeRequestBody(upstreamBody), url: upstreamUrl }).substring(0, 4000))) } catch {}
         return c.json({
-          error: { message: `Upstream error: ${errText}`, type: 'upstream_error' },
+          error: { message: `Upstream error: ${sanitizeUpstreamError(errText)}`, type: 'upstream_error' },
         }, response.status as Parameters<typeof c.json>[1])
       }
 
@@ -2668,7 +2684,7 @@ async function handleResponsesVisionBridge(
       c.executionCtx.waitUntil(writeLog(c.env, 'error', `[responses] ${model} → ${response.status} VisionBridge`, JSON.stringify({ error: errText, model, primary: upstreamBody['model'] }).substring(0, 4000)))
     } catch { /* log failure must not break request */ }
     return c.json({
-      error: { message: `Upstream error: ${errText}`, type: 'upstream_error' },
+      error: { message: `Upstream error: ${sanitizeUpstreamError(errText)}`, type: 'upstream_error' },
     }, response.status as Parameters<typeof c.json>[1])
   }
 
@@ -2794,7 +2810,7 @@ async function handleResponsesGemini(
       c.executionCtx.waitUntil(writeLog(c.env, 'error', `[responses] ${model} → ${response.status} Gemini`, JSON.stringify({ error: errText, body: bodySummary }).substring(0, 4000)))
     } catch { /* log failure must not break request */ }
     return c.json({
-      error: { message: `Upstream error: ${errText}`, type: 'upstream_error' },
+      error: { message: `Upstream error: ${sanitizeUpstreamError(errText)}`, type: 'upstream_error' },
     }, response.status as Parameters<typeof c.json>[1])
   }
 

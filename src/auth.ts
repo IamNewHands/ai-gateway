@@ -1,6 +1,6 @@
 import { Context, Next } from 'hono'
 import { getCookie, setCookie, deleteCookie } from 'hono/cookie'
-import { createSession, getSession, deleteSession, getValidProxyKey } from './storage'
+import { createSession, getSession, deleteSession, getValidProxyKey, recordLoginFailure, resetLoginFailures, getLoginFailureCount } from './storage'
 import { SESSION_TTL } from './config'
 import type { AppEnv, Env } from './types'
 
@@ -11,6 +11,20 @@ export async function hashPassword(password: string): Promise<string> {
   const hashBuffer = await crypto.subtle.digest('SHA-256', data)
   const hashArray = Array.from(new Uint8Array(hashBuffer))
   return hashArray.map((b) => b.toString(16).padStart(2, '0')).join('')
+}
+
+/** S8b：恒定时间字符串比较——两串长度不一致时补零对齐，逐字节累积 XOR，杜绝基于时序的侧信道 */
+function safeEqual(a: string, b: string): boolean {
+  const aBuf = new TextEncoder().encode(a)
+  const bBuf = new TextEncoder().encode(b)
+  const len = Math.max(aBuf.length, bBuf.length)
+  let diff = aBuf.length ^ bBuf.length
+  for (let i = 0; i < len; i++) {
+    const av = i < aBuf.length ? aBuf[i] : 0
+    const bv = i < bBuf.length ? bBuf[i] : 0
+    diff |= av ^ bv
+  }
+  return diff === 0
 }
 
 /** 管理后台 Session 验证中间件 */
@@ -59,10 +73,10 @@ export async function managementAuthMiddleware(c: Context<AppEnv>, next: Next) {
   }
 
   const token = authHeader.slice(7)
-  // 沿用 handleLogin 的哈希比对模式（SHA-256 hex），不另造加密套路
+  // 沿用 handleLogin 的哈希比对模式（SHA-256 hex），恒定时间比较防时序侧信道
   const tokenHash = await hashPassword(token)
   const configuredHash = await hashPassword(configured)
-  if (tokenHash !== configuredHash) {
+  if (!safeEqual(tokenHash, configuredHash)) {
     return c.json({ success: false, message: '管理 Token 无效' }, 401)
   }
 
@@ -75,6 +89,15 @@ export async function handleLogin(c: Context<AppEnv>) {
   const adminUser = c.env.ADMIN_USERNAME
   const adminPass = c.env.ADMIN_PASSWORD
 
+  // S8c：按客户端 IP 限速——窗口内失败 ≥5 次直接拒绝，防暴力破解
+  const ip = c.req.header('CF-Connecting-IP') || c.req.header('x-real-ip') || ''
+  if (ip) {
+    const failed = await getLoginFailureCount(c.env, ip)
+    if (failed >= 5) {
+      return c.json({ success: false, message: '尝试次数过多，请 5 分钟后再试' }, 429)
+    }
+  }
+
   if (!adminUser || !adminPass) {
     return c.json({
       success: false,
@@ -86,16 +109,21 @@ export async function handleLogin(c: Context<AppEnv>) {
     return c.json({ success: false, message: '请输入用户名和密码' }, 400)
   }
 
-  if (username !== adminUser) {
+  if (!safeEqual(username, adminUser)) {
+    if (ip) await recordLoginFailure(c.env, ip)
     return c.json({ success: false, message: '用户名或密码错误' }, 401)
   }
 
   const passwordHash = await hashPassword(password)
   const adminPassHash = await hashPassword(adminPass)
 
-  if (passwordHash !== adminPassHash) {
+  if (!safeEqual(passwordHash, adminPassHash)) {
+    if (ip) await recordLoginFailure(c.env, ip)
     return c.json({ success: false, message: '用户名或密码错误' }, 401)
   }
+
+  // 登录成功：清掉该 IP 的失败计数
+  if (ip) await resetLoginFailures(c.env, ip)
 
   const sessionId = await createSession(c.env, username, SESSION_TTL)
   setCookie(c, 'session_id', sessionId, {

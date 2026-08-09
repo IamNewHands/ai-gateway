@@ -77,6 +77,35 @@ export async function deleteProvider(env: Env, id: string): Promise<boolean> {
   return true
 }
 
+// ===== 登录失败限速（S8c）=====
+const LOGIN_ATTEMPT_TTL = 5 * 60 // 窗口 5 分钟
+const LOGIN_ATTEMPT_MAX = 5 // 窗口内最多失败次数
+const loginRateKey = (ip: string) => `${KV_KEYS.LOGIN_RATE}${ip}`
+
+/**
+ * 记录一次登录失败，返回是否应拒绝（true = 已超过阈值，锁 5 分钟）。
+ * 计数存 KV，键带 TTL 自动过期，窗口内累计失败 ≥5 次即锁定该 IP。
+ */
+export async function recordLoginFailure(env: Env, ip: string): Promise<boolean> {
+  const key = loginRateKey(ip)
+  const raw = await env.KV.get(key)
+  const count = raw ? (parseInt(raw, 10) || 0) : 0
+  const next = count + 1
+  await env.KV.put(key, String(next), { expirationTtl: LOGIN_ATTEMPT_TTL })
+  return next >= LOGIN_ATTEMPT_MAX
+}
+
+/** 登录成功 / 明确拒绝前，清掉该 IP 的历史失败计数 */
+export async function resetLoginFailures(env: Env, ip: string): Promise<void> {
+  await env.KV.delete(loginRateKey(ip))
+}
+
+/** 查询某 IP 当前失败计数（用于锁定提示文案） */
+export async function getLoginFailureCount(env: Env, ip: string): Promise<number> {
+  const raw = await env.KV.get(loginRateKey(ip))
+  return raw ? (parseInt(raw, 10) || 0) : 0
+}
+
 // ===== Session 管理 =====
 
 export async function createSession(env: Env, username: string, ttlSeconds: number): Promise<string> {

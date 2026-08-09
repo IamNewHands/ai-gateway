@@ -32,6 +32,7 @@ export const KV_KEYS = {
   OAUTH_TOKEN_PREFIX: 'oauth:token:',
   OAUTH_DEVICE_PREFIX: 'oauth:device:',
   CHECKIN_RESULT_PREFIX: 'checkin:result:',
+  LOGIN_RATE: 'login:rate:',
 } as const
 
 // access_token 过期前多少毫秒触发惰性刷新（默认提前 60 秒）
