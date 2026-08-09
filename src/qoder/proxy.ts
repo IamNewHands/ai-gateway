@@ -17,6 +17,7 @@ import type { Env, Provider } from '../types'
 import { getOauthAccessToken, readOauthToken, refreshOauthToken } from '../oauth'
 import { buildQoderBody, cpaToUpstreamKey } from './body'
 import { qoderEncode, cosySessionFor, cosyHeaders, buildBearer, type CosySession } from './cosy'
+import { streamFetchWithTimeout } from '../opencode'
 
 export const QODER_PROVIDER_ID = 'qoder'
 export const QODER_GATEWAY = 'https://gateway.qoder.com.cn'
@@ -24,9 +25,6 @@ export const QODER_CHAT_URL =
   QODER_GATEWAY +
   '/algo/api/v2/service/pro/sse/agent_chat_generation?FetchKeys=llm_model_result&AgentId=agent_common&Encode=1'
 export const QODER_MODELS_URL = QODER_GATEWAY + '/algo/api/v2/model/list?Encode=1'
-
-/** 转发超时：LLM 长响应/流式容易超过 60s，放宽到 5 分钟避免中途被掐断 */
-const QODER_TIMEOUT_MS = 300000
 
 export function isQoderProvider(providerId: string): boolean {
   return providerId === QODER_PROVIDER_ID
@@ -330,11 +328,10 @@ export async function proxyQoderChatRequest(
 
   let resp: Response
   try {
-    resp = await fetch(QODER_CHAT_URL, {
+    resp = await streamFetchWithTimeout(QODER_CHAT_URL, {
       method: 'POST',
       headers,
       body: encodedBody,
-      signal: AbortSignal.timeout(QODER_TIMEOUT_MS),
     })
   } catch (err) {
     return qoderErrorResponse(502, (err as Error).message || '网络请求失败')

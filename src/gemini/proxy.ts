@@ -20,14 +20,12 @@
 
 import type { Env, Provider } from '../types'
 import { getOauthAccessToken, readOauthToken, refreshOauthToken, GEMINI_OAUTH, GEMINI_API_CLIENT_HEADER, geminiUserAgent } from '../oauth'
+import { streamFetchWithTimeout } from '../opencode'
 
 export const GEMINI_BASE_URL = 'https://cloudcode-pa.googleapis.com'
 export const GEMINI_GENERATE_PATH = '/v1internal:generateContent'
 export const GEMINI_STREAM_PATH = '/v1internal:streamGenerateContent'
 export const GEMINI_COUNT_TOKENS_PATH = '/v1internal:countTokens'
-
-/** 转发超时：LLM 长响应/流式容易超过 60s，放宽到 5 分钟避免中途被掐断 */
-const GEMINI_TIMEOUT_MS = 300000
 
 /** 静态模型列表（参考 internal/models/models.go，输入 1048576 / 输出 65536） */
 export const GEMINI_MODELS: Array<{ id: string; displayName: string }> = [
@@ -622,11 +620,10 @@ export async function proxyGeminiChatRequest(
 
   let resp: Response
   try {
-    resp = await fetch(endpoint, {
+    resp = await streamFetchWithTimeout(endpoint, {
       method: 'POST',
       headers: geminiHeaders(token, model, stream),
       body: JSON.stringify(wrapped),
-      signal: AbortSignal.timeout(GEMINI_TIMEOUT_MS),
     })
   } catch (err) {
     return geminiErrorResponse(502, (err as Error).message || '网络请求失败')
@@ -639,11 +636,10 @@ export async function proxyGeminiChatRequest(
       const fresh = await readOauthToken(env, provider.id)
       token = fresh?.access_token || token
       try {
-        resp = await fetch(endpoint, {
+        resp = await streamFetchWithTimeout(endpoint, {
           method: 'POST',
           headers: geminiHeaders(token, model, stream),
           body: JSON.stringify(wrapped),
-          signal: AbortSignal.timeout(GEMINI_TIMEOUT_MS),
         })
       } catch (err) {
         return geminiErrorResponse(502, (err as Error).message || '网络请求失败')

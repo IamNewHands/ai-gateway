@@ -10,6 +10,9 @@ const EMPTY_USAGE: UsageMetrics = {
   totalTokens: 0,
 }
 
+/** 观察分支行缓冲上限：异常响应出现超长单行时截断，防止内存无界增长（P3/R9） */
+const MAX_SSE_BUFFER = 64 * 1024
+
 const getDatasetName = (env: Env): string => {
   const configured = env.USAGE_ANALYTICS_DATASET
   return configured && /^[A-Za-z_][A-Za-z0-9_]*$/.test(configured) ? configured : 'ai_gateway_usage'
@@ -87,6 +90,11 @@ export const observeStreamUsage = async (
       const chunk = await reader.read()
       if (chunk.done) break
       buffer += decoder.decode(chunk.value, { stream: true })
+      // 超长单行（异常响应无换行）防止 buffer 无界增长：只保留尾段
+      if (buffer.length > MAX_SSE_BUFFER) {
+        const lastNl = buffer.lastIndexOf('\n')
+        buffer = lastNl >= 0 ? buffer.slice(lastNl + 1) : buffer.slice(-MAX_SSE_BUFFER)
+      }
       const lines = buffer.split(/\r?\n/)
       buffer = lines.pop() || ''
       for (const line of lines) {

@@ -285,15 +285,12 @@ export async function renderAdminPage(c: Context<AppEnv>) {
 
   // 全部已启用模型引用（providerId/modelId），供 Vision Bridge 识图模型勾选（可跨厂商）
   const allModelRefs = providers.flatMap((provider) => provider.models.filter((m) => m.enabled).map((m) => `${provider.id}/${m.id}`))
-  // 主文本模型：单选框列表（留空 = 本提供商自身模型）
-  const modelRadioHtml = (name: string, checked = '') => [
-    `<label class="model-check"><input type="radio" name="${name}" value=""${!checked ? ' checked' : ''}><span>本提供商自身模型（共享识图，推荐）</span></label>`,
-    ...allModelRefs.map((r) => `<label class="model-check"><input type="radio" name="${name}" value="${escapePageHtml(r)}"${checked === r ? ' checked' : ''}><span>${escapePageHtml(r)}</span></label>`),
-  ].join('')
-  // 识图模型：复选框列表（视觉模型链，可多选，按勾选顺序转写）
-  const modelCheckboxHtml = (checked: string[] = []) => allModelRefs.length
-    ? `<div class="model-check-list">${allModelRefs.map((r) => `<label class="model-check vb-item"><span class="vb-order" title="识图链顺序">-</span><input type="checkbox" value="${escapePageHtml(r)}"${checked.includes(r) ? ' checked' : ''}><span>${escapePageHtml(r)}</span></label>`).join('')}</div><p class="form-helper">按勾选顺序转写（序号 1 优先），全部失败才尝试下一个。</p>`
-    : '<p class="form-helper">暂无已启用的模型，请先添加并启用模型。</p>'
+  // P6：识图模型引用列表不再于 SSR 阶段为每个提供商重放全库（O(N×M) 页面膨胀），
+  // 改为输出空容器，客户端展开「识图模型配置」时按需填充（数据源 VB_MODELS 只输出一次）。
+  const vbRadioContainer = (id: string, name: string, checked: string) =>
+    `<div id="${id}" data-vb-radio="1" data-name="${escapePageHtml(name)}" data-checked="${escapePageHtml(checked)}"></div>`
+  const vbCheckContainer = (id: string, checked: string[]) =>
+    `<div id="${id}" data-vb-check="1" data-checked="${escapePageHtml(JSON.stringify(checked))}"></div>`
 
   return c.html(`<!DOCTYPE html><html lang="zh-CN">
 ${H('管理')}
@@ -455,8 +452,8 @@ ${H('管理')}
                 <i class="fas fa-chevron-right collapse-icon" aria-hidden="true"></i> 识图模型配置（可选）
               </button>
               <fieldset class="form-group hd" id="avb-fs"><legend>识图模型配置（可选）</legend><span class="form-helper">让不支持图片的模型支持图片：请求含图时自动调用下方勾选的识图模型转写为文本。识图模型可从已维护的所有模型中选择（同厂商或跨厂商）。两种用法：①「主文本模型」留空 → 本提供商下所有模型自动共享识图能力；②「主文本模型」选了其它提供商/模型 → 本提供商作为图片转写桥，所有模型转发到该主文本模型。</span>
-                <div class="fg"><label>主文本模型（留空 = 转发到本提供商自身模型）</label><div id="avb-primary">${modelRadioHtml('avb-primary')}</div></div>
-                <div class="fg"><label>识图模型（视觉模型链，勾选后请求含图时按勾选顺序依次转写，全部失败按下方策略处理）</label><div id="avb-vision">${modelCheckboxHtml()}</div></div>
+                <div class="fg"><label>主文本模型（留空 = 转发到本提供商自身模型）</label>${vbRadioContainer('avb-primary', 'avb-primary', '')}</div>
+                <div class="fg"><label>识图模型（视觉模型链，勾选后请求含图时按勾选顺序依次转写，全部失败按下方策略处理）</label>${vbCheckContainer('avb-vision', [])}</div>
                 <div class="fg"><label>视觉转写失败策略</label><select id="avb-fail" class="select-sm"><option value="error">error（返回错误）</option><option value="text_only">text_only（丢弃图片仅转发文本）</option></select></div>
               </fieldset>
             </div>
@@ -506,8 +503,8 @@ ${H('管理')}
                   <i class="fas fa-chevron-right collapse-icon" aria-hidden="true"></i> 识图模型配置（可选）
                 </button>
                 <fieldset class="form-group hd" id="vb-fs-${escapePageHtml(p.id)}"><legend>识图模型配置（可选）</legend><span class="form-helper">勾选识图模型后，本提供商所有模型都自动支持图片：请求含图时先由识图模型转写为文本再按原模型转发（留空主文本模型）。若选了主文本模型，则本提供商作为图片转写桥，全部请求转发到该主文本模型。全部取消勾选即恢复普通转发。</span>
-                  <div class="fg"><label>主文本模型（留空 = 转发到本提供商自身模型）</label><div id="vb-primary-${escapePageHtml(p.id)}">${modelRadioHtml('vb-primary-' + escapePageHtml(p.id), (p.visionBridge&&p.visionBridge.primary)||'')}</div></div>
-                  <div class="fg"><label>识图模型（视觉模型链，勾选后请求含图时按勾选顺序依次转写，全部失败按下方策略处理）</label><div id="vb-vision-${escapePageHtml(p.id)}">${modelCheckboxHtml((p.visionBridge&&p.visionBridge.vision)||[])}</div></div>
+                  <div class="fg"><label>主文本模型（留空 = 转发到本提供商自身模型）</label>${vbRadioContainer('vb-primary-' + escapePageHtml(p.id), 'vb-primary-' + escapePageHtml(p.id), (p.visionBridge&&p.visionBridge.primary)||'')}</div>
+                  <div class="fg"><label>识图模型（视觉模型链，勾选后请求含图时按勾选顺序依次转写，全部失败按下方策略处理）</label>${vbCheckContainer('vb-vision-' + escapePageHtml(p.id), (p.visionBridge&&p.visionBridge.vision)||[])}</div>
                   <div class="fg"><label>视觉转写失败策略</label><select id="vb-fail-${escapePageHtml(p.id)}" class="select-sm"><option value="error" ${!p.visionBridge||p.visionBridge.onVisionFailure==='error'?'selected':''}>error（返回错误）</option><option value="text_only" ${p.visionBridge&&p.visionBridge.onVisionFailure==='text_only'?'selected':''}>text_only（丢弃图片仅转发文本）</option></select></div>
                 </fieldset>
               </div>
@@ -547,6 +544,42 @@ ${H('管理')}
 <script>${SHARED_JS}${ANALYTICS_JS}
 // 全部已启用模型引用（providerId/modelId），供 Vision Bridge 识图模型勾选
 const VB_MODELS = ${JSON.stringify(allModelRefs).replace(/</g, '\\u003c')};
+// 各提供商已保存的识图配置快照（懒渲染未展开时，保存表单可据此保留原配置）
+const VB_ORIGINAL = ${JSON.stringify(Object.fromEntries(providers.map(p => [p.id, { primary: (p.visionBridge&&p.visionBridge.primary)||'', vision: (p.visionBridge&&p.visionBridge.vision)||[], onVisionFailure: (p.visionBridge&&p.visionBridge.onVisionFailure)||'error' }]))).replace(/</g, '\\u003c')};
+// P6：识图模型引用列表懒渲染——展开「识图模型配置」时才从 VB_MODELS 生成控件，
+// 避免 SSR 为每个提供商重放全库模型引用（O(N×M) 页面膨胀）。
+function vbFill(container) {
+  if (!container || container.getAttribute('data-vb-built')) return
+  var isRadio = container.hasAttribute('data-vb-radio')
+  var name = container.getAttribute('data-name') || ''
+  var checkedVal = container.getAttribute('data-checked') || ''
+  var checkedArr = []
+  try { checkedArr = JSON.parse(checkedVal || '[]') } catch (e) { checkedArr = [] }
+  var refs = VB_MODELS || []
+  var h = ''
+  if (isRadio) {
+    h = '<label class="model-check"><input type="radio" name="' + escapeHtml(name) + '" value=""' + (!checkedVal ? ' checked' : '') + '><span>本提供商自身模型（共享识图，推荐）</span></label>'
+    refs.forEach(function (r) {
+      var s = escapeHtml(r)
+      h += '<label class="model-check"><input type="radio" name="' + escapeHtml(name) + '" value="' + s + '"' + (checkedVal === r ? ' checked' : '') + '><span>' + s + '</span></label>'
+    })
+  } else if (refs.length === 0) {
+    h = '<p class="form-helper">暂无已启用的模型，请先添加并启用模型。</p>'
+  } else {
+    h = '<div class="model-check-list">'
+    refs.forEach(function (r) {
+      var s = escapeHtml(r)
+      h += '<label class="model-check vb-item"><span class="vb-order" title="识图链顺序">-</span><input type="checkbox" value="' + s + '"' + (checkedArr.indexOf(r) !== -1 ? ' checked' : '') + '><span>' + s + '</span></label>'
+    })
+    h += '</div><p class="form-helper">按勾选顺序转写（序号 1 优先），全部失败才尝试下一个。</p>'
+  }
+  container.innerHTML = h
+  container.setAttribute('data-vb-built', '1')
+}
+function vbFillScope(root) {
+  ;(root || document).querySelectorAll('[data-vb-radio],[data-vb-check]').forEach(function (c) { vbFill(c) })
+  renumberVisionOrders()
+}
 // copy
 function copyText(t, el) {
   const i = el.tagName === 'I' ? el : (el.querySelector('i') || el.parentElement?.querySelector('i'))
@@ -618,6 +651,7 @@ function toggleVbCollapse(id, btn) {
   btn.setAttribute('aria-expanded', !isHidden)
   const icon = btn.querySelector('.collapse-icon')
   if (icon) icon.style.transform = isHidden ? '' : 'rotate(90deg)'
+  if (!isHidden) vbFillScope(fs)  // 展开时按需填充全库模型引用列表（P6）
 }
 
 // aid 输入 opencode 时自动填充 API 地址
@@ -787,6 +821,13 @@ function collectVisionBridgeNew() {
 
 /** 收集「编辑提供商」表单的 Vision Bridge 配置；未勾选识图模型则清除配置 */
 function collectVisionBridgeEdit(id) {
+  // 懒渲染未展开时容器内无控件，直接读回 SSR 快照，避免保存时误清已保存的识图配置（P6）
+  const root = document.getElementById('vb-vision-' + id)
+  if (root && !root.getAttribute('data-vb-built')) {
+    const orig = VB_ORIGINAL && VB_ORIGINAL[id]
+    if (!orig || !orig.vision || orig.vision.length === 0) return undefined
+    return { primary: orig.primary || undefined, vision: orig.vision, onVisionFailure: orig.onVisionFailure || 'error' }
+  }
   const vision = checkedValues('vb-vision-' + id)
   if (vision.length === 0) return undefined
   const primary = checkedRadioValue('vb-primary-' + id)
@@ -1650,7 +1691,7 @@ function startLogAutoRefresh() {
   stopLogAutoRefresh()
   logAutoRefreshSec = Math.max(1, parseInt(document.getElementById('log-auto-sec').value) || 5)
   logAutoRefreshTimer = setInterval(function () {
-    if (document.getElementById('log-switch').checked) refreshLogs()
+    if (document.getElementById('log-switch').checked) refreshLogs(true)  // P7：自动刷新静默模式
   }, logAutoRefreshSec * 1000)
 }
 function stopLogAutoRefresh() {
@@ -1692,18 +1733,19 @@ async function toggleLog(on) {
   }
 }
 
-async function refreshLogs() {
+async function refreshLogs(isAuto) {
   if (logRefreshing) return
   logRefreshing = true
   const el = document.getElementById('log-list')
-  el.innerHTML = '<div class="empty-state"><i class="fas fa-spinner fa-pulse"></i><h3>加载中…</h3></div>'
+  // P7：定时自动刷新走静默模式——不闪「加载中」，内容未变化时不重绘 DOM
+  if (!isAuto) el.innerHTML = '<div class="empty-state"><i class="fas fa-spinner fa-pulse"></i><h3>加载中…</h3></div>'
   try {
     try {
       const r = await fetch('/admin/api/logs?limit=' + logPageSize + '&offset=' + ((logPage - 1) * logPageSize))
       const d = await r.json()
       if (!d.success || !d.data.logs || d.data.logs.length === 0) {
         // 当前页无数据：若不在第一页则回退一页重新加载（如日志被清除）
-        if (logPage > 1) { logPage--; logRefreshing = false; refreshLogs(); return }
+        if (logPage > 1) { logPage--; logRefreshing = false; refreshLogs(isAuto); return }
         el.innerHTML = '<div class="empty-state"><i class="fas fa-list-alt" aria-hidden="true"></i><h3>暂无日志</h3><p>开启开关后 API 请求会被记录。</p></div>'
         return
       }
@@ -1730,9 +1772,10 @@ async function refreshLogs() {
       html += '<button class="btn btn-gh btn-xs" onclick="logPageChange(' + (logPage + 1) + ')" ' + (logPage >= totalPages ? 'disabled' : '') + '>下一页<i class="fas fa-chevron-right"></i></button>'
       html += '<span class="mu" style="font-size:12px">' + sizeHtml + '</span>'
       html += '</div>'
-      el.innerHTML = html
+      // P7：内容未变化时跳过 DOM 重绘（自动刷新场景避免整页闪烁）
+      if (!isAuto || el.innerHTML !== html) el.innerHTML = html
     } catch(e) {
-      el.innerHTML = '<div class="empty-state"><i class="fas fa-exclamation-triangle c-l"></i><h3>加载失败</h3></div>'
+      if (!isAuto) el.innerHTML = '<div class="empty-state"><i class="fas fa-exclamation-triangle c-l"></i><h3>加载失败</h3></div>'
     }
   } finally {
     logRefreshing = false

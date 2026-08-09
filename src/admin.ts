@@ -1071,11 +1071,22 @@ function sanitizeLogText(text: string): string {
     .replace(/(Set-Cookie[^,;]*=)[^,;]{4,}/gi, '$1***')
 }
 
+// ===== 日志 KV 写入 =====
+// P4：log_enabled 开关做内存缓存（5s TTL），消除每请求 1 次 KV.get；开关切换时同步刷新。
+let logEnabledCache = { at: 0, value: false }
+const LOG_ENABLED_CACHE_TTL_MS = 5_000
+
+async function isLogEnabled(env: Env): Promise<boolean> {
+  if (Date.now() - logEnabledCache.at < LOG_ENABLED_CACHE_TTL_MS) return logEnabledCache.value
+  const enabled = await env.KV.get('config:log_enabled')
+  logEnabledCache = { at: Date.now(), value: enabled === 'true' }
+  return logEnabledCache.value
+}
+
 /** 写日志到 KV */
 export async function writeLog(env: Env, type: LogEntry['type'], message: string, details?: string) {
   // 检查是否启用日志
-  const enabled = await env.KV.get('config:log_enabled')
-  if (enabled !== 'true') return
+  if (!(await isLogEnabled(env))) return
 
   const id = Date.now().toString(36) + Math.random().toString(36).slice(2, 8)
   const entry: LogEntry = {
@@ -1094,36 +1105,33 @@ export async function handleLogs(c: Context<AppEnv>) {
   const type = c.req.query('type') || ''
   const offset = Math.max(parseInt(c.req.query('offset') || '0'), 0)
 
-  // 用 cursor 循环拉取全部 key 名（KV.list 单次最多 1000 条，仅返回 key 名很快）。
-  // key 名 = 'log:' + Date.now().toString(36) + 随机，字典序等价于时间序。
-  const allNames: string[] = []
+  // P5：避免全量 KV.get。KV.list 只拉 key 名（便宜，上限 TOTAL_CAP 截断 total），
+  // 再只对 offset..offset+limit 窗口内的 key 发起 KV.get——日志量大时不再逼近 subrequest 上限。
+  const TOTAL_CAP = 5000
+  const names: string[] = []
   let cursor: string | undefined
   do {
     const list = await c.env.KV.list({ prefix: LOG_PREFIX, limit: 1000, cursor })
-    for (const k of list.keys) allNames.push(k.name)
     cursor = list.list_complete ? undefined : list.cursor
-  } while (cursor)
-  allNames.reverse()  // 最新在前
+    for (const k of list.keys) names.push(k.name)
+  } while (cursor && names.length < TOTAL_CAP)
+  // key 名 = 'log:' + Date.now().toString(36) + 随机，字典序正序 = 旧→新；取最新在前
+  names.reverse()
+  const total = names.length
 
-  // 从 offset 开始向后读，按 type 过滤收集，直到满 limit 或读完。
-  // 分批并行读取（25 条/批），避免一次性发起过多 subrequest。
-  const BATCH = 25
   const logs: LogEntry[] = []
-  for (let i = offset; i < allNames.length && logs.length < limit; i += BATCH) {
-    const batch = allNames.slice(i, i + BATCH)
-    const raws = await Promise.all(batch.map(n => c.env.KV.get(n)))
+  const slice = names.slice(offset, offset + limit)
+  for (let i = 0; i < slice.length; i += 25) {
+    const raws = await Promise.all(slice.slice(i, i + 25).map((n) => c.env.KV.get(n)))
     for (const raw of raws) {
       if (!raw) continue
       try {
         const entry = JSON.parse(raw) as LogEntry
-        if (!type || entry.type === type) {
-          logs.push(entry)
-        }
+        if (!type || entry.type === type) logs.push(entry)
       } catch { /* skip corrupt entries */ }
     }
   }
-
-  return c.json<ApiResponse>({ success: true, data: { logs: logs.slice(0, limit), total: allNames.length, offset } })
+  return c.json<ApiResponse>({ success: true, data: { logs: logs.slice(0, limit), total, offset } })
 }
 
 /** 清除日志 */
@@ -1141,6 +1149,7 @@ export async function handleLogConfig(c: Context<AppEnv>) {
     const body = await c.req.json().catch(() => ({}))
     const enabled = body.enabled ? 'true' : 'false'
     await c.env.KV.put('config:log_enabled', enabled)
+    logEnabledCache = { at: Date.now(), value: enabled === 'true' }  // 立即刷新缓存
     return c.json<ApiResponse>({ success: true, data: { enabled: body.enabled } })
   }
   const enabled = await c.env.KV.get('config:log_enabled')

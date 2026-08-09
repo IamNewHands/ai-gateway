@@ -931,10 +931,25 @@ function geminiProjectFromValue(value: unknown): string {
 
 // ===== Token 刷新 =====
 
+// R1：同一 provider 并发刷新去重。多个请求同时 401 → 同时 refresh 时，
+// 会各自读到旧 state、并发打上游，上游 rotate refresh_token 后后写覆盖先写。
+// 在 isolate 内存中合并同一 provider 的刷新任务，只打一次上游。
+const refreshInflight = new Map<string, Promise<boolean>>()
+
 /**
  * 使用 refresh_token 刷新 access_token。根据 flowType 分发。
  */
-export async function refreshOauthToken(env: Env, providerId: string, cfg: OAuthDeviceConfig): Promise<boolean> {
+export function refreshOauthToken(env: Env, providerId: string, cfg: OAuthDeviceConfig): Promise<boolean> {
+  const existing = refreshInflight.get(providerId)
+  if (existing) return existing
+  const task = doRefreshOauthToken(env, providerId, cfg).finally(() => {
+    refreshInflight.delete(providerId)
+  })
+  refreshInflight.set(providerId, task)
+  return task
+}
+
+async function doRefreshOauthToken(env: Env, providerId: string, cfg: OAuthDeviceConfig): Promise<boolean> {
   if (cfg.flowType === 'gemini') {
     return refreshOauthTokenGemini(env, providerId, cfg)
   }

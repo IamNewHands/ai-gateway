@@ -6,12 +6,12 @@ const OPENCODE_VERSION = '1.17.8'
 // POST 连接/首字节超时：思考模型首字节前可能长时间无输出，放宽到 90s。
 // 连接建立后（流式）不再受整体超时限制，改由 withSSEKeepAlive 的 idle 兜底，
 // 避免长思考中途被 5 分钟整体超时掐断（"思考到一半停住"）。
-const OPENCODE_CONNECT_TIMEOUT_MS = 90000
+export const OPENCODE_CONNECT_TIMEOUT_MS = 90000
 // 流式期间上游完全无数据的最长容忍时间（防止挂死），正常思考持续输出不会触发
-const OPENCODE_STREAM_IDLE_TIMEOUT_MS = 240000
+export const OPENCODE_STREAM_IDLE_TIMEOUT_MS = 240000
 // 向客户端注入 SSE 心跳注释行的空闲阈值：距上次输出超过该值即发 `: keep-alive`，
 // 防止客户端因长时间无事件触发 idle 超时
-const OPENCODE_KEEPALIVE_MS = 15000
+export const OPENCODE_KEEPALIVE_MS = 15000
 // GET（模型列表/连通性测试）保持整体超时，数据量小无需放宽
 const OPENCODE_GET_TIMEOUT_MS = 20000
 // 429 限流重试：FreeUsageLimitError 多为短时限流（用户手动重发即恢复），
@@ -133,19 +133,26 @@ function transportErrorResponse(error: unknown): Response {
   })
 }
 
-function isSSEResponse(response: Response): boolean {
+export function isSSEResponse(response: Response): boolean {
   const ct = (response.headers.get('content-type') || '').toLowerCase()
   return ct.includes('text/event-stream') || ct.includes('application/x-ndjson')
 }
 
 /**
+ * 严格 SSE：仅 text/event-stream。`: keep-alive` 心跳注释行只对这种格式安全——
+ * NDJSON 等逐行 JSON 流里注入注释行会破坏客户端解析，只配 idle 兜底不配心跳。
+ */
+export function isEventStreamResponse(response: Response): boolean {
+  return (response.headers.get('content-type') || '').toLowerCase().includes('text/event-stream')
+}
+
+/**
  * 包装上游 SSE 流：
- * 1. 心跳：距上次输出超过 keepAliveMs 时向客户端注入 `: keep-alive\n\n` 注释行。
- *    SSE 注释行客户端会忽略但能重置 idle 计时器——思考模型长时间只吐 reasoning
- *    或完全静默时，防止客户端（如 Trae）判定超时而中断流。
+ * 1. 心跳（keepAliveMs > 0 时启用）：距上次输出超过 keepAliveMs 时向客户端注入
+ *    `: keep-alive\n\n` 注释行。SSE 注释行客户端会忽略但能重置 idle 计时器。
  * 2. idle 兜底：上游超过 idleTimeoutMs 无任何数据时主动结束流，防止无限挂起。
  */
-function withSSEKeepAlive(
+export function withSSEKeepAlive(
   body: ReadableStream<Uint8Array>,
   keepAliveMs: number,
   idleTimeoutMs: number
@@ -172,6 +179,7 @@ function withSSEKeepAlive(
         idleTimer = setTimeout(() => finish(controller), idleTimeoutMs)
       }
       const armHeartbeat = () => {
+        if (keepAliveMs <= 0) return
         if (heartbeatTimer) clearTimeout(heartbeatTimer)
         heartbeatTimer = setTimeout(() => {
           if (closed) return
@@ -205,6 +213,39 @@ function withSSEKeepAlive(
   })
 }
 
+/**
+ * 通用流式上游 fetch：连接/首字节超时（默认 90s），拿到 response 后解除整体超时；
+ * body 包 withSSEKeepAlive（idle 兜底 + 可选心跳）。keepAliveMs 默认 0（不注入心跳注释行，
+ * 避免干扰各私有 SSE 解析器）；需要防客户端 idle 断流的路径显式传 OPENCODE_KEEPALIVE_MS。
+ */
+export async function streamFetchWithTimeout(
+  url: string,
+  init: RequestInit,
+  opts?: { connectTimeoutMs?: number; idleTimeoutMs?: number; keepAliveMs?: number },
+): Promise<Response> {
+  const connectTimeoutMs = opts?.connectTimeoutMs ?? OPENCODE_CONNECT_TIMEOUT_MS
+  const controller = new AbortController()
+  const timer = setTimeout(() => controller.abort(), connectTimeoutMs)
+  let response: Response
+  try {
+    response = await fetch(url, { ...init, signal: controller.signal })
+  } catch (err) {
+    clearTimeout(timer)
+    throw err
+  }
+  clearTimeout(timer)
+  if (response.body) {
+    // 心跳注释行只对严格 SSE（text/event-stream）注入；NDJSON 等格式注入会破坏逐行解析
+    const body = withSSEKeepAlive(
+      response.body,
+      isEventStreamResponse(response) ? (opts?.keepAliveMs ?? 0) : 0,
+      opts?.idleTimeoutMs ?? OPENCODE_STREAM_IDLE_TIMEOUT_MS,
+    )
+    return new Response(body, { status: response.status, statusText: response.statusText, headers: response.headers })
+  }
+  return response
+}
+
 async function requestUpstream(
   fetcher: typeof fetch,
   url: string,
@@ -227,9 +268,10 @@ async function requestUpstream(
       signal: controller.signal,
     })
     clearTimeout(timer)
-    // 流式 SSE：包装 idle 超时 + 心跳；非 SSE（JSON 错误/普通响应）原样透传，避免污染
+    // 流式 SSE：包装 idle 超时 + 心跳；非 SSE（JSON 错误/普通响应）原样透传，避免污染。
+    // 心跳仅对严格 text/event-stream 注入，NDJSON 只配 idle 兜底。
     if (isStreamRequest && response.body && isSSEResponse(response)) {
-      const body = withSSEKeepAlive(response.body, OPENCODE_KEEPALIVE_MS, OPENCODE_STREAM_IDLE_TIMEOUT_MS)
+      const body = withSSEKeepAlive(response.body, isEventStreamResponse(response) ? OPENCODE_KEEPALIVE_MS : 0, OPENCODE_STREAM_IDLE_TIMEOUT_MS)
       return new Response(body, {
         status: response.status,
         statusText: response.statusText,

@@ -44,6 +44,8 @@ const FILTER_FIELDS: Record<UsageLogDimension, string> = {
 const getRange = (value?: string): AnalyticsRange => value && value in RANGE_SQL ? value as AnalyticsRange : '24h'
 const getDataset = (env: Env): string => env.USAGE_ANALYTICS_DATASET && /^[A-Za-z_][A-Za-z0-9_]*$/.test(env.USAGE_ANALYTICS_DATASET) ? env.USAGE_ANALYTICS_DATASET : 'ai_gateway_usage'
 const escapeSql = (value: string): string => value.replace(/'/g, "''")
+// LIKE 通配符转义：用户输入当作字面量，防止注入 %/_ 扩大匹配面。
+const escapeLike = (value: string): string => value.replace(/[\\%_]/g, '\\$&')
 // Analytics Engine SQL 不支持除零保护函数；与原项目一致直接用采样总量作除数，空结果由响应归一化为 0。
 const AVG_LATENCY_SQL = `sum(${ANALYTICS_DOUBLES.latencyMs} * _sample_interval) / sum(_sample_interval)`
 
@@ -132,7 +134,9 @@ const buildTimeWhere = (start?: string, end?: string): string => {
 export const queryUsageLogs = async (c: Context<AppEnv>, params: { start?: string; end?: string; dimension?: string; keyword?: string; result?: string; page?: string }): Promise<{ records: Array<Record<string, unknown>>; page: number; pageSize: number }> => {
   const field = params.dimension && params.dimension in FILTER_FIELDS ? FILTER_FIELDS[params.dimension as UsageLogDimension] : ''
   const filters = [buildTimeWhere(params.start, params.end)]
-  if (field && params.keyword) filters.push(`${field} ILIKE '%${escapeSql(params.keyword.slice(0, 100))}%'`)
+  // P7：关键词走前缀匹配（'kw%'）而非前导通配符（'%kw%'）。
+  // 前导通配符无法利用块级 min/max 索引，日志量大时退化为全表扫描；前缀匹配可大幅缩小扫描范围。
+  if (field && params.keyword) filters.push(`${field} ILIKE '${escapeSql(escapeLike(params.keyword.slice(0, 100)))}%'`)
   const result = params.result === 'success' || params.result === 'failure' ? params.result : 'all'
   if (result !== 'all') filters.push(`${ANALYTICS_BLOBS.result} = '${result}'`)
   const page = Math.min(1000, Math.max(1, Number(params.page || 1) || 1))

@@ -60,25 +60,31 @@
   - [storage.ts:6-9](src/storage.ts#L6-L9) 每次全量读 `providers` 并 JSON.parse（含明文密钥）
   - 每请求 ≥2 次同步 KV 读 + 1-2 次 KV 写日志；Anthropic/OAuth 路径峰值约 7 次 KV 操作
   - ✅ 已修复：`storage.ts` 新增内存缓存（10s TTL）应用于 providers/proxyKeys 读写；读路径优先走缓存，写路径同步刷新，多 isolate 最多滞后一个 TTL
-- [ ] **P2. `AbortSignal.timeout(300000)` 掐断超过 5 分钟的流**
+- [x] **P2. `AbortSignal.timeout(300000)` 掐断超过 5 分钟的流**
   - [proxy.ts:856](src/proxy.ts#L856) 通用/OAuth 路径 abort 对流式读取持续生效，长思考/agent 会话中途被截断
   - opencode 路径已正确规避（连接超时后改 idle 超时 + keep-alive），其余路径未对齐
+  - ✅ 已修复：`opencode.ts` 通用化 `streamFetchWithTimeout`（连接/首字节超时 90s → 拿到响应后解除整体超时 → `withSSEKeepAlive` idle 兜底 240s + 心跳）；心跳只对严格 `text/event-stream` 注入（NDJSON 等逐行格式注入注释行会破坏解析）；proxy 通用/OAuth/Anthropic/Responses/qoder/cline/gemini 全部路径统一接入 `fetchUpstream`/`streamFetchWithTimeout`
 
 ### 🟠 中
 
-- [ ] **P3. 响应体多次缓冲放大内存 2-3 倍**
+- [x] **P3. 响应体多次缓冲放大内存 2-3 倍**
   - [proxy.ts:471](src/proxy.ts#L471) 对响应 `tee()`，观察分支逐行 JSON.parse 整个 SSE 流
-- [ ] **P4. 日志 KV 写放大**
+  - ✅ 已修复：非流式不再 `tee()`（整体读一次解析 usage 后直接构造响应，单份缓冲）；`observeStreamUsage` 单行缓冲设 64KB 上限，异常超长行只保留尾段
+- [x] **P4. 日志 KV 写放大**
   - 每请求 1 次 KV.put（日志）+ 1 次 Analytics 数据点
-- [ ] **P5. handleLogs 全量 KV 枚举**
+  - ✅ 已修复：`log_enabled` 开关 5s 内存 TTL 缓存（`isLogEnabled`），消除每请求 1 次 KV.get；开关切换时同步刷新缓存
+- [x] **P5. handleLogs 全量 KV 枚举**
   - [admin.ts:984-989](src/admin.ts#L984-L989) 先全量 KV.list 再逐批读取，日志量大时逼近 subrequest 上限
-- [ ] **P6. 管理页 SSR 体量 O(N×M)**
+  - ✅ 已修复：KV.list 只拉 key 名（上限 5000 条截断 total），仅对 offset..offset+limit 窗口内的 key 发起 KV.get，subrequest 数从「全量」降到「页数 + limit」量级
+- [x] **P6. 管理页 SSR 体量 O(N×M)**
   - [pages.ts:269-276](src/pages.ts#L269-L276) 每提供商完整重放全库模型引用列表
+  - ✅ 已修复：识图模型引用列表改懒渲染——SSR 只输出空容器 + `VB_MODELS`/`VB_ORIGINAL` 快照各一份（O(N)），展开「识图模型配置」时才客户端生成控件；未展开时保存表单按快照保留原配置，避免误清
 
 ### 🟡 低
 
-- [ ] **P7. 其他**
+- [x] **P7. 其他**
   - 前端日志 5s 自动刷新全量重绘；opencode 429 重试同步 sleep；usage-logs 前导通配符 ILIKE 全表扫描
+  - ✅ 已修复：① 日志自动刷新改静默模式（不闪「加载中」，内容未变化时不重绘 DOM）；② opencode 429 重试已是异步「sleep + 退避重试」（commit 720f565 引入 `await sleep`，非同步阻塞，审查点复核无改动）；③ usage-logs 关键词去掉前导通配符，改前缀匹配（`ILIKE 'kw%'`）并转义用户输入的 `%`/`_`/`\`
 
 ---
 
@@ -114,9 +120,10 @@
 
 ### 🔴 高
 
-- [ ] **R1. 并发 KV 读-改-写竞争**
+- [x] **R1. 并发 KV 读-改-写竞争**
   - 键健康计数 readHealth → failures++ → writeHealth 无原子性，并发计数丢失；成功删除失败记录可能清掉并发失败记录
   - OAuth token 刷新多并发 401 同时 refresh，上游 rotate refresh_token 时互相覆盖
+  - ✅ 已修复：health 读写走 10s 内存缓存（写路径同步刷新），isolate 内并发共享同一 map 消除覆盖写；OAuth `refreshInflight` 按 provider 合并并发刷新 Promise，同一 provider 只打一次上游
 - [ ] **R2. 客户端断开后上游流仍被持续消费**
   - [proxy.ts:471](src/proxy.ts#L471) tee 后观察分支继续读完整条上游 body，浪费 Worker 时长与上游配额
 
@@ -156,3 +163,10 @@
 | 2026-08-09 | P1 KV 缓存 | storage.ts | providers/proxyKeys 10s 内存 TTL 缓存，写路径同步刷新 |
 | 2026-08-09 | R6 畸形 JSON 400 化 | index.ts | `onError` 识别 SyntaxError 返回 400，覆盖 admin/auth `c.req.json()` |
 | 2026-08-09 | R7 JSON.parse 保护 | storage.ts | `safeParseArray` 回退空数组；`getSession` try/catch + 类型校验 |
+| 2026-08-09 | R1 并发 KV 竞争 | proxy.ts, oauth.ts | health 读写加 10s 内存缓存（写路径同步刷新），消除「读→改→覆盖写」并发计数丢失；OAuth token 刷新 `refreshInflight` 按 provider 合并并发刷新 Promise，只打一次上游 |
+| 2026-08-09 | P2 流式超时 | opencode.ts, proxy.ts, qoder/proxy.ts, cline/proxy.ts, gemini/proxy.ts | `streamFetchWithTimeout` 连接/首字节 90s + idle 240s 兜底 + 心跳；心跳仅对严格 text/event-stream 注入；全部上游路径统一接入 |
+| 2026-08-09 | P3 内存放大 | proxy.ts, analytics/usage-logger.ts | 非流式不再 tee（单份缓冲）；`observeStreamUsage` 单行缓冲 64KB 上限 |
+| 2026-08-09 | P4 日志 KV 写放大 | admin.ts | `log_enabled` 5s 内存缓存消除每请求 KV.get |
+| 2026-08-09 | P5 全量 KV 枚举 | admin.ts | handleLogs 只 KV.list 拉 key 名（5000 截断），仅对 offset..limit 窗口 KV.get |
+| 2026-08-09 | P6 SSR 体量 | pages.ts | 识图模型列表懒渲染：SSR 输出空容器 + `VB_MODELS`/`VB_ORIGINAL` 快照，展开时客户端生成，未展开保存读快照防误清 |
+| 2026-08-09 | P7 其他 | pages.ts, analytics/query.ts | 日志自动刷新静默模式（内容不变不重绘）；usage-logs 关键词前缀匹配 + 通配符转义；opencode 429 已为异步退避（复核无改动） |

@@ -17,6 +17,7 @@
 
 import type { Env, Provider } from '../types'
 import { updateProvider } from '../storage'
+import { streamFetchWithTimeout } from '../opencode'
 
 export const CLINE_PROVIDER_ID = 'cline'
 export const CLINE_API_BASE = 'https://api.cline.bot/api/v1'
@@ -36,9 +37,6 @@ export const CLINE_MODELS: Array<{ id: string; provider: string; cost: string }>
 export function isClineProvider(providerId: string): boolean {
   return providerId === CLINE_PROVIDER_ID
 }
-
-/** 向上游转发超时：LLM 长响应/流式放宽到 5 分钟，避免中途被掐断 */
-const CLINE_TIMEOUT_MS = 300000
 
 // ===== 账号池状态（per isolate，按 provider.id 隔离） =====
 
@@ -152,11 +150,10 @@ async function clineFetch(
     'Content-Type': 'application/json',
     'X-Task-ID': sessionId,
   }
-  const resp = await fetch(CLINE_API_BASE + path, {
+  const resp = await streamFetchWithTimeout(CLINE_API_BASE + path, {
     method: 'POST',
     headers,
     body: JSON.stringify(bodyObj),
-    signal: AbortSignal.timeout(CLINE_TIMEOUT_MS),
   })
   // token 失效：标记当前账号冷却，强制重试（会用别的账号/刷新）
   if (resp.status === 401 && !retried) {

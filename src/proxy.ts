@@ -5,7 +5,13 @@ import type { AppEnv, Env, ProxyRequestBody } from './types'
 import { createAnalyticsContext, normalizeAnthropicUsage, normalizeChatUsage, normalizeResponsesUsage, summarizeError } from './analytics/types'
 import type { AnalyticsContext, UsageMetrics } from './analytics/types'
 import { observeStreamUsage, writeAnalyticsEvent } from './analytics/usage-logger'
-import { isOpenCodeProvider, proxyOpenCodeRequest, resolveOpenCodeUrls } from './opencode'
+import {
+  isOpenCodeProvider,
+  proxyOpenCodeRequest,
+  resolveOpenCodeUrls,
+  streamFetchWithTimeout,
+  OPENCODE_KEEPALIVE_MS,
+} from './opencode'
 import { isQoderProvider, proxyQoderChatRequest } from './qoder/proxy'
 import { isClineProvider, proxyClineChatRequest } from './cline/proxy'
 import { isVisionBridgeProvider, buildVisionBridgeRequestBody } from './vision/bridge'
@@ -37,9 +43,23 @@ type HealthMap = Record<string, KeyHealth>
 
 const HEALTH_KEY = (providerId: string) => KV_KEYS.KEY_HEALTH_PREFIX + providerId
 
+// R1：health 读写缓存。同一 isolate 内并发请求共享同一 healthMap 对象（10s TTL），
+// 消除「readHealth → failures++ → writeHealth 整条覆盖写」并发时的计数互相覆盖。
+// 跨 isolate 的极端并发仍受 KV 无原子增量限制，但失败计数失陪几秒可接受。
+const HEALTH_CACHE_TTL_MS = 10_000
+interface HealthCacheEntry { map: HealthMap | null; at: number }
+const healthCache = new Map<string, HealthCacheEntry>()
+
 async function readHealth(env: Env, providerId: string): Promise<HealthMap> {
-  const raw = await env.KV.get(HEALTH_KEY(providerId))
-  return raw ? JSON.parse(raw) : {}
+  const key = HEALTH_KEY(providerId)
+  const cache = healthCache.get(key)
+  if (cache && Date.now() - cache.at < HEALTH_CACHE_TTL_MS) {
+    return cache.map || {}
+  }
+  const raw = await env.KV.get(key)
+  const map: HealthMap = raw ? JSON.parse(raw) : {}
+  healthCache.set(key, { map, at: Date.now() })
+  return map
 }
 
 async function writeHealth(env: Env, providerId: string, health: HealthMap): Promise<void> {
@@ -48,11 +68,14 @@ async function writeHealth(env: Env, providerId: string, health: HealthMap): Pro
   for (const [k, v] of Object.entries(health)) {
     if (v.failures > 0) filtered[k] = v
   }
+  const key = HEALTH_KEY(providerId)
   if (Object.keys(filtered).length > 0) {
-    await env.KV.put(HEALTH_KEY(providerId), JSON.stringify(filtered))
+    await env.KV.put(key, JSON.stringify(filtered))
+    healthCache.set(key, { map: filtered, at: Date.now() })
   } else {
     // 全部健康，删除 KV 条目
-    await env.KV.delete(HEALTH_KEY(providerId)).catch(() => {})
+    await env.KV.delete(key).catch(() => {})
+    healthCache.set(key, { map: null, at: Date.now() })
   }
 }
 
@@ -439,6 +462,26 @@ function passthroughResponse(response: Response, cleanFn?: (chunk: string) => st
 const isStreamRequest = (body: ProxyRequestBody): boolean => body.stream === true
 const getRoute = (url: URL): string => url.pathname.replace(/^\/v1\//, '') || 'chat/completions'
 
+/**
+ * P2：上游 fetch——取消「5 分钟整体超时」对流式 body 的持续生效（长思考/agent 中途被掐断）。
+ * - 非流式：保持原有 AbortSignal.timeout(总超时) 行为。
+ * - 流式：连接/首字节超时（90s），拿到 response 后 clearTimeout；
+ *   SSE body 额外包 withSSEKeepAlive（idle 兜底 240s 无数据自动结束 + 15s 心跳防客户端断流）。
+ */
+const UPSTREAM_TOTAL_TIMEOUT_MS = 300000
+
+/** P2：通用/OAuth/Anthropic/Responses 路径统一走「连接超时 + idle 兜底 + 心跳」 */
+function fetchUpstream(
+  url: string,
+  init: RequestInit,
+  isStream: boolean,
+): Promise<Response> {
+  if (!isStream) {
+    return fetch(url, { ...init, signal: AbortSignal.timeout(UPSTREAM_TOTAL_TIMEOUT_MS) })
+  }
+  return streamFetchWithTimeout(url, init, { keepAliveMs: OPENCODE_KEEPALIVE_MS })
+}
+
 const normalizeUsage = (route: string, provider: import('./types').Provider, payload: unknown): UsageMetrics | null => {
   if (route === 'responses') return normalizeResponsesUsage(payload)
   if (route === 'messages' || provider.apiType === 'anthropic') return normalizeAnthropicUsage(payload)
@@ -468,10 +511,11 @@ const finalizeProxyResponse = async (
     return new Response(null, { status: response.status, statusText: response.statusText, headers })
   }
 
-  const [clientStream, observerStream] = response.body.tee()
-  c.executionCtx.waitUntil((async () => {
-    let usage: UsageMetrics | undefined
-    if (context.streamMode === 'stream') {
+  if (context.streamMode === 'stream') {
+    // 流式：tee 后观察分支解析 usage，客户端分支直接透传（tee 为流式所必需）
+    const [clientStream, observerStream] = response.body.tee()
+    c.executionCtx.waitUntil((async () => {
+      let usage: UsageMetrics | undefined
       await observeStreamUsage(observerStream, '', (value) => {
         usage = usage ? {
           promptTokens: Math.max(usage.promptTokens, value.promptTokens),
@@ -480,22 +524,24 @@ const finalizeProxyResponse = async (
           totalTokens: Math.max(usage.totalTokens, value.totalTokens),
         } : value
       })
-    } else {
-      const contentType = headers.get('Content-Type') || ''
-      if (contentType.includes('json')) {
-        const observerResponse = new Response(observerStream, { headers })
-        const payload = await observerResponse.json().catch(() => null) as unknown
-        usage = normalizeUsage(route, { apiType: 'openai' } as import('./types').Provider, payload) || undefined
-      } else {
-        await observerStream.cancel()
-      }
-    }
-    writeAnalyticsEvent(c, { context, result: 'success', usage, upstreamStatus: response.status })
-  })().catch((error) => {
-    writeAnalyticsEvent(c, { context, result: 'success', upstreamStatus: response.status, errorSummary: summarizeError(error) })
-  }))
+      writeAnalyticsEvent(c, { context, result: 'success', usage, upstreamStatus: response.status })
+    })().catch((error) => {
+      writeAnalyticsEvent(c, { context, result: 'success', upstreamStatus: response.status, errorSummary: summarizeError(error) })
+    }))
+    return new Response(clientStream, { status: response.status, statusText: response.statusText, headers })
+  }
 
-  return new Response(clientStream, { status: response.status, statusText: response.statusText, headers })
+  // 非流式：不 tee（P3，避免响应体双份缓冲），先整体读一次解析 usage，再用同一份 payload 构造响应
+  const contentType = headers.get('Content-Type') || ''
+  if (contentType.includes('json')) {
+    const payload = await response.json().catch(() => null) as unknown
+    const usage = normalizeUsage(route, { apiType: 'openai' } as import('./types').Provider, payload) || undefined
+    writeAnalyticsEvent(c, { context, result: 'success', usage, upstreamStatus: response.status })
+    headers.delete('Content-Length')  // 重序列化后长度可能变化，去掉上游旧值
+    return new Response(JSON.stringify(payload), { status: response.status, statusText: response.statusText, headers })
+  }
+  writeAnalyticsEvent(c, { context, result: 'success', upstreamStatus: response.status })
+  return new Response(response.body, { status: response.status, statusText: response.statusText, headers })
 }
 
 /** 测试模型连接，发送最小请求验证 */
@@ -849,12 +895,11 @@ export async function forwardProxy(
           'Authorization': `Bearer ${apiKey}`,
         }
 
-        const response = await fetch(forwardUrl, {
+        const response = await fetchUpstream(forwardUrl, {
           method,
           headers: forwardHeaders,
           body: JSON.stringify(forwardBody),
-          signal: AbortSignal.timeout(300000),
-        })
+        }, isStreamRequest(forwardBody as ProxyRequestBody))
 
         if (response.ok) {
           // 成功：重置健康状态
@@ -987,12 +1032,11 @@ async function proxyOAuthRequest(
     if (provider.id.startsWith('workbuddy') && body.stream !== true) {
       body.stream = true
     }
-    return fetch(buildForwardUrl(r), {
+    return fetchUpstream(buildForwardUrl(r), {
       method,
       headers: buildOauthHeaders(cfg, token, { origin: buildOrigin(r), apiType: provider.apiType, cookies: tokenState?.cookies }),
       body: method === 'GET' || method === 'HEAD' ? undefined : JSON.stringify(body),
-      signal: AbortSignal.timeout(300000),
-    }).then(resp => ({ resp, originalStream }))
+    }, (body as Record<string, unknown>).stream === true || provider.id.startsWith('workbuddy')).then(resp => ({ resp, originalStream }))
   }
 
   try {
@@ -1297,12 +1341,11 @@ export async function handleAnthropicMessages(c: Context<AppEnv>) {
         cookies: tokenState.cookies,
       })
 
-      let response = await fetch(upstreamUrl, {
+      let response = await fetchUpstream(upstreamUrl, {
         method: 'POST',
         headers,
         body: JSON.stringify(upstreamBody),
-        signal: AbortSignal.timeout(300000),
-      })
+      }, originalStream === true)
 
       // 401/403 时刷新 token 重试
       if ((response.status === 401 || response.status === 403) && tokenState.refresh_token) {
@@ -1314,12 +1357,11 @@ export async function handleAnthropicMessages(c: Context<AppEnv>) {
               origin,
               cookies: freshState.cookies,
             })
-            response = await fetch(upstreamUrl, {
+            response = await fetchUpstream(upstreamUrl, {
               method: 'POST',
               headers: retryHeaders,
               body: JSON.stringify(upstreamBody),
-              signal: AbortSignal.timeout(300000),
-            })
+            }, originalStream === true)
           }
         }
       }
@@ -1475,15 +1517,14 @@ export async function handleAnthropicMessages(c: Context<AppEnv>) {
     sanitizeBlockedTemplates(upstreamBody)
     const apiKey = enabledKeys[0].key
 
-    const response = await fetch(forwardUrl, {
+    const response = await fetchUpstream(forwardUrl, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
         'Authorization': `Bearer ${apiKey}`,
       },
       body: JSON.stringify(upstreamBody),
-      signal: AbortSignal.timeout(300000),
-    })
+    }, originalStream === true)
 
     if (!response.ok) {
       const errText = await response.text()
@@ -2286,12 +2327,11 @@ export async function handleResponses(c: Context<AppEnv>) {
         cookies: tokenState.cookies,
       })
 
-      let response = await fetch(upstreamUrl, {
+      let response = await fetchUpstream(upstreamUrl, {
         method: 'POST',
         headers,
         body: JSON.stringify(upstreamBody),
-        signal: AbortSignal.timeout(300000),
-      })
+      }, originalStream === true)
 
       // 401/403 时刷新重试
       if ((response.status === 401 || response.status === 403) && tokenState.refresh_token) {
@@ -2304,12 +2344,11 @@ export async function handleResponses(c: Context<AppEnv>) {
               apiType: provider.apiType,
               cookies: freshState.cookies,
             })
-            response = await fetch(upstreamUrl, {
+            response = await fetchUpstream(upstreamUrl, {
               method: 'POST',
               headers: retryHeaders,
               body: JSON.stringify(upstreamBody),
-              signal: AbortSignal.timeout(300000),
-            })
+            }, originalStream === true)
           }
         }
       }
@@ -2439,15 +2478,14 @@ export async function handleResponses(c: Context<AppEnv>) {
     sanitizeBlockedTemplates(upstreamBody)
     const apiKey = enabledKeys[0].key
 
-    const response = await fetch(forwardUrl, {
+    const response = await fetchUpstream(forwardUrl, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
         'Authorization': `Bearer ${apiKey}`,
       },
       body: JSON.stringify(upstreamBody),
-      signal: AbortSignal.timeout(300000),
-    })
+    }, true)
 
     if (!response.ok) {
       const errText = await response.text()
