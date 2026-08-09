@@ -29,6 +29,7 @@ export const handleUsageLogs = async (c: Context<AppEnv>): Promise<Response> => 
       keyword: c.req.query('keyword'),
       result: c.req.query('result'),
       page: c.req.query('page'),
+      pageSize: c.req.query('pageSize'),
     }) })
   } catch (error) { return respondError(c, error) }
 }

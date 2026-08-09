@@ -131,7 +131,7 @@ const buildTimeWhere = (start?: string, end?: string): string => {
   return clauses.length ? clauses.join(' AND ') : "timestamp >= NOW() - INTERVAL '24' HOUR"
 }
 
-export const queryUsageLogs = async (c: Context<AppEnv>, params: { start?: string; end?: string; dimension?: string; keyword?: string; result?: string; page?: string }): Promise<{ records: Array<Record<string, unknown>>; page: number; pageSize: number }> => {
+export const queryUsageLogs = async (c: Context<AppEnv>, params: { start?: string; end?: string; dimension?: string; keyword?: string; result?: string; page?: string; pageSize?: string }): Promise<{ records: Array<Record<string, unknown>>; page: number; pageSize: number }> => {
   const field = params.dimension && params.dimension in FILTER_FIELDS ? FILTER_FIELDS[params.dimension as UsageLogDimension] : ''
   const filters = [buildTimeWhere(params.start, params.end)]
   // P7：关键词走前缀匹配（'kw%'）而非前导通配符（'%kw%'）。
@@ -139,7 +139,8 @@ export const queryUsageLogs = async (c: Context<AppEnv>, params: { start?: strin
   if (field && params.keyword) filters.push(`${field} ILIKE '${escapeSql(escapeLike(params.keyword.slice(0, 100)))}%'`)
   const result = params.result === 'success' || params.result === 'failure' ? params.result : 'all'
   if (result !== 'all') filters.push(`${ANALYTICS_BLOBS.result} = '${result}'`)
-  const page = Math.min(1000, Math.max(1, Number(params.page || 1) || 1))
-  const sql = `SELECT timestamp, ${Object.values(ANALYTICS_BLOBS).join(', ')}, ${Object.values(ANALYTICS_DOUBLES).join(', ')} FROM ${getDataset(c.env)} WHERE ${filters.join(' AND ')} ORDER BY timestamp DESC LIMIT 50 OFFSET ${(page - 1) * 50}`
-  return { records: (await queryAnalytics(c, sql)).data, page, pageSize: 50 }
+  const page = Math.min(10000, Math.max(1, Number(params.page || 1) || 1))
+  const pageSize = Math.min(200, Math.max(1, Number(params.pageSize || 5) || 5))
+  const sql = `SELECT timestamp, ${Object.values(ANALYTICS_BLOBS).join(', ')}, ${Object.values(ANALYTICS_DOUBLES).join(', ')} FROM ${getDataset(c.env)} WHERE ${filters.join(' AND ')} ORDER BY timestamp DESC LIMIT ${pageSize} OFFSET ${(page - 1) * pageSize}`
+  return { records: (await queryAnalytics(c, sql)).data, page, pageSize }
 }

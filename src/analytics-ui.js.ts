@@ -2,6 +2,8 @@
 export const ANALYTICS_JS = `
 let analyticsRange = '24h'
 let analyticsLogPage = 1
+// 详细日志每页条数：默认 5，用户选择后记忆在 localStorage
+let analyticsLogPageSize = parseInt(localStorage.getItem('usageLogPageSize') || '5', 10) || 5
 let analyticsLogRecords = []
 let analyticsController = null
 
@@ -151,7 +153,7 @@ async function loadUsageLogs(resetPage) {
   if (resetPage) analyticsLogPage = 1
   const errorBox = document.getElementById('usage-log-error')
   errorBox.classList.add('hd')
-  const params = new URLSearchParams({ page: String(analyticsLogPage), dimension: document.getElementById('log-dimension').value, keyword: document.getElementById('log-keyword').value.trim(), result: document.getElementById('log-result').value })
+  const params = new URLSearchParams({ page: String(analyticsLogPage), pageSize: String(analyticsLogPageSize), dimension: document.getElementById('log-dimension').value, keyword: document.getElementById('log-keyword').value.trim(), result: document.getElementById('log-result').value })
   const start = document.getElementById('log-start').value, end = document.getElementById('log-end').value
   if (start) params.set('start', new Date(start).toISOString())
   if (end) params.set('end', new Date(end).toISOString())
@@ -167,11 +169,29 @@ async function loadUsageLogs(resetPage) {
   }
 }
 
-function changeLogPage(offset) { analyticsLogPage = Math.max(1, analyticsLogPage + offset); loadUsageLogs(false) }
+function changeLogPage(offset) {
+  analyticsLogPage = Math.max(1, analyticsLogPage + offset)
+  loadUsageLogs(false)
+}
+function changeUsageLogPageSize(v) {
+  v = parseInt(v, 10) || 5
+  if (v === analyticsLogPageSize) return
+  analyticsLogPageSize = v
+  try { localStorage.setItem('usageLogPageSize', String(v)) } catch (e) {}
+  loadUsageLogs(true)  // 切换每页条数后回到第一页
+}
 function resetLogFilters() {
   document.getElementById('log-start').value = ''; document.getElementById('log-end').value = ''; document.getElementById('log-keyword').value = ''; document.getElementById('log-result').value = 'all'; document.getElementById('log-dimension').value = 'model'; loadUsageLogs(true)
 }
 
 loadAnalytics()
+// 同步本地记忆的每页条数到下拉框（SSR 默认选中 5）
+function syncLogPageSizeSelect() {
+  const sel = document.getElementById('log-page-size')
+  if (sel) sel.value = String(analyticsLogPageSize)
+}
+const usageOpts = [5, 10, 20, 50, 100]
+if (usageOpts.indexOf(analyticsLogPageSize) === -1) analyticsLogPageSize = 5
+syncLogPageSizeSelect()
 loadUsageLogs(true)
 `

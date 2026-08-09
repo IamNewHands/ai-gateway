@@ -94,20 +94,25 @@
 
 - [x] **UX1. 折叠面板内嵌可交互控件（键盘误触）**
   - [pages.ts:452-455](src/pages.ts#L452-L455) `.ps` 整块 role="button"，内部又放 checkbox/按钮，按 Enter 同时触发展开收起和状态切换
-- [ ] **UX2. 保存/删除后整页 `location.reload()`**
+- [x] **UX2. 保存/删除后整页 `location.reload()`**
   - 多处 reload 导致页面回顶、面板折叠、输入丢失
-- [ ] **UX3. 表单无提交中状态，可重复提交**
+  - ✅ 已修复：`reloadAdmin()` 在 reload 前记录滚动位置 + 展开的提供商面板 + 添加表单状态，刷新后 `restoreAdminState()` 恢复；全部 reload 调用点已替换
+- [x] **UX3. 表单无提交中状态，可重复提交**
   - 双击「创建提供商」可 POST 两次
+  - ✅ 已修复：全局 `adminSubmitting` 防重入 + `busyBtn`/`idleBtn` 按钮提交中状态（「处理中…」+ 禁用），覆盖创建/保存/删除/Key 模型筛选/生成 Key/删除 Key/Cline 一键授权
 
 ### 🟠 中
 
 - [x] **UX4. flowType 回显 Bug（功能缺陷）**
   - [pages.ts:464](src/pages.ts#L464) `(p.oauth&&p.oauth.flowType)||'device'==='device'` 运算优先级错误恒为 true，browser/qoder/gemini 流程编辑时总是选中「设备码」
-- [ ] **UX5. 模态框无障碍缺失**
+- [x] **UX5. 模态框无障碍缺失**
   - 无 ESC 关闭、无焦点管理、无键盘陷阱；动态添加行无 aria-label
-- [ ] **UX6. 多 Key 并发测试结果互相覆盖**
-- [ ] **UX7. 双重转义**
+  - ✅ 已修复：`showM`/`closeM` 记录并归还触发焦点、打开时聚焦首控件；ESC 关闭（优先触发「取消」让 Promise 正常 resolve）、Tab 焦点圈在弹窗内；Key/模型动态行按钮补 aria-label
+- [x] **UX6. 多 Key 并发测试结果互相覆盖**
+  - ✅ 已修复：Key/模型测试结果写入各自行内的 `.trt` 结果区（`ktr-<id>-<idx>`/`mtr-<id>-<idx>`），并发测试互不覆盖
+- [x] **UX7. 双重转义**
   - `escapeHtml(msg)` 后再经 `showResult` 二次转义，错误信息显示字面 `&amp;lt;` 实体
+  - ✅ 已修复：移除 `fetchOauthModels`/`fetchEditModels` 调用处的预转义，`showResult` 内部统一转义
 
 ### 🟡 低
 
@@ -160,6 +165,12 @@
 | 2026-08-09 | S3 前端 XSS | pages.ts, shared.js.ts | `escapePageJsx`/`escapeJsAttr` 双转义；addKeyRow/Key 值转义；全部内联事件参数转义 |
 | 2026-08-09 | UX1 折叠面板键盘误触 | pages.ts | onkeydown 加 `event.target===this` 判断，内部控件不再连锁触发 |
 | 2026-08-09 | UX4 flowType 回显 | pages.ts | 修正 `(p.oauth&&p.oauth.flowType)||'device'==='device'` 优先级 Bug |
+| 2026-08-09 | UX2 reload 状态丢失 | pages.ts | `reloadAdmin()` 捕获滚动/展开面板/添加表单状态，`restoreAdminState()` 刷新后恢复 |
+| 2026-08-09 | UX3 重复提交 | pages.ts | `adminSubmitting` 防重入 + `busyBtn`/`idleBtn` 提交中状态，覆盖创建/保存/删除/Key 筛选/生成/删除/Cline 授权 |
+| 2026-08-09 | UX5 模态框无障碍 | pages.ts | 焦点记录/归还/首控件聚焦、ESC 关闭（触发取消按钮防 Promise 悬挂）、Tab 焦点圈、动态行 aria-label |
+| 2026-08-09 | UX6 测试结果互相覆盖 | pages.ts | Key/模型测试写入各自行 `.trt` 结果区（`ktr-<id>-<idx>`/`mtr-<id>-<idx>`） |
+| 2026-08-09 | UX7 双重转义 | pages.ts | 移除 `fetchOauthModels`/`fetchEditModels` 预转义，`showResult` 统一转义 |
+| 2026-08-09 | 详细日志每页条数 | pages.ts, analytics-ui.js.ts, analytics/query.ts, analytics/admin-api.ts | 每页 5/10/20/50/100 可选，默认 5，localStorage 记忆；后端 `pageSize` 参数 clamp 1-200 |
 | 2026-08-09 | P1 KV 缓存 | storage.ts | providers/proxyKeys 10s 内存 TTL 缓存，写路径同步刷新 |
 | 2026-08-09 | R6 畸形 JSON 400 化 | index.ts | `onError` 识别 SyntaxError 返回 400，覆盖 admin/auth `c.req.json()` |
 | 2026-08-09 | R7 JSON.parse 保护 | storage.ts | `safeParseArray` 回退空数组；`getSession` try/catch + 类型校验 |

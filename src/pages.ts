@@ -404,6 +404,9 @@ ${H('管理')}
           <button class="btn btn-gh btn-xs" id="log-prev" onclick="changeLogPage(-1)" disabled><i class="fas fa-chevron-left"></i>上一页</button>
           <span class="mu" id="log-page-label">第 1 页</span>
           <button class="btn btn-gh btn-xs" id="log-next" onclick="changeLogPage(1)">下一页<i class="fas fa-chevron-right"></i></button>
+          <label class="mu" style="font-size:12px;display:inline-flex;align-items:center;gap:4px">每页
+            <select id="log-page-size" class="select-sm" onchange="changeUsageLogPageSize(this.value)" aria-label="每页条数"><option value="5" selected>5</option><option value="10">10</option><option value="20">20</option><option value="50">50</option><option value="100">100</option></select>
+            条</label>
         </div>
       </section>
 
@@ -598,8 +601,42 @@ function copyText(t, el) {
 }
 
 // modal
-function showM(h) { document.getElementById('mc').innerHTML = h; document.getElementById('modal').classList.remove('hd') }
-function closeM() { document.getElementById('modal').classList.add('hd') }
+let modalLastFocus = null
+function showM(h) {
+  document.getElementById('mc').innerHTML = h
+  const m = document.getElementById('modal')
+  m.classList.remove('hd')
+  // UX5：记录触发元素，关闭后归还焦点；打开时聚焦弹窗内首个可交互控件
+  modalLastFocus = document.activeElement
+  const f = m.querySelector('[autofocus], button, input, select, textarea, [href], [tabindex]:not([tabindex="-1"])')
+  if (f) f.focus()
+}
+function closeM() {
+  const m = document.getElementById('modal')
+  if (m.classList.contains('hd')) return
+  m.classList.add('hd')
+  if (modalLastFocus && modalLastFocus.focus) { try { modalLastFocus.focus() } catch (e) { /* 忽略 */ } }
+  modalLastFocus = null
+}
+// UX5：ESC 关闭 + Tab 焦点圈在弹窗内
+document.addEventListener('keydown', function (e) {
+  const m = document.getElementById('modal')
+  if (!m || m.classList.contains('hd')) return
+  if (e.key === 'Escape') {
+    // 优先触发「取消」按钮，让确认/输入的 Promise 正常 resolve，避免 await 悬挂
+    const cancel = m.querySelector('.btn-s, [data-cancel]')
+    if (cancel) cancel.click()
+    else closeM()
+    return
+  }
+  if (e.key === 'Tab') {
+    const focusables = Array.from(m.querySelectorAll('button, input, select, textarea, [href], [tabindex]:not([tabindex="-1"])'))
+    if (focusables.length === 0) return
+    const first = focusables[0], last = focusables[focusables.length - 1]
+    if (e.shiftKey && (document.activeElement === first || document.activeElement === m)) { e.preventDefault(); last.focus() }
+    else if (!e.shiftKey && document.activeElement === last) { e.preventDefault(); first.focus() }
+  }
+})
 function cM(msg) {
   return new Promise(r => {
     showM('<h3><i class="fas fa-question-circle c-p"></i> 确认</h3><p>' + msg + '</p><div class="fa"><button class="btn btn-s" onclick="closeM();r(false)">取消</button><button class="btn btn-p" onclick="closeM();r(true)">确定</button></div>')
@@ -642,6 +679,46 @@ function tog(id) {
   c.style.transform = d.classList.contains('open') ? 'rotate(90deg)' : ''
 }
 
+// UX2：保存/删除等操作后 location.reload() 会把页面打回顶部、收起所有面板。
+// reload 前捕获滚动位置与展开状态，刷新后恢复，避免「操作一次就找不到刚才的位置」。
+function reloadAdmin() {
+  try {
+    const open = []
+    document.querySelectorAll('.pd.open').forEach(function (d) { if (d.id) open.push(d.id) })
+    const af = document.getElementById('af')
+    localStorage.setItem('ui_state', JSON.stringify({ y: window.scrollY, open: open, add: !!(af && !af.classList.contains('hd')) }))
+  } catch (e) { /* 忽略存储失败 */ }
+  location.reload()
+}
+function restoreAdminState() {
+  try {
+    const s = JSON.parse(localStorage.getItem('ui_state') || 'null')
+    if (!s) { return }
+    (s.open || []).forEach(function (panelId) {
+      const d = document.getElementById(panelId)
+      const c = document.getElementById('ch-' + String(panelId).replace(/^dt-/, ''))
+      if (d && d.classList && !d.classList.contains('open')) { d.classList.add('open'); if (c) c.style.transform = 'rotate(90deg)' }
+    })
+    if (s.add) { const af = document.getElementById('af'); if (af) af.classList.remove('hd') }
+    if (s.y) window.scrollTo(0, s.y)
+  } catch (e) { /* 忽略损坏的状态 */ }
+  try { localStorage.removeItem('ui_state') } catch (e) { /* 忽略 */ }
+}
+
+// UX3：表单提交中状态——防重复提交，按钮显示「处理中」
+let adminSubmitting = false
+function busyBtn(btn) {
+  if (!btn || btn.disabled) return
+  btn.disabled = true
+  btn.dataset.prevHtml = btn.innerHTML
+  btn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> 处理中…'
+}
+function idleBtn(btn) {
+  if (!btn) return
+  if (btn.dataset.prevHtml !== undefined) { btn.innerHTML = btn.dataset.prevHtml; delete btn.dataset.prevHtml }
+  btn.disabled = false
+}
+
 function showAdd() { document.getElementById('af').classList.remove('hd') }
 function hideAdd() { document.getElementById('af').classList.add('hd'); document.getElementById('amc').classList.add('hd') }
 function toggleVbCollapse(id, btn) {
@@ -666,7 +743,8 @@ function addAKeyRow() {
   const c = document.getElementById('akeys')
   const d = document.createElement('div')
   d.className = 'fc mb-4 field-row'
-  d.innerHTML = '<input type="password" placeholder="sk-xxx" class="fx1 aki"><button class="icon-btn" onclick="toggleKeyText(this)" title="显示/隐藏 Key"><i class="fas fa-eye" aria-hidden="true"></i></button><label class="tg"><input type="checkbox" checked class="ake"><span class="sl"></span></label><button class="btn btn-gh btn-xs" onclick="testNewAKey(this)" title="测试"><i class="fas fa-plug"></i></button><button class="btn btn-gh btn-xs" onclick="this.parentElement.remove()"><i class="fas fa-times c-l"></i></button>'
+  // UX6：每行自带独立结果区（.trt），多 Key 并发测试互不覆盖
+  d.innerHTML = '<input type="password" placeholder="sk-xxx" class="fx1 aki" aria-label="API Key"><button class="icon-btn" onclick="toggleKeyText(this)" title="显示/隐藏 Key" aria-label="显示或隐藏 Key"><i class="fas fa-eye" aria-hidden="true"></i></button><label class="tg"><input type="checkbox" checked class="ake" aria-label="启用该 Key"><span class="sl"></span></label><button class="btn btn-gh btn-xs" onclick="testNewAKey(this)" title="测试" aria-label="测试该 Key"><i class="fas fa-plug"></i></button><button class="btn btn-gh btn-xs" onclick="this.parentElement.remove()" title="移除" aria-label="移除该 Key"><i class="fas fa-times c-l"></i></button><span class="trt" style="flex-basis:100%" aria-live="polite"></span>'
   c.appendChild(d)
 }
 
@@ -699,7 +777,7 @@ function testNewAKey(btn) {
   const url = document.getElementById('aurl').value.trim()
   if (!url) { toast('请先填写 API 地址', 'error'); return }
   const apiType = document.getElementById('afmt').value
-  const tr = document.getElementById('atestR')
+  const tr = btn.parentElement.querySelector('.trt') || document.getElementById('atestR')
   showSpinner(tr)
   testKeyConnection(url, apiType, k, providerId).then(function(result) {
     if (result.success && result.data) {
@@ -717,7 +795,7 @@ function addMdlRow() {
   const c = document.getElementById('amodels')
   const d = document.createElement('div')
   d.className = 'fc mb-4 field-row'
-  d.innerHTML = '<input type="text" placeholder="deepseek-chat" class="fx1 ami"><label class="tg"><input type="checkbox" checked class="ame"><span class="sl"></span></label><button class="btn btn-gh btn-xs" onclick="testNewMdl(this)"><i class="fas fa-plug"></i></button><button class="btn btn-gh btn-xs" onclick="this.parentElement.remove()"><i class="fas fa-times c-l"></i></button>'
+  d.innerHTML = '<input type="text" placeholder="deepseek-chat" class="fx1 ami" aria-label="模型 ID"><label class="tg"><input type="checkbox" checked class="ame" aria-label="启用该模型"><span class="sl"></span></label><button class="btn btn-gh btn-xs" onclick="testNewMdl(this)" aria-label="测试该模型"><i class="fas fa-plug"></i></button><button class="btn btn-gh btn-xs" onclick="this.parentElement.remove()" aria-label="移除该模型"><i class="fas fa-times c-l"></i></button><span class="trt" style="flex-basis:100%" aria-live="polite"></span>'
   c.appendChild(d)
 }
 
@@ -725,7 +803,7 @@ function addMdlToForm(mid) {
   const c = document.getElementById('amodels')
   const d = document.createElement('div')
   d.className = 'fc mb-4 field-row'
-  d.innerHTML = '<input type="text" value="' + escapeHtml(mid) + '" class="fx1 ami"><label class="tg"><input type="checkbox" checked class="ame"><span class="sl"></span></label><button class="btn btn-gh btn-xs" onclick="testNewMdl(this)"><i class="fas fa-plug"></i></button><button class="btn btn-gh btn-xs" onclick="this.parentElement.remove()"><i class="fas fa-times c-l"></i></button>'
+  d.innerHTML = '<input type="text" value="' + escapeHtml(mid) + '" class="fx1 ami" aria-label="模型 ID"><label class="tg"><input type="checkbox" checked class="ame" aria-label="启用该模型"><span class="sl"></span></label><button class="btn btn-gh btn-xs" onclick="testNewMdl(this)" aria-label="测试该模型"><i class="fas fa-plug"></i></button><button class="btn btn-gh btn-xs" onclick="this.parentElement.remove()" aria-label="移除该模型"><i class="fas fa-times c-l"></i></button><span class="trt" style="flex-basis:100%" aria-live="polite"></span>'
   c.appendChild(d)
 }
 
@@ -736,7 +814,7 @@ function testNewMdl(btn) {
     const akeys = document.querySelectorAll('#akeys .aki')
     const configuredKey = Array.from(akeys).map(function(inp) { return inp.value.trim() }).filter(Boolean)[0] || ''
     const apiType = document.getElementById('afmt').value
-    const tr = document.getElementById('atestR')
+    const tr = btn.parentElement.querySelector('.trt') || document.getElementById('atestR')
     showSpinner(tr)
   const providerId = document.getElementById('aid').value.trim()
   const apiKey = configuredKey || (providerId === 'opencode' ? '' : 'dummy')
@@ -746,6 +824,8 @@ function testNewMdl(btn) {
 }
 
 async function createProv(opts) {
+  if (adminSubmitting) return
+  const btns = Array.from(document.querySelectorAll('#af .btn-p'))
   const nm = document.getElementById('anm').value.trim(), id = document.getElementById('aid').value.trim()
   const url = document.getElementById('aurl').value.trim(), apiType = document.getElementById('afmt').value
   const authType = document.getElementById('aat').value
@@ -773,20 +853,28 @@ async function createProv(opts) {
   // 识图模型：勾选了识图模型即保存配置；选了主文本模型才是独立桥（type=vision-bridge），
   // 仅勾识图模型（primary 留空）= 本提供商共享识图，保持普通提供商身份
   const vb = collectVisionBridgeNew()
-  const r = await fetch('/admin/api/providers', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ id, name: nm, baseUrl: url, apiType, authType, oauth: authType === 'oauth-device' ? oauth : undefined, apiKeys: keys, models, enabled, type: vb && vb.primary ? 'vision-bridge' : undefined, visionBridge: vb })
-  })
-  const d = await r.json()
-  if (d.success) {
-    if (opts && typeof opts.afterCreate === 'function') {
-      toast('已创建，继续下一步…', 'success')
-      opts.afterCreate(id)
-    } else {
-      toast('已创建', 'success'); location.reload()
-    }
-  } else toast(d.message || '创建失败', 'error')
+  adminSubmitting = true
+  btns.forEach(busyBtn)
+  try {
+    const r = await fetch('/admin/api/providers', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ id, name: nm, baseUrl: url, apiType, authType, oauth: authType === 'oauth-device' ? oauth : undefined, apiKeys: keys, models, enabled, type: vb && vb.primary ? 'vision-bridge' : undefined, visionBridge: vb })
+    })
+    const d = await r.json()
+    if (d.success) {
+      if (opts && typeof opts.afterCreate === 'function') {
+        toast('已创建，继续下一步…', 'success')
+        opts.afterCreate(id)
+      } else {
+        toast('已创建', 'success'); reloadAdmin()
+      }
+    } else toast(d.message || '创建失败', 'error')
+  } catch (e) { toast('创建失败', 'error') }
+  finally {
+    adminSubmitting = false
+    btns.forEach(idleBtn)
+  }
 }
 
 function collectOauthNew() {
@@ -1239,8 +1327,10 @@ function oauthDisconnect(id) {
 // ===== Cline 一键授权（WorkOS 设备码流程，与原项目 cline_oauth.py 一致） =====
 // 发起后弹出授权链接 + 设备码，浏览器登录授权后由后台轮询并自动把 refreshToken 存入账号池。
 function clineOAuthConnect(id) {
+  if (adminSubmitting) return  // 防重复发起（UX3）
   const st = document.getElementById('tr-' + id)
   if (st) st.textContent = '发起中…'
+  adminSubmitting = true
   return fetch('/admin/api/cline/oauth/' + encodeURIComponent(id) + '/connect', { method: 'POST' }).then(r => r.json()).then(d => {
     if (!d.success || !d.data) { if (st) showResult(st, false, d.message || '发起失败'); return }
     const dev = d.data
@@ -1254,7 +1344,7 @@ function clineOAuthConnect(id) {
       if (!pollSt || pollSt.textContent.includes('成功')) { clearInterval(window._clineOAuthTimer); return }
       clineOAuthPoll(id)
     }, 5000)
-  }).catch(() => { if (st) showResult(st, false, '发起失败') })
+  }).catch(() => { if (st) showResult(st, false, '发起失败') }).finally(function() { adminSubmitting = false })
 }
 
 function clineOAuthPoll(id) {
@@ -1266,7 +1356,7 @@ function clineOAuthPoll(id) {
       if (window._clineOAuthTimer) { clearInterval(window._clineOAuthTimer); window._clineOAuthTimer = null }
       if (pollSt) { pollSt.textContent = '授权成功！正在刷新账号列表…'; setTimeout(closeM, 1200) }
       if (st) showResult(st, true, '授权成功，RefreshToken 已加入账号池')
-      setTimeout(function () { location.reload() }, 1400)
+      setTimeout(function () { reloadAdmin() }, 1400)
       return true
     }
     if (pollSt) pollSt.textContent = d.message || '等待授权…'
@@ -1304,7 +1394,8 @@ async function fetchOauthModels(id) {
         if (dbg.tokenExpiresAt) debugInfo += 'Token 过期: ' + dbg.tokenExpiresAt + NL
         if (d.data.allErrors) debugInfo += '所有错误: ' + JSON.stringify(d.data.allErrors) + NL
       }
-      if (tr) showResult(tr, false, escapeHtml(msg + debugInfo))
+      // UX7：showResult 内部已 escapeHtml，这里不再预转义，避免双重转义显示 &amp;lt;
+      if (tr) showResult(tr, false, msg + debugInfo)
       if (st) st.textContent = msg
     }
   } catch (e) {
@@ -1333,7 +1424,7 @@ function addKeyRow(id) {
   const d = document.createElement('div')
   d.className = 'fc mb-3 field-row'
   d.dataset.kidx = cnt
-  d.innerHTML = '<input type="password" value="' + escapeHtml(k) + '" class="fx1" id="k-' + escapeHtml(id) + '-' + cnt + '" placeholder="API Key"><button class="icon-btn" onclick="toggleKeyText(this)" title="显示/隐藏 Key"><i class="fas fa-eye" aria-hidden="true"></i></button><label class="tg"><input type="checkbox" checked id="ken-' + escapeHtml(id) + '-' + cnt + '"><span class="sl"></span></label><button class="btn btn-gh btn-xs" onclick="testKeyRow(\\'' + escapeJsAttr(id) + '\\',' + cnt + ')" title="测试"><i class="fas fa-plug"></i></button><button class="btn btn-gh btn-xs" onclick="rmKeyRow(\\'' + escapeJsAttr(id) + '\\',' + cnt + ')"><i class="fas fa-times c-l"></i></button>'
+  d.innerHTML = '<input type="password" value="' + escapeHtml(k) + '" class="fx1" id="k-' + escapeHtml(id) + '-' + cnt + '" placeholder="API Key" aria-label="API Key"><button class="icon-btn" onclick="toggleKeyText(this)" title="显示/隐藏 Key" aria-label="显示或隐藏 Key"><i class="fas fa-eye" aria-hidden="true"></i></button><label class="tg"><input type="checkbox" checked id="ken-' + escapeHtml(id) + '-' + cnt + '" aria-label="启用该 Key"><span class="sl"></span></label><button class="btn btn-gh btn-xs" onclick="testKeyRow(\\'' + escapeJsAttr(id) + '\\',' + cnt + ')" title="测试" aria-label="测试该 Key"><i class="fas fa-plug"></i></button><button class="btn btn-gh btn-xs" onclick="rmKeyRow(\\'' + escapeJsAttr(id) + '\\',' + cnt + ')" title="移除" aria-label="移除该 Key"><i class="fas fa-times c-l"></i></button><span class="trt" id="ktr-' + escapeHtml(id) + '-' + cnt + '" style="flex-basis:100%" aria-live="polite"></span>'
   c.appendChild(d)
   inp.value = ''
   inp.focus()
@@ -1351,7 +1442,8 @@ async function testKeyRow(id, idx) {
   const url = document.getElementById('url-' + id).value.trim()
   if (!k) { toast('请输入 API Key', 'error'); return }
   const apiType = document.getElementById('at-' + id).value
-  const tr = document.getElementById('tr-' + id)
+  // UX6：结果写入该 Key 行自己的结果区，多个 Key 并发测试互不覆盖
+  const tr = document.getElementById('ktr-' + id + '-' + idx) || document.getElementById('tr-' + id)
   showSpinner(tr)
   const result = await testKeyConnection(url, apiType, k, id)
   showResult(tr, result.success, result.success ? '' : (result.message && result.message.indexOf('HTTP') !== -1 ? result.message : 'HTTP ' + result.status + (result.message ? ': ' + result.message : '')))
@@ -1369,7 +1461,8 @@ async function fetchEditModels(id) {
   const tr = document.getElementById('tr-' + id)
   showSpinner(tr)
   const result = await testKeyConnection(url, apiType, apiKey, id)
-  showResult(tr, result.success, result.success ? '' : escapeHtml(result.message || '获取模型失败'))
+  // UX7：showResult 内部已转义，不再二次转义
+  showResult(tr, result.success, result.success ? '' : (result.message || '获取模型失败'))
   if (result.success && result.data) {
     showEditModelsList(id, result.data.data || [])
   }
@@ -1437,6 +1530,7 @@ function getMdl(id) {
 }
 
 async function save(id) {
+  if (adminSubmitting) return
   const nm = document.getElementById('nm-' + id).value.trim(), url = document.getElementById('url-' + id).value.trim()
   const apiType = document.getElementById('at-' + id).value
   const authType = document.getElementById('auth-' + id).value
@@ -1450,22 +1544,41 @@ async function save(id) {
     }
   }
   const vb = collectVisionBridgeEdit(id) || null
-  const r = await fetch('/admin/api/providers/' + encodeURIComponent(id), {
-    method: 'PUT',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ name: nm, baseUrl: url, apiType, authType, oauth: authType === 'oauth-device' ? oauth : undefined, apiKeys: keys, models, enabled, type: vb && vb.primary ? 'vision-bridge' : null, visionBridge: vb })
-  })
-  const d = await r.json()
-  if (d.success) { toast('已保存', 'success'); location.reload() }
-  else toast(d.message || '保存失败', 'error')
+  const btn = document.querySelector('#dt-' + id + ' .detail-actions .btn-p')
+  adminSubmitting = true
+  busyBtn(btn)
+  try {
+    const r = await fetch('/admin/api/providers/' + encodeURIComponent(id), {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name: nm, baseUrl: url, apiType, authType, oauth: authType === 'oauth-device' ? oauth : undefined, apiKeys: keys, models, enabled, type: vb && vb.primary ? 'vision-bridge' : null, visionBridge: vb })
+    })
+    const d = await r.json()
+    if (d.success) { toast('已保存', 'success'); reloadAdmin() }
+    else toast(d.message || '保存失败', 'error')
+  } catch (e) { toast('保存失败', 'error') }
+  finally {
+    adminSubmitting = false
+    idleBtn(btn)
+  }
 }
 
 async function del(id) {
   if (!(await cM('确定要删除此提供商？'))) return
-  const r = await fetch('/admin/api/providers/' + encodeURIComponent(id), { method: 'DELETE' })
-  const d = await r.json()
-  if (d.success) { toast('已删除', 'success'); location.reload() }
-  else toast(d.message || '删除失败', 'error')
+  if (adminSubmitting) return
+  const btn = document.querySelector('#dt-' + id + ' .detail-actions .btn-d')
+  adminSubmitting = true
+  busyBtn(btn)
+  try {
+    const r = await fetch('/admin/api/providers/' + encodeURIComponent(id), { method: 'DELETE' })
+    const d = await r.json()
+    if (d.success) { toast('已删除', 'success'); reloadAdmin() }
+    else toast(d.message || '删除失败', 'error')
+  } catch (e) { toast('删除失败', 'error') }
+  finally {
+    adminSubmitting = false
+    idleBtn(btn)
+  }
 }
 
 // ===== 转发 Key 模型筛选 =====
@@ -1514,18 +1627,28 @@ function keyModelsToggle(checked) {
   document.querySelectorAll('.mdl-chk input').forEach(function(el) { el.checked = checked })
 }
 async function saveKeyModels(keyId) {
+  if (adminSubmitting) return  // 防重复提交（UX3）
   var checked = Array.from(document.querySelectorAll('.mdl-chk input:checked')).map(function(el) { return el.value })
   var all = Array.from(document.querySelectorAll('.mdl-chk input')).map(function(el) { return el.value })
   // 全部勾选 = 存空数组（= 全部允许）
   var allowedModels = checked.length === all.length ? [] : checked
-  var res = await fetch('/admin/api/proxy-keys/' + encodeURIComponent(keyId), {
-    method: 'PATCH',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ allowedModels: allowedModels })
-  })
-  var d = await res.json()
-  if (d.success) { toast('已保存', 'success'); closeM(); setTimeout(function() { location.reload() }, 500) }
-  else toast(d.message || '保存失败', 'error')
+  const btn = document.querySelector('#mc .btn-p')
+  adminSubmitting = true
+  busyBtn(btn)
+  try {
+    var res = await fetch('/admin/api/proxy-keys/' + encodeURIComponent(keyId), {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ allowedModels: allowedModels })
+    })
+    var d = await res.json()
+    if (d.success) { toast('已保存', 'success'); closeM(); setTimeout(function() { reloadAdmin() }, 500) }
+    else toast(d.message || '保存失败', 'error')
+  } catch (e) { toast('保存失败', 'error') }
+  finally {
+    adminSubmitting = false
+    idleBtn(btn)
+  }
 }
 
 function addMdl(id) {
@@ -1535,7 +1658,7 @@ function addMdl(id) {
   const d = document.createElement('div')
   d.className = 'fc mb-3 field-row'
   d.dataset.idx = cnt
-  d.innerHTML = '<input type="text" value="' + escapeHtml(mid) + '" class="fx1" id="mid-' + escapeHtml(id) + '-' + cnt + '" placeholder="模型 ID"><label class="tg"><input type="checkbox" checked id="men-' + escapeHtml(id) + '-' + cnt + '"><span class="sl"></span></label><button class="btn btn-gh btn-xs" id="tm-' + escapeHtml(id) + '-' + cnt + '"><i class="fas fa-plug"></i></button><button class="btn btn-gh btn-xs" id="rm-' + escapeHtml(id) + '-' + cnt + '"><i class="fas fa-times c-l"></i></button>'
+  d.innerHTML = '<input type="text" value="' + escapeHtml(mid) + '" class="fx1" id="mid-' + escapeHtml(id) + '-' + cnt + '" placeholder="模型 ID" aria-label="模型 ID"><label class="tg"><input type="checkbox" checked id="men-' + escapeHtml(id) + '-' + cnt + '" aria-label="启用该模型"><span class="sl"></span></label><button class="btn btn-gh btn-xs" id="tm-' + escapeHtml(id) + '-' + cnt + '" aria-label="测试该模型"><i class="fas fa-plug"></i></button><button class="btn btn-gh btn-xs" id="rm-' + escapeHtml(id) + '-' + cnt + '" aria-label="移除该模型"><i class="fas fa-times c-l"></i></button><span class="trt" id="mtr-' + escapeHtml(id) + '-' + cnt + '" style="flex-basis:100%" aria-live="polite"></span>'
   c.appendChild(d)
   document.getElementById('tm-' + id + '-' + cnt).addEventListener('click', function() { testMdl(id, mid, cnt) })
   document.getElementById('rm-' + id + '-' + cnt).addEventListener('click', function() { rmMdl(id, cnt) })
@@ -1550,7 +1673,8 @@ function rmMdl(id, idx) {
 }
 
 async function testMdl(id, mid, idx) {
-  const tr = document.getElementById('tr-' + id)
+  // UX6：结果写入该模型行自己的结果区，多个模型并发测试互不覆盖
+  const tr = document.getElementById('mtr-' + id + '-' + idx) || document.getElementById('tr-' + id)
   showSpinner(tr)
   try {
     const r = await fetch('/admin/api/providers/' + encodeURIComponent(id) + '/test-model', {
@@ -1577,24 +1701,29 @@ async function genKey() {
 }
 
 async function doGenKey(exp, name) {
+  if (adminSubmitting) return  // 防重复提交（UX3）
   closeM()
   const nm = name || ''
-  const r = await fetch('/admin/api/proxy-keys', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ name: nm, expiresIn: exp })
-  })
-  const d = await r.json()
-  if (d.success && d.data) {
-    showM('<h3><i class="fas fa-check-circle c-s"></i> 生成成功</h3><p>请妥善保存，切勿泄露：</p><div class="mk">' + d.data.key + '</div><div class="fa"><button class="btn btn-p" onclick="closeM();location.reload()">关闭</button></div>')
-  } else toast(d.message || '生成失败', 'error')
+  adminSubmitting = true
+  try {
+    const r = await fetch('/admin/api/proxy-keys', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name: nm, expiresIn: exp })
+    })
+    const d = await r.json()
+    if (d.success && d.data) {
+      showM('<h3><i class="fas fa-check-circle c-s"></i> 生成成功</h3><p>请妥善保存，切勿泄露：</p><div class="mk">' + d.data.key + '</div><div class="fa"><button class="btn btn-p" onclick="closeM();reloadAdmin()">关闭</button></div>')
+    } else toast(d.message || '生成失败', 'error')
+  } catch (e) { toast('生成失败', 'error') }
+  finally { adminSubmitting = false }
 }
 
 async function rmKey(id) {
   if (!(await cM('确定要删除此 Key？'))) return
   const r = await fetch('/admin/api/proxy-keys/' + encodeURIComponent(id), { method: 'DELETE' })
   const d = await r.json()
-  if (d.success) { toast('已删除', 'success'); location.reload() }
+  if (d.success) { toast('已删除', 'success'); reloadAdmin() }
   else toast(d.message || '删除失败', 'error')
 }
 
@@ -1884,6 +2013,8 @@ async function triggerCheckin(id) {
 }
 // 页面加载后初始化识图模型顺序序号（处理编辑表单预勾选的模型）
 renumberVisionOrders();
+// UX2：上次 reload 前保存的滚动位置/展开面板在此恢复
+restoreAdminState();
 </script>
 </body></html>`)
 }
