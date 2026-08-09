@@ -48,6 +48,72 @@ function normalizeArray<T>(
   return items as T[]
 }
 
+/**
+ * SSRF 防护：校验待 fetch 的 URL 是否安全（baseUrl / 测试 URL / OAuth 端点）。
+ * - 只允许 http/https
+ * - 拒绝带用户名/密码凭据的 URL
+ * - 拒绝指向本机/内网/保留地址段的 IP 字面量（IPv4 / IPv6）
+ * - 拒绝 localhost 等常见本机域名
+ * 说明：纯域名无法在 Worker 端做 DNS 反查，依赖平台出网隔离兜底 DNS 重绑定。
+ */
+export function isSafeHttpUrl(value: string): boolean {
+  if (!value || value.length > 2048) return false
+  let u: URL
+  try { u = new URL(value) } catch { return false }
+  if (u.protocol !== 'http:' && u.protocol !== 'https:') return false
+  if (u.username || u.password) return false
+  const host = u.hostname.toLowerCase()
+  // 常见本机/内网域名直接拒绝
+  if (host === 'localhost' || host.endsWith('.localhost') ||
+      host.endsWith('.local') || host.endsWith('.internal') || host.endsWith('.lan') ||
+      host === 'metadata.google.internal') return false
+  // IP 字面量 → 按网段判断；否则（正常域名）放行
+  return !/^[\d.]+$/.test(host) ? true : !isPrivateIp(host)
+}
+
+function isPrivateIp(host: string): boolean {
+  if (host.includes(':')) {
+    // IPv6（可能带 []）；::ffff:a.b.c.d 映射回 IPv4 判断
+    let v6 = host
+    if (v6.startsWith('[') && v6.endsWith(']')) v6 = v6.slice(1, -1)
+    const low = v6.toLowerCase()
+    if (low.startsWith('::ffff:')) return isPrivateIp(low.slice(7))
+    if (low === '::' || low === '::1') return true
+    if (low.startsWith('fe8') || low.startsWith('fe9') || low.startsWith('fea') || low.startsWith('feb')) return true // 链路本地
+    if (low.startsWith('fc') || low.startsWith('fd')) return true // ULA
+    return false
+  }
+  const parts = host.split('.').map((n) => parseInt(n, 10))
+  if (parts.length !== 4 || parts.some((n) => isNaN(n) || n < 0 || n > 255)) return false
+  const [a, b] = parts
+  if (a === 0 || a === 127) return true            // 本机/保留
+  if (a === 10) return true                        // 10/8
+  if (a === 169 && b === 254) return true          // 链路本地（含云元数据）
+  if (a === 172 && b >= 16 && b <= 31) return true // 172.16/12
+  if (a === 192 && b === 168) return true          // 192.168/16
+  if (a === 192 && b === 0) return true            // 192.0.0.0/24（保留，含 192.0.0.9/10 任意播）
+  if (a === 198 && (b === 18 || b === 19)) return true // 198.18/15 基准测试网段
+  if (a >= 224) return true                        // 组播/广播/保留
+  return false
+}
+
+/** 校验 OAuth 中会被服务端 fetch 的端点 URL；不合法返回错误文案，全部合法返回 null */
+function validateOAuthUrls(oauth?: OAuthDeviceConfig): string | null {
+  if (!oauth) return null
+  const names: Array<[string, string | undefined]> = [
+    ['deviceCodeUrl', oauth.deviceCodeUrl],
+    ['deviceTokenUrl', oauth.deviceTokenUrl],
+    ['refreshTokenUrl', oauth.refreshTokenUrl],
+    ['modelsUrl', oauth.modelsUrl],
+    ['globalBaseUrl', oauth.globalBaseUrl],
+    ['globalModelsUrl', oauth.globalModelsUrl],
+  ]
+  for (const [name, v] of names) {
+    if (v && !isSafeHttpUrl(v)) return `OAuth ${name} 必须是合法的 http/https 公网地址`
+  }
+  return null
+}
+
 export async function handleStatus(c: Context<AppEnv>) {
   const providers = await getProviders(c.env)
   const proxyKeys = await getProxyKeys(c.env)
@@ -89,6 +155,13 @@ export async function handleCreateProvider(c: Context<AppEnv>) {
   if (!body.id || !body.name || !body.baseUrl) {
     return c.json<ApiResponse>({ success: false, message: 'id、name、baseUrl 为必填项' }, 400)
   }
+  if (!isSafeHttpUrl(body.baseUrl)) {
+    return c.json<ApiResponse>({ success: false, message: 'baseUrl 必须是合法的 http/https 公网地址' }, 400)
+  }
+  const oauthErr = validateOAuthUrls(body.oauth)
+  if (oauthErr) {
+    return c.json<ApiResponse>({ success: false, message: oauthErr }, 400)
+  }
 
   const providers = await getProviders(c.env)
   if (providers.some((p) => p.id === body.id)) {
@@ -125,10 +198,19 @@ export async function handleUpdateProvider(c: Context<AppEnv>) {
 
   const updates: Partial<Provider> = {}
   if (body.name !== undefined) updates.name = body.name
-  if (body.baseUrl !== undefined) updates.baseUrl = body.baseUrl.replace(/\/$/, '')
+  if (body.baseUrl !== undefined) {
+    if (!isSafeHttpUrl(body.baseUrl)) {
+      return c.json<ApiResponse>({ success: false, message: 'baseUrl 必须是合法的 http/https 公网地址' }, 400)
+    }
+    updates.baseUrl = body.baseUrl.replace(/\/$/, '')
+  }
   if (body.apiType !== undefined) updates.apiType = body.apiType
   if (body.authType !== undefined) updates.authType = body.authType
-  if (body.oauth !== undefined) updates.oauth = body.oauth
+  if (body.oauth !== undefined) {
+    const oauthErr = validateOAuthUrls(body.oauth)
+    if (oauthErr) return c.json<ApiResponse>({ success: false, message: oauthErr }, 400)
+    updates.oauth = body.oauth
+  }
   if (body.type !== undefined) updates.type = body.type ?? undefined
   if (body.visionBridge !== undefined) updates.visionBridge = body.visionBridge ?? undefined
 if (body.apiKeys !== undefined) {
@@ -185,6 +267,9 @@ export async function handleUpsertProvider(c: Context<AppEnv>) {
     if (!body.name || !body.baseUrl) {
       return c.json<ApiResponse>({ success: false, message: '新建时 name、baseUrl 为必填项' }, 400)
     }
+    if (!isSafeHttpUrl(body.baseUrl)) {
+      return c.json<ApiResponse>({ success: false, message: 'baseUrl 必须是合法的 http/https 公网地址' }, 400)
+    }
     const now = new Date().toISOString()
     const provider: Provider = {
       id: body.id,
@@ -205,7 +290,12 @@ export async function handleUpsertProvider(c: Context<AppEnv>) {
   // ===== 存在 → 合并 =====
   const updates: Partial<Provider> = {}
   if (body.name !== undefined) updates.name = body.name
-  if (body.baseUrl !== undefined) updates.baseUrl = body.baseUrl.replace(/\/$/, '')
+  if (body.baseUrl !== undefined) {
+    if (!isSafeHttpUrl(body.baseUrl)) {
+      return c.json<ApiResponse>({ success: false, message: 'baseUrl 必须是合法的 http/https 公网地址' }, 400)
+    }
+    updates.baseUrl = body.baseUrl.replace(/\/$/, '')
+  }
   if (body.apiType !== undefined) updates.apiType = body.apiType
   if (body.authType !== undefined) updates.authType = body.authType
   if (body.enabled !== undefined) updates.enabled = body.enabled
@@ -357,6 +447,9 @@ export async function handleTestKeyNew(c: Context<AppEnv>) {
   if (!url || (!apiKey && !(providerId && isOpenCodeProvider(providerId)))) {
     return c.json<ApiResponse>({ success: false, message: 'url 和 apiKey 为必填项' }, 400)
   }
+  if (!isSafeHttpUrl(url)) {
+    return c.json<ApiResponse>({ success: false, message: 'url 必须是合法的 http/https 公网地址' }, 400)
+  }
 
   if (providerId && isOpenCodeProvider(providerId)) {
     // 没填 key 时检查是否配了镜像，避免迷惑性报错
@@ -441,6 +534,9 @@ export async function handleTestModelNew(c: Context<AppEnv>) {
   }>()
   if (!url || !model || (!apiKey && !isOpenCodeProvider(providerId || ''))) {
     return c.json<ApiResponse>({ success: false, message: 'url、apiKey、model 为必填项' }, 400)
+  }
+  if (!isSafeHttpUrl(url)) {
+    return c.json<ApiResponse>({ success: false, message: 'url 必须是合法的 http/https 公网地址' }, 400)
   }
 
   if (providerId && isOpenCodeProvider(providerId)) {
@@ -589,8 +685,8 @@ export async function handleOAuthStatus(c: Context<AppEnv>) {
       connected: !!token,
       expiresAt: token?.expires_at ?? null,
       updatedAt: token?.updated_at ?? null,
+      // 只暴露是否有 Cookie，绝不返回 Cookie 片段（会话凭据）
       hasCookies: !!(token?.cookies),
-      cookiesPreview: token?.cookies ? token.cookies.substring(0, 100) : null,
       email: token?.email ?? null,
       projectId: token?.projectId ?? null,
     },
@@ -835,12 +931,12 @@ export async function handleOAuthModels(c: Context<AppEnv>) {
   const debug: Record<string, unknown> = {
     realm: detectTokenRealm(token),
     tokenHeader: cfg.tokenHeader || 'x-api-key',
-    tokenHeaderPrefix: cfg.tokenHeaderPrefix || '',
+    tokenHeaderPrefix: cfg.tokenHeaderPrefix || '（前缀值不打印）',
     hasCookies: !!cookies,
-    cookiesPreview: cookies ? cookies.substring(0, 80) + '...' : '(none)',
     modelsUrl: cfg.modelsUrl || `${provider.baseUrl.replace(/\/$/, '')}/models`,
     baseUrl: provider.baseUrl,
-    extraHeaders: cfg.extraHeaders,
+    // extraHeaders 可能含 Origin/Referer 之外的敏感值（如 client_secret），只记头名
+    extraHeaderNames: cfg.extraHeaders ? Object.keys(cfg.extraHeaders) : undefined,
     tokenExpiresAt: tokenState?.expires_at ? new Date(tokenState.expires_at).toISOString() : 'unknown',
   }
 
@@ -872,8 +968,13 @@ export async function handleOAuthModels(c: Context<AppEnv>) {
     try {
       const reqHeaders = buildOauthHeaders(cfg, token, { origin: ep.origin, cookies })
       debug['requestUrl'] = ep.url
+      // 只记请求头名与是否有 Cookie（值长度），绝不打印 token / cookie 值
       debug['requestHeaders'] = Object.keys(reqHeaders).reduce((acc, k) => {
-        acc[k] = k.toLowerCase() === 'cookie' ? (reqHeaders[k] || '').substring(0, 80) + '...' : reqHeaders[k]
+        const v = reqHeaders[k] || ''
+        const lk = k.toLowerCase()
+        if (lk === 'cookie') acc[k] = `yes (${v.length} chars)`
+        else if (lk === 'x-api-key' || lk === 'authorization') acc[k] = v.length > 0 ? '***' : ''
+        else acc[k] = v
         return acc
       }, {} as Record<string, string>)
 
@@ -955,6 +1056,21 @@ export interface LogEntry {
 const LOG_PREFIX = 'log:'
 const LOG_TTL = 60 * 60 * 24 * 7 // 7 天
 
+/**
+ * 日志内容脱敏：日志里绝不落盘密钥原文。
+ * 覆盖：Bearer token、sk_cf_* 类转发 Key、API Key、x-api-key / Authorization 值、
+ * Cookie（会话凭据）、token / refresh_token / secret 类的 JSON 值。
+ */
+function sanitizeLogText(text: string): string {
+  if (!text) return text
+  return text
+    .replace(/(Bearer\s+)[A-Za-z0-9._~+\/-]+/gi, '$1***')
+    .replace(/\bsk[-_][A-Za-z0-9_-]{8,}/gi, 'sk_***')
+    .replace(/("?(?:x-api-key|authorization|api[-_]?key|refresh_token|access_token|client_secret|token)"?\s*[:=]\s*")[^"]{6,}(")/gi, '$1***$3')
+    .replace(/(cookie[^=:=]*[:=]\s*"?)["',;][^"',;]{4,}["',;]/gi, '$1***')
+    .replace(/(Set-Cookie[^,;]*=)[^,;]{4,}/gi, '$1***')
+}
+
 /** 写日志到 KV */
 export async function writeLog(env: Env, type: LogEntry['type'], message: string, details?: string) {
   // 检查是否启用日志
@@ -966,8 +1082,8 @@ export async function writeLog(env: Env, type: LogEntry['type'], message: string
     id,
     time: new Date().toISOString(),
     type,
-    message,
-    details: details ? details.substring(0, 4000) : undefined,
+    message: sanitizeLogText(message),
+    details: details ? sanitizeLogText(details).substring(0, 4000) : undefined,
   }
   await env.KV.put(LOG_PREFIX + id, JSON.stringify(entry), { expirationTtl: LOG_TTL })
 }

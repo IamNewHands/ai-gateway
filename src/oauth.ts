@@ -293,7 +293,8 @@ async function startOauthBrowserFlow(env: Env, providerId: string, cfg: OAuthDev
     res.headers.forEach((value, key) => {
       if (key.toLowerCase() === 'set-cookie') allSetCookies.push(value)
     })
-    console.log(`[oauth-start] provider=${providerId} Set-Cookie count: ${allSetCookies.length}, raw: "${setCookie.substring(0, 200)}"`)
+    // 只记录数量，绝不打印 Cookie 原文（上游 Cookie 属账号会话凭据）
+    console.log(`[oauth-start] provider=${providerId} Set-Cookie count: ${allSetCookies.length}`)
     const { state, authUrl } = env_resp.data
     const device: DeviceFlowState = {
       device_code: state,        // browser 模式下 device_code 字段存 state
@@ -350,9 +351,9 @@ async function pollOauthBrowserFlow(env: Env, providerId: string, cfg: OAuthDevi
     const expiresInSec = tok.expiresIn || 7200
     // 保存 cookies 到 token 状态，后续模型拉取和 API 转发需要复用
     const newCookies = res.headers.get('Set-Cookie') || device.cookies || undefined
-    console.log(`[oauth-poll] provider=${providerId} set-cookie from poll response: ${res.headers.get('Set-Cookie') || '(none)'}`)
-    console.log(`[oauth-poll] provider=${providerId} device.cookies from login: ${device.cookies || '(none)'}`)
-    console.log(`[oauth-poll] provider=${providerId} final cookies saved: ${newCookies || '(none)'}`)
+    // 只记录是否有 Cookie（长度），绝不打印原文
+    console.log(`[oauth-poll] provider=${providerId} set-cookie from poll response: ${newCookies ? `yes (${newCookies.length} chars)` : '(none)'}`)
+    console.log(`[oauth-poll] provider=${providerId} device.cookies from login: ${device.cookies ? `yes (${device.cookies.length} chars)` : '(none)'}`)
     await writeOauthToken(env, providerId, {
       access_token: tok.accessToken,
       refresh_token: tok.refreshToken,

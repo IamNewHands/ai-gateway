@@ -171,6 +171,11 @@ app.notFound((c) => {
 
 // ===== 错误处理 =====
 app.onError((err, c) => {
+  // 请求体 JSON 解析失败（原生 Request.json() 会抛 SyntaxError）：返回 400 而非 500。
+  // 覆盖 admin/auth 等所有 `await c.req.json()` 无 try/catch 的路径（R6）。
+  if (err instanceof SyntaxError && /Unexpected (end of JSON input|token)/i.test(err.message)) {
+    return c.json({ error: { message: '请求体 JSON 格式错误', type: 'bad_request' } }, 400)
+  }
   console.error('未捕获的错误:', err)
   return c.json({ error: { message: '服务器内部错误', type: 'server_error' } }, 500)
 })

@@ -1,11 +1,46 @@
 import { KV_KEYS } from './config'
 import type { Env, Provider, ProxyKey, Session } from './types'
 
+// ===== 内存缓存（P1：降低热路径 KV 读放大）=====
+// 每个 isolate 内缓存 KV 原始文本 + 10s TTL；写路径同步刷新缓存。
+// 多 isolate 部署时，其它实例最多滞后一个 TTL（10s），对网关场景可接受。
+const CACHE_TTL_MS = 10_000
+interface RawCacheEntry { text: string; at: number }
+const providersCache = new Map<string, RawCacheEntry>()
+const proxyKeysCache = new Map<string, RawCacheEntry>()
+
+function rawCacheGet(cache: Map<string, RawCacheEntry>, key: string): string | undefined {
+  const entry = cache.get(key)
+  if (!entry) return undefined
+  if (Date.now() - entry.at > CACHE_TTL_MS) {
+    cache.delete(key)
+    return undefined
+  }
+  return entry.text
+}
+function rawCacheSet(cache: Map<string, RawCacheEntry>, key: string, text: string): void {
+  cache.set(key, { text, at: Date.now() })
+}
+
+/** 安全 JSON.parse：KV 数据损坏 / 结构不符时回退默认值，避免连锁 500（R7） */
+function safeParseArray<T>(text: string | null | undefined, fallback: T[]): T[] {
+  if (!text) return fallback
+  try {
+    const parsed: unknown = JSON.parse(text)
+    return Array.isArray(parsed) ? (parsed as T[]) : fallback
+  } catch {
+    return fallback
+  }
+}
+
 // ===== 提供商 CRUD =====
 
 export async function getProviders(env: Env): Promise<Provider[]> {
+  const cached = rawCacheGet(providersCache, KV_KEYS.PROVIDERS)
+  if (cached !== undefined) return safeParseArray<Provider>(cached, [])
   const data = await env.KV.get(KV_KEYS.PROVIDERS)
-  return data ? JSON.parse(data) : []
+  if (data !== null) rawCacheSet(providersCache, KV_KEYS.PROVIDERS, data)
+  return safeParseArray<Provider>(data, [])
 }
 
 export async function getProvider(env: Env, id: string): Promise<Provider | null> {
@@ -14,7 +49,9 @@ export async function getProvider(env: Env, id: string): Promise<Provider | null
 }
 
 export async function setProviders(env: Env, providers: Provider[]): Promise<void> {
-  await env.KV.put(KV_KEYS.PROVIDERS, JSON.stringify(providers))
+  const text = JSON.stringify(providers)
+  await env.KV.put(KV_KEYS.PROVIDERS, text)
+  rawCacheSet(providersCache, KV_KEYS.PROVIDERS, text)
 }
 
 export async function addProvider(env: Env, provider: Provider): Promise<void> {
@@ -57,8 +94,13 @@ export async function createSession(env: Env, username: string, ttlSeconds: numb
 export async function getSession(env: Env, sessionId: string): Promise<Session | null> {
   const data = await env.KV.get(KV_KEYS.SESSION_PREFIX + sessionId)
   if (!data) return null
-  const session: Session = JSON.parse(data)
-  if (session.expiresAt < Date.now()) {
+  let session: Session | null = null
+  try {
+    session = JSON.parse(data) as Session
+  } catch {
+    return null
+  }
+  if (!session || typeof session.expiresAt !== 'number' || session.expiresAt < Date.now()) {
     await deleteSession(env, sessionId)
     return null
   }
@@ -72,12 +114,17 @@ export async function deleteSession(env: Env, sessionId: string): Promise<void> 
 // ===== 转发 Key =====
 
 export async function getProxyKeys(env: Env): Promise<ProxyKey[]> {
+  const cached = rawCacheGet(proxyKeysCache, KV_KEYS.PROXY_KEYS)
+  if (cached !== undefined) return safeParseArray<ProxyKey>(cached, [])
   const data = await env.KV.get(KV_KEYS.PROXY_KEYS)
-  return data ? JSON.parse(data) : []
+  if (data !== null) rawCacheSet(proxyKeysCache, KV_KEYS.PROXY_KEYS, data)
+  return safeParseArray<ProxyKey>(data, [])
 }
 
 export async function setProxyKeys(env: Env, keys: ProxyKey[]): Promise<void> {
-  await env.KV.put(KV_KEYS.PROXY_KEYS, JSON.stringify(keys))
+  const text = JSON.stringify(keys)
+  await env.KV.put(KV_KEYS.PROXY_KEYS, text)
+  rawCacheSet(proxyKeysCache, KV_KEYS.PROXY_KEYS, text)
 }
 
 export async function addProxyKey(env: Env, key: ProxyKey): Promise<void> {

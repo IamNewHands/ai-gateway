@@ -416,25 +416,22 @@ export async function fetchQoderModels(
   }
   const { session } = data
   console.log(`[qoder-models] session ok uid=${session.uid || '(empty)'} machineType=${session.machineType.slice(0, 8)}...`)
-  console.log(`[qoder-models] machineId=${session.machineId} machineToken=${session.machineToken.substring(0, 20)}...`)
-  console.log(`[qoder-models] info len=${session.info.length} head=${session.info.substring(0, 40)}`)
-  console.log(`[qoder-models] cosyKey len=${session.cosyKey.length} head=${session.cosyKey.substring(0, 40)}`)
+  // 只记长度，绝不打印 machineToken / info / cosyKey 原文（均为会话凭据）
+  console.log(`[qoder-models] machineId=${session.machineId} machineToken len=${session.machineToken.length}`)
+  console.log(`[qoder-models] info len=${session.info.length}`)
+  console.log(`[qoder-models] cosyKey len=${session.cosyKey.length}`)
   debug.machineId = session.machineId
   debug.machineType = session.machineType
-  debug.machineToken = session.machineToken.substring(0, 20) + '...'
+  debug.machineTokenLen = session.machineToken.length
   debug.infoLen = session.info.length
-  debug.infoHead = session.info.substring(0, 40)
   debug.cosyKeyLen = session.cosyKey.length
-  debug.cosyKeyHead = session.cosyKey.substring(0, 40)
   debug.uid = session.uid || '(empty)'
-  debug.identityJSON = session.identityJSON
-  debug.tempKey = session.tempKey
 
   let encodedBody: string
   try {
     encodedBody = qoderEncode('{}')
-    console.log(`[qoder-models] encodedBody=${encodedBody}`)
-    debug.encodedBody = encodedBody
+    console.log(`[qoder-models] encodedBody len=${encodedBody.length}`)
+    debug.encodedBodyLen = encodedBody.length
   } catch (err) {
     console.error(`[qoder-models] qoderEncode threw:`, err)
     return { ok: false, message: `QoderEncoding 失败: ${(err as Error).message || err}`, debug }
@@ -444,21 +441,14 @@ export async function fetchQoderModels(
   try {
     // 先单独调用 buildBearer 获取签名中间值用于调试
     const bearerInfo = buildBearer(session, encodedBody, QODER_MODELS_URL)
-    debug.bearerPayloadB64Full = bearerInfo.payloadB64
     debug.bearerDate = bearerInfo.date
-    debug.bearerSig = bearerInfo.bearer.substring(bearerInfo.bearer.lastIndexOf('.') + 1)
-    debug.cosyKeyFull = session.cosyKey
-    debug.bodyForSign = encodedBody
-    debug.sigInput = bearerInfo.sigInput
-    
+    debug.bearerSigLen = bearerInfo.sigInput.length
+    debug.cosyKeyLen = session.cosyKey.length
+
     headers = cosyHeaders(session, encodedBody, QODER_MODELS_URL, 'application/json', false)
-    console.log(`[qoder-models] request headers:`, JSON.stringify(headers, null, 2).substring(0, 2000))
-    debug.cosyHeaders = Object.fromEntries(
-      Object.entries(headers).map(([k, v]) => [
-        k,
-        v.length > 200 ? v.substring(0, 200) + '...' : v,
-      ])
-    )
+    // 请求头可能含 Authorization Bearer 签名，只记头名列表
+    console.log(`[qoder-models] request header names:`, Object.keys(headers).join(', '))
+    debug.cosyHeaderNames = Object.keys(headers)
   } catch (err) {
     console.error(`[qoder-models] cosyHeaders threw:`, err)
     return { ok: false, message: `COSY 签名失败: ${(err as Error).message || err}`, debug }

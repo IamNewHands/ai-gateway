@@ -4,6 +4,24 @@ import { writeLog } from './admin'
 import type { Env } from './types'
 
 /**
+ * WS 首帧摘要：只记录 model/消息数量/内容长度等结构信息，
+ * 不落盘用户 prompt、system prompt、工具定义的全文。
+ */
+function summarizeWsFrame(text: string): string {
+  try {
+    const parsed = JSON.parse(text) as Record<string, unknown>
+    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+      const model = typeof parsed['model'] === 'string' ? parsed['model'] : '(?)'
+      const msgs = Array.isArray(parsed['messages']) ? (parsed['messages'] as unknown[]).length : '?'
+      const tools = Array.isArray(parsed['tools']) ? (parsed['tools'] as unknown[]).length : undefined
+      const stream = parsed['stream']
+      return `model=${model}, messages=${msgs}${typeof tools === 'number' ? `, tools=${tools}` : ''}, stream=${stream}`
+    }
+  } catch { /* 非 JSON，走兜底 */ }
+  return `len=${text.length}（非标准 JSON）`
+}
+
+/**
  * 处理 /v1/* 的 WebSocket 升级请求（Trae 等客户端自定义模型直连网关时走 WS 传输）。
  *
  * 背景：客户端发起 WS 握手（GET + Upgrade: websocket，无 body）。此前 handleProxy 用
@@ -77,14 +95,14 @@ export async function handleProxyWebSocket(c: Context<{ Bindings: Env }>) {
     const model = body['model']
 
     try {
-      // 日志：记录 WS 桥接请求（含首帧摘要，便于核对客户端帧协议）
+      // 日志：记录 WS 桥接请求（只记结构摘要，绝不落盘客户端全文，避免 prompt/密钥泄漏）
       try {
         c.executionCtx.waitUntil(writeLog(c.env, 'request',
           `[WS桥接] ${model} → 上游`,
-          `首帧: ${text.substring(0, 1500)}`
+          `首帧摘要: ${summarizeWsFrame(text)}`
         ))
       } catch { /* log failure must not break */ }
-      console.log(`[ws-bridge] model=${model} first_frame=${text.substring(0, 500)}`)
+      console.log(`[ws-bridge] model=${model} first_frame=${summarizeWsFrame(text).substring(0, 500)}`)
 
       // 复用 HTTP 转发核心（强制 POST，与正常 chat/completions 调用一致）
       const response = await forwardProxy(c, body, 'POST')

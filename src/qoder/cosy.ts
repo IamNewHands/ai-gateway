@@ -242,13 +242,13 @@ async function newCosySession(id: CosyIdentity): Promise<CosySession> {
     refresh_token: id.refreshToken,
   }
   const identityJSON = jsonSortedCompact(identityMap)
-  console.log('[cosy:session] identityJSON=', identityJSON.substring(0, 200))
+  // 只记长度，绝不打印 identityJSON（含 refresh_token / oauth token）/ tempKey 原文
   console.log('[cosy:session] identityJSON len=', identityJSON.length)
-  console.log('[cosy:session] tempKey=', tempKey, 'len=', tempKey.length)
+  console.log('[cosy:session] tempKey len=', tempKey.length)
   const infoBytes = await aesCbcEncrypt(identityJSON, new TextEncoder().encode(tempKey))
   const info = base64Std(infoBytes)
-  console.log('[cosy:session] info len=', info.length, 'info head=', info.substring(0, 40))
-  console.log('[cosy:session] cosyKey len=', cosyKey.length, 'cosyKey head=', cosyKey.substring(0, 40))
+  console.log('[cosy:session] info len=', info.length)
+  console.log('[cosy:session] cosyKey len=', cosyKey.length)
 
   return {
     machineId: machineID,
@@ -288,12 +288,12 @@ export function buildBearer(sess: CosySession, body: string, rawUrl: string): Co
   const date = String(Math.floor(Date.now() / 1000))
   const sigInput = payloadB64 + '\n' + sess.cosyKey + '\n' + date + '\n' + body + '\n' + pathSig
   const sig = md5Hex(sigInput)
-  console.log('[cosy:sign] payloadJSON=', payloadJSON.substring(0, 200))
-  console.log('[cosy:sign] payloadB64 len=', payloadB64.length, 'head=', payloadB64.substring(0, 40))
-  console.log('[cosy:sign] cosyKey len=', sess.cosyKey.length, 'head=', sess.cosyKey.substring(0, 40))
+  // 只记长度与 md5，绝不打印 payloadJSON / body / cosyKey 原文
+  console.log('[cosy:sign] payloadB64 len=', payloadB64.length)
+  console.log('[cosy:sign] cosyKey len=', sess.cosyKey.length)
   console.log('[cosy:sign] date=', date)
-  console.log('[cosy:sign] body len=', body.length, 'body head=', body.substring(0, 100))
-  console.log('[cosy:sign] pathSig=', pathSig)
+  console.log('[cosy:sign] body len=', body.length)
+  console.log('[cosy:sign] pathSig len=', pathSig.length)
   console.log('[cosy:sign] sigInput len=', sigInput.length, 'md5=', sig)
   return { payloadB64, date, bearer: 'Bearer COSY.' + payloadB64 + '.' + sig, sigInput }
 }

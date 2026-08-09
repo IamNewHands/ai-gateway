@@ -23,6 +23,18 @@ function escapeHtml(value) {
     .replace(/"/g, '&quot;')
     .replace(/'/g, '&#39;')
 }
+// JS 字符串字面量转义（内联 onclick 里单/双引号字符串）
+function escapeJsString(value) {
+  return String(value == null ? '' : value)
+    .replace(/\\\\/g, '\\\\\\\\')
+    .replace(/'/g, "\\\\'")
+    .replace(/"/g, '\\\\"')
+    .replace(/\\n/g, '\\\\n')
+    .replace(/\\r/g, '\\\\r')
+    .replace(/\\t/g, '\\\\t')
+}
+// JS 字符串 → 内联事件属性 双转义（先 JS 再 HTML，两个上下文都防住）
+function escapeJsAttr(value) { return escapeHtml(escapeJsString(value)) }
 function buildAuthHeaders(apiType, key) {
   return apiType === 'anthropic'
     ? { 'x-api-key': key, 'anthropic-version': '2023-06-01' }

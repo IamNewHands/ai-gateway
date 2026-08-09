@@ -864,7 +864,7 @@ export async function forwardProxy(
           }
           if (healthUpdated) await writeHealth(c.env, providerId, healthData)
 
-          try { c.executionCtx.waitUntil(writeLog(c.env, 'request', `[${provider.name}] ${model} → 200 (key: ${apiKey.substring(0, 8)}...)`, `provider=${providerId}`)) } catch {}
+          try { c.executionCtx.waitUntil(writeLog(c.env, 'request', `[${provider.name}] ${model} → 200`, `provider=${providerId}`)) } catch {}
           return passthroughResponse(response)
         }
 
