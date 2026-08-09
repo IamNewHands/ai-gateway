@@ -74,10 +74,28 @@ const session = await getSession(c.env, sessionId)
 // ===== 登录/退出 =====
 app.get('/admin/login', async (c) => renderLoginPage(c))
 app.post('/admin/login', handleLogin)
-app.get('/admin/logout', handleLogout)
+// S5：logout 改 POST-only——GET 会被链接型 CSRF 触发（SameSite=Lax 对顶层导航 GET 仍带 Cookie）
+app.post('/admin/logout', handleLogout)
 
 // ===== 管理后台（需 Session 验证） =====
 app.use('/admin/*', adminAuthMiddleware)
+// S5：CSRF 防护——管理面写操作校验 Origin 与 Host 同源。
+// 同源 fetch/表单都带 Origin；跨站提交（含旧浏览器无 Origin）另有 SameSite=Lax 兜底。
+app.use('/admin/*', async (c, next) => {
+  const method = c.req.method
+  if (method === 'GET' || method === 'HEAD' || method === 'OPTIONS') return next()
+  const origin = c.req.header('Origin')
+  if (origin) {
+    let originHost: string
+    try { originHost = new URL(origin).host }
+    catch { return c.json({ success: false, message: '请求来源不合法' }, 403) }
+    const host = c.req.header('Host') || ''
+    if (originHost !== host) {
+      return c.json({ success: false, message: '跨站请求被拒绝（CSRF 防护）' }, 403)
+    }
+  }
+  return next()
+})
 
 app.get('/admin', async (c) => {
   c.header('Cache-Control', 'no-store, no-cache, must-revalidate')
@@ -107,7 +125,8 @@ app.get('/admin/api/oauth/:id/status', handleOAuthStatus)
 app.post('/admin/api/oauth/:id/connect', handleOAuthConnect)
 app.post('/admin/api/oauth/:id/poll', handleOAuthPoll)
 app.post('/admin/api/oauth/:id/disconnect', handleOAuthDisconnect)
-app.get('/admin/api/oauth/:id/models', handleOAuthModels)
+// S5：模型拉取有副作用（请求上游并自动合并保存到 provider.models），改 POST 防链接型 CSRF
+app.post('/admin/api/oauth/:id/models', handleOAuthModels)
 // Gemini 授权回调：浏览器授权后把地址栏 URL 粘贴回后台提交（POST { callbackUrl }）
 app.post('/admin/api/oauth/:id/callback', handleOAuthGeminiCallback)
 

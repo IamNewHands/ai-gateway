@@ -4,7 +4,7 @@ import { KV_KEYS, KEY_HEALTH_COOLDOWN_MS, KEY_HEALTH_MAX_FAILURES } from './conf
 import type { AppEnv, Env, ProxyRequestBody } from './types'
 import { createAnalyticsContext, normalizeAnthropicUsage, normalizeChatUsage, normalizeResponsesUsage, summarizeError } from './analytics/types'
 import type { AnalyticsContext, UsageMetrics } from './analytics/types'
-import { observeStreamUsage, writeAnalyticsEvent } from './analytics/usage-logger'
+import { createStreamUsageProbe, writeAnalyticsEvent } from './analytics/usage-logger'
 import {
   isOpenCodeProvider,
   proxyOpenCodeRequest,
@@ -391,6 +391,12 @@ function passthroughResponse(response: Response, cleanFn?: (chunk: string) => st
   }
   const ct = response.headers.get('Content-Type')
   if (ct) headers['Content-Type'] = ct
+  // R9：3xx 重定向响应补透传 Location，否则客户端（curl/客户端 SDK）重定向链断裂。
+  // 其他头（Cookie、Set-Cookie 等）不与透传——避免把敏感控制面头泄漏给模型客户端。
+  if (response.status >= 300 && response.status < 400) {
+    const loc = response.headers.get('Location')
+    if (loc) headers['Location'] = loc
+  }
 
   // 无清洗函数或 body 不存在，直接透传
   if (!cleanFn || !response.body) {
@@ -512,22 +518,22 @@ const finalizeProxyResponse = async (
   }
 
   if (context.streamMode === 'stream') {
-    // 流式：tee 后观察分支解析 usage，客户端分支直接透传（tee 为流式所必需）
-    const [clientStream, observerStream] = response.body.tee()
-    c.executionCtx.waitUntil((async () => {
-      let usage: UsageMetrics | undefined
-      await observeStreamUsage(observerStream, '', (value) => {
-        usage = usage ? {
-          promptTokens: Math.max(usage.promptTokens, value.promptTokens),
-          completionTokens: Math.max(usage.completionTokens, value.completionTokens),
-          cachedTokens: Math.max(usage.cachedTokens, value.cachedTokens),
-          totalTokens: Math.max(usage.totalTokens, value.totalTokens),
-        } : value
-      })
+    // R2：单消费链——usage 探针内联进透传管道（pipeThrough）。
+    // 不再 tee 出独立观察支流：旧实现里客户端断开后观察支流仍会继续读完上游
+    // body；现在客户端 Cancel 会沿管道传播到上游，立即停止后续流消费。
+    let usage: UsageMetrics | undefined
+    const probe = createStreamUsageProbe('', (value) => {
+      usage = usage ? {
+        promptTokens: Math.max(usage.promptTokens, value.promptTokens),
+        completionTokens: Math.max(usage.completionTokens, value.completionTokens),
+        cachedTokens: Math.max(usage.cachedTokens, value.cachedTokens),
+        totalTokens: Math.max(usage.totalTokens, value.totalTokens),
+      } : value
+    }, () => {
+      // 正常流结束时写 analytics；客户端中途断开（cancel）不会走到这里
       writeAnalyticsEvent(c, { context, result: 'success', usage, upstreamStatus: response.status })
-    })().catch((error) => {
-      writeAnalyticsEvent(c, { context, result: 'success', upstreamStatus: response.status, errorSummary: summarizeError(error) })
-    }))
+    })
+    const clientStream = response.body.pipeThrough(probe)
     return new Response(clientStream, { status: response.status, statusText: response.statusText, headers })
   }
 

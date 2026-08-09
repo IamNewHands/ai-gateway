@@ -96,4 +96,29 @@ function toggleKeyText(btn) {
   const ic = btn.querySelector('i')
   if (ic) ic.className = show ? 'fas fa-eye-slash' : 'fas fa-eye'
 }
+
+// S5：logout 已改 POST-only（GET 易被链接型 CSRF 触发），退出统一走这里
+function doLogout() {
+  fetch('/admin/logout', { method: 'POST', credentials: 'same-origin' })
+    .then(function () { location.href = '/admin/login' })
+    .catch(function () { /* 忽略网络错误 */ })
+}
+
+// ── UX8：未保存变更离开提醒 ──
+// Provider 表单（#af 新增 / #dt-* 编辑）、Key 模型筛选（.mdl-list）、
+// 日志筛选（.analytics-log-filters）内有输入变更且未保存时，关页/刷新/离开给确认。
+let unsavedChanges = false
+function markSaved() { unsavedChanges = false }
+function ux8Watch(e) {
+  const t = e.target
+  if (!t || !t.closest) return
+  if (t.closest('#af, .pd[id^="dt-"], .mdl-list, .analytics-log-filters')) unsavedChanges = true
+}
+document.addEventListener('input', ux8Watch)
+document.addEventListener('change', ux8Watch)
+window.addEventListener('beforeunload', function (e) {
+  if (!unsavedChanges) return
+  e.preventDefault()
+  e.returnValue = ''
+})
 `

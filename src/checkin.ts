@@ -393,7 +393,13 @@ const resultKey = (providerId: string) => KV_KEYS.CHECKIN_RESULT_PREFIX + provid
 
 export async function readCheckinResult(env: Env, providerId: string): Promise<CheckinResult | null> {
   const raw = await env.KV.get(resultKey(providerId))
-  return raw ? (JSON.parse(raw) as CheckinResult) : null
+  // R9：损坏的 JSON 视为无结果，不能让 JSON.parse 抛错打断签到列表渲染
+  if (!raw) return null
+  try {
+    return JSON.parse(raw) as CheckinResult
+  } catch {
+    return null
+  }
 }
 
 async function writeCheckinResult(env: Env, providerId: string, result: CheckinResult): Promise<void> {

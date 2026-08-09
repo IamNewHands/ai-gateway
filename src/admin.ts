@@ -1099,11 +1099,17 @@ export async function writeLog(env: Env, type: LogEntry['type'], message: string
   await env.KV.put(LOG_PREFIX + id, JSON.stringify(entry), { expirationTtl: LOG_TTL })
 }
 
+/** 安全解析分页参数：非数字/缺失时回退默认值（R8：parseInt 遇 NaN 会污染 slice/limit） */
+const toInt = (raw: string | null | undefined, fallback: number): number => {
+  const n = Number(raw)
+  return Number.isFinite(n) ? Math.trunc(n) : fallback
+}
+
 /** 获取日志列表（支持 limit / offset 分页） */
 export async function handleLogs(c: Context<AppEnv>) {
-  const limit = Math.min(Math.max(parseInt(c.req.query('limit') || '50'), 1), 200)
+  const limit = Math.min(Math.max(toInt(c.req.query('limit'), 50), 1), 200)
   const type = c.req.query('type') || ''
-  const offset = Math.max(parseInt(c.req.query('offset') || '0'), 0)
+  const offset = Math.max(toInt(c.req.query('offset'), 0), 0)
 
   // P5：避免全量 KV.get。KV.list 只拉 key 名（便宜，上限 TOTAL_CAP 截断 total），
   // 再只对 offset..offset+limit 窗口内的 key 发起 KV.get——日志量大时不再逼近 subrequest 上限。
@@ -1136,11 +1142,24 @@ export async function handleLogs(c: Context<AppEnv>) {
 
 /** 清除日志 */
 export async function handleLogsClear(c: Context<AppEnv>) {
-  const list = await c.env.KV.list({ prefix: LOG_PREFIX })
-  for (const k of list.keys) {
-    await c.env.KV.delete(k.name)
-  }
-  return c.json<ApiResponse>({ success: true, message: '日志已清除' })
+  // R8：KV.list 默认只返回一页（最多 1000 个 key），旧实现只删了第一页——
+  // 改为按 cursor 循环删除直至全部删完，并设单次上限防止日志量过大时
+  // subrequest 超限或无限循环。
+  const DELETE_CAP = 20000
+  let cursor: string | undefined
+  let deleted = 0
+  do {
+    const list = await c.env.KV.list({ prefix: LOG_PREFIX, limit: 1000, cursor })
+    cursor = list.list_complete ? undefined : list.cursor
+    for (let i = 0; i < list.keys.length; i += 50) {
+      await Promise.all(list.keys.slice(i, i + 50).map((k) => c.env.KV.delete(k.name)))
+    }
+    deleted += list.keys.length
+  } while (cursor && deleted < DELETE_CAP)
+  return c.json<ApiResponse>({
+    success: true,
+    message: deleted >= DELETE_CAP ? `已清除 ${deleted} 条（达到单次上限，可再次执行）` : '日志已清除',
+  })
 }
 
 /** 获取/设置日志开关状态 */

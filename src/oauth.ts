@@ -17,8 +17,12 @@ export async function readOauthToken(env: Env, providerId: string): Promise<OAut
 }
 
 async function writeOauthToken(env: Env, providerId: string, state: OAuthTokenState): Promise<void> {
-  // token 有效期最长 30 天，KV 到期自清理（避免残留）
-  const ttlSeconds = Math.min(Math.max(Math.floor((state.expires_at - Date.now()) / 1000), 60), 86400 * 30)
+  // R4：有 refresh_token 时 TTL 放宽到 30 天——access_token 2h 过期不能连带删除
+  // 刷新凭据，否则离线续期功能失效；只有无 refresh_token（一次性 token）才随
+  // access 过期清理，KV 到期自动回收避免残留。
+  const ttlSeconds = state.refresh_token
+    ? 86400 * 30
+    : Math.min(Math.max(Math.ceil((state.expires_at - Date.now()) / 1000), 60), 86400 * 30)
   await env.KV.put(tokenKey(providerId), JSON.stringify(state), { expirationTtl: ttlSeconds })
 }
 
@@ -1017,6 +1021,8 @@ async function refreshOauthTokenBrowser(env: Env, providerId: string, cfg: OAuth
       refresh_token: tok.refreshToken || state.refresh_token,
       expires_at: Date.now() + (tok.expiresIn || 7200) * 1000,
       updated_at: Date.now(),
+      // R5：刷新后必须保留/更新 cookie jar——browser 模式上游 API 依赖 cookie 会话
+      cookies: res.headers.get('Set-Cookie') || state.cookies,
     })
     return true
   } catch {

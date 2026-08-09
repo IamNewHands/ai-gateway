@@ -163,6 +163,7 @@ async function loadUsageLogs(resetPage) {
     document.getElementById('log-page-label').textContent = '第 ' + data.page + ' 页'
     document.getElementById('log-prev').disabled = analyticsLogPage <= 1
     document.getElementById('log-next').disabled = data.records.length < data.pageSize
+    if (typeof markSaved === 'function') markSaved()  // UX8：查询已执行，筛选条件视为已确认
   } catch (error) {
     errorBox.innerHTML = '<i class="fas fa-exclamation-circle"></i><span>' + escapeHtml(error.message || '日志查询失败') + '</span>'
     errorBox.classList.remove('hd')

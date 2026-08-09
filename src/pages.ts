@@ -80,7 +80,7 @@ ${H('首页')}
     </a>
     <nav class="topbar__actions" aria-label="主导航">
       ${isLoggedIn
-        ? `<a href="/admin" class="btn btn-p"><i class="fas fa-sliders-h" aria-hidden="true"></i>管理控制台</a><a href="/admin/logout" class="btn btn-gh"><i class="fas fa-sign-out-alt" aria-hidden="true"></i>退出</a>`
+        ? `<a href="/admin" class="btn btn-p"><i class="fas fa-sliders-h" aria-hidden="true"></i>管理控制台</a><a href="javascript:void(0)" onclick="doLogout()" class="btn btn-gh"><i class="fas fa-sign-out-alt" aria-hidden="true"></i>退出</a>`
         : `<a href="/admin/login" class="btn btn-p"><i class="fas fa-sign-in-alt" aria-hidden="true"></i>管理员登录</a>`
       }
     </nav>
@@ -156,6 +156,12 @@ ${H('首页')}
     })
   })
 })()
+// S5：logout 已改 POST-only（GET 易被链接型 CSRF 触发），退出统一走这里
+function doLogout() {
+  fetch('/admin/logout', { method: 'POST', credentials: 'same-origin' })
+    .catch(function () { /* 忽略网络错误 */ })
+    .then(function () { location.href = '/admin/login' })
+}
 </script>
 </body></html>`)
 }
@@ -312,7 +318,7 @@ ${H('管理')}
     </nav>
     <div class="admin-rail__foot">
       <a href="/" class="admin-nav__link"><i class="fas fa-arrow-left" aria-hidden="true"></i><span>返回首页</span></a>
-      <a href="/admin/logout" class="admin-nav__link"><i class="fas fa-sign-out-alt" aria-hidden="true"></i><span>退出登录</span></a>
+      <a href="javascript:void(0)" onclick="doLogout()" class="admin-nav__link"><i class="fas fa-sign-out-alt" aria-hidden="true"></i><span>退出登录</span></a>
     </div>
   </aside>
 
@@ -320,7 +326,7 @@ ${H('管理')}
     <header class="admin-topbar">
       <a class="brand" href="/"><span class="brand__mark" aria-hidden="true"><i class="fas fa-cloud"></i></span><span class="brand__name">${SITE_CONFIG.title}</span></a>
       <nav aria-label="移动端控制台导航"><a href="#overview">概览</a><a href="#providers">提供商</a><a href="#proxy-keys">Key</a><a href="#analytics">统计</a><a href="#usage-logs">日志</a><a href="#checkin">签到</a><a href="#logs">系统日志</a></nav>
-      <a class="icon-btn" href="/admin/logout" aria-label="退出登录"><i class="fas fa-sign-out-alt" aria-hidden="true"></i></a>
+      <a class="icon-btn" href="javascript:void(0)" onclick="doLogout()" aria-label="退出登录"><i class="fas fa-sign-out-alt" aria-hidden="true"></i></a>
     </header>
 
     <main class="admin-content">
@@ -682,6 +688,7 @@ function tog(id) {
 // UX2：保存/删除等操作后 location.reload() 会把页面打回顶部、收起所有面板。
 // reload 前捕获滚动位置与展开状态，刷新后恢复，避免「操作一次就找不到刚才的位置」。
 function reloadAdmin() {
+  markSaved()  // UX8：保存成功即将刷新，清除未保存标记
   try {
     const open = []
     document.querySelectorAll('.pd.open').forEach(function (d) { if (d.id) open.push(d.id) })
@@ -864,6 +871,7 @@ async function createProv(opts) {
     const d = await r.json()
     if (d.success) {
       if (opts && typeof opts.afterCreate === 'function') {
+        markSaved()  // UX8：创建已保存，继续 OAuth 连接流程
         toast('已创建，继续下一步…', 'success')
         opts.afterCreate(id)
       } else {
@@ -1371,7 +1379,7 @@ async function fetchOauthModels(id) {
   if (tr) showSpinner(tr)
   const st = document.getElementById('oauth-st-' + id)
   try {
-    const r = await fetch('/admin/api/oauth/' + encodeURIComponent(id) + '/models')
+    const r = await fetch('/admin/api/oauth/' + encodeURIComponent(id) + '/models', { method: 'POST' })
     const d = await r.json()
     if (d.success && d.data && d.data.data) {
       showEditModelsList(id, d.data.data || [])
@@ -1642,7 +1650,7 @@ async function saveKeyModels(keyId) {
       body: JSON.stringify({ allowedModels: allowedModels })
     })
     var d = await res.json()
-    if (d.success) { toast('已保存', 'success'); closeM(); setTimeout(function() { reloadAdmin() }, 500) }
+    if (d.success) { toast('已保存', 'success'); markSaved(); closeM(); setTimeout(function() { reloadAdmin() }, 500) }
     else toast(d.message || '保存失败', 'error')
   } catch (e) { toast('保存失败', 'error') }
   finally {
@@ -1713,6 +1721,7 @@ async function doGenKey(exp, name) {
     })
     const d = await r.json()
     if (d.success && d.data) {
+      markSaved()  // UX8：Key 已生成（modal 内无表单输入残留）
       showM('<h3><i class="fas fa-check-circle c-s"></i> 生成成功</h3><p>请妥善保存，切勿泄露：</p><div class="mk">' + d.data.key + '</div><div class="fa"><button class="btn btn-p" onclick="closeM();reloadAdmin()">关闭</button></div>')
     } else toast(d.message || '生成失败', 'error')
   } catch (e) { toast('生成失败', 'error') }
@@ -1740,6 +1749,7 @@ async function togglePb(id, checked) {
   })
   const d = await r.json()
   if (!d.success) toast(d.message || '操作失败', 'error')
+  else markSaved()  // UX8：启用/禁用开关已即时保存
 }
 
 function toggleKeyVis(id) {

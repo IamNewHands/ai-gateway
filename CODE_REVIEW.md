@@ -1,4 +1,4 @@
-﻿# AI Gateway 代码审查报告与修复进度
+# AI Gateway 代码审查报告与修复进度
 
 > 生成日期：2026-08-09
 > 审查范围：全项目约 1.4 万行 TypeScript（proxy / admin / pages / oauth / checkin / gemini / cline / opencode / ws / analytics 等全部模块）
@@ -35,9 +35,9 @@
 
 - [ ] **S4. OAuth token 明文存 KV**
   - [oauth.ts:19-23](src/oauth.ts#L19-L23) `access_token` / `refresh_token` / 会话 Cookie 以纯 JSON 明文写 KV，无应用层加密
-- [ ] **S5. 管理 API 无 CSRF 防护**
+- [x] **S5. 管理 API 无 CSRF 防护**
   - 写操作依赖 `SameSite=Lax` 单层防线；带副作用的 GET（`handleOAuthModels`、`/admin/logout`）可被链接型 CSRF 触发
-  - 建议：写操作加 Origin 校验或 CSRF Token；`handleOAuthModels` 改为 POST
+  - ✅ 已修复：`index.ts` 在 `/admin/*` 认证后新增跨域中间件——非 GET/HEAD/OPTIONS 请求校验 `Origin` 与 `Host` 同源，跨站返回 403；`/admin/logout` 与 `/admin/api/oauth/:id/models` 改为 POST-only；前端 logout 链接改走 `doLogout()`（POST 后跳登录），`fetchOauthModels` 改 POST
 - [ ] **S6. Gemini 图片抓取 SSRF + 无界内存**
   - [gemini/proxy.ts:141-165](src/gemini/proxy.ts#L141-L165) 直接 `fetch` 用户可控 `image_url`，无协议白名单、无大小限制
 - [ ] **S7. Gemini 回调 state 校验可跳过**
@@ -116,8 +116,9 @@
 
 ### 🟡 低
 
-- [ ] **UX8. 其他**
-  - 无「未保存离开」提醒；成功 toast 与 modal 双路径风格不统一；模板字符串嵌套过深；魔法数字/重复预设表（服务端 + 客户端两套）
+- [x] **UX8. 其他**
+  - ✅ 已修复（未保存离开提醒）：`shared.js` 全局监听 Provider 表单（`#af`/`#dt-*`）、Key 模型筛选（`.mdl-list`）、日志筛选（`.analytics-log-filters`）的 input/change 置脏，`beforeunload` 拦截未保存离开；保存成功路径（`reloadAdmin`/`createProv`/`saveKeyModels`/`doGenKey`/`togglePb`/日志查询）统一 `markSaved()` 复位
+  - 未做（低优先级）：成功 toast 与 modal 双路径风格统一；服务端+客户端两套重复预设表去重
 
 ---
 
@@ -129,17 +130,20 @@
   - 键健康计数 readHealth → failures++ → writeHealth 无原子性，并发计数丢失；成功删除失败记录可能清掉并发失败记录
   - OAuth token 刷新多并发 401 同时 refresh，上游 rotate refresh_token 时互相覆盖
   - ✅ 已修复：health 读写走 10s 内存缓存（写路径同步刷新），isolate 内并发共享同一 map 消除覆盖写；OAuth `refreshInflight` 按 provider 合并并发刷新 Promise，同一 provider 只打一次上游
-- [ ] **R2. 客户端断开后上游流仍被持续消费**
+- [x] **R2. 客户端断开后上游流仍被持续消费**
   - [proxy.ts:471](src/proxy.ts#L471) tee 后观察分支继续读完整条上游 body，浪费 Worker 时长与上游配额
+  - ✅ 已修复：`usage-logger` 新增 `createStreamUsageProbe`（TransformStream），usage 解析内联进透传管道；`finalizeProxyResponse` 由「tee + waitUntil 观察」改为 `pipeThrough` 单一消费链——客户端 Cancel 沿管道传播到上游立即停止拉取，usage 在正常流结束（flush）时一次性写 analytics，中途断开不再后台空读
 
 ### 🟠 中
 
 - [ ] **R3. Anthropic/Responses 非 OAuth 路径只用第 1 个 key，无 failover**
   - [proxy.ts:1476-1486](src/proxy.ts#L1476-L1489)、[proxy.ts:2440-2450](src/proxy.ts#L2440-L2450) 单 key 故障即整条格式路径不可用
-- [ ] **R4. OAuth token KV TTL 绑定 access_token 寿命**
+- [x] **R4. OAuth token KV TTL 绑定 access_token 寿命**
   - [oauth.ts:21-22](src/oauth.ts#L21-L22) 过期即删，refresh_token 一并丢失，之后无法离线续期
-- [ ] **R5. browser 模式刷新后丢失 Cookie jar**
+  - ✅ 已修复：`writeOauthToken` 有 `refresh_token` 时 TTL 放宽到 30 天（不再随 access 2h 过期删除）；仅无 refresh_token 的一次性 token 才按 access 剩余寿命设置 TTL（60s 下限 / 30 天上限）
+- [x] **R5. browser 模式刷新后丢失 Cookie jar**
   - [oauth.ts:978-1009](src/oauth.ts#L978-L1009) 刷新路径未写 `cookies` 字段，后续请求 401
+  - ✅ 已修复：`refreshOauthTokenBrowser` 写回 `cookies: Set-Cookie || state.cookies`，刷新不丢 cookie 会话
 - [x] **R6. 管理 handler 的 `c.req.json()` 无 try/catch**
   - admin.ts 全文件无保护，畸形 JSON 返回 500 而非 400
   - ✅ 已修复：`index.ts` `app.onError` 识别 JSON 解析失败（SyntaxError "Unexpected end of JSON input"/"Unexpected token"）返回 400，覆盖 admin/auth 全部 `c.req.json()` 路径
@@ -149,9 +153,10 @@
 
 ### 🟡 低
 
-- [ ] 圆R8. handleLogs 的 `parseInt('abc')` 产生 NaN 静默返回空列表；handleLogsClear 只删 1000 条
-- [ ] **R9. 其他**
-  - usage-logs 查询前导通配符；observeStreamUsage 超长单行 buffer 无界增长；checkin 结果 JSON.parse 无捕获；passthrough 丢弃 3xx Location 头
+- [x] **R8. handleLogs 的 `parseInt('abc')` 产生 NaN 静默返回空列表；handleLogsClear 只删 1000 条**
+  - ✅ 已修复：`handleLogs` 新增 `toInt` 安全解析（Number + isFinite 兜底），limit/offset 不再被 NaN 污染；`handleLogsClear` 按 cursor 循环删除直至全部删完，单次上限 20000 条并分批（50/批）避免 subrequest 超限
+- [x] **R9. 其他**
+  - ✅ 已修复：usage-logs 查询前导通配符（`escapeLike` 前缀化）；observeStreamUsage 超长单行 buffer 64KB 截断；checkin 结果 `JSON.parse` try/catch 兜底；passthrough 3xx 透传 Location 头
 
 ---
 
@@ -180,4 +185,10 @@
 | 2026-08-09 | P4 日志 KV 写放大 | admin.ts | `log_enabled` 5s 内存缓存消除每请求 KV.get |
 | 2026-08-09 | P5 全量 KV 枚举 | admin.ts | handleLogs 只 KV.list 拉 key 名（5000 截断），仅对 offset..limit 窗口 KV.get |
 | 2026-08-09 | P6 SSR 体量 | pages.ts | 识图模型列表懒渲染：SSR 输出空容器 + `VB_MODELS`/`VB_ORIGINAL` 快照，展开时客户端生成，未展开保存读快照防误清 |
-| 2026-08-09 | P7 其他 | pages.ts, analytics/query.ts | 日志自动刷新静默模式（内容不变不重绘）；usage-logs 关键词前缀匹配 + 通配符转义；opencode 429 已为异步退避（复核无改动） |
+| 2026-08-09 | P7 其他 | pages.ts, analytics/query.ts | 日志自动刷新静默模式（内容不变不重绘）；usage-logs 前缀匹配 + 通配符转义；opencode 429 已为异步退避（复核无改动） |
+| 2026-08-09 | S5 CSRF 防护 | index.ts, pages.ts, shared.js.ts | `/admin/*` 写操作 Origin/Host 同源校验（跨站 403）；logout 与 oauth/models 改 POST-only；前端 logout 走 `doLogout()` POST |
+| 2026-08-09 | R2 客户端断开停流 | proxy.ts, analytics/usage-logger.ts | usage 探针 `createStreamUsageProbe` 内联进 `pipeThrough` 透传链，客户端 Cancel 沿管道传播到上游，flush 时一次写 analytics |
+| 2026-08-09 | R4/R5 OAuth token | oauth.ts | 有 refresh_token 时 TTL 放宽 30 天不随 access 过期；browser 刷新写回 `cookies: Set-Cookie || state.cookies` |
+| 2026-08-09 | R8 日志分页/清空 | admin.ts | `toInt` 兜底 NaN；`handleLogsClear` cursor 循环删除全部（上限 20000，50/批） |
+| 2026-08-09 | R9 健壮性 | checkin.ts, proxy.ts | checkin 结果 JSON.parse try/catch；passthrough 3xx 透传 Location |
+| 2026-08-09 | UX8 未保存离开提醒 | shared.js, pages.ts, analytics-ui.js.ts | Provider/Key 筛选/日志筛选输入置脏，beforeunload 拦截；保存成功路径 markSaved 复位 |

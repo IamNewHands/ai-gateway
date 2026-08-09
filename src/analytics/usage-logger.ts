@@ -77,19 +77,28 @@ export const writeAnalyticsEvent = (
   }
 }
 
-export const observeStreamUsage = async (
-  stream: ReadableStream<Uint8Array>,
+/**
+ * R2：把 usage 解析内联进 SSE 透传管道（TransformStream）。
+ * 相比旧「tee + 独立观察分支」实现，这里只有单一消费链：
+ * 客户端断开（cancel）会沿 pipeThrough 传播到上游，停止继续消费上游流，
+ * 避免客户端已断开后网关仍在后台拉取上游 body。
+ * chunk 原样透传（不缓冲、不修改），解析失败不影响客户端流。
+ * @param providerType 'anthropic' 时按 Anthropic 流式 usage 解析，否则按 OpenAI
+ * @param onUsage 每解析到 usage 片段即回调（调用方自行做 max 合并）
+ * @param onDone 流正常结束时（flush）回调；客户端中途取消不会触发
+ */
+export const createStreamUsageProbe = (
   providerType: string,
   onUsage: (usage: UsageMetrics) => void,
-): Promise<void> => {
-  const reader = stream.getReader()
+  onDone?: () => void,
+): TransformStream<Uint8Array, Uint8Array> => {
   const decoder = new TextDecoder()
   let buffer = ''
-  try {
-    while (true) {
-      const chunk = await reader.read()
-      if (chunk.done) break
-      buffer += decoder.decode(chunk.value, { stream: true })
+  return new TransformStream<Uint8Array, Uint8Array>({
+    transform(chunk, controller) {
+      // 先透传再解析，保证 usage 统计不拖慢也不阻断客户端流
+      controller.enqueue(chunk)
+      buffer += decoder.decode(chunk, { stream: true })
       // 超长单行（异常响应无换行）防止 buffer 无界增长：只保留尾段
       if (buffer.length > MAX_SSE_BUFFER) {
         const lastNl = buffer.lastIndexOf('\n')
@@ -110,10 +119,13 @@ export const observeStreamUsage = async (
           // SSE 允许包含非 JSON 注释行，解析失败时跳过而不影响客户端流。
         }
       }
-    }
-  } finally {
-    reader.releaseLock()
-  }
+    },
+    flush() {
+      if (onDone) {
+        try { onDone() } catch { /* 收尾回调失败不影响流结束 */ }
+      }
+    },
+  })
 }
 
 const normalizeStreamUsage = (value: unknown): UsageMetrics | null => {
