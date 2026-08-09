@@ -34,6 +34,92 @@ const escapePageJs = (value: unknown) => String(value ?? '')
  */
 const escapePageJsx = (value: unknown) => escapePageHtml(escapePageJs(value))
 
+// UX8：厂商预设与 OAuth 预置模板——单一数据源。
+// SSR 下拉 option 与客户端 applyProviderPreset / applyOauthPreset* 共用，
+// 注入为页面 script 常量，消除服务端/客户端两套重复预设表。
+const PROVIDER_PRESETS: Record<string, { name: string; id: string; baseUrl: string; apiType: string; authType?: string; oauthPreset?: string; models?: string[] }> = {
+  deepseek:     { name: 'DeepSeek',           id: 'deepseek',     baseUrl: 'https://api.deepseek.com',                          apiType: 'openai' },
+  openai:       { name: 'OpenAI',             id: 'openai',       baseUrl: 'https://api.openai.com/v1',                         apiType: 'openai' },
+  anthropic:    { name: 'Anthropic',          id: 'anthropic',    baseUrl: 'https://api.anthropic.com',                         apiType: 'anthropic' },
+  zhipu:        { name: '智谱 AI',             id: 'zhipu',        baseUrl: 'https://open.bigmodel.cn/api/paas/v4',              apiType: 'openai' },
+  qwen:         { name: '通义千问',            id: 'qwen',         baseUrl: 'https://dashscope.aliyuncs.com/compatible-mode/v1', apiType: 'openai' },
+  moonshot:     { name: 'Kimi',               id: 'moonshot',     baseUrl: 'https://api.moonshot.cn/v1',                        apiType: 'openai' },
+  baichuan:     { name: '百川',               id: 'baichuan',     baseUrl: 'https://api.baichuan-ai.com/v1',                    apiType: 'openai' },
+  lingyi:       { name: '零一万物',            id: 'lingyi',       baseUrl: 'https://api.lingyiwanwu.com/v1',                    apiType: 'openai' },
+  stepfun:      { name: '阶跃星辰',            id: 'stepfun',      baseUrl: 'https://api.stepfun.com/v1',                        apiType: 'openai' },
+  siliconflow:  { name: '硅基流动',            id: 'siliconflow',  baseUrl: 'https://api.siliconflow.cn/v1',                     apiType: 'openai' },
+  volcengine:   { name: '火山方舟',            id: 'volcengine',   baseUrl: 'https://ark.cn-beijing.volces.com/api/v3',          apiType: 'openai' },
+  qianfan:      { name: '百度千帆',            id: 'qianfan',      baseUrl: 'https://qianfan.baidubce.com/v2',                   apiType: 'openai' },
+  openrouter:   { name: 'OpenRouter',         id: 'openrouter',   baseUrl: 'https://openrouter.ai/api/v1',                      apiType: 'openai' },
+  together:     { name: 'Together AI',        id: 'together',     baseUrl: 'https://api.together.xyz/v1',                       apiType: 'openai' },
+  groq:         { name: 'Groq',               id: 'groq',         baseUrl: 'https://api.groq.com/openai/v1',                    apiType: 'openai' },
+  deepinfra:    { name: 'DeepInfra',          id: 'deepinfra',    baseUrl: 'https://api.deepinfra.com/v1/openai',               apiType: 'openai' },
+  mistral:      { name: 'Mistral AI',         id: 'mistral',      baseUrl: 'https://api.mistral.ai/v1',                         apiType: 'openai' },
+  xai:          { name: 'xAI (Grok)',         id: 'xai',          baseUrl: 'https://api.x.ai/v1',                               apiType: 'openai' },
+  workbuddy:    { name: 'WorkBuddy (OAuth)',  id: 'workbuddy',    baseUrl: 'https://copilot.tencent.com/v2',                    apiType: 'openai', authType: 'oauth-device', oauthPreset: 'workbuddy' },
+  qoder:        { name: 'QoderWork (OAuth)',  id: 'qoder',        baseUrl: 'https://gateway.qoder.com.cn',                      apiType: 'openai', authType: 'oauth-device', oauthPreset: 'qoder' },
+  gemini:       { name: 'Gemini CLI (OAuth)', id: 'gemini',       baseUrl: 'https://cloudcode-pa.googleapis.com',               apiType: 'openai', authType: 'oauth-device', oauthPreset: 'gemini' },
+  'gemini-api':   { name: 'Gemini (官方 API Key)', id: 'gemini-api',  baseUrl: 'https://generativelanguage.googleapis.com/v1beta/openai', apiType: 'openai',
+    models: ['gemini-2.5-flash', 'gemini-2.5-pro', 'gemini-2.5-flash-lite', 'gemini-2.0-flash', 'gemini-2.0-flash-lite', 'gemini-3-flash-preview', 'gemini-3-pro-preview', 'gemini-3.5-flash'],
+  },
+  cline:        { name: 'Cline (白嫖模型)',    id: 'cline',        baseUrl: 'https://api.cline.bot/api/v1',                      apiType: 'openai',
+    models: ['poolside/laguna-s-2.1:free', 'deepseek/deepseek-v4-flash', 'cline-free/glm-5.2', 'cline-pass/glm-5.2', 'cline-pass/deepseek-v4-flash', 'cline-pass/qwen3.7-max'],
+  },
+  visionbridge: { name: 'Vision Bridge (图片转写桥)', id: 'visionbridge', baseUrl: 'https://example.com/v1', apiType: 'openai' },
+}
+
+const OAUTH_PRESETS: Record<string, { label: string; flowType: string; deviceCodeUrl: string; deviceTokenUrl: string; refreshTokenUrl: string; clientId: string; clientSecret?: string; scope?: string; tokenHeader: string; tokenHeaderPrefix: string; extraHeaders: Record<string, string>; _baseUrl?: string; _modelsUrl?: string; _globalBaseUrl?: string; _globalModelsUrl?: string; _globalOrigin?: string; _redirectUri?: string }> = {
+  workbuddy: {
+    label: 'WorkBuddy（浏览器登录）',
+    flowType: 'browser',
+    deviceCodeUrl: 'https://copilot.tencent.com/v2/plugin/auth/state?platform=CLI',
+    deviceTokenUrl: 'https://copilot.tencent.com/v2/plugin/auth/token',
+    refreshTokenUrl: 'https://copilot.tencent.com/v2/plugin/auth/token/refresh',
+    clientId: '',
+    tokenHeader: 'Authorization',
+    tokenHeaderPrefix: 'Bearer ',
+    extraHeaders: {
+      'Origin': 'https://www.codebuddy.cn',
+      'Referer': 'https://www.codebuddy.cn/',
+      'User-Agent': 'CLI/2.63.2 CodeBuddy/2.63.2',
+    },
+    _baseUrl: 'https://copilot.tencent.com/v2',
+    _modelsUrl: 'https://copilot.tencent.com/console/enterprises/personal/models',
+    _globalBaseUrl: 'https://www.workbuddy.ai/v2',
+    _globalModelsUrl: 'https://www.workbuddy.ai/console/enterprises/personal/models',
+    _globalOrigin: 'https://www.workbuddy.ai',
+  },
+  qoder: {
+    label: 'QoderWork（Qoder 设备授权）',
+    flowType: 'qoder',
+    deviceCodeUrl: 'https://qoder.com.cn/device/selectAccounts',
+    deviceTokenUrl: 'https://openapi.qoder.com.cn/api/v1/deviceToken/poll',
+    refreshTokenUrl: 'https://openapi.qoder.com.cn/api/v1/deviceToken/refresh',
+    clientId: '1c5e33e1-364d-4ce6-b02c-acaa81274a5c',
+    scope: '',
+    tokenHeader: 'Authorization',
+    tokenHeaderPrefix: 'Bearer ',
+    extraHeaders: {},
+    _baseUrl: 'https://openapi.qoder.com.cn',
+    _modelsUrl: 'https://gateway.qoder.com.cn/algo/api/v2/model/list?Encode=1',
+  },
+  gemini: {
+    label: 'Gemini（官方 OAuth）',
+    flowType: 'gemini',
+    deviceCodeUrl: '',
+    deviceTokenUrl: '',
+    refreshTokenUrl: '',
+    clientId: '',
+    clientSecret: '',
+    scope: 'https://www.googleapis.com/auth/cloud-platform https://www.googleapis.com/auth/userinfo.email https://www.googleapis.com/auth/userinfo.profile',
+    tokenHeader: 'Authorization',
+    tokenHeaderPrefix: 'Bearer ',
+    extraHeaders: {},
+    _baseUrl: 'https://cloudcode-pa.googleapis.com',
+    _redirectUri: 'http://127.0.0.1:8089/oauth2callback',
+  },
+}
+
 /**
  * 根据已保存的 OAuth 配置反推匹配的预置模板名称（用于编辑表单回显选中项）。
  * 预置模板本身不作为字段存储，但 deviceCodeUrl 是每个预置的唯一标识，
@@ -429,7 +515,7 @@ ${H('管理')}
               <div class="fg"><label for="anm">名称</label><input type="text" id="anm" placeholder="DeepSeek"></div>
               <div class="fg"><label for="aid">提供商 ID</label><input type="text" id="aid" placeholder="deepseek"><span class="form-helper">用于模型前缀，创建后不可修改。</span></div>
             </div>
-            <div class="fg"><label for="apreset">厂商预设</label><select id="apreset" class="select-sm" onchange="applyProviderPreset(this.value)"><option value="">— 自定义 —</option><option value="deepseek">DeepSeek</option><option value="openai">OpenAI</option><option value="anthropic">Anthropic (Claude)</option><option value="zhipu">智谱 AI (GLM)</option><option value="qwen">通义千问 (DashScope)</option><option value="moonshot">月之暗面 (Kimi)</option><option value="baichuan">百川</option><option value="lingyi">零一万物 (Yi)</option><option value="stepfun">阶跃星辰 (StepFun)</option><option value="siliconflow">硅基流动 (SiliconFlow)</option><option value="volcengine">火山方舟 (豆包)</option><option value="qianfan">百度千帆 (文心)</option><option value="openrouter">OpenRouter</option><option value="together">Together AI</option><option value="groq">Groq</option><option value="deepinfra">DeepInfra</option><option value="mistral">Mistral AI</option><option value="xai">xAI (Grok)</option><option value="workbuddy">WorkBuddy (OAuth 登录)</option><option value="qoder">QoderWork (OAuth 登录)</option><option value="gemini">Gemini CLI (OAuth 登录)</option><option value="gemini-api">Gemini (官方 API Key)</option><option value="cline">Cline (白嫖模型)</option><option value="visionbridge">Vision Bridge (图片转写桥)</option></select><span class="form-helper">选择后自动填充名称/地址/格式，只需填 API Key 即可测试。</span></div>
+            <div class="fg"><label for="apreset">厂商预设</label><select id="apreset" class="select-sm" onchange="applyProviderPreset(this.value)"><option value="">— 自定义 —</option>${Object.entries(PROVIDER_PRESETS).map(([name, pre]) => `<option value="${name}">${escapePageHtml(pre.name)}</option>`).join('')}</select><span class="form-helper">选择后自动填充名称/地址/格式，只需填 API Key 即可测试。</span></div>
             <div class="fg"><label for="aurl">API 地址</label><input type="url" id="aurl" placeholder="https://api.deepseek.com"></div>
             <div class="fg"><label for="afmt">API 格式</label><select id="afmt" class="select-sm"><option value="openai">OpenAI 兼容</option><option value="anthropic">Anthropic 兼容</option></select></div>
             <div class="fg"><label for="aat">认证方式</label><select id="aat" class="select-sm" onchange="toggleAuthType()"><option value="api-key">API Key</option><option value="oauth-device">OAuth 设备码登录</option></select></div>
@@ -450,7 +536,7 @@ ${H('管理')}
                 <div class="fg"><label>Global 域 baseUrl</label><input type="url" id="ao11" placeholder="https://www.workbuddy.ai/v2"></div>
                 <div class="fg"><label>Global 域模型 URL</label><input type="url" id="ao12" placeholder="https://www.workbuddy.ai/console/enterprises/personal/models"></div>
                 <div class="fg"><label>Global 域 Origin</label><input type="url" id="ao13" placeholder="https://www.workbuddy.ai"></div>
-                <div class="fg"><label>预置模板</label><select class="select-sm" onchange="applyOauthPreset(this.value)"><option value="">— 选择 —</option><option value="workbuddy">WorkBuddy（浏览器登录）</option><option value="qoder">QoderWork（Qoder 设备授权）</option><option value="gemini">Gemini（官方 OAuth）</option></select></div>
+                <div class="fg"><label>预置模板</label><select class="select-sm" onchange="applyOauthPreset(this.value)"><option value="">— 选择 —</option>${Object.entries(OAUTH_PRESETS).map(([k, pre]) => `<option value="${k}">${escapePageHtml(pre.label)}</option>`).join('')}</select></div>
                 <div class="fc mt-1 field-row"><button class="btn btn-p" onclick="createProv({afterCreate:function(id){location.href='/admin?connect='+encodeURIComponent(id)}})"><i class="fas fa-plug" aria-hidden="true"></i>创建并发起连接</button><span class="form-helper">先创建提供商，保存后自动弹出 OAuth 登录链接；登录成功会自动拉取模型。</span></div>
               </fieldset>
             </div>
@@ -501,7 +587,7 @@ ${H('管理')}
                   <div class="fg"><label>Global 域 baseUrl（海外账户，可选）</label><input type="url" id="eao11-${escapePageHtml(p.id)}" value="${escapePageHtml((p.oauth&&p.oauth.globalBaseUrl)||'')}" placeholder="https://www.workbuddy.ai/v2"></div>
                   <div class="fg"><label>Global 域模型 URL（可选）</label><input type="url" id="eao12-${escapePageHtml(p.id)}" value="${escapePageHtml((p.oauth&&p.oauth.globalModelsUrl)||'')}" placeholder="https://www.workbuddy.ai/console/enterprises/personal/models"></div>
                   <div class="fg"><label>Global 域 Origin（可选）</label><input type="url" id="eao13-${escapePageHtml(p.id)}" value="${escapePageHtml((p.oauth&&p.oauth.globalOrigin)||'')}" placeholder="https://www.workbuddy.ai"></div>
-                  <div class="fg"><label>预置模板</label><select class="select-sm" onchange="applyOauthPresetEdit('${escapePageJsx(p.id)}',this.value)"><option value="" ${detectOauthPreset(p.oauth)===''?'selected':''}>— 选择 —</option><option value="workbuddy" ${detectOauthPreset(p.oauth)==='workbuddy'?'selected':''}>WorkBuddy（浏览器登录）</option><option value="qoder" ${detectOauthPreset(p.oauth)==='qoder'?'selected':''}>QoderWork（Qoder 设备授权）</option><option value="gemini" ${detectOauthPreset(p.oauth)==='gemini'?'selected':''}>Gemini（官方 OAuth）</option></select></div>
+                  <div class="fg"><label>预置模板</label><select class="select-sm" onchange="applyOauthPresetEdit('${escapePageJsx(p.id)}',this.value)"><option value="" ${detectOauthPreset(p.oauth)===''?'selected':''}>— 选择 —</option>${Object.entries(OAUTH_PRESETS).map(([k, pre]) => `<option value="${k}" ${detectOauthPreset(p.oauth)===k?'selected':''}>${escapePageHtml(pre.label)}</option>`).join('')}</select></div>
                   <div class="fc mt-1 field-row"><button class="btn btn-s" onclick="oauthConnect('${escapePageJsx(p.id)}')"><i class="fas fa-plug" aria-hidden="true"></i>发起连接</button><button class="btn btn-gh" onclick="fetchOauthModels('${escapePageJsx(p.id)}')"><i class="fas fa-cloud-download-alt" aria-hidden="true"></i>获取模型</button><button class="btn btn-gh" onclick="oauthStatus('${escapePageJsx(p.id)}')"><i class="fas fa-sync" aria-hidden="true"></i>状态</button><button class="btn btn-gh" onclick="oauthDisconnect('${escapePageJsx(p.id)}')"><i class="fas fa-unlink" aria-hidden="true"></i>断开</button><span id="oauth-st-${escapePageHtml(p.id)}" class="oauth-status"></span></div>
                 </fieldset>
               </div>
@@ -550,7 +636,11 @@ ${H('管理')}
 
 <div id="modal" class="modal-o hd" role="presentation" onclick="if(event.target===this)closeM()"><div class="modal" id="mc" role="dialog" aria-modal="true" aria-live="polite"></div></div>
 
-<script>${SHARED_JS}${ANALYTICS_JS}
+<script>
+// UX8：预设表单一数据源——注入文件顶部 PROVIDER_PRESETS / OAUTH_PRESETS，供 applyProviderPreset 等使用
+const PROVIDER_PRESETS = ${JSON.stringify(PROVIDER_PRESETS).replace(/</g, '\\u003c')};
+const OAUTH_PRESETS = ${JSON.stringify(OAUTH_PRESETS).replace(/</g, '\\u003c')};
+${SHARED_JS}${ANALYTICS_JS}
 // 全部已启用模型引用（providerId/modelId），供 Vision Bridge 识图模型勾选
 const VB_MODELS = ${JSON.stringify(allModelRefs).replace(/</g, '\\u003c')};
 // 各提供商已保存的识图配置快照（懒渲染未展开时，保存表单可据此保留原配置）
@@ -995,37 +1085,7 @@ function collectOauthEdit(id) {
   }
 }
 
-// ===== 厂商预设：选择后自动填充名称/ID/URL/格式，用户只需填 Key =====
-const PROVIDER_PRESETS = {
-  deepseek:     { name: 'DeepSeek',           id: 'deepseek',     baseUrl: 'https://api.deepseek.com',                          apiType: 'openai' },
-  openai:       { name: 'OpenAI',             id: 'openai',       baseUrl: 'https://api.openai.com/v1',                         apiType: 'openai' },
-  anthropic:    { name: 'Anthropic',          id: 'anthropic',    baseUrl: 'https://api.anthropic.com',                         apiType: 'anthropic' },
-  zhipu:        { name: '智谱 AI',             id: 'zhipu',        baseUrl: 'https://open.bigmodel.cn/api/paas/v4',              apiType: 'openai' },
-  qwen:         { name: '通义千问',            id: 'qwen',         baseUrl: 'https://dashscope.aliyuncs.com/compatible-mode/v1', apiType: 'openai' },
-  moonshot:     { name: 'Kimi',               id: 'moonshot',     baseUrl: 'https://api.moonshot.cn/v1',                        apiType: 'openai' },
-  baichuan:     { name: '百川',               id: 'baichuan',     baseUrl: 'https://api.baichuan-ai.com/v1',                    apiType: 'openai' },
-  lingyi:       { name: '零一万物',            id: 'lingyi',       baseUrl: 'https://api.lingyiwanwu.com/v1',                    apiType: 'openai' },
-  stepfun:      { name: '阶跃星辰',            id: 'stepfun',      baseUrl: 'https://api.stepfun.com/v1',                        apiType: 'openai' },
-  siliconflow:  { name: '硅基流动',            id: 'siliconflow',  baseUrl: 'https://api.siliconflow.cn/v1',                     apiType: 'openai' },
-  volcengine:   { name: '火山方舟',            id: 'volcengine',   baseUrl: 'https://ark.cn-beijing.volces.com/api/v3',          apiType: 'openai' },
-  qianfan:      { name: '百度千帆',            id: 'qianfan',      baseUrl: 'https://qianfan.baidubce.com/v2',                   apiType: 'openai' },
-  openrouter:   { name: 'OpenRouter',         id: 'openrouter',   baseUrl: 'https://openrouter.ai/api/v1',                      apiType: 'openai' },
-  together:     { name: 'Together AI',        id: 'together',     baseUrl: 'https://api.together.xyz/v1',                       apiType: 'openai' },
-  groq:         { name: 'Groq',               id: 'groq',         baseUrl: 'https://api.groq.com/openai/v1',                    apiType: 'openai' },
-  deepinfra:    { name: 'DeepInfra',          id: 'deepinfra',    baseUrl: 'https://api.deepinfra.com/v1/openai',               apiType: 'openai' },
-  mistral:      { name: 'Mistral AI',         id: 'mistral',      baseUrl: 'https://api.mistral.ai/v1',                         apiType: 'openai' },
-  xai:          { name: 'xAI (Grok)',         id: 'xai',          baseUrl: 'https://api.x.ai/v1',                               apiType: 'openai' },
-  workbuddy:    { name: 'WorkBuddy (OAuth)',  id: 'workbuddy',    baseUrl: 'https://copilot.tencent.com/v2',                    apiType: 'openai', authType: 'oauth-device', oauthPreset: 'workbuddy' },
-  qoder:        { name: 'QoderWork (OAuth)',  id: 'qoder',        baseUrl: 'https://gateway.qoder.com.cn',                      apiType: 'openai', authType: 'oauth-device', oauthPreset: 'qoder' },
-  gemini:       { name: 'Gemini CLI (OAuth)', id: 'gemini',       baseUrl: 'https://cloudcode-pa.googleapis.com',               apiType: 'openai', authType: 'oauth-device', oauthPreset: 'gemini' },
-  'gemini-api':   { name: 'Gemini (官方 API Key)', id: 'gemini-api',  baseUrl: 'https://generativelanguage.googleapis.com/v1beta/openai', apiType: 'openai',
-    models: ['gemini-2.5-flash', 'gemini-2.5-pro', 'gemini-2.5-flash-lite', 'gemini-2.0-flash', 'gemini-2.0-flash-lite', 'gemini-3-flash-preview', 'gemini-3-pro-preview', 'gemini-3.5-flash'],
-  },
-  cline:        { name: 'Cline (白嫖模型)',    id: 'cline',        baseUrl: 'https://api.cline.bot/api/v1',                      apiType: 'openai',
-    models: ['poolside/laguna-s-2.1:free', 'deepseek/deepseek-v4-flash', 'cline-free/glm-5.2', 'cline-pass/glm-5.2', 'cline-pass/deepseek-v4-flash', 'cline-pass/qwen3.7-max'],
-  },
-  visionbridge: { name: 'Vision Bridge (图片转写桥)', id: 'visionbridge', baseUrl: 'https://example.com/v1', apiType: 'openai' },
-}
+// ===== 厂商预设：单一数据源在文件顶部，页面 script 已注入 PROVIDER_PRESETS =====
 function applyProviderPreset(name) {
   const p = PROVIDER_PRESETS[name]
   if (!p) return
@@ -1102,61 +1162,7 @@ function toggleAuthTypeEdit(id) {
   if (modelsFs) modelsFs.classList.toggle('hd', isOauth)
 }
 
-const OAUTH_PRESETS = {
-  workbuddy: {
-    flowType: 'browser',
-    deviceCodeUrl: 'https://copilot.tencent.com/v2/plugin/auth/state?platform=CLI',
-    deviceTokenUrl: 'https://copilot.tencent.com/v2/plugin/auth/token',
-    refreshTokenUrl: 'https://copilot.tencent.com/v2/plugin/auth/token/refresh',
-    clientId: '',
-    tokenHeader: 'Authorization',
-    tokenHeaderPrefix: 'Bearer ',
-    extraHeaders: {
-      'Origin': 'https://www.codebuddy.cn',
-      'Referer': 'https://www.codebuddy.cn/',
-      'User-Agent': 'CLI/2.63.2 CodeBuddy/2.63.2',
-    },
-    // chat 端点在 /v2/chat/completions，故 baseUrl 带 /v2，转发时拼 chat/completions 即可
-    _baseUrl: 'https://copilot.tencent.com/v2',
-    // 模型发现端点（非 OpenAI 标准 /models），登录后动态拉取真实可用模型
-    _modelsUrl: 'https://copilot.tencent.com/console/enterprises/personal/models',
-    // Global 域（海外账户，iss=workbuddy.ai）备选端点：copilot.tencent.com 的 APISIX 会 401 拒绝 Global token
-    _globalBaseUrl: 'https://www.workbuddy.ai/v2',
-    _globalModelsUrl: 'https://www.workbuddy.ai/console/enterprises/personal/models',
-    _globalOrigin: 'https://www.workbuddy.ai',
-  },
-  qoder: {
-    flowType: 'qoder',
-    deviceCodeUrl: 'https://qoder.com.cn/device/selectAccounts',
-    deviceTokenUrl: 'https://openapi.qoder.com.cn/api/v1/deviceToken/poll',
-    refreshTokenUrl: 'https://openapi.qoder.com.cn/api/v1/deviceToken/refresh',
-    clientId: '1c5e33e1-364d-4ce6-b02c-acaa81274a5c',
-    scope: '',
-    tokenHeader: 'Authorization',
-    tokenHeaderPrefix: 'Bearer ',
-    extraHeaders: {},
-    // QoderWork 转发走 COSY 签名（qoder/proxy.ts），baseUrl 仅展示；模型发现也在网关
-    _baseUrl: 'https://openapi.qoder.com.cn',
-    _modelsUrl: 'https://gateway.qoder.com.cn/algo/api/v2/model/list?Encode=1',
-  },
-  gemini: {
-    flowType: 'gemini',
-    // 官方 Gemini CLI 的 OAuth 客户端凭据不硬编码：在下方表单粘贴，
-    // 或配置环境变量 GEMINI_OAUTH_CLIENT_ID / GEMINI_OAUTH_CLIENT_SECRET
-    deviceCodeUrl: '',
-    deviceTokenUrl: '',
-    refreshTokenUrl: '',
-    clientId: '',
-    clientSecret: '',
-    scope: 'https://www.googleapis.com/auth/cloud-platform https://www.googleapis.com/auth/userinfo.email https://www.googleapis.com/auth/userinfo.profile',
-    tokenHeader: 'Authorization',
-    tokenHeaderPrefix: 'Bearer ',
-    extraHeaders: {},
-    // Gemini 交互：后台生成授权链接，用户在浏览器授权后把地址栏 URL 粘贴回后台
-    _baseUrl: 'https://cloudcode-pa.googleapis.com',
-    _redirectUri: 'http://127.0.0.1:8089/oauth2callback',
-  },
-}
+// OAuth 预置模板：单一数据源在文件顶部，页面 script 已注入 OAUTH_PRESETS
 function applyOauthPreset(name) {
   const p = OAUTH_PRESETS[name]
   if (!p) return

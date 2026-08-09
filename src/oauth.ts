@@ -669,7 +669,9 @@ export async function submitOauthGeminiCallback(
   if (parsed.error) {
     return { success: false, message: `授权被拒绝：${parsed.error}` }
   }
-  if (parsed.state && device.device_code && parsed.state !== device.device_code) {
+  // S7：state 校验不可跳过——发起授权时已把 state 写入 device.device_code，
+  // 回调缺少 state 或与本次流程不一致一律拒绝（防账号劫持/跨流程复用）
+  if (!parsed.state || parsed.state !== device.device_code) {
     return { success: false, message: 'OAuth state 校验失败，请确认粘贴的是本次发起的授权回调 URL' }
   }
 

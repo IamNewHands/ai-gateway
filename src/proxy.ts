@@ -1521,24 +1521,39 @@ export async function handleAnthropicMessages(c: Context<AppEnv>) {
     // 清理上游不支持的字段 + 被屏蔽的 Claude Code 模板短语
     sanitizeUpstreamBody(upstreamBody)
     sanitizeBlockedTemplates(upstreamBody)
-    const apiKey = enabledKeys[0].key
+    // R3：多 Key 顺序 failover——单 key 故障（HTTP 非 2xx 或网络异常）自动切换
+    // 下一个启用的 key，全部失败才把最后一次错误返回给客户端。
+    let response: Response | undefined
+    let lastErrText = ''
+    let lastStatus = 502
+    for (const key of enabledKeys) {
+      try {
+        const r = await fetchUpstream(forwardUrl, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': `Bearer ${key.key}`,
+          },
+          body: JSON.stringify(upstreamBody),
+        }, originalStream === true)
+        if (r.ok) {
+          response = r
+          break
+        }
+        lastStatus = r.status
+        lastErrText = await r.text()
+      } catch (err) {
+        lastStatus = 502
+        lastErrText = (err as Error).message || '网络错误'
+      }
+    }
 
-    const response = await fetchUpstream(forwardUrl, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': `Bearer ${apiKey}`,
-      },
-      body: JSON.stringify(upstreamBody),
-    }, originalStream === true)
-
-    if (!response.ok) {
-      const errText = await response.text()
-      try { c.executionCtx.waitUntil(writeLog(c.env, 'error', `[anthropic] ${model} → ${response.status} ${forwardUrl}`, JSON.stringify({ error: errText, body: summarizeRequestBody(upstreamBody), url: forwardUrl }).substring(0, 4000))) } catch {}
+    if (!response) {
+      try { c.executionCtx.waitUntil(writeLog(c.env, 'error', `[anthropic] ${model} → failover 全部失败 ${forwardUrl}`, JSON.stringify({ error: lastErrText, body: summarizeRequestBody(upstreamBody), url: forwardUrl }).substring(0, 4000))) } catch {}
       return c.json({
         type: 'error',
-        error: { type: 'upstream_error', message: `Upstream error: ${errText}` },
-      }, response.status as Parameters<typeof c.json>[1])
+        error: { type: 'upstream_error', message: `Upstream error: ${lastErrText}` },
+      }, lastStatus as Parameters<typeof c.json>[1])
     }
 
     try { c.executionCtx.waitUntil(writeLog(c.env, 'request', `[anthropic] ${model} → 200 ${forwardUrl}`, `stream=${originalStream}`)) } catch {}
@@ -2482,23 +2497,38 @@ export async function handleResponses(c: Context<AppEnv>) {
     // 清理上游不支持的字段 + 被屏蔽的 Claude Code 模板短语
     sanitizeUpstreamBody(upstreamBody)
     sanitizeBlockedTemplates(upstreamBody)
-    const apiKey = enabledKeys[0].key
+    // R3：多 Key 顺序 failover——单 key 故障（HTTP 非 2xx 或网络异常）自动切换
+    // 下一个启用的 key，全部失败才把最后一次错误返回给客户端。
+    let response: Response | undefined
+    let lastErrText = ''
+    let lastStatus = 502
+    for (const key of enabledKeys) {
+      try {
+        const r = await fetchUpstream(forwardUrl, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': `Bearer ${key.key}`,
+          },
+          body: JSON.stringify(upstreamBody),
+        }, true)
+        if (r.ok) {
+          response = r
+          break
+        }
+        lastStatus = r.status
+        lastErrText = await r.text()
+      } catch (err) {
+        lastStatus = 502
+        lastErrText = (err as Error).message || '网络错误'
+      }
+    }
 
-    const response = await fetchUpstream(forwardUrl, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': `Bearer ${apiKey}`,
-      },
-      body: JSON.stringify(upstreamBody),
-    }, true)
-
-    if (!response.ok) {
-      const errText = await response.text()
-      try { c.executionCtx.waitUntil(writeLog(c.env, 'error', `[responses] ${model} → ${response.status} ${forwardUrl}`, JSON.stringify({ error: errText, body: summarizeRequestBody(upstreamBody), url: forwardUrl }).substring(0, 4000))) } catch {}
+    if (!response) {
+      try { c.executionCtx.waitUntil(writeLog(c.env, 'error', `[responses] ${model} → failover 全部失败 ${forwardUrl}`, JSON.stringify({ error: lastErrText, body: summarizeRequestBody(upstreamBody), url: forwardUrl }).substring(0, 4000))) } catch {}
       return c.json({
-        error: { message: `Upstream error: ${errText}`, type: 'upstream_error' },
-      }, response.status as Parameters<typeof c.json>[1])
+        error: { message: `Upstream error: ${lastErrText}`, type: 'upstream_error' },
+      }, lastStatus as Parameters<typeof c.json>[1])
     }
 
     try { c.executionCtx.waitUntil(writeLog(c.env, 'request', `[responses] ${model} → 200 ${forwardUrl}`, `stream=${originalStream}`)) } catch {}

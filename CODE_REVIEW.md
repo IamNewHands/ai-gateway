@@ -38,10 +38,12 @@
 - [x] **S5. 管理 API 无 CSRF 防护**
   - 写操作依赖 `SameSite=Lax` 单层防线；带副作用的 GET（`handleOAuthModels`、`/admin/logout`）可被链接型 CSRF 触发
   - ✅ 已修复：`index.ts` 在 `/admin/*` 认证后新增跨域中间件——非 GET/HEAD/OPTIONS 请求校验 `Origin` 与 `Host` 同源，跨站返回 403；`/admin/logout` 与 `/admin/api/oauth/:id/models` 改为 POST-only；前端 logout 链接改走 `doLogout()`（POST 后跳登录），`fetchOauthModels` 改 POST
-- [ ] **S6. Gemini 图片抓取 SSRF + 无界内存**
+- [x] **S6. Gemini 图片抓取 SSRF + 无界内存**
   - [gemini/proxy.ts:141-165](src/gemini/proxy.ts#L141-L165) 直接 `fetch` 用户可控 `image_url`，无协议白名单、无大小限制
-- [ ] **S7. Gemini 回调 state 校验可跳过**
+  - ✅ 已修复：抓取前用 `isSafeHttpUrl` 校验（仅公网 http/https、拒绝本机/内网/保留 IP）；流式读取累计字节数，超过 8MB 立即取消，不再无界拉取
+- [x] **S7. Gemini 回调 state 校验可跳过**
   - [oauth.ts:667](src/oauth.ts#L667) state 缺失时直接放行，存在账号劫持风险
+  - ✅ 已修复：`submitOauthGeminiCallback` 回调缺少 `state` 或与 `device.device_code`（发起授权时写入）不一致一律拒绝，不再跳过校验
 
 ### 🟡 低危
 
@@ -118,7 +120,8 @@
 
 - [x] **UX8. 其他**
   - ✅ 已修复（未保存离开提醒）：`shared.js` 全局监听 Provider 表单（`#af`/`#dt-*`）、Key 模型筛选（`.mdl-list`）、日志筛选（`.analytics-log-filters`）的 input/change 置脏，`beforeunload` 拦截未保存离开；保存成功路径（`reloadAdmin`/`createProv`/`saveKeyModels`/`doGenKey`/`togglePb`/日志查询）统一 `markSaved()` 复位
-  - 未做（低优先级）：成功 toast 与 modal 双路径风格统一；服务端+客户端两套重复预设表去重
+  - ✅ 已修复（重复预设表去重）：`PROVIDER_PRESETS` / `OAUTH_PRESETS` 收敛为文件顶部单一数据源，SSR 下拉 option（厂商预设、OAuth 预置模板×2）改为由常量生成，页面 script 注入同一份常量，删除服务端/客户端两套重复定义
+  - ✅ 已复核（toast 与 modal 风格）：成功/错误提示图标体系已统一（toast `fa-check-circle`/`fa-times-circle` + `al-s`/`al-e`，与 modal `fa-check-circle c-s` 一致）；modal 仅保留于需要展示不可变敏感信息（如生成的 Key）与确认/输入场景，属合理分工，无需改动
 
 ---
 
@@ -136,8 +139,9 @@
 
 ### 🟠 中
 
-- [ ] **R3. Anthropic/Responses 非 OAuth 路径只用第 1 个 key，无 failover**
+- [x] **R3. Anthropic/Responses 非 OAuth 路径只用第 1 个 key，无 failover**
   - [proxy.ts:1476-1486](src/proxy.ts#L1476-L1489)、[proxy.ts:2440-2450](src/proxy.ts#L2440-L2450) 单 key 故障即整条格式路径不可用
+  - ✅ 已修复：Anthropic 与 Responses 非 OAuth 路径改为按启用的 key 顺序遍历——HTTP 非 2xx 或网络异常自动切换下一个 key，全部失败才把最后一次错误（保留其状态码）返回客户端
 - [x] **R4. OAuth token KV TTL 绑定 access_token 寿命**
   - [oauth.ts:21-22](src/oauth.ts#L21-L22) 过期即删，refresh_token 一并丢失，之后无法离线续期
   - ✅ 已修复：`writeOauthToken` 有 `refresh_token` 时 TTL 放宽到 30 天（不再随 access 2h 过期删除）；仅无 refresh_token 的一次性 token 才按 access 剩余寿命设置 TTL（60s 下限 / 30 天上限）
@@ -192,3 +196,7 @@
 | 2026-08-09 | R8 日志分页/清空 | admin.ts | `toInt` 兜底 NaN；`handleLogsClear` cursor 循环删除全部（上限 20000，50/批） |
 | 2026-08-09 | R9 健壮性 | checkin.ts, proxy.ts | checkin 结果 JSON.parse try/catch；passthrough 3xx 透传 Location |
 | 2026-08-09 | UX8 未保存离开提醒 | shared.js, pages.ts, analytics-ui.js.ts | Provider/Key 筛选/日志筛选输入置脏，beforeunload 拦截；保存成功路径 markSaved 复位 |
+| 2026-08-09 | S6 Gemini 图片 SSRF/内存 | gemini/proxy.ts | 抓图前 `isSafeHttpUrl` 校验（拒绝内网/保留 IP）；流式读取上限 8MB，超限取消 |
+| 2026-08-09 | S7 Gemini state 校验 | oauth.ts | 回调缺 state 或与 device.device_code 不一致一律拒绝，不再跳过校验 |
+| 2026-08-09 | R3 非 OAuth 多 Key failover | proxy.ts | Anthropic/Responses 非 OAuth 路径按启用 key 顺序遍历，故障自动切换，全部失败才返回错误 |
+| 2026-08-09 | UX8 预设表去重 | pages.ts | PROVIDER_PRESETS/OAUTH_PRESETS 收敛单一数据源：SSR 下拉由常量生成 + script 注入，删除两套重复定义 |

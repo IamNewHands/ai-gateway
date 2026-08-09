@@ -21,6 +21,7 @@
 import type { Env, Provider } from '../types'
 import { getOauthAccessToken, readOauthToken, refreshOauthToken, GEMINI_OAUTH, GEMINI_API_CLIENT_HEADER, geminiUserAgent } from '../oauth'
 import { streamFetchWithTimeout } from '../opencode'
+import { isSafeHttpUrl } from '../admin'
 
 export const GEMINI_BASE_URL = 'https://cloudcode-pa.googleapis.com'
 export const GEMINI_GENERATE_PATH = '/v1internal:generateContent'
@@ -149,13 +150,43 @@ async function imageToInlineData(url: string): Promise<{ mimeType: string; data:
     return { mimeType: mimeMatch ? mimeMatch[1] : 'image/png', data: b64 }
   }
   if (trimUrl.startsWith('http://') || trimUrl.startsWith('https://')) {
+    // S6：SSRF 防护——只允许公网 http/https 且无凭据 URL，拒绝本机/内网/保留 IP；
+    // 同时限制单张图片大小，防止恶意超大图拉爆 Worker 内存。
+    if (!isSafeHttpUrl(trimUrl)) return null
+    const MAX_IMAGE_BYTES = 8 * 1024 * 1024
     try {
       const resp = await fetch(trimUrl, { signal: AbortSignal.timeout(10000) })
       if (!resp.ok) return null
-      const buf = await resp.arrayBuffer()
-      const bytes = new Uint8Array(buf)
+      const declared = Number(resp.headers.get('Content-Length') || 0)
+      if (declared > MAX_IMAGE_BYTES) return null
+      const reader = resp.body ? resp.body.getReader() : null
+      if (!reader) return null
+      const parts: Uint8Array[] = []
+      let total = 0
+      try {
+        while (true) {
+          const { done, value } = await reader.read()
+          if (done) break
+          if (value) {
+            total += value.byteLength
+            if (total > MAX_IMAGE_BYTES) {
+              await reader.cancel().catch(() => {})
+              return null
+            }
+            parts.push(value)
+          }
+        }
+      } catch {
+        return null
+      }
+      const buf = new Uint8Array(total)
+      let offset = 0
+      for (const p of parts) {
+        buf.set(p, offset)
+        offset += p.byteLength
+      }
       let bin = ''
-      for (const b of bytes) bin += String.fromCharCode(b)
+      for (const b of buf) bin += String.fromCharCode(b)
       const mime = resp.headers.get('Content-Type') || 'image/png'
       return { mimeType: mime.split(';')[0] || 'image/png', data: btoa(bin) }
     } catch {
