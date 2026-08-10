@@ -116,9 +116,4 @@ function ux8Watch(e) {
 }
 document.addEventListener('input', ux8Watch)
 document.addEventListener('change', ux8Watch)
-window.addEventListener('beforeunload', function (e) {
-  if (!unsavedChanges) return
-  e.preventDefault()
-  e.returnValue = ''
-})
 `
