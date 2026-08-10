@@ -123,11 +123,17 @@ async function fetchCheckinStatus(
 /** 执行签到。返回 { success, message }。 */
 async function performCheckin(
   token: string,
-  realm: 'cn' | 'global'
-): Promise<{ success: boolean; message: string }> {
+  realm: 'cn' | 'global',
+  env?: Env
+): Promise<{ success: boolean; message: string; reward?: any }> {
   try {
-    await billingCall(token, '/v2/billing/meter/daily-checkin', realm)
-    return { success: true, message: '签到成功' }
+    // 临时诊断（方案 A）：把 daily-checkin 返回的完整 data 打到后台日志，
+    // 用于确认"签到获取积分 / 权益包"等字段的真实命名。
+    const data = await billingCall(token, '/v2/billing/meter/daily-checkin', realm)
+    if (env) {
+      try { await writeLog(env, 'info', '[checkin-diag] daily-checkin 返回 data', JSON.stringify(data).substring(0, 3000)) } catch { /* ignore */ }
+    }
+    return { success: true, message: '签到成功', reward: data }
   } catch (e) {
     const msg = (e as Error).message
     // 业务软失败（已签到类）→ 视为成功已签
@@ -245,6 +251,8 @@ async function fetchUserResource(
   const data = await billingCall(token, '/v2/billing/meter/get-user-resource', realm, { body, extraHeaders })
   const resp = data && data.Response && data.Response.Data ? data.Response.Data : null
   if (!resp) return null
+  // 临时诊断（方案 A）：打印原始 Response.Data，用于确认权益包期限等字段的真实命名。
+  try { await writeLog(env, 'info', '[checkin-diag] get-user-resource 返回 Response.Data', JSON.stringify(resp).substring(0, 3000)) } catch { /* ignore */ }
   const accounts: any[] = Array.isArray(resp.Accounts) ? resp.Accounts : []
   let totalRemain = 0, totalUsed = 0, totalSize = 0
   for (const a of accounts) {
@@ -489,7 +497,7 @@ export async function checkinOneAccount(env: Env, provider: Provider): Promise<C
   }
 
   // 执行签到
-  const res = await performCheckin(token, 'cn')
+  const res = await performCheckin(token, 'cn', env)
   base.success = res.success
   base.message = res.message
   base.reason = res.success ? 'ok' : 'fail'
