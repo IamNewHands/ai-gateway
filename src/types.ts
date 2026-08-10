@@ -266,6 +266,18 @@ export interface CheckinResult {
   paymentType?: string
   /** 账号昵称（JWT 解出，解不出则留空） */
   nickname?: string
+  /** 权益包明细（每个包的名称 + 到期时间），来自 get-user-resource Accounts[] */
+  packages?: PackageInfo[]
+}
+
+/** 单个权益包信息（来自 get-user-resource 的 Accounts[] 元素） */
+export interface PackageInfo {
+  /** 包名，如 "CodeBuddy个人体验版" */
+  name: string
+  /** 到期时间（原始字符串）。空串表示未设置过期时间（通常为长期/按周期滚动） */
+  expireAt: string
+  /** 本周期结束时间（月度额度周期），如 "2026-08-31 23:59:59" */
+  cycleEndTime?: string
 }
 
 export interface CreateProxyKeyRequest {

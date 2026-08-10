@@ -15,7 +15,7 @@
  * 多账号：遍历所有 oauth-device provider，各自签到。
  */
 import { Context } from 'hono'
-import type { Env, Provider, CheckinResult, ApiResponse } from './types'
+import type { Env, Provider, CheckinResult, PackageInfo, ApiResponse } from './types'
 import { KV_KEYS, CHECKIN_RESULT_TTL_SEC } from './config'
 import { getProviders } from './storage'
 import { getOauthAccessToken, detectTokenRealm, readOauthToken } from './oauth'
@@ -232,7 +232,7 @@ async function fetchUserResource(
   uid: string,
   enterpriseId: string,
   env?: Env
-): Promise<{ totalRemain: number; totalUsed: number; totalSize: number; packCount: number } | null> {
+): Promise<{ totalRemain: number; totalUsed: number; totalSize: number; packCount: number; packages: PackageInfo[] } | null> {
   const now = new Date()
   const end = new Date(now.getTime() + 365 * 101 * 24 * 60 * 60 * 1000)
   const body = {
@@ -258,11 +258,23 @@ async function fetchUserResource(
   }
   const accounts: any[] = Array.isArray(resp.Accounts) ? resp.Accounts : []
   let totalRemain = 0, totalUsed = 0, totalSize = 0
+  const packages: PackageInfo[] = []
   for (const a of accounts) {
     const { remain, used, size } = packageRemainUsed(a)
     totalRemain += remain
     totalUsed += used
     totalSize += size
+    // 收集每个权益包的名称 + 到期时间（ExpiredTime 空串 = 未设置过期时间/长期）
+    if (a && typeof a === 'object') {
+      const name = typeof a.PackageName === 'string' ? a.PackageName : ''
+      if (name) {
+        packages.push({
+          name,
+          expireAt: typeof a.ExpiredTime === 'string' ? a.ExpiredTime : '',
+          cycleEndTime: typeof a.CycleEndTime === 'string' ? a.CycleEndTime : undefined,
+        })
+      }
+    }
   }
   const packCount = accounts.length
   // 用 size−remain 对齐 used，保证 UI 总计自洽
@@ -277,7 +289,7 @@ async function fetchUserResource(
     const derived = Math.max(0, totalSize - totalRemain)
     if (derived > totalUsed) totalUsed = derived
   }
-  return { totalRemain, totalUsed, totalSize, packCount }
+  return { totalRemain, totalUsed, totalSize, packCount, packages }
 }
 
 /** 拉取套餐类型：POST /v2/billing/meter/get-payment-type → paymentType（free/paid…）。 */
@@ -314,6 +326,9 @@ async function fillCredits(env: Env, base: CheckinResult, token: string, realm: 
       base.totalUsed = credits.totalUsed
       base.totalSize = credits.totalSize
       base.packCount = credits.packCount
+      if (credits.packages && credits.packages.length > 0) {
+        base.packages = credits.packages
+      }
     } else {
       try { await writeLog(env, 'warn', `[checkin] ${base.name} 额度无数据（get-user-resource 响应缺 Response.Data.Accounts）`, `uid=${uid || '(空)'} eid=${enterpriseId || '(空)'}`) } catch { /* ignore */ }
     }
