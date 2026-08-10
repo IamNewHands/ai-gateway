@@ -1981,7 +1981,7 @@ function renderCheckinList(d) {
     return
   }
   var html = ''
-  d.data.forEach(function(c) {
+  d.data.forEach(function(c, idx) {
     var reason = c.reason || 'fail'
     var badge = reason === 'ok' ? '<span class="bd bd-on">签到成功</span>'
       : reason === 'already' ? '<span class="bd bd-on">今日已签</span>'
@@ -2003,7 +2003,7 @@ function renderCheckinList(d) {
     var checkinLine = '连续签到：' + streak + ' · 总积分：' + credits + ' · 上次签到：' + escapeHtml(lastTime)
     var packLine = ''
     if (c.packages && c.packages.length > 0) {
-      var pkgId = 'pkg-' + escapeHtml(c.providerId)
+      var pkgId = 'pkg-' + idx
       var rows = c.packages.map(function(p) {
         var exp = (p.expireAt && p.expireAt.trim()) ? escapeHtml(p.expireAt) : '长期'
         var cyc = (p.cycleEndTime && p.cycleEndTime.trim()) ? escapeHtml(p.cycleEndTime) : '—'
@@ -2016,13 +2016,16 @@ function renderCheckinList(d) {
         }
         return '<tr><td>' + escapeHtml(p.name) + '</td><td>' + exp + '</td><td>' + cyc + '</td>' + qty + '</tr>'
       }).join('')
-      packLine = '<div class="collapse-section" style="margin-top:6px"><button class="collapse-btn" onclick="toggleCollapse(\'' + pkgId + '\', this)" type="button" aria-expanded="false"><i class="fas fa-chevron-right collapse-icon" aria-hidden="true"></i> 权益包明细（' + c.packages.length + '）</button><div id="' + pkgId + '" class="hd usage-log-table-wrap"><table class="usage-log-table"><thead><tr><th>名称</th><th>到期时间</th><th>周期结束</th><th>已用/总额度</th></tr></thead><tbody>' + rows + '</tbody></table></div></div>'
+      packLine = '<div class="collapse-section" style="margin-top:6px"><button class="collapse-btn" data-pkg="' + pkgId + '" type="button" aria-expanded="false"><i class="fas fa-chevron-right collapse-icon" aria-hidden="true"></i> 权益包明细（' + c.packages.length + '）</button><div id="' + pkgId + '" class="hd usage-log-table-wrap"><table class="usage-log-table"><thead><tr><th>名称</th><th>到期时间</th><th>周期结束</th><th>已用/总额度</th></tr></thead><tbody>' + rows + '</tbody></table></div></div>'
     }
     html += '<article class="ki"><div class="key-main"><span class="key-icon" aria-hidden="true"><i class="fas fa-calendar-check"></i></span><div><div class="kv"><h3>' + title + '</h3>' + realmBadge + payBadge + badge + '</div><p>' + creditLine + '</p><p style="margin-top:2px">' + checkinLine + '</p>' + packLine + (c.message ? '<p class="mu" style="margin-top:2px">' + escapeHtml(c.message) + '</p>' : '') + '</div></div><div class="key-actions"><button class="btn btn-gh btn-xs" data-cid="' + escapeHtml(c.providerId) + '"><i class="fas fa-calendar-check" aria-hidden="true"></i>签到</button></div></article>'
   })
   el.innerHTML = html
   el.querySelectorAll('[data-cid]').forEach(function(btn) {
     btn.addEventListener('click', function() { triggerCheckin(btn.getAttribute('data-cid')) })
+  })
+  el.querySelectorAll('[data-pkg]').forEach(function(btn) {
+    btn.addEventListener('click', function() { toggleCollapse(btn.getAttribute('data-pkg'), btn) })
   })
 }
 
