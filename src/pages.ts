@@ -828,6 +828,16 @@ function toggleVbCollapse(id, btn) {
   if (!isHidden) vbFillScope(fs)  // 展开时按需填充全库模型引用列表（P6）
 }
 
+// 通用折叠/展开（权益包明细表格等纯展示区域，无懒渲染逻辑）
+function toggleCollapse(id, btn) {
+  const fs = document.getElementById(id)
+  if (!fs) return
+  const isHidden = fs.classList.toggle('hd')
+  btn.setAttribute('aria-expanded', !isHidden)
+  const icon = btn.querySelector('.collapse-icon')
+  if (icon) icon.style.transform = isHidden ? '' : 'rotate(90deg)'
+}
+
 // aid 输入 opencode 时自动填充 API 地址
 document.getElementById('aid').addEventListener('input', function() {
   if (this.value.trim() === 'opencode') {
@@ -1993,11 +2003,13 @@ function renderCheckinList(d) {
     var checkinLine = '连续签到：' + streak + ' · 总积分：' + credits + ' · 上次签到：' + escapeHtml(lastTime)
     var packLine = ''
     if (c.packages && c.packages.length > 0) {
-      var items = c.packages.map(function(p) {
+      var pkgId = 'pkg-' + escapeHtml(c.providerId)
+      var rows = c.packages.map(function(p) {
         var exp = (p.expireAt && p.expireAt.trim()) ? escapeHtml(p.expireAt) : '长期'
-        return '<span class="bd">' + escapeHtml(p.name) + '</span> <small style="color:var(--muted)">' + exp + '</small>'
-      }).join('　')
-      packLine = '<p class="mu" style="margin-top:4px;font-size:12px">权益包：' + items + '</p>'
+        var cyc = (p.cycleEndTime && p.cycleEndTime.trim()) ? escapeHtml(p.cycleEndTime) : '—'
+        return '<tr><td>' + escapeHtml(p.name) + '</td><td>' + exp + '</td><td>' + cyc + '</td></tr>'
+      }).join('')
+      packLine = '<div class="collapse-section" style="margin-top:6px"><button class="collapse-btn" onclick="toggleCollapse(\'' + pkgId + '\', this)" type="button" aria-expanded="false"><i class="fas fa-chevron-right collapse-icon" aria-hidden="true"></i> 权益包明细（' + c.packages.length + '）</button><div id="' + pkgId + '" class="hd usage-log-table-wrap"><table class="usage-log-table"><thead><tr><th>名称</th><th>到期时间</th><th>周期结束</th></tr></thead><tbody>' + rows + '</tbody></table></div></div>'
     }
     html += '<article class="ki"><div class="key-main"><span class="key-icon" aria-hidden="true"><i class="fas fa-calendar-check"></i></span><div><div class="kv"><h3>' + title + '</h3>' + realmBadge + payBadge + badge + '</div><p>' + creditLine + '</p><p style="margin-top:2px">' + checkinLine + '</p>' + packLine + (c.message ? '<p class="mu" style="margin-top:2px">' + escapeHtml(c.message) + '</p>' : '') + '</div></div><div class="key-actions"><button class="btn btn-gh btn-xs" data-cid="' + escapeHtml(c.providerId) + '"><i class="fas fa-calendar-check" aria-hidden="true"></i>签到</button></div></article>'
   })
