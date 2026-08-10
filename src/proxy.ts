@@ -492,6 +492,17 @@ const getRoute = (url: URL): string => url.pathname.replace(/^\/v1\//, '') || 'c
  */
 const UPSTREAM_TOTAL_TIMEOUT_MS = 300000
 
+// ===== 瞬时错误自动重试 =====
+// Trae 等客户端直连网关时，上游偶发瞬时 5xx/网络抖动会直接透传失败，
+// 客户端在读取响应流时再叠加 TLS/网络抖动（如 SEC_E_MESSAGE_ALTERED）就报错。
+// 既然"重试一次又正常"，网关侧对瞬时错误自动重试 1 次即可消除大部分此类问题。
+const TRANSIENT_RETRY_MAX = 1
+const TRANSIENT_RETRY_DELAY_MS = 400
+/** 瞬时性上游状态码：可安全对同一请求重试（区别于 4xx 的确定性错误） */
+function isTransientStatus(status: number): boolean {
+  return status === 502 || status === 503 || status === 504
+}
+
 /** P2：通用/OAuth/Anthropic/Responses 路径统一走「连接超时 + idle 兜底 + 心跳」 */
 function fetchUpstream(
   url: string,
@@ -916,12 +927,27 @@ export async function forwardProxy(
           'Content-Type': 'application/json',
           'Authorization': `Bearer ${apiKey}`,
         }
+        const requestBody = JSON.stringify(forwardBody)
+        const isStream = isStreamRequest(forwardBody as ProxyRequestBody)
 
-        const response = await fetchUpstream(forwardUrl, {
+        // 瞬时错误自动重试：对同一 key 的瞬时 5xx / 网络抖动重试，
+        // 消除"偶发 500/断连，客户端重试一次又正常"的体验问题。
+        let response = await fetchUpstream(forwardUrl, {
           method,
           headers: forwardHeaders,
-          body: JSON.stringify(forwardBody),
-        }, isStreamRequest(forwardBody as ProxyRequestBody))
+          body: requestBody,
+        }, isStream)
+        let transientRetries = 0
+        while (isTransientStatus(response.status) && transientRetries < TRANSIENT_RETRY_MAX) {
+          transientRetries++
+          try { c.executionCtx.waitUntil(writeLog(c.env, 'warn', `[${provider.name}] ${model} → 瞬时 ${response.status}，${transientRetries}/${TRANSIENT_RETRY_MAX} 次重试`)) } catch {}
+          await new Promise((r) => setTimeout(r, TRANSIENT_RETRY_DELAY_MS * transientRetries))
+          response = await fetchUpstream(forwardUrl, {
+            method,
+            headers: forwardHeaders,
+            body: requestBody,
+          }, isStream)
+        }
 
         if (response.ok) {
           // 成功：重置健康状态
@@ -961,7 +987,49 @@ export async function forwardProxy(
         return c.json(errorData, response.status as Parameters<typeof c.json>[1])
       } catch (err) {
         const error = err as Error
-        // 网络错误也标记为失败
+        // 网络异常/连接被重置等瞬时错误：对同一 key 短暂退避后重试 1 次，
+        // 多数情况下重试即恢复（对应客户端"重试一次又正常"的现象）。
+        let lastErr: Error = error
+        let netRetries = 0
+        while (netRetries < TRANSIENT_RETRY_MAX) {
+          netRetries++
+          try { c.executionCtx.waitUntil(writeLog(c.env, 'warn', `[${provider.name}] ${model} → 网络瞬时错误，${netRetries}/${TRANSIENT_RETRY_MAX} 次重试: ${String(error.message || error).substring(0, 200)}`)) } catch {}
+          await new Promise((r) => setTimeout(r, TRANSIENT_RETRY_DELAY_MS * netRetries))
+          try {
+            const retryResp = await fetchUpstream(forwardUrl, {
+              method,
+              headers: forwardHeaders,
+              body: requestBody,
+            }, isStream)
+            if (retryResp.ok) {
+              if (healthData[apiKey]?.failures > 0) {
+                delete healthData[apiKey]
+                healthUpdated = true
+                await writeHealth(c.env, providerId, healthData)
+              }
+              try { c.executionCtx.waitUntil(writeLog(c.env, 'request', `[${provider.name}] ${model} → 200（重试成功）`)) } catch {}
+              return passthroughResponse(retryResp)
+            }
+            // 重试返回了瞬时 5xx，继续下一轮；确定性错误则直接按原逻辑处理
+            if (!isTransientStatus(retryResp.status)) {
+              lastErr = new Error(`HTTP ${retryResp.status}`)
+              if (retryResp.status === 401 || retryResp.status === 403 || retryResp.status >= 500) {
+                const rh = healthData[apiKey] || { failures: 0, lastFailed: false }
+                rh.failures++
+                rh.lastFailed = true
+                if (rh.failures >= KEY_HEALTH_MAX_FAILURES) rh.demotedAt = Date.now()
+                healthData[apiKey] = rh
+                healthUpdated = true
+              }
+              lastError = retryResp
+              break
+            }
+          } catch (retryErr) {
+            lastErr = retryErr as Error
+          }
+        }
+        if (lastError) continue
+        // 重试耗尽仍失败，标记健康状态并切下一个 key
         const h = healthData[apiKey] || { failures: 0, lastFailed: false }
         h.failures++
         h.lastFailed = true
@@ -971,7 +1039,7 @@ export async function forwardProxy(
         healthData[apiKey] = h
         healthUpdated = true
         lastError = new Response(JSON.stringify({
-          error: { message: error.message || '请求失败', type: 'proxy_error' },
+          error: { message: lastErr.message || '请求失败', type: 'proxy_error' },
         }), { status: 502 })
         continue
       }
@@ -1061,6 +1129,20 @@ async function proxyOAuthRequest(
     }, (body as Record<string, unknown>).stream === true || provider.id.startsWith('workbuddy')).then(resp => ({ resp, originalStream }))
   }
 
+  // 瞬时错误自动重试：对同一 token 的瞬时 5xx / 网络抖动重试 1 次，
+  // 消除"偶发 500，客户端重试一次又正常"的体验问题（复用 doFetch 的流式/非流式语义）。
+  const doFetchWithRetry = async (token: string, realm?: 'cn' | 'global') => {
+    let result = await doFetch(token, realm)
+    let transientRetries = 0
+    while (isTransientStatus(result.resp.status) && transientRetries < TRANSIENT_RETRY_MAX) {
+      transientRetries++
+      try { c.executionCtx.waitUntil(writeLog(c.env, 'warn', `[${provider.name}] ${model} → 瞬时 ${result.resp.status}，${transientRetries}/${TRANSIENT_RETRY_MAX} 次重试`)) } catch {}
+      await new Promise((r) => setTimeout(r, TRANSIENT_RETRY_DELAY_MS * transientRetries))
+      result = await doFetch(token, realm)
+    }
+    return result
+  }
+
   try {
     let token = tokenState?.access_token ?? null
     if (!token) {
@@ -1082,7 +1164,7 @@ async function proxyOAuthRequest(
     }
 
     const primaryRealm = resolveRealm(token)
-    let { resp: response, originalStream } = await doFetch(token)
+    let { resp: response, originalStream } = await doFetchWithRetry(token)
 
     // 401/403：可能 token 过期，刷新后重试一次
     if ((response.status === 401 || response.status === 403) && tokenState?.refresh_token) {
@@ -1091,7 +1173,7 @@ async function proxyOAuthRequest(
         const freshState = await readOauthToken(c.env, provider.id)
         if (freshState) {
           tokenState = freshState
-          const retry = await doFetch(freshState.access_token)
+          const retry = await doFetchWithRetry(freshState.access_token)
           response = retry.resp
           originalStream = retry.originalStream
         }
@@ -1103,7 +1185,7 @@ async function proxyOAuthRequest(
       const alt = altRealm(primaryRealm)
       if (alt) {
         console.log(`[proxy-oauth] ${primaryRealm} 域 401，自动切换到 ${alt} 域重试`)
-        const altResult = await doFetch(token, alt)
+        const altResult = await doFetchWithRetry(token, alt)
         if (altResult.resp.ok || altResult.resp.status !== 401) {
           response = altResult.resp
           originalStream = altResult.originalStream

@@ -21,6 +21,14 @@ const OPENCODE_RATE_LIMIT_RETRY_BASE_MS = 1200
 // 不同 key 之间 429 切换前的最小等待（避免并发触发同一限流窗口）
 const OPENCODE_RATE_LIMIT_KEY_GAP_MS = 800
 
+// 瞬时错误自动重试：上游偶发 502/503/504 或网络抖动时对同一 key 重试，
+// 消除"偶发 500，客户端重试一次又正常"的体验问题。
+const TRANSIENT_RETRY_MAX = 1
+const TRANSIENT_RETRY_DELAY_MS = 400
+function isTransientStatus(status: number): boolean {
+  return status === 502 || status === 503 || status === 504
+}
+
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms))
 
 interface OpenCodeRequestOptions {
@@ -299,7 +307,9 @@ export async function proxyOpenCodeRequest(options: OpenCodeRequestOptions): Pro
 
   for (const entry of enabledKeys) {
     try {
-      const response = await requestUpstream(
+      // 瞬时错误自动重试：对同一 key 的瞬时 5xx / 网络抖动重试 1 次，
+      // 消除"偶发 500，客户端重试一次又正常"的体验问题。
+      let response = await requestUpstream(
         fetcher,
         officialUrl,
         entry.key,
@@ -307,6 +317,19 @@ export async function proxyOpenCodeRequest(options: OpenCodeRequestOptions): Pro
         requestId,
         sessionId
       )
+      let transientRetries = 0
+      while (isTransientStatus(response.status) && transientRetries < TRANSIENT_RETRY_MAX) {
+        transientRetries++
+        await sleep(TRANSIENT_RETRY_DELAY_MS * transientRetries)
+        response = await requestUpstream(
+          fetcher,
+          officialUrl,
+          entry.key,
+          options,
+          requestId,
+          sessionId
+        )
+      }
       if (response.ok) return response
 
       officialFailure = await storeFailure(response)
@@ -339,7 +362,44 @@ export async function proxyOpenCodeRequest(options: OpenCodeRequestOptions): Pro
       }
       if (response.status !== 401 && response.status !== 403) break
     } catch (error) {
+      // 网络异常/连接被重置等瞬时错误：对同一 key 重试 1 次后仍失败再放弃
       lastTransportError = error
+      let netRetries = 0
+      let netRecovered = false
+      while (netRetries < TRANSIENT_RETRY_MAX) {
+        netRetries++
+        await sleep(TRANSIENT_RETRY_DELAY_MS * netRetries)
+        try {
+          const retry = await requestUpstream(
+            fetcher,
+            officialUrl,
+            entry.key,
+            options,
+            requestId,
+            sessionId
+          )
+          if (retry.ok) return retry
+          if (isTransientStatus(retry.status)) {
+            officialFailure = await storeFailure(retry)
+            continue
+          }
+          // 重试返回确定性错误，按原逻辑处理
+          officialFailure = await storeFailure(retry)
+          if (retry.status === 429) {
+            await sleep(OPENCODE_RATE_LIMIT_KEY_GAP_MS)
+            netRecovered = true
+            break
+          }
+          if (retry.status === 401 || retry.status === 403) {
+            netRecovered = true
+            break
+          }
+          break
+        } catch (retryErr) {
+          lastTransportError = retryErr
+        }
+      }
+      if (netRecovered) continue
       break
     }
   }
