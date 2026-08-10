@@ -922,14 +922,14 @@ export async function forwardProxy(
 
     for (const keyIndex of keyOrder) {
       const apiKey = enabledKeys[keyIndex].key
+      // 提升到 try/catch 外层，供 catch 分支做瞬时错误重试时复用
+      const forwardHeaders: Record<string, string> = {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${apiKey}`,
+      }
+      const requestBody = JSON.stringify(forwardBody)
+      const isStream = isStreamRequest(forwardBody as ProxyRequestBody)
       try {
-        const forwardHeaders: Record<string, string> = {
-          'Content-Type': 'application/json',
-          'Authorization': `Bearer ${apiKey}`,
-        }
-        const requestBody = JSON.stringify(forwardBody)
-        const isStream = isStreamRequest(forwardBody as ProxyRequestBody)
-
         // 瞬时错误自动重试：对同一 key 的瞬时 5xx / 网络抖动重试，
         // 消除"偶发 500/断连，客户端重试一次又正常"的体验问题。
         let response = await fetchUpstream(forwardUrl, {
