@@ -253,7 +253,9 @@ async function fetchUserResource(
   const resp = data && data.Response && data.Response.Data ? data.Response.Data : null
   if (!resp) return null
   // 临时诊断（方案 A）：打印原始 Response.Data，用于确认权益包期限等字段的真实命名。
-  try { await writeLog(env, 'info', '[checkin-diag] get-user-resource 返回 Response.Data', JSON.stringify(resp).substring(0, 3000)) } catch { /* ignore */ }
+  if (env) {
+    try { await writeLog(env, 'info', '[checkin-diag] get-user-resource 返回 Response.Data', JSON.stringify(resp).substring(0, 3000)) } catch { /* ignore */ }
+  }
   const accounts: any[] = Array.isArray(resp.Accounts) ? resp.Accounts : []
   let totalRemain = 0, totalUsed = 0, totalSize = 0
   for (const a of accounts) {
