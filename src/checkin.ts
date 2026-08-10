@@ -230,7 +230,8 @@ async function fetchUserResource(
   token: string,
   realm: 'cn' | 'global',
   uid: string,
-  enterpriseId: string
+  enterpriseId: string,
+  env?: Env
 ): Promise<{ totalRemain: number; totalUsed: number; totalSize: number; packCount: number } | null> {
   const now = new Date()
   const end = new Date(now.getTime() + 365 * 101 * 24 * 60 * 60 * 1000)
@@ -305,7 +306,7 @@ async function fetchPaymentType(
  */
 async function fillCredits(env: Env, base: CheckinResult, token: string, realm: 'cn' | 'global', uid: string, enterpriseId: string) {
   try {
-    const credits = await fetchUserResource(token, realm, uid, enterpriseId)
+    const credits = await fetchUserResource(token, realm, uid, enterpriseId, env)
     if (credits) {
       base.totalRemain = credits.totalRemain
       base.totalUsed = credits.totalUsed
