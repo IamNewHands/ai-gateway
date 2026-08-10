@@ -269,13 +269,20 @@ async function fetchUserResource(
       const name = typeof a.PackageName === 'string' ? a.PackageName : ''
       if (name) {
         const num = (v: any) => (v === undefined || v === null || v === '') ? 0 : (Number(v) || 0)
+        // 优先本周期维度（CycleCapacity*），与实际扣费及顶部聚合口径一致；
+        // 周期字段为 0 时（如已过期包无周期额度）回退整包维度（Capacity*）
+        let pkgUsed = num(a.CycleCapacityUsed)
+        let pkgSize = num(a.CycleCapacitySize)
+        if (pkgSize <= 0) {
+          pkgUsed = num(a.CapacityUsed)
+          pkgSize = num(a.CapacitySize)
+        }
         packages.push({
           name,
           expireAt: typeof a.ExpiredTime === 'string' ? a.ExpiredTime : '',
           cycleEndTime: typeof a.CycleEndTime === 'string' ? a.CycleEndTime : undefined,
-          // 整包维度额度（非本周期 cycle），用于表格逐包展示已用/总额度
-          used: num(a.CapacityUsed),
-          size: num(a.CapacitySize),
+          used: pkgUsed,
+          size: pkgSize,
           unit: typeof a.CapacityUnit === 'string' ? a.CapacityUnit : undefined,
         })
       }

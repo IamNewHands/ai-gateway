@@ -278,9 +278,9 @@ export interface PackageInfo {
   expireAt: string
   /** 本周期结束时间（月度额度周期），如 "2026-08-31 23:59:59" */
   cycleEndTime?: string
-  /** 该包已用额度（整包维度，CapacityUsed） */
+  /** 该包已用额度（优先本周期 CycleCapacityUsed，回退整包 CapacityUsed） */
   used?: number
-  /** 该包总额度（整包维度，CapacitySize） */
+  /** 该包总额度（优先本周期 CycleCapacitySize，回退整包 CapacitySize） */
   size?: number
   /** 额度单位，如 credits */
   unit?: string
