@@ -1917,8 +1917,22 @@ async function refreshLogs(isAuto) {
       var fEnd = syslogEnd ? syslogEnd.value : ''
       var fKw = syslogKeyword ? syslogKeyword.value.trim() : ''
       if (fType) qs += '&type=' + encodeURIComponent(fType)
-      if (fStart) qs += '&start=' + encodeURIComponent(fStart)
-      if (fEnd) qs += '&end=' + encodeURIComponent(fEnd)
+      // 日期修复：datetime-local 值不含时区，Workers 运行时默认 UTC 会整体偏移 8 小时。
+      // 在浏览器（用户本地时区）先转成 ISO 字符串再传，后端 new Date(iso) 即得正确 UTC 毫秒。
+      if (fStart) {
+        var ds = new Date(fStart)
+        if (!isNaN(ds.getTime())) qs += '&start=' + encodeURIComponent(ds.toISOString())
+      }
+      if (fEnd) {
+        var de = new Date(fEnd)
+        if (!isNaN(de.getTime())) {
+          // end 选 00:00:00 时补到 23:59:59.999——用户选同一天只想搜整天，避免漏掉当天后半段
+          if (de.getHours() === 0 && de.getMinutes() === 0 && de.getSeconds() === 0) {
+            de.setHours(23, 59, 59, 999)
+          }
+          qs += '&end=' + encodeURIComponent(de.toISOString())
+        }
+      }
       if (fKw) qs += '&keyword=' + encodeURIComponent(fKw)
       const r = await fetch('/admin/api/logs?' + qs)
       const d = await r.json()
