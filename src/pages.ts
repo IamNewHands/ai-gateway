@@ -618,15 +618,11 @@ ${H('管理')}
       </section>
       <section id="logs" class="workspace-section" aria-labelledby="logs-title">
         <div class="section-heading section-heading--admin"><div><h2 id="logs-title">系统日志</h2><p>记录 API 请求、错误等关键信息。</p></div><div><label class="tg"><input type="checkbox" id="log-switch" onchange="toggleLog(this.checked)"><span class="sl"></span></label><span id="log-status">已关闭</span><label class="tg" style="margin-left:8px" title="定时自动刷新日志，便于排查问题"><input type="checkbox" id="log-auto-on" onchange="logAutoToggle(this.checked)"><span class="sl"></span></label><input type="number" id="log-auto-sec" min="1" max="3600" value="5" style="width:58px;text-align:center;font-size:12px;padding:2px 4px;border-radius:6px;border:1px solid var(--border,#e2e8f0);background:var(--card,#fff);color:inherit;margin-left:6px" onchange="logAutoSecChange()"><span class="mu" style="font-size:12px;margin-left:4px">秒自动刷新</span><button class="btn btn-gh btn-xs" onclick="logPageChange(1)" style="margin-left:8px" title="刷新（回到第一页）"><i class="fas fa-sync-alt"></i></button><button class="btn btn-d btn-xs" onclick="clearLogs()" style="margin-left:4px">清除</button></div></div>
-        <div class="syslog-filters" style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;padding:8px 10px;margin-bottom:8px;border-radius:8px;border:1px solid var(--border,#e2e8f0);background:var(--card,#fff)">
-          <select id="syslog-type" aria-label="日志类型" style="font-size:12px;padding:3px 6px;border-radius:6px;border:1px solid var(--border,#e2e8f0);background:var(--card,#fff);color:inherit"><option value="">全部类型</option><option value="error">error</option><option value="warn">warn</option><option value="info">info</option><option value="request">request</option><option value="response">response</option></select>
-          <label style="font-size:12px;color:var(--muted,#64748b)" for="syslog-start">起</label>
-          <input type="datetime-local" id="syslog-start" style="font-size:12px;padding:3px 6px;border-radius:6px;border:1px solid var(--border,#e2e8f0);background:var(--card,#fff);color:inherit">
-          <label style="font-size:12px;color:var(--muted,#64748b)" for="syslog-end">止</label>
-          <input type="datetime-local" id="syslog-end" style="font-size:12px;padding:3px 6px;border-radius:6px;border:1px solid var(--border,#e2e8f0);background:var(--card,#fff);color:inherit">
-          <input type="search" id="syslog-keyword" placeholder="日志关键字" style="flex:1;min-width:140px;font-size:12px;padding:3px 8px;border-radius:6px;border:1px solid var(--border,#e2e8f0);background:var(--card,#fff);color:inherit" onkeydown="if(event.key==='Enter'){syslogSearch()}">
-          <button class="btn btn-p btn-xs" onclick="syslogSearch()"><i class="fas fa-search"></i>搜索</button>
-          <button class="btn btn-gh btn-xs" onclick="syslogReset()">重置</button>
+        <div class="syslog-filters">
+          <div class="fg log-time-range"><label>时间范围</label><div class="fc"><input type="datetime-local" id="syslog-start" aria-label="开始时间"><span style="margin:0 4px;color:var(--color-muted)">至</span><input type="datetime-local" id="syslog-end" aria-label="结束时间"></div></div>
+          <div class="fg"><label>类型</label><select id="syslog-type" aria-label="日志类型"><option value="">全部</option><option value="error">error</option><option value="warn">warn</option><option value="info">info</option><option value="request">request</option><option value="response">response</option></select></div>
+          <div class="fg"><label>关键词</label><input type="search" id="syslog-keyword" placeholder="日志关键字" onkeydown="if(event.key==='Enter'){syslogSearch()}"></div>
+          <div class="log-actions"><button class="btn btn-gh btn-xs" onclick="syslogReset()"><i class="fas fa-undo-alt" aria-hidden="true"></i>重置</button><button class="btn btn-p btn-xs" onclick="syslogSearch()"><i class="fas fa-search" aria-hidden="true"></i>搜索</button></div>
         </div>
         <div id="log-list" class="key-list">
           <div class="empty-state"><i class="fas fa-list-alt" aria-hidden="true"></i><h3>暂无日志</h3><p>开启日志开关后，API 请求和错误会被记录。</p></div>

@@ -534,11 +534,12 @@ label, legend { color: var(--color-ink-2); font-size: var(--text-xs); font-weigh
 .usage-log-table td.numeric { text-align: right; font-family: var(--font-mono); }
 .usage-log-table code { font-size: var(--text-xs); }
 .usage-log-cards { display: none; }
-.analytics-log-filters { display: grid; grid-template-columns: minmax(0, 1fr); gap: var(--space-2xs); margin-block: var(--space-sm); padding: var(--space-sm); border: .0625rem solid var(--color-rule); border-radius: var(--radius-control); background: var(--color-paper-2); }
-.analytics-log-filters .fg { margin-block-end: 0; }
-.analytics-log-filters select, .analytics-log-filters input { height: 2.25rem; font-size: var(--text-xs); }
-.analytics-log-filters .log-time-range { grid-column: 1 / -1; }
-.analytics-log-filters .log-time-range .fc { flex-wrap: wrap; }
+.analytics-log-filters, .syslog-filters { display: grid; grid-template-columns: minmax(0, 1fr); gap: var(--space-2xs); margin-block: var(--space-sm); padding: var(--space-sm); border: .0625rem solid var(--color-rule); border-radius: var(--radius-control); background: var(--color-paper-2); }
+.analytics-log-filters .fg, .syslog-filters .fg { margin-block-end: 0; }
+.analytics-log-filters select, .analytics-log-filters input, .syslog-filters select, .syslog-filters input { height: 2.25rem; font-size: var(--text-xs); }
+.analytics-log-filters .log-time-range, .syslog-filters .log-time-range { grid-column: 1 / -1; }
+.analytics-log-filters .log-time-range .fc, .syslog-filters .log-time-range .fc { flex-wrap: wrap; }
+.syslog-filters .log-actions { grid-column: 1 / -1; display: flex; justify-content: flex-end; gap: var(--space-2xs); }
 .analytics-log-pagination { display: flex; align-items: center; justify-content: center; gap: var(--space-sm); margin-block-start: var(--space-sm); }
 .log-detail-grid { display: grid; grid-template-columns: minmax(6rem, auto) minmax(0, 1fr); gap: var(--space-2xs) var(--space-xs); font-size: var(--text-xs); }
 .log-detail-grid dt { color: var(--color-muted); font-weight: 600; }
@@ -553,8 +554,8 @@ label, legend { color: var(--color-ink-2); font-size: var(--text-xs); font-weigh
   .analytics-metrics > div:last-child { border-inline-end: 0; }
   .analytics-charts { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); }
   .analytics-charts > .analytics-chart-panel:first-child { grid-column: 1 / -1; }
-  .analytics-log-filters { grid-template-columns: repeat(4, minmax(0, 1fr)); }
-  .analytics-log-filters .log-time-range { grid-column: span 2; }
+  .analytics-log-filters, .syslog-filters { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+  .analytics-log-filters .log-time-range, .syslog-filters .log-time-range { grid-column: span 2; }
   .usage-log-table { display: table; }
   .usage-log-cards { display: none; }
 }
