@@ -2000,7 +2000,8 @@ function renderCheckinList(d) {
     var packs = (c.packCount !== undefined && c.packCount !== null) ? c.packCount + ' 个包' : '—'
     var pct = (c.totalSize > 0 && c.totalUsed !== undefined && c.totalUsed !== null) ? Math.round(c.totalUsed / c.totalSize * 100) + '%' : ''
     var creditLine = '可用 ' + remain + ' · 已用 ' + used + (pct ? ' · ' + pct : '') + ' · 额度池 ' + size + ' · ' + packs
-    var checkinLine = '连续签到：' + streak + ' · 总积分：' + credits + ' · 上次签到：' + escapeHtml(lastTime)
+    var checkinCredit = (c.checkinCredit !== undefined && c.checkinCredit !== null) ? '+' + c.checkinCredit : ''
+    var checkinLine = '连续签到：' + streak + (checkinCredit ? ' · 本次签到 ' + checkinCredit + ' 积分' : '') + ' · 总积分：' + credits + ' · 上次签到：' + escapeHtml(lastTime)
     var packLine = ''
     if (c.packages && c.packages.length > 0) {
       var pkgId = 'pkg-' + idx

@@ -250,6 +250,8 @@ export interface CheckinResult {
   streakDays?: number
   totalCredits?: number
   dailyCredit?: number
+  /** 本次签到获得积分（仅签到成功当天有值，already 当天无） */
+  checkinCredit?: number
   /** 上次签到时间（epoch ms） */
   lastCheckinAt?: number
   updatedAt: number
