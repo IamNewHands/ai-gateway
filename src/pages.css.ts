@@ -538,7 +538,11 @@ label, legend { color: var(--color-ink-2); font-size: var(--text-xs); font-weigh
 .analytics-log-filters .fg, .syslog-filters .fg { margin-block-end: 0; }
 .analytics-log-filters select, .analytics-log-filters input, .syslog-filters select, .syslog-filters input { height: 2.25rem; font-size: var(--text-xs); }
 .analytics-log-filters .log-time-range, .syslog-filters .log-time-range { grid-column: 1 / -1; }
-.analytics-log-filters .log-time-range .fc, .syslog-filters .log-time-range .fc { flex-wrap: wrap; }
+/* 时间范围：label 与起止框同一行横排，框宽收紧 */
+.log-time-range { display: flex; align-items: center; flex-wrap: wrap; gap: var(--space-2xs); }
+.log-time-range > label { display: inline; margin-block-end: 0; white-space: nowrap; }
+.log-time-range .fc { flex: 1 1 auto; min-width: 0; flex-wrap: nowrap; }
+.log-time-range input[type="datetime-local"] { width: auto; min-width: 0; flex: 1 1 0; max-width: 11rem; }
 .syslog-filters .log-actions { grid-column: 1 / -1; display: flex; justify-content: flex-end; gap: var(--space-2xs); }
 .analytics-log-pagination { display: flex; align-items: center; justify-content: center; gap: var(--space-sm); margin-block-start: var(--space-sm); }
 .log-detail-grid { display: grid; grid-template-columns: minmax(6rem, auto) minmax(0, 1fr); gap: var(--space-2xs) var(--space-xs); font-size: var(--text-xs); }
