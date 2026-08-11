@@ -1068,9 +1068,21 @@ export interface LogEntry {
 
 const LOG_PREFIX = 'log:'
 const LOG_TTL = 60 * 60 * 24 * 7 // 7 天
-// 搜索模式下扫描的最近日志条数上限：1 次 KV.list(1000) + 600 次 KV.get ≈ 601 subrequest，
-// 远低于 Workers 单请求 1000 subrequest 上限；600 条覆盖日常排查。
-const SEARCH_SCAN = 600
+// 搜索模式下 KV.get 次数上限：KV.list(≤5 次) + 990 次 KV.get ≈ 995 subrequest，
+// 留余量低于 Workers 单请求 1000 subrequest 上限。
+const SEARCH_SCAN = 990
+
+/**
+ * 从日志 key 名解析写入时间戳（毫秒）。
+ * key 格式 = 'log:' + Date.now().toString(36) + Math.random().toString(36).slice(2,8)
+ * 去掉 'log:' 前缀和 6 位随机后缀，剩余即 base36 时间戳。解析失败返回 NaN。
+ * 用于搜索时按日期预过滤 key 名，免去对不相关时间段日志的 KV.get。
+ */
+function tsFromLogKey(name: string): number {
+  const ts36 = name.slice(LOG_PREFIX.length, name.length - 6)
+  const ts = parseInt(ts36, 36)
+  return Number.isFinite(ts) ? ts : NaN
+}
 
 /**
  * 日志内容脱敏：日志里绝不落盘密钥原文。
@@ -1124,8 +1136,8 @@ const toInt = (raw: string | null | undefined, fallback: number): number => {
 /**
  * 获取日志列表（支持 limit / offset 分页 + type / keyword / 日期范围搜索）。
  * 无搜索条件时只读本页窗口的 key（P5：subrequest 最小化）；
- * 有搜索条件时读最近 SEARCH_SCAN 条全量过滤后内存分页——
- * SEARCH_SCAN 控制在 600，使单请求 subrequest（list + get）远低于 1000 上限。
+ * 有搜索条件时先用 key 名时间戳做日期预过滤（免 KV.get），再对命中 key 读取过滤——
+ * 日期搜索可覆盖全部日志，关键词搜索扫描上限 SEARCH_SCAN 控 subrequest 在 1000 内。
  */
 export async function handleLogs(c: Context<AppEnv>) {
   const limit = Math.min(Math.max(toInt(c.req.query('limit'), 50), 1), 200)
@@ -1139,8 +1151,9 @@ export async function handleLogs(c: Context<AppEnv>) {
   const endTime = endRaw ? new Date(endRaw).getTime() : NaN
   const hasFilter = !!(type || keyword || !Number.isNaN(startTime) || !Number.isNaN(endTime))
 
-  // P5：KV.list 只拉 key 名（便宜）。无搜索用 5000 上限报 total；搜索模式降到 600 控 subrequest。
-  const TOTAL_CAP = hasFilter ? SEARCH_SCAN : 5000
+  // P5：KV.list 只拉 key 名（便宜）。无论是否搜索都拉到 5000 上限——
+  // 搜索时需用 key 名时间戳预过滤，拉全部 key 名才能覆盖完整日期范围。
+  const TOTAL_CAP = 5000
   const names: string[] = []
   let cursor: string | undefined
   do {
@@ -1150,10 +1163,10 @@ export async function handleLogs(c: Context<AppEnv>) {
   } while (cursor && names.length < TOTAL_CAP)
   // key 名 = 'log:' + Date.now().toString(36) + 随机，字典序正序 = 旧→新；取最新在前
   names.reverse()
+  const kvTotal = names.length
 
   // 无搜索：只读 offset..offset+limit 窗口的 key（原逻辑，type 过滤保持向后兼容）
   if (!hasFilter) {
-    const total = names.length
     const logs: LogEntry[] = []
     const slice = names.slice(offset, offset + limit)
     for (let i = 0; i < slice.length; i += 25) {
@@ -1166,11 +1179,20 @@ export async function handleLogs(c: Context<AppEnv>) {
         } catch { /* skip corrupt entries */ }
       }
     }
-    return c.json<ApiResponse>({ success: true, data: { logs: logs.slice(0, limit), total, offset } })
+    return c.json<ApiResponse>({ success: true, data: { logs: logs.slice(0, limit), total: kvTotal, offset } })
   }
 
-  // 搜索：读 SEARCH_SCAN 条 entry 全量过滤后内存分页
-  const scan = names.slice(0, SEARCH_SCAN)
+  // 搜索：先用 key 名时间戳做日期预过滤（免 KV.get），大幅减少需读取的 key 数
+  const startMs = Number.isNaN(startTime) ? -Infinity : startTime
+  const endMs = Number.isNaN(endTime) ? Infinity : endTime
+  const byDate = names.filter((n) => {
+    const ts = tsFromLogKey(n)
+    // 解析失败的 key 保留（保险，后续用 entry.time 兜底过滤）
+    if (Number.isNaN(ts)) return true
+    return ts >= startMs && ts <= endMs
+  })
+  // 控 subrequest：候选 key 上限 SEARCH_SCAN（list 已用 ≤5，990 get = 995，留余量）
+  const scan = byDate.slice(0, SEARCH_SCAN)
   const matched: LogEntry[] = []
   for (let i = 0; i < scan.length; i += 25) {
     const raws = await Promise.all(scan.slice(i, i + 25).map((n) => c.env.KV.get(n)))
@@ -1179,9 +1201,12 @@ export async function handleLogs(c: Context<AppEnv>) {
       try {
         const entry = JSON.parse(raw) as LogEntry
         if (type && entry.type !== type) continue
-        const ts = new Date(entry.time).getTime()
-        if (!Number.isNaN(startTime) && ts < startTime) continue
-        if (!Number.isNaN(endTime) && ts > endTime) continue
+        // 日期已在 key 名预过滤，但解析失败的 key 仍需用 entry.time 兜底精确过滤
+        if (!Number.isNaN(startTime) || !Number.isNaN(endTime)) {
+          const ts = new Date(entry.time).getTime()
+          if (!Number.isNaN(startTime) && ts < startTime) continue
+          if (!Number.isNaN(endTime) && ts > endTime) continue
+        }
         if (keyword) {
           const hay = ((entry.message || '') + '\n' + (entry.details || '')).toLowerCase()
           if (!hay.includes(keyword)) continue
@@ -1192,7 +1217,14 @@ export async function handleLogs(c: Context<AppEnv>) {
   }
   return c.json<ApiResponse>({
     success: true,
-    data: { logs: matched.slice(offset, offset + limit), total: matched.length, offset, scanned: scan.length },
+    data: {
+      logs: matched.slice(offset, offset + limit),
+      total: matched.length,
+      offset,
+      scanned: scan.length,
+      kvTotal,
+      truncated: byDate.length > scan.length,
+    },
   })
 }
 

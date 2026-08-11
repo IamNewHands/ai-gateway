@@ -1939,8 +1939,15 @@ async function refreshLogs(isAuto) {
       if (!d.success || !d.data.logs || d.data.logs.length === 0) {
         // 当前页无数据：若不在第一页则回退一页重新加载（如日志被清除）
         if (logPage > 1) { logPage--; logRefreshing = false; refreshLogs(isAuto); return }
-        var emptyTip = (fType || fStart || fEnd || fKw) ? '没有匹配的日志，试试调整搜索条件。' : '开启开关后 API 请求会被记录。'
-        var scannedNote = (d.data && d.data.scanned) ? '<p style="font-size:11px;color:var(--muted,#64748b)">已搜索最近 ' + d.data.scanned + ' 条</p>' : ''
+        var hasCond = !!(fType || fStart || fEnd || fKw)
+        var emptyTip = hasCond ? '没有匹配的日志，试试调整搜索条件。' : '开启开关后 API 请求会被记录。'
+        // 搜索模式下显示扫描范围，便于诊断（scanned=实际扫描数 / kvTotal=日志总数）
+        var scannedNote = ''
+        if (hasCond && d.data) {
+          scannedNote = '<p style="font-size:11px;color:var(--muted,#64748b)">已扫描 ' + (d.data.scanned || 0) + ' / ' + (d.data.kvTotal || 0) + ' 条日志'
+          if (d.data.truncated) scannedNote += '（仅最近 ' + (d.data.scanned || 0) + ' 条，缩小日期范围可全量搜索）'
+          scannedNote += '</p>'
+        }
         el.innerHTML = '<div class="empty-state"><i class="fas fa-list-alt" aria-hidden="true"></i><h3>暂无日志</h3><p>' + emptyTip + '</p>' + scannedNote + '</div>'
         return
       }
@@ -1963,7 +1970,7 @@ async function refreshLogs(isAuto) {
       sizeHtml += '</select>'
       html += '<div style="padding:10px;display:flex;align-items:center;justify-content:center;gap:8px;flex-wrap:wrap">'
       html += '<button class="btn btn-gh btn-xs" onclick="logPageChange(' + (logPage - 1) + ')" ' + (logPage <= 1 ? 'disabled' : '') + '><i class="fas fa-chevron-left"></i>上一页</button>'
-      html += '<span class="mu" style="font-size:12px">第 ' + logPage + ' / ' + totalPages + ' 页 · 共 ' + d.data.total + ' 条' + (d.data.scanned ? ' · 已搜最近 ' + d.data.scanned + ' 条' : '') + '</span>'
+      html += '<span class="mu" style="font-size:12px">第 ' + logPage + ' / ' + totalPages + ' 页 · 共 ' + d.data.total + ' 条' + (d.data.scanned ? ' · 已扫描 ' + d.data.scanned + '/' + (d.data.kvTotal || d.data.scanned) + ' 条' : '') + '</span>'
       html += '<button class="btn btn-gh btn-xs" onclick="logPageChange(' + (logPage + 1) + ')" ' + (logPage >= totalPages ? 'disabled' : '') + '>下一页<i class="fas fa-chevron-right"></i></button>'
       html += '<span class="mu" style="font-size:12px">' + sizeHtml + '</span>'
       html += '</div>'
