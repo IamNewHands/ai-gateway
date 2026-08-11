@@ -1068,6 +1068,9 @@ export interface LogEntry {
 
 const LOG_PREFIX = 'log:'
 const LOG_TTL = 60 * 60 * 24 * 7 // 7 天
+// 搜索模式下扫描的最近日志条数上限：1 次 KV.list(1000) + 600 次 KV.get ≈ 601 subrequest，
+// 远低于 Workers 单请求 1000 subrequest 上限；600 条覆盖日常排查。
+const SEARCH_SCAN = 600
 
 /**
  * 日志内容脱敏：日志里绝不落盘密钥原文。
@@ -1118,15 +1121,26 @@ const toInt = (raw: string | null | undefined, fallback: number): number => {
   return Number.isFinite(n) ? Math.trunc(n) : fallback
 }
 
-/** 获取日志列表（支持 limit / offset 分页） */
+/**
+ * 获取日志列表（支持 limit / offset 分页 + type / keyword / 日期范围搜索）。
+ * 无搜索条件时只读本页窗口的 key（P5：subrequest 最小化）；
+ * 有搜索条件时读最近 SEARCH_SCAN 条全量过滤后内存分页——
+ * SEARCH_SCAN 控制在 600，使单请求 subrequest（list + get）远低于 1000 上限。
+ */
 export async function handleLogs(c: Context<AppEnv>) {
   const limit = Math.min(Math.max(toInt(c.req.query('limit'), 50), 1), 200)
   const type = c.req.query('type') || ''
   const offset = Math.max(toInt(c.req.query('offset'), 0), 0)
+  // 搜索条件：关键词（小写匹配 message+details）、日期范围（按 entry.time 绝对时间戳比较）
+  const keyword = (c.req.query('keyword') || '').trim().toLowerCase().slice(0, 100)
+  const startRaw = c.req.query('start') || ''
+  const endRaw = c.req.query('end') || ''
+  const startTime = startRaw ? new Date(startRaw).getTime() : NaN
+  const endTime = endRaw ? new Date(endRaw).getTime() : NaN
+  const hasFilter = !!(type || keyword || !Number.isNaN(startTime) || !Number.isNaN(endTime))
 
-  // P5：避免全量 KV.get。KV.list 只拉 key 名（便宜，上限 TOTAL_CAP 截断 total），
-  // 再只对 offset..offset+limit 窗口内的 key 发起 KV.get——日志量大时不再逼近 subrequest 上限。
-  const TOTAL_CAP = 5000
+  // P5：KV.list 只拉 key 名（便宜）。无搜索用 5000 上限报 total；搜索模式降到 600 控 subrequest。
+  const TOTAL_CAP = hasFilter ? SEARCH_SCAN : 5000
   const names: string[] = []
   let cursor: string | undefined
   do {
@@ -1136,21 +1150,50 @@ export async function handleLogs(c: Context<AppEnv>) {
   } while (cursor && names.length < TOTAL_CAP)
   // key 名 = 'log:' + Date.now().toString(36) + 随机，字典序正序 = 旧→新；取最新在前
   names.reverse()
-  const total = names.length
 
-  const logs: LogEntry[] = []
-  const slice = names.slice(offset, offset + limit)
-  for (let i = 0; i < slice.length; i += 25) {
-    const raws = await Promise.all(slice.slice(i, i + 25).map((n) => c.env.KV.get(n)))
+  // 无搜索：只读 offset..offset+limit 窗口的 key（原逻辑，type 过滤保持向后兼容）
+  if (!hasFilter) {
+    const total = names.length
+    const logs: LogEntry[] = []
+    const slice = names.slice(offset, offset + limit)
+    for (let i = 0; i < slice.length; i += 25) {
+      const raws = await Promise.all(slice.slice(i, i + 25).map((n) => c.env.KV.get(n)))
+      for (const raw of raws) {
+        if (!raw) continue
+        try {
+          const entry = JSON.parse(raw) as LogEntry
+          if (!type || entry.type === type) logs.push(entry)
+        } catch { /* skip corrupt entries */ }
+      }
+    }
+    return c.json<ApiResponse>({ success: true, data: { logs: logs.slice(0, limit), total, offset } })
+  }
+
+  // 搜索：读 SEARCH_SCAN 条 entry 全量过滤后内存分页
+  const scan = names.slice(0, SEARCH_SCAN)
+  const matched: LogEntry[] = []
+  for (let i = 0; i < scan.length; i += 25) {
+    const raws = await Promise.all(scan.slice(i, i + 25).map((n) => c.env.KV.get(n)))
     for (const raw of raws) {
       if (!raw) continue
       try {
         const entry = JSON.parse(raw) as LogEntry
-        if (!type || entry.type === type) logs.push(entry)
+        if (type && entry.type !== type) continue
+        const ts = new Date(entry.time).getTime()
+        if (!Number.isNaN(startTime) && ts < startTime) continue
+        if (!Number.isNaN(endTime) && ts > endTime) continue
+        if (keyword) {
+          const hay = ((entry.message || '') + '\n' + (entry.details || '')).toLowerCase()
+          if (!hay.includes(keyword)) continue
+        }
+        matched.push(entry)
       } catch { /* skip corrupt entries */ }
     }
   }
-  return c.json<ApiResponse>({ success: true, data: { logs: logs.slice(0, limit), total, offset } })
+  return c.json<ApiResponse>({
+    success: true,
+    data: { logs: matched.slice(offset, offset + limit), total: matched.length, offset, scanned: scan.length },
+  })
 }
 
 /** 清除日志 */
