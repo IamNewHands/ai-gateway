@@ -767,6 +767,14 @@ export async function forwardProxy(
         search: url.search,
         body: JSON.stringify(forwardBody),
         mirrorUrls: resolveOpenCodeUrls(c.env),
+        providerName: provider.name,
+        // opencode 内部 key 切换 / 走 public 等关键事件透传到系统日志
+        logger: (level, message, details) => {
+          const logType = level === 'info' ? 'request' : level
+          try {
+            c.executionCtx.waitUntil(writeLog(c.env, logType, `${message} [${model}]`, details))
+          } catch { /* log failure must not break */ }
+        },
       })
       // OpenCode 路径之前缺少日志记录，导致请求成功但后台无记录
       const logLevel = response.ok ? 'request' : (response.status >= 500 ? 'error' : 'warn')
