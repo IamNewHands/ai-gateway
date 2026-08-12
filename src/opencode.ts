@@ -20,6 +20,11 @@ const OPENCODE_RATE_LIMIT_RETRIES = 2
 const OPENCODE_RATE_LIMIT_RETRY_BASE_MS = 1200
 // 不同 key 之间 429 切换前的最小等待（避免并发触发同一限流窗口）
 const OPENCODE_RATE_LIMIT_KEY_GAP_MS = 800
+// 官方地址 429 短时熔断：所有 key 连续 429 后，在熔断期内跳过官方地址直接走镜像，
+// 避免每次请求都白等 N 个 key × 重试次 数的延迟。熔断期内仍会用第一个 key 探测 1 次
+// （不重试），成功则解除熔断。模块级内存状态，Worker isolate 回收后丢失，对 60s 足够。
+const OPENCODE_OFFICIAL_429_COOLDOWN_MS = 60000
+let official429Until = 0
 
 // 瞬时错误自动重试：上游偶发 502/503/504 或网络抖动时对同一 key 重试，
 // 消除"偶发 500，客户端重试一次又正常"的体验问题。
@@ -336,6 +341,40 @@ export async function proxyOpenCodeRequest(options: OpenCodeRequestOptions): Pro
     log('info', `${tag} 启用的 key 数量=${enabledKeys.length}，优先走官方地址（带 key）`)
   }
 
+  // 官方地址 429 短时熔断：熔断期内用第一个 key 探测 1 次（不重试），
+  // 成功则解除熔断；仍 429 则保持熔断直接走镜像，避免每次请求都白等 key 重试。
+  const now = Date.now()
+  let skipOfficial = false
+  if (enabledKeys.length > 0 && now < official429Until) {
+    const remainSec = Math.ceil((official429Until - now) / 1000)
+    const probeKey = enabledKeys[0]
+    const probeMask = maskApiKey(probeKey.key)
+    log('warn', `${tag} 官方地址 429 熔断中（剩余 ${remainSec}s），用 key#1 ${probeMask} 探测 1 次`)
+    try {
+      const probe = await requestUpstream(fetcher, officialUrl, probeKey.key, options, requestId, sessionId)
+      if (probe.ok) {
+        official429Until = 0
+        log('info', `${tag} key#1 ${probeMask} 探测 → 200 成功，解除熔断`)
+        return probe
+      }
+      officialFailure = await storeFailure(probe)
+      if (probe.status === 429) {
+        log('warn', `${tag} key#1 ${probeMask} 探测仍 429，保持熔断，走镜像`)
+      } else {
+        // 非 429：解除熔断（官方地址可能恢复，或有其他确定性错误）
+        official429Until = 0
+        log('warn', `${tag} key#1 ${probeMask} 探测 → ${probe.status}，解除熔断，走镜像`)
+      }
+      skipOfficial = true
+    } catch (error) {
+      lastTransportError = error
+      log('warn', `${tag} key#1 ${probeMask} 探测网络异常，保持熔断，走镜像`)
+      skipOfficial = true
+    }
+  }
+
+  let keysExhaustedBy429 = 0
+  if (!skipOfficial) {
   for (let ki = 0; ki < enabledKeys.length; ki++) {
     const entry = enabledKeys[ki]
     const keyMask = maskApiKey(entry.key)
@@ -395,6 +434,7 @@ export async function proxyOpenCodeRequest(options: OpenCodeRequestOptions): Pro
         }
         // 重试后仍 429：等待后再尝试下一个 key（或镜像）
         if (lastStatus === 429) {
+          keysExhaustedBy429++
           log('warn', `${tag} key#${ki + 1} ${keyMask} 重试后仍 429，切换下一个 key`)
           await sleep(OPENCODE_RATE_LIMIT_KEY_GAP_MS)
           continue
@@ -449,6 +489,7 @@ export async function proxyOpenCodeRequest(options: OpenCodeRequestOptions): Pro
           // 重试返回确定性错误，按原逻辑处理
           officialFailure = await storeFailure(retry)
           if (retry.status === 429) {
+            keysExhaustedBy429++
             log('warn', `${tag} key#${ki + 1} ${keyMask} 网络重试后 → 429，切换下一个 key`)
             await sleep(OPENCODE_RATE_LIMIT_KEY_GAP_MS)
             netRecovered = true
@@ -476,6 +517,13 @@ export async function proxyOpenCodeRequest(options: OpenCodeRequestOptions): Pro
       break
     }
   }
+
+  // 所有 key 都因 429 失败 → 触发官方地址熔断，避免后续请求白等 key 重试
+  if (enabledKeys.length > 0 && keysExhaustedBy429 === enabledKeys.length) {
+    official429Until = Date.now() + OPENCODE_OFFICIAL_429_COOLDOWN_MS
+    log('warn', `${tag} 所有 ${enabledKeys.length} 个 key 均因 429 失败，触发官方地址熔断 ${OPENCODE_OFFICIAL_429_COOLDOWN_MS / 1000}s`)
+  }
+  } // end if (!skipOfficial)
 
   // 所有 key 都失败，回退到镜像 public 模式
   const mirrors = getMirrorOrder(options.mirrorUrls, random)
