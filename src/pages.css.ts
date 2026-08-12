@@ -38,15 +38,15 @@ export const CSS_CONTENT = `
   --font-mono: 'JetBrains Mono', 'SFMono-Regular', Consolas, monospace;
 
   --space-3xs: .25rem;
-  --space-2xs: .5rem;
-  --space-xs: .75rem;
-  --space-sm: 1rem;
-  --space-md: 1.25rem;
-  --space-lg: 1.5rem;
-  --space-xl: 2rem;
-  --space-2xl: 2.5rem;
-  --space-3xl: 3rem;
-  --space-4xl: 4rem;
+  --space-2xs: .375rem;
+  --space-xs: .5rem;
+  --space-sm: .75rem;
+  --space-md: 1rem;
+  --space-lg: 1.25rem;
+  --space-xl: 1.75rem;
+  --space-2xl: 2.25rem;
+  --space-3xl: 2.75rem;
+  --space-4xl: 3.5rem;
 
   --text-xs: .75rem;
   --text-sm: .875rem;
