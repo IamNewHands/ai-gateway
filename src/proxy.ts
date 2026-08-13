@@ -16,6 +16,7 @@ import { isQoderProvider, proxyQoderChatRequest } from './qoder/proxy'
 import { isClineProvider, proxyClineChatRequest } from './cline/proxy'
 import { isVisionBridgeProvider, buildVisionBridgeRequestBody } from './vision/bridge'
 import { isGeminiProvider, proxyGeminiChatRequest } from './gemini/proxy'
+import { isCnbProvider, proxyCnbChatRequest } from './cnb/proxy'
 import { writeLog } from './admin'
 import { getOauthAccessToken, readOauthToken, refreshOauthToken, detectTokenRealm, buildOauthHeaders } from './oauth'
 import {
@@ -862,6 +863,22 @@ export async function forwardProxy(
       return response
     }
 
+    // CNB（cnb.cool）：免费获取 deepseek-v4，CSRF 凭证免登录免 Key。
+    // 上游强制流式，网关把 OpenAI 请求体转成上游可接受的 user/assistant 序列，
+    // 并把上游 SSE 转回 OpenAI 格式；开启 toolBridge 时走 XYML 工具桥（见 src/cnb/proxy.ts）。
+    if (isCnbProvider(provider)) {
+      const response = await proxyCnbChatRequest(c.env, provider, forwardBody as Record<string, unknown>)
+      const logLevel = response.ok ? 'request' : (response.status >= 500 ? 'error' : 'warn')
+      try {
+        const bodySummary = summarizeRequestBody(forwardBody)
+        c.executionCtx.waitUntil(writeLog(c.env, logLevel,
+          `[${provider.name}] ${model} → ${response.status}`,
+          JSON.stringify({ providerId, subPath, body: bodySummary, toolBridge: provider.toolBridge === true }).substring(0, 4000)
+        ))
+      } catch { /* log failure must not break */ }
+      return response
+    }
+
     // OAuth 设备码提供商：使用 KV 中保存的 access_token 转发，401 时尝试刷新后重试
     if (provider.authType === 'oauth-device' && provider.oauth) {
       return await proxyOAuthRequest(c, provider, subPath, url.search, forwardBody, method)
@@ -1396,6 +1413,11 @@ export async function handleAnthropicMessages(c: Context<AppEnv>) {
     // Gemini：OAuth 授权码转发（OpenAI 格式），再转回 Anthropic SSE。
     if (isGeminiProvider(provider)) {
       return await handleAnthropicGemini(c, provider, model, openaiBody, originalStream)
+    }
+
+    // CNB：CSRF 凭证转发（OpenAI 格式），再转回 Anthropic SSE。
+    if (isCnbProvider(provider)) {
+      return await handleAnthropicCnb(c, provider, model, openaiBody, originalStream)
     }
 
     // Vision Bridge：图片转写后转发给主文本模型（OpenAI 格式），再转回 Anthropic 格式。
@@ -2059,24 +2081,39 @@ async function handleAnthropicCline(
   openaiBody: Record<string, unknown>,
   originalStream: boolean
 ): Promise<Response> {
-  // Cline 上游支持流式，非流式时也先强制流式再由客户端格式决定转换
+  return handleAnthropicSpecial(c, provider, model, openaiBody, originalStream, proxyClineChatRequest, 'Cline')
+}
+
+/** 特殊提供商（Cline/Gemini/CNB）的 Anthropic 格式转发共用实现。 */
+type SpecialChatProxy = (env: Env, provider: import('./types').Provider, body: Record<string, unknown>) => Promise<Response>
+
+async function handleAnthropicSpecial(
+  c: Context<AppEnv>,
+  provider: import('./types').Provider,
+  model: string,
+  openaiBody: Record<string, unknown>,
+  originalStream: boolean,
+  proxyFn: SpecialChatProxy,
+  label: string
+): Promise<Response> {
+  // 上游支持流式，非流式时也先强制流式再由客户端格式决定转换
   const upstreamBody: Record<string, unknown> = { ...openaiBody, stream: true }
   // 清理上游不支持的字段 + 被屏蔽的 Claude Code 模板短语
   sanitizeUpstreamBody(upstreamBody)
   sanitizeBlockedTemplates(upstreamBody)
-  // max_completion_tokens → max_tokens（Cline 上游只认 max_tokens）
+  // max_completion_tokens → max_tokens（部分上游只认 max_tokens）
   if (upstreamBody['max_completion_tokens'] !== undefined && upstreamBody['max_tokens'] === undefined) {
     upstreamBody['max_tokens'] = upstreamBody['max_completion_tokens']
     delete upstreamBody['max_completion_tokens']
   }
 
-  const response = await proxyClineChatRequest(c.env, provider, upstreamBody, { stream: true })
+  const response = await proxyFn(c.env, provider, upstreamBody)
 
   if (!response.ok) {
     const errText = await response.text().catch(() => '')
     try {
       const bodySummary = summarizeRequestBody(upstreamBody)
-      c.executionCtx.waitUntil(writeLog(c.env, 'error', `[anthropic] ${model} → ${response.status} Cline`, JSON.stringify({ error: errText, body: bodySummary }).substring(0, 4000)))
+      c.executionCtx.waitUntil(writeLog(c.env, 'error', `[anthropic] ${model} → ${response.status} ${label}`, JSON.stringify({ error: errText, body: bodySummary }).substring(0, 4000)))
     } catch { /* log failure must not break request */ }
     return c.json({
       type: 'error',
@@ -2084,7 +2121,7 @@ async function handleAnthropicCline(
     }, response.status as Parameters<typeof c.json>[1])
   }
 
-  try { c.executionCtx.waitUntil(writeLog(c.env, 'request', `[anthropic] ${model} → 200 Cline`, `stream=${originalStream}`)) } catch {}
+  try { c.executionCtx.waitUntil(writeLog(c.env, 'request', `[anthropic] ${model} → 200 ${label}`, `stream=${originalStream}`)) } catch {}
 
   if (!response.body) {
     return c.json({ type: 'error', error: { type: 'upstream_error', message: 'Upstream returned empty body' } }, 502)
@@ -2145,7 +2182,7 @@ async function handleAnthropicCline(
           } catch { /* enqueue failed */ }
           try {
             c.executionCtx.waitUntil(writeLog(c.env, 'warn',
-              `[anthropic] 流结束兜底触发 ${model} (cline)`,
+              `[anthropic] 流结束兜底触发 ${model} (${label.toLowerCase()})`,
               JSON.stringify({ providerId: provider.id, model, ...finalizeDiag })
             ))
           } catch { /* log failure must not break */ }
@@ -2206,140 +2243,21 @@ async function handleAnthropicGemini(
   openaiBody: Record<string, unknown>,
   originalStream: boolean
 ): Promise<Response> {
-  // Gemini 上游支持流式；统一强制流式，由客户端格式决定最终转换
-  const upstreamBody: Record<string, unknown> = { ...openaiBody, stream: true }
-  // 清理上游不支持的字段 + 被屏蔽的 Claude Code 模板短语
-  sanitizeUpstreamBody(upstreamBody)
-  sanitizeBlockedTemplates(upstreamBody)
-  // max_completion_tokens → max_tokens（部分上游只认 max_tokens）
-  if (upstreamBody['max_completion_tokens'] !== undefined && upstreamBody['max_tokens'] === undefined) {
-    upstreamBody['max_tokens'] = upstreamBody['max_completion_tokens']
-    delete upstreamBody['max_completion_tokens']
-  }
+  return handleAnthropicSpecial(c, provider, model, openaiBody, originalStream, proxyGeminiChatRequest, 'Gemini')
+}
 
-  const response = await proxyGeminiChatRequest(c.env, provider, upstreamBody, { stream: true })
-
-  if (!response.ok) {
-    const errText = await response.text().catch(() => '')
-    try {
-      const bodySummary = summarizeRequestBody(upstreamBody)
-      c.executionCtx.waitUntil(writeLog(c.env, 'error', `[anthropic] ${model} → ${response.status} Gemini`, JSON.stringify({ error: errText, body: bodySummary }).substring(0, 4000)))
-    } catch { /* log failure must not break request */ }
-    return c.json({
-      type: 'error',
-      error: { type: 'upstream_error', message: `Upstream error: ${sanitizeUpstreamError(errText)}` },
-    }, response.status as Parameters<typeof c.json>[1])
-  }
-
-  try { c.executionCtx.waitUntil(writeLog(c.env, 'request', `[anthropic] ${model} → 200 Gemini`, `stream=${originalStream}`)) } catch {}
-
-  if (!response.body) {
-    return c.json({ type: 'error', error: { type: 'upstream_error', message: 'Upstream returned empty body' } }, 502)
-  }
-
-  // 流式：OpenAI SSE → Anthropic SSE 实时转换
-  if (originalStream) {
-    const acc = createAnthropicSSEAccumulator()
-    const readable = new ReadableStream({
-      async start(controller) {
-        const decoder = new TextDecoderStream()
-        const textReader = response.body!.pipeThrough(decoder).getReader()
-        let lineBuffer = ''
-
-        try {
-          while (true) {
-            const { done, value } = await textReader.read()
-            if (done) break
-            const combined = lineBuffer + value
-            const lines = combined.split('\n')
-            lineBuffer = lines.pop() || ''
-
-            for (const line of lines) {
-              const trimmed = line.trim()
-              if (!trimmed.startsWith('data:')) continue
-              const data = trimmed.slice(5).trim()
-              if (!data || data === '[DONE]') continue
-              try {
-                const chunk = JSON.parse(data)
-                cleanChunkDelta(chunk)
-                const anthropicSSE = openAIChunkToAnthropicSSE(chunk, acc)
-                if (anthropicSSE) {
-                  controller.enqueue(new TextEncoder().encode(anthropicSSE))
-                }
-              } catch { /* skip malformed */ }
-            }
-          }
-          if (lineBuffer.trim().startsWith('data:')) {
-            const data = lineBuffer.trim().slice(5).trim()
-            if (data && data !== '[DONE]') {
-              try {
-                const chunk = JSON.parse(data)
-                cleanChunkDelta(chunk)
-                const anthropicSSE = openAIChunkToAnthropicSSE(chunk, acc)
-                if (anthropicSSE) {
-                  controller.enqueue(new TextEncoder().encode(anthropicSSE))
-                }
-              } catch { /* skip */ }
-            }
-          }
-        } catch { /* stream error */ }
-        // 流结束兜底：补发缺失的 content_block_stop / message_stop 事件
-        const finalizeDiag = diagnoseAnthropicAccumulator(acc)
-        const finalized = finalizeAnthropicStream(acc)
-        if (finalized) {
-          try {
-            controller.enqueue(new TextEncoder().encode(finalized))
-          } catch { /* enqueue failed */ }
-          try {
-            c.executionCtx.waitUntil(writeLog(c.env, 'warn',
-              `[anthropic] 流结束兜底触发 ${model} (gemini)`,
-              JSON.stringify({ providerId: provider.id, model, ...finalizeDiag })
-            ))
-          } catch { /* log failure must not break */ }
-        }
-        controller.close()
-      },
-    })
-
-    return new Response(readable, {
-      status: 200,
-      headers: {
-        'Content-Type': 'text/event-stream',
-        'Cache-Control': 'no-store',
-        'X-Accel-Buffering': 'no',
-      },
-    })
-  }
-
-  // 非流式：收集所有 OpenAI SSE → 聚合 → Anthropic
-  const allChunks: any[] = []
-  const decoder2 = new TextDecoderStream()
-  const textReader2 = response.body.pipeThrough(decoder2).getReader()
-  let lineBuffer2 = ''
-
-  try {
-    while (true) {
-      const { done, value } = await textReader2.read()
-      if (done) break
-      const combined = lineBuffer2 + value
-      const lines = combined.split('\n')
-      lineBuffer2 = lines.pop() || ''
-      for (const line of lines) {
-        const trimmed = line.trim()
-        if (!trimmed.startsWith('data:')) continue
-        const data = trimmed.slice(5).trim()
-        if (!data || data === '[DONE]') continue
-        try {
-          const chunk = JSON.parse(data)
-          cleanChunkDelta(chunk)
-          allChunks.push(chunk)
-        } catch { /* skip */ }
-      }
-    }
-  } catch { /* stream error */ }
-
-  const anthropicResp = aggregateOpenAIToAnthropic(allChunks)
-  return c.json(anthropicResp)
+/**
+ * CNB Anthropic 格式转发：OpenAI 请求体 → CNB 上游转发（proxyCnbChatRequest 已把
+ * CNB SSE 解包成 OpenAI SSE）→ 再转回 Anthropic SSE。
+ */
+async function handleAnthropicCnb(
+  c: Context<AppEnv>,
+  provider: import('./types').Provider,
+  model: string,
+  openaiBody: Record<string, unknown>,
+  originalStream: boolean
+): Promise<Response> {
+  return handleAnthropicSpecial(c, provider, model, openaiBody, originalStream, proxyCnbChatRequest, 'CNB')
 }
 
 // ============================================================
@@ -2412,6 +2330,11 @@ export async function handleResponses(c: Context<AppEnv>) {
     // Gemini：OAuth 授权码转发（OpenAI 格式），再转回 Responses 格式。
     if (isGeminiProvider(provider)) {
       return await handleResponsesGemini(c, provider, model, openaiBody, originalStream)
+    }
+
+    // CNB：CSRF 凭证转发（OpenAI 格式），再转回 Responses 格式。
+    if (isCnbProvider(provider)) {
+      return await handleResponsesCnb(c, provider, model, openaiBody, originalStream)
     }
 
     // OAuth 提供商
@@ -2886,25 +2809,38 @@ async function handleResponsesGemini(
   openaiBody: Record<string, unknown>,
   originalStream: boolean
 ): Promise<Response> {
-  // Gemini 上游支持流式；统一强制流式，由客户端格式决定最终转换
+  return handleResponsesSpecial(c, provider, model, openaiBody, originalStream, proxyGeminiChatRequest, 'Gemini')
+}
+
+/** 特殊提供商（Gemini/CNB 等）的 Responses 格式转发共用实现。 */
+async function handleResponsesSpecial(
+  c: Context<AppEnv>,
+  provider: import('./types').Provider,
+  model: string,
+  openaiBody: Record<string, unknown>,
+  originalStream: boolean,
+  proxyFn: SpecialChatProxy,
+  label: string
+): Promise<Response> {
+  // 上游支持流式；统一强制流式，由客户端格式决定最终转换
   const upstreamBody: Record<string, unknown> = { ...openaiBody, stream: true }
   sanitizeUpstreamBody(upstreamBody)
   sanitizeBlockedTemplates(upstreamBody)
 
-  const response = await proxyGeminiChatRequest(c.env, provider, upstreamBody, { stream: true })
+  const response = await proxyFn(c.env, provider, upstreamBody)
 
   if (!response.ok) {
     const errText = await response.text().catch(() => '')
     try {
       const bodySummary = summarizeRequestBody(upstreamBody)
-      c.executionCtx.waitUntil(writeLog(c.env, 'error', `[responses] ${model} → ${response.status} Gemini`, JSON.stringify({ error: errText, body: bodySummary }).substring(0, 4000)))
+      c.executionCtx.waitUntil(writeLog(c.env, 'error', `[responses] ${model} → ${response.status} ${label}`, JSON.stringify({ error: errText, body: bodySummary }).substring(0, 4000)))
     } catch { /* log failure must not break request */ }
     return c.json({
       error: { message: `Upstream error: ${sanitizeUpstreamError(errText)}`, type: 'upstream_error' },
     }, response.status as Parameters<typeof c.json>[1])
   }
 
-  try { c.executionCtx.waitUntil(writeLog(c.env, 'request', `[responses] ${model} → 200 Gemini`, `stream=${originalStream}`)) } catch {}
+  try { c.executionCtx.waitUntil(writeLog(c.env, 'request', `[responses] ${model} → 200 ${label}`, `stream=${originalStream}`)) } catch {}
 
   if (!response.body) {
     return c.json({ error: { message: 'Upstream returned empty body', type: 'upstream_error' } }, 502)
@@ -3018,6 +2954,20 @@ async function handleResponsesGemini(
 
   const openaiResp = aggregateOpenAIToResponses(allChunks)
   return c.json(openaiResp)
+}
+
+/**
+ * CNB Responses 格式转发：OpenAI 请求体 → CNB 上游转发（proxyCnbChatRequest 已把
+ * CNB SSE 解包成 OpenAI SSE）→ 再转回 Responses SSE。
+ */
+async function handleResponsesCnb(
+  c: Context<AppEnv>,
+  provider: import('./types').Provider,
+  model: string,
+  openaiBody: Record<string, unknown>,
+  originalStream: boolean
+): Promise<Response> {
+  return handleResponsesSpecial(c, provider, model, openaiBody, originalStream, proxyCnbChatRequest, 'CNB')
 }
 
 /**

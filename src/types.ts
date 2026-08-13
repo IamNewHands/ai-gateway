@@ -20,6 +20,12 @@ export interface Provider {
   apiKeys: ApiKeyEntry[]
   models: Model[]
   enabled: boolean
+  /**
+   * 工具桥开关（当前用于 CNB 提供商）。上游禁原生 tools（403 Agent calls not allowed），
+   * 开启后网关把客户端 tools 转成 XYML 提示词注入（见 src/cnb/xyml.ts），
+   * 并将模型输出的 XYML 文本流式解析回标准 tool_calls 返回客户端。
+   */
+  toolBridge?: boolean
   createdAt: string
   updatedAt: string
   /**
@@ -198,6 +204,7 @@ export interface CreateProviderRequest {
   enabled?: boolean
   type?: 'vision-bridge'
   visionBridge?: VisionBridgeConfig
+  toolBridge?: boolean
 }
 
 export interface UpdateProviderRequest {
@@ -212,6 +219,8 @@ export interface UpdateProviderRequest {
   /** 传 null 可清除已设置的 type（如从独立桥恢复为普通提供商） */
   type?: 'vision-bridge' | null
   visionBridge?: VisionBridgeConfig | null
+  /** 传 null 可清除工具桥开关 */
+  toolBridge?: boolean | null
 }
 
 /**
@@ -231,6 +240,7 @@ export interface UpsertProviderRequest {
   apiKeys?: Array<ApiKeyEntry | string>
   models?: Array<Model | string>
   enabled?: boolean
+  toolBridge?: boolean
 }
 
 /**

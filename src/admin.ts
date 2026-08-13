@@ -15,6 +15,7 @@ import { fetchOpenCodeModels, isOpenCodeProvider, resolveOpenCodeUrls, testOpenC
 import { isQoderProvider, fetchQoderModels } from './qoder/proxy'
 import { isClineProvider, fetchClineModels, testClineChat, testClineRefreshToken, startClineOAuth, pollClineOAuth } from './cline/proxy'
 import { isGeminiProvider, testGeminiModel, GEMINI_MODELS } from './gemini/proxy'
+import { isCnbProvider, testCnbConnection, proxyCnbChatRequest } from './cnb/proxy'
 import { PROXY_KEY_PREFIX, EXPIRY_OPTIONS, OPENCODE_DEFAULT_URL } from './config'
 import { startOauthDeviceFlow, pollOauthDeviceFlow, readOauthToken, deleteOauthToken, getOauthAccessToken, buildOauthHeaders, detectTokenRealm, submitOauthGeminiCallback } from './oauth'
 import type {
@@ -191,6 +192,7 @@ export async function handleCreateProvider(c: Context<AppEnv>) {
     oauth: body.oauth,
     type: body.type,
     visionBridge: body.visionBridge,
+    toolBridge: body.toolBridge,
     apiKeys: normalizeArray(body.apiKeys, (k) => ({ key: k, enabled: true })),
     models: body.models
       ? normalizeArray(body.models, (m) => ({ id: m, enabled: true }))
@@ -226,6 +228,7 @@ export async function handleUpdateProvider(c: Context<AppEnv>) {
   }
   if (body.type !== undefined) updates.type = body.type ?? undefined
   if (body.visionBridge !== undefined) updates.visionBridge = body.visionBridge ?? undefined
+  if (body.toolBridge !== undefined) updates.toolBridge = body.toolBridge ?? undefined
 if (body.apiKeys !== undefined) {
     updates.apiKeys = normalizeArray(body.apiKeys, (k) => ({ key: k, enabled: true }))
   }
@@ -457,7 +460,13 @@ export async function handleTestKeyNew(c: Context<AppEnv>) {
     apiType?: string
     providerId?: string
   }>()
-  if (!url || (!apiKey && !(providerId && isOpenCodeProvider(providerId)))) {
+  // CNB 免 Key：允许无 apiKey，由 providerId 判定
+  let cnbProvider: Provider | null = null
+  if (providerId) {
+    const p = await getProvider(c.env, providerId)
+    if (p && isCnbProvider(p)) cnbProvider = p
+  }
+  if (!url || (!apiKey && !(providerId && (isOpenCodeProvider(providerId) || cnbProvider)))) {
     return c.json<ApiResponse>({ success: false, message: 'url 和 apiKey 为必填项' }, 400)
   }
   if (!isSafeHttpUrl(url)) {
@@ -497,6 +506,20 @@ export async function handleTestKeyNew(c: Context<AppEnv>) {
         statusCode: result.statusCode || 0,
         message: result.message,
         data: result.success ? fetchClineModels().models : null,
+      },
+    })
+  }
+
+  // CNB：CSRF 凭证连通性测试（免 Key）
+  if (cnbProvider) {
+    const result = await testCnbConnection(c.env, cnbProvider)
+    return c.json<ApiResponse>({
+      success: true,
+      data: {
+        success: result.success,
+        statusCode: result.statusCode || 0,
+        message: result.message,
+        data: result.data,
       },
     })
   }
@@ -545,7 +568,7 @@ export async function handleTestModelNew(c: Context<AppEnv>) {
     model: string
     providerId?: string
   }>()
-  if (!url || !model || (!apiKey && !isOpenCodeProvider(providerId || ''))) {
+  if (!url || !model || (!apiKey && !(isOpenCodeProvider(providerId || '') || (providerId && isCnbProvider({ id: providerId } as Provider))))) {
     return c.json<ApiResponse>({ success: false, message: 'url、apiKey、model 为必填项' }, 400)
   }
   if (!isSafeHttpUrl(url)) {
@@ -569,6 +592,27 @@ export async function handleTestModelNew(c: Context<AppEnv>) {
       success: true,
       data: { success: result.success, statusCode: result.statusCode || 0, message: result.message },
     })
+  }
+
+  // CNB：CSRF 凭证 + 最小 chat 请求测试模型可用性
+  if (providerId) {
+    const provider = await getProvider(c.env, providerId)
+    if (provider && isCnbProvider(provider)) {
+      const resp = await proxyCnbChatRequest(c.env, provider, {
+        model,
+        messages: [{ role: 'user', content: 'hi' }],
+        stream: false,
+      })
+      if (resp.ok) {
+        return c.json<ApiResponse>({ success: true, data: { success: true, statusCode: 200, message: '连接成功' } })
+      }
+      let detail = ''
+      try { detail = (await resp.text()).substring(0, 300) } catch { /* ignore */ }
+      return c.json<ApiResponse>({
+        success: true,
+        data: { success: false, statusCode: resp.status, message: `HTTP ${resp.status}: ${detail}` },
+      })
+    }
   }
 
   const cleanBase = url.replace(/\/$/, '')

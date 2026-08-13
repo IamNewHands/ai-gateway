@@ -37,7 +37,7 @@ const escapePageJsx = (value: unknown) => escapePageHtml(escapePageJs(value))
 // UX8：厂商预设与 OAuth 预置模板——单一数据源。
 // SSR 下拉 option 与客户端 applyProviderPreset / applyOauthPreset* 共用，
 // 注入为页面 script 常量，消除服务端/客户端两套重复预设表。
-const PROVIDER_PRESETS: Record<string, { name: string; id: string; baseUrl: string; apiType: string; authType?: string; oauthPreset?: string; models?: string[] }> = {
+const PROVIDER_PRESETS: Record<string, { name: string; id: string; baseUrl: string; apiType: string; authType?: string; oauthPreset?: string; models?: string[]; toolBridge?: boolean }> = {
   deepseek:     { name: 'DeepSeek',           id: 'deepseek',     baseUrl: 'https://api.deepseek.com',                          apiType: 'openai' },
   openai:       { name: 'OpenAI',             id: 'openai',       baseUrl: 'https://api.openai.com/v1',                         apiType: 'openai' },
   anthropic:    { name: 'Anthropic',          id: 'anthropic',    baseUrl: 'https://api.anthropic.com',                         apiType: 'anthropic' },
@@ -64,6 +64,9 @@ const PROVIDER_PRESETS: Record<string, { name: string; id: string; baseUrl: stri
   },
   cline:        { name: 'Cline (白嫖模型)',    id: 'cline',        baseUrl: 'https://api.cline.bot/api/v1',                      apiType: 'openai',
     models: ['poolside/laguna-s-2.1:free', 'deepseek/deepseek-v4-flash', 'cline-free/glm-5.2', 'cline-pass/glm-5.2', 'cline-pass/deepseek-v4-flash', 'cline-pass/qwen3.7-max'],
+  },
+  cnb:          { name: 'CNB (免费 deepseek-v4)', id: 'cnb',       baseUrl: 'https://cnb.cool',                                   apiType: 'openai', toolBridge: true,
+    models: ['deepseek-v4-flash', 'deepseek-v4-pro'],
   },
   visionbridge: { name: 'Vision Bridge (图片转写桥)', id: 'visionbridge', baseUrl: 'https://example.com/v1', apiType: 'openai' },
 }
@@ -552,6 +555,7 @@ ${H('管理')}
                 <div class="fg"><label>视觉转写失败策略</label><select id="avb-fail" class="select-sm"><option value="error">error（返回错误）</option><option value="text_only">text_only（丢弃图片仅转发文本）</option></select></div>
               </fieldset>
             </div>
+            <fieldset class="form-group" id="atb-fs"><legend>工具桥</legend><label class="switch-label"><span>启用工具桥（XYML 提示词注入 + 流式解析回 tool_calls，仅 CNB 需要）</span><span class="tg"><input type="checkbox" id="atb"><span class="sl"></span></span></label></fieldset>
             <div class="panel-actions"><label class="switch-label"><span>创建后立即启用</span><span class="tg"><input type="checkbox" checked id="aen"><span class="sl"></span></span></label><div><button class="btn btn-s" onclick="hideAdd()">取消</button><button class="btn btn-p" onclick="createProv()"><i class="fas fa-check" aria-hidden="true"></i>创建提供商</button></div></div>
             <div id="atestR" class="mt-1" aria-live="polite"></div>
           </div>
@@ -603,6 +607,7 @@ ${H('管理')}
                   <div class="fg"><label>视觉转写失败策略</label><select id="vb-fail-${escapePageHtml(p.id)}" class="select-sm"><option value="error" ${!p.visionBridge||p.visionBridge.onVisionFailure==='error'?'selected':''}>error（返回错误）</option><option value="text_only" ${p.visionBridge&&p.visionBridge.onVisionFailure==='text_only'?'selected':''}>text_only（丢弃图片仅转发文本）</option></select></div>
                 </fieldset>
               </div>
+              <fieldset class="form-group" id="atb-fs-${escapePageHtml(p.id)}"><legend>工具桥</legend><label class="switch-label"><span>启用工具桥（XYML 提示词注入 + 流式解析回 tool_calls，仅 CNB 需要）</span><span class="tg"><input type="checkbox" id="atb-${escapePageHtml(p.id)}" ${p.toolBridge?'checked':''}><span class="sl"></span></span></label></fieldset>
               <div class="detail-actions"><div id="tr-${escapePageHtml(p.id)}" aria-live="polite"></div><div>${(p.id === 'opencode' || p.id === 'cline') ? '<button class="btn btn-s" onclick="fetchEditModels(\'' + escapePageJsx(p.id) + '\')"><i class="fas fa-download" aria-hidden="true"></i>获取模型</button>' : ''}${p.id === 'cline' ? '<button class="btn btn-s" onclick="clineOAuthConnect(\'' + escapePageJsx(p.id) + '\')"><i class="fas fa-sign-in-alt" aria-hidden="true"></i>一键授权获取 Token</button>' : ''}<button class="btn btn-d" onclick="del('${escapePageJsx(p.id)}')"><i class="fas fa-trash" aria-hidden="true"></i>删除</button><button class="btn btn-p" onclick="save('${escapePageJsx(p.id)}')"><i class="fas fa-save" aria-hidden="true"></i>保存更改</button></div></div>
             </div>
           </article>`).join('') : `<div class="empty-state"><i class="fas fa-server" aria-hidden="true"></i><h3>还没有提供商</h3><p>添加第一个上游提供商，配置 API 地址、Key 和模型。</p><button class="btn btn-p" onclick="showAdd()">添加提供商</button></div>`}
@@ -972,7 +977,7 @@ async function createProv(opts) {
     const r = await fetch('/admin/api/providers', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ id, name: nm, baseUrl: url, apiType, authType, oauth: authType === 'oauth-device' ? oauth : undefined, apiKeys: keys, models, enabled, type: vb && vb.primary ? 'vision-bridge' : undefined, visionBridge: vb })
+      body: JSON.stringify({ id, name: nm, baseUrl: url, apiType, authType, oauth: authType === 'oauth-device' ? oauth : undefined, apiKeys: keys, models, enabled, toolBridge: (document.getElementById('atb')||{}).checked === true, type: vb && vb.primary ? 'vision-bridge' : undefined, visionBridge: vb })
     })
     const d = await r.json()
     if (d.success) {
@@ -1130,6 +1135,8 @@ function applyProviderPreset(name) {
   } else {
     applyClineKeyHint(false)
   }
+  const tb = document.getElementById('atb')
+  if (tb) tb.checked = !!p.toolBridge
 }
 function applyVisionBridgePreset() {
   applyClineKeyHint(false)
@@ -1581,7 +1588,7 @@ async function save(id) {
     const r = await fetch('/admin/api/providers/' + encodeURIComponent(id), {
       method: 'PUT',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ name: nm, baseUrl: url, apiType, authType, oauth: authType === 'oauth-device' ? oauth : undefined, apiKeys: keys, models, enabled, type: vb && vb.primary ? 'vision-bridge' : null, visionBridge: vb })
+      body: JSON.stringify({ name: nm, baseUrl: url, apiType, authType, oauth: authType === 'oauth-device' ? oauth : undefined, apiKeys: keys, models, enabled, toolBridge: (document.getElementById('atb-' + id)||{}).checked === true, type: vb && vb.primary ? 'vision-bridge' : null, visionBridge: vb })
     })
     const d = await r.json()
     if (d.success) { toast('已保存', 'success'); reloadAdmin() }
