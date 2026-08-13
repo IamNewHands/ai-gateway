@@ -497,11 +497,12 @@ const UPSTREAM_TOTAL_TIMEOUT_MS = 300000
 // Trae 等客户端直连网关时，上游偶发瞬时 5xx/网络抖动会直接透传失败，
 // 客户端在读取响应流时再叠加 TLS/网络抖动（如 SEC_E_MESSAGE_ALTERED）就报错。
 // 既然"重试一次又正常"，网关侧对瞬时错误自动重试 1 次即可消除大部分此类问题。
+// 注意：500 也纳入——上游过载/限流网关常见偶发 500，重试与 502/503/504 一视同仁。
 const TRANSIENT_RETRY_MAX = 1
 const TRANSIENT_RETRY_DELAY_MS = 400
 /** 瞬时性上游状态码：可安全对同一请求重试（区别于 4xx 的确定性错误） */
 function isTransientStatus(status: number): boolean {
-  return status === 502 || status === 503 || status === 504
+  return status === 500 || status === 502 || status === 503 || status === 504
 }
 
 /** P2：通用/OAuth/Anthropic/Responses 路径统一走「连接超时 + idle 兜底 + 心跳」 */

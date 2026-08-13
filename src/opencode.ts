@@ -26,12 +26,12 @@ const OPENCODE_RATE_LIMIT_KEY_GAP_MS = 800
 const OPENCODE_OFFICIAL_429_COOLDOWN_MS = 60000
 let official429Until = 0
 
-// 瞬时错误自动重试：上游偶发 502/503/504 或网络抖动时对同一 key 重试，
-// 消除"偶发 500，客户端重试一次又正常"的体验问题。
+// 瞬时错误自动重试：上游偶发 500（过载/限流网关常见）/502/503/504 或网络抖动时对同一 key 重试，
+// 消除"偶发 500，客户端报 ConnectionReset/Network IO error，重试一次又正常"的体验问题。
 const TRANSIENT_RETRY_MAX = 1
 const TRANSIENT_RETRY_DELAY_MS = 400
 function isTransientStatus(status: number): boolean {
-  return status === 502 || status === 503 || status === 504
+  return status === 500 || status === 502 || status === 503 || status === 504
 }
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms))
