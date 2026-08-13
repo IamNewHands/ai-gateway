@@ -598,18 +598,55 @@ async function buildNonStreamResponse(upstream: Response, opts: BridgeOptions): 
   })
 }
 
-/** 抓取一次 CSRF 凭证并做一次最小请求，验证 CNB 连通性。 */
+/** 获取 CSRF 凭证并发一个最小 chat 请求，验证 CNB 完整链路（凭证 + 模型连通性）。 */
 export async function testCnbConnection(
   env: Env,
   provider: Provider,
+  model?: string,
 ): Promise<{ success: boolean; statusCode?: number; message?: string; data?: unknown }> {
   try {
     const csrf = await getCsrf(env, provider.id)
+    const modelName = model
+      || (Array.isArray(provider.models) && provider.models[0]?.id)
+      || 'deepseek-v4-flash'
+    // 最小 chat 请求验证真实链路；stream:false 由网关聚合上游 SSE 后返回 JSON
+    const resp = await proxyCnbChatRequest(env, provider, {
+      model: modelName,
+      messages: [{ role: 'user', content: 'ping' }],
+      stream: false,
+      max_tokens: 16,
+    })
+    if (!resp.ok) {
+      let detail = ''
+      try { detail = (await resp.text()).substring(0, 300) } catch { /* ignore */ }
+      return {
+        success: false,
+        statusCode: resp.status,
+        message: `chat 请求失败 HTTP ${resp.status}${detail ? `：${detail}` : ''}`,
+      }
+    }
+    let content = ''
+    let finishReason = ''
+    let usage: unknown = null
+    try {
+      const data = await resp.json() as { choices?: Array<{ message?: { content?: string }; finish_reason?: string }>; usage?: unknown }
+      content = String(data?.choices?.[0]?.message?.content || '').trim()
+      finishReason = String(data?.choices?.[0]?.finish_reason || '')
+      usage = data?.usage ?? null
+    } catch { /* 解析失败不影响结论 */ }
     return {
       success: true,
       statusCode: 200,
-      message: `连接成功（CSRF 凭证已获取：key len=${csrf.key.length}, token len=${csrf.token.length}）`,
-      data: { cnb: true, csrfKeyLen: csrf.key.length, csrfTokenLen: csrf.token.length },
+      message: `连接成功（${modelName} 已响应）${content ? `，回复：${content.substring(0, 80)}` : ''}`,
+      data: {
+        cnb: true,
+        model: modelName,
+        csrfKeyLen: csrf.key.length,
+        csrfTokenLen: csrf.token.length,
+        reply: content.substring(0, 200),
+        finishReason,
+        usage,
+      },
     }
   } catch (err) {
     const msg = (err as Error).message || String(err)

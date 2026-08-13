@@ -15,7 +15,7 @@ import { fetchOpenCodeModels, isOpenCodeProvider, resolveOpenCodeUrls, testOpenC
 import { isQoderProvider, fetchQoderModels } from './qoder/proxy'
 import { isClineProvider, fetchClineModels, testClineChat, testClineRefreshToken, startClineOAuth, pollClineOAuth } from './cline/proxy'
 import { isGeminiProvider, testGeminiModel, GEMINI_MODELS } from './gemini/proxy'
-import { isCnbProvider, testCnbConnection, proxyCnbChatRequest } from './cnb/proxy'
+import { isCnbProvider, testCnbConnection } from './cnb/proxy'
 import { PROXY_KEY_PREFIX, EXPIRY_OPTIONS, OPENCODE_DEFAULT_URL } from './config'
 import { startOauthDeviceFlow, pollOauthDeviceFlow, readOauthToken, deleteOauthToken, getOauthAccessToken, buildOauthHeaders, detectTokenRealm, submitOauthGeminiCallback } from './oauth'
 import type {
@@ -594,23 +594,14 @@ export async function handleTestModelNew(c: Context<AppEnv>) {
     })
   }
 
-  // CNB：CSRF 凭证 + 最小 chat 请求测试模型可用性
+  // CNB：CSRF 凭证 + 最小 chat 请求测试模型可用性（完整链路）
   if (providerId) {
     const provider = await getProvider(c.env, providerId)
     if (provider && isCnbProvider(provider)) {
-      const resp = await proxyCnbChatRequest(c.env, provider, {
-        model,
-        messages: [{ role: 'user', content: 'hi' }],
-        stream: false,
-      })
-      if (resp.ok) {
-        return c.json<ApiResponse>({ success: true, data: { success: true, statusCode: 200, message: '连接成功' } })
-      }
-      let detail = ''
-      try { detail = (await resp.text()).substring(0, 300) } catch { /* ignore */ }
+      const result = await testCnbConnection(c.env, provider, model)
       return c.json<ApiResponse>({
         success: true,
-        data: { success: false, statusCode: resp.status, message: `HTTP ${resp.status}: ${detail}` },
+        data: { success: result.success, statusCode: result.statusCode || 0, message: result.message, data: result.data },
       })
     }
   }
