@@ -1206,9 +1206,12 @@ export class ToolSieve {
       return null
     }
     const calls = parseToolCalls(this.capture, this.tools, { config: this.config })
-    if (!calls.length) return null
     this.capture = ''
     this.capturing = false
-    return [{ type: 'tool_calls', calls }]
+    if (calls.length) return [{ type: 'tool_calls', calls }]
+    // 未能解析出工具调用：捕获区是从 <|XYML|... 标记开始的工具块。此时模型可能输出了
+    // 残缺/嵌套不一致的 XYML（典型：当前请求未带 tools，模型却仍按历史输出工具块）。
+    // 直接丢弃整块，绝不让原始 XYML 标记泄漏给客户端；也不尝试从中抠正文（残缺标记容易漏）。
+    return []
   }
 }

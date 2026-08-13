@@ -445,7 +445,9 @@ function buildStreamResponse(upstream: Response, opts: BridgeOptions): Response 
   let stdID = '', stdModel = CNB_MODELS[0], stdCreated = Math.floor(Date.now() / 1000), stdUsage: unknown = null
   let finished = false
   let emittedToolCalls = false
-  const sieve = opts.bridge && opts.tools.length ? new ToolSieve(opts.tools) : null
+  // bridge 模式下始终启用 ToolSieve：即使当前请求未携带 tools（多轮对话时客户端可能只在首轮传 tools，
+  // 但历史仍让模型按 XYML 输出），也要拦截并剥离原始 XYML 标记，避免泄漏给客户端。
+  const sieve = opts.bridge ? new ToolSieve(opts.tools) : null
   let toolIdx = 0
 
   const write = (s: string) => writer.write(encoder.encode(s))
@@ -545,7 +547,8 @@ async function buildNonStreamResponse(upstream: Response, opts: BridgeOptions): 
   let stdID = '', stdModel = '', stdCreated = Math.floor(Date.now() / 1000)
   let stdUsage: unknown = null
   let finish = 'stop'
-  const sieve = opts.bridge && opts.tools.length ? new ToolSieve(opts.tools) : null
+  // bridge 模式下始终启用 ToolSieve（理由同 buildStreamResponse：避免无 tools 请求时 XYML 泄漏）
+  const sieve = opts.bridge ? new ToolSieve(opts.tools) : null
   const toolCalls: Array<Record<string, unknown>> = []
 
   await readUpstreamSSE(upstream.body, (obj, isDone) => {
