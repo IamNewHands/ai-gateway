@@ -118,6 +118,16 @@ function setAnalyticsRange(range, button) {
 function getLogField(record, key) { return record[key] == null ? '' : record[key] }
 function logStatusClass(record) { return getLogField(record, 'blob8') === 'success' ? 'status-badge--on' : 'status-badge--off' }
 
+// Analytics Engine 返回的 timestamp 为 UTC 字符串（如 "2026-08-13 04:00:00"），
+// 直接 new Date 会被按本地时区解析导致显示偏差，这里强制按 UTC 解析后转为中国时区显示。
+function formatLogTime(value) {
+  const raw = String(value == null ? '' : value).trim()
+  if (!raw) return '—'
+  const normalized = /Z$|[+-]\d{2}:?\d{2}$/.test(raw) ? raw : raw.replace(' ', 'T') + 'Z'
+  const date = new Date(normalized)
+  return Number.isNaN(date.getTime()) ? raw : date.toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' })
+}
+
 function renderLogRecords(records) {
   analyticsLogRecords = Array.isArray(records) ? records : []
   const table = document.getElementById('usage-log-body')
@@ -129,11 +139,11 @@ function renderLogRecords(records) {
   empty.classList.add('hd')
   table.innerHTML = analyticsLogRecords.map(function(record, index) {
     const success = getLogField(record, 'blob8') === 'success'
-    return '<tr><td><time>' + escapeHtml(new Date(String(record.timestamp)).toLocaleString('zh-CN')) + '</time></td><td><span class="status-badge ' + logStatusClass(record) + '"><i></i>' + (success ? '成功' : '失败') + '</span></td><td><code title="' + escapeHtml(getLogField(record, 'blob6')) + '">' + escapeHtml(getLogField(record, 'blob6') || '—') + '</code></td><td>' + escapeHtml(getLogField(record, 'blob4') || getLogField(record, 'blob3') || '—') + '</td><td class="numeric">' + formatMetric(record.double1) + ' / ' + formatMetric(record.double2) + '</td><td class="numeric">' + formatLatency(record.double5) + '</td><td class="numeric">' + escapeHtml(record.double7 || '—') + '</td><td><button class="btn btn-gh btn-xs" type="button" onclick="showUsageLogDetail(' + index + ')">查看</button></td></tr>'
+    return '<tr><td><time>' + escapeHtml(formatLogTime(record.timestamp)) + '</time></td><td><span class="status-badge ' + logStatusClass(record) + '"><i></i>' + (success ? '成功' : '失败') + '</span></td><td><code title="' + escapeHtml(getLogField(record, 'blob6')) + '">' + escapeHtml(getLogField(record, 'blob6') || '—') + '</code></td><td>' + escapeHtml(getLogField(record, 'blob4') || getLogField(record, 'blob3') || '—') + '</td><td class="numeric">' + formatMetric(record.double1) + ' / ' + formatMetric(record.double2) + '</td><td class="numeric">' + formatLatency(record.double5) + '</td><td class="numeric">' + escapeHtml(record.double7 || '—') + '</td><td><button class="btn btn-gh btn-xs" type="button" onclick="showUsageLogDetail(' + index + ')">查看</button></td></tr>'
   }).join('')
   cards.innerHTML = analyticsLogRecords.map(function(record, index) {
     const success = getLogField(record, 'blob8') === 'success'
-    return '<button class="log-card" type="button" onclick="showUsageLogDetail(' + index + ')"><span><span class="status-badge ' + logStatusClass(record) + '"><i></i>' + (success ? '成功' : '失败') + '</span><time>' + escapeHtml(new Date(String(record.timestamp)).toLocaleString('zh-CN')) + '</time></span><code>' + escapeHtml(getLogField(record, 'blob6') || '未知模型') + '</code><small>' + escapeHtml(getLogField(record, 'blob4') || getLogField(record, 'blob3') || '未知渠道') + ' · 输入 ' + formatMetric(record.double1) + ' · 输出 ' + formatMetric(record.double2) + ' · ' + formatLatency(record.double5) + '</small></button>'
+    return '<button class="log-card" type="button" onclick="showUsageLogDetail(' + index + ')"><span><span class="status-badge ' + logStatusClass(record) + '"><i></i>' + (success ? '成功' : '失败') + '</span><time>' + escapeHtml(formatLogTime(record.timestamp)) + '</time></span><code>' + escapeHtml(getLogField(record, 'blob6') || '未知模型') + '</code><small>' + escapeHtml(getLogField(record, 'blob4') || getLogField(record, 'blob3') || '未知渠道') + ' · 输入 ' + formatMetric(record.double1) + ' · 输出 ' + formatMetric(record.double2) + ' · ' + formatLatency(record.double5) + '</small></button>'
   }).join('')
 }
 
@@ -141,7 +151,7 @@ function showUsageLogDetail(index) {
   const record = analyticsLogRecords[index]
   if (!record) return
   const fields = [
-    ['时间', new Date(String(record.timestamp)).toLocaleString('zh-CN')], ['结果', getLogField(record, 'blob8')], ['路由', getLogField(record, 'blob1')], ['渠道', getLogField(record, 'blob4') || getLogField(record, 'blob3')],
+    ['时间', formatLogTime(record.timestamp)], ['结果', getLogField(record, 'blob8')], ['路由', getLogField(record, 'blob1')], ['渠道', getLogField(record, 'blob4') || getLogField(record, 'blob3')],
     ['Provider ID', getLogField(record, 'blob3')], ['Provider 类型', getLogField(record, 'blob5')], ['请求模型', getLogField(record, 'blob6')], ['上游模型', getLogField(record, 'blob7')],
     ['输入 Token', record.double1], ['输出 Token', record.double2], ['缓存 Token', record.double3], ['总 Token', record.double4], ['延迟', formatLatency(record.double5)], ['重试次数', record.double6], ['上游状态', record.double7],
     ['Request ID', getLogField(record, 'blob12')], ['Trace ID', getLogField(record, 'blob13')], ['客户端 IP', getLogField(record, 'blob14')], ['User-Agent', getLogField(record, 'blob15')], ['位置', [record.blob16, record.blob17, record.blob18].filter(Boolean).join(' / ')], ['Colo', getLogField(record, 'blob19')], ['错误代码', getLogField(record, 'blob10')], ['错误摘要', getLogField(record, 'blob20')]
