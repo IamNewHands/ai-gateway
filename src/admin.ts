@@ -529,6 +529,47 @@ export async function handleTestKeyNew(c: Context<AppEnv>) {
     })
   }
 
+  // Cloudflare Workers AI：OpenAI 兼容端点不支持 GET /models，
+  // 改走原生模型搜索接口（同一 Bearer token），既能测试连通性也能拉取模型列表。
+  if (providerId === 'cloudflare-ai') {
+    const resolvedUrl = resolveProviderBaseUrl(c.env, url)
+    if (!resolvedUrl) {
+      return c.json<ApiResponse>({ success: false, message: 'baseUrl 含 {CF_ACCOUNT_ID} 占位符，但环境变量 CF_ACCOUNT_ID 未配置' }, 400)
+    }
+    // baseUrl: .../accounts/{ACCOUNT_ID}/ai/v1 → 原生搜索接口 .../ai/models/search
+    const searchUrl = resolvedUrl.replace(/\/ai\/v1\/?$/, '/ai/models/search?per_page=100')
+    try {
+      const response = await fetch(searchUrl, {
+        method: 'GET', headers: { 'Authorization': `Bearer ${apiKey}` }, signal: AbortSignal.timeout(15000),
+      })
+      let errBody = ''
+      if (response.ok) {
+        const body = (await response.json()) as { result?: Array<{ name?: string; id?: string }> }
+        const models = (body.result || [])
+          .map((m) => ({ id: m.name || m.id || '' }))
+          .filter((m) => !!m.id)
+        return c.json<ApiResponse>({
+          success: true,
+          data: { success: true, statusCode: 200, data: { data: models }, message: '' },
+        })
+      }
+      try {
+        const raw = await response.text()
+        errBody = raw.substring(0, 1000)
+        await writeLog(c.env, 'error', `[test-key] ${searchUrl} → ${response.status}`, errBody)
+      } catch { /* ignore */ }
+      return c.json<ApiResponse>({
+        success: true,
+        data: { success: false, statusCode: response.status, message: `HTTP ${response.status}: ${errBody}` },
+      })
+    } catch (err) {
+      return c.json<ApiResponse>({
+        success: true,
+        data: { success: false, statusCode: 0, message: (err as Error).message || '连接失败' },
+      })
+    }
+  }
+
   const resolvedUrl = resolveProviderBaseUrl(c.env, url)
   if (!resolvedUrl) {
     return c.json<ApiResponse>({ success: false, message: 'baseUrl 含 {CF_ACCOUNT_ID} 占位符，但环境变量 CF_ACCOUNT_ID 未配置' }, 400)
