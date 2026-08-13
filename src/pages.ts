@@ -1559,11 +1559,15 @@ function addMdlToEdit(id, mid) {
 
 function getMdl(id) {
   const c = document.getElementById('ml-' + id), items = c.querySelectorAll('[data-idx]')
-  return Array.from(items).map(item => {
+  const list = Array.from(items).map(item => {
     const idx = parseInt(item.dataset.idx), mid = document.getElementById('mid-' + id + '-' + idx).value.trim()
     const en = document.getElementById('men-' + id + '-' + idx).checked
     return mid ? { id: mid, enabled: en } : null
   }).filter(Boolean)
+  // 用户在"新的模型 ID"输入框里填了但没点"添加"就直接保存时，自动带上，避免模型丢失
+  const np = document.getElementById('nmid-' + id)
+  if (np && np.value.trim()) list.push({ id: np.value.trim(), enabled: true })
+  return list
 }
 
 async function save(id) {

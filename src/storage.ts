@@ -38,9 +38,15 @@ function safeParseArray<T>(text: string | null | undefined, fallback: T[]): T[] 
 export async function getProviders(env: Env): Promise<Provider[]> {
   const cached = rawCacheGet(providersCache, KV_KEYS.PROVIDERS)
   if (cached !== undefined) return safeParseArray<Provider>(cached, [])
+  return getProvidersFresh(env)
+}
+
+/** 绕过内存缓存直读 KV 并刷新本地缓存（写路径用，避免基于过期缓存读-改-写丢更新）。 */
+export async function getProvidersFresh(env: Env): Promise<Provider[]> {
   const data = await env.KV.get(KV_KEYS.PROVIDERS)
-  if (data !== null) rawCacheSet(providersCache, KV_KEYS.PROVIDERS, data)
-  return safeParseArray<Provider>(data, [])
+  const providers = safeParseArray<Provider>(data, [])
+  rawCacheSet(providersCache, KV_KEYS.PROVIDERS, JSON.stringify(providers))
+  return providers
 }
 
 export async function getProvider(env: Env, id: string): Promise<Provider | null> {
@@ -55,13 +61,13 @@ export async function setProviders(env: Env, providers: Provider[]): Promise<voi
 }
 
 export async function addProvider(env: Env, provider: Provider): Promise<void> {
-  const providers = await getProviders(env)
+  const providers = await getProvidersFresh(env)
   providers.push(provider)
   await setProviders(env, providers)
 }
 
 export async function updateProvider(env: Env, id: string, updates: Partial<Provider>): Promise<Provider | null> {
-  const providers = await getProviders(env)
+  const providers = await getProvidersFresh(env)
   const index = providers.findIndex((p) => p.id === id)
   if (index === -1) return null
   providers[index] = { ...providers[index], ...updates, updatedAt: new Date().toISOString() }
@@ -70,7 +76,7 @@ export async function updateProvider(env: Env, id: string, updates: Partial<Prov
 }
 
 export async function deleteProvider(env: Env, id: string): Promise<boolean> {
-  const providers = await getProviders(env)
+  const providers = await getProvidersFresh(env)
   const filtered = providers.filter((p) => p.id !== id)
   if (filtered.length === providers.length) return false
   await setProviders(env, filtered)
