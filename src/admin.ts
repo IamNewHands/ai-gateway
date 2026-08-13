@@ -1127,7 +1127,7 @@ export interface LogEntry {
 }
 
 const LOG_PREFIX = 'log:'
-const LOG_TTL = 60 * 60 * 24 * 7 // 7 天
+const DEFAULT_LOG_RETENTION_DAYS = 7 // 默认日志保留天数
 // 搜索模式下 KV.get 次数上限：KV.list(≤5 次) + 990 次 KV.get ≈ 995 subrequest，
 // 留余量低于 Workers 单请求 1000 subrequest 上限。
 const SEARCH_SCAN = 990
@@ -1161,14 +1161,38 @@ function sanitizeLogText(text: string): string {
 
 // ===== 日志 KV 写入 =====
 // P4：log_enabled 开关做内存缓存（5s TTL），消除每请求 1 次 KV.get；开关切换时同步刷新。
-let logEnabledCache = { at: 0, value: false }
+let logEnabledCache = { at: 0, value: true }
 const LOG_ENABLED_CACHE_TTL_MS = 5_000
 
+/**
+ * 日志开关判断（默认开启）：只有 KV 明确存 'false' 才关闭日志，
+ * 'true'、缺失、空值或任何非 'false' 值均视为开启。
+ * 修复"日志突然不记录"：原实现严格 === 'true'，一旦 KV 值异常/被覆盖
+ * （如某次误写 '0'、'false 前导空格'、或 KV 为空）就会静默停止全部日志。
+ */
 async function isLogEnabled(env: Env): Promise<boolean> {
   if (Date.now() - logEnabledCache.at < LOG_ENABLED_CACHE_TTL_MS) return logEnabledCache.value
-  const enabled = await env.KV.get('config:log_enabled')
-  logEnabledCache = { at: Date.now(), value: enabled === 'true' }
-  return logEnabledCache.value
+  const raw = await env.KV.get('config:log_enabled')
+  const value = raw !== 'false' // 仅显式 'false' 视为关闭，其余均开启
+  logEnabledCache = { at: Date.now(), value }
+  return value
+}
+
+// 日志保留天数：KV config:log_retention_days 存储，5s 内存缓存，避免每请求 1 次 KV.get。
+// 保留天数变化后最多 5 秒生效；超期日志由 KV expirationTtl 自动过期删除。
+let logRetentionCache = { at: 0, days: DEFAULT_LOG_RETENTION_DAYS }
+
+/** 读取日志保留天数（钳制到 1..365），带内存缓存 */
+export async function getLogRetentionDays(env: Env): Promise<number> {
+  if (Date.now() - logRetentionCache.at >= LOG_ENABLED_CACHE_TTL_MS) {
+    const raw = await env.KV.get('config:log_retention_days')
+    const n = Number(raw)
+    logRetentionCache = {
+      at: Date.now(),
+      days: Number.isFinite(n) && n > 0 ? Math.min(Math.trunc(n), 365) : DEFAULT_LOG_RETENTION_DAYS,
+    }
+  }
+  return logRetentionCache.days
 }
 
 /** 写日志到 KV */
@@ -1184,7 +1208,9 @@ export async function writeLog(env: Env, type: LogEntry['type'], message: string
     message: sanitizeLogText(message),
     details: details ? sanitizeLogText(details).substring(0, 4000) : undefined,
   }
-  await env.KV.put(LOG_PREFIX + id, JSON.stringify(entry), { expirationTtl: LOG_TTL })
+  // 保留天数动态设置过期时间：超期日志由 KV 自动删除
+  const days = await getLogRetentionDays(env)
+  await env.KV.put(LOG_PREFIX + id, JSON.stringify(entry), { expirationTtl: days * 24 * 60 * 60 })
 }
 
 /** 安全解析分页参数：非数字/缺失时回退默认值（R8：parseInt 遇 NaN 会污染 slice/limit） */
@@ -1288,37 +1314,74 @@ export async function handleLogs(c: Context<AppEnv>) {
   })
 }
 
-/** 清除日志 */
+/**
+ * 清除日志（支持按日期范围）。
+ * 带 start/end 查询参数时只删除该时间段内的日志（按 key 名时间戳过滤，
+ * 删除用 key 名即可精确命中，无需读内容）；不带参数则全量删除。
+ * 均按 cursor 循环删除直至删完，设单次上限防止日志量过大时 subrequest 超限。
+ */
 export async function handleLogsClear(c: Context<AppEnv>) {
-  // R8：KV.list 默认只返回一页（最多 1000 个 key），旧实现只删了第一页——
-  // 改为按 cursor 循环删除直至全部删完，并设单次上限防止日志量过大时
-  // subrequest 超限或无限循环。
   const DELETE_CAP = 20000
+  const startRaw = c.req.query('start') || ''
+  const endRaw = c.req.query('end') || ''
+  const startTime = startRaw ? new Date(startRaw).getTime() : NaN
+  const endTime = endRaw ? new Date(endRaw).getTime() : NaN
+  const hasDateFilter = !Number.isNaN(startTime) || !Number.isNaN(endTime)
+  const startMs = Number.isNaN(startTime) ? -Infinity : startTime
+  const endMs = Number.isNaN(endTime) ? Infinity : endTime
+  // 按日期过滤时不能中途停，必须扫完整段（否则 cursor 循环会漏删后半段）
+  const cap = hasDateFilter ? Infinity : DELETE_CAP
   let cursor: string | undefined
   let deleted = 0
+  let skipped = 0
   do {
     const list = await c.env.KV.list({ prefix: LOG_PREFIX, limit: 1000, cursor })
     cursor = list.list_complete ? undefined : list.cursor
-    for (let i = 0; i < list.keys.length; i += 50) {
-      await Promise.all(list.keys.slice(i, i + 50).map((k) => c.env.KV.delete(k.name)))
+    const targets = hasDateFilter ? list.keys.filter((k) => {
+      const ts = tsFromLogKey(k.name)
+      return Number.isNaN(ts) ? true : ts >= startMs && ts <= endMs
+    }) : list.keys
+    for (let i = 0; i < targets.length; i += 50) {
+      await Promise.all(targets.slice(i, i + 50).map((k) => c.env.KV.delete(k.name)))
     }
-    deleted += list.keys.length
-  } while (cursor && deleted < DELETE_CAP)
+    deleted += targets.length
+    skipped += list.keys.length - targets.length
+  } while (cursor && deleted < cap)
+  const dateText = hasDateFilter
+    ? `（${startRaw ? new Date(startRaw).toISOString() : '最早'} 至 ${endRaw ? new Date(endRaw).toISOString() : '现在'}）`
+    : ''
   return c.json<ApiResponse>({
     success: true,
-    message: deleted >= DELETE_CAP ? `已清除 ${deleted} 条（达到单次上限，可再次执行）` : '日志已清除',
+    message: hasDateFilter
+      ? `已删除 ${deleted} 条日志${dateText}${skipped ? `，跳过范围外 ${skipped} 条` : ''}`
+      : (deleted >= DELETE_CAP ? `已清除 ${deleted} 条（达到单次上限，可再次执行）` : '日志已清除'),
   })
 }
 
-/** 获取/设置日志开关状态 */
+/** 获取/设置日志开关状态 + 保留天数 */
 export async function handleLogConfig(c: Context<AppEnv>) {
   if (c.req.method === 'POST') {
     const body = await c.req.json().catch(() => ({}))
-    const enabled = body.enabled ? 'true' : 'false'
-    await c.env.KV.put('config:log_enabled', enabled)
-    logEnabledCache = { at: Date.now(), value: enabled === 'true' }  // 立即刷新缓存
-    return c.json<ApiResponse>({ success: true, data: { enabled: body.enabled } })
+    // enabled 字段可选：未传时保持现有值（兼容只改保留天数的调用）
+    if (body.enabled !== undefined) {
+      const enabled = body.enabled ? 'true' : 'false'
+      await c.env.KV.put('config:log_enabled', enabled)
+      logEnabledCache = { at: Date.now(), value: enabled === 'true' }  // 立即刷新缓存
+    }
+    // 保留天数：1..365，非法值忽略
+    if (body.retentionDays !== undefined) {
+      const n = Number(body.retentionDays)
+      if (Number.isFinite(n) && n > 0) {
+        const days = Math.min(Math.trunc(n), 365)
+        await c.env.KV.put('config:log_retention_days', String(days))
+        logRetentionCache = { at: Date.now(), days }  // 立即刷新缓存
+      }
+    }
+    const enabled = await c.env.KV.get('config:log_enabled')
+    const retention = await getLogRetentionDays(c.env)
+    return c.json<ApiResponse>({ success: true, data: { enabled: enabled !== 'false', retentionDays: retention } })
   }
   const enabled = await c.env.KV.get('config:log_enabled')
-  return c.json<ApiResponse>({ success: true, data: { enabled: enabled === 'true' } })
+  const retention = await getLogRetentionDays(c.env)
+  return c.json<ApiResponse>({ success: true, data: { enabled: enabled !== 'false', retentionDays: retention } })
 }

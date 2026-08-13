@@ -405,7 +405,9 @@ async function readUpstreamSSE(
         } catch { /* 单块解析失败跳过 */ }
       }
     }
-    // 尾部残余（无 [DONE]）
+    // 上游 EOF（未发 [DONE]，部分上游以关流代替）：先消化 buf 里未换行的尾部残余，
+    // 再触发收尾让 buildStreamResponse 正确 flush 并补发 finish/[DONE]，
+    // 避免尾部 chunk 丢失、客户端拿到无 finish 的裸 EOF 而误判为截断/异常。
     if (buf.trim()) {
       const payload = buf.trim()
       if (payload !== '[DONE]' && payload.startsWith('{')) {
@@ -415,6 +417,7 @@ async function readUpstreamSSE(
         } catch { /* ignore */ }
       }
     }
+    await onChunk(null, true)
   } finally {
     try { await reader.cancel() } catch { /* ignore */ }
   }

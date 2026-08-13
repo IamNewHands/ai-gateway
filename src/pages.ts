@@ -622,12 +622,12 @@ ${H('管理')}
         </div>
       </section>
       <section id="logs" class="workspace-section" aria-labelledby="logs-title">
-        <div class="section-heading section-heading--admin"><div><h2 id="logs-title">系统日志</h2><p>记录 API 请求、错误等关键信息。</p></div><div><label class="tg"><input type="checkbox" id="log-switch" onchange="toggleLog(this.checked)"><span class="sl"></span></label><span id="log-status">已关闭</span><label class="tg" style="margin-left:8px" title="定时自动刷新日志，便于排查问题"><input type="checkbox" id="log-auto-on" onchange="logAutoToggle(this.checked)"><span class="sl"></span></label><input type="number" id="log-auto-sec" min="1" max="3600" value="5" style="width:58px;text-align:center;font-size:12px;padding:2px 4px;border-radius:6px;border:1px solid var(--border,#e2e8f0);background:var(--card,#fff);color:inherit;margin-left:6px" onchange="logAutoSecChange()"><span class="mu" style="font-size:12px;margin-left:4px">秒自动刷新</span><button class="btn btn-gh btn-xs" onclick="logPageChange(1)" style="margin-left:8px" title="刷新（回到第一页）"><i class="fas fa-sync-alt"></i></button><button class="btn btn-d btn-xs" onclick="clearLogs()" style="margin-left:4px">清除</button></div></div>
+        <div class="section-heading section-heading--admin"><div><h2 id="logs-title">系统日志</h2><p>记录 API 请求、错误等关键信息。超过保留天数的日志会自动删除。</p></div><div><label class="tg"><input type="checkbox" id="log-switch" onchange="toggleLog(this.checked)"><span class="sl"></span></label><span id="log-status">已关闭</span><label class="tg" style="margin-left:8px" title="定时自动刷新日志，便于排查问题"><input type="checkbox" id="log-auto-on" onchange="logAutoToggle(this.checked)"><span class="sl"></span></label><input type="number" id="log-auto-sec" min="1" max="3600" value="5" style="width:58px;text-align:center;font-size:12px;padding:2px 4px;border-radius:6px;border:1px solid var(--border,#e2e8f0);background:var(--card,#fff);color:inherit;margin-left:6px" onchange="logAutoSecChange()"><span class="mu" style="font-size:12px;margin-left:4px">秒自动刷新</span><label class="mu" style="font-size:12px;margin-left:10px" title="日志保留天数，超过后自动删除">保留</label><input type="number" id="log-retention" min="1" max="365" value="7" style="width:50px;text-align:center;font-size:12px;padding:2px 4px;border-radius:6px;border:1px solid var(--border,#e2e8f0);background:var(--card,#fff);color:inherit;margin-left:4px" onchange="logRetentionChange(this.value)"><span class="mu" style="font-size:12px;margin-left:4px">天</span><button class="btn btn-gh btn-xs" onclick="logPageChange(1)" style="margin-left:10px" title="刷新（回到第一页）"><i class="fas fa-sync-alt"></i></button><button class="btn btn-d btn-xs" onclick="clearLogs()" style="margin-left:4px">清除</button></div></div>
         <div class="syslog-filters">
           <div class="fg log-time-range"><label>时间范围</label><div class="fc"><input type="datetime-local" id="syslog-start" aria-label="开始时间"><span style="margin:0 4px;color:var(--color-muted)">至</span><input type="datetime-local" id="syslog-end" aria-label="结束时间"></div></div>
           <div class="fg"><label>类型</label><select id="syslog-type" aria-label="日志类型"><option value="">全部</option><option value="error">error</option><option value="warn">warn</option><option value="info">info</option><option value="request">request</option><option value="response">response</option></select></div>
           <div class="fg"><label>关键词</label><input type="search" id="syslog-keyword" placeholder="日志关键字" onkeydown="if(event.key==='Enter'){syslogSearch()}"></div>
-          <div class="log-actions"><button class="btn btn-gh btn-xs" onclick="syslogReset()"><i class="fas fa-undo-alt" aria-hidden="true"></i>重置</button><button class="btn btn-p btn-xs" onclick="syslogSearch()"><i class="fas fa-search" aria-hidden="true"></i>搜索</button></div>
+          <div class="log-actions"><button class="btn btn-gh btn-xs" onclick="syslogReset()"><i class="fas fa-undo-alt" aria-hidden="true"></i>重置</button><button class="btn btn-p btn-xs" onclick="syslogSearch()"><i class="fas fa-search" aria-hidden="true"></i>搜索</button><button class="btn btn-d btn-xs" onclick="deleteLogsByDate()" title="按上方时间范围删除该时段日志"><i class="fas fa-calendar-minus" aria-hidden="true"></i>删除所选日期</button></div>
         </div>
         <div id="log-list" class="key-list">
           <div class="empty-state"><i class="fas fa-list-alt" aria-hidden="true"></i><h3>暂无日志</h3><p>开启日志开关后，API 请求和错误会被记录。</p></div>
@@ -1884,6 +1884,7 @@ function logAutoSecChange() {
     if (d.success) {
       document.getElementById('log-switch').checked = d.data.enabled
       document.getElementById('log-status').textContent = d.data.enabled ? '已开启' : '已关闭'
+      if (d.data.retentionDays) document.getElementById('log-retention').value = d.data.retentionDays
       if (d.data.enabled) refreshLogs()
     }
   })
@@ -2031,6 +2032,51 @@ async function clearLogs() {
   await fetch('/admin/api/logs', { method: 'DELETE' })
   document.getElementById('log-list').innerHTML = '<div class="empty-state"><i class="fas fa-list-alt" aria-hidden="true"></i><h3>暂无日志</h3><p>日志已清除。</p></div>'
   toast('日志已清除', 'success')
+}
+
+// 变更日志保留天数：超过该天数的日志由 KV 自动过期删除
+async function logRetentionChange(v) {
+  const n = Math.max(1, Math.min(365, parseInt(v) || 7))
+  if (document.getElementById('log-retention').value != n) document.getElementById('log-retention').value = n
+  const r = await fetch('/admin/api/logs/config', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({ retentionDays: n })
+  })
+  const d = await r.json()
+  if (d.success) toast('日志保留 ' + n + ' 天，超期自动删除。', 'success')
+  else toast(d.message || '保存失败', 'error')
+}
+
+// 按上方"时间范围"删除该时段的日志（至少填一端）
+async function deleteLogsByDate() {
+  const sEl = document.getElementById('syslog-start')
+  const eEl = document.getElementById('syslog-end')
+  const sRaw = sEl ? sEl.value : ''
+  const eRaw = eEl ? eEl.value : ''
+  if (!sRaw && !eRaw) { toast('请先在"时间范围"选择开始或结束日期', 'error'); return }
+  // 与搜索一致的 ISO 转换（datetime-local → UTC ISO，end 当日 00:00 补到 23:59:59）
+  var qs = ''
+  if (sRaw) {
+    var ds = new Date(sRaw)
+    if (!isNaN(ds.getTime())) qs += 'start=' + encodeURIComponent(ds.toISOString())
+  }
+  if (eRaw) {
+    var de = new Date(eRaw)
+    if (!isNaN(de.getTime())) {
+      if (de.getHours() === 0 && de.getMinutes() === 0 && de.getSeconds() === 0) de.setHours(23, 59, 59, 999)
+      qs += (qs ? '&' : '') + 'end=' + encodeURIComponent(de.toISOString())
+    }
+  }
+  var label = (sRaw ? sRaw : '最早') + ' 至 ' + (eRaw ? eRaw : '现在')
+  if (!(await cM('确定删除「' + label + '」时段内的日志吗？此操作不可撤销。'))) return
+  const r = await fetch('/admin/api/logs?' + qs, { method: 'DELETE' })
+  const d = await r.json()
+  if (d.success) {
+    toast(d.message || '已删除', 'success')
+    logPage = 1
+    refreshLogs()
+  } else toast(d.message || '删除失败', 'error')
 }
 
 // ===== WorkBuddy 签到 =====

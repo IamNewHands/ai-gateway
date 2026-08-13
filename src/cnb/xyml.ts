@@ -1170,6 +1170,7 @@ function firstClosedBlockEnd(text: string, config: ToolCallConfig): number {
  */
 function scrubToolFragments(text: unknown): string {
   let t = String(text ?? '')
+  t = t.replace(/<!\[CDATA\[/g, '')
   t = t.replace(/\]\]>/g, '')
   t = t.replace(/<\s*\/?\s*\|\s*[A-Za-z][A-Za-z0-9_]*\s*\|\s*[A-Za-z_][A-Za-z0-9_.:-]*[^>]*>/gi, '')
   t = t.replace(/<\/?(?:tool_call|tool_use|function|invoke|parameter)\b[^>]*>/gi, '')
@@ -1274,6 +1275,10 @@ export class ToolSieve {
     const remainder = end > 0 ? this.capture.slice(end) : ''
     this.capture = ''
     const calls = parseToolCalls(blockText, this.tools, { config: this.config })
-    return { events: calls.length ? [{ type: 'tool_calls', calls }] : [], remainder }
+    // 解析不出工具调用（无可用工具 / 块残缺 / 非工具块）时降级为正文透传，
+    // 清洗协议标记后输出原文——绝不静默丢弃，否则该轮内容被吞、客户端"停止返回"。
+    if (calls.length) return { events: [{ type: 'tool_calls', calls }], remainder }
+    const text = scrubToolFragments(blockText)
+    return { events: text ? [{ type: 'content', text }] : [], remainder }
   }
 }
