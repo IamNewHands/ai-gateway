@@ -749,29 +749,6 @@ export async function handleOAuthConnect(c: Context<AppEnv>) {
   const provider = await getProvider(c.env, id)
   if (!provider) return c.json<ApiResponse>({ success: false, message: '提供商不存在' }, 404)
 
-  // CNB：cnb.cool 无公开模型列表端点（实测 /ai/models 等均返回 404 HTML），
-  // 与 Gemini 一致使用内置静态清单，一键拉取后自动合并保存。
-  if (isCnbProvider(provider)) {
-    const models = CNB_MODELS.map((m) => ({ id: m }))
-    try {
-      const existing = provider.models || []
-      const existingIds = new Set(existing.map((m) => m.id))
-      const merged = [...existing]
-      for (const m of models) {
-        if (!existingIds.has(m.id)) {
-          merged.push({ id: m.id, enabled: true })
-          existingIds.add(m.id)
-        }
-      }
-      if (merged.length !== existing.length) {
-        await updateProvider(c.env, id, { models: merged })
-      }
-    } catch (e) {
-      console.warn(`[oauth-models] cnb auto-save failed: ${(e as Error).message}`)
-    }
-    return c.json<ApiResponse>({ success: true, data: { data: models } })
-  }
-
   if (provider.authType !== 'oauth-device' || !provider.oauth) {
     return c.json<ApiResponse>({ success: false, message: '该提供商未配置 OAuth 认证' }, 400)
   }
@@ -922,6 +899,30 @@ export async function handleOAuthModels(c: Context<AppEnv>) {
 
   const provider = await getProvider(c.env, id)
   if (!provider) return c.json<ApiResponse>({ success: false, message: '提供商不存在' }, 404)
+
+  // CNB：cnb.cool 无公开模型列表端点（实测 /ai/models 等均返回 404 HTML），
+  // 与 Gemini 一致使用内置静态清单，一键拉取后自动合并保存。
+  if (isCnbProvider(provider)) {
+    const models = CNB_MODELS.map((m) => ({ id: m }))
+    try {
+      const existing = provider.models || []
+      const existingIds = new Set(existing.map((m) => m.id))
+      const merged = [...existing]
+      for (const m of models) {
+        if (!existingIds.has(m.id)) {
+          merged.push({ id: m.id, enabled: true })
+          existingIds.add(m.id)
+        }
+      }
+      if (merged.length !== existing.length) {
+        await updateProvider(c.env, id, { models: merged })
+      }
+    } catch (e) {
+      console.warn(`[oauth-models] cnb auto-save failed: ${(e as Error).message}`)
+    }
+    return c.json<ApiResponse>({ success: true, data: { data: models } })
+  }
+
   if (provider.authType !== 'oauth-device' || !provider.oauth) {
     return c.json<ApiResponse>({ success: false, message: '该提供商未配置 OAuth 认证' }, 400)
   }
