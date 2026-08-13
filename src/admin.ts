@@ -529,7 +529,11 @@ export async function handleTestKeyNew(c: Context<AppEnv>) {
     })
   }
 
-  const cleanBase = url.replace(/\/$/, '')
+  const resolvedUrl = resolveProviderBaseUrl(c.env, url)
+  if (!resolvedUrl) {
+    return c.json<ApiResponse>({ success: false, message: 'baseUrl 含 {CF_ACCOUNT_ID} 占位符，但环境变量 CF_ACCOUNT_ID 未配置' }, 400)
+  }
+  const cleanBase = resolvedUrl.replace(/\/$/, '')
   try {
     const response = await fetch(`${cleanBase}/models`, {
       method: 'GET', headers: { 'Authorization': `Bearer ${apiKey}` }, signal: AbortSignal.timeout(15000),
@@ -611,7 +615,11 @@ export async function handleTestModelNew(c: Context<AppEnv>) {
     }
   }
 
-  const cleanBase = url.replace(/\/$/, '')
+  const resolvedUrl = resolveProviderBaseUrl(c.env, url)
+  if (!resolvedUrl) {
+    return c.json<ApiResponse>({ success: false, message: 'baseUrl 含 {CF_ACCOUNT_ID} 占位符，但环境变量 CF_ACCOUNT_ID 未配置' }, 400)
+  }
+  const cleanBase = resolvedUrl.replace(/\/$/, '')
   // aigateway 内部始终用 OpenAI chat/completions 格式与上游通信
   const endpoint = 'chat/completions'
 
