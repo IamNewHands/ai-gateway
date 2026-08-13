@@ -867,16 +867,28 @@ export async function forwardProxy(
     // 上游强制流式，网关把 OpenAI 请求体转成上游可接受的 user/assistant 序列，
     // 并把上游 SSE 转回 OpenAI 格式；开启 toolBridge 时走 XYML 工具桥（见 src/cnb/proxy.ts）。
     if (isCnbProvider(provider)) {
-      const response = await proxyCnbChatRequest(c.env, provider, forwardBody as Record<string, unknown>)
-      const logLevel = response.ok ? 'request' : (response.status >= 500 ? 'error' : 'warn')
       try {
-        const bodySummary = summarizeRequestBody(forwardBody)
-        c.executionCtx.waitUntil(writeLog(c.env, logLevel,
-          `[${provider.name}] ${model} → ${response.status}`,
-          JSON.stringify({ providerId, subPath, body: bodySummary, toolBridge: provider.toolBridge === true }).substring(0, 4000)
-        ))
-      } catch { /* log failure must not break */ }
-      return response
+        const response = await proxyCnbChatRequest(c.env, provider, forwardBody as Record<string, unknown>)
+        const logLevel = response.ok ? 'request' : (response.status >= 500 ? 'error' : 'warn')
+        try {
+          const bodySummary = summarizeRequestBody(forwardBody)
+          c.executionCtx.waitUntil(writeLog(c.env, logLevel,
+            `[${provider.name}] ${model} → ${response.status}`,
+            JSON.stringify({ providerId, subPath, body: bodySummary, toolBridge: provider.toolBridge === true }).substring(0, 4000)
+          ))
+        } catch { /* log failure must not break */ }
+        return response
+      } catch (err) {
+        // 异常路径也记录日志（CSRF 获取失败、重试耗尽等），否则该调用在日志里完全不可见
+        try {
+          const errText = (err as Error).message || String(err)
+          c.executionCtx.waitUntil(writeLog(c.env, 'error',
+            `[${provider.name}] ${model} → cnb 转发异常`,
+            JSON.stringify({ providerId, subPath, error: errText, body: summarizeRequestBody(forwardBody) }).substring(0, 4000)
+          ))
+        } catch { /* log failure must not break */ }
+        throw err
+      }
     }
 
     // OAuth 设备码提供商：使用 KV 中保存的 access_token 转发，401 时尝试刷新后重试

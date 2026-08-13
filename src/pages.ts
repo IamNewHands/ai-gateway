@@ -986,7 +986,9 @@ async function createProv(opts) {
         toast('已创建，继续下一步…', 'success')
         opts.afterCreate(id)
       } else {
-        toast('已创建', 'success'); reloadAdmin()
+        toast('已创建', 'success')
+        hideAdd()  // 创建成功后收起添加表单，reloadAdmin 不再把 add:true 写进 ui_state，刷新后表单保持关闭
+        reloadAdmin()
       }
     } else toast(d.message || '创建失败', 'error')
   } catch (e) { toast('创建失败', 'error') }
