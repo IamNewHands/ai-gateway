@@ -5,6 +5,18 @@ import type { Env, Provider, ProxyKey, Session } from './types'
 // 每个 isolate 内缓存 KV 原始文本 + 10s TTL；写路径同步刷新缓存。
 // 多 isolate 部署时，其它实例最多滞后一个 TTL（10s），对网关场景可接受。
 const CACHE_TTL_MS = 10_000
+
+/**
+ * 解析 provider.baseUrl 中的占位符：
+ * - {CF_ACCOUNT_ID} → env.CF_ACCOUNT_ID（Cloudflare Workers AI 的 URL 需要 Account ID）
+ * 未配置对应环境变量时返回 null，调用方应给出明确错误提示。
+ */
+export function resolveProviderBaseUrl(env: Env, baseUrl: string): string | null {
+  if (!baseUrl.includes('{CF_ACCOUNT_ID}')) return baseUrl
+  if (!env.CF_ACCOUNT_ID) return null
+  return baseUrl.replace(/\{CF_ACCOUNT_ID\}/g, env.CF_ACCOUNT_ID)
+}
+
 interface RawCacheEntry { text: string; at: number }
 const providersCache = new Map<string, RawCacheEntry>()
 const proxyKeysCache = new Map<string, RawCacheEntry>()
@@ -205,25 +217,33 @@ import { DEFAULT_PROVIDERS, PROXY_KEY_PREFIX } from './config'
 
 export async function seedInitialData(env: Env): Promise<void> {
   const providers = await getProviders(env)
-  const migrationCompleted = await env.KV.get(KV_KEYS.OPENCODE_MIGRATION)
-  const opencode = DEFAULT_PROVIDERS.find((provider) => provider.id === 'opencode')
 
-  if (!migrationCompleted) {
-    if (opencode && !providers.some((provider) => provider.id === opencode.id)) {
+  // 升级迁移：补全新默认 provider（cloudflare-ai / openrouter）。
+  // 用 KV 标记保证只补齐一次——用户之后手动删除的默认 provider 不会被自动加回。
+  const migrationDone = await env.KV.get(KV_KEYS.DEFAULT_PROVIDERS_MIGRATION)
+  if (!migrationDone) {
+    const opencodeMigrated = await env.KV.get(KV_KEYS.OPENCODE_MIGRATION) === '1'
+    const existingIds = new Set(providers.map((p) => p.id))
+    // 全新部署补全部默认 provider；老部署（opencode 已迁移过）只补本次新增的两个。
+    const missing = DEFAULT_PROVIDERS.filter((d) => {
+      if (existingIds.has(d.id)) return false
+      return !(opencodeMigrated && d.id === 'opencode')
+    })
+    if (missing.length > 0) {
       await setProviders(env, [
         ...providers,
-        {
-          ...opencode,
-          apiKeys: opencode.apiKeys.map((key) => ({ ...key })),
-          models: opencode.models.map((model) => ({ ...model })),
-        },
+        ...missing.map((p) => ({
+          ...p,
+          apiKeys: p.apiKeys.map((k) => ({ ...k })),
+          models: p.models.map((m) => ({ ...m })),
+        })),
       ])
     }
-    await env.KV.put(KV_KEYS.OPENCODE_MIGRATION, '1')
+    await env.KV.put(KV_KEYS.DEFAULT_PROVIDERS_MIGRATION, '1')
   }
 
-  // 仅首次运行时创建测试转发 Key
-  if (providers.length === 0 && !migrationCompleted) {
+  // 仅首次运行时创建测试转发 Key（以补齐前的原始 providers 判断，避免补齐后误判为非首次）
+  if (providers.length === 0) {
     const keys = await getProxyKeys(env)
     if (keys.length === 0) {
       const testKey = {

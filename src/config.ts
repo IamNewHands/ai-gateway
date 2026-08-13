@@ -29,6 +29,7 @@ export const KV_KEYS = {
   SESSION_PREFIX: 'admin:session:',
   KEY_HEALTH_PREFIX: 'key:health:',
   OPENCODE_MIGRATION: 'migration:opencode-default:v1',
+  DEFAULT_PROVIDERS_MIGRATION: 'migration:default-providers:v2',
   OAUTH_TOKEN_PREFIX: 'oauth:token:',
   OAUTH_DEVICE_PREFIX: 'oauth:device:',
   CHECKIN_RESULT_PREFIX: 'checkin:result:',
@@ -62,6 +63,50 @@ export const DEFAULT_PROVIDERS: Provider[] = [
       { id: 'mimo-v2.5-free', enabled: true },
       { id: 'nemotron-3-ultra-free', enabled: true },
       { id: 'hy3-free', enabled: true },
+    ],
+    enabled: true,
+    createdAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+  },
+  {
+    // Cloudflare Workers AI：每天 10,000 Neurons 免费额度（所有模型共享，UTC 0 点重置）。
+    // baseUrl 里的 {CF_ACCOUNT_ID} 占位符会在转发/测试时被替换为 env.CF_ACCOUNT_ID；
+    // 也可在管理后台直接把占位符改成真实 Account ID（两种方式任选）。
+    id: 'cloudflare-ai',
+    name: 'Cloudflare Workers AI',
+    baseUrl: 'https://api.cloudflare.com/client/v4/accounts/{CF_ACCOUNT_ID}/ai/v1',
+    apiType: 'openai',
+    apiKeys: [],
+    models: [
+      { id: '@cf/meta/llama-3.3-70b-instruct-fp8-fast', enabled: true },
+      { id: '@cf/meta/llama-3.1-8b-instruct-fp8-fast', enabled: true },
+      { id: '@cf/meta/llama-4-scout-17b-16e-instruct', enabled: true },
+      { id: '@cf/mistralai/mistral-small-3.1-24b-instruct', enabled: true },
+      { id: '@cf/mistral/mistral-7b-instruct-v0.1', enabled: true },
+      { id: '@cf/qwen/qwen1.5-7b-chat', enabled: true },
+      { id: '@cf/zai-org/glm-4.7-flash', enabled: true },
+      { id: '@cf/google/gemma-4-26b-a4b-it', enabled: true },
+      { id: '@cf/nvidia/nemotron-3-120b-a12b', enabled: true },
+      { id: '@cf/deepseek-ai/deepseek-r1-distill-qwen-32b', enabled: true },
+    ],
+    enabled: true,
+    createdAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+  },
+  {
+    // OpenRouter：OpenAI 兼容聚合平台，替代已下线的 GitHub Models（2026-07-30 关闭）。
+    // 免费模型以 ":free" 结尾（如 deepseek/deepseek-chat-v3-0324:free），
+    // 需在管理后台配置 apiKey（OpenRouter 官网申请，免费模型无需充值）。
+    id: 'openrouter',
+    name: 'OpenRouter',
+    baseUrl: 'https://openrouter.ai/api/v1',
+    apiType: 'openai',
+    apiKeys: [],
+    models: [
+      { id: 'deepseek/deepseek-chat-v3-0324:free', enabled: true },
+      { id: 'meta-llama/llama-3.3-70b-instruct:free', enabled: true },
+      { id: 'qwen/qwen-2.5-72b-instruct:free', enabled: true },
+      { id: 'mistralai/mistral-small-3.1-24b-instruct:free', enabled: true },
     ],
     enabled: true,
     createdAt: new Date().toISOString(),

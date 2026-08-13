@@ -9,6 +9,7 @@ import {
   addProxyKey,
   updateProxyKey,
   deleteProxyKey,
+  resolveProviderBaseUrl,
 } from './storage'
 import { testModelConnection } from './proxy'
 import { fetchOpenCodeModels, isOpenCodeProvider, resolveOpenCodeUrls, testOpenCodeModel } from './opencode'
@@ -441,9 +442,13 @@ export async function handleTestModel(c: Context<AppEnv>) {
     return c.json<ApiResponse>({ success: false, message: '该提供商未配置可用的 API Key' }, 400)
   }
 
+  const resolvedBase = resolveProviderBaseUrl(c.env, provider.baseUrl)
+  if (!resolvedBase) {
+    return c.json<ApiResponse>({ success: false, message: `提供商 "${provider.name}" 的 baseUrl 含 {CF_ACCOUNT_ID} 占位符，但环境变量 CF_ACCOUNT_ID 未配置` }, 400)
+  }
   const result = isOpenCodeProvider(provider.id)
-    ? await testOpenCodeModel(provider.baseUrl, enabledKeys, modelId, resolveOpenCodeUrls(c.env))
-    : await testModelConnection(provider.baseUrl, enabledKeys[0].key, modelId, provider.apiType)
+    ? await testOpenCodeModel(resolvedBase, enabledKeys, modelId, resolveOpenCodeUrls(c.env))
+    : await testModelConnection(resolvedBase, enabledKeys[0].key, modelId, provider.apiType)
 
   return c.json<ApiResponse>({
     success: true,

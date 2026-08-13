@@ -1,5 +1,5 @@
 import { Context } from 'hono'
-import { getProvider, getProviders } from './storage'
+import { getProvider, getProviders, resolveProviderBaseUrl } from './storage'
 import { KV_KEYS, KEY_HEALTH_COOLDOWN_MS, KEY_HEALTH_MAX_FAILURES } from './config'
 import type { AppEnv, Env, ProxyRequestBody } from './types'
 import { createAnalyticsContext, normalizeAnthropicUsage, normalizeChatUsage, normalizeResponsesUsage, summarizeError } from './analytics/types'
@@ -903,7 +903,13 @@ export async function forwardProxy(
       }, 500)
     }
 
-    const cleanBase = provider.baseUrl.replace(/\/$/, '')
+    const resolvedBase = resolveProviderBaseUrl(c.env, provider.baseUrl)
+    if (!resolvedBase) {
+      return c.json({
+        error: { message: `提供商 "${provider.name}" 的 baseUrl 含 {CF_ACCOUNT_ID} 占位符，但环境变量 CF_ACCOUNT_ID 未配置`, type: 'configuration_error' },
+      }, 500)
+    }
+    const cleanBase = resolvedBase.replace(/\/$/, '')
     const forwardUrl = `${cleanBase}/${subPath}${url.search}`
 
     // 按健康状态排序 key：健康→洗牌，不健康→末尾，冷却到期→试用，连续失败3次→降权排除
@@ -1648,7 +1654,14 @@ export async function handleAnthropicMessages(c: Context<AppEnv>) {
       }, 500)
     }
 
-    const cleanBase = provider.baseUrl.replace(/\/$/, '')
+    const resolvedBase = resolveProviderBaseUrl(c.env, provider.baseUrl)
+    if (!resolvedBase) {
+      return c.json({
+        type: 'error',
+        error: { type: 'configuration_error', message: `Provider "${provider.name}" baseUrl has {CF_ACCOUNT_ID} placeholder but CF_ACCOUNT_ID env is not set` },
+      }, 500)
+    }
+    const cleanBase = resolvedBase.replace(/\/$/, '')
     const forwardUrl = `${cleanBase}/chat/completions`
     const upstreamBody: Record<string, unknown> = { ...openaiBody, stream: true }
     // 清理上游不支持的字段 + 被屏蔽的 Claude Code 模板短语
@@ -2533,7 +2546,13 @@ export async function handleResponses(c: Context<AppEnv>) {
       }, 500)
     }
 
-    const cleanBase = provider.baseUrl.replace(/\/$/, '')
+    const resolvedBase = resolveProviderBaseUrl(c.env, provider.baseUrl)
+    if (!resolvedBase) {
+      return c.json({
+        error: { type: 'configuration_error', message: `Provider "${provider.name}" baseUrl has {CF_ACCOUNT_ID} placeholder but CF_ACCOUNT_ID env is not set` },
+      }, 500)
+    }
+    const cleanBase = resolvedBase.replace(/\/$/, '')
     const forwardUrl = `${cleanBase}/chat/completions`
     const upstreamBody: Record<string, unknown> = { ...openaiBody, stream: true }
     // 清理上游不支持的字段 + 被屏蔽的 Claude Code 模板短语
