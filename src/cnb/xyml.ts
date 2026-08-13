@@ -1132,6 +1132,52 @@ function looksStructurallyClosed(text: string, config: ToolCallConfig): boolean 
   return false
 }
 
+/**
+ * 返回文本中「第一个已闭合协议块」的结束位置（不含之后的剩余内容）。
+ * 用于流式解析：一次 capture 内可能同时包含多个连续工具块（前一块的闭合标签
+ * 与后一块的开标签在同一 chunk 到达），只消费第一个完整块，剩余内容交由
+ * processChunk 继续处理，避免后一块的开标签被吞掉、尾部标记裸漏给客户端。
+ * 找不到可确定的块边界时返回 -1（视为整段是一个块）。
+ */
+function firstClosedBlockEnd(text: string, config: ToolCallConfig): number {
+  let best = -1
+  // 协议根闭合标签：</|XYML|tool_calls> / </|QNML|tool_calls>
+  for (const protocol of config.parseProtocols) {
+    const name = protocol.name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+    const tag = protocol.tags.root.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+    const re = new RegExp(`<\\s*/\\s*\\|\\s*${name}\\s*\\|\\s*${tag}\\s*>`, 'i')
+    const m = re.exec(text)
+    if (m) {
+      const end = m.index + m[0].length
+      best = best === -1 ? end : Math.min(best, end)
+    }
+  }
+  // 普通 XML 工具块闭合标签：</tool_call> </tool_use> </function> </invoke>
+  for (const tag of ['tool_call', 'tool_use', 'function', 'invoke']) {
+    const m = new RegExp(`<\\s*/\\s*${tag}\\s*>`, 'i').exec(text)
+    if (m) {
+      const end = m.index + m[0].length
+      best = best === -1 ? end : Math.min(best, end)
+    }
+  }
+  return best
+}
+
+/**
+ * 剥离流式正文里漏网的协议标记残片（未配对的 XYML 标签、CDATA 结束符、
+ * 普通 XML 工具标签、行首协议说明行），避免原始工具标记显示给客户端。
+ * 仅作兜底：正常情况下工具块都已被 ToolSieve 捕获解析，此处只处理截断/残缺块。
+ */
+function scrubToolFragments(text: unknown): string {
+  let t = String(text ?? '')
+  t = t.replace(/\]\]>/g, '')
+  t = t.replace(/<\s*\/?\s*\|\s*[A-Za-z][A-Za-z0-9_]*\s*\|\s*[A-Za-z_][A-Za-z0-9_.:-]*[^>]*>/gi, '')
+  t = t.replace(/<\/?(?:tool_call|tool_use|function|invoke|parameter)\b[^>]*>/gi, '')
+  t = t.replace(/^=+\s*(?:XYML|QNML)\s+TOOL CALL PROTOCOL\s*=+$/gim, '')
+  t = t.replace(/^Default protocol for new tool calls:.*$/gim, '')
+  return t
+}
+
 export interface SieveEvent {
   type: 'content' | 'tool_calls'
   text?: string
@@ -1160,58 +1206,74 @@ export class ToolSieve {
     if (!chunk) return []
     this.pending += String(chunk)
     const events: SieveEvent[] = []
-    if (this.capturing) {
-      this.capture += this.pending
-      this.pending = ''
-      const consumed = this.consumeCapture(false)
-      if (consumed) events.push(...consumed)
+    // 循环处理：一个 chunk 可能包含多个连续工具块（前一块闭合后紧跟着下一块的开标签）。
+    // consumeCapture 只消费第一个完整闭合块并返回 remainder，这里把 remainder 重新喂回，
+    // 避免后一块的开标签被吞掉、其尾部闭合标签被当作正文裸漏。
+    while (true) {
+      if (this.capturing) {
+        this.capture += this.pending
+        this.pending = ''
+        const consumed = this.consumeCapture(false)
+        if (consumed === null) return events // 捕获区未闭合，等待更多数据
+        events.push(...consumed.events)
+        if (!consumed.remainder) return events
+        this.pending = consumed.remainder
+        continue
+      }
+      const start = firstToolMarkerIndex(this.pending, this.config)
+      if (start >= 0) {
+        const prefix = this.pending.slice(0, start)
+        if (prefix) events.push({ type: 'content', text: scrubToolFragments(prefix) })
+        this.capture = this.pending.slice(start)
+        this.pending = ''
+        this.capturing = true
+        const consumed = this.consumeCapture(false)
+        if (consumed === null) return events
+        events.push(...consumed.events)
+        if (!consumed.remainder) return events
+        this.pending = consumed.remainder
+        continue
+      }
+      if (this.pending.length <= this.holdLength) return events
+      const safe = this.pending.slice(0, -this.holdLength)
+      this.pending = this.pending.slice(-this.holdLength)
+      if (safe) events.push({ type: 'content', text: scrubToolFragments(safe) })
       return events
     }
-    const start = firstToolMarkerIndex(this.pending, this.config)
-    if (start >= 0) {
-      const prefix = this.pending.slice(0, start)
-      if (prefix) events.push({ type: 'content', text: prefix })
-      this.capture = this.pending.slice(start)
-      this.pending = ''
-      this.capturing = true
-      const consumed = this.consumeCapture(false)
-      if (consumed) events.push(...consumed)
-      return events
-    }
-    if (this.pending.length <= this.holdLength) return events
-    const safe = this.pending.slice(0, -this.holdLength)
-    this.pending = this.pending.slice(-this.holdLength)
-    if (safe) events.push({ type: 'content', text: safe })
-    return events
   }
 
   flush(): SieveEvent[] {
     const events: SieveEvent[] = []
     if (this.capturing && this.capture) {
       const consumed = this.consumeCapture(true)
-      if (consumed) events.push(...consumed)
-      else events.push({ type: 'content', text: this.capture })
+      if (consumed && consumed.events.length) {
+        events.push(...consumed.events)
+        // 闭合块之后剩余的尾部内容（可能含残缺工具块标记），清洗后再透传
+        if (consumed.remainder) events.push({ type: 'content', text: scrubToolFragments(consumed.remainder) })
+      } else if (consumed && consumed.remainder) {
+        events.push({ type: 'content', text: scrubToolFragments(consumed.remainder) })
+      }
       this.capture = ''
       this.capturing = false
     }
     if (this.pending) {
-      events.push({ type: 'content', text: this.pending })
+      events.push({ type: 'content', text: scrubToolFragments(this.pending) })
       this.pending = ''
     }
     return events
   }
 
-  private consumeCapture(force: boolean): SieveEvent[] | null {
+  private consumeCapture(force: boolean): { events: SieveEvent[]; remainder: string } | null {
     if (!force && hasOpenProtocolBlock(this.capture, this.config) && !looksStructurallyClosed(this.capture, this.config)) {
       return null
     }
-    const calls = parseToolCalls(this.capture, this.tools, { config: this.config })
-    this.capture = ''
     this.capturing = false
-    if (calls.length) return [{ type: 'tool_calls', calls }]
-    // 未能解析出工具调用：捕获区是从 <|XYML|... 标记开始的工具块。此时模型可能输出了
-    // 残缺/嵌套不一致的 XYML（典型：当前请求未带 tools，模型却仍按历史输出工具块）。
-    // 直接丢弃整块，绝不让原始 XYML 标记泄漏给客户端；也不尝试从中抠正文（残缺标记容易漏）。
-    return []
+    // 只消费第一个完整闭合块；块之后的剩余内容（后续工具块 / 正文）由 processChunk 继续处理
+    const end = firstClosedBlockEnd(this.capture, this.config)
+    const blockText = end > 0 ? this.capture.slice(0, end) : this.capture
+    const remainder = end > 0 ? this.capture.slice(end) : ''
+    this.capture = ''
+    const calls = parseToolCalls(blockText, this.tools, { config: this.config })
+    return { events: calls.length ? [{ type: 'tool_calls', calls }] : [], remainder }
   }
 }
