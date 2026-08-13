@@ -1315,46 +1315,51 @@ export async function handleLogs(c: Context<AppEnv>) {
 }
 
 /**
- * 清除日志（支持按日期范围）。
- * 带 start/end 查询参数时只删除该时间段内的日志（按 key 名时间戳过滤，
- * 删除用 key 名即可精确命中，无需读内容）；不带参数则全量删除。
+ * 清除日志。
+ * - 带 expired=1：按保留天数清理——以当前时间为起点往前推，删除超过保留天数的日志。
+ *   保留天数取 KV config:log_retention_days（与写日志时的过期策略一致），无需前端传日期。
+ * - 不带参数：全量删除。
  * 均按 cursor 循环删除直至删完，设单次上限防止日志量过大时 subrequest 超限。
  */
 export async function handleLogsClear(c: Context<AppEnv>) {
   const DELETE_CAP = 20000
-  const startRaw = c.req.query('start') || ''
-  const endRaw = c.req.query('end') || ''
-  const startTime = startRaw ? new Date(startRaw).getTime() : NaN
-  const endTime = endRaw ? new Date(endRaw).getTime() : NaN
-  const hasDateFilter = !Number.isNaN(startTime) || !Number.isNaN(endTime)
-  const startMs = Number.isNaN(startTime) ? -Infinity : startTime
-  const endMs = Number.isNaN(endTime) ? Infinity : endTime
-  // 按日期过滤时不能中途停，必须扫完整段（否则 cursor 循环会漏删后半段）
-  const cap = hasDateFilter ? Infinity : DELETE_CAP
-  let cursor: string | undefined
+  const expiredOnly = c.req.query('expired') === '1'
   let deleted = 0
   let skipped = 0
+  if (expiredOnly) {
+    const days = await getLogRetentionDays(c.env)
+    const cutoff = Date.now() - days * 24 * 60 * 60 * 1000
+    let cursor: string | undefined
+    do {
+      const list = await c.env.KV.list({ prefix: LOG_PREFIX, limit: 1000, cursor })
+      cursor = list.list_complete ? undefined : list.cursor
+      const targets = list.keys.filter((k) => {
+        const ts = tsFromLogKey(k.name)
+        return Number.isNaN(ts) ? false : ts < cutoff
+      })
+      for (let i = 0; i < targets.length; i += 50) {
+        await Promise.all(targets.slice(i, i + 50).map((k) => c.env.KV.delete(k.name)))
+      }
+      deleted += targets.length
+      skipped += list.keys.length - targets.length
+    } while (cursor)
+    return c.json<ApiResponse>({
+      success: true,
+      message: `已删除 ${deleted} 条超过保留天数（${days} 天）的日志${skipped ? `，保留范围内 ${skipped} 条` : ''}`,
+    })
+  }
+  let cursor: string | undefined
   do {
     const list = await c.env.KV.list({ prefix: LOG_PREFIX, limit: 1000, cursor })
     cursor = list.list_complete ? undefined : list.cursor
-    const targets = hasDateFilter ? list.keys.filter((k) => {
-      const ts = tsFromLogKey(k.name)
-      return Number.isNaN(ts) ? true : ts >= startMs && ts <= endMs
-    }) : list.keys
-    for (let i = 0; i < targets.length; i += 50) {
-      await Promise.all(targets.slice(i, i + 50).map((k) => c.env.KV.delete(k.name)))
+    for (let i = 0; i < list.keys.length; i += 50) {
+      await Promise.all(list.keys.slice(i, i + 50).map((k) => c.env.KV.delete(k.name)))
     }
-    deleted += targets.length
-    skipped += list.keys.length - targets.length
-  } while (cursor && deleted < cap)
-  const dateText = hasDateFilter
-    ? `（${startRaw ? new Date(startRaw).toISOString() : '最早'} 至 ${endRaw ? new Date(endRaw).toISOString() : '现在'}）`
-    : ''
+    deleted += list.keys.length
+  } while (cursor && deleted < DELETE_CAP)
   return c.json<ApiResponse>({
     success: true,
-    message: hasDateFilter
-      ? `已删除 ${deleted} 条日志${dateText}${skipped ? `，跳过范围外 ${skipped} 条` : ''}`
-      : (deleted >= DELETE_CAP ? `已清除 ${deleted} 条（达到单次上限，可再次执行）` : '日志已清除'),
+    message: deleted >= DELETE_CAP ? `已清除 ${deleted} 条（达到单次上限，可再次执行）` : '日志已清除',
   })
 }
 

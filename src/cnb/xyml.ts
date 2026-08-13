@@ -12,6 +12,16 @@
 
 // ===== 常量 =====
 
+// ToolSieve 捕获区异常兜底（防"会话几轮后停止返回"）：
+// 模型偶发输出畸形工具块（只有开标签 <|XYML|...，无闭合标签，常见于流式中断/上下文过长），
+// 若不干预，capture 将无限累积、后随正文全被吞掉，客户端收不到任何内容、只能输入"继续"续命。
+// 双保险：
+// - MAX_CAPTURE_MS：开标签后超过该时长仍未闭合 → 视为畸形块，强制降级为正文透传；
+//   正常工具块从开标签到闭合亚秒级到达，不受影响，故设 2s。
+// - MAX_CAPTURE_LEN：罕见超大块（超大参数）兜底，避免长度型吞内容。
+const MAX_CAPTURE_MS = 2_000
+const MAX_CAPTURE_LEN = 50_000
+
 const DEFAULT_RAW_STRING_PARAMS = new Set([
   'content', 'command', 'cmd', 'script', 'code', 'prompt', 'file_content',
   'old_string', 'new_string', 'insert_text', 'patch', 'pattern', 'text',
@@ -1172,7 +1182,11 @@ function scrubToolFragments(text: unknown): string {
   let t = String(text ?? '')
   t = t.replace(/<!\[CDATA\[/g, '')
   t = t.replace(/\]\]>/g, '')
-  t = t.replace(/<\s*\/?\s*\|\s*[A-Za-z][A-Za-z0-9_]*\s*\|\s*[A-Za-z_][A-Za-z0-9_.:-]*[^>]*>/gi, '')
+  // 完整协议标签（开/闭，单/双 tag，含属性）：<|XYML|tool_calls> </|XYML|parameter name="..."> <|XYML|tool_calls>
+  t = t.replace(/<\s*\/?\s*\|\s*[A-Za-z][A-Za-z0-9_]*\s*\|\s*[A-Za-z_][A-Za-z0-9_.:-]*(\s[^>]*)?>/gi, '')
+  t = t.replace(/<\s*\/?\s*\|\s*[A-Za-z][A-Za-z0-9_]*\s*\|?>/gi, '')
+  // 截断残片（无 >）：</|XYML|、<|XYML|、</|XYML —— 精确匹配标签本身，不吞后续正文（如路径/行号）
+  t = t.replace(/<\s*\/?\s*\|\s*[A-Za-z][A-Za-z0-9_]*\s*\|?/gi, '')
   t = t.replace(/<\/?(?:tool_call|tool_use|function|invoke|parameter)\b[^>]*>/gi, '')
   t = t.replace(/^=+\s*(?:XYML|QNML)\s+TOOL CALL PROTOCOL\s*=+$/gim, '')
   t = t.replace(/^Default protocol for new tool calls:.*$/gim, '')
@@ -1195,6 +1209,7 @@ export class ToolSieve {
   pending = ''
   capture = ''
   capturing = false
+  captureStart = 0
   holdLength: number
 
   constructor(tools?: unknown, opts?: { config?: Partial<ToolCallConfig>; holdLength?: number }) {
@@ -1228,6 +1243,7 @@ export class ToolSieve {
         this.capture = this.pending.slice(start)
         this.pending = ''
         this.capturing = true
+        this.captureStart = Date.now()
         const consumed = this.consumeCapture(false)
         if (consumed === null) return events
         events.push(...consumed.events)
@@ -1265,17 +1281,24 @@ export class ToolSieve {
   }
 
   private consumeCapture(force: boolean): { events: SieveEvent[]; remainder: string } | null {
-    if (!force && hasOpenProtocolBlock(this.capture, this.config) && !looksStructurallyClosed(this.capture, this.config)) {
+    // 捕获区异常判定：
+    // 1) hasOpenProtocolBlock 检测到开标签且结构未闭合 → 正常等待更多数据（流式块未到齐）
+    // 2) 捕获区超时仍未闭合（模型输出了畸形工具块/流式中断，只有开标签无闭合标签，
+    //    后续正文被持续吞入捕获区）→ 强制降级为正文透传，否则客户端"停止返回"。
+    const stalled = this.captureStart > 0 && Date.now() - this.captureStart > MAX_CAPTURE_MS
+    const tooLong = this.capture.length > MAX_CAPTURE_LEN
+    if (!force && !stalled && !tooLong && hasOpenProtocolBlock(this.capture, this.config) && !looksStructurallyClosed(this.capture, this.config)) {
       return null
     }
     this.capturing = false
+    this.captureStart = 0
     // 只消费第一个完整闭合块；块之后的剩余内容（后续工具块 / 正文）由 processChunk 继续处理
     const end = firstClosedBlockEnd(this.capture, this.config)
     const blockText = end > 0 ? this.capture.slice(0, end) : this.capture
     const remainder = end > 0 ? this.capture.slice(end) : ''
     this.capture = ''
     const calls = parseToolCalls(blockText, this.tools, { config: this.config })
-    // 解析不出工具调用（无可用工具 / 块残缺 / 非工具块）时降级为正文透传，
+    // 解析不出工具调用（无可用工具 / 块残缺 / 畸形未闭合块 / 非工具块）时降级为正文透传，
     // 清洗协议标记后输出原文——绝不静默丢弃，否则该轮内容被吞、客户端"停止返回"。
     if (calls.length) return { events: [{ type: 'tool_calls', calls }], remainder }
     const text = scrubToolFragments(blockText)

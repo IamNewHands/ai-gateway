@@ -627,7 +627,7 @@ ${H('管理')}
           <div class="fg log-time-range"><label>时间范围</label><div class="fc"><input type="datetime-local" id="syslog-start" aria-label="开始时间"><span style="margin:0 4px;color:var(--color-muted)">至</span><input type="datetime-local" id="syslog-end" aria-label="结束时间"></div></div>
           <div class="fg"><label>类型</label><select id="syslog-type" aria-label="日志类型"><option value="">全部</option><option value="error">error</option><option value="warn">warn</option><option value="info">info</option><option value="request">request</option><option value="response">response</option></select></div>
           <div class="fg"><label>关键词</label><input type="search" id="syslog-keyword" placeholder="日志关键字" onkeydown="if(event.key==='Enter'){syslogSearch()}"></div>
-          <div class="log-actions"><button class="btn btn-gh btn-xs" onclick="syslogReset()"><i class="fas fa-undo-alt" aria-hidden="true"></i>重置</button><button class="btn btn-p btn-xs" onclick="syslogSearch()"><i class="fas fa-search" aria-hidden="true"></i>搜索</button><button class="btn btn-d btn-xs" onclick="deleteLogsByDate()" title="按上方时间范围删除该时段日志"><i class="fas fa-calendar-minus" aria-hidden="true"></i>删除所选日期</button></div>
+          <div class="log-actions"><button class="btn btn-gh btn-xs" onclick="syslogReset()"><i class="fas fa-undo-alt" aria-hidden="true"></i>重置</button><button class="btn btn-p btn-xs" onclick="syslogSearch()"><i class="fas fa-search" aria-hidden="true"></i>搜索</button><button class="btn btn-d btn-xs" onclick="deleteExpiredLogs()" title="删除超过保留天数的日志（按上方保留天数自动计算，无需选择时间范围）"><i class="fas fa-trash-alt" aria-hidden="true"></i>删除过期日志</button></div>
         </div>
         <div id="log-list" class="key-list">
           <div class="empty-state"><i class="fas fa-list-alt" aria-hidden="true"></i><h3>暂无日志</h3><p>开启日志开关后，API 请求和错误会被记录。</p></div>
@@ -2048,32 +2048,14 @@ async function logRetentionChange(v) {
   else toast(d.message || '保存失败', 'error')
 }
 
-// 按上方"时间范围"删除该时段的日志（至少填一端）
-async function deleteLogsByDate() {
-  const sEl = document.getElementById('syslog-start')
-  const eEl = document.getElementById('syslog-end')
-  const sRaw = sEl ? sEl.value : ''
-  const eRaw = eEl ? eEl.value : ''
-  if (!sRaw && !eRaw) { toast('请先在"时间范围"选择开始或结束日期', 'error'); return }
-  // 与搜索一致的 ISO 转换（datetime-local → UTC ISO，end 当日 00:00 补到 23:59:59）
-  var qs = ''
-  if (sRaw) {
-    var ds = new Date(sRaw)
-    if (!isNaN(ds.getTime())) qs += 'start=' + encodeURIComponent(ds.toISOString())
-  }
-  if (eRaw) {
-    var de = new Date(eRaw)
-    if (!isNaN(de.getTime())) {
-      if (de.getHours() === 0 && de.getMinutes() === 0 && de.getSeconds() === 0) de.setHours(23, 59, 59, 999)
-      qs += (qs ? '&' : '') + 'end=' + encodeURIComponent(de.toISOString())
-    }
-  }
-  var label = (sRaw ? sRaw : '最早') + ' 至 ' + (eRaw ? eRaw : '现在')
-  if (!(await cM('确定删除「' + label + '」时段内的日志吗？此操作不可撤销。'))) return
-  const r = await fetch('/admin/api/logs?' + qs, { method: 'DELETE' })
+// 删除超过保留天数的日志：以当前时间为起点往前推，后端按保留天数配置自动计算清理
+async function deleteExpiredLogs() {
+  const days = document.getElementById('log-retention').value || 7
+  if (!(await cM('确定删除超过保留天数（' + days + ' 天）的日志吗？此操作不可撤销。'))) return
+  const r = await fetch('/admin/api/logs?expired=1', { method: 'DELETE' })
   const d = await r.json()
   if (d.success) {
-    toast(d.message || '已删除', 'success')
+    toast(d.message || '已删除过期日志', 'success')
     logPage = 1
     refreshLogs()
   } else toast(d.message || '删除失败', 'error')
