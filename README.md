@@ -329,7 +329,3 @@ ai-gateway/
 ## License
 
 Apache 2.0
-
-## 星星走起
-
-[![Star History Chart](https://api.star-history.com/chart?repos=yutian81/ai-gateway&type=date&legend=top-left&sealed_token=ss5l0FbgLFED_spRh5MGVvFPQXDCPXMWds6_dNkiuSrV1ESAvtN32rTu3h59YAu1cUWg2yKcFf1bZLX5Q4Cic1RgaLixtg_F81tOAvMEnoYRi4nE_plSMwSC-JC3lCGiTCwGBdd1yRwsXgV9owq1Jll7i2NnNKEx6b30mK7nspfrbAFBFYvCXLjR9P7W)](https://www.star-history.com/?repos=yutian81%2Fai-gateway&type=date&legend=top-left)
