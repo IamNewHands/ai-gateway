@@ -1085,9 +1085,14 @@ async function createProv(opts) {
   const enabled = document.getElementById('aen').checked
   if (!nm || !id || !url) { toast('请填写名称、ID 和 API 地址', 'error'); return }
   if (authType === 'oauth-device') {
-    const needsClientId = oauth.flowType !== 'browser'
-    if (!oauth.deviceCodeUrl || !oauth.deviceTokenUrl || !oauth.refreshTokenUrl || (needsClientId && !oauth.clientId)) {
-      toast('OAuth 模式下请填写完整的配置（三个端点' + (needsClientId ? ' + Client ID' : '') + '）', 'error'); return
+    // gemini / m365（PKCE 授权码、ROPC 账密）由后端专用流程处理，端点与 Client ID 均有默认值，
+    // 无需强制三端点；先保存，认证在「连接」里引导
+    const specialFlow = oauth.flowType === 'gemini' || oauth.flowType === 'm365-pkce' || oauth.flowType === 'm365-ropc'
+    if (!specialFlow) {
+      const needsClientId = oauth.flowType !== 'browser'
+      if (!oauth.deviceCodeUrl || !oauth.deviceTokenUrl || !oauth.refreshTokenUrl || (needsClientId && !oauth.clientId)) {
+        toast('OAuth 模式下请填写完整的配置（三个端点' + (needsClientId ? ' + Client ID' : '') + '）', 'error'); return
+      }
     }
   }
   // 识图模型：勾选了识图模型即保存配置；选了主文本模型才是独立桥（type=vision-bridge），
@@ -1760,9 +1765,13 @@ async function save(id) {
   const keys = getKeys(id)
   const models = getMdl(id), enabled = document.getElementById('en-' + id).checked
   if (authType === 'oauth-device') {
-    const needsClientId = oauth.flowType !== 'browser'
-    if (!oauth.deviceCodeUrl || !oauth.deviceTokenUrl || !oauth.refreshTokenUrl || (needsClientId && !oauth.clientId)) {
-      toast('OAuth 模式下请填写完整的配置（三个端点' + (needsClientId ? ' + Client ID' : '') + '）', 'error'); return
+    // gemini / m365 同创建校验：后端专用流程无需三端点，允许先保存再连接认证
+    const specialFlow = oauth.flowType === 'gemini' || oauth.flowType === 'm365-pkce' || oauth.flowType === 'm365-ropc'
+    if (!specialFlow) {
+      const needsClientId = oauth.flowType !== 'browser'
+      if (!oauth.deviceCodeUrl || !oauth.deviceTokenUrl || !oauth.refreshTokenUrl || (needsClientId && !oauth.clientId)) {
+        toast('OAuth 模式下请填写完整的配置（三个端点' + (needsClientId ? ' + Client ID' : '') + '）', 'error'); return
+      }
     }
   }
   const vb = collectVisionBridgeEdit(id) || null
