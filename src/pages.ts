@@ -2331,10 +2331,18 @@ function unimodelFind(id) {
   for (var i = 0; i < UNIMODELS.length; i++) if (UNIMODELS[i].id === id) return UNIMODELS[i]
   return null
 }
+function unimodelModelGrid(selected) {
+  var sel = selected || []
+  if (!VB_MODELS || VB_MODELS.length === 0) return '<span class="mu">暂无已启用模型，请先在「提供商」中配置并启用模型</span>'
+  return VB_MODELS.map(function (ref) {
+    var checked = sel.indexOf(ref) >= 0 ? ' checked' : ''
+    return '<label class="mdl-item ov" title="' + escapeHtml(ref) + '"><input type="checkbox" class="um-ref" value="' + escapeHtml(ref) + '"' + checked + '><span class="fx1">' + escapeHtml(ref) + '</span></label>'
+  }).join('')
+}
 function unimodelFormModal(u) {
   var h = '<h3><i class="fas fa-layer-group c-p"></i> ' + (u ? '编辑联合模型' : '添加联合模型') + '</h3>'
   h += '<div class="fg"><label>名称</label><input type="text" id="um-name" value="' + (u ? escapeHtml(u.name) : '') + '" placeholder="如：free-flash"><span class="form-helper">调用模型 ID 为 unimodel/名称</span></div>'
-  h += '<div class="fg"><label>候选模型（每行一个 providerId/modelId）</label><textarea id="um-models" rows="5" placeholder="deepseek/deepseek-chat\\nopenrouter/deepseek/deepseek-chat-v3-0324:free">' + (u ? escapeHtml((u.models || []).join('\\n')) : '') + '</textarea><span class="form-helper">按顺序 failover，第一个成功即返回。候选须为已配置的 providerId/modelId。</span></div>'
+  h += '<div class="fg"><label>候选模型（勾选顺序即 failover 尝试顺序，从上到下）</label><div id="um-models" class="grid-2-gap6">' + unimodelModelGrid(u ? (u.models || []) : []) + '</div><span class="form-helper">从已启用模型的列表中直接勾选，候选引用为 providerId/modelId；全部失败返回 unimodel_exhausted。</span></div>'
   h += '<div class="panel-actions"><label class="switch-label"><span>启用</span><span class="tg"><input type="checkbox" id="um-enabled"' + (!u || u.enabled ? ' checked' : '') + '><span class="sl"></span></span></label><div><button class="btn btn-s" onclick="closeM()">取消</button><button class="btn btn-p" onclick="unimodelSave(\\'' + (u ? escapeJsAttr(u.id) : '') + '\\')">保存</button></div></div>'
   showM(h)
 }
@@ -2342,7 +2350,7 @@ function unimodelEdit(id) { unimodelFormModal(unimodelFind(id)) }
 function unimodelSave(id) {
   var name = document.getElementById('um-name').value.trim()
   var enabled = document.getElementById('um-enabled').checked
-  var models = document.getElementById('um-models').value.split('\\n').map(function (s) { return s.trim() }).filter(Boolean)
+  var models = Array.prototype.map.call(document.querySelectorAll('#um-models input.um-ref:checked'), function (c) { return c.value })
   if (!name) { toast('名称为必填项', 'error'); return }
   if (models.length === 0) { toast('至少需要一个候选模型', 'error'); return }
   var payload = { name: name, models: models, enabled: enabled }
