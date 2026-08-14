@@ -8,21 +8,20 @@
  * - 心跳：收到 type=6 回 {"type":6}\x1e
  * - 事件：type=1 update（流式）/ type=2 result / type=3 complete（结束）
  *
- * 依赖 Workers 出站 WebSocket `connect()` API（compatibility_date >= 2024-01-01）。
+ * 出站 WS 用 fetch + Upgrade: websocket 建立（不依赖 connect 全局，Worker/DO 均可用）。
  */
 import { classifyUpdateMessages, extractToolEvents, normalizeFrame, imageURLs } from './events'
 import type { ChatHubStreamEvent } from './events'
 import { toolProtocolPrompt } from './tools'
 
 /**
- * Workers 出站 WebSocket connect() API（compatibility_date >= 2024-01-01）。
- * @cloudflare/workers-types 当前版本未提供该全局函数类型，这里本地声明。
+ * Workers 出站 WebSocket 客户端。
+ * 说明：出站 WS 用 `fetch()` + `Upgrade: websocket` 建立（`resp.webSocket`），
+ * 该方式在普通 Worker 与 Durable Object 中均可用，不依赖 `connect()` 全局
+ * （`connect` 仅在部分运行环境注入，DO / nodejs_compat 下可能缺失导致 is not defined）。
  */
-declare global {
-  function connect(
-    address: string,
-    options?: { headers?: Record<string, string> }
-  ): { socket: WebSocket; response: Promise<Response> }
+interface OutboundWebSocket extends WebSocket {
+  accept(options?: { allowHalfOpen?: boolean }): void
 }
 
 const RS = '\x1e'
@@ -362,20 +361,23 @@ export async function chatWithHandlers(
     await uploadAttachments(acc, conversationId, req.attachments, opts)
   }
 
-  // 2) 建立出站 WS
+  // 2) 建立出站 WS（fetch + Upgrade: websocket，兼容 Worker / DO，不依赖 connect 全局）
   const wsURL = buildWSURL(acc, sessionId, conversationId, requestID)
-  let socket: WebSocket
-  let handshakeResp: Response
+  let socket: OutboundWebSocket
   try {
-    const connected = connect(wsURL, {
+    const resp = await fetch(wsURL, {
       headers: {
+        Upgrade: 'websocket',
         Origin: 'https://m365.cloud.microsoft',
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:148.0) Gecko/20100101 Firefox/148.0',
       },
     })
-    socket = connected.socket
-    handshakeResp = await connected.response
-    if (handshakeResp.status !== 101) throw new Error(`ws dial failed: HTTP ${handshakeResp.status}`)
+    if (resp.status !== 101 || !resp.webSocket) {
+      const text = await resp.text().catch(() => '')
+      throw new Error(`ws dial failed: HTTP ${resp.status} ${text.substring(0, 200)}`)
+    }
+    socket = resp.webSocket as unknown as OutboundWebSocket
+    socket.accept()
   } catch (err) {
     throw new Error(`ws dial: ${err instanceof Error ? err.message : String(err)}`)
   }
