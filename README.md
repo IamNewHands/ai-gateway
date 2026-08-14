@@ -149,6 +149,49 @@
 - **首页隐私保护**：首页不再展示模型目录、提供商统计数字；BASE_URL 与 curl 示例统一改用占位符 `https://自定义的域名/v1`，不泄露真实部署域名
 - **新增模型免保存即可测试**：编辑已有提供商时，新加的模型行可直接点「测试」按钮验证连通性，无需先点保存（移除了 `/test-model` 端点对模型必须已入库的多余校验）
 
+### 9. 从 aihub 移植的高级能力
+
+一系列面向 API 网关的高级能力，移植自 [yutian81/aihub](https://github.com/yutian81/aihub)，覆盖 MCP 工具聚合、多模型联合调度、缓存运维与转发增强。
+
+#### 9.1 MCP 聚合网关（`/v1/mcp`）
+
+把多个 MCP Server 聚合成一个 OpenAI 兼容的工具调用入口，客户端仅需对接网关一个端点即可使用所有 MCP 工具。
+
+- **管理 API**：`GET/POST /admin/api/mcps`、`PUT/DELETE /admin/api/mcps/:id`，支持配置上游 URL 与鉴权头（`httpHeaders`）
+- **JSON-RPC 端点**：`POST /v1/mcp`（需转发 Key），支持 `initialize` / `notifications/initialized` / `tools/list` / `tools/call`
+- **工具名前缀**：`工具名.前缀`（`<MCP名>-<工具名>`）避免多 Server 工具名冲突，`tools/call` 按前缀路由回对应 MCP Server
+- **并发与重试**：`tools/list` 拉取全部 Server 时并发限制 6，失败自动重试（5 次，间隔 1 秒）
+- **SSRF 防护**：MCP URL 复用网关注入的 `isSafeHttpUrl` 校验，禁止内网/私有地址
+
+调用示例：把 `https://你的域名/v1/mcp` 配置为 LLM 客户端的 MCP Server，工具即来自所有已启用的 MCP Server。
+
+#### 9.2 uni-model 联合模型（Unified Model Failover）
+
+一个逻辑模型名映射一组候选模型，按顺序自动故障转移，任一候选成功即返回，无需客户端自行重试。
+
+- **管理 API**：`GET/POST /admin/api/unimodels`、`PUT/DELETE /admin/api/unimodels/:id`
+- **用法**：调用 `model: unimodel/联合模型名`，网关按候选顺序依次转发，全部失败返回 `unimodel_exhausted`（附带最后一次错误状态码）
+- **自动注入模型列表**：启用且存在候选的联合模型会自动出现在 `/v1/models` 中，provider_name 显示「联合模型」——客户端无需额外配置即可发现
+- **兼容权限体系**：联合模型整体仍受转发 Key 的 `allowedModels` 白名单约束；候选模型格式为 `提供商ID/模型ID`
+
+#### 9.3 内存缓存可视化后台管理
+
+- **管理 API**：`GET /admin/api/cache`（列表）、`DELETE /admin/api/cache`（清空全部）、`DELETE /admin/api/cache/:key`（单项清除）
+- **管理后台面板**：侧栏「内存缓存」入口，展示每个缓存项的类型、大小、年龄与剩余 TTL，支持单项清除与一键清空
+- 适用于 KV 数据更新后不重启 Worker 的即时生效场景
+
+#### 9.4 未配置模型透传（提供商级后台开关）
+
+- **provider.allowUnlistedModels 开关**（管理后台「模型策略」）：关闭（默认）时保持「模型必须预配置」原校验；开启后，请求该提供商的**任意 modelId 都直接转发**，模型是否有效交由上游判断
+- 适合模型频繁上架、不想每次后台手动加模型的提供商（如 OpenRouter）
+- 已禁用的模型不受开关影响，仍返回 403
+
+#### 9.5 请求头白名单透传
+
+- 默认网关转发上游时只带 `Content-Type` 与 `Authorization`；现在客户端发来的 `x-` / `anthropic-` / `user-` / `referer` 前缀头会**原样透传**给上游
+- 场景举例：OpenRouter 的 `X-Title` / `HTTP-Referer`（后台显示调用来源应用名）、仅认 `x-api-key` 的上游供应商、Anthropic 的 `anthropic-version` / `anthropic-beta`、企业网关的 `user-` 身份头
+- 注：opencode 等专用通道暂未透传（内部固定使用自有头）；`referer` 系浏览器保护字段，部分 HTTP 客户端（如 undici）会自动吞掉，需要透传时请改用非受限客户端
+
 ## 功能与特性（源仓库）
 
 - **统一 API 接口** — 所有 AI 提供商通过 `https://你的域名/v1` 访问，兼容 OpenAI / Anthropic 协议
@@ -273,6 +316,7 @@ ai-gateway/
 │   ├── checkin.ts               # 每日签到
 │   ├── ws.ts                    # WebSocket 桥接
 │   ├── formats.ts               # 格式转换工具
+│   ├── mcp-gateway.ts           # MCP 聚合网关（JSON-RPC：initialize / tools/list / tools/call）
 │   ├── config.ts                # 默认配置
 │   └── storage.ts               # KV 存储层
 ├── analytics-ui.js.ts           # 分析看板前端 JS

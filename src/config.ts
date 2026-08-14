@@ -34,7 +34,18 @@ export const KV_KEYS = {
   OAUTH_DEVICE_PREFIX: 'oauth:device:',
   CHECKIN_RESULT_PREFIX: 'checkin:result:',
   LOGIN_RATE: 'login:rate:',
+  MCPS: 'mcps',
+  UNIMODELS: 'unimodels',
 } as const
+
+/** uni-model 虚拟提供商 ID（模型 ID 前缀，如 unimodel/xxx） */
+export const UNIMODEL_PROVIDER_ID = 'unimodel'
+
+/** uni-model 每个候选最多尝试次数（aihub 原值 5） */
+export const UNIMODEL_MAX_RETRIES = 5
+
+/** uni-model 候选失败后切换间隔（毫秒，aihub 原值 1s） */
+export const UNIMODEL_RETRY_DELAY_MS = 1000
 
 // access_token 过期前多少毫秒触发惰性刷新（默认提前 60 秒）
 export const OAUTH_TOKEN_REFRESH_MARGIN_MS = 60 * 1000

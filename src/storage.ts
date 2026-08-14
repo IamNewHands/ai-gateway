@@ -1,5 +1,5 @@
 import { KV_KEYS } from './config'
-import type { Env, Provider, ProxyKey, Session } from './types'
+import type { Env, Provider, ProxyKey, Session, McpServer, UniModel } from './types'
 
 // ===== 内存缓存（P1：降低热路径 KV 读放大）=====
 // 每个 isolate 内缓存 KV 原始文本 + 10s TTL；写路径同步刷新缓存。
@@ -32,6 +32,70 @@ function rawCacheGet(cache: Map<string, RawCacheEntry>, key: string): string | u
 }
 function rawCacheSet(cache: Map<string, RawCacheEntry>, key: string, text: string): void {
   cache.set(key, { text, at: Date.now() })
+}
+
+// ===== 内存缓存可视化（P4：管理后台可见可管）=====
+// 缓存是 isolate 本地的，多 isolate 部署时每个实例各自缓存、各自失效。
+// 面板仅能查看清空「当前实例」的缓存，无需也不应该跨实例同步。
+
+export interface CacheEntryView {
+  /** 原始 KV key */
+  key: string
+  /** 可读名称 */
+  label: string
+  /** 缓存文本大小（字节） */
+  size: number
+  /** 已缓存时长（毫秒） */
+  ageMs: number
+  /** TTL（毫秒） */
+  ttlMs: number
+}
+
+const cacheRegistry: Array<{ key: string; label: string; cache: Map<string, RawCacheEntry> }> = [
+  { key: KV_KEYS.PROVIDERS, label: '提供商配置 (providers)', cache: providersCache },
+  { key: KV_KEYS.PROXY_KEYS, label: '转发 Key (proxy:keys)', cache: proxyKeysCache },
+]
+
+export function getCacheEntries(): CacheEntryView[] {
+  const now = Date.now()
+  const views: CacheEntryView[] = []
+  for (const reg of cacheRegistry) {
+    const entry = reg.cache.get(reg.key)
+    if (!entry) continue
+    if (now - entry.at > CACHE_TTL_MS) {
+      reg.cache.delete(reg.key)
+      continue
+    }
+    views.push({
+      key: reg.key,
+      label: reg.label,
+      size: new TextEncoder().encode(entry.text).length,
+      ageMs: now - entry.at,
+      ttlMs: CACHE_TTL_MS,
+    })
+  }
+  return views
+}
+
+/** 删除指定缓存项，不存在返回 false */
+export function deleteCacheEntry(key: string): boolean {
+  for (const reg of cacheRegistry) {
+    if (reg.key === key && reg.cache.has(key)) {
+      reg.cache.delete(key)
+      return true
+    }
+  }
+  return false
+}
+
+/** 清空全部缓存，返回清理的条目数 */
+export function clearCache(): { cleared: number; total: number } {
+  const total = cacheRegistry.length
+  let cleared = 0
+  for (const reg of cacheRegistry) {
+    if (reg.cache.delete(reg.key)) cleared++
+  }
+  return { cleared, total }
 }
 
 /** 安全 JSON.parse：KV 数据损坏 / 结构不符时回退默认值，避免连锁 500（R7） */
@@ -156,6 +220,85 @@ export async function getSession(env: Env, sessionId: string): Promise<Session |
 
 export async function deleteSession(env: Env, sessionId: string): Promise<void> {
   await env.KV.delete(KV_KEYS.SESSION_PREFIX + sessionId)
+}
+
+// ===== MCP Server CRUD（MCP 聚合网关） =====
+
+export async function getMcps(env: Env): Promise<McpServer[]> {
+  const data = await env.KV.get(KV_KEYS.MCPS)
+  return safeParseArray<McpServer>(data, [])
+}
+
+export async function setMcps(env: Env, mcps: McpServer[]): Promise<void> {
+  await env.KV.put(KV_KEYS.MCPS, JSON.stringify(mcps))
+}
+
+export async function getMcp(env: Env, id: string): Promise<McpServer | null> {
+  const mcps = await getMcps(env)
+  return mcps.find((m) => m.id === id || m.name === id) ?? null
+}
+
+export async function addMcp(env: Env, mcp: McpServer): Promise<void> {
+  const mcps = await getMcps(env)
+  mcps.push(mcp)
+  await setMcps(env, mcps)
+}
+
+export async function updateMcp(env: Env, id: string, updates: Partial<McpServer>): Promise<McpServer | null> {
+  const mcps = await getMcps(env)
+  const index = mcps.findIndex((m) => m.id === id)
+  if (index === -1) return null
+  mcps[index] = { ...mcps[index], ...updates, updatedAt: new Date().toISOString() }
+  await setMcps(env, mcps)
+  return mcps[index]
+}
+
+export async function deleteMcp(env: Env, id: string): Promise<boolean> {
+  const mcps = await getMcps(env)
+  const filtered = mcps.filter((m) => m.id !== id)
+  if (filtered.length === mcps.length) return false
+  await setMcps(env, filtered)
+  return true
+}
+
+// ===== 联合模型（uni-model）CRUD =====
+
+export async function getUnimodels(env: Env): Promise<UniModel[]> {
+  const data = await env.KV.get(KV_KEYS.UNIMODELS)
+  return safeParseArray<UniModel>(data, [])
+}
+
+export async function setUnimodels(env: Env, unimodels: UniModel[]): Promise<void> {
+  await env.KV.put(KV_KEYS.UNIMODELS, JSON.stringify(unimodels))
+}
+
+export async function getUnimodel(env: Env, id: string): Promise<UniModel | null> {
+  const unimodels = await getUnimodels(env)
+  // 顶层模型 ID 形如 unimodel/<name>，转发时按 name 查找；同时兼容按 id 查找
+  return unimodels.find((u) => u.id === id || u.name === id) ?? null
+}
+
+export async function addUnimodel(env: Env, unimodel: UniModel): Promise<void> {
+  const unimodels = await getUnimodels(env)
+  unimodels.push(unimodel)
+  await setUnimodels(env, unimodels)
+}
+
+export async function updateUnimodel(env: Env, id: string, updates: Partial<UniModel>): Promise<UniModel | null> {
+  const unimodels = await getUnimodels(env)
+  const index = unimodels.findIndex((u) => u.id === id)
+  if (index === -1) return null
+  unimodels[index] = { ...unimodels[index], ...updates, updatedAt: new Date().toISOString() }
+  await setUnimodels(env, unimodels)
+  return unimodels[index]
+}
+
+export async function deleteUnimodel(env: Env, id: string): Promise<boolean> {
+  const unimodels = await getUnimodels(env)
+  const filtered = unimodels.filter((u) => u.id !== id)
+  if (filtered.length === unimodels.length) return false
+  await setUnimodels(env, filtered)
+  return true
 }
 
 // ===== 转发 Key =====

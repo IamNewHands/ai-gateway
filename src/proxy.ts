@@ -1,6 +1,6 @@
 import { Context } from 'hono'
-import { getProvider, getProviders, resolveProviderBaseUrl } from './storage'
-import { KV_KEYS, KEY_HEALTH_COOLDOWN_MS, KEY_HEALTH_MAX_FAILURES } from './config'
+import { getProvider, getProviders, getUnimodel, getUnimodels, resolveProviderBaseUrl } from './storage'
+import { KV_KEYS, KEY_HEALTH_COOLDOWN_MS, KEY_HEALTH_MAX_FAILURES, UNIMODEL_PROVIDER_ID } from './config'
 import type { AppEnv, Env, ProxyRequestBody } from './types'
 import { createAnalyticsContext, normalizeAnthropicUsage, normalizeChatUsage, normalizeResponsesUsage, summarizeError } from './analytics/types'
 import type { AnalyticsContext, UsageMetrics } from './analytics/types'
@@ -485,6 +485,27 @@ function passthroughResponse(response: Response, cleanFn?: (chunk: string) => st
 const isStreamRequest = (body: ProxyRequestBody): boolean => body.stream === true
 const getRoute = (url: URL): string => url.pathname.replace(/^\/v1\//, '') || 'chat/completions'
 
+// P7：上游请求头白名单透传（从 aihub 移植）。
+// 客户端发来的一层自定义头（如 OpenRouter 的 X-Title / HTTP-Referer、x-api-key 认证、
+// Anthropic 的 anthropic-version / anthropic-beta、企业网关 user- 身份头）默认被丢弃，
+// 这里按前缀白名单透传给上游。仅过滤前缀，无需关心值内容。
+const PASSTHROUGH_HEADER_PREFIXES = ['x-', 'anthropic-', 'user-', 'referer', 'http-referer']
+
+/**
+ * 从客户端请求中收集白名单前缀头（小写匹配，保留原始大小写），供转发上游时附加。
+ * 独立于具体转发路径：通用转发 / opencode / qoder 等均可复用。
+ */
+export function buildPassthroughHeaders(c: Context<AppEnv>): Record<string, string> {
+  const out: Record<string, string> = {}
+  for (const [key, value] of c.req.raw.headers.entries()) {
+    const lower = key.toLowerCase()
+    if (PASSTHROUGH_HEADER_PREFIXES.some((p) => lower.startsWith(p)) && value) {
+      out[key] = value
+    }
+  }
+  return out
+}
+
 /**
  * P2：上游 fetch——取消「5 分钟整体超时」对流式 body 的持续生效（长思考/agent 中途被掐断）。
  * - 非流式：保持原有 AbortSignal.timeout(总超时) 行为。
@@ -719,6 +740,58 @@ export async function forwardProxy(
       }
     }
 
+    // uni-model 联合模型（从 aihub 移植）：一个逻辑模型名映射一组 providerId/modelId 候选，
+    // 按顺序逐个递归 failover，第一个成功即返回。顶层模型 ID 形如 unimodel/xxx。
+    if (providerId === UNIMODEL_PROVIDER_ID) {
+      const unimodel = await getUnimodel(c.env, modelId)
+      if (!unimodel) {
+        return c.json({
+          error: { message: `联合模型 "${modelId}" 不存在，请先在管理后台配置`, type: 'invalid_request_error' },
+        }, 404)
+      }
+      if (!unimodel.enabled) {
+        return c.json({
+          error: { message: `联合模型 "${unimodel.name}" 已禁用`, type: 'model_disabled' },
+        }, 403)
+      }
+      if (unimodel.models.length === 0) {
+        return c.json({
+          error: { message: `联合模型 "${unimodel.name}" 未配置候选模型`, type: 'configuration_error' },
+        }, 500)
+      }
+
+      // 递归转发期间不做候选模型的 Key 权限二次校验（顶层 unimodel/xxx 已校验通过即可访问组内全部候选）
+      const savedProxyKey = (c as any).get('proxyKey')
+      ;(c as any).set('proxyKey', undefined)
+      try {
+        let lastError: { status: number; data: string } | null = null
+        for (const ref of unimodel.models) {
+          let resp: Response
+          try {
+            resp = await forwardProxy(c, { ...body, model: ref }, method)
+          } catch (err) {
+            lastError = { status: 502, data: err instanceof Error ? err.message : String(err) }
+            continue
+          }
+          if (resp.status >= 200 && resp.status < 300) {
+            try { c.executionCtx.waitUntil(writeLog(c.env, 'request', `[联合模型 ${unimodel.name}] ${model} → ${ref} 成功`)) } catch { /* log failure must not break */ }
+            return resp
+          }
+          lastError = { status: resp.status, data: (await resp.text().catch(() => '')).substring(0, 500) }
+        }
+        // 全部候选失败
+        return c.json({
+          error: {
+            message: `联合模型 "${unimodel.name}" 所有候选均失败，最后一次错误: HTTP ${lastError?.status || 502}`,
+            type: 'unimodel_exhausted',
+            detail: lastError?.data || '',
+          },
+        }, (lastError?.status || 502) as Parameters<typeof c.json>[1])
+      } finally {
+        ;(c as any).set('proxyKey', savedProxyKey)
+      }
+    }
+
     const provider = await getProvider(c.env, providerId)
 
     if (!provider) {
@@ -735,11 +808,14 @@ export async function forwardProxy(
 
     const modelConfig = provider.models.find((m) => m.id === modelId)
     if (!modelConfig) {
-      return c.json({
-        error: { message: `模型 "${modelId}" 未在提供商 "${provider.name}" 中配置`, type: 'invalid_request_error' },
-      }, 404)
-    }
-    if (!modelConfig.enabled) {
+      // P6：允许未配置模型透传开关开启时跳过"未配置"校验，模型是否有效交由上游判断
+      //（适合模型频繁上架、不想每次后台手动加模型的提供商）。
+      if (!provider.allowUnlistedModels) {
+        return c.json({
+          error: { message: `模型 "${modelId}" 未在提供商 "${provider.name}" 中配置`, type: 'invalid_request_error' },
+        }, 404)
+      }
+    } else if (!modelConfig.enabled) {
       return c.json({
         error: { message: `模型 "${modelId}" 已禁用`, type: 'model_disabled' },
       }, 403)
@@ -970,6 +1046,8 @@ export async function forwardProxy(
       const forwardHeaders: Record<string, string> = {
         'Content-Type': 'application/json',
         'Authorization': `Bearer ${apiKey}`,
+        // P7：白名单前缀头（x- / anthropic- / user-）透传，供上游识别客户端
+        ...buildPassthroughHeaders(c),
       }
       const requestBody = JSON.stringify(forwardBody)
       const isStream = isStreamRequest(forwardBody as ProxyRequestBody)
@@ -1331,6 +1409,22 @@ export async function handleModels(c: Context<AppEnv>) {
         owned_by: provider.id,
       })
     }
+  }
+
+  // 注入联合模型（uni-model）条目（模型 ID 形如 unimodel/xxx）
+  const unimodels = await getUnimodels(c.env)
+  for (const um of unimodels) {
+    if (!um.enabled) continue
+    const fullId = `${UNIMODEL_PROVIDER_ID}/${um.name}`
+    if (allowSet && !allowSet.has(fullId)) continue
+    models.push({
+      id: fullId,
+      provider: UNIMODEL_PROVIDER_ID,
+      provider_name: '联合模型',
+      object: 'model',
+      created: Math.floor(Date.now() / 1000),
+      owned_by: UNIMODEL_PROVIDER_ID,
+    })
   }
 
   return c.json({

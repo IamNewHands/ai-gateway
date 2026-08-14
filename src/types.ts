@@ -37,6 +37,13 @@ export interface Provider {
   type?: 'vision-bridge'
   /** type === 'vision-bridge' 时的桥配置 */
   visionBridge?: VisionBridgeConfig
+  /**
+   * 允许未配置模型透传（P6 后台开关，从 aihub 移植）。
+   * 开启后，请求该提供商的任意 modelId 都直接转发（跳过"模型未配置"校验），
+   * 适合模型频繁新增上架、不想每次后台手动加模型的提供商（如 OpenRouter）。
+   * 关闭（默认）则保持原有预配置校验。
+   */
+  allowUnlistedModels?: boolean
 }
 
 /**
@@ -173,6 +180,36 @@ export interface ProxyKey {
   allowedModels?: string[]
 }
 
+/**
+ * MCP Server 配置（MCP 聚合网关用）。
+ * 网关聚合多个 MCP Server 的工具列表并统一路由 tools/call。
+ * 工具名命名空间：`${name(空格转下划线)}-${工具名}`。
+ */
+export interface McpServer {
+  id: string
+  name: string
+  url: string
+  /** 请求上游时附加的 HTTP 头（如鉴权头） */
+  httpHeaders: Record<string, string>
+  enabled: boolean
+  createdAt: string
+  updatedAt: string
+}
+
+/**
+ * 联合模型（uni-model）：一个逻辑模型名映射一组 `提供商ID/模型ID`，
+ * 调用时按顺序逐个 failover，第一个成功即返回。模型 ID 形如 `unimodel/xxx`。
+ */
+export interface UniModel {
+  id: string
+  name: string
+  /** 候选模型引用列表，格式 `providerId/modelId`，按顺序 failover */
+  models: string[]
+  enabled: boolean
+  createdAt: string
+  updatedAt: string
+}
+
 export interface Session {
   username: string
   expiresAt: number
@@ -205,6 +242,7 @@ export interface CreateProviderRequest {
   type?: 'vision-bridge'
   visionBridge?: VisionBridgeConfig
   toolBridge?: boolean
+  allowUnlistedModels?: boolean
 }
 
 export interface UpdateProviderRequest {
@@ -221,6 +259,7 @@ export interface UpdateProviderRequest {
   visionBridge?: VisionBridgeConfig | null
   /** 传 null 可清除工具桥开关 */
   toolBridge?: boolean | null
+  allowUnlistedModels?: boolean
 }
 
 /**
@@ -241,6 +280,7 @@ export interface UpsertProviderRequest {
   models?: Array<Model | string>
   enabled?: boolean
   toolBridge?: boolean
+  allowUnlistedModels?: boolean
 }
 
 /**

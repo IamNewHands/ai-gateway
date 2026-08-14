@@ -1,5 +1,5 @@
 import { Context } from 'hono'
-import { getProviders, getProxyKeys } from './storage'
+import { getProviders, getProxyKeys, getMcps, getUnimodels } from './storage'
 import { SITE_CONFIG, OPENCODE_DEFAULT_URL } from './config'
 import type { AppEnv, OAuthDeviceConfig } from './types'
 import { CSS_CONTENT } from './pages.css'
@@ -376,6 +376,8 @@ ${H('登录')}
 export async function renderAdminPage(c: Context<AppEnv>) {
   const providers = await getProviders(c.env)
   const proxyKeys = await getProxyKeys(c.env)
+  const mcps = await getMcps(c.env)
+  const unimodels = await getUnimodels(c.env)
   const enabledProvidersCount = providers.filter((provider) => provider.enabled).length
   const modelsCount = providers.reduce((total, provider) => total + provider.models.length, 0)
   const enabledModelsCount = providers.reduce((total, provider) => total + provider.models.filter((model) => model.enabled).length, 0)
@@ -407,6 +409,9 @@ ${H('管理')}
       <a class="admin-nav__link" href="#usage-logs"><i class="fas fa-clipboard-list" aria-hidden="true"></i><span>详细日志</span></a>
       <a class="admin-nav__link" href="#logs"><i class="fas fa-list-alt" aria-hidden="true"></i><span>系统日志</span></a>
 <a class="admin-nav__link" href="#checkin"><i class="fas fa-calendar-check" aria-hidden="true"></i><span>签到</span><b>${providers.filter((p:any)=>p.authType==='oauth-device'&&p.oauth).length}</b></a>
+      <a class="admin-nav__link" href="#mcps"><i class="fas fa-boxes" aria-hidden="true"></i><span>MCP 网关</span><b>${mcps.length}</b></a>
+      <a class="admin-nav__link" href="#unimodels"><i class="fas fa-layer-group" aria-hidden="true"></i><span>联合模型</span><b>${unimodels.length}</b></a>
+      <a class="admin-nav__link" href="#cache"><i class="fas fa-memory" aria-hidden="true"></i><span>内存缓存</span></a>
     </nav>
     <div class="admin-rail__foot">
       <a href="/" class="admin-nav__link"><i class="fas fa-arrow-left" aria-hidden="true"></i><span>返回首页</span></a>
@@ -417,7 +422,7 @@ ${H('管理')}
   <div class="admin-main">
     <header class="admin-topbar">
       <a class="brand" href="/"><span class="brand__mark" aria-hidden="true"><i class="fas fa-cloud"></i></span><span class="brand__name">${SITE_CONFIG.title}</span></a>
-      <nav aria-label="移动端控制台导航"><a href="#overview">概览</a><a href="#providers">提供商</a><a href="#proxy-keys">Key</a><a href="#analytics">统计</a><a href="#usage-logs">日志</a><a href="#checkin">签到</a><a href="#logs">系统日志</a></nav>
+      <nav aria-label="移动端控制台导航"><a href="#overview">概览</a><a href="#providers">提供商</a><a href="#proxy-keys">Key</a><a href="#analytics">统计</a><a href="#usage-logs">日志</a><a href="#checkin">签到</a><a href="#mcps">MCP</a><a href="#unimodels">联合</a><a href="#cache">缓存</a><a href="#logs">系统日志</a></nav>
       <a class="icon-btn" href="javascript:void(0)" onclick="doLogout()" aria-label="退出登录"><i class="fas fa-sign-out-alt" aria-hidden="true"></i></a>
     </header>
 
@@ -559,6 +564,7 @@ ${H('管理')}
               </fieldset>
             </div>
             <fieldset class="form-group" id="atb-fs"><legend>工具桥</legend><label class="switch-label"><span>启用工具桥（XYML 提示词注入 + 流式解析回 tool_calls，仅 CNB 需要）</span><span class="tg"><input type="checkbox" id="atb"><span class="sl"></span></span></label></fieldset>
+            <fieldset class="form-group" id="aum-fs"><legend>模型策略</legend><label class="switch-label"><span>允许未配置模型透传——开启后请求该提供商的任意 modelId 都直接转发（跳过「未配置」校验），适合模型频繁上架、不想每次手动加模型的提供商（如 OpenRouter）。</span><span class="tg"><input type="checkbox" id="aum"><span class="sl"></span></span></label></fieldset>
             <div class="panel-actions"><label class="switch-label"><span>创建后立即启用</span><span class="tg"><input type="checkbox" checked id="aen"><span class="sl"></span></span></label><div><button class="btn btn-s" onclick="hideAdd()">取消</button><button class="btn btn-p" onclick="createProv()"><i class="fas fa-check" aria-hidden="true"></i>创建提供商</button></div></div>
             <div id="atestR" class="mt-1" aria-live="polite"></div>
           </div>
@@ -611,6 +617,7 @@ ${H('管理')}
                 </fieldset>
               </div>
               <fieldset class="form-group" id="atb-fs-${escapePageHtml(p.id)}"><legend>工具桥</legend><label class="switch-label"><span>启用工具桥（XYML 提示词注入 + 流式解析回 tool_calls，仅 CNB 需要）</span><span class="tg"><input type="checkbox" id="atb-${escapePageHtml(p.id)}" ${p.toolBridge?'checked':''}><span class="sl"></span></span></label></fieldset>
+              <fieldset class="form-group" id="aum-fs-${escapePageHtml(p.id)}"><legend>模型策略</legend><label class="switch-label"><span>允许未配置模型透传——开启后请求该提供商的任意 modelId 都直接转发（跳过「未配置」校验），适合模型频繁上架、不想每次手动加模型的提供商（如 OpenRouter）。</span><span class="tg"><input type="checkbox" id="aum-${escapePageHtml(p.id)}" ${p.allowUnlistedModels?'checked':''}><span class="sl"></span></span></label></fieldset>
               <div class="detail-actions"><div id="tr-${escapePageHtml(p.id)}" aria-live="polite"></div><div>${(p.id === 'cnb' || (p.baseUrl && p.baseUrl.indexOf('cnb.cool') !== -1)) ? '<button class="btn btn-s" onclick="fetchOauthModels(\'' + escapePageJsx(p.id) + '\')"><i class="fas fa-download" aria-hidden="true"></i>获取模型</button>' : (p.apiType === 'openai' || p.id === 'cline' || p.id === 'opencode') ? '<button class="btn btn-s" onclick="fetchEditModels(\'' + escapePageJsx(p.id) + '\')"><i class="fas fa-download" aria-hidden="true"></i>获取模型</button>' : ''}${p.id === 'cline' ? '<button class="btn btn-s" onclick="clineOAuthConnect(\'' + escapePageJsx(p.id) + '\')"><i class="fas fa-sign-in-alt" aria-hidden="true"></i>一键授权获取 Token</button>' : ''}<button class="btn btn-d" onclick="del('${escapePageJsx(p.id)}')"><i class="fas fa-trash" aria-hidden="true"></i>删除</button><button class="btn btn-p" onclick="save('${escapePageJsx(p.id)}')"><i class="fas fa-save" aria-hidden="true"></i>保存更改</button></div></div>
             </div>
           </article>`).join('') : `<div class="empty-state"><i class="fas fa-server" aria-hidden="true"></i><h3>还没有提供商</h3><p>添加第一个上游提供商，配置 API 地址、Key 和模型。</p><button class="btn btn-p" onclick="showAdd()">添加提供商</button></div>`}
@@ -640,6 +647,60 @@ ${H('管理')}
         <div class="section-heading section-heading--admin"><div><h2 id="checkin-title">WorkBuddy 签到</h2><p>每日签到领取免费积分。仅 CN 账号可签到，国际版自动跳过。定时任务每天 09:00/21:00 自动执行。</p></div><div><button class="btn btn-gh btn-xs" onclick="loadCheckin()" style="margin-left:8px"><i class="fas fa-sync-alt"></i></button><button class="btn btn-p btn-xs" onclick="triggerCheckin()"><i class="fas fa-calendar-check" aria-hidden="true"></i>全部签到</button></div></div>
         <div id="checkin-list" class="key-list">
           <div class="empty-state"><i class="fas fa-calendar-check" aria-hidden="true"></i><h3>暂无签到数据</h3><p>配置 WorkBuddy / QoderWork OAuth 提供商后，点击「全部签到」。</p></div>
+        </div>
+      </section>
+
+      <!-- ===== MCP 聚合网关 ===== -->
+      <section id="mcps" class="workspace-section" aria-labelledby="mcps-title">
+        <div class="section-heading section-heading--admin">
+          <div><h2 id="mcps-title">MCP 网关</h2><p>聚合多个 MCP Server 的工具，统一暴露 JSON-RPC 端点 <code>/v1/mcp</code>（需转发 Key 认证）。工具名自动加前缀 <code>{MCP名称}-</code> 隔离命名空间。</p></div>
+          <button class="btn btn-p" onclick="mcpFormModal()"><i class="fas fa-plus" aria-hidden="true"></i>添加 MCP</button>
+        </div>
+        <div class="key-list">
+          ${mcps.length===0?'<div class="empty-state"><i class="fas fa-boxes" aria-hidden="true"></i><h3>还没有 MCP Server</h3><p>添加 MCP Server 后，其 tools/list 工具会聚合到 <code>/v1/mcp</code>，支持 tools/call 路由。</p><button class="btn btn-p" onclick="mcpFormModal()">添加 MCP</button></div>':''}
+          ${mcps.map(m=>`<article class="ki" data-id="${escapePageHtml(m.id)}">
+            <div class="key-main"><span class="key-icon" aria-hidden="true"><i class="fas fa-boxes"></i></span>
+              <div><h3>${escapePageHtml(m.name)} <span class="bd ${m.enabled?'bd-on':'bd-off'}">${m.enabled?'已启用':'已禁用'}</span></h3>
+              <p><code>${escapePageHtml(m.url)}</code>${Object.keys(m.httpHeaders||{}).length>0?' · '+Object.keys(m.httpHeaders).length+' 个请求头':''}</p></div>
+            </div>
+            <div class="key-actions">
+              <label class="tg"><input type="checkbox" ${m.enabled?'checked':''} onchange="mcpToggle('${escapePageJsx(m.id)}',this.checked)" aria-label="启用 ${escapePageHtml(m.name)}"><span class="sl"></span></label>
+              <button class="btn btn-gh btn-xs" onclick="mcpEdit('${escapePageJsx(m.id)}')" title="编辑"><i class="fas fa-edit" aria-hidden="true"></i>编辑</button>
+              <button class="btn btn-d btn-xs" onclick="mcpDel('${escapePageJsx(m.id)}')"><i class="fas fa-trash" aria-hidden="true"></i>删除</button>
+            </div>
+          </article>`).join('')}
+        </div>
+      </section>
+
+      <!-- ===== 联合模型（uni-model） ===== -->
+      <section id="unimodels" class="workspace-section" aria-labelledby="unimodels-title">
+        <div class="section-heading section-heading--admin">
+          <div><h2 id="unimodels-title">联合模型</h2><p>一个逻辑模型名映射一组 <code>providerId/modelId</code> 候选，调用时按顺序 failover。调用模型 ID：<code>unimodel/名称</code>。</p></div>
+          <button class="btn btn-p" onclick="unimodelFormModal()"><i class="fas fa-plus" aria-hidden="true"></i>添加联合模型</button>
+        </div>
+        <div class="key-list">
+          ${unimodels.length===0?'<div class="empty-state"><i class="fas fa-layer-group" aria-hidden="true"></i><h3>还没有联合模型</h3><p>把多个提供商的等价模型聚成一个逻辑模型，如 <code>unimodel/free-flash</code>。</p><button class="btn btn-p" onclick="unimodelFormModal()">添加联合模型</button></div>':''}
+          ${unimodels.map(u=>`<article class="ki" data-id="${escapePageHtml(u.id)}">
+            <div class="key-main"><span class="key-icon" aria-hidden="true"><i class="fas fa-layer-group"></i></span>
+              <div><h3>unimodel/${escapePageHtml(u.name)} <span class="bd ${u.enabled?'bd-on':'bd-off'}">${u.enabled?'已启用':'已禁用'}</span></h3>
+              <p>${(u.models||[]).map(ref=>`<code>${escapePageHtml(ref)}</code>`).join(' → ')}</p></div>
+            </div>
+            <div class="key-actions">
+              <label class="tg"><input type="checkbox" ${u.enabled?'checked':''} onchange="unimodelToggle('${escapePageJsx(u.id)}',this.checked)" aria-label="启用 unimodel/${escapePageHtml(u.name)}"><span class="sl"></span></label>
+              <button class="btn btn-gh btn-xs" onclick="unimodelEdit('${escapePageJsx(u.id)}')" title="编辑"><i class="fas fa-edit" aria-hidden="true"></i>编辑</button>
+              <button class="btn btn-d btn-xs" onclick="unimodelDel('${escapePageJsx(u.id)}')"><i class="fas fa-trash" aria-hidden="true"></i>删除</button>
+            </div>
+          </article>`).join('')}
+        </div>
+      </section>
+      <!-- ===== 内存缓存管理（P4） ===== -->
+      <section id="cache" class="workspace-section" aria-labelledby="cache-title">
+        <div class="section-heading section-heading--admin">
+          <div><h2 id="cache-title">内存缓存</h2><p>热路径 KV 读的 10s 内存缓存（当前 isolate 实例）。外部直接改 KV 后，可在此手动清空让网关立即重读；也可点「清空全部」。</p></div>
+          <div><button class="btn btn-gh btn-xs" onclick="loadCache()" style="margin-left:8px"><i class="fas fa-sync-alt"></i></button><button class="btn btn-d btn-xs" onclick="cacheClear()"><i class="fas fa-trash" aria-hidden="true"></i>清空全部</button></div>
+        </div>
+        <div id="cache-list" class="key-list">
+          <div class="empty-state"><i class="fas fa-memory" aria-hidden="true"></i><h3>加载中…</h3></div>
         </div>
       </section>
     </main>
@@ -980,7 +1041,7 @@ async function createProv(opts) {
     const r = await fetch('/admin/api/providers', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ id, name: nm, baseUrl: url, apiType, authType, oauth: authType === 'oauth-device' ? oauth : undefined, apiKeys: keys, models, enabled, toolBridge: (document.getElementById('atb')||{}).checked === true, type: vb && vb.primary ? 'vision-bridge' : undefined, visionBridge: vb })
+      body: JSON.stringify({ id, name: nm, baseUrl: url, apiType, authType, oauth: authType === 'oauth-device' ? oauth : undefined, apiKeys: keys, models, enabled, toolBridge: (document.getElementById('atb')||{}).checked === true, allowUnlistedModels: (document.getElementById('aum')||{}).checked === true, type: vb && vb.primary ? 'vision-bridge' : undefined, visionBridge: vb })
     })
     const d = await r.json()
     if (d.success) {
@@ -1597,7 +1658,7 @@ async function save(id) {
     const r = await fetch('/admin/api/providers/' + encodeURIComponent(id), {
       method: 'PUT',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ name: nm, baseUrl: url, apiType, authType, oauth: authType === 'oauth-device' ? oauth : undefined, apiKeys: keys, models, enabled, toolBridge: (document.getElementById('atb-' + id)||{}).checked === true, type: vb && vb.primary ? 'vision-bridge' : null, visionBridge: vb })
+      body: JSON.stringify({ name: nm, baseUrl: url, apiType, authType, oauth: authType === 'oauth-device' ? oauth : undefined, apiKeys: keys, models, enabled, toolBridge: (document.getElementById('atb-' + id)||{}).checked === true, allowUnlistedModels: (document.getElementById('aum-' + id)||{}).checked === true, type: vb && vb.primary ? 'vision-bridge' : null, visionBridge: vb })
     })
     const d = await r.json()
     if (d.success) { toast('已保存', 'success'); reloadAdmin() }
@@ -2168,6 +2229,144 @@ async function triggerCheckin(id) {
 renumberVisionOrders();
 // UX2：上次 reload 前保存的滚动位置/展开面板在此恢复
 restoreAdminState();
+
+// ===== MCP 网关管理 =====
+const MCPS = ${JSON.stringify(mcps).replace(/</g, '\\u003c')};
+const UNIMODELS = ${JSON.stringify(unimodels).replace(/</g, '\\u003c')};
+function mcpFind(id) {
+  for (var i = 0; i < MCPS.length; i++) if (MCPS[i].id === id) return MCPS[i]
+  return null
+}
+function mcpFormModal(m) {
+  var h = '<h3><i class="fas fa-boxes c-p"></i> ' + (m ? '编辑 MCP Server' : '添加 MCP Server') + '</h3>'
+  h += '<div class="fg"><label>名称</label><input type="text" id="mcp-name" value="' + (m ? escapeHtml(m.name) : '') + '" placeholder="如：网络搜索"></div>'
+  h += '<div class="fg"><label>URL（MCP JSON-RPC 端点）</label><input type="url" id="mcp-url" value="' + (m ? escapeHtml(m.url) : '') + '" placeholder="https://example.com/mcp"></div>'
+  h += '<div class="fg"><label>HTTP 头（JSON，可选）</label><textarea id="mcp-headers" rows="3" placeholder=\'{"Authorization":"Bearer xxx"}\'>' + (m ? escapeHtml(JSON.stringify(m.httpHeaders || {}, null, 2)) : '') + '</textarea><span class="form-helper">工具名自动加前缀「' + (m ? escapeHtml(m.name) : '名称') + '-」，名称中的空格变下划线。</span></div>'
+  h += '<div class="panel-actions"><label class="switch-label"><span>启用</span><span class="tg"><input type="checkbox" id="mcp-enabled"' + (!m || m.enabled ? ' checked' : '') + '><span class="sl"></span></span></label><div><button class="btn btn-s" onclick="closeM()">取消</button><button class="btn btn-p" onclick="mcpSave(\'' + (m ? escapeJsAttr(m.id) : '') + '\')">保存</button></div></div>'
+  showM(h)
+}
+function mcpEdit(id) { mcpFormModal(mcpFind(id)) }
+function mcpSave(id) {
+  var name = document.getElementById('mcp-name').value.trim()
+  var url = document.getElementById('mcp-url').value.trim()
+  var headersRaw = document.getElementById('mcp-headers').value.trim()
+  var enabled = document.getElementById('mcp-enabled').checked
+  if (!name || !url) { toast('名称和 URL 为必填项', 'error'); return }
+  var headers = {}
+  if (headersRaw) {
+    try { headers = JSON.parse(headersRaw) } catch (e) { toast('HTTP 头必须是合法 JSON', 'error'); return }
+  }
+  var payload = { name: name, url: url, httpHeaders: headers, enabled: enabled }
+  fetch(id ? '/admin/api/mcps/' + encodeURIComponent(id) : '/admin/api/mcps', {
+    method: id ? 'PUT' : 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload)
+  }).then(function (r) { return r.json() }).then(function (d) {
+    if (d.success) { closeM(); toast('保存成功', 'success'); setTimeout(function () { reloadAdmin() }, 300) }
+    else { toast(d.message || '保存失败', 'error') }
+  }).catch(function () { toast('网络错误', 'error') })
+}
+function mcpToggle(id, checked) {
+  fetch('/admin/api/mcps/' + encodeURIComponent(id), {
+    method: 'PUT', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ enabled: checked })
+  }).then(function (r) { return r.json() }).then(function (d) {
+    if (d.success) toast(checked ? '已启用' : '已禁用', 'success')
+    else toast(d.message || '操作失败', 'error')
+  })
+}
+function mcpDel(id) {
+  cM('确认删除该 MCP Server？').then(function (ok) {
+    if (!ok) return
+    fetch('/admin/api/mcps/' + encodeURIComponent(id), { method: 'DELETE' }).then(function (r) { return r.json() })
+      .then(function (d) { if (d.success) { toast('已删除', 'success'); setTimeout(function () { reloadAdmin() }, 300) } else toast(d.message || '删除失败', 'error') })
+  })
+}
+
+// ===== 联合模型（uni-model）管理 =====
+function unimodelFind(id) {
+  for (var i = 0; i < UNIMODELS.length; i++) if (UNIMODELS[i].id === id) return UNIMODELS[i]
+  return null
+}
+function unimodelFormModal(u) {
+  var h = '<h3><i class="fas fa-layer-group c-p"></i> ' + (u ? '编辑联合模型' : '添加联合模型') + '</h3>'
+  h += '<div class="fg"><label>名称</label><input type="text" id="um-name" value="' + (u ? escapeHtml(u.name) : '') + '" placeholder="如：free-flash"><span class="form-helper">调用模型 ID 为 unimodel/名称</span></div>'
+  h += '<div class="fg"><label>候选模型（每行一个 providerId/modelId）</label><textarea id="um-models" rows="5" placeholder="deepseek/deepseek-chat\\nopenrouter/deepseek/deepseek-chat-v3-0324:free">' + (u ? escapeHtml((u.models || []).join('\\n')) : '') + '</textarea><span class="form-helper">按顺序 failover，第一个成功即返回。候选须为已配置的 providerId/modelId。</span></div>'
+  h += '<div class="panel-actions"><label class="switch-label"><span>启用</span><span class="tg"><input type="checkbox" id="um-enabled"' + (!u || u.enabled ? ' checked' : '') + '><span class="sl"></span></span></label><div><button class="btn btn-s" onclick="closeM()">取消</button><button class="btn btn-p" onclick="unimodelSave(\'' + (u ? escapeJsAttr(u.id) : '') + '\')">保存</button></div></div>'
+  showM(h)
+}
+function unimodelEdit(id) { unimodelFormModal(unimodelFind(id)) }
+function unimodelSave(id) {
+  var name = document.getElementById('um-name').value.trim()
+  var enabled = document.getElementById('um-enabled').checked
+  var models = document.getElementById('um-models').value.split('\\n').map(function (s) { return s.trim() }).filter(Boolean)
+  if (!name) { toast('名称为必填项', 'error'); return }
+  if (models.length === 0) { toast('至少需要一个候选模型', 'error'); return }
+  var payload = { name: name, models: models, enabled: enabled }
+  fetch(id ? '/admin/api/unimodels/' + encodeURIComponent(id) : '/admin/api/unimodels', {
+    method: id ? 'PUT' : 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload)
+  }).then(function (r) { return r.json() }).then(function (d) {
+    if (d.success) { closeM(); toast('保存成功', 'success'); setTimeout(function () { reloadAdmin() }, 300) }
+    else { toast(d.message || '保存失败', 'error') }
+  }).catch(function () { toast('网络错误', 'error') })
+}
+function unimodelToggle(id, checked) {
+  fetch('/admin/api/unimodels/' + encodeURIComponent(id), {
+    method: 'PUT', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ enabled: checked })
+  }).then(function (r) { return r.json() }).then(function (d) {
+    if (d.success) toast(checked ? '已启用' : '已禁用', 'success')
+    else toast(d.message || '操作失败', 'error')
+  })
+}
+function unimodelDel(id) {
+  cM('确认删除该联合模型？').then(function (ok) {
+    if (!ok) return
+    fetch('/admin/api/unimodels/' + encodeURIComponent(id), { method: 'DELETE' }).then(function (r) { return r.json() })
+      .then(function (d) { if (d.success) { toast('已删除', 'success'); setTimeout(function () { reloadAdmin() }, 300) } else toast(d.message || '删除失败', 'error') })
+  })
+}
+
+// ===== 内存缓存管理（P4） =====
+async function loadCache() {
+  const el = document.getElementById('cache-list')
+  if (!el) return
+  const r = await fetch('/admin/api/cache')
+  const d = await r.json()
+  if (!d.success) { el.innerHTML = '<div class="empty-state"><i class="fas fa-exclamation-triangle"></i><h3>加载失败</h3><p>' + escapeHtml(d.message || '') + '</p></div>'; return }
+  const entries = d.data || []
+  if (entries.length === 0) {
+    el.innerHTML = '<div class="empty-state"><i class="fas fa-memory" aria-hidden="true"></i><h3>暂无缓存条目</h3><p>访问过 /v1 接口后，提供商配置与转发 Key 会进入 10s 内存缓存，届时可在此查看与管理。</p></div>'
+    return
+  }
+  el.innerHTML = entries.map(function (e) {
+    var age = Math.round(e.ageMs / 1000)
+    var ttl = Math.round(e.ttlMs / 1000)
+    return '<article class="ki" data-key="' + escapeHtml(e.key) + '"><div class="key-main"><span class="key-icon" aria-hidden="true"><i class="fas fa-memory"></i></span><div><h3>' + escapeHtml(e.label) + '</h3><p>大小 ' + (e.size / 1024).toFixed(1) + ' KB · 已缓存 ' + age + 's / TTL ' + ttl + 's · KV key: <code>' + escapeHtml(e.key) + '</code></p></div></div><div class="key-actions"><button class="btn btn-d btn-xs" onclick="cacheDel(\'' + escapeJsAttr(e.key) + '\')"><i class="fas fa-trash" aria-hidden="true"></i>清除</button></div></article>'
+  }).join('')
+}
+function cacheDel(key) {
+  fetch('/admin/api/cache/' + encodeURIComponent(key), { method: 'DELETE' }).then(function (r) { return r.json() })
+    .then(function (d) { if (d.success) { toast('已清除', 'success'); loadCache() } else toast(d.message || '清除失败', 'error') })
+}
+function cacheClear() {
+  cM('确认清空全部内存缓存？下次请求将重新从 KV 读取。').then(function (ok) {
+    if (!ok) return
+    fetch('/admin/api/cache', { method: 'DELETE' }).then(function (r) { return r.json() })
+      .then(function (d) { if (d.success) { toast(d.message || '已清空', 'success'); loadCache() } else toast(d.message || '清空失败', 'error') })
+  })
+}
+// 与签到面板一致：页面加载时加载一次；进入 #cache 锚点时刷新
+function maybeLoadCache(hash) { if (hash === '#cache') loadCache() }
+window.addEventListener('hashchange', function () { maybeLoadCache(location.hash) })
+adminNavLinks.forEach(function (link) {
+  if (link.getAttribute('href') === '#cache') {
+    link.addEventListener('click', function () { setTimeout(loadCache, 50) })
+  }
+})
+setTimeout(loadCache, 0)
 </script>
 </body></html>`)
 }

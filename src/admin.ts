@@ -10,6 +10,18 @@ import {
   updateProxyKey,
   deleteProxyKey,
   resolveProviderBaseUrl,
+  getMcps,
+  addMcp,
+  updateMcp,
+  deleteMcp,
+  getUnimodels,
+  addUnimodel,
+  updateUnimodel,
+  deleteUnimodel,
+  getCacheEntries,
+  deleteCacheEntry,
+  clearCache,
+  type CacheEntryView,
 } from './storage'
 import { testModelConnection } from './proxy'
 import { fetchOpenCodeModels, isOpenCodeProvider, resolveOpenCodeUrls, testOpenCodeModel } from './opencode'
@@ -32,6 +44,8 @@ import type {
   CreateProxyKeyRequest,
   TestModelRequest,
   OAuthDeviceConfig,
+  McpServer,
+  UniModel,
 } from './types'
 
 // ===== 系统状态 =====
@@ -194,6 +208,7 @@ export async function handleCreateProvider(c: Context<AppEnv>) {
     type: body.type,
     visionBridge: body.visionBridge,
     toolBridge: body.toolBridge,
+    allowUnlistedModels: body.allowUnlistedModels,
     apiKeys: normalizeArray(body.apiKeys, (k) => ({ key: k, enabled: true })),
     models: body.models
       ? normalizeArray(body.models, (m) => ({ id: m, enabled: true }))
@@ -230,6 +245,7 @@ export async function handleUpdateProvider(c: Context<AppEnv>) {
   if (body.type !== undefined) updates.type = body.type ?? undefined
   if (body.visionBridge !== undefined) updates.visionBridge = body.visionBridge ?? undefined
   if (body.toolBridge !== undefined) updates.toolBridge = body.toolBridge ?? undefined
+  if (body.allowUnlistedModels !== undefined) updates.allowUnlistedModels = body.allowUnlistedModels
 if (body.apiKeys !== undefined) {
     updates.apiKeys = normalizeArray(body.apiKeys, (k) => ({ key: k, enabled: true }))
   }
@@ -696,6 +712,192 @@ export async function handleTestModelNew(c: Context<AppEnv>) {
       data: { success: false, statusCode: 0, message: (err as Error).message || '连接失败' },
     })
   }
+}
+
+// ===== MCP Server 管理（MCP 聚合网关） =====
+
+/** 校验并归一化 httpHeaders：必须为普通对象，值统一转为字符串；非法返回 null */
+function normalizeHttpHeaders(value: unknown): Record<string, string> | null {
+  if (value === undefined || value === null) return {}
+  if (typeof value !== 'object' || Array.isArray(value)) return null
+  const out: Record<string, string> = {}
+  for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
+    out[k] = String(v)
+  }
+  return out
+}
+
+/** 校验 uni-model 候选模型列表：必须为数组、元素为非空字符串；非法的过滤并返回 */
+function normalizeUnimodelModels(value: unknown): string[] {
+  if (!Array.isArray(value)) return []
+  return value.filter((v): v is string => typeof v === 'string' && v.trim() !== '').map((v) => v.trim())
+}
+
+export async function handleGetMcps(c: Context<AppEnv>) {
+  const mcps = await getMcps(c.env)
+  return c.json<ApiResponse<McpServer[]>>({ success: true, data: mcps })
+}
+
+export async function handleCreateMcp(c: Context<AppEnv>) {
+  const body = await c.req.json<Partial<McpServer>>()
+  if (!body.name || !body.url) {
+    return c.json<ApiResponse>({ success: false, message: 'name、url 为必填项' }, 400)
+  }
+  if (!isSafeHttpUrl(body.url)) {
+    return c.json<ApiResponse>({ success: false, message: 'url 必须是合法的 http/https 公网地址' }, 400)
+  }
+  const httpHeaders = normalizeHttpHeaders(body.httpHeaders)
+  if (!httpHeaders) {
+    return c.json<ApiResponse>({ success: false, message: 'httpHeaders 必须是普通对象（如 {"Authorization":"Bearer xxx"}）' }, 400)
+  }
+
+  const mcps = await getMcps(c.env)
+  if (mcps.some((m) => m.name === body.name)) {
+    return c.json<ApiResponse>({ success: false, message: `MCP 名称 "${body.name}" 已存在` }, 409)
+  }
+
+  const now = new Date().toISOString()
+  const mcp: McpServer = {
+    id: body.id || crypto.randomUUID(),
+    name: body.name,
+    url: body.url.replace(/\/$/, ''),
+    httpHeaders,
+    enabled: body.enabled !== undefined ? body.enabled : true,
+    createdAt: now,
+    updatedAt: now,
+  }
+  await addMcp(c.env, mcp)
+  return c.json<ApiResponse<McpServer>>({ success: true, data: mcp }, 201)
+}
+
+export async function handleUpdateMcp(c: Context<AppEnv>) {
+  const id = c.req.param('id')
+  if (!id) return c.json<ApiResponse>({ success: false, message: '缺少 id 参数' }, 400)
+  const body = await c.req.json<Partial<McpServer>>()
+
+  const updates: Partial<McpServer> = {}
+  if (body.name !== undefined) {
+    if (!body.name) return c.json<ApiResponse>({ success: false, message: 'name 不能为空' }, 400)
+    const mcps = await getMcps(c.env)
+    if (mcps.some((m) => m.name === body.name && m.id !== id)) {
+      return c.json<ApiResponse>({ success: false, message: `MCP 名称 "${body.name}" 已存在` }, 409)
+    }
+    updates.name = body.name
+  }
+  if (body.url !== undefined) {
+    if (!isSafeHttpUrl(body.url)) {
+      return c.json<ApiResponse>({ success: false, message: 'url 必须是合法的 http/https 公网地址' }, 400)
+    }
+    updates.url = body.url.replace(/\/$/, '')
+  }
+  if (body.httpHeaders !== undefined) {
+    const httpHeaders = normalizeHttpHeaders(body.httpHeaders)
+    if (!httpHeaders) return c.json<ApiResponse>({ success: false, message: 'httpHeaders 必须是普通对象' }, 400)
+    updates.httpHeaders = httpHeaders
+  }
+  if (body.enabled !== undefined) updates.enabled = body.enabled
+
+  const updated = await updateMcp(c.env, id, updates)
+  if (!updated) return c.json<ApiResponse>({ success: false, message: 'MCP 不存在' }, 404)
+  return c.json<ApiResponse<McpServer>>({ success: true, data: updated })
+}
+
+export async function handleDeleteMcp(c: Context<AppEnv>) {
+  const id = c.req.param('id')
+  if (!id) return c.json<ApiResponse>({ success: false, message: '缺少 id 参数' }, 400)
+  const deleted = await deleteMcp(c.env, id)
+  if (!deleted) return c.json<ApiResponse>({ success: false, message: 'MCP 不存在' }, 404)
+  return c.json<ApiResponse>({ success: true })
+}
+
+// ===== 联合模型（uni-model）管理 =====
+
+export async function handleGetUnimodels(c: Context<AppEnv>) {
+  const unimodels = await getUnimodels(c.env)
+  return c.json<ApiResponse<UniModel[]>>({ success: true, data: unimodels })
+}
+
+export async function handleCreateUnimodel(c: Context<AppEnv>) {
+  const body = await c.req.json<Partial<UniModel>>()
+  if (!body.name) {
+    return c.json<ApiResponse>({ success: false, message: 'name 为必填项' }, 400)
+  }
+  const models = normalizeUnimodelModels(body.models)
+  if (models.length === 0) {
+    return c.json<ApiResponse>({ success: false, message: 'models 必须是非空数组（元素为 providerId/modelId）' }, 400)
+  }
+
+  const unimodels = await getUnimodels(c.env)
+  if (unimodels.some((u) => u.name === body.name)) {
+    return c.json<ApiResponse>({ success: false, message: `联合模型名称 "${body.name}" 已存在` }, 409)
+  }
+
+  const now = new Date().toISOString()
+  const unimodel: UniModel = {
+    id: body.id || crypto.randomUUID(),
+    name: body.name,
+    models,
+    enabled: body.enabled !== undefined ? body.enabled : true,
+    createdAt: now,
+    updatedAt: now,
+  }
+  await addUnimodel(c.env, unimodel)
+  return c.json<ApiResponse<UniModel>>({ success: true, data: unimodel }, 201)
+}
+
+export async function handleUpdateUnimodel(c: Context<AppEnv>) {
+  const id = c.req.param('id')
+  if (!id) return c.json<ApiResponse>({ success: false, message: '缺少 id 参数' }, 400)
+  const body = await c.req.json<Partial<UniModel>>()
+
+  const updates: Partial<UniModel> = {}
+  if (body.name !== undefined) {
+    if (!body.name) return c.json<ApiResponse>({ success: false, message: 'name 不能为空' }, 400)
+    const unimodels = await getUnimodels(c.env)
+    if (unimodels.some((u) => u.name === body.name && u.id !== id)) {
+      return c.json<ApiResponse>({ success: false, message: `联合模型名称 "${body.name}" 已存在` }, 409)
+    }
+    updates.name = body.name
+  }
+  if (body.models !== undefined) {
+    const models = normalizeUnimodelModels(body.models)
+    if (models.length === 0) {
+      return c.json<ApiResponse>({ success: false, message: 'models 必须是非空数组（元素为 providerId/modelId）' }, 400)
+    }
+    updates.models = models
+  }
+  if (body.enabled !== undefined) updates.enabled = body.enabled
+
+  const updated = await updateUnimodel(c.env, id, updates)
+  if (!updated) return c.json<ApiResponse>({ success: false, message: '联合模型不存在' }, 404)
+  return c.json<ApiResponse<UniModel>>({ success: true, data: updated })
+}
+
+export async function handleDeleteUnimodel(c: Context<AppEnv>) {
+  const id = c.req.param('id')
+  if (!id) return c.json<ApiResponse>({ success: false, message: '缺少 id 参数' }, 400)
+  const deleted = await deleteUnimodel(c.env, id)
+  if (!deleted) return c.json<ApiResponse>({ success: false, message: '联合模型不存在' }, 404)
+  return c.json<ApiResponse>({ success: true })
+}
+
+// ===== 内存缓存管理（P4）=====
+
+export async function handleGetCache(c: Context<AppEnv>) {
+  return c.json<ApiResponse<CacheEntryView[]>>({ success: true, data: getCacheEntries() })
+}
+
+export async function handleDeleteCache(c: Context<AppEnv>) {
+  const key = c.req.param('key')
+  if (!key) return c.json<ApiResponse>({ success: false, message: '缺少 key 参数' }, 400)
+  const deleted = deleteCacheEntry(decodeURIComponent(key))
+  if (!deleted) return c.json<ApiResponse>({ success: false, message: `缓存项 "${key}" 不存在` }, 404)
+  return c.json<ApiResponse>({ success: true, message: `已清除缓存 "${key}"` })
+}
+
+export async function handleClearCache(c: Context<AppEnv>) {
+  const { cleared, total } = clearCache()
+  return c.json<ApiResponse>({ success: true, message: `已清空缓存（${cleared}/${total}）`, data: { cleared, total } })
 }
 
 // ===== 转发 Key 管理 =====

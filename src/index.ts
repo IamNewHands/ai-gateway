@@ -30,7 +30,19 @@ import {
   handleLogsClear,
   handleLogConfig,
   writeLog,
+  handleGetMcps,
+  handleCreateMcp,
+  handleUpdateMcp,
+  handleDeleteMcp,
+  handleGetUnimodels,
+  handleCreateUnimodel,
+  handleUpdateUnimodel,
+  handleDeleteUnimodel,
+  handleGetCache,
+  handleDeleteCache,
+  handleClearCache,
 } from './admin'
+import { handleMcpJsonRpc } from './mcp-gateway'
 import { renderHomePage, renderLoginPage, renderAdminPage } from './pages'
 import { seedInitialData, getSession, getProviders } from './storage'
 import {
@@ -146,6 +158,23 @@ app.delete('/admin/api/logs', handleLogsClear)
 app.get('/admin/api/logs/config', handleLogConfig)
 app.post('/admin/api/logs/config', handleLogConfig)
 
+// MCP Server 管理（MCP 聚合网关）
+app.get('/admin/api/mcps', handleGetMcps)
+app.post('/admin/api/mcps', handleCreateMcp)
+app.put('/admin/api/mcps/:id', handleUpdateMcp)
+app.delete('/admin/api/mcps/:id', handleDeleteMcp)
+
+// 联合模型（uni-model）管理
+app.get('/admin/api/unimodels', handleGetUnimodels)
+app.post('/admin/api/unimodels', handleCreateUnimodel)
+app.put('/admin/api/unimodels/:id', handleUpdateUnimodel)
+app.delete('/admin/api/unimodels/:id', handleDeleteUnimodel)
+
+// 内存缓存管理（P4）
+app.get('/admin/api/cache', handleGetCache)
+app.delete('/admin/api/cache', handleClearCache)
+app.delete('/admin/api/cache/:key', handleDeleteCache)
+
 // 签到（浏览器面板用，需 session 认证）
 app.get('/admin/api/checkin/status', handleCheckinStatus)
 app.post('/admin/api/checkin', handleCheckinTrigger)
@@ -162,6 +191,9 @@ app.post('/api/manage/checkin/:id', handleCheckinTrigger)
 // ===== API 转发路由（需转发 Key 验证） =====
 app.use('/v1/*', proxyKeyAuthMiddleware)
 app.get('/v1/models', handleModels)
+
+// MCP 聚合网关（JSON-RPC，OpenAI 兼容端点之外的独立协议）
+app.post('/v1/mcp', handleMcpJsonRpc)
 
 // Anthropic Messages API — 必须在 /v1/* 通配之前注册
 app.post('/v1/messages', handleAnthropicMessages)
