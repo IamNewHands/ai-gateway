@@ -92,19 +92,26 @@ export async function testM365Model(
   provider: Provider,
   modelId: string
 ): Promise<{ success: boolean; message: string; statusCode?: number }> {
-  const resp = await proxyM365ChatRequest(
-    env,
-    provider,
-    { model: modelId, messages: [{ role: 'user', content: 'hi' }], stream: false }
-  )
-  if (resp.ok) {
-    return { success: true, message: '连接成功', statusCode: resp.status }
-  }
-  const text = await resp.text().catch(() => '')
-  let detail = text
   try {
-    const j = JSON.parse(text)
-    detail = j?.error?.message || text
-  } catch { /* keep text */ }
-  return { success: false, message: `HTTP ${resp.status}: ${detail.substring(0, 200)}`, statusCode: resp.status }
+    const resp = await proxyM365ChatRequest(
+      env,
+      provider,
+      { model: modelId, messages: [{ role: 'user', content: 'hi' }], stream: false }
+    )
+    if (resp.ok) {
+      return { success: true, message: '连接成功', statusCode: resp.status }
+    }
+    const text = await resp.text().catch(() => '')
+    let detail = text
+    try {
+      const j = JSON.parse(text)
+      detail = j?.error?.message || text
+    } catch { /* keep text */ }
+    console.error(`[m365-test-model] model=${modelId} status=${resp.status} detail=${detail.substring(0, 200)}`)
+    return { success: false, message: `HTTP ${resp.status}: ${detail.substring(0, 200)}`, statusCode: resp.status }
+  } catch (err) {
+    const msg = (err as Error)?.message || String(err)
+    console.error(`[m365-test-model] model=${modelId} 异常: ${msg}`)
+    return { success: false, message: `测试异常: ${msg.substring(0, 200)}`, statusCode: 0 }
+  }
 }

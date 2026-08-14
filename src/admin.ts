@@ -405,6 +405,12 @@ export async function handleTestModel(c: Context<AppEnv>) {
   // M365：走完整 ChatHub WS 链路发最小请求验证（网络代理配置异常时给出明确提示）
   if (isM365Provider(provider)) {
     const result = await testM365Model(c.env, provider, modelId)
+    // 写系统日志，便于排查连通性失败根因（token 失效 / DO 会话 / ChatHub WS 异常等）
+    if (!result.success) {
+      try {
+        await writeLog(c.env, 'error', `[m365-test-model] provider=${id} model=${modelId} → ${result.message}`)
+      } catch { /* ignore */ }
+    }
     return c.json<ApiResponse>({ success: true, data: result })
   }
 
