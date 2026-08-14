@@ -361,13 +361,18 @@ export async function chatWithHandlers(
     await uploadAttachments(acc, conversationId, req.attachments, opts)
   }
 
-  // 2) 建立出站 WS（fetch + Upgrade: websocket，兼容 Worker / DO，不依赖 connect 全局）
+  // 2) 建立出站 WS（Cloudflare 出站 WebSocket 需用 fetch + Upgrade 头，
+  //    且 URL 必须把 wss:// 转成 https://，不能直接用 wss 协议 fetch。
+  //    参考 openai-agents-js CloudflareRealtimeTransport：wss→https 后取 resp.webSocket.accept()）
   const wsURL = buildWSURL(acc, sessionId, conversationId, requestID)
   let socket: OutboundWebSocket
   try {
-    const resp = await fetch(wsURL, {
+    const httpUrl = wsURL.replace(/^wss:\/\//i, 'https://').replace(/^ws:\/\//i, 'http://')
+    const resp = await fetch(httpUrl, {
+      method: 'GET',
       headers: {
         Upgrade: 'websocket',
+        Connection: 'Upgrade',
         Origin: 'https://m365.cloud.microsoft',
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:148.0) Gecko/20100101 Firefox/148.0',
       },

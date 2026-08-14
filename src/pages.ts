@@ -2100,6 +2100,13 @@ async function refreshLogs(isAuto) {
   if (logRefreshing) return
   logRefreshing = true
   const el = document.getElementById('log-list')
+  // 日志记录开关关闭时：刷新也保持「日志已关闭」占位，不向后端拉取历史日志
+  const sw = document.getElementById('log-switch')
+  if (sw && !sw.checked) {
+    el.innerHTML = '<div class="empty-state"><i class="fas fa-list-alt" aria-hidden="true"></i><h3>日志已关闭</h3><p>开启开关后开始记录。</p></div>'
+    logRefreshing = false
+    return
+  }
   // P7：定时自动刷新走静默模式——不闪「加载中」，内容未变化时不重绘 DOM
   if (!isAuto) el.innerHTML = '<div class="empty-state"><i class="fas fa-spinner fa-pulse"></i><h3>加载中…</h3></div>'
   try {
