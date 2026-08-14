@@ -13,6 +13,17 @@ mode = "smart"
 [[kv_namespaces]]
 binding = "KV"
 
+# M365 Copilot Session Durable Object — 承载 ChatHub WS 会话（绕过 Worker 墙钟限制，
+# 同会话并发串行化 + 会话绑定读写）。绑定后需 `wrangler deploy` 创建迁移。
+[durable_objects]
+bindings = [
+  { name = "M365_SESSION", class_name = "M365Session" },
+]
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["M365Session"]
+
 # Analytics Engine 数据集 — 记录代理请求用量统计
 [vars]
 USAGE_ANALYTICS_DATASET = "ai_gateway_usage"

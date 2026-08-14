@@ -24,6 +24,8 @@ import {
   handleOAuthDisconnect,
   handleOAuthModels,
   handleOAuthGeminiCallback,
+  handleOAuthM365Callback,
+  handleOAuthM365ROPC,
   handleClineOAuthConnect,
   handleClineOAuthPoll,
   handleLogs,
@@ -53,7 +55,10 @@ import {
 } from './analytics/admin-api'
 import { refreshAllOauthTokens } from './oauth'
 import { runAllCheckins, handleCheckinTrigger, handleCheckinStatus } from './checkin'
+import { M365Session } from './m365/durable'
 import type { AppEnv, Env, Provider } from './types'
+
+export { M365Session }
 
 const app = new Hono<AppEnv>()
 
@@ -141,6 +146,9 @@ app.post('/admin/api/oauth/:id/disconnect', handleOAuthDisconnect)
 app.post('/admin/api/oauth/:id/models', handleOAuthModels)
 // Gemini 授权回调：浏览器授权后把地址栏 URL 粘贴回后台提交（POST { callbackUrl }）
 app.post('/admin/api/oauth/:id/callback', handleOAuthGeminiCallback)
+// M365 PKCE 授权回调（POST { callbackUrl }）与 M365 ROPC 账号密码登录（POST { username, password }）
+app.post('/admin/api/oauth/:id/m365-callback', handleOAuthM365Callback)
+app.post('/admin/api/oauth/:id/m365-ropc', handleOAuthM365ROPC)
 
 // Cline 一键授权（WorkOS 设备码流程，登录后自动把 refreshToken 存入账号池）
 app.post('/admin/api/cline/oauth/:id/connect', handleClineOAuthConnect)

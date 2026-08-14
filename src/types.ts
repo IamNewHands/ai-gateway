@@ -73,8 +73,11 @@ export interface OAuthDeviceConfig {
    * - qoder：QoderWork 设备授权（PKCE）— 本地构造 selectAccounts 授权链接，用户浏览器授权后轮询拿 dt-/drt- token
    * - gemini：Gemini CLI（Google OAuth）— 标准授权码 + PKCE(S256) + offline/consent，
    *   网关无法监听本地回调端口，用户授权后把回调 URL（含 code）粘贴回后台完成换 token
+   * - m365-pkce：M365 Copilot（微软 Entra ID）— 标准授权码 + PKCE(S256)+offline，
+   *   网关无法监听本地回调端口，用户授权后把回调 URL 粘贴回后台完成换 token（同 gemini）
+   * - m365-ropc：M365 Copilot（资源所有者密码凭据）— 直接填写企业订阅账号/密码换 token
    */
-  flowType?: 'device' | 'browser' | 'qoder' | 'gemini'
+  flowType?: 'device' | 'browser' | 'qoder' | 'gemini' | 'm365-pkce' | 'm365-ropc'
   /**
    * 设备码申请端点 / 浏览器登录发起端点：
    * - device 模式：POST, x-www-form-urlencoded, 需 client_id，返回 device_code/user_code
@@ -97,6 +100,8 @@ export interface OAuthDeviceConfig {
   clientId: string
   /** OAuth 应用 client_secret（gemini 模式必填；其余模式可留空） */
   clientSecret?: string
+  /** OAuth 回调地址（gemini/m365-pkce 模式可用；留空走官方默认） */
+  redirectUri?: string
   /** 申请的 scope（可选） */
   scope?: string
   /** 轮询间隔（秒），默认 5 */
@@ -143,6 +148,10 @@ export interface OAuthTokenState {
   projectId?: string
   /** gemini 模式：该账号可用的项目 ID 列表（cloudresourcemanager 拉取） */
   projectIds?: string[]
+  /** m365 模式：Entra ID 对象的 Object ID（ChatHub WS 需要） */
+  oid?: string
+  /** m365 模式：Entra ID 租户 ID（ChatHub WS 需要） */
+  tid?: string
 }
 
 /** 进行中的设备码/浏览器/Qoder 登录流程状态 */
@@ -156,7 +165,7 @@ export interface DeviceFlowState {
   interval: number
   expires_at: number
   /** 流程类型，用于轮询时分发 */
-  flowType?: 'device' | 'browser' | 'qoder' | 'gemini'
+  flowType?: 'device' | 'browser' | 'qoder' | 'gemini' | 'm365-pkce' | 'm365-ropc'
   /**
    * browser 模式：发起登录时上游返回的 Set-Cookie。
    * cpa-plugin 强调 must reuse the same cookie jar，否则 token 无效导致 401。
@@ -363,6 +372,8 @@ export interface Env {
   USAGE_ANALYTICS_DATASET?: string
   CF_ACCOUNT_ID?: string
   CF_API_TOKEN?: string
+  /** M365 Session Durable Object 绑定（承载 ChatHub WS 对话与会话串行化） */
+  M365_SESSION: DurableObjectNamespace
 }
 
 export interface AnalyticsEngineDatasetBinding {

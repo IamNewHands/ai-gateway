@@ -30,7 +30,8 @@ import { isClineProvider, fetchClineModels, testClineChat, testClineRefreshToken
 import { isGeminiProvider, testGeminiModel, GEMINI_MODELS } from './gemini/proxy'
 import { isCnbProvider, testCnbConnection, CNB_MODELS } from './cnb/proxy'
 import { PROXY_KEY_PREFIX, EXPIRY_OPTIONS, OPENCODE_DEFAULT_URL } from './config'
-import { startOauthDeviceFlow, pollOauthDeviceFlow, readOauthToken, deleteOauthToken, getOauthAccessToken, buildOauthHeaders, detectTokenRealm, submitOauthGeminiCallback } from './oauth'
+import { startOauthDeviceFlow, pollOauthDeviceFlow, readOauthToken, deleteOauthToken, getOauthAccessToken, buildOauthHeaders, detectTokenRealm, submitOauthGeminiCallback, submitOauthM365Callback, submitOauthM365ROPC } from './oauth'
+import { isM365Provider, M365_MODELS, testM365Model } from './m365/proxy'
 import type {
   AppEnv,
   Env,
@@ -398,6 +399,12 @@ export async function handleTestModel(c: Context<AppEnv>) {
   // Gemini：走 cloudcode-pa 上游（OAuth token + project_id），发送最小请求验证
   if (isGeminiProvider(provider)) {
     const result = await testGeminiModel(c.env, provider, modelId)
+    return c.json<ApiResponse>({ success: true, data: result })
+  }
+
+  // M365：走完整 ChatHub WS 链路发最小请求验证（网络代理配置异常时给出明确提示）
+  if (isM365Provider(provider)) {
+    const result = await testM365Model(c.env, provider, modelId)
     return c.json<ApiResponse>({ success: true, data: result })
   }
 
@@ -993,6 +1000,9 @@ export async function handleOAuthStatus(c: Context<AppEnv>) {
       hasCookies: !!(token?.cookies),
       email: token?.email ?? null,
       projectId: token?.projectId ?? null,
+      // M365：账号标识（来自 access_token JWT，非敏感凭据）
+      oid: token?.oid ?? null,
+      tid: token?.tid ?? null,
     },
   })
 }
@@ -1040,6 +1050,11 @@ export async function handleOAuthDisconnect(c: Context<AppEnv>) {
   const id = c.req.param('id')
   if (!id) return c.json<ApiResponse>({ success: false, message: '缺少 id 参数' }, 400)
   await deleteOauthToken(c.env, id)
+  // M365：一并清理该提供商的会话绑定（云端对话随账号断开失效）
+  const p = await getProvider(c.env, id).catch(() => null)
+  if (p && isM365Provider(p)) {
+    await c.env.KV.delete(`m365:sessions:${id}`).catch(() => {})
+  }
   return c.json<ApiResponse>({ success: true, message: '已断开 OAuth 连接' })
 }
 
@@ -1075,6 +1090,73 @@ export async function handleOAuthGeminiCallback(c: Context<AppEnv>) {
     success: true,
     message: result.message,
     data: { email: result.email, projectId: result.projectId },
+  })
+}
+
+/**
+ * 提交 M365 PKCE 授权回调：用户在浏览器完成微软授权后，把地址栏的回调 URL
+ * （含 ?code=...&state=...）粘贴回后台，此处校验 state 并换 token。
+ * 对应 startOauthDeviceFlow（flowType=m365-pkce）生成的授权链接。
+ */
+export async function handleOAuthM365Callback(c: Context<AppEnv>) {
+  const id = c.req.param('id')
+  if (!id) return c.json<ApiResponse>({ success: false, message: '缺少 id 参数' }, 400)
+
+  const provider = await getProvider(c.env, id)
+  if (!provider) return c.json<ApiResponse>({ success: false, message: '提供商不存在' }, 404)
+  if (provider.authType !== 'oauth-device' || !provider.oauth) {
+    return c.json<ApiResponse>({ success: false, message: '该提供商未配置 OAuth 认证' }, 400)
+  }
+  if (provider.oauth.flowType !== 'm365-pkce') {
+    return c.json<ApiResponse>({ success: false, message: '该提供商不是 M365 PKCE 授权模式' }, 400)
+  }
+
+  const body = await c.req.json<{ callbackUrl?: string }>()
+  const callbackUrl = String(body?.callbackUrl || '').trim()
+  if (!callbackUrl) {
+    return c.json<ApiResponse>({ success: false, message: 'callbackUrl 为必填项' }, 400)
+  }
+
+  const result = await submitOauthM365Callback(c.env, id, provider.oauth, callbackUrl)
+  if (!result.success) {
+    return c.json<ApiResponse>({ success: false, message: result.message }, 400)
+  }
+  return c.json<ApiResponse>({
+    success: true,
+    message: result.message,
+    data: { email: result.email },
+  })
+}
+
+/** M365 ROPC 登录：直接用企业订阅账号/密码换 token（flowType=m365-ropc） */
+export async function handleOAuthM365ROPC(c: Context<AppEnv>) {
+  const id = c.req.param('id')
+  if (!id) return c.json<ApiResponse>({ success: false, message: '缺少 id 参数' }, 400)
+
+  const provider = await getProvider(c.env, id)
+  if (!provider) return c.json<ApiResponse>({ success: false, message: '提供商不存在' }, 404)
+  if (provider.authType !== 'oauth-device' || !provider.oauth) {
+    return c.json<ApiResponse>({ success: false, message: '该提供商未配置 OAuth 认证' }, 400)
+  }
+  if (provider.oauth.flowType !== 'm365-ropc') {
+    return c.json<ApiResponse>({ success: false, message: '该提供商不是 M365 ROPC 授权模式' }, 400)
+  }
+
+  const body = await c.req.json<{ username?: string; password?: string }>()
+  const username = String(body?.username || '').trim()
+  const password = String(body?.password || '')
+  if (!username || !password) {
+    return c.json<ApiResponse>({ success: false, message: 'username 与 password 为必填项' }, 400)
+  }
+
+  const result = await submitOauthM365ROPC(c.env, id, provider.oauth, username, password)
+  if (!result.success) {
+    return c.json<ApiResponse>({ success: false, message: result.message }, 400)
+  }
+  return c.json<ApiResponse>({
+    success: true,
+    message: result.message,
+    data: { email: result.email },
   })
 }
 
@@ -1246,6 +1328,29 @@ export async function handleOAuthModels(c: Context<AppEnv>) {
       }
     } catch (e) {
       console.warn(`[oauth-models] gemini auto-save failed: ${(e as Error).message}`)
+    }
+    return c.json<ApiResponse>({ success: true, data: { data: models } })
+  }
+
+  // M365 Copilot：模型清单为静态（订阅账号无公开 models 端点），
+  // 与 gemini 一致使用内置清单，登录成功后一键拉取自动合并保存。
+  if (isM365Provider(provider)) {
+    const models = M365_MODELS.map((m) => ({ id: m.id }))
+    try {
+      const existing = provider.models || []
+      const existingIds = new Set(existing.map((m) => m.id))
+      const merged = [...existing]
+      for (const m of models) {
+        if (!existingIds.has(m.id)) {
+          merged.push({ id: m.id, enabled: true })
+          existingIds.add(m.id)
+        }
+      }
+      if (merged.length !== existing.length) {
+        await updateProvider(c.env, id, { models: merged })
+      }
+    } catch (e) {
+      console.warn(`[oauth-models] m365 auto-save failed: ${(e as Error).message}`)
     }
     return c.json<ApiResponse>({ success: true, data: { data: models } })
   }

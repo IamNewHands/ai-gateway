@@ -17,6 +17,7 @@ import { isClineProvider, proxyClineChatRequest } from './cline/proxy'
 import { isVisionBridgeProvider, buildVisionBridgeRequestBody } from './vision/bridge'
 import { isGeminiProvider, proxyGeminiChatRequest } from './gemini/proxy'
 import { isCnbProvider, proxyCnbChatRequest } from './cnb/proxy'
+import { isM365Provider, proxyM365ChatRequest } from './m365/proxy'
 import { writeLog } from './admin'
 import { getOauthAccessToken, readOauthToken, refreshOauthToken, detectTokenRealm, buildOauthHeaders } from './oauth'
 import {
@@ -968,6 +969,25 @@ export async function forwardProxy(
       }
     }
 
+    // M365 Copilot：ChatHub WS 对话（OAuth flowType ∈ m365-pkce/m365-ropc），
+    // 协议适配与 WS 会话承载在 Durable Object（env.M365_SESSION）中完成，
+    // 网关透传 DO 返回的 OpenAI SSE/JSON。
+    if (isM365Provider(provider)) {
+      const response = await proxyM365ChatRequest(c.env, provider, forwardBody as Record<string, unknown>, {
+        ip: c.req.header('cf-connecting-ip') || c.req.header('x-real-ip') || '',
+        userAgent: c.req.header('user-agent') || '',
+      })
+      const logLevel = response.ok ? 'request' : (response.status >= 500 ? 'error' : 'warn')
+      try {
+        const bodySummary = summarizeRequestBody(forwardBody)
+        c.executionCtx.waitUntil(writeLog(c.env, logLevel,
+          `[${provider.name}] ${model} → ${response.status}`,
+          JSON.stringify({ providerId, subPath, body: bodySummary }).substring(0, 4000)
+        ))
+      } catch { /* log failure must not break */ }
+      return response
+    }
+
     // OAuth 设备码提供商：使用 KV 中保存的 access_token 转发，401 时尝试刷新后重试
     if (provider.authType === 'oauth-device' && provider.oauth) {
       return await proxyOAuthRequest(c, provider, subPath, url.search, forwardBody, method)
@@ -1531,6 +1551,11 @@ export async function handleAnthropicMessages(c: Context<AppEnv>) {
     // CNB：CSRF 凭证转发（OpenAI 格式），再转回 Anthropic SSE。
     if (isCnbProvider(provider)) {
       return await handleAnthropicCnb(c, provider, model, openaiBody, originalStream)
+    }
+
+    // M365 Copilot：OAuth 授权码转发（OpenAI 格式），再转回 Anthropic SSE。
+    if (isM365Provider(provider)) {
+      return await handleAnthropicM365(c, provider, model, openaiBody, originalStream)
     }
 
     // Vision Bridge：图片转写后转发给主文本模型（OpenAI 格式），再转回 Anthropic 格式。
@@ -2380,6 +2405,20 @@ async function handleAnthropicCnb(
   return handleAnthropicSpecial(c, provider, model, openaiBody, originalStream, proxyCnbChatRequest, 'CNB')
 }
 
+/**
+ * M365 Copilot Anthropic 格式转发：OpenAI 请求体 → M365 DO 转发（proxyM365ChatRequest
+ * 返回 OpenAI SSE）→ 再转回 Anthropic SSE。
+ */
+async function handleAnthropicM365(
+  c: Context<AppEnv>,
+  provider: import('./types').Provider,
+  model: string,
+  openaiBody: Record<string, unknown>,
+  originalStream: boolean
+): Promise<Response> {
+  return handleAnthropicSpecial(c, provider, model, openaiBody, originalStream, proxyM365ChatRequest, 'M365')
+}
+
 // ============================================================
 //  OpenAI Responses API 代理  /v1/responses
 //  将 Responses 格式请求转为 Chat Completions，调用上游，
@@ -2455,6 +2494,11 @@ export async function handleResponses(c: Context<AppEnv>) {
     // CNB：CSRF 凭证转发（OpenAI 格式），再转回 Responses 格式。
     if (isCnbProvider(provider)) {
       return await handleResponsesCnb(c, provider, model, openaiBody, originalStream)
+    }
+
+    // M365 Copilot：OAuth 授权码转发（OpenAI 格式），再转回 Responses 格式。
+    if (isM365Provider(provider)) {
+      return await handleResponsesM365(c, provider, model, openaiBody, originalStream)
     }
 
     // OAuth 提供商
@@ -3094,6 +3138,20 @@ async function handleResponsesCnb(
   originalStream: boolean
 ): Promise<Response> {
   return handleResponsesSpecial(c, provider, model, openaiBody, originalStream, proxyCnbChatRequest, 'CNB')
+}
+
+/**
+ * M365 Copilot Responses 格式转发：OpenAI 请求体 → M365 DO 转发（proxyM365ChatRequest
+ * 返回 OpenAI SSE）→ 再转回 Responses SSE。
+ */
+async function handleResponsesM365(
+  c: Context<AppEnv>,
+  provider: import('./types').Provider,
+  model: string,
+  openaiBody: Record<string, unknown>,
+  originalStream: boolean
+): Promise<Response> {
+  return handleResponsesSpecial(c, provider, model, openaiBody, originalStream, proxyM365ChatRequest, 'M365')
 }
 
 /**

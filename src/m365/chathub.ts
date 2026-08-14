@@ -1,0 +1,581 @@
+/**
+ * ChatHub SignalR WebSocket 客户端（移植自 M365-Copilot2API internal/chathub/client.go）。
+ *
+ * 协议要点：
+ * - 出站 WS 连接到 wss://substrate.office.com/m365Copilot/Chathub，access_token/OID/TID 放 URL query
+ * - SignalR JSON 协议，帧之间用 RS 分隔符（\x1e）
+ * - 握手：先发 {"protocol":"json","version":1}\x1e
+ * - 心跳：收到 type=6 回 {"type":6}\x1e
+ * - 事件：type=1 update（流式）/ type=2 result / type=3 complete（结束）
+ *
+ * 依赖 Workers 出站 WebSocket `connect()` API（compatibility_date >= 2024-01-01）。
+ */
+import { classifyUpdateMessages, extractToolEvents, normalizeFrame, imageURLs } from './events'
+import type { ChatHubStreamEvent } from './events'
+import { toolProtocolPrompt } from './tools'
+
+/**
+ * Workers 出站 WebSocket connect() API（compatibility_date >= 2024-01-01）。
+ * @cloudflare/workers-types 当前版本未提供该全局函数类型，这里本地声明。
+ */
+declare global {
+  function connect(
+    address: string,
+    options?: { headers?: Record<string, string> }
+  ): { socket: WebSocket; response: Promise<Response> }
+}
+
+const RS = '\x1e'
+const DEFAULT_TONE = 'magic'
+const WS_BASE = 'wss://substrate.office.com/m365Copilot/Chathub'
+const MAX_ATTACHMENTS = 10
+const MAX_ATTACHMENT_MIB = 10
+
+/** 与浏览器探针一致的 variants 字符串 */
+const VARIANTS =
+  'EnableMcpServerWidgets,feature.EnableMcpServerWidgets,feature.EnableLuForChatCIQ,feature.enableChatCIQPlugin,EnableRequestPlugins,feature.EnableSensitivityLabels,EnableUnsupportedUrlDetector,feature.IsCustomEngineCopilotEnabled,feature.bizchatfluxv3,feature.enablechatpages,feature.enableCodeCanvas,feature.turnOnWorkTabRecommendation,turnOffWorkTabUpsellFromClient,feature.turnOnDARecommendation,feature.IsStreamingModeInChatRequestEnabled,IncludeSourceAttributionsConcise,SkipPublishEmptyMessage,feature.EnableDeduplicatingSourceAttributions,Enable3PActionProgressMessages,feature.enableClientWebRtc,feature.EnableMeetingRecapOfSeriesMeetingWithCiq,feature.EnableReferencesListCompleteSignal,feature.StorageMessageSplitDisabled,feature.EnableCuaTakeControlApi,feature.cwcallowedos,feature.disabledisallowedmsgs,feature.enableCitationsForSynthesisData,feature.enableGenerateGraphicArtOptionsSet,cdximagen,feature.EnableUpdatedUXForConfirmationDialog,feature.EnableClientFileURLSupportForOfficeWebPaidCopilot,feature.EnableDesignEditorImageGrounding,feature.EnableDesignerEditor,feature.OfficeWebToHelix,feature.OfficeDesktopToHelix,feature.M365TeamsHubToHelix,feature.OwaHubToHelix,feature.MonarchHubToHelix,feature.Win32OutlookHubToHelix,feature.MacOutlookHubToHelix,Agt_bizchat_enableGpt5ForHelix'
+
+export interface ChatHubAccount {
+  accessToken: string
+  oid: string
+  tid: string
+}
+
+export interface ChatHubAttachment {
+  type: 'image' | 'file'
+  url: string
+  mimeType?: string
+  name?: string
+  docId?: string
+  fileType?: string
+}
+
+export interface ChatHubTool {
+  type: string
+  function: { name: string; description?: string; parameters?: unknown }
+}
+
+export interface ChatHubRequest {
+  text: string
+  tone?: string
+  conversationId?: string
+  sessionId?: string
+  attachments?: ChatHubAttachment[]
+  tools?: ChatHubTool[]
+  toolChoice?: unknown
+  /** 首轮标记：会话/对话 ID 为空或首次使用时为 true */
+  started?: boolean
+}
+
+export interface ChatHubResult {
+  text: string
+  reasoning: string
+  conversationId: string
+  sessionId: string
+  requestId: string
+  events: unknown[]
+  images: string[]
+}
+
+export type ChatHubStreamHandler = (ev: ChatHubStreamEvent) => void
+
+export interface ChatHubOptions {
+  /** 会话/请求总超时（ms），默认 300_000 */
+  timeoutMs?: number
+  /** 单条帧读超时（ms），默认 90_000 */
+  readTimeoutMs?: number
+  /** 附件元数据追踪回调（可选） */
+  trace?: (meta: Record<string, unknown>) => void
+}
+
+function randomUUID(): string {
+  return crypto.randomUUID()
+}
+
+function buildWSURL(acc: ChatHubAccount, sessionID: string, conversationID: string, requestID: string): string {
+  const q = new URLSearchParams()
+  q.set('chatsessionid', requestID)
+  q.set('clientrequestid', requestID)
+  q.set('X-SessionId', sessionID)
+  q.set('ConversationId', conversationID)
+  q.set('access_token', acc.accessToken)
+  q.set('variants', VARIANTS)
+  q.set('source', '"officeweb"')
+  q.set('product', 'Office')
+  q.set('agentHost', 'Bizchat.FullScreen')
+  q.set('licenseType', 'Starter')
+  q.set('agent', 'web')
+  q.set('scenario', 'OfficeWebIncludedCopilot')
+  return `${WS_BASE}/${encodeURIComponent(acc.oid)}@${encodeURIComponent(acc.tid)}?${q.toString()}`
+}
+
+/** 校验远程图片下载 URL（防 SSRF，同 ai-gateway isSafeHttpUrl 思路） */
+function isSafeDownloadURL(url: string): boolean {
+  try {
+    const u = new URL(url)
+    if (u.protocol !== 'https:') return false
+    const host = u.hostname.toLowerCase()
+    if (host === 'localhost' || host.endsWith('.local')) return false
+    if (/^(10\.|127\.|172\.(1[6-9]|2\d|3[01])\.|192\.168\.)/.test(host)) return false
+    if (host === '169.254.169.254') return false
+    return true
+  } catch {
+    return false
+  }
+}
+
+/**
+ * 上传图片附件到 M365 UploadFile 端点（form-urlencoded，base64 data URL）。
+ * 远程 https URL 会先下载再转 base64。返回 docId 供消息注解使用。
+ */
+async function uploadAttachments(acc: ChatHubAccount, conversationID: string, attachments: ChatHubAttachment[], opts: ChatHubOptions): Promise<void> {
+  let imageCount = 0
+  for (let i = 0; i < attachments.length; i++) {
+    const a = attachments[i]
+    if (a.type !== 'image') continue
+    imageCount++
+    if (imageCount > MAX_ATTACHMENTS) throw new Error(`too many image attachments: limit is ${MAX_ATTACHMENTS}`)
+
+    let imageData = a.url
+    if (!imageData.startsWith('data:')) {
+      if (!isSafeDownloadURL(imageData)) throw new Error('attachment URL is not a safe public https URL')
+      let resp: Response
+      try {
+        resp = await fetch(imageData)
+      } catch {
+        continue
+      }
+      if (!resp.ok) continue
+      const buf = await resp.arrayBuffer()
+      if (buf.byteLength > MAX_ATTACHMENT_MIB << 20) continue
+      const mimeType = resp.headers.get('Content-Type') || 'image/png'
+      imageData = `data:${mimeType};base64,${bytesToBase64(new Uint8Array(buf))}`
+    }
+    const comma = imageData.indexOf(',')
+    if (comma < 0) throw new Error('invalid image data URL')
+    if (!/;base64/i.test(imageData.substring(0, comma))) throw new Error('image URL is not base64')
+
+    const form = new URLSearchParams()
+    form.set('scenario', 'UploadImage')
+    form.set('conversationId', conversationID)
+    form.set('FileBase64', imageData)
+    form.append('optionsSets', 'cwcgptvsan')
+    form.append('optionsSets', 'flux_v3_gptv_enable_upload_multi_image_in_turn_wo_ch')
+
+    let resp: Response
+    try {
+      resp = await fetch('https://substrate.office.com/m365Copilot/UploadFile', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/x-www-form-urlencoded',
+          'Authorization': `Bearer ${acc.accessToken}`,
+          'Accept': 'application/json',
+          'X-Variants': 'feature.EnableImageSupportInUploadFile',
+          'X-Scenario': 'OfficeWebIncludedCopilot',
+          'Referer': 'https://m365.cloud.microsoft/',
+          'Origin': 'https://m365.cloud.microsoft',
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:148.0) Gecko/20100101 Firefox/148.0',
+        },
+        body: form.toString(),
+      })
+    } catch {
+      continue
+    }
+    if (!resp.ok) continue
+    let out: { docId?: string; fileName?: string; fileType?: string; result?: { value?: string } }
+    try {
+      out = await resp.json()
+    } catch {
+      continue
+    }
+    if (out.result?.value !== 'Success' || !out.docId) continue
+    a.docId = out.docId
+    a.fileType = (out.fileType || '').toLowerCase().replace(/^\./, '')
+    if (a.fileType === 'jpeg') a.fileType = 'jpg'
+    if (!a.name) a.name = out.fileName
+  }
+}
+
+function bytesToBase64(bytes: Uint8Array): string {
+  let binary = ''
+  const chunk = 0x8000
+  for (let i = 0; i < bytes.length; i += chunk) {
+    binary += String.fromCharCode.apply(null, bytes.subarray(i, i + chunk) as unknown as number[])
+  }
+  return btoa(binary)
+}
+
+/** 组装 ChatHub chat 帧（type=4 target=chat） */
+function chatPayload(req: ChatHubRequest, requestID: string, firstTurn: boolean): string {
+  const tools = req.tools || []
+  const attachments = req.attachments || []
+  const hasPlugins = clientPlugins(tools).length > 0
+  const text = toolProtocolPrompt(req.text, tools, req.toolChoice, hasPlugins)
+
+  const message: Record<string, unknown> = {
+    author: 'user',
+    attachments,
+    inputMethod: 'Keyboard',
+    text,
+    entityAnnotationTypes: ['People', 'File', 'Event', 'Email', 'TeamsMessage'],
+    requestId: requestID,
+    locationInfo: { timeZoneOffset: 8, timeZone: 'Asia/Shanghai' },
+    locale: 'zh-cn',
+    messageType: 'Chat',
+    experienceType: 'Default',
+    adaptiveCards: [],
+    clientPreferences: {},
+  }
+
+  // 图片上传后注入文件注解（messageAnnotations）
+  const annotations: Record<string, unknown>[] = []
+  for (const a of attachments) {
+    if (a.type !== 'image' || !a.docId) continue
+    const name = a.name || `image.${a.fileType || 'jpg'}`
+    let fileType = a.fileType
+    if (!fileType) fileType = (a.mimeType || '').replace(/^image\//, '')
+    if (!fileType || fileType === 'image' || fileType === '*') fileType = 'jpg'
+    annotations.push({
+      id: a.docId,
+      messageAnnotationMetadata: {
+        '@type': 'File',
+        annotationType: 'File',
+        fileType,
+        fileName: name,
+      },
+      messageAnnotationType: 'ImageFile',
+    })
+  }
+  if (annotations.length > 0) {
+    message['messageAnnotations'] = annotations
+    message['connectedFederatedConnections'] = ['dummyId']
+  }
+  // 兼容旧网关注入路径
+  for (const a of attachments) {
+    if (a.type !== 'image' || !a.url) continue
+    if (a.url.startsWith('data:')) {
+      const comma = a.url.indexOf(',')
+      if (comma >= 0 && comma + 1 < a.url.length) {
+        message['imageBase64'] = a.url.substring(comma + 1)
+      }
+    } else {
+      message['imageUrl'] = a.url
+    }
+    break
+  }
+
+  const optionsSets = [
+    'search_result_progress_messages_with_search_queries',
+    'update_textdoc_response_after_streaming',
+    'deepleo_networking_timeout_10minutes_canmore',
+    'cwc_flux_image',
+    'cwcfluxgptv',
+    'flux_v3_gptv_enable_upload_multi_image_in_turn_wo_ch',
+    'gptvnorm2048',
+    'cwc_fileupload_odb',
+    'update_memory_plugin',
+    'add_custom_instructions',
+    'cwc_flux_v3',
+    'flux_v3_progress_messages',
+    'enable_batch_token_processing',
+    'enable_gg_gpt',
+  ]
+
+  const chat = {
+    arguments: [
+      {
+        source: 'officeweb',
+        clientCorrelationId: randomUUID(),
+        sessionId: req.sessionId,
+        optionsSets,
+        options: {},
+        allowedMessageTypes: ['Chat', 'Suggestion', 'Disengaged', 'Progress', 'EndOfRequest', 'InternalLoaderMessage'],
+        sliceIds: [],
+        threadLevelGptId: {},
+        conversationId: req.conversationId,
+        traceId: randomUUID(),
+        isStartOfSession: firstTurn,
+        productThreadType: 'Office',
+        clientInfo: { clientPlatform: 'mcmcopilot-web', clientAppName: 'Office' },
+        tone: req.tone || DEFAULT_TONE,
+        streamingMode: 'ConciseWithPadding',
+        message,
+        plugins: clientPlugins(tools),
+        toolChoice: req.toolChoice,
+      },
+    ],
+    invocationId: '0',
+    target: 'chat',
+    type: 4,
+  }
+  const metrics = {
+    arguments: [
+      {
+        Timestamps: {
+          ConnectionStart: '',
+          UserInputStart: '',
+          ConnectionEstablished: '',
+          UserInputSubmit: '',
+        },
+      },
+    ],
+    target: 'Metrics',
+    type: 1,
+  }
+  return JSON.stringify(chat) + RS + JSON.stringify(metrics) + RS
+}
+
+/** M365 原生插件列表（工具名以 m365-plugin 命名空间标记，全部按官方命名注册） */
+function clientPlugins(tools: ChatHubTool[]): Record<string, unknown>[] {
+  if (!tools || tools.length === 0) return []
+  // 保持与官方客户端的插件名映射一致（本网关主要走提示词注入，插件仅用于标记 hasPlugins）
+  return tools.map((t, i) => ({
+    id: `m365-plugin-${i}`,
+    name: t.function.name,
+    description: t.function.description || '',
+    version: 1,
+    source: 'gateway',
+  }))
+}
+
+/**
+ * 核心对话入口：建立 WS → 握手 → 发送 payload → 流式解析事件 → 返回完整结果。
+ * text delta 与 reasoning 通过 handler 即时送出，最终 Result 包含全文与推理。
+ */
+export async function chatWithHandlers(
+  acc: ChatHubAccount,
+  req: ChatHubRequest,
+  opts: ChatHubOptions,
+  onDelta?: (text: string) => void,
+  onEvent?: (ev: ChatHubStreamEvent) => void,
+): Promise<ChatHubResult> {
+  if (!acc.accessToken || !acc.oid || !acc.tid) throw new Error('missing access token / oid / tid')
+  if (!req.text.trim() && (!req.attachments || req.attachments.length === 0)) throw new Error('empty prompt and no attachments')
+
+  let sessionId = req.sessionId || randomUUID()
+  let conversationId = req.conversationId || randomUUID()
+  const firstTurn = req.started === true || !req.sessionId || !req.conversationId
+  const requestID = randomUUID()
+
+  // 1) 上传图片附件
+  if (req.attachments && req.attachments.length > 0) {
+    await uploadAttachments(acc, conversationId, req.attachments, opts)
+  }
+
+  // 2) 建立出站 WS
+  const wsURL = buildWSURL(acc, sessionId, conversationId, requestID)
+  let socket: WebSocket
+  let handshakeResp: Response
+  try {
+    const connected = connect(wsURL, {
+      headers: {
+        Origin: 'https://m365.cloud.microsoft',
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:148.0) Gecko/20100101 Firefox/148.0',
+      },
+    })
+    socket = connected.socket
+    handshakeResp = await connected.response
+    if (handshakeResp.status !== 101) throw new Error(`ws dial failed: HTTP ${handshakeResp.status}`)
+  } catch (err) {
+    throw new Error(`ws dial: ${err instanceof Error ? err.message : String(err)}`)
+  }
+
+  // 消息队列：事件驱动 → 同步式读取
+  const queue: { msg?: string; err?: Error }[] = []
+  const waiters: ((v: { msg?: string; err?: Error }) => void)[] = []
+  let closed = false
+  const push = (v: { msg?: string; err?: Error }) => {
+    if (closed) return
+    if (waiters.length > 0) {
+      const w = waiters.shift()!
+      w(v)
+    } else {
+      queue.push(v)
+    }
+  }
+  socket.addEventListener('message', (e) => {
+    const data = (e as MessageEvent).data
+    const text = typeof data === 'string' ? data : data instanceof ArrayBuffer ? new TextDecoder().decode(data) : String(data)
+    push({ msg: text })
+  })
+  socket.addEventListener('close', (e) => {
+    closed = true
+    push({ err: new Error(`ws closed: code=${(e as CloseEvent).code} reason=${(e as CloseEvent).reason || ''}`) })
+  })
+  socket.addEventListener('error', () => {
+    // close 事件随后触发；这里只兜底
+    push({ err: new Error('ws error') })
+  })
+
+  const next = (): Promise<{ msg?: string; err?: Error }> => {
+    if (queue.length > 0) return Promise.resolve(queue.shift()!)
+    if (closed) return Promise.resolve({ err: new Error('ws already closed') })
+    return new Promise((resolve) => waiters.push(resolve))
+  }
+
+  const withTimeout = <T>(p: Promise<T>, ms: number, what: string): Promise<T> => {
+    return new Promise<T>((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error(`timeout waiting ${what} (${ms}ms)`)), ms)
+      p.then((v) => { clearTimeout(timer); resolve(v) }, (e) => { clearTimeout(timer); reject(e) })
+    })
+  }
+
+  const timeoutMs = opts.timeoutMs || 300_000
+  const readTimeoutMs = opts.readTimeoutMs || 90_000
+  const deadline = Date.now() + timeoutMs
+
+  try {
+    // 3) 握手
+    socket.send(`{"protocol":"json","version":1}${RS}`)
+    await withTimeout(next(), 15_000, 'handshake')
+
+    // 4) 发送 chat payload
+    const payload = chatPayload(req, requestID, firstTurn)
+    socket.send(payload)
+
+    // 5) 事件循环
+    const seenStreamTools = new Set<string>()
+    let reasoningBuf = ''
+    let finalText = ''
+    let streamedText = ''
+    let rawResult = ''
+    let throttling: unknown
+
+    const rateLimited = (text: string): boolean => {
+      if (streamedText !== '') return false
+      const t = text.toLowerCase()
+      return (
+        t.includes('temporarily unable to respond to this many requests') ||
+        t.includes('太多请求') ||
+        t.includes('无法响应这么多请求') ||
+        t.includes('too many requests') ||
+        (t.includes('please retry') && t.includes('later'))
+      )
+    }
+
+    // ChatHub 以"全量快照 + 光标重写"方式送文本，只输出未见过的后缀
+    const emitSnapshot = (snapshot: string): void => {
+      if (!snapshot) return
+      if (rateLimited(snapshot)) throw new Error('upstream rate-limit notice')
+      const cur = streamedText
+      if (cur === '') {
+        streamedText = snapshot
+        onDelta?.(snapshot)
+        return
+      }
+      if (snapshot.startsWith(cur)) {
+        const tail = snapshot.substring(cur.length)
+        if (tail) { streamedText = snapshot; onDelta?.(tail) }
+        return
+      }
+      const i = snapshot.indexOf(cur)
+      if (i >= 0) {
+        const tail = snapshot.substring(i + cur.length)
+        if (tail) { streamedText = snapshot; onDelta?.(tail) }
+        return
+      }
+      if (snapshot.length > cur.length && snapshot.endsWith(cur)) {
+        const head = snapshot.substring(0, snapshot.length - cur.length)
+        if (head) { streamedText = snapshot; onDelta?.(head) }
+        return
+      }
+      if (snapshot.length > cur.length) {
+        streamedText = snapshot
+        onDelta?.(snapshot)
+      }
+    }
+
+    while (Date.now() < deadline) {
+      const read = await withTimeout(next(), readTimeoutMs, 'ws message')
+      if (read.err) throw read.err
+      if (!read.msg) continue
+
+      const parts = read.msg.split(RS)
+      for (const partRaw of parts) {
+        const part = partRaw.trim()
+        if (!part) continue
+        const frame = normalizeFrame(part)
+        if (!frame) continue
+
+        // SignalR ping
+        if (frame.type === 6) {
+          try { socket.send(`{"type":6}${RS}`) } catch { /* ignore */ }
+          continue
+        }
+
+        // update：流式文本 / 推理 / 工具 / 进度
+        if (frame.type === 1 && frame.target === 'update') {
+          for (const arg of frame.arguments || []) {
+            if (!arg || typeof arg !== 'object' || Array.isArray(arg)) continue
+            const a = arg as Record<string, unknown>
+            if (onEvent) {
+              for (const ev of extractToolEvents(a, seenStreamTools)) onEvent(ev)
+            }
+            const msgs = Array.isArray(a['messages']) ? (a['messages'] as unknown[]) : []
+            for (const ev of classifyUpdateMessages(msgs)) {
+              if (ev.kind === 'reasoning') reasoningBuf += ev.text || ''
+              if (ev.kind !== 'text' && onEvent) onEvent(ev)
+            }
+            // 判断工具帧（跳过光标文本，工具帧的 writeAtCursor 不应当作答案输出）
+            let toolFrame = false
+            for (const mraw of msgs) {
+              if (!mraw || typeof mraw !== 'object') continue
+              const m = mraw as Record<string, unknown>
+              if (m['messageType'] === 'Progress' || m['contentType'] === 'SearchResults' || m['contentType'] === 'Code' || m['contentType'] === 'ToolCall') {
+                toolFrame = true
+                break
+              }
+            }
+            if (a['throttling'] !== undefined) throttling = a['throttling']
+            const wac = a['writeAtCursor']
+            if (typeof wac === 'string' && wac !== '' && !toolFrame) emitSnapshot(wac)
+            for (const mraw of msgs) {
+              if (!mraw || typeof mraw !== 'object') continue
+              const m = mraw as Record<string, unknown>
+              if (m['author'] === 'bot' && (m['messageType'] || '') === '' && typeof m['text'] === 'string' && m['text'] !== '') {
+                emitSnapshot(m['text'] as string)
+              }
+            }
+          }
+          continue
+        }
+
+        // result：最终结果帧
+        if (frame.type === 2) {
+          const item = frame.item as Record<string, unknown> | undefined
+          if (item) {
+            if (item['throttling'] !== undefined) throttling = item['throttling']
+            const res = item['result'] as Record<string, unknown> | undefined
+            if (res) {
+              if (typeof res['value'] === 'string') rawResult = res['value']
+              if (typeof res['message'] === 'string') {
+                finalText = res['message']
+                if (rateLimited(finalText)) throw new Error('upstream rate-limit notice')
+              }
+            }
+          }
+          continue
+        }
+
+        // complete：结束
+        if (frame.type === 3) {
+          if (frame.error) throw new Error(`chathub completion error: ${JSON.stringify(frame.error)}`)
+          const text = finalText || streamedText
+          if (rateLimited(text)) throw new Error('upstream rate-limit notice')
+          return {
+            text,
+            reasoning: reasoningBuf,
+            conversationId,
+            sessionId,
+            requestId: requestID,
+            events: [],
+            images: imageURLs([]),
+          }
+        }
+      }
+    }
+    throw new Error('chathub response deadline exceeded before completion')
+  } finally {
+    try { socket.close() } catch { /* ignore */ }
+  }
+}

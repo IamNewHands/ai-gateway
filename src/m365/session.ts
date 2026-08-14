@@ -1,0 +1,270 @@
+/**
+ * M365 会话绑定与内容键复用（移植自 M365-Copilot2API internal/web/session_resolver.go）。
+ *
+ * 核心：把"客户端上下文"（消息历史）与"云端对话"（conversationId/sessionId）绑定。
+ * - 显式指定 X-M365-Session-Id：最高优先级
+ * - 内容键匹配：历史严格是客户端消息的前缀时复用会话，只发增量（类似 DeepSeek 上下文缓存）
+ * - suffix 匹配：历史被客户端截断但仍高度相似时复用
+ *
+ * 存储：KV（每 provider 一个 JSON 列表），TTL 默认 2 小时。
+ */
+import type { Env } from '../types'
+import type { OaiMsgLite } from './tools'
+import { contentToString } from './tools'
+
+export interface SessionBinding {
+  sessionId: string
+  conversationId: string
+  accountId: string
+  createdAt: number
+  lastUsedAt: number
+  ipFingerprint?: string
+  userField?: string
+  contextFinger?: string
+  contextHistory?: OaiMsgLite[]
+}
+
+export interface ResolveResult {
+  sessionId: string
+  conversationId: string
+  accountId: string
+  matchedBy: string
+  isNew: boolean
+  /** 复用命中时云端对话已包含的消息条数（增量发送起点） */
+  historyLen: number
+}
+
+const M365_SESSION_PREFIX = 'm365:sessions:'
+const SESSION_TTL_MS = 2 * 60 * 60 * 1000
+const CONTEXT_TTL_MS = 2 * 60 * 60 * 1000
+const MAX_SESSIONS = 1000
+
+function kvKey(providerId: string): string {
+  return M365_SESSION_PREFIX + providerId
+}
+
+export function contextFingerprint(messages: OaiMsgLite[]): string {
+  if (!messages || messages.length === 0) return ''
+  const parts: string[] = []
+  const limit = Math.min(messages.length, 3)
+  for (let i = messages.length - limit; i < messages.length; i++) {
+    const m = messages[i]
+    parts.push(`${m.role}:${contentToString(m.content)}`)
+  }
+  const data = parts.join('||')
+  return sha256Hex(data)
+}
+
+function sha256Hex(s: string): string {
+  return sha256HexSync(s)
+}
+
+/** 同步 SHA-256（Workers 环境用 crypto.subtle 需 async，这里退化为简易 hash 也可，但保持一致用 subtle 的同步包装）
+ *  实际上 crypto.subtle 是异步的；为简单可靠，采用同步哈希（FNV/混合）即可——指纹只用于会话匹配，不涉及安全。 */
+function sha256HexSync(s: string): string {
+  // 简单 64 位 FNV-1a 双哈希 → hex，用于上下文指纹（非安全用途）
+  let h1 = 0x811c9dc5
+  let h2 = 0x01000193
+  for (let i = 0; i < s.length; i++) {
+    h1 = (h1 ^ s.charCodeAt(i)) >>> 0
+    h1 = Math.imul(h1, 0x01000193) >>> 0
+    h2 = (h2 ^ s.charCodeAt(i)) >>> 0
+    h2 = Math.imul(h2, 0x85ebca6b) >>> 0
+  }
+  const p1 = (h1 >>> 0).toString(16).padStart(8, '0')
+  const p2 = (h2 >>> 0).toString(16).padStart(8, '0')
+  return p1 + p2
+}
+
+async function readAll(env: Env, providerId: string): Promise<SessionBinding[]> {
+  try {
+    const raw = await env.KV.get(kvKey(providerId))
+    if (!raw) return []
+    const list = JSON.parse(raw) as SessionBinding[]
+    return Array.isArray(list) ? list : []
+  } catch {
+    return []
+  }
+}
+
+async function writeAll(env: Env, providerId: string, list: SessionBinding[]): Promise<void> {
+  try {
+    await env.KV.put(kvKey(providerId), JSON.stringify(list), { expirationTtl: Math.floor((SESSION_TTL_MS * 2) / 1000) })
+  } catch { /* KV 写入失败不影响主流程 */ }
+}
+
+function clientIPFingerprint(c: ContextLike): string {
+  const ip = c.ip || ''
+  const ua = c.userAgent || ''
+  return sha256Hex(ip + '|' + ua)
+}
+
+export interface ContextLike {
+  ip?: string
+  userAgent?: string
+  user?: string
+  explicitSessionId?: string
+}
+
+function messagesEqual(a: OaiMsgLite, b: OaiMsgLite): boolean {
+  if (a.role !== b.role) return false
+  if (contentToString(a.content) !== contentToString(b.content)) return false
+  const hasA = Array.isArray(a.tool_calls) && a.tool_calls.length > 0
+  const hasB = Array.isArray(b.tool_calls) && b.tool_calls.length > 0
+  if (hasA !== hasB) return false
+  return JSON.stringify(a.tool_calls || []) === JSON.stringify(b.tool_calls || [])
+}
+
+function contextPrefixLen(hist: OaiMsgLite[], msgs: OaiMsgLite[]): number {
+  if (hist.length === 0 || msgs.length < hist.length) return 0
+  for (let i = 0; i < hist.length; i++) {
+    if (!messagesEqual(hist[i], msgs[i])) return 0
+  }
+  return hist.length
+}
+
+function suffixMatchLen(hist: OaiMsgLite[], msgs: OaiMsgLite[]): number {
+  const maxN = Math.min(hist.length, msgs.length)
+  let n = 0
+  for (let i = 1; i <= maxN; i++) {
+    if (messagesEqual(hist[hist.length - i], msgs[msgs.length - i])) n = i
+    else break
+  }
+  return n
+}
+
+function cloneMessages(msgs: OaiMsgLite[]): OaiMsgLite[] {
+  return msgs.map((m) => ({ ...m, content: Array.isArray(m.content) ? [...m.content] : m.content, tool_calls: m.tool_calls ? [...m.tool_calls] : m.tool_calls }))
+}
+
+function evict(list: SessionBinding[]): SessionBinding[] {
+  const now = Date.now()
+  let out = list.filter((s) => now - s.lastUsedAt <= SESSION_TTL_MS)
+  if (out.length > MAX_SESSIONS) {
+    out = [...out].sort((a, b) => b.lastUsedAt - a.lastUsedAt).slice(0, MAX_SESSIONS)
+  }
+  return out
+}
+
+/**
+ * 解析会话绑定：显式 ID > 内容前缀 > suffix。
+ * messages 为客户端当前全量消息列表。
+ */
+export async function resolveSession(env: Env, providerId: string, msgs: OaiMsgLite[], ctx: ContextLike): Promise<ResolveResult> {
+  let list = await readAll(env, providerId)
+  list = evict(list)
+
+  const explicitID = ctx.explicitSessionId || ''
+  if (explicitID) {
+    const s = list.find((x) => x.sessionId === explicitID)
+    if (s) {
+      s.lastUsedAt = Date.now()
+      await writeAll(env, providerId, list)
+      return { sessionId: s.sessionId, conversationId: s.conversationId, accountId: s.accountId, matchedBy: 'explicit', isNew: false, historyLen: s.contextHistory?.length || 0 }
+    }
+  }
+
+  if (msgs && msgs.length > 0) {
+    const ipFinger = clientIPFingerprint(ctx)
+    // 内容前缀匹配
+    let best: { id: string; n: number; recent: number } | null = null
+    for (const s of list) {
+      if (!s.ipFingerprint || s.ipFingerprint !== ipFinger) continue
+      if (Date.now() - s.lastUsedAt > CONTEXT_TTL_MS) continue
+      if (!s.contextHistory || s.contextHistory.length === 0) continue
+      const n = contextPrefixLen(s.contextHistory, msgs)
+      if (n >= 1 && (!best || n > best.n || (n === best.n && s.lastUsedAt > best.recent))) {
+        best = { id: s.sessionId, n, recent: s.lastUsedAt }
+      }
+    }
+    if (best) {
+      const s = list.find((x) => x.sessionId === best!.id)!
+      s.lastUsedAt = Date.now()
+      await writeAll(env, providerId, list)
+      return { sessionId: s.sessionId, conversationId: s.conversationId, accountId: s.accountId, matchedBy: `context_prefix_${best.n}`, isNew: false, historyLen: best.n }
+    }
+    // suffix 匹配（客户端本地截断历史时仍可复用）
+    let bestS: { id: string; n: number; recent: number } | null = null
+    for (const s of list) {
+      if (!s.ipFingerprint || s.ipFingerprint !== ipFinger) continue
+      if (Date.now() - s.lastUsedAt > CONTEXT_TTL_MS) continue
+      if (!s.contextHistory || s.contextHistory.length < 2) continue
+      const n = suffixMatchLen(s.contextHistory, msgs)
+      if (n >= 2 && (!bestS || n > bestS.n || (n === bestS.n && s.lastUsedAt > bestS.recent))) {
+        bestS = { id: s.sessionId, n, recent: s.lastUsedAt }
+      }
+    }
+    if (bestS) {
+      const s = list.find((x) => x.sessionId === bestS!.id)!
+      s.lastUsedAt = Date.now()
+      await writeAll(env, providerId, list)
+      return { sessionId: s.sessionId, conversationId: s.conversationId, accountId: s.accountId, matchedBy: `context_suffix_${bestS.n}`, isNew: false, historyLen: bestS.n }
+    }
+  }
+
+  return { sessionId: '', conversationId: '', accountId: '', matchedBy: 'new', isNew: true, historyLen: 0 }
+}
+
+/**
+ * 绑定会话：对话完成后把（sessionId/conversationId/accountId + 消息历史）写入 KV。
+ * assistantText 为本次助手回复全文（含推理），用于更新历史供下次匹配。
+ */
+export async function bindSession(env: Env, providerId: string, sessionId: string, conversationId: string, accountId: string, msgs: OaiMsgLite[], assistantText: string, ctx: ContextLike): Promise<void> {
+  let list = await readAll(env, providerId)
+  list = evict(list)
+
+  const now = Date.now()
+  const history = cloneMessages(msgs)
+  if (assistantText.trim() !== '') {
+    history.push({ role: 'assistant', content: assistantText })
+  }
+  const ipFinger = clientIPFingerprint(ctx)
+
+  const existing = list.find((s) => s.sessionId === sessionId || (s.conversationId === conversationId && sessionId === ''))
+  if (existing) {
+    existing.conversationId = conversationId
+    existing.accountId = accountId
+    existing.lastUsedAt = now
+    existing.userField = ctx.user
+    existing.ipFingerprint = ipFinger
+    existing.contextFinger = contextFingerprint(history)
+    existing.contextHistory = history
+  } else {
+    list.push({
+      sessionId: sessionId || crypto.randomUUID(),
+      conversationId,
+      accountId,
+      createdAt: now,
+      lastUsedAt: now,
+      userField: ctx.user,
+      ipFingerprint: ipFinger,
+      contextFinger: contextFingerprint(history),
+      contextHistory: history,
+    })
+  }
+  await writeAll(env, providerId, list)
+}
+
+/** 列出某 provider 的所有会话（管理后台用） */
+export async function listSessions(env: Env, providerId: string): Promise<SessionBinding[]> {
+  return evict(await readAll(env, providerId))
+}
+
+/** 删除某 provider 的会话 */
+export async function deleteSession(env: Env, providerId: string, sessionId: string): Promise<boolean> {
+  let list = await readAll(env, providerId)
+  const before = list.length
+  list = list.filter((s) => s.sessionId !== sessionId)
+  if (list.length === before) return false
+  await writeAll(env, providerId, list)
+  return true
+}
+
+/** 清理过期会话（Cron 用） */
+export async function cleanupSessions(env: Env, providerId: string): Promise<number> {
+  let list = await readAll(env, providerId)
+  const before = list.length
+  list = evict(list)
+  if (list.length !== before) await writeAll(env, providerId, list)
+  return before - list.length
+}

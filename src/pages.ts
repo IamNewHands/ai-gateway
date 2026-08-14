@@ -155,6 +155,20 @@ const OAUTH_PRESETS: Record<string, { label: string; flowType: string; deviceCod
     _baseUrl: 'https://cloudcode-pa.googleapis.com',
     _redirectUri: 'http://127.0.0.1:8089/oauth2callback',
   },
+  m365: {
+    label: 'M365 Copilot（微软 OAuth）',
+    flowType: 'm365-pkce',
+    deviceCodeUrl: '',
+    deviceTokenUrl: '',
+    refreshTokenUrl: '',
+    clientId: 'c0ab8ce9-e9a0-42e7-b064-33d422df41f1',
+    scope: 'openid profile offline_access https://substrate.office.com/sydney/M365Chat.Read https://substrate.office.com/sydney/sydney.readwrite',
+    tokenHeader: 'Authorization',
+    tokenHeaderPrefix: 'Bearer ',
+    extraHeaders: {},
+    _baseUrl: 'https://substrate.office.com',
+    _redirectUri: 'https://login.microsoftonline.com/common/oauth2/nativeclient',
+  },
 }
 
 /**
@@ -575,7 +589,7 @@ ${H('管理')}
             <div class="fg"><label for="aat">认证方式</label><select id="aat" class="select-sm" onchange="toggleAuthType()"><option value="api-key">API Key</option><option value="oauth-device">OAuth 设备码登录</option></select></div>
             <div id="oauth-new" class="hd form-group">
               <fieldset class="form-group"><legend>OAuth 配置</legend>
-                <div class="fg"><label>登录流程类型</label><select id="ao8" class="select-sm"><option value="device">设备码（RFC 8628）</option><option value="browser">浏览器登录（WorkBuddy）</option><option value="qoder">Qoder 设备授权（QoderWork）</option><option value="gemini">Gemini 授权码（Gemini CLI）</option></select></div>
+                <div class="fg"><label>登录流程类型</label><select id="ao8" class="select-sm"><option value="device">设备码（RFC 8628）</option><option value="browser">浏览器登录（WorkBuddy）</option><option value="qoder">Qoder 设备授权（QoderWork）</option><option value="gemini">Gemini 授权码（Gemini CLI）</option><option value="m365-pkce">M365 授权码（PKCE）</option><option value="m365-ropc">M365 账号密码（ROPC）</option></select></div>
                 <div class="fg"><label>发起端点 (deviceCodeUrl)</label><input type="url" id="ao1" placeholder="https://.../auth/device/code"></div>
                 <div class="fg"><label>轮询端点 (deviceTokenUrl)</label><input type="url" id="ao2" placeholder="https://.../auth/device/token"></div>
                 <div class="fg"><label>Token 刷新端点 (refreshTokenUrl)</label><input type="url" id="ao3" placeholder="https://.../auth/oauth_token/refresh"></div>
@@ -629,7 +643,7 @@ ${H('管理')}
               <div class="fg"><label>认证方式</label><select id="auth-${escapePageHtml(p.id)}" class="select-sm" onchange="toggleAuthTypeEdit('${escapePageJsx(p.id)}')"><option value="api-key" ${(p.authType||'api-key')==='api-key'?'selected':''}>API Key</option><option value="oauth-device" ${p.authType==='oauth-device'?'selected':''}>OAuth 设备码登录</option></select></div>
               <div id="oauth-edit-${escapePageHtml(p.id)}" class="${p.authType==='oauth-device'?'form-group':'hd form-group'}">
                 <fieldset class="form-group"><legend>OAuth 配置</legend>
-                  <div class="fg"><label>登录流程类型</label><select id="eao8-${escapePageHtml(p.id)}" class="select-sm"><option value="device" ${((p.oauth&&p.oauth.flowType)||'device')==='device'?'selected':''}>设备码（RFC 8628）</option><option value="browser" ${(p.oauth&&p.oauth.flowType)==='browser'?'selected':''}>浏览器登录（WorkBuddy）</option><option value="qoder" ${(p.oauth&&p.oauth.flowType)==='qoder'?'selected':''}>Qoder 设备授权（QoderWork）</option><option value="gemini" ${(p.oauth&&p.oauth.flowType)==='gemini'?'selected':''}>Gemini 授权码（Gemini CLI）</option></select></div>
+                  <div class="fg"><label>登录流程类型</label><select id="eao8-${escapePageHtml(p.id)}" class="select-sm"><option value="device" ${((p.oauth&&p.oauth.flowType)||'device')==='device'?'selected':''}>设备码（RFC 8628）</option><option value="browser" ${(p.oauth&&p.oauth.flowType)==='browser'?'selected':''}>浏览器登录（WorkBuddy）</option><option value="qoder" ${(p.oauth&&p.oauth.flowType)==='qoder'?'selected':''}>Qoder 设备授权（QoderWork）</option><option value="gemini" ${(p.oauth&&p.oauth.flowType)==='gemini'?'selected':''}>Gemini 授权码（Gemini CLI）</option><option value="m365-pkce" ${(p.oauth&&p.oauth.flowType)==='m365-pkce'?'selected':''}>M365 授权码（PKCE）</option><option value="m365-ropc" ${(p.oauth&&p.oauth.flowType)==='m365-ropc'?'selected':''}>M365 账号密码（ROPC）</option></select></div>
                   <div class="fg"><label>发起端点</label><input type="url" id="eao1-${escapePageHtml(p.id)}" value="${escapePageHtml((p.oauth&&p.oauth.deviceCodeUrl)||'')}" placeholder="https://.../auth/device/code"></div>
                   <div class="fg"><label>轮询端点</label><input type="url" id="eao2-${escapePageHtml(p.id)}" value="${escapePageHtml((p.oauth&&p.oauth.deviceTokenUrl)||'')}" placeholder="https://.../auth/device/token"></div>
                   <div class="fg"><label>Token 刷新端点</label><input type="url" id="eao3-${escapePageHtml(p.id)}" value="${escapePageHtml((p.oauth&&p.oauth.refreshTokenUrl)||'')}" placeholder="https://.../auth/oauth_token/refresh"></div>
@@ -1375,9 +1389,13 @@ function oauthConnect(id) {
   // browser（WorkBuddy）与 qoder（QoderWork 设备授权）都是"跳转登录页授权"的交互：
   // 直接打开登录链接，用户确认后由后台轮询 token，无需输入授权码
   const isBrowser = oauth.flowType === 'browser' || oauth.flowType === 'qoder'
-  // gemini（Gemini CLI）是"授权码"交互：后台生成授权链接，用户授权后把回调 URL 粘贴回来
+  // gemini（Gemini CLI）/ m365-pkce 是"授权码"交互：后台生成授权链接，用户授权后把回调 URL 粘贴回来
   const isGemini = oauth.flowType === 'gemini'
-  if (!isGemini && (!oauth.deviceCodeUrl || !oauth.deviceTokenUrl || !oauth.refreshTokenUrl)) {
+  const isM365PKCE = oauth.flowType === 'm365-pkce'
+  // m365-ropc 是"账号密码"交互：不需要授权链接，直接提交企业账号/密码换 token
+  const isM365ROPC = oauth.flowType === 'm365-ropc'
+  // gemini/m365 的端点可留空（后端走官方默认端点）
+  if (!isGemini && !isM365PKCE && !isM365ROPC && (!oauth.deviceCodeUrl || !oauth.deviceTokenUrl || !oauth.refreshTokenUrl)) {
     st.textContent = '请先填写 OAuth 端点并保存'
     return
   }
@@ -1388,6 +1406,11 @@ function oauthConnect(id) {
       st.textContent = '请填写 Gemini Client ID / Client Secret，或配置环境变量 GEMINI_OAUTH_CLIENT_ID / GEMINI_OAUTH_CLIENT_SECRET'
       return
     }
+  } else if (isM365ROPC) {
+    // ROPC 无需发起授权，直接弹账号密码表单
+    st.textContent = '请输入 M365 企业订阅账号与密码'
+    showM('<h3><i class="fas fa-sign-in-alt c-p" aria-hidden="true"></i> M365 账号密码登录（ROPC）</h3><p>请输入拥有 M365 Copilot 订阅的企业账号与密码（仅用于换取 OAuth token，不会存储密码）：</p><p><input type="text" id="m365-ropc-user" placeholder="user@example.com" style="width:100%;box-sizing:border-box"></p><p><input type="password" id="m365-ropc-pass" placeholder="密码" style="width:100%;box-sizing:border-box"></p><p class="oauth-status" id="m365-ropc-st"></p><div class="fa"><button class="btn btn-s" onclick="closeM()">取消</button><button class="btn btn-p" onclick="oauthSubmitM365ROPC(\'' + escapeJsAttr(id) + '\')">登录</button></div>')
+    return
   } else if (!isBrowser && !oauth.clientId) {
     st.textContent = '设备码模式需要 Client ID，请填写并保存'
     return
@@ -1397,10 +1420,11 @@ function oauthConnect(id) {
     if (!d.success) { st.textContent = d.message || '发起失败'; return }
     const dev = d.data
     const uri = (dev && dev.verification_uri) || ''
-    if (isGemini) {
-      // Gemini 授权码模式：打开授权链接，授权后把地址栏（含 ?code=...&state=...）粘贴回来
+    if (isGemini || isM365PKCE) {
+      // 授权码模式：打开授权链接，授权后把地址栏（含 ?code=...&state=...）粘贴回来
+      const isM = isM365PKCE
       st.textContent = '请在浏览器中完成授权后粘贴回调 URL'
-      showM('<h3><i class="fas fa-sign-in-alt c-p" aria-hidden="true"></i> Gemini OAuth 授权</h3><p>1. 点击下方链接在浏览器中登录并授权（授权后页面会跳转到 localhost，地址栏里含 <code>?code=...</code>&nbsp;<code>state=...</code>）：</p><p><a href="' + escapeHtml(uri) + '" target="_blank" rel="noreferrer" style="word-break:break-all;font-size:1.05em">' + escapeHtml(uri) + '</a></p><p>2. 复制浏览器地址栏的完整回调 URL，粘贴到下方后提交：</p><p><input type="text" id="gemini-cb-url" placeholder="http://127.0.0.1:8089/oauth2callback?code=...&state=..." style="width:100%;box-sizing:border-box"></p><p class="oauth-status" id="gemini-cb-st"></p><div class="fa"><button class="btn btn-s" onclick="closeM()">取消</button><button class="btn btn-p" onclick="oauthSubmitGemini(\\'' + escapeJsAttr(id) + '\\')">提交授权</button></div>')
+      showM('<h3><i class="fas fa-sign-in-alt c-p" aria-hidden="true"></i> ' + (isM ? 'M365' : 'Gemini') + ' OAuth 授权</h3><p>1. 点击下方链接在浏览器中登录并授权（授权后页面会跳转，地址栏里含 <code>?code=...</code>&nbsp;<code>state=...</code>）：</p><p><a href="' + escapeHtml(uri) + '" target="_blank" rel="noreferrer" style="word-break:break-all;font-size:1.05em">' + escapeHtml(uri) + '</a></p><p>2. 复制浏览器地址栏的完整回调 URL，粘贴到下方后提交：</p><p><input type="text" id="' + (isM ? 'm365' : 'gemini') + '-cb-url" placeholder="' + (isM ? 'https://login.microsoftonline.com/common/oauth2/nativeclient?code=...&state=...' : 'http://127.0.0.1:8089/oauth2callback?code=...&state=...') + '" style="width:100%;box-sizing:border-box"></p><p class="oauth-status" id="' + (isM ? 'm365' : 'gemini') + '-cb-st"></p><div class="fa"><button class="btn btn-s" onclick="closeM()">取消</button><button class="btn btn-p" onclick="oauthSubmit' + (isM ? 'M365' : 'Gemini') + '(\'' + escapeJsAttr(id) + '\')">提交授权</button></div>')
     } else if (isBrowser) {
       // 浏览器登录模式：显示登录链接，自动轮询
       st.textContent = '请在弹窗中打开登录链接完成授权'
@@ -1461,6 +1485,53 @@ function oauthSubmitGemini(id) {
       if (st) st.textContent = d.message || '提交失败'
     }
   }).catch(() => { if (st) st.textContent = '提交失败，请重试' })
+}
+
+// M365 授权码模式：提交用户粘贴的回调 URL（换 token 逻辑同 gemini，走 /m365-callback）
+function oauthSubmitM365(id) {
+  const st = document.getElementById('m365-cb-st')
+  const mainSt = document.getElementById('oauth-st-' + id)
+  const url = ((document.getElementById('m365-cb-url') || {}).value || '').trim()
+  if (!url) { if (st) st.textContent = '请先粘贴授权后的回调 URL'; return }
+  if (st) st.textContent = '提交中…'
+  return fetch('/admin/api/oauth/' + encodeURIComponent(id) + '/m365-callback', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ callbackUrl: url }),
+  }).then(r => r.json()).then(d => {
+    if (d.success) {
+      if (st) st.textContent = '授权成功！正在拉取模型列表…'
+      if (mainSt) mainSt.textContent = '已连接'
+      setTimeout(closeM, 1200)
+      setTimeout(function() { fetchOauthModels(id) }, 1300)
+    } else {
+      if (st) st.textContent = d.message || '提交失败'
+    }
+  }).catch(() => { if (st) st.textContent = '提交失败，请重试' })
+}
+
+// M365 ROPC 模式：提交账号密码直接登录换 token
+function oauthSubmitM365ROPC(id) {
+  const st = document.getElementById('m365-ropc-st')
+  const mainSt = document.getElementById('oauth-st-' + id)
+  const username = ((document.getElementById('m365-ropc-user') || {}).value || '').trim()
+  const password = ((document.getElementById('m365-ropc-pass') || {}).value || '')
+  if (!username || !password) { if (st) st.textContent = '请输入账号与密码'; return }
+  if (st) st.textContent = '登录中…'
+  return fetch('/admin/api/oauth/' + encodeURIComponent(id) + '/m365-ropc', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ username: username, password: password }),
+  }).then(r => r.json()).then(d => {
+    if (d.success) {
+      if (st) st.textContent = '登录成功！正在拉取模型列表…'
+      if (mainSt) mainSt.textContent = '已连接'
+      setTimeout(closeM, 1200)
+      setTimeout(function() { fetchOauthModels(id) }, 1300)
+    } else {
+      if (st) st.textContent = d.message || '登录失败'
+    }
+  }).catch(() => { if (st) st.textContent = '登录失败，请重试' })
 }
 
 function oauthDisconnect(id) {

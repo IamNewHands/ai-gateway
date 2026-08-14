@@ -1,5 +1,6 @@
 import { KV_KEYS, OAUTH_TOKEN_REFRESH_MARGIN_MS } from './config'
 import type { Env, OAuthDeviceConfig, OAuthTokenState, DeviceFlowState } from './types'
+import { startM365PKCE, submitM365PKCECallback, m365ROPC, refreshM365Token } from './m365/oauth'
 
 // ===== KV 读写 =====
 
@@ -110,6 +111,14 @@ export async function startOauthDeviceFlow(env: Env, providerId: string, cfg: OA
   if (cfg.flowType === 'browser') {
     return startOauthBrowserFlow(env, providerId, cfg)
   }
+  if (cfg.flowType === 'm365-pkce') {
+    const r = await startM365PKCE(env, providerId, cfg)
+    return { success: r.success, message: r.message, device: r.authUrl ? { device_code: '', user_code: '', verification_uri: r.authUrl, interval: cfg.pollInterval || 5, expires_at: 0, flowType: 'm365-pkce' } : undefined }
+  }
+  if (cfg.flowType === 'm365-ropc') {
+    // ROPC 需要账号密码，走后台表单单独提交，不经过此处
+    return { success: false, message: 'm365-ropc 请使用账号密码直接登录（见后台表单）' }
+  }
   return startOauthDeviceCodeFlow(env, providerId, cfg)
 }
 
@@ -136,6 +145,12 @@ export async function pollOauthDeviceFlow(env: Env, providerId: string, cfg: OAu
   }
   if (flowType === 'browser') {
     return pollOauthBrowserFlow(env, providerId, cfg, device)
+  }
+  if (flowType === 'm365-pkce') {
+    // PKCE 回调由后台「提交回调 URL」完成换 token；轮询只兜底检测 token 是否已写入
+    const token = await readOauthToken(env, providerId)
+    if (token) return { status: 'success', message: 'OAuth 连接成功' }
+    return { status: 'pending', message: '请授权后把回调 URL 粘贴回后台' }
   }
   return pollOauthDeviceCodeFlow(env, providerId, cfg, device)
 }
@@ -965,6 +980,9 @@ async function doRefreshOauthToken(env: Env, providerId: string, cfg: OAuthDevic
   if (cfg.flowType === 'browser') {
     return refreshOauthTokenBrowser(env, providerId, cfg)
   }
+  if (cfg.flowType === 'm365-pkce' || cfg.flowType === 'm365-ropc') {
+    return refreshM365Token(env, providerId, cfg)
+  }
   return refreshOauthTokenDevice(env, providerId, cfg)
 }
 
@@ -1073,4 +1091,34 @@ export interface ProviderLike {
   id: string
   authType?: 'api-key' | 'oauth-device'
   oauth?: OAuthDeviceConfig
+}
+
+// ===== M365 Copilot（flowType=m365-pkce / m365-ropc）=====
+// 认证逻辑实现在 src/m365/oauth.ts；此处仅做网关统一出口分发。
+
+export interface M365CallbackSubmitResult {
+  success: boolean
+  message: string
+  email?: string
+}
+
+/** 提交 M365 PKCE 授权回调（把浏览器地址栏 URL 粘贴回后台） */
+export async function submitOauthM365Callback(
+  env: Env,
+  providerId: string,
+  cfg: OAuthDeviceConfig,
+  callbackUrl: string
+): Promise<M365CallbackSubmitResult> {
+  return submitM365PKCECallback(env, providerId, cfg, callbackUrl)
+}
+
+/** M365 ROPC：账号密码直接登录换 token */
+export async function submitOauthM365ROPC(
+  env: Env,
+  providerId: string,
+  cfg: OAuthDeviceConfig,
+  username: string,
+  password: string
+): Promise<M365CallbackSubmitResult> {
+  return m365ROPC(env, providerId, cfg, username, password)
 }
