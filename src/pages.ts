@@ -6,6 +6,37 @@ import { CSS_CONTENT } from './pages.css'
 import { SHARED_JS, renderSiteFooter } from './shared.js'
 import { ANALYTICS_JS } from './analytics-ui.js'
 
+// ============================================================================
+// ⚠️ SSR 内联 JS 转义铁律（多次踩坑，改本文件前必读）
+//
+// 本文件是把 TypeScript 模板字符串（反引号）整体渲染成 <script> 内联脚本，
+// 任何转义失误都会导致【整块脚本语法错误 → 后台所有按钮/函数失效】，且错误
+// 只在浏览器控制台报 "xxx is not defined"，极难排查。铁律如下：
+//
+// 1. 想要渲染后 JS 里出现 \'（JS 字符串内的转义单引号），源文件必须写 \\'
+//    （两个反斜杠）。写单反斜杠 \' 会在模板字符串里被解释成裸单引号 '，
+//    使渲染出的 JS 单引号字符串提前闭合 → SyntaxError。
+//    例：onclick="mcpSave(\\'' + id + '\\')"   ✅
+//        onclick="mcpSave(\'' + id + '\')"    ❌（必炸）
+//
+// 2. 向 <script> 注入数据 JSON，一律用 serializeForScript()，禁止裸 JSON.stringify：
+//    - 不转义 < 时，数据里的 </script> 会直接截断 HTML script 块；
+//      <!-- 会开启 HTML 注释吞掉后续脚本。
+//    - 数据里的 U+2028/U+2029（JS 行/段分隔符）会令字符串字面量非法。
+//    例：const X = ${serializeForScript(data)};   ✅
+//        const X = ${JSON.stringify(data)};       ❌
+//
+// 3. 页面 JS 内容中不得出现裸反引号 ` 或裸 ${（会被当作 TS 模板字符串边界/插值）。
+//
+// 4. 字符串值进 HTML 用 escapePageHtml()；进内联 JS 属性（onclick/onchange）
+//    用 escapePageJs() / escapePageJsx()；不要混用。
+//
+// 5. 改完本文件脚本部分，务必重新渲染管理页并用 `node --check` 校验生成的
+//    <script> 内容，或至少核对新写的 \' 均为 \\'。
+//
+// 以上同样适用于 ${SHARED_JS} / ${ANALYTICS_JS} 注入的 shared.js.ts / analytics-ui.js.ts。
+// ============================================================================
+
 // 前端页面模板：仅重构视觉与交互，保持后端路由、KV 结构和 API 契约不变。
 const escapePageHtml = (value: unknown) => String(value ?? '')
   .replace(/&/g, '&amp;')
