@@ -14,15 +14,19 @@ mode = "smart"
 binding = "KV"
 
 # M365 Copilot Session Durable Object — 承载 ChatHub WS 会话（绕过 Worker 墙钟限制，
-# 同会话并发串行化 + 会话绑定读写）。绑定后需 `wrangler deploy` 创建迁移。
+# 同会话并发串行化 + 会话绑定读写）。
 [durable_objects]
 bindings = [
   { name = "M365_SESSION", class_name = "M365Session" },
 ]
 
-[[migrations]]
-tag = "v1"
-new_sqlite_classes = ["M365Session"]
+# M365Session 生命周期用声明式 exports（与 legacy [[migrations]] 互斥，只能二选一）。
+# 相比 [[migrations]]，exports 由 Cloudflare 对账自动创建 namespace，不依赖 migration tag 链，
+# 可规避给「已存在且从未部署过 DO 迁移」的 Worker 首次加 DO 时的
+# "Actor migration tag precondition failed, got tag '' when expected tag is 'v1'" (10079) 报错。
+[exports.M365Session]
+type = "durable-object"
+storage = "sqlite"
 
 # Analytics Engine 数据集 — 记录代理请求用量统计
 [vars]
