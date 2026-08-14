@@ -373,6 +373,18 @@ ${H('登录')}
 
 // ===== 管理后台 =====
 
+/**
+ * 安全序列化 JSON 用于内联 <script> 注入：
+ * - `<` → \u003c：防止数据中的 `</script>` 截断脚本块、`<!--` 注释挖洞
+ * - U+2028 / U+2029 → \u2028 / \u2029：行/段分隔符在 JS 字符串字面量中属非法字符（ES2019 起才合法），
+ *   会导致整个脚本块语法错误——表现为后台所有按钮失效（函数全部未定义）
+ */
+const serializeForScript = (data: unknown): string =>
+  JSON.stringify(data)
+    .replace(/</g, '\\u003c')
+    .replace(/\u2028/g, '\\u2028')
+    .replace(/\u2029/g, '\\u2029')
+
 export async function renderAdminPage(c: Context<AppEnv>) {
   const providers = await getProviders(c.env)
   const proxyKeys = await getProxyKeys(c.env)
@@ -713,13 +725,13 @@ ${H('管理')}
 
 <script>
 // UX8：预设表单一数据源——注入文件顶部 PROVIDER_PRESETS / OAUTH_PRESETS，供 applyProviderPreset 等使用
-const PROVIDER_PRESETS = ${JSON.stringify(PROVIDER_PRESETS).replace(/</g, '\\u003c')};
-const OAUTH_PRESETS = ${JSON.stringify(OAUTH_PRESETS).replace(/</g, '\\u003c')};
+const PROVIDER_PRESETS = ${serializeForScript(PROVIDER_PRESETS)};
+const OAUTH_PRESETS = ${serializeForScript(OAUTH_PRESETS)};
 ${SHARED_JS}${ANALYTICS_JS}
 // 全部已启用模型引用（providerId/modelId），供 Vision Bridge 识图模型勾选
-const VB_MODELS = ${JSON.stringify(allModelRefs).replace(/</g, '\\u003c')};
+const VB_MODELS = ${serializeForScript(allModelRefs)};
 // 各提供商已保存的识图配置快照（懒渲染未展开时，保存表单可据此保留原配置）
-const VB_ORIGINAL = ${JSON.stringify(Object.fromEntries(providers.map(p => [p.id, { primary: (p.visionBridge&&p.visionBridge.primary)||'', vision: (p.visionBridge&&p.visionBridge.vision)||[], onVisionFailure: (p.visionBridge&&p.visionBridge.onVisionFailure)||'error' }]))).replace(/</g, '\\u003c')};
+const VB_ORIGINAL = ${serializeForScript(Object.fromEntries(providers.map(p => [p.id, { primary: (p.visionBridge&&p.visionBridge.primary)||'', vision: (p.visionBridge&&p.visionBridge.vision)||[], onVisionFailure: (p.visionBridge&&p.visionBridge.onVisionFailure)||'error' }])))};
 // P6：识图模型引用列表懒渲染——展开「识图模型配置」时才从 VB_MODELS 生成控件，
 // 避免 SSR 为每个提供商重放全库模型引用（O(N×M) 页面膨胀）。
 function vbFill(container) {
@@ -2231,8 +2243,8 @@ renumberVisionOrders();
 restoreAdminState();
 
 // ===== MCP 网关管理 =====
-const MCPS = ${JSON.stringify(mcps).replace(/</g, '\\u003c')};
-const UNIMODELS = ${JSON.stringify(unimodels).replace(/</g, '\\u003c')};
+const MCPS = ${serializeForScript(mcps)};
+const UNIMODELS = ${serializeForScript(unimodels)};
 function mcpFind(id) {
   for (var i = 0; i < MCPS.length; i++) if (MCPS[i].id === id) return MCPS[i]
   return null
@@ -2241,8 +2253,8 @@ function mcpFormModal(m) {
   var h = '<h3><i class="fas fa-boxes c-p"></i> ' + (m ? '编辑 MCP Server' : '添加 MCP Server') + '</h3>'
   h += '<div class="fg"><label>名称</label><input type="text" id="mcp-name" value="' + (m ? escapeHtml(m.name) : '') + '" placeholder="如：网络搜索"></div>'
   h += '<div class="fg"><label>URL（MCP JSON-RPC 端点）</label><input type="url" id="mcp-url" value="' + (m ? escapeHtml(m.url) : '') + '" placeholder="https://example.com/mcp"></div>'
-  h += '<div class="fg"><label>HTTP 头（JSON，可选）</label><textarea id="mcp-headers" rows="3" placeholder=\'{"Authorization":"Bearer xxx"}\'>' + (m ? escapeHtml(JSON.stringify(m.httpHeaders || {}, null, 2)) : '') + '</textarea><span class="form-helper">工具名自动加前缀「' + (m ? escapeHtml(m.name) : '名称') + '-」，名称中的空格变下划线。</span></div>'
-  h += '<div class="panel-actions"><label class="switch-label"><span>启用</span><span class="tg"><input type="checkbox" id="mcp-enabled"' + (!m || m.enabled ? ' checked' : '') + '><span class="sl"></span></span></label><div><button class="btn btn-s" onclick="closeM()">取消</button><button class="btn btn-p" onclick="mcpSave(\'' + (m ? escapeJsAttr(m.id) : '') + '\')">保存</button></div></div>'
+  h += '<div class="fg"><label>HTTP 头（JSON，可选）</label><textarea id="mcp-headers" rows="3" placeholder=\\'{"Authorization":"Bearer xxx"}\\'>' + (m ? escapeHtml(JSON.stringify(m.httpHeaders || {}, null, 2)) : '') + '</textarea><span class="form-helper">工具名自动加前缀「' + (m ? escapeHtml(m.name) : '名称') + '-」，名称中的空格变下划线。</span></div>'
+  h += '<div class="panel-actions"><label class="switch-label"><span>启用</span><span class="tg"><input type="checkbox" id="mcp-enabled"' + (!m || m.enabled ? ' checked' : '') + '><span class="sl"></span></span></label><div><button class="btn btn-s" onclick="closeM()">取消</button><button class="btn btn-p" onclick="mcpSave(\\'' + (m ? escapeJsAttr(m.id) : '') + '\\')">保存</button></div></div>'
   showM(h)
 }
 function mcpEdit(id) { mcpFormModal(mcpFind(id)) }
@@ -2292,7 +2304,7 @@ function unimodelFormModal(u) {
   var h = '<h3><i class="fas fa-layer-group c-p"></i> ' + (u ? '编辑联合模型' : '添加联合模型') + '</h3>'
   h += '<div class="fg"><label>名称</label><input type="text" id="um-name" value="' + (u ? escapeHtml(u.name) : '') + '" placeholder="如：free-flash"><span class="form-helper">调用模型 ID 为 unimodel/名称</span></div>'
   h += '<div class="fg"><label>候选模型（每行一个 providerId/modelId）</label><textarea id="um-models" rows="5" placeholder="deepseek/deepseek-chat\\nopenrouter/deepseek/deepseek-chat-v3-0324:free">' + (u ? escapeHtml((u.models || []).join('\\n')) : '') + '</textarea><span class="form-helper">按顺序 failover，第一个成功即返回。候选须为已配置的 providerId/modelId。</span></div>'
-  h += '<div class="panel-actions"><label class="switch-label"><span>启用</span><span class="tg"><input type="checkbox" id="um-enabled"' + (!u || u.enabled ? ' checked' : '') + '><span class="sl"></span></span></label><div><button class="btn btn-s" onclick="closeM()">取消</button><button class="btn btn-p" onclick="unimodelSave(\'' + (u ? escapeJsAttr(u.id) : '') + '\')">保存</button></div></div>'
+  h += '<div class="panel-actions"><label class="switch-label"><span>启用</span><span class="tg"><input type="checkbox" id="um-enabled"' + (!u || u.enabled ? ' checked' : '') + '><span class="sl"></span></span></label><div><button class="btn btn-s" onclick="closeM()">取消</button><button class="btn btn-p" onclick="unimodelSave(\\'' + (u ? escapeJsAttr(u.id) : '') + '\\')">保存</button></div></div>'
   showM(h)
 }
 function unimodelEdit(id) { unimodelFormModal(unimodelFind(id)) }
@@ -2344,7 +2356,7 @@ async function loadCache() {
   el.innerHTML = entries.map(function (e) {
     var age = Math.round(e.ageMs / 1000)
     var ttl = Math.round(e.ttlMs / 1000)
-    return '<article class="ki" data-key="' + escapeHtml(e.key) + '"><div class="key-main"><span class="key-icon" aria-hidden="true"><i class="fas fa-memory"></i></span><div><h3>' + escapeHtml(e.label) + '</h3><p>大小 ' + (e.size / 1024).toFixed(1) + ' KB · 已缓存 ' + age + 's / TTL ' + ttl + 's · KV key: <code>' + escapeHtml(e.key) + '</code></p></div></div><div class="key-actions"><button class="btn btn-d btn-xs" onclick="cacheDel(\'' + escapeJsAttr(e.key) + '\')"><i class="fas fa-trash" aria-hidden="true"></i>清除</button></div></article>'
+    return '<article class="ki" data-key="' + escapeHtml(e.key) + '"><div class="key-main"><span class="key-icon" aria-hidden="true"><i class="fas fa-memory"></i></span><div><h3>' + escapeHtml(e.label) + '</h3><p>大小 ' + (e.size / 1024).toFixed(1) + ' KB · 已缓存 ' + age + 's / TTL ' + ttl + 's · KV key: <code>' + escapeHtml(e.key) + '</code></p></div></div><div class="key-actions"><button class="btn btn-d btn-xs" onclick="cacheDel(\\'' + escapeJsAttr(e.key) + '\\')"><i class="fas fa-trash" aria-hidden="true"></i>清除</button></div></article>'
   }).join('')
 }
 function cacheDel(key) {
