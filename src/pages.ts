@@ -103,6 +103,7 @@ const PROVIDER_PRESETS: Record<string, { name: string; id: string; baseUrl: stri
     models: ['deepseek-v4-flash', 'deepseek-v4-pro'],
   },
   visionbridge: { name: 'Vision Bridge (图片转写桥)', id: 'visionbridge', baseUrl: 'https://example.com/v1', apiType: 'openai' },
+  m365:         { name: 'M365 Copilot (OAuth)',   id: 'm365',         baseUrl: 'https://substrate.office.com',                     apiType: 'openai', authType: 'oauth-device', oauthPreset: 'm365' },
 }
 
 const OAUTH_PRESETS: Record<string, { label: string; flowType: string; deviceCodeUrl: string; deviceTokenUrl: string; refreshTokenUrl: string; clientId: string; clientSecret?: string; scope?: string; tokenHeader: string; tokenHeaderPrefix: string; extraHeaders: Record<string, string>; _baseUrl?: string; _modelsUrl?: string; _globalBaseUrl?: string; _globalModelsUrl?: string; _globalOrigin?: string; _redirectUri?: string }> = {
