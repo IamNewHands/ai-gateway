@@ -974,6 +974,7 @@ export async function forwardProxy(
     // 网关透传 DO 返回的 OpenAI SSE/JSON。
     if (isM365Provider(provider)) {
       const response = await proxyM365ChatRequest(c.env, provider, forwardBody as Record<string, unknown>, {
+        explicitSessionId: c.req.header('X-M365-Session-Id') || '',
         ip: c.req.header('cf-connecting-ip') || c.req.header('x-real-ip') || '',
         userAgent: c.req.header('user-agent') || '',
       })
@@ -2416,6 +2417,9 @@ async function handleAnthropicM365(
   openaiBody: Record<string, unknown>,
   originalStream: boolean
 ): Promise<Response> {
+  // 透传 X-M365-Session-Id 请求头到 body（Anthropic 路径无 context 直传，靠 extractExplicitSession 识别）
+  const sid = c.req.header('X-M365-Session-Id')
+  if (sid) openaiBody['m365_session_id'] = sid
   return handleAnthropicSpecial(c, provider, model, openaiBody, originalStream, proxyM365ChatRequest, 'M365')
 }
 
@@ -3151,6 +3155,9 @@ async function handleResponsesM365(
   openaiBody: Record<string, unknown>,
   originalStream: boolean
 ): Promise<Response> {
+  // 透传 X-M365-Session-Id 请求头到 body（Responses 路径无 context 直传，靠 extractExplicitSession 识别）
+  const sid = c.req.header('X-M365-Session-Id')
+  if (sid) openaiBody['m365_session_id'] = sid
   return handleResponsesSpecial(c, provider, model, openaiBody, originalStream, proxyM365ChatRequest, 'M365')
 }
 

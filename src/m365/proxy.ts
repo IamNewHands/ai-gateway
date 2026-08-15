@@ -64,7 +64,8 @@ export async function proxyM365ChatRequest(
   context?: M365ProxyContext
 ): Promise<Response> {
   const messages = (body['messages'] as Array<Record<string, unknown>>) || []
-  const explicitSessionId = extractExplicitSession(body)
+  // 显式会话 ID 优先级：HTTP 头 X-M365-Session-Id > 请求体字段（m365_session_id / session_id）
+  const explicitSessionId = context?.explicitSessionId || extractExplicitSession(body)
   const sessionId = sessionKey(provider.id, explicitSessionId, messages)
 
   const payload: M365ChatPayload = {

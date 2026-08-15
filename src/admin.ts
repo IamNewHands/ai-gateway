@@ -32,6 +32,7 @@ import { isCnbProvider, testCnbConnection, CNB_MODELS } from './cnb/proxy'
 import { PROXY_KEY_PREFIX, EXPIRY_OPTIONS, OPENCODE_DEFAULT_URL } from './config'
 import { startOauthDeviceFlow, pollOauthDeviceFlow, readOauthToken, deleteOauthToken, getOauthAccessToken, buildOauthHeaders, detectTokenRealm, submitOauthGeminiCallback, submitOauthM365Callback, submitOauthM365ROPC } from './oauth'
 import { isM365Provider, M365_MODELS, testM365Model } from './m365/proxy'
+import { listSessions as listM365Sessions, deleteSession as deleteM365Session } from './m365/session'
 import type {
   AppEnv,
   Env,
@@ -1756,4 +1757,96 @@ export async function handleLogConfig(c: Context<AppEnv>) {
   const enabled = await c.env.KV.get('config:log_enabled')
   const retention = await getLogRetentionDays(c.env)
   return c.json<ApiResponse>({ success: true, data: { enabled: enabled !== 'false', retentionDays: retention } })
+}
+
+// ============================================================
+//  M365 会话绑定管理  /v1/sessions
+//  （对标原版会话管理：查询 / 按 session_id 查询 / 解除绑定）
+// ============================================================
+
+/** 校验 provider_id 是否为已存在的 M365 提供商；合法则返回它，否则返回 null */
+async function resolveM365ProviderIdByStr(c: Context<AppEnv>, providerId: string): Promise<string | null> {
+  if (!providerId) return null
+  const p = await getProvider(c.env, providerId).catch(() => null)
+  if (!p) return null
+  if (p.authType !== 'oauth-device' || !isM365Provider(p)) return null
+  return providerId
+}
+
+/**
+ * GET /v1/sessions?provider_id=xxx      —— 列出该 provider 的会话绑定
+ * POST /v1/sessions {provider_id, session_id} —— 按 session_id 查询指定绑定
+ */
+export async function handleM365Sessions(c: Context<AppEnv>) {
+  // provider_id：query 优先，POST 也支持 body 传入
+  let providerId = c.req.query('provider_id') || ''
+  if (!providerId && c.req.method === 'POST') {
+    const body = await c.req.json().catch(() => ({}))
+    if (typeof body['provider_id'] === 'string') providerId = body['provider_id']
+  }
+  const resolved = await resolveM365ProviderIdByStr(c, providerId)
+  if (!resolved) {
+    return c.json({ error: { message: '缺少有效的 M365 provider_id 参数', type: 'invalid_request_error' } }, 400)
+  }
+  const providerIdResolved = resolved
+  try {
+    const sessions = await listM365Sessions(c.env, providerIdResolved)
+    if (c.req.method === 'POST') {
+      const body = await c.req.json().catch(() => ({}))
+      const sid = typeof body['session_id'] === 'string' ? body['session_id'] : ''
+      if (sid) {
+        const hit = sessions.find((s) => s.sessionId === sid)
+        if (!hit) {
+          return c.json({ error: { message: 'session not found', type: 'not_found' } }, 404)
+        }
+        return c.json({
+          object: 'session',
+          session_id: hit.sessionId,
+          conversation_id: hit.conversationId,
+          account_id: hit.accountId,
+          matched_by: 'explicit',
+          created_at: hit.createdAt,
+          last_used_at: hit.lastUsedAt,
+        })
+      }
+    }
+    // GET：返回脱敏的会话绑定列表
+    return c.json({
+      object: 'list',
+      data: sessions.map((s) => ({
+        session_id: s.sessionId,
+        conversation_id: s.conversationId,
+        account_id: s.accountId,
+        created_at: s.createdAt,
+        last_used_at: s.lastUsedAt,
+      })),
+    })
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err)
+    try { await writeLog(c.env, 'error', `[m365-sessions] provider=${providerIdResolved} list failed`, msg) } catch { /* ignore */ }
+    return c.json({ error: { message: msg, type: 'internal_error' } }, 500)
+  }
+}
+
+/** DELETE /v1/sessions/:id?provider_id=xxx —— 解除会话绑定 */
+export async function handleM365SessionDelete(c: Context<AppEnv>) {
+  const providerId = await resolveM365ProviderIdByStr(c, c.req.query('provider_id') || '')
+  if (!providerId) {
+    return c.json({ error: { message: '缺少有效的 M365 provider_id 参数', type: 'invalid_request_error' } }, 400)
+  }
+  const id = c.req.param('id')
+  if (!id) {
+    return c.json({ error: { message: '缺少 session id 参数', type: 'invalid_request_error' } }, 400)
+  }
+  try {
+    const ok = await deleteM365Session(c.env, providerId, id)
+    if (!ok) {
+      return c.json({ error: { message: 'session not found', type: 'not_found' } }, 404)
+    }
+    return c.json({ success: true, deleted: true })
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err)
+    try { await writeLog(c.env, 'error', `[m365-sessions] provider=${providerId} delete failed`, msg) } catch { /* ignore */ }
+    return c.json({ error: { message: msg, type: 'internal_error' } }, 500)
+  }
 }

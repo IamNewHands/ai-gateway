@@ -43,6 +43,8 @@ import {
   handleGetCache,
   handleDeleteCache,
   handleClearCache,
+  handleM365Sessions,
+  handleM365SessionDelete,
 } from './admin'
 import { handleMcpJsonRpc } from './mcp-gateway'
 import { renderHomePage, renderLoginPage, renderAdminPage } from './pages'
@@ -208,6 +210,10 @@ app.post('/v1/messages', handleAnthropicMessages)
 
 // OpenAI Responses API — 必须在 /v1/* 通配之前注册
 app.post('/v1/responses', handleResponses)
+
+// M365 会话绑定管理（GET/POST 查询、DELETE 解除）—— 需在通用转发 handleProxy 之前注册
+app.all('/v1/sessions', handleM365Sessions)
+app.delete('/v1/sessions/:id', handleM365SessionDelete)
 
 // WebSocket 桥接 — Trae 等客户端自定义模型直连网关时用 WS 传输（GET 升级请求无 body，
 // 不能让 handleProxy 用 c.req.json() 读取，否则抛 "Unexpected end of JSON input" → 500 → 握手失败）。
