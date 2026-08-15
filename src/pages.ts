@@ -466,7 +466,7 @@ ${H('管理')}
       <a class="admin-nav__link" href="#analytics"><i class="fas fa-chart-bar" aria-hidden="true"></i><span>使用统计</span></a>
       <a class="admin-nav__link" href="#usage-logs"><i class="fas fa-clipboard-list" aria-hidden="true"></i><span>详细日志</span></a>
       <a class="admin-nav__link" href="#logs"><i class="fas fa-list-alt" aria-hidden="true"></i><span>系统日志</span></a>
-<a class="admin-nav__link" href="#checkin"><i class="fas fa-calendar-check" aria-hidden="true"></i><span>签到</span><b>${providers.filter((p:any)=>p.authType==='oauth-device'&&p.oauth).length}</b></a>
+<a class="admin-nav__link" href="#checkin"><i class="fas fa-calendar-check" aria-hidden="true"></i><span>签到</span><b>${providers.filter((p:any)=>p.authType==='oauth-device'&&p.oauth&&p.oauth.flowType!=='m365-pkce'&&p.oauth.flowType!=='m365-ropc').length}</b></a>
       <a class="admin-nav__link" href="#mcps"><i class="fas fa-boxes" aria-hidden="true"></i><span>MCP 网关</span><b>${mcps.length}</b></a>
       <a class="admin-nav__link" href="#unimodels"><i class="fas fa-layer-group" aria-hidden="true"></i><span>联合模型</span><b>${unimodels.length}</b></a>
       <a class="admin-nav__link" href="#cache"><i class="fas fa-memory" aria-hidden="true"></i><span>内存缓存</span></a>
