@@ -1827,6 +1827,10 @@ async function editKeyModels(keyId) {
       allModels.push({ id: p.id + '/' + m.id, label: p.name + ' / ' + m.id, group: p.name })
     })
   })
+  // 联合模型（uni-model）也作为可筛选模型：调用 ID 形如 unimodel/名称
+  ;(typeof UNIMODELS !== 'undefined' ? UNIMODELS : []).forEach(function(u) {
+    allModels.push({ id: 'unimodel/' + u.name, label: 'unimodel/' + u.name, group: '联合模型' })
+  })
   if (allModels.length === 0) { toast('暂无可用模型，请先添加提供商和模型', 'error'); return }
   // 获取当前 Key 的 allowedModels
   const keyRes = await fetch('/admin/api/proxy-keys')
@@ -2424,7 +2428,7 @@ function unimodelModelGrid(selected) {
   if (!VB_MODELS || VB_MODELS.length === 0) return '<span class="mu">暂无已启用模型，请先在「提供商」中配置并启用模型</span>'
   return VB_MODELS.map(function (ref) {
     var checked = sel.indexOf(ref) >= 0 ? ' checked' : ''
-    return '<label class="mdl-item ov" title="' + escapeHtml(ref) + '"><input type="checkbox" class="um-ref" value="' + escapeHtml(ref) + '"' + checked + '><span class="fx1">' + escapeHtml(ref) + '</span></label>'
+    return '<label class="mdl-item um-item" title="' + escapeHtml(ref) + '"><input type="checkbox" class="um-ref" value="' + escapeHtml(ref) + '"' + checked + '><span class="fx1">' + escapeHtml(ref) + '</span></label>'
   }).join('')
 }
 function unimodelFormModal(u) {

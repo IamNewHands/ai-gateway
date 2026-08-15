@@ -375,6 +375,9 @@ label, legend { color: var(--color-ink-2); font-size: var(--text-xs); font-weigh
 .mdl-item .fx1 { min-width: 0; white-space: normal; overflow-wrap: anywhere; }
 .mdl-item i:first-child { color: var(--color-muted); }
 .mdl-add-btn { flex-shrink: 0; }
+/* 联合模型候选勾选项：约束原生复选框尺寸、与文字垂直对齐，允许长模型 ID 换行不挤压 */
+.mdl-item .um-ref { width: .875rem; height: .875rem; flex: 0 0 auto; min-width: 0; margin: 0; accent-color: var(--color-accent); }
+.mdl-item.um-item { white-space: normal; overflow-wrap: anywhere; cursor: pointer; }
 .grid-2-gap6 { display: grid; grid-template-columns: minmax(0, 1fr); gap: var(--space-2xs); }
 @keyframes modal-in { from { opacity: 0; transform: translateY(var(--space-xs)); } to { opacity: 1; transform: none; } }
 
