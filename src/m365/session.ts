@@ -106,13 +106,34 @@ export interface ContextLike {
   explicitSessionId?: string
 }
 
+/** 比较两个工具调用：name 与 arguments 一致即视为等价，忽略 id（客户端重放时 id 会重新生成） */
+function toolCallEqual(x: unknown, y: unknown): boolean {
+  if (!x || typeof x !== 'object' || !y || typeof y !== 'object') return false
+  const a = x as Record<string, unknown>
+  const b = y as Record<string, unknown>
+  const xf = (a['function'] || {}) as Record<string, unknown>
+  const yf = (b['function'] || {}) as Record<string, unknown>
+  const xn = typeof xf['name'] === 'string' ? xf['name'] : ''
+  const yn = typeof yf['name'] === 'string' ? yf['name'] : ''
+  if (xn !== yn) return false
+  const xa = xf['arguments'] === undefined ? '' : String(xf['arguments'])
+  const ya = yf['arguments'] === undefined ? '' : String(yf['arguments'])
+  return xa === ya
+}
+
 function messagesEqual(a: OaiMsgLite, b: OaiMsgLite): boolean {
   if (a.role !== b.role) return false
   if (contentToString(a.content) !== contentToString(b.content)) return false
-  const hasA = Array.isArray(a.tool_calls) && a.tool_calls.length > 0
-  const hasB = Array.isArray(b.tool_calls) && b.tool_calls.length > 0
-  if (hasA !== hasB) return false
-  return JSON.stringify(a.tool_calls || []) === JSON.stringify(b.tool_calls || [])
+  const ta = Array.isArray(a.tool_calls) ? a.tool_calls : undefined
+  const tb = Array.isArray(b.tool_calls) ? b.tool_calls : undefined
+  if ((ta === undefined) !== (tb === undefined)) return false
+  if (ta === undefined) return true
+  if (ta.length !== tb!.length) return false
+  for (let i = 0; i < ta.length; i++) {
+    if (toolCallEqual(ta[i], tb![i])) continue
+    return false
+  }
+  return true
 }
 
 function contextPrefixLen(hist: OaiMsgLite[], msgs: OaiMsgLite[]): number {
@@ -219,8 +240,12 @@ export async function bindSession(env: Env, providerId: string, sessionId: strin
     history.push({ role: 'assistant', content: assistantText })
   }
   const ipFinger = clientIPFingerprint(ctx)
+  // 客户端显式指定会话 ID 时，以它为持久化 sessionId（同原版 Bind：explicitID 优先），
+  // 否则复用命中/新建会话用云端返回的 sessionId。
+  const explicitID = ctx.explicitSessionId || ''
+  const persistId = explicitID || sessionId
 
-  const existing = list.find((s) => s.sessionId === sessionId || (s.conversationId === conversationId && sessionId === ''))
+  const existing = list.find((s) => s.sessionId === persistId || (s.conversationId === conversationId && persistId === ''))
   if (existing) {
     existing.conversationId = conversationId
     existing.accountId = accountId
@@ -231,7 +256,7 @@ export async function bindSession(env: Env, providerId: string, sessionId: strin
     existing.contextHistory = history
   } else {
     list.push({
-      sessionId: sessionId || crypto.randomUUID(),
+      sessionId: persistId || crypto.randomUUID(),
       conversationId,
       accountId,
       createdAt: now,
