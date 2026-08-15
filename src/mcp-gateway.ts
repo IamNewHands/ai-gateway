@@ -8,7 +8,7 @@ import type { AppEnv, McpServer } from './types'
  * 对外暴露统一 JSON-RPC 端点（/v1/mcp）：
  * - initialize / notifications/initialized：握手
  * - tools/list：并发聚合所有已启用 MCP Server 的工具，工具名加 `{mcp名(空格转下划线)}-{工具名}` 前缀做命名空间隔离
- * - tools/call：按前缀反解路由到目标 MCP Server，支持 SSE 响应，失败重试 5 次
+ * - tools/call：按前缀反解路由到目标 MCP Server，支持 SSE 响应，默认仅请求上游一次
  */
 
 // ===== 极简并发限制器（p-limit 替代，避免新增依赖） =====
@@ -30,9 +30,12 @@ async function mapWithLimit<T, R>(
 }
 
 const MCP_JSONRPC_VERSION = '2.0'
-const MCP_FETCH_RETRIES = 5
+const MCP_READ_FETCH_ATTEMPTS = 5
 const MCP_RETRY_DELAY_MS = 1000
 const MCP_FETCH_CONCURRENCY = 6
+const MCP_FETCH_TIMEOUT_MS = 30_000
+
+const isRetryableStatus = (status: number) => status === 408 || status === 429 || status >= 500
 
 /** 工具名前缀：mcp 名称的空格转下划线，与工具名用 `-` 分隔（与 aihub 一致） */
 const mcpToolPrefix = (mcp: McpServer) => mcp.name.replaceAll(' ', '_')
@@ -71,12 +74,14 @@ async function fetchMcpTools(mcp: McpServer): Promise<{ mcp: McpServer; tools: A
   const headers = buildMcpHeaders(mcp)
   let lastError: string | null = null
 
-  for (let i = 1; i <= MCP_FETCH_RETRIES; i++) {
+  for (let i = 1; i <= MCP_READ_FETCH_ATTEMPTS; i++) {
+    let shouldRetry = true
     try {
       const resp = await fetch(mcp.url, {
         method: 'POST',
         headers,
         body: JSON.stringify({ jsonrpc: MCP_JSONRPC_VERSION, id: 1, method: 'tools/list' }),
+        signal: AbortSignal.timeout(MCP_FETCH_TIMEOUT_MS),
       })
       if (resp.ok) {
         const rawJSON = parseMcpResponseText(await resp.text())
@@ -84,11 +89,13 @@ async function fetchMcpTools(mcp: McpServer): Promise<{ mcp: McpServer; tools: A
         const tools = Array.isArray(parsed.result?.tools) ? (parsed.result.tools as Array<Record<string, unknown>>) : []
         return { mcp, tools }
       }
+      shouldRetry = isRetryableStatus(resp.status)
       lastError = `HTTP ${resp.status}: ${(await resp.text()).substring(0, 200)}`
     } catch (err) {
       lastError = err instanceof Error ? err.message : String(err)
     }
-    if (i < MCP_FETCH_RETRIES) await new Promise((r) => setTimeout(r, MCP_RETRY_DELAY_MS))
+    if (!shouldRetry || i === MCP_READ_FETCH_ATTEMPTS) break
+    await new Promise((r) => setTimeout(r, MCP_RETRY_DELAY_MS))
   }
 
   return { mcp, tools: [], error: lastError || '未知错误' }
@@ -184,29 +191,27 @@ export async function handleMcpJsonRpc(c: Context<AppEnv>): Promise<Response> {
       const headers = buildMcpHeaders(mcp)
       // 路由到目标 MCP 时，params.name 还原为原始工具名
       const upstreamBody = { ...body, params: { ...params, name: toolName } }
-      let lastError: { status: number; data: string } | null = null
+      let lastError: { status: number; data: string }
 
-      for (let i = 1; i <= MCP_FETCH_RETRIES; i++) {
-        try {
-          const resp = await fetch(mcp.url, {
-            method: 'POST',
-            headers,
-            body: JSON.stringify(upstreamBody),
-          })
-          if (resp.ok) {
-            // 透传上游响应（JSON 或 SSE）
-            return new Response(resp.body, { status: resp.status, statusText: resp.statusText, headers: resp.headers })
-          }
-          lastError = { status: resp.status, data: (await resp.text()).substring(0, 500) }
-        } catch (err) {
-          lastError = { status: 500, data: err instanceof Error ? err.message : String(err) }
+      try {
+        const resp = await fetch(mcp.url, {
+          method: 'POST',
+          headers,
+          body: JSON.stringify(upstreamBody),
+          signal: AbortSignal.timeout(MCP_FETCH_TIMEOUT_MS),
+        })
+        if (resp.ok) {
+          // 透传上游响应（JSON 或 SSE）
+          return new Response(resp.body, { status: resp.status, statusText: resp.statusText, headers: resp.headers })
         }
-        if (i < MCP_FETCH_RETRIES) await new Promise((r) => setTimeout(r, MCP_RETRY_DELAY_MS))
+        lastError = { status: resp.status, data: (await resp.text()).substring(0, 500) }
+      } catch (err) {
+        lastError = { status: 500, data: err instanceof Error ? err.message : String(err) }
       }
 
       return c.json(
-        rpcError(id, jsonrpc, -32603, `调用 MCP "${mcp.name}" 工具 "${toolName}" 失败: ${lastError?.data || '未知错误'}`),
-        (lastError?.status || 502) as Parameters<typeof c.json>[1]
+        rpcError(id, jsonrpc, -32603, `调用 MCP "${mcp.name}" 工具 "${toolName}" 失败: ${lastError.data || '未知错误'}`),
+        (lastError.status || 502) as Parameters<typeof c.json>[1]
       )
     }
 

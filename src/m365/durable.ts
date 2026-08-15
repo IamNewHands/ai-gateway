@@ -129,9 +129,19 @@ export class M365Session {
     // 4) 工具路由：带 tools 且 toolChoice != none 时，先发起一次独立的路由对话，
     //    注入完整工具定义 + ledger 证据让模型显式决策是否调用工具（同原版 planningMode="router"）。
     //    路由对话是临时会话（started=true，不绑定持久会话）。
+    //    注意：路由对话的 WS 连接失败时降级到主回答（不带工具），避免 502 透传。
     const choiceStr = String(toolChoice ?? 'auto').toLowerCase()
+    let toolRouterFailed = false
     if (toolDefs.length > 0 && choiceStr !== 'none') {
-      const route = await this.tryToolRouter(acc, answerPrompt, toolDefs, toolChoice, attachments, ledgerCtx)
+      let route: Awaited<ReturnType<typeof this.tryToolRouter>> | null = null
+      try {
+        route = await this.tryToolRouter(acc, answerPrompt, toolDefs, toolChoice, attachments, ledgerCtx)
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err)
+        const detail = `model=${model} tools=${toolDefs.length} promptLen=${answerPrompt.length} err=${msg}`
+        try { await writeLog(this.env, 'error', `[m365-chat] provider=${providerId} → tool router failed, falling back to main chat`, detail) } catch { /* ignore */ }
+        toolRouterFailed = true
+      }
       if (route && route.calls.length > 0) {
         // 有工具调用：直接返回 tool_calls 给客户端（客户端执行后再续聊）
         const outcome: ChatOutcome = {
@@ -157,6 +167,10 @@ export class M365Session {
     if (ledger.completed.length > 0 || ledger.pending.length > 0) mainPrompt += '\n' + ledgerCtx
     if (ledger.completed.length > 0) mainPrompt += '\nFINAL ANSWER RULE: Report only actions supported by completed tool results. If the goal is not fully verified, state exactly what remains unconfirmed.'
 
+    // 工具路由 WS 失败时，主回答也不带工具（避免级联失败），上层仍可得到纯文本回复
+    const mainTools = toolRouterFailed ? [] : toolDefs
+    const mainChoice = toolRouterFailed ? 'none' : toolChoice
+
     let streamedText = ''
     let reasoning = ''
     let result: Awaited<ReturnType<typeof chatWithHandlers>>
@@ -169,8 +183,8 @@ export class M365Session {
           sessionId: resolved.isNew ? undefined : resolved.sessionId,
           started: resolved.isNew,
           attachments,
-          tools: toolDefs,
-          toolChoice,
+          tools: mainTools,
+          toolChoice: mainChoice,
         },
         { timeoutMs: 300_000 },
         (delta) => { streamedText += delta },
