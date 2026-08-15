@@ -1565,20 +1565,34 @@ export async function getLogRetentionDays(env: Env): Promise<number> {
 
 /** 写日志到 KV */
 export async function writeLog(env: Env, type: LogEntry['type'], message: string, details?: string) {
-  // 检查是否启用日志
-  if (!(await isLogEnabled(env))) return
+  //region debug-point writeLog-entry
+  const _dbg_start = Date.now()
+  console.log(`[debug:writeLog] enter type=${type} msg=${String(message).slice(0, 60)}`)
+  try {
+    //endregion
+    // 检查是否启用日志
+    const _dbg_enabled = await isLogEnabled(env)
+    console.log(`[debug:writeLog] isLogEnabled=${_dbg_enabled} elapsed=${Date.now() - _dbg_start}ms`)
+    if (!_dbg_enabled) return
 
-  const id = Date.now().toString(36) + Math.random().toString(36).slice(2, 8)
-  const entry: LogEntry = {
-    id,
-    time: new Date().toISOString(),
-    type,
-    message: sanitizeLogText(message),
-    details: details ? sanitizeLogText(details).substring(0, 4000) : undefined,
+    const id = Date.now().toString(36) + Math.random().toString(36).slice(2, 8)
+    const entry: LogEntry = {
+      id,
+      time: new Date().toISOString(),
+      type,
+      message: sanitizeLogText(message),
+      details: details ? sanitizeLogText(details).substring(0, 4000) : undefined,
+    }
+    // 保留天数动态设置过期时间：超期日志由 KV 自动删除
+    const days = await getLogRetentionDays(env)
+    console.log(`[debug:writeLog] days=${days} key=${LOG_PREFIX + id} elapsed=${Date.now() - _dbg_start}ms`)
+    await env.KV.put(LOG_PREFIX + id, JSON.stringify(entry), { expirationTtl: days * 24 * 60 * 60 })
+    console.log(`[debug:writeLog] put-ok key=${LOG_PREFIX + id} elapsed=${Date.now() - _dbg_start}ms`)
+    //region debug-point writeLog-entry
+  } catch (e) {
+    console.log(`[debug:writeLog] ERROR ${String((e as Error)?.message || e)} elapsed=${Date.now() - _dbg_start}ms`)
   }
-  // 保留天数动态设置过期时间：超期日志由 KV 自动删除
-  const days = await getLogRetentionDays(env)
-  await env.KV.put(LOG_PREFIX + id, JSON.stringify(entry), { expirationTtl: days * 24 * 60 * 60 })
+  //endregion
 }
 
 /** 安全解析分页参数：非数字/缺失时回退默认值（R8：parseInt 遇 NaN 会污染 slice/limit） */
