@@ -545,6 +545,11 @@ export async function checkinOneAccount(env: Env, provider: Provider): Promise<C
 
 // ===== 全量签到 =====
 
+/** 是否 M365 Copilot provider：不参与签到（微软账号无签到功能）。 */
+function isM365OAuth(p: Provider): boolean {
+  return p.oauth?.flowType === 'm365-pkce' || p.oauth?.flowType === 'm365-ropc'
+}
+
 export async function runAllCheckins(env: Env, silent = false): Promise<{
   total: number
   success: number
@@ -554,7 +559,7 @@ export async function runAllCheckins(env: Env, silent = false): Promise<{
   results: CheckinResult[]
 }> {
   const providers = (await getProviders(env)) as Provider[]
-  const oauthProviders = providers.filter((p) => p.authType === 'oauth-device' && p.oauth)
+  const oauthProviders = providers.filter((p) => p.authType === 'oauth-device' && p.oauth && !isM365OAuth(p))
 
   const results: CheckinResult[] = []
   // 简单串行（账号数量通常很少，且避免并发刷新 token 冲突）
@@ -598,6 +603,7 @@ export async function handleCheckinTrigger(c: Context<{ Bindings: Env }>) {
     const providers = (await getProviders(c.env)) as Provider[]
     const p = providers.find((x) => x.id === id)
     if (!p) return c.json<ApiResponse>({ success: false, message: '提供商不存在' }, 404)
+    if (isM365OAuth(p)) return c.json<ApiResponse>({ success: false, message: 'M365 账号不参与签到' }, 400)
     const result = await checkinOneAccount(c.env, p)
     if (!body.silent) {
       try { await writeLog(c.env, 'info', `[checkin] ${p.name} → ${result.reason}（手动）`, JSON.stringify(result)) } catch { /* ignore */ }
@@ -612,7 +618,7 @@ export async function handleCheckinTrigger(c: Context<{ Bindings: Env }>) {
 /** GET /admin/api/checkin/status：返回所有 provider 的签到结果（面板展示）。 */
 export async function handleCheckinStatus(c: Context<{ Bindings: Env }>) {
   const providers = (await getProviders(c.env)) as Provider[]
-  const oauthProviders = providers.filter((p) => p.authType === 'oauth-device' && p.oauth)
+  const oauthProviders = providers.filter((p) => p.authType === 'oauth-device' && p.oauth && !isM365OAuth(p))
 
   const list: CheckinResult[] = []
   for (const p of oauthProviders) {
