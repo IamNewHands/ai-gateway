@@ -1567,13 +1567,17 @@ export async function getLogRetentionDays(env: Env): Promise<number> {
 export async function writeLog(env: Env, type: LogEntry['type'], message: string, details?: string) {
   //region debug-point writeLog-entry
   const _dbg_start = Date.now()
+  const _dbg_key = 'debug:writelog-' + (Math.random().toString(36).slice(2, 6))
   console.log(`[debug:writeLog] enter type=${type} msg=${String(message).slice(0, 60)}`)
   try {
     //endregion
     // 检查是否启用日志
     const _dbg_enabled = await isLogEnabled(env)
     console.log(`[debug:writeLog] isLogEnabled=${_dbg_enabled} elapsed=${Date.now() - _dbg_start}ms`)
-    if (!_dbg_enabled) return
+    if (!_dbg_enabled) {
+      await env.KV.put(_dbg_key, JSON.stringify({ t: Date.now(), step: 'disabled', type }))
+      return
+    }
 
     const id = Date.now().toString(36) + Math.random().toString(36).slice(2, 8)
     const entry: LogEntry = {
@@ -1587,10 +1591,14 @@ export async function writeLog(env: Env, type: LogEntry['type'], message: string
     const days = await getLogRetentionDays(env)
     console.log(`[debug:writeLog] days=${days} key=${LOG_PREFIX + id} elapsed=${Date.now() - _dbg_start}ms`)
     await env.KV.put(LOG_PREFIX + id, JSON.stringify(entry), { expirationTtl: days * 24 * 60 * 60 })
+    await env.KV.put(_dbg_key, JSON.stringify({ t: Date.now(), step: 'put-ok', key: LOG_PREFIX + id }))
     console.log(`[debug:writeLog] put-ok key=${LOG_PREFIX + id} elapsed=${Date.now() - _dbg_start}ms`)
     //region debug-point writeLog-entry
   } catch (e) {
     console.log(`[debug:writeLog] ERROR ${String((e as Error)?.message || e)} elapsed=${Date.now() - _dbg_start}ms`)
+    try {
+      await env.KV.put(_dbg_key, JSON.stringify({ t: Date.now(), step: 'ERROR', err: String((e as Error)?.message || e) }))
+    } catch { /* ignore */ }
   }
   //endregion
 }
