@@ -16,6 +16,7 @@ import { extractToolCalls, flattenPromptMessages } from './tools'
 import type { DetectedToolCall } from './tools'
 import { resolveSession, bindSession } from './session'
 import { getM365Account } from './oauth'
+import { writeLog } from '../admin'
 
 export interface M365ChatPayload {
   providerId: string
@@ -124,21 +125,33 @@ export class M365Session {
     // 4) 执行 ChatHub 对话（事件流 → 组装）
     let streamedText = ''
     let reasoning = ''
-    const result = await chatWithHandlers(
-      acc,
-      {
-        text: answerPrompt,
-        conversationId: resolved.isNew ? undefined : resolved.conversationId,
-        sessionId: resolved.isNew ? undefined : resolved.sessionId,
-        started: resolved.isNew,
-        attachments,
-        tools: toolDefs,
-        toolChoice,
-      },
-      { timeoutMs: 300_000 },
-      (delta) => { streamedText += delta },
-      (ev) => { if (ev.kind === 'reasoning') reasoning += ev.text || '' },
-    )
+    let result: Awaited<ReturnType<typeof chatWithHandlers>>
+    try {
+      result = await chatWithHandlers(
+        acc,
+        {
+          text: answerPrompt,
+          conversationId: resolved.isNew ? undefined : resolved.conversationId,
+          sessionId: resolved.isNew ? undefined : resolved.sessionId,
+          started: resolved.isNew,
+          attachments,
+          tools: toolDefs,
+          toolChoice,
+        },
+        { timeoutMs: 300_000 },
+        (delta) => { streamedText += delta },
+        (ev) => { if (ev.kind === 'reasoning') reasoning += ev.text || '' },
+      )
+    } catch (err) {
+      // 记录完整 ChatHub 错误（含微软服务端返回的 detail）便于排查真实对话 500
+      const msg = err instanceof Error ? err.message : String(err)
+      const detail =
+        `model=${model} isNew=${resolved.isNew} tools=${toolDefs.length} ` +
+        `promptLen=${answerPrompt.length} stream=${stream} historyLen=${resolved.historyLen} ` +
+        `err=${msg}`
+      try { await writeLog(this.env, 'error', `[m365-chat] provider=${providerId} → ${msg}`, detail) } catch { /* ignore */ }
+      return cjson({ error: { message: msg, type: 'internal_error' } }, 500)
+    }
     streamedText = streamedText || result.text
 
     const outcome: ChatOutcome = {

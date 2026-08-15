@@ -324,17 +324,21 @@ function chatPayload(req: ChatHubRequest, requestID: string, firstTurn: boolean)
   return JSON.stringify(chat) + RS + JSON.stringify(metrics) + RS
 }
 
-/** M365 原生插件列表（工具名以 m365-plugin 命名空间标记，全部按官方命名注册） */
+/** M365 原生插件列表（与原版 clientPlugins 一致的官方插件结构，字段名须大写） */
 function clientPlugins(tools: ChatHubTool[]): Record<string, unknown>[] {
   if (!tools || tools.length === 0) return []
-  // 保持与官方客户端的插件名映射一致（本网关主要走提示词注入，插件仅用于标记 hasPlugins）
-  return tools.map((t, i) => ({
-    id: `m365-plugin-${i}`,
-    name: t.function.name,
-    description: t.function.description || '',
-    version: 1,
-    source: 'gateway',
-  }))
+  const plugins: Record<string, unknown>[] = []
+  for (const t of tools) {
+    const f = t.function
+    if (!f || !f.name) continue
+    plugins.push({
+      Id: f.name,
+      Source: 'API',
+      Description: f.description || '',
+      Parameters: f.parameters ?? null,
+    })
+  }
+  return plugins
 }
 
 /**
