@@ -184,6 +184,11 @@ export class M365Session {
         `promptLen=${mainPrompt.length} stream=${stream} historyLen=${resolved.historyLen} ` +
         `err=${msg}`
       try { await writeLog(this.env, 'error', `[m365-chat] provider=${providerId} → ${msg}`, detail) } catch { /* ignore */ }
+      // 上游限流：返回 429 + Retry-After（同原版 upstreamStatus / writeUpstreamError），
+      // 让客户端退避重试，而不是报 500/502 误导为服务端内部错误。
+      if (msg.includes('upstream rate-limit notice')) {
+        return cjson({ error: { message: 'upstream is rate limiting; try again shortly', type: 'rate_limit_error' } }, 429, { 'Retry-After': '60' })
+      }
       return cjson({ error: { message: msg, type: 'internal_error' } }, 500)
     }
     streamedText = streamedText || result.text
@@ -250,7 +255,14 @@ export class M365Session {
 
     const opts = { timeoutMs: 300_000 }
     const routePrompt = modelToolRouterPrompt(prompt + (ledgerCtx ? '\n' + ledgerCtx : ''), toolDefs, toolChoice)
-    const routeRes = await chatWithHandlers(acc, { text: routePrompt, started: true, attachments }, opts)
+    // 路由对话是"决策是否调用工具"的辅助轮：上游限流/异常时优雅降级（返回 null 走主回答），
+    // 不应让一次可选的决策对话因限流而阻断整个请求（同原版 failover 对路由阶段限流不致命）。
+    let routeRes: Awaited<ReturnType<typeof chatWithHandlers>>
+    try {
+      routeRes = await chatWithHandlers(acc, { text: routePrompt, started: true, attachments }, opts)
+    } catch {
+      return null
+    }
     let { calls, parsed } = parseModelToolDecision(routeRes.text, toolDefs, toolChoice)
     if (!parsed) {
       // 修复对话：让模型输出纯 JSON envelope
@@ -288,8 +300,8 @@ export class M365Session {
   }
 }
 
-function cjson(data: unknown, status: number): Response {
-  return new Response(JSON.stringify(data), { status, headers: { 'Content-Type': 'application/json' } })
+function cjson(data: unknown, status: number, extraHeaders?: Record<string, string>): Response {
+  return new Response(JSON.stringify(data), { status, headers: { 'Content-Type': 'application/json', ...extraHeaders } })
 }
 
 function buildJSON(id: string, model: string, o: ChatOutcome): Response {
