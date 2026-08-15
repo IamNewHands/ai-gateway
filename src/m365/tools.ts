@@ -451,3 +451,155 @@ export function flattenPromptMessages(messages: OaiMsgLite[], attachments?: { ty
   }
   return { prompt: parts.join('').trim(), attachments: outAttachments }
 }
+
+/* ==================== 多轮工具证据 ledger（同原版 agent_ledger.go） ==================== */
+
+export interface ToolEvidence {
+  id: string
+  name: string
+  arguments: string
+  result: string
+  failed: boolean
+}
+
+export interface AgentLedger {
+  completed: ToolEvidence[]
+  pending: ToolEvidence[]
+  toolRounds: number
+  repeatedCall: boolean
+  repeatedFailure: boolean
+  repetitionSignature?: string
+}
+
+const failureSignal = /(exit\s*(code|status)?\s*[:=]?\s*[1-9]\d*|\berror\b|\bfailed\b|\bfailure\b|exception|traceback|timed?\s*out|permission denied|not found|refused)/i
+const unsupportedSuccess = /\b(installed|created|written|executed|ran|started|deployed|deleted|verified|completed|succeeded|successful(?:ly)?)\b/i
+
+export function normalizeFailure(s: string): string {
+  s = s.toLowerCase()
+  s = s.replace(/\d+/g, '#')
+  if (s.length > 500) s = s.slice(0, 500)
+  return s
+}
+
+/** 从 messages 历史构建工具证据 ledger（assistant.tool_calls + tool 结果） */
+export function buildAgentLedger(messages: OaiMsgLite[]): AgentLedger {
+  const calls: Record<string, ToolEvidence> = {}
+  const order: string[] = []
+  for (const m of messages) {
+    if (m.role === 'assistant' && m.tool_calls) {
+      for (const raw of m.tool_calls) {
+        if (!raw || typeof raw !== 'object') continue
+        const r = raw as Record<string, unknown>
+        const id = typeof r['id'] === 'string' ? r['id'] : ''
+        const fn = (r['function'] || {}) as Record<string, unknown>
+        const name = typeof fn['name'] === 'string' ? fn['name'] : ''
+        const args = fn['arguments'] === undefined ? '' : String(fn['arguments'])
+        if (id !== '') {
+          calls[id] = { id, name, arguments: args, result: '', failed: false }
+          order.push(id)
+        }
+      }
+    }
+    if (m.role === 'tool') {
+      const tid = typeof m.tool_call_id === 'string' ? m.tool_call_id : ''
+      if (calls[tid]) {
+        calls[tid].result = compactToolResult(contentToString(m.content), 4000)
+        calls[tid].failed = failureSignal.test(calls[tid].result)
+      }
+    }
+  }
+  const l: AgentLedger = { completed: [], pending: [], toolRounds: 0, repeatedCall: false, repeatedFailure: false }
+  const seenCall: Record<string, number> = {}
+  const seenFailure: Record<string, number> = {}
+  for (const id of order) {
+    const e = calls[id]
+    l.toolRounds++
+    const sig = e.name + '\x00' + e.arguments
+    seenCall[sig] = (seenCall[sig] || 0) + 1
+    if (seenCall[sig] >= 2) {
+      l.repeatedCall = true
+      l.repetitionSignature = sig
+    }
+    if (e.result === '') {
+      l.pending.push(e)
+    } else {
+      l.completed.push(e)
+      if (e.failed) {
+        const fs = e.name + '\x00' + e.arguments + '\x00' + normalizeFailure(e.result)
+        seenFailure[fs] = (seenFailure[fs] || 0) + 1
+        if (seenFailure[fs] >= 2) {
+          l.repeatedFailure = true
+          l.repetitionSignature = fs
+        }
+      }
+    }
+  }
+  return l
+}
+
+/** ledger 紧凑证据上下文（同原版 RouterContext），注入路由/主回答提示词 */
+export function ledgerRouterContext(l: AgentLedger): string {
+  const compact = { completed: l.completed, pending: l.pending, repeated_call: l.repeatedCall }
+  const json = JSON.stringify(compact)
+  let hint = 'Use only this compact evidence. A completed call is final evidence; do not issue the same name and arguments again.'
+  if (l.repeatedFailure) hint += ' The same call failed repeatedly; change strategy instead of retrying unchanged.'
+  return hint + '\nEVIDENCE_LEDGER: ' + json
+}
+
+export function canonicalToolArguments(s: string): string {
+  s = String(s || '').trim()
+  try {
+    return JSON.stringify(JSON.parse(s))
+  } catch {
+    return s
+  }
+}
+
+export function ledgerHasCompleted(l: AgentLedger, name: string, args: string): boolean {
+  const want = canonicalToolArguments(args)
+  for (const e of l.completed) {
+    if (e.name === name && canonicalToolArguments(e.arguments) === want) return true
+  }
+  return false
+}
+
+/** 过滤掉 ledger 中已完成（同参数同名称）的工具调用，避免重复触发 */
+export function filterCompletedCalls(calls: DetectedToolCall[], l: AgentLedger): DetectedToolCall[] {
+  return calls.filter((c) => !ledgerHasCompleted(l, c.name, c.arguments))
+}
+
+/** 已完成的工具调用 ID 列表（排序），用于作用域化 call id */
+export function completedCallIDs(l: AgentLedger): string[] {
+  return l.completed.map((e) => e.id).sort()
+}
+
+/** 主回答是否允许作为"已完成"结论（存在待处理调用时不允许；有完成证据时不允许含失败措辞） */
+export function completionEvidenceAllows(answer: string, l: AgentLedger): boolean {
+  if (l.pending.length > 0) return false
+  if (l.completed.length === 0 && l.pending.length === 0) return true
+  const low = answer.toLowerCase()
+  const failureKeywords = ['cannot confirm', 'not confirmed', 'unable to confirm', 'no tool result', 'no matching tool results were returned', 'no external action has been verified']
+  let hasFailure = false
+  for (const h of failureKeywords) if (low.includes(h)) { hasFailure = true; break }
+  if (l.completed.length > 0) return !hasFailure
+  if (unsupportedSuccess.test(answer)) return false
+  return true
+}
+
+/* ==================== 工具拒绝检测（同原版 toolloop.go isToolRefusal） ==================== */
+
+const toolRefusalPatterns = [
+  'tools are not available', 'tool is not available', 'cannot access the Windows path', 'only provides Linux',
+  '只提供 Linux 容器', '工具未暴露', '工具不可用', '没有可调用的', '无法继续操作',
+  'will not pretend', 'will not fake', 'cannot fake', 'would be fabricated', 'cannot fabricate',
+  'refuse to fabricate', 'not actually registered', 'not actually available', 'not exposed in this',
+  'not available in this session', 'cannot execute on this platform', '没有 Windows 执行接口',
+  '回复通道没有', '没有执行接口', '不会虚构', '不会!转入', '不会转入',
+]
+
+/** 检测模型是否错误拒绝使用工具（触发纠正重试） */
+export function isToolRefusal(text: string): boolean {
+  const low = text.toLowerCase()
+  for (const p of toolRefusalPatterns) if (low.includes(p)) return true
+  return false
+}

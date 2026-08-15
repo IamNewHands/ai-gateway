@@ -12,8 +12,8 @@
 import type { Env } from '../types'
 import { chatWithHandlers } from './chathub'
 import type { ChatHubAccount, ChatHubTool, ChatHubResult } from './chathub'
-import { flattenPromptMessages, modelToolRouterPrompt, parseModelToolDecision, fencedToolCalls, nativeToolCalls, compactToolResult } from './tools'
-import type { DetectedToolCall } from './tools'
+import { flattenPromptMessages, modelToolRouterPrompt, parseModelToolDecision, fencedToolCalls, nativeToolCalls, compactToolResult, buildAgentLedger, ledgerRouterContext, filterCompletedCalls, completionEvidenceAllows, isToolRefusal } from './tools'
+import type { DetectedToolCall, AgentLedger, OaiMsgLite } from './tools'
 import { resolveSession, bindSession } from './session'
 import { getM365Account } from './oauth'
 import { writeLog } from '../admin'
@@ -122,24 +122,41 @@ export class M365Session {
       return { type: typeof obj['type'] === 'string' ? obj['type'] : 'function', function: { name: String(f['name'] || ''), description: typeof f['description'] === 'string' ? f['description'] : undefined, parameters: f['parameters'] } }
     })
 
+    // 多轮工具证据 ledger：从 messages 历史解析已完成/待处理的工具调用，去重并注入上下文
+    const ledger: AgentLedger = buildAgentLedger(messages as OaiMsgLite[])
+    const ledgerCtx = ledger.toolRounds > 0 ? ledgerRouterContext(ledger) : ''
+
     // 4) 工具路由：带 tools 且 toolChoice != none 时，先发起一次独立的路由对话，
-    //    注入完整工具定义让模型显式决策是否调用工具（同原版 planningMode="router"）。
+    //    注入完整工具定义 + ledger 证据让模型显式决策是否调用工具（同原版 planningMode="router"）。
     //    路由对话是临时会话（started=true，不绑定持久会话）。
-    const route = await this.tryToolRouter(acc, answerPrompt, toolDefs, toolChoice, attachments)
-    if (route && route.calls.length > 0) {
-      // 有工具调用：直接返回 tool_calls 给客户端（客户端执行后再续聊）
-      const outcome: ChatOutcome = {
-        text: '',
-        reasoning: '',
-        conversationId: route.res.conversationId,
-        sessionId: route.res.sessionId,
-        toolCalls: route.calls,
+    const choiceStr = String(toolChoice ?? 'auto').toLowerCase()
+    if (toolDefs.length > 0 && choiceStr !== 'none') {
+      const route = await this.tryToolRouter(acc, answerPrompt, toolDefs, toolChoice, attachments, ledgerCtx)
+      if (route && route.calls.length > 0) {
+        // 有工具调用：直接返回 tool_calls 给客户端（客户端执行后再续聊）
+        const outcome: ChatOutcome = {
+          text: '',
+          reasoning: route.res.reasoning || '',
+          conversationId: route.res.conversationId,
+          sessionId: route.res.sessionId,
+          toolCalls: route.calls,
+        }
+        const id = 'chatcmpl-' + crypto.randomUUID()
+        return stream ? buildSSE(id, model, outcome, payload) : buildJSON(id, model, outcome)
       }
-      const id = 'chatcmpl-' + crypto.randomUUID()
-      return stream ? buildSSE(id, model, outcome, payload) : buildJSON(id, model, outcome)
+      if (route && route.requiredFailed) {
+        const detail = `model=${model} tools=${toolDefs.length} promptLen=${answerPrompt.length}`
+        try { await writeLog(this.env, 'error', `[m365-chat] provider=${providerId} → model did not select a required tool`, detail) } catch { /* ignore */ }
+        return cjson({ error: { message: 'model did not select a required tool after constrained retry', type: 'tool_required' } }, 502)
+      }
     }
 
     // 5) 执行主回答对话（持久会话）
+    //    多轮时在主回答注入 ledger 证据 + 最终回答规则，避免模型虚构未经验证的操作
+    let mainPrompt = answerPrompt
+    if (ledger.completed.length > 0 || ledger.pending.length > 0) mainPrompt += '\n' + ledgerCtx
+    if (ledger.completed.length > 0) mainPrompt += '\nFINAL ANSWER RULE: Report only actions supported by completed tool results. If the goal is not fully verified, state exactly what remains unconfirmed.'
+
     let streamedText = ''
     let reasoning = ''
     let result: Awaited<ReturnType<typeof chatWithHandlers>>
@@ -147,7 +164,7 @@ export class M365Session {
       result = await chatWithHandlers(
         acc,
         {
-          text: answerPrompt,
+          text: mainPrompt,
           conversationId: resolved.isNew ? undefined : resolved.conversationId,
           sessionId: resolved.isNew ? undefined : resolved.sessionId,
           started: resolved.isNew,
@@ -164,21 +181,40 @@ export class M365Session {
       const msg = err instanceof Error ? err.message : String(err)
       const detail =
         `model=${model} isNew=${resolved.isNew} tools=${toolDefs.length} ` +
-        `promptLen=${answerPrompt.length} stream=${stream} historyLen=${resolved.historyLen} ` +
+        `promptLen=${mainPrompt.length} stream=${stream} historyLen=${resolved.historyLen} ` +
         `err=${msg}`
       try { await writeLog(this.env, 'error', `[m365-chat] provider=${providerId} → ${msg}`, detail) } catch { /* ignore */ }
       return cjson({ error: { message: msg, type: 'internal_error' } }, 500)
     }
     streamedText = streamedText || result.text
 
-    // 主回答兜底提取工具调用：先原生工具事件，再 fenced block（<m365-tool-call> / ```name\n{json}```）
-    const calls: DetectedToolCall[] =
-      nativeToolCalls(result.events, toolDefs).length > 0
-        ? nativeToolCalls(result.events, toolDefs)
-        : fencedToolCalls(result.text || streamedText, toolDefs, toolChoice)
+    // 主回答兜底 1：模型错误拒绝使用工具时，发起纠正对话重试（同原版 isToolRefusal）
+    if (toolDefs.length > 0 && isToolRefusal(result.text || streamedText)) {
+      const correction =
+        'Your previous response incorrectly denied that caller tools are available. They are real, active, and callable on the caller\'s Windows machine. Call the appropriate tool now. Do not explain tool availability.\n\nUser request:\n' + mainPrompt
+      try {
+        const corrRes = await chatWithHandlers(acc, { text: correction, conversationId: resolved.isNew ? undefined : resolved.conversationId, sessionId: resolved.isNew ? undefined : resolved.sessionId, started: resolved.isNew, attachments }, { timeoutMs: 300_000 })
+        if (!isToolRefusal(corrRes.text)) {
+          result = { ...corrRes, events: result.events }
+          streamedText = corrRes.text
+        }
+      } catch { /* keep original result */ }
+    }
+
+    // 主回答兜底 2：提取工具调用。先 fenced block（<m365-tool-call> / ```name\n{json}```），再原生工具事件；用 ledger 过滤已完成调用
+    const rawCalls: DetectedToolCall[] =
+      fencedToolCalls(result.text || streamedText, toolDefs, toolChoice)
+    const allCalls = rawCalls.length > 0 ? rawCalls : nativeToolCalls(result.events, toolDefs)
+    const calls = filterCompletedCalls(allCalls, ledger)
+
+    let finalText = result.text
+    // 兜底 3：若存在工具证据但回答声称"已完成"，且无匹配工具结果，则替换为未确认措辞
+    if (toolDefs.length > 0 && !completionEvidenceAllows(finalText, ledger)) {
+      finalText = 'I cannot confirm completion because no matching tool results were returned. No external action has been verified.'
+    }
 
     const outcome: ChatOutcome = {
-      text: result.text,
+      text: finalText,
       reasoning: result.reasoning || reasoning,
       conversationId: result.conversationId,
       sessionId: result.sessionId,
@@ -196,8 +232,8 @@ export class M365Session {
   }
 
   /**
-   * 工具路由对话：注入完整工具定义让模型决策是否调用工具。
-   * 返回 { calls, res }；无工具调用或未带 tools 时返回 null（走主回答）。
+   * 工具路由对话：注入完整工具定义 + ledger 证据让模型决策是否调用工具。
+   * 返回 { calls, res, requiredFailed }；无工具调用或未带 tools 时返回 null（走主回答）。
    * 路由对话使用独立临时会话（started=true），不绑定持久会话，避免污染多轮上下文。
    */
   private async tryToolRouter(
@@ -206,13 +242,14 @@ export class M365Session {
     toolDefs: ChatHubTool[],
     toolChoice: unknown,
     attachments: { type: 'image'; url: string }[],
-  ): Promise<{ calls: DetectedToolCall[]; res: ChatHubResult } | null> {
+    ledgerCtx: string,
+  ): Promise<{ calls: DetectedToolCall[]; res: ChatHubResult; requiredFailed?: boolean } | null> {
     if (toolDefs.length === 0) return null
     const choiceStr = String(toolChoice ?? 'auto').toLowerCase()
     if (choiceStr === 'none') return null
 
     const opts = { timeoutMs: 300_000 }
-    const routePrompt = modelToolRouterPrompt(prompt, toolDefs, toolChoice)
+    const routePrompt = modelToolRouterPrompt(prompt + (ledgerCtx ? '\n' + ledgerCtx : ''), toolDefs, toolChoice)
     const routeRes = await chatWithHandlers(acc, { text: routePrompt, started: true, attachments }, opts)
     let { calls, parsed } = parseModelToolDecision(routeRes.text, toolDefs, toolChoice)
     if (!parsed) {
@@ -228,20 +265,23 @@ export class M365Session {
           calls = r2.calls
           return { calls, res: repairRes }
         }
-      } catch { /* fall through to main answer */ }
-      return null
+      } catch { /* fall through */ }
+      // 解析失败：非 required 时降级走主回答；required 时视为选择失败
+      if (choiceStr !== 'required') return null
+      return { calls: [], res: routeRes, requiredFailed: true }
     }
     // tool_choice='required' 时必须调用工具：路由判定无调用时强制重试（注入完整工具定义）
     if (calls.length === 0 && choiceStr === 'required') {
       const retryPrompt =
         'Select at least one required next tool call from FUNCTION_DEFINITIONS. Validate every argument against its schema. ' +
         'Return JSON only as {"calls":[{"name":"function_name","arguments":{}}]}.\n' +
-        'APPLICATION_REQUEST_AND_EVIDENCE:\n' + prompt + '\nFUNCTION_DEFINITIONS:\n' + JSON.stringify(toolDefs)
+        'APPLICATION_REQUEST_AND_EVIDENCE:\n' + prompt + (ledgerCtx ? '\n' + ledgerCtx : '') + '\nFUNCTION_DEFINITIONS:\n' + JSON.stringify(toolDefs)
       try {
         const retryRes = await chatWithHandlers(acc, { text: retryPrompt, started: true, attachments }, opts)
         const r3 = parseModelToolDecision(retryRes.text, toolDefs, toolChoice)
         if (r3.parsed && r3.calls.length > 0) return { calls: r3.calls, res: retryRes }
-      } catch { /* fall through to main answer */ }
+      } catch { /* fall through */ }
+      return { calls: [], res: routeRes, requiredFailed: true }
     }
     if (calls.length === 0) return null
     return { calls, res: routeRes }
