@@ -451,6 +451,8 @@ export async function chatWithHandlers(
     let streamedText = ''
     let rawResult = ''
     let throttling: unknown
+    /** 收集原生工具事件（含 messages[] 之外的插件调用），供上层 nativeToolCalls 提取 */
+    const collectedEvents: unknown[] = []
 
     const rateLimited = (text: string): boolean => {
       if (streamedText !== '') return false
@@ -519,8 +521,10 @@ export async function chatWithHandlers(
           for (const arg of frame.arguments || []) {
             if (!arg || typeof arg !== 'object' || Array.isArray(arg)) continue
             const a = arg as Record<string, unknown>
-            if (onEvent) {
-              for (const ev of extractToolEvents(a, seenStreamTools)) onEvent(ev)
+            const toolEvents = extractToolEvents(a, seenStreamTools)
+            if (toolEvents.length > 0) {
+              collectedEvents.push(...toolEvents)
+              if (onEvent) for (const ev of toolEvents) onEvent(ev)
             }
             const msgs = Array.isArray(a['messages']) ? (a['messages'] as unknown[]) : []
             for (const ev of classifyUpdateMessages(msgs)) {
@@ -579,7 +583,7 @@ export async function chatWithHandlers(
             conversationId,
             sessionId,
             requestId: requestID,
-            events: [],
+            events: collectedEvents,
             images: imageURLs([]),
           }
         }

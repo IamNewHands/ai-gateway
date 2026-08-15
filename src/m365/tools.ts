@@ -91,6 +91,101 @@ function toolChoiceAllows(choice: unknown, name: string): boolean {
   return true
 }
 
+/** tool_choice 归一化：string 直接返回；命名选择器返回 'named:<name>'；默认 'auto'（同原版 normalizedToolChoiceMode） */
+export function normalizedToolChoiceMode(choice: unknown): string {
+  if (choice === undefined || choice === null) return 'auto'
+  if (typeof choice === 'string') return choice
+  if (typeof choice === 'object') {
+    const c = choice as Record<string, unknown>
+    const f = c['function'] as Record<string, unknown> | undefined
+    if (f && typeof f['name'] === 'string') return 'named:' + f['name']
+    if (typeof c['name'] === 'string') return 'named:' + c['name']
+  }
+  return 'auto'
+}
+
+/** 按名称查找工具定义（返回 function 对象），未找到返回 null（同原版 toolFunction） */
+export function toolFunction(name: string, tools: ToolDef[]): Record<string, unknown> | null {
+  for (const t of tools) {
+    const f = t.function
+    if (f && f.name === name) return f as unknown as Record<string, unknown>
+  }
+  return null
+}
+
+/** JSON Schema 校验（同原版 validateJSONSchema）。返回错误信息或 null。 */
+export function validateJSONSchema(value: unknown, schema: Record<string, unknown>, path: string): string | null {
+  const enums = schema['enum']
+  if (Array.isArray(enums)) {
+    const a = JSON.stringify(value)
+    let found = false
+    for (const e of enums) {
+      if (JSON.stringify(e) === a) { found = true; break }
+    }
+    if (!found) return `${path} is not an allowed enum value`
+  }
+  const typ = schema['type']
+  switch (typ) {
+    case 'object': {
+      if (value === null || typeof value !== 'object' || Array.isArray(value)) return `${path} must be object`
+      const m = value as Record<string, unknown>
+      const req = schema['required']
+      if (Array.isArray(req)) {
+        for (const raw of req) {
+          const n = String(raw)
+          if (!(n in m)) return `missing required argument ${n}`
+        }
+      }
+      const props = (schema['properties'] as Record<string, unknown>) || {}
+      const ap = schema['additionalProperties']
+      if (typeof ap === 'boolean' && !ap) {
+        for (const n of Object.keys(m)) {
+          if (!(n in props)) return `${path}.${n} is not allowed`
+        }
+      }
+      for (const n of Object.keys(m)) {
+        const ps = props[n] as Record<string, unknown> | undefined
+        if (ps) {
+          const err = validateJSONSchema(m[n], ps, `${path}.${n}`)
+          if (err) return err
+        }
+      }
+      return null
+    }
+    case 'array': {
+      if (!Array.isArray(value)) return `${path} must be array`
+      const item = schema['items'] as Record<string, unknown> | undefined
+      if (item) {
+        for (let i = 0; i < value.length; i++) {
+          const err = validateJSONSchema(value[i], item, `${path}[${i}]`)
+          if (err) return err
+        }
+      }
+      return null
+    }
+    case 'string':
+      return typeof value === 'string' ? null : `${path} must be string`
+    case 'number':
+      return typeof value === 'number' ? null : `${path} must be number`
+    case 'integer': {
+      if (typeof value !== 'number' || Math.trunc(value) !== value) return `${path} must be integer`
+      return null
+    }
+    case 'boolean':
+      return typeof value === 'boolean' ? null : `${path} must be boolean`
+    case 'null':
+      return value === null ? null : `${path} must be null`
+    default:
+      return null
+  }
+}
+
+function schemaValid(args: Record<string, unknown>, fn: Record<string, unknown>): string | null {
+  const params = fn['parameters']
+  if (params === null || typeof params !== 'object') return null
+  return validateJSONSchema(args, params as Record<string, unknown>, 'arguments')
+}
+
 /**
  * 从响应文本解析 <m365-tool-call> fenced block（与 M365 官方协议一致）。
  * 返回 (工具调用列表, 是否包含调用块)。
@@ -120,6 +215,165 @@ export function extractToolCalls(text: string, tools: ToolDef[], choice: unknown
     } catch { /* keep {} */ }
     out.push({ id: `call_${crypto.randomUUID()}`, type: toolTypeOf(name, tools), name, arguments: args })
   }
+  return out
+}
+
+/**
+ * 工具路由提示词（同原版 modelToolRouterPrompt）：
+ * 注入完整工具定义 + 决策规则，让模型显式选择调用哪个工具（CALL_TOOL: name({...})）
+ * 或判定无需工具（NO_TOOL_NEEDED）。这是让 M365 模型真正调用工具的核心机制。
+ */
+export function modelToolRouterPrompt(text: string, tools: ToolDef[], choice: unknown): string {
+  const defs = JSON.stringify(tools)
+  const mode = normalizedToolChoiceMode(choice)
+  let rules =
+    '- If a tool is needed, respond with: CALL_TOOL: tool_name({"arg1":"value1"})\n' +
+    '- If no tool is needed, respond with: NO_TOOL_NEEDED\n' +
+    '- Only use tools from the available list above\n' +
+    '- Validate all arguments against the tool\'s schema\n' +
+    '- Do not invent tools that are not in the list'
+  // 多轮：已完成工具证据（tool[...] / tool_calls:）不应重复触发
+  if (text.includes('tool_calls:') || text.includes('tool[call_')) {
+    rules +=
+      '\n- Completed evidence must not be repeated: tool_calls/tool[call_x] rows are prior results already delivered to the user, never re-invoke them' +
+      '\n- Only start a new tool call when fresh unfinished work remains on the current request'
+  }
+  return (
+    'You are a tool selection assistant. Based on the user request, decide which tool to call next.\n\n' +
+    `Available tools: ${defs}\n\n` +
+    `MODE: ${mode}\n\n` +
+    `Rules:\n${rules}\n\n` +
+    `User request and evidence:\n${text}`
+  )
+}
+
+/**
+ * 解析工具路由决策（同原版 parseModelToolDecision）：
+ * 优先 CALL_TOOL: name({...})，其次 NO_TOOL_NEEDED，兜底解析 JSON envelope。
+ * 返回 (工具调用列表, 是否成功解析)。
+ */
+export function parseModelToolDecision(text: string, tools: ToolDef[], choice: unknown): { calls: DetectedToolCall[]; parsed: boolean } {
+  const t = text.trim()
+  const lower = t.toLowerCase()
+  // 1) CALL_TOOL: name({...}) 自然语言格式
+  if (t.startsWith('CALL_TOOL:') || lower.startsWith('call_tool:')) {
+    const rest = t.slice(t.indexOf(':') + 1).trim()
+    const start = rest.indexOf('(')
+    const end = rest.lastIndexOf(')')
+    if (start > 0 && end > start) {
+      const name = rest.slice(0, start).trim()
+      const argsStr = rest.slice(start + 1, end)
+      try {
+        const args = JSON.parse(argsStr) as Record<string, unknown>
+        if (args !== null && typeof args === 'object' && toolChoiceAllows(choice, name)) {
+          const fn = toolFunction(name, tools)
+          if (fn) {
+            return {
+              calls: [{ id: `call_${crypto.randomUUID()}`, type: toolTypeOf(name, tools), name, arguments: JSON.stringify(args) }],
+              parsed: true,
+            }
+          }
+        }
+      } catch { /* fall through */ }
+    }
+  }
+  // 2) NO_TOOL_NEEDED
+  if (t.includes('NO_TOOL_NEEDED') || lower.includes('no_tool_needed')) {
+    return { calls: [], parsed: true }
+  }
+  // 3) 兜底：fenced code block 或 JSON envelope {"calls":[...]}
+  let body = t
+  const fenceStart = t.indexOf('```')
+  if (fenceStart >= 0) {
+    body = t.slice(fenceStart + 3).replace(/```$/, '').replace(/^json\s*/i, '').trim()
+  }
+  const js = body.indexOf('{')
+  const je = body.lastIndexOf('}')
+  if (js >= 0 && je > js) {
+    const inner = body.slice(js, je + 1)
+    try {
+      const env = JSON.parse(inner) as { calls?: Array<{ name?: string; arguments?: unknown }> }
+      if (env && Array.isArray(env.calls)) {
+        const calls: DetectedToolCall[] = []
+        for (const c of env.calls) {
+          if (!c || typeof c !== 'object') continue
+          const name = String(c.name || '')
+          const fn = toolFunction(name, tools)
+          if (!fn || c.arguments === undefined || c.arguments === null) continue
+          if (!toolChoiceAllows(choice, name)) continue
+          const argsObj = c.arguments as Record<string, unknown>
+          if (schemaValid(argsObj, fn)) continue
+          calls.push({ id: `call_${crypto.randomUUID()}`, type: toolTypeOf(name, tools), name, arguments: JSON.stringify(argsObj) })
+        }
+        return { calls, parsed: true }
+      }
+    } catch { /* fall through */ }
+  }
+  return { calls: [], parsed: false }
+}
+
+/** 解析 fenced code block 形式的工具调用（同原版 fencedToolCalls 的扩展解析） */
+const FENCED_TOOL = /```([A-Za-z0-9_-]+)\s*\n([\s\S]*?)\n```/
+
+/** 从回答文本解析所有 fenced 工具调用（含 <m365-tool-call> 与 ```name\n{json}\n``` 两种约定） */
+export function fencedToolCalls(text: string, tools: ToolDef[], choice: unknown): DetectedToolCall[] {
+  // 1) 原生 <m365-tool-call> 约定
+  const native = extractToolCalls(text, tools, choice)
+  if (native.length > 0) return native
+  // 2) ```name\n{json}\n``` 约定
+  const allowed = allowedToolNames(tools)
+  const out: DetectedToolCall[] = []
+  let m: RegExpExecArray | null
+  const re = new RegExp(FENCED_TOOL, 'g')
+  while ((m = re.exec(text)) !== null) {
+    const name = m[1]
+    const args = m[2].trim()
+    let v: unknown
+    try {
+      v = JSON.parse(args)
+    } catch {
+      v = null
+    }
+    if (!allowed.has(name) || !toolChoiceAllows(choice, name)) continue
+    if (v === null) continue
+    out.push({ id: `call_${crypto.randomUUID()}`, type: toolTypeOf(name, tools), name, arguments: JSON.stringify(v) })
+  }
+  return out
+}
+
+/** 从原生工具事件列表提取工具调用（同原版 nativeToolCalls，遍历事件树找 name/arguments） */
+export function nativeToolCalls(events: unknown[], tools: ToolDef[]): DetectedToolCall[] {
+  const allowed = new Set<string>()
+  for (const t of tools) {
+    if (t.function?.name) allowed.add(t.function.name)
+  }
+  const out: DetectedToolCall[] = []
+  const walk = (x: unknown) => {
+    if (Array.isArray(x)) {
+      for (const item of x) walk(item)
+      return
+    }
+    if (x && typeof x === 'object') {
+      const obj = x as Record<string, unknown>
+      let name = ''
+      for (const k of ['name', 'toolName', 'pluginName', 'functionName', 'id']) {
+        const s = obj[k]
+        if (typeof s === 'string' && allowed.has(s)) { name = s; break }
+      }
+      if (name !== '') {
+        let a: unknown
+        for (const k of ['arguments', 'args', 'parameters', 'input', 'functionArguments']) {
+          if (obj[k] !== undefined) { a = obj[k]; break }
+        }
+        if (a !== undefined && a !== null) {
+          out.push({ id: `call_${crypto.randomUUID()}`, type: toolTypeOf(name, tools), name, arguments: JSON.stringify(a) })
+          return
+        }
+      }
+      for (const k of Object.keys(obj)) walk(obj[k])
+    }
+  }
+  for (const ev of events) walk(ev)
   return out
 }
 

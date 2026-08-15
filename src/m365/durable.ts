@@ -11,8 +11,8 @@
  */
 import type { Env } from '../types'
 import { chatWithHandlers } from './chathub'
-import type { ChatHubAccount, ChatHubTool } from './chathub'
-import { extractToolCalls, flattenPromptMessages } from './tools'
+import type { ChatHubAccount, ChatHubTool, ChatHubResult } from './chathub'
+import { flattenPromptMessages, modelToolRouterPrompt, parseModelToolDecision, fencedToolCalls, nativeToolCalls, compactToolResult } from './tools'
 import type { DetectedToolCall } from './tools'
 import { resolveSession, bindSession } from './session'
 import { getM365Account } from './oauth'
@@ -122,7 +122,24 @@ export class M365Session {
       return { type: typeof obj['type'] === 'string' ? obj['type'] : 'function', function: { name: String(f['name'] || ''), description: typeof f['description'] === 'string' ? f['description'] : undefined, parameters: f['parameters'] } }
     })
 
-    // 4) 执行 ChatHub 对话（事件流 → 组装）
+    // 4) 工具路由：带 tools 且 toolChoice != none 时，先发起一次独立的路由对话，
+    //    注入完整工具定义让模型显式决策是否调用工具（同原版 planningMode="router"）。
+    //    路由对话是临时会话（started=true，不绑定持久会话）。
+    const route = await this.tryToolRouter(acc, answerPrompt, toolDefs, toolChoice, attachments)
+    if (route && route.calls.length > 0) {
+      // 有工具调用：直接返回 tool_calls 给客户端（客户端执行后再续聊）
+      const outcome: ChatOutcome = {
+        text: '',
+        reasoning: '',
+        conversationId: route.res.conversationId,
+        sessionId: route.res.sessionId,
+        toolCalls: route.calls,
+      }
+      const id = 'chatcmpl-' + crypto.randomUUID()
+      return stream ? buildSSE(id, model, outcome, payload) : buildJSON(id, model, outcome)
+    }
+
+    // 5) 执行主回答对话（持久会话）
     let streamedText = ''
     let reasoning = ''
     let result: Awaited<ReturnType<typeof chatWithHandlers>>
@@ -154,15 +171,21 @@ export class M365Session {
     }
     streamedText = streamedText || result.text
 
+    // 主回答兜底提取工具调用：先原生工具事件，再 fenced block（<m365-tool-call> / ```name\n{json}```）
+    const calls: DetectedToolCall[] =
+      nativeToolCalls(result.events, toolDefs).length > 0
+        ? nativeToolCalls(result.events, toolDefs)
+        : fencedToolCalls(result.text || streamedText, toolDefs, toolChoice)
+
     const outcome: ChatOutcome = {
       text: result.text,
       reasoning: result.reasoning || reasoning,
       conversationId: result.conversationId,
       sessionId: result.sessionId,
-      toolCalls: extractToolCalls(result.text, toolDefs, toolChoice),
+      toolCalls: calls,
     }
 
-    // 5) 绑定会话（记录全量历史 + 助手回复）
+    // 6) 绑定会话（记录全量历史 + 助手回复）
     await bindSession(this.env, providerId, outcome.sessionId, outcome.conversationId, providerId, messages as never[], outcome.text + (outcome.reasoning ? '\n<reasoning>\n' + outcome.reasoning + '\n</reasoning>' : ''), ctx)
 
     const id = 'chatcmpl-' + crypto.randomUUID()
@@ -170,6 +193,58 @@ export class M365Session {
       return buildSSE(id, model, outcome, payload)
     }
     return buildJSON(id, model, outcome)
+  }
+
+  /**
+   * 工具路由对话：注入完整工具定义让模型决策是否调用工具。
+   * 返回 { calls, res }；无工具调用或未带 tools 时返回 null（走主回答）。
+   * 路由对话使用独立临时会话（started=true），不绑定持久会话，避免污染多轮上下文。
+   */
+  private async tryToolRouter(
+    acc: ChatHubAccount,
+    prompt: string,
+    toolDefs: ChatHubTool[],
+    toolChoice: unknown,
+    attachments: { type: 'image'; url: string }[],
+  ): Promise<{ calls: DetectedToolCall[]; res: ChatHubResult } | null> {
+    if (toolDefs.length === 0) return null
+    const choiceStr = String(toolChoice ?? 'auto').toLowerCase()
+    if (choiceStr === 'none') return null
+
+    const opts = { timeoutMs: 300_000 }
+    const routePrompt = modelToolRouterPrompt(prompt, toolDefs, toolChoice)
+    const routeRes = await chatWithHandlers(acc, { text: routePrompt, started: true, attachments }, opts)
+    let { calls, parsed } = parseModelToolDecision(routeRes.text, toolDefs, toolChoice)
+    if (!parsed) {
+      // 修复对话：让模型输出纯 JSON envelope
+      const repairPrompt =
+        'Repair this tool routing output into JSON only with shape {"calls":[{"name":"function_name","arguments":{}}]}. ' +
+        'Do not invent calls; use {"calls":[]} if unrecoverable. OUTPUT:\n' +
+        compactToolResult(routeRes.text, 6000)
+      try {
+        const repairRes = await chatWithHandlers(acc, { text: repairPrompt, started: true, attachments }, opts)
+        const r2 = parseModelToolDecision(repairRes.text, toolDefs, toolChoice)
+        if (r2.parsed) {
+          calls = r2.calls
+          return { calls, res: repairRes }
+        }
+      } catch { /* fall through to main answer */ }
+      return null
+    }
+    // tool_choice='required' 时必须调用工具：路由判定无调用时强制重试（注入完整工具定义）
+    if (calls.length === 0 && choiceStr === 'required') {
+      const retryPrompt =
+        'Select at least one required next tool call from FUNCTION_DEFINITIONS. Validate every argument against its schema. ' +
+        'Return JSON only as {"calls":[{"name":"function_name","arguments":{}}]}.\n' +
+        'APPLICATION_REQUEST_AND_EVIDENCE:\n' + prompt + '\nFUNCTION_DEFINITIONS:\n' + JSON.stringify(toolDefs)
+      try {
+        const retryRes = await chatWithHandlers(acc, { text: retryPrompt, started: true, attachments }, opts)
+        const r3 = parseModelToolDecision(retryRes.text, toolDefs, toolChoice)
+        if (r3.parsed && r3.calls.length > 0) return { calls: r3.calls, res: retryRes }
+      } catch { /* fall through to main answer */ }
+    }
+    if (calls.length === 0) return null
+    return { calls, res: routeRes }
   }
 }
 
