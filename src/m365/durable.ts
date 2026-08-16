@@ -16,6 +16,8 @@ import { flattenPromptMessages, modelToolRouterPrompt, parseModelToolDecision, f
 import type { DetectedToolCall, AgentLedger, OaiMsgLite } from './tools'
 import { resolveSession, bindSession } from './session'
 import { getM365Account } from './oauth'
+import { recordConversation, shouldCleanup, cleanupConversations, getCleanupMode, getCleanupConfig } from './conversation-manager'
+import { markAccountSuccess, markAccountFailure, accountCooldownSeconds, isRateLimited, isAuthFailure, isEmptyCompletion } from './account-health'
 import { writeLog } from '../admin'
 
 export interface M365ChatPayload {
@@ -198,10 +200,20 @@ export class M365Session {
         `promptLen=${mainPrompt.length} stream=${stream} historyLen=${resolved.historyLen} ` +
         `err=${msg}`
       try { await writeLog(this.env, 'error', `[m365-chat] provider=${providerId} → ${msg}`, detail) } catch { /* ignore */ }
+
+      // 账户健康检测：标记失败 + 提取 Retry-After
+      const errObj = err instanceof Error ? err : new Error(msg)
+      const retryAfter = isRateLimited(errObj) ? 60 : 0
+      await markAccountFailure(this.env, providerId, errObj, retryAfter)
+
       // 上游限流：返回 429 + Retry-After（同原版 upstreamStatus / writeUpstreamError），
       // 让客户端退避重试，而不是报 500/502 误导为服务端内部错误。
-      if (msg.includes('upstream rate-limit notice')) {
-        return cjson({ error: { message: 'upstream is rate limiting; try again shortly', type: 'rate_limit_error' } }, 429, { 'Retry-After': '60' })
+      if (isRateLimited(errObj)) {
+        const cooldown = await accountCooldownSeconds(this.env, providerId)
+        return cjson({ error: { message: 'upstream is rate limiting; try again shortly', type: 'rate_limit_error' } }, 429, { 'Retry-After': String(Math.max(cooldown || 60, 60)) })
+      }
+      if (isAuthFailure(errObj)) {
+        return cjson({ error: { message: 'M365 account authentication failed; re-authorize required', type: 'auth_error' } }, 401)
       }
       return cjson({ error: { message: msg, type: 'internal_error' } }, 500)
     }
@@ -242,6 +254,27 @@ export class M365Session {
 
     // 6) 绑定会话（记录全量历史 + 助手回复）
     await bindSession(this.env, providerId, outcome.sessionId, outcome.conversationId, providerId, messages as never[], outcome.text + (outcome.reasoning ? '\n<reasoning>\n' + outcome.reasoning + '\n</reasoning>' : ''), ctx)
+
+    // 标记账户健康：成功
+    await markAccountSuccess(this.env, providerId)
+
+    // 7) 对话管理器：记录云端对话 + 按模式清理
+    const promptText = typeof messages[messages.length - 1]?.['content'] === 'string'
+      ? String(messages[messages.length - 1]['content']).substring(0, 100)
+      : ''
+    await recordConversation(this.env, providerId, outcome.conversationId, providerId, promptText)
+    if (await shouldCleanup(this.env, providerId)) {
+      const cfg = await getCleanupConfig(this.env, providerId)
+      const mode = await getCleanupMode(this.env, providerId)
+      const maxAgeMs = cfg.maxAgeHours * 60 * 60 * 1000
+      // 收集活跃对话（当前会话绑定中的对话）
+      const activeIds = new Set<string>()
+      activeIds.add(outcome.conversationId)
+      const cleaned = await cleanupConversations(this.env, providerId, mode, cfg.keepN, maxAgeMs, activeIds)
+      if (cleaned.length > 0) {
+        console.log(`[conversation-manager] auto-cleaned ${cleaned.length} conversations`)
+      }
+    }
 
     const id = 'chatcmpl-' + crypto.randomUUID()
     if (stream) {

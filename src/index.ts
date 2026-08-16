@@ -3,6 +3,8 @@ import { cors } from 'hono/cors'
 import { logger } from 'hono/logger'
 import { adminAuthMiddleware, proxyKeyAuthMiddleware, managementAuthMiddleware, handleLogin, handleLogout } from './auth'
 import { handleProxy, handleModels, handleAnthropicMessages, handleResponses } from './proxy'
+import { handleImageGeneration, handleImageFile } from './m365/images'
+import { isM365Provider } from './m365/proxy'
 import { handleProxyWebSocket } from './ws'
 import {
   handleStatus,
@@ -45,6 +47,10 @@ import {
   handleClearCache,
   handleM365Sessions,
   handleM365SessionDelete,
+  handleM365Conversations,
+  handleM365ConversationWhitelist,
+  handleM365ConversationConfig,
+  handleM365ConversationCleanup,
 } from './admin'
 import { handleMcpJsonRpc } from './mcp-gateway'
 import { renderHomePage, renderLoginPage, renderAdminPage } from './pages'
@@ -57,6 +63,7 @@ import {
 } from './analytics/admin-api'
 import { refreshAllOauthTokens } from './oauth'
 import { runAllCheckins, handleCheckinTrigger, handleCheckinStatus } from './checkin'
+import { autoCleanupAll } from './m365/auto-cleanup'
 import { M365Session } from './m365/durable'
 import type { AppEnv, Env, Provider } from './types'
 
@@ -215,6 +222,80 @@ app.post('/v1/responses', handleResponses)
 app.all('/v1/sessions', handleM365Sessions)
 app.delete('/v1/sessions/:id', handleM365SessionDelete)
 
+// M365 对话管理（列表/白名单/清理配置/手动清理）—— 需在通用转发之前注册
+app.get('/admin/api/m365/conversations', handleM365Conversations)
+app.post('/admin/api/m365/conversations/whitelist', handleM365ConversationWhitelist)
+app.all('/admin/api/m365/conversations/config', handleM365ConversationConfig)
+app.post('/admin/api/m365/conversations/cleanup', handleM365ConversationCleanup)
+
+// M365 DALL-E 图片生成（/v1/images/generations, /v1/images/edits）—— 需在通用转发之前注册
+app.post('/v1/images/generations', async (c) => {
+  const providers = (await getProviders(c.env)) as Provider[]
+  const m365 = providers.find((p) => isM365Provider(p))
+  if (!m365) {
+    return c.json({ error: { message: 'no M365 account configured for image generation', type: 'configuration_error' } }, 503)
+  }
+  const body = await c.req.json().catch(() => ({}))
+  if (typeof body['prompt'] !== 'string' || !body['prompt'].trim()) {
+    return c.json({ error: { message: 'prompt is required', type: 'invalid_request_error' } }, 400)
+  }
+  return handleImageGeneration(c.env, m365, {
+    prompt: body['prompt'],
+    model: body['model'],
+    n: body['n'],
+    size: body['size'],
+    response_format: body['response_format'],
+    user: body['user'],
+    operation: 'generation',
+  })
+})
+app.post('/v1/images/edits', async (c) => {
+  const providers = (await getProviders(c.env)) as Provider[]
+  const m365 = providers.find((p) => isM365Provider(p))
+  if (!m365) {
+    return c.json({ error: { message: 'no M365 account configured for image generation', type: 'configuration_error' } }, 503)
+  }
+  const ct = c.req.header('Content-Type') || ''
+  if (ct.includes('multipart/form-data')) {
+    const form = await c.req.parseBody()
+    const file = form['image'] as File | undefined
+    if (!file) {
+      return c.json({ error: { message: 'image is required', type: 'invalid_request_error' } }, 400)
+    }
+    const buf = await file.arrayBuffer()
+    const b64 = btoa(String.fromCharCode(...new Uint8Array(buf)))
+    return handleImageGeneration(c.env, m365, {
+      prompt: typeof form['prompt'] === 'string' ? form['prompt'] : '',
+      model: typeof form['model'] === 'string' ? form['model'] : undefined,
+      n: typeof form['n'] === 'string' ? parseInt(form['n']) : undefined,
+      size: typeof form['size'] === 'string' ? form['size'] : undefined,
+      response_format: typeof form['response_format'] === 'string' ? form['response_format'] as 'url' | 'b64_json' : undefined,
+      operation: 'edit',
+      image: b64,
+      imageType: file.type,
+    })
+  }
+  // JSON body
+  const body = await c.req.json().catch(() => ({}))
+  return handleImageGeneration(c.env, m365, {
+    prompt: body['prompt'],
+    model: body['model'],
+    n: body['n'],
+    size: body['size'],
+    response_format: body['response_format'],
+    operation: 'edit',
+    image: body['image'],
+    imageType: body['image_type'],
+  })
+})
+app.get('/v1/images/files/:id', async (c) => {
+  const id = c.req.param('id')
+  if (!id || !/^[0-9a-f-]{36}$/.test(id)) {
+    return c.json({ error: { message: 'not found', type: 'not_found' } }, 404)
+  }
+  return handleImageFile(c.env, id)
+})
+
 // WebSocket 桥接 — Trae 等客户端自定义模型直连网关时用 WS 传输（GET 升级请求无 body，
 // 不能让 handleProxy 用 c.req.json() 读取，否则抛 "Unexpected end of JSON input" → 500 → 握手失败）。
 // 必须在通用转发 handleProxy 之前注册。
@@ -249,6 +330,7 @@ app.onError((err, c) => {
 // crons（见 wrangler.toml）：
 //   "0 */2 * * *"   —— 每 2 小时刷新 OAuth token
 //   "0 1,13 * * *"  —— 每日 09:00/21:00（北京时间）WorkBuddy 签到
+//   "0 * * * *"     —— 每小时 M365 对话自动清理
 // ⚠️ Cloudflare ES Module Workers 只认 default export 上的 handler：
 //    scheduled 若写成 named export（export async function scheduled），运行时找不到
 //    default.scheduled，cron 触发后会被静默丢弃 → 定时签到/token 刷新均不执行。
@@ -257,6 +339,12 @@ async function scheduled(event: ScheduledEvent, env: Env, ctx: ExecutionContext)
     // 签到
     const summary = await runAllCheckins(env)
     console.log(`[checkin] cron done: total=${summary.total} ok=${summary.success} already=${summary.already} fail=${summary.fail} skipped=${summary.skipped}`)
+    return
+  }
+  if (event.cron === '0 * * * *') {
+    // M365 对话自动清理
+    const result = await autoCleanupAll(env)
+    console.log(`[auto-cleanup] cron done: total=${result.total} providers=${result.providers} errors=${result.errors}`)
     return
   }
   // token 刷新（默认 / "0 */2 * * *"）

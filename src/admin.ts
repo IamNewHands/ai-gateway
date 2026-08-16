@@ -33,6 +33,8 @@ import { PROXY_KEY_PREFIX, EXPIRY_OPTIONS, OPENCODE_DEFAULT_URL } from './config
 import { startOauthDeviceFlow, pollOauthDeviceFlow, readOauthToken, deleteOauthToken, getOauthAccessToken, buildOauthHeaders, detectTokenRealm, submitOauthGeminiCallback, submitOauthM365Callback, submitOauthM365ROPC } from './oauth'
 import { isM365Provider, M365_MODELS, testM365Model } from './m365/proxy'
 import { listSessions as listM365Sessions, deleteSession as deleteM365Session } from './m365/session'
+import { listConversations as listM365Conversations, whitelistConversation, unwhitelistConversation, getCleanupMode, setCleanupMode, getCleanupConfig, setCleanupConfig, deleteConversationRecord } from './m365/conversation-manager'
+import { autoCleanupProvider } from './m365/auto-cleanup'
 import type {
   AppEnv,
   Env,
@@ -1849,6 +1851,110 @@ export async function handleM365SessionDelete(c: Context<AppEnv>) {
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err)
     try { await writeLog(c.env, 'error', `[m365-sessions] provider=${providerId} delete failed`, msg) } catch { /* ignore */ }
+    return c.json({ error: { message: msg, type: 'internal_error' } }, 500)
+  }
+}
+
+// ============================================================
+//  M365 对话管理  /admin/api/m365/conversations
+//  （对标原版对话管理器：列表/白名单/清理配置/手动清理）
+// ============================================================
+
+/** GET /admin/api/m365/conversations?provider_id=xxx —— 列出该 provider 的对话记录 */
+export async function handleM365Conversations(c: Context<AppEnv>) {
+  const providerId = c.req.query('provider_id') || ''
+  const resolved = await resolveM365ProviderIdByStr(c, providerId)
+  if (!resolved) {
+    return c.json({ error: { message: '缺少有效的 M365 provider_id 参数', type: 'invalid_request_error' } }, 400)
+  }
+  try {
+    const conversations = await listM365Conversations(c.env, resolved)
+    const mode = await getCleanupMode(c.env, resolved)
+    const config = await getCleanupConfig(c.env, resolved)
+    return c.json({
+      success: true,
+      data: conversations.map((c) => ({
+        id: c.id,
+        account_id: c.accountId,
+        created_at: c.createdAt,
+        last_used_at: c.lastUsedAt,
+        title: c.title || '',
+      })),
+      config: { mode, keep_n: config.keepN, max_age_hours: config.maxAgeHours },
+    })
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err)
+    return c.json({ error: { message: msg, type: 'internal_error' } }, 500)
+  }
+}
+
+/** POST /admin/api/m365/conversations/whitelist —— 白名单管理 {provider_id, conversation_id, action} */
+export async function handleM365ConversationWhitelist(c: Context<AppEnv>) {
+  const body = await c.req.json().catch(() => ({}))
+  const providerId = typeof body['provider_id'] === 'string' ? body['provider_id'] : ''
+  const resolved = await resolveM365ProviderIdByStr(c, providerId)
+  if (!resolved) {
+    return c.json({ error: { message: '缺少有效的 M365 provider_id 参数', type: 'invalid_request_error' } }, 400)
+  }
+  const convId = typeof body['conversation_id'] === 'string' ? body['conversation_id'] : ''
+  if (!convId) {
+    return c.json({ error: { message: '缺少 conversation_id', type: 'invalid_request_error' } }, 400)
+  }
+  const action = body['action'] === 'remove' ? 'remove' : 'add'
+  try {
+    if (action === 'add') {
+      await whitelistConversation(c.env, resolved, convId)
+    } else {
+      await unwhitelistConversation(c.env, resolved, convId)
+    }
+    return c.json({ success: true, action, conversation_id: convId })
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err)
+    return c.json({ error: { message: msg, type: 'internal_error' } }, 500)
+  }
+}
+
+/** GET|POST /admin/api/m365/conversations/config?provider_id=xxx —— 获取/设置清理配置 */
+export async function handleM365ConversationConfig(c: Context<AppEnv>) {
+  const providerId = c.req.query('provider_id') || ''
+  const resolved = await resolveM365ProviderIdByStr(c, providerId)
+  if (!resolved) {
+    return c.json({ error: { message: '缺少有效的 M365 provider_id 参数', type: 'invalid_request_error' } }, 400)
+  }
+  if (c.req.method === 'POST') {
+    const body = await c.req.json().catch(() => ({}))
+    const mode = body['mode']
+    if (mode && (mode === 'after_response' || mode === 'keep_n' || mode === 'max_age' || mode === 'on_exit')) {
+      await setCleanupMode(c.env, resolved, mode)
+    }
+    const keepN = typeof body['keep_n'] === 'number' ? body['keep_n'] : undefined
+    const maxAgeHours = typeof body['max_age_hours'] === 'number' ? body['max_age_hours'] : undefined
+    if (keepN !== undefined || maxAgeHours !== undefined) {
+      const cfg = await getCleanupConfig(c.env, resolved)
+      await setCleanupConfig(c.env, resolved, keepN ?? cfg.keepN, maxAgeHours ?? cfg.maxAgeHours)
+    }
+  }
+  const mode = await getCleanupMode(c.env, resolved)
+  const config = await getCleanupConfig(c.env, resolved)
+  return c.json({ success: true, mode, keep_n: config.keepN, max_age_hours: config.maxAgeHours })
+}
+
+/** POST /admin/api/m365/conversations/cleanup?provider_id=xxx —— 手动触发清理 */
+export async function handleM365ConversationCleanup(c: Context<AppEnv>) {
+  const providerId = c.req.query('provider_id') || ''
+  const resolved = await resolveM365ProviderIdByStr(c, providerId)
+  if (!resolved) {
+    return c.json({ error: { message: '缺少有效的 M365 provider_id 参数', type: 'invalid_request_error' } }, 400)
+  }
+  try {
+    const provider = await getProvider(c.env, resolved)
+    if (!provider) {
+      return c.json({ error: { message: 'provider not found', type: 'not_found' } }, 404)
+    }
+    const deleted = await autoCleanupProvider(c.env, provider as Provider)
+    return c.json({ success: true, deleted })
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err)
     return c.json({ error: { message: msg, type: 'internal_error' } }, 500)
   }
 }
