@@ -523,16 +523,12 @@ ${H('管理')}
         </div>
         <div class="analytics-charts">
           <div class="analytics-chart-panel">
-            <div class="panel-heading"><div><span class="panel-heading__mark"><i class="fas fa-chart-line"></i></span><div><h3>请求趋势</h3><p>时间范围内的请求量变化</p></div></div></div>
-            <div id="analytics-trend"><div class="analytics-empty"><i class="fas fa-spinner fa-pulse"></i><p>加载中…</p></div></div>
-          </div>
-          <div class="analytics-chart-panel">
-            <div class="panel-heading"><div><span class="panel-heading__mark"><i class="fas fa-cube"></i></span><div><h3>模型调用排行</h3><p>按请求量排序</p></div></div></div>
+            <div class="panel-heading"><div><span class="panel-heading__mark"><i class="fas fa-cube"></i></span><div><h3>模型调用排行</h3><p>按请求量 / Token 用量排序，点击切换</p></div></div></div>
+            <div class="ranking-tabs" role="tablist">
+              <button class="btn btn-gh btn-xs is-active" data-rank-tab="requests" onclick="switchModelRanking('requests',this)" role="tab" aria-selected="true">请求次数</button>
+              <button class="btn btn-gh btn-xs" data-rank-tab="tokens" onclick="switchModelRanking('tokens',this)" role="tab" aria-selected="false">Token 用量</button>
+            </div>
             <div id="model-ranking"><div class="analytics-empty"><p>暂无数据</p></div></div>
-          </div>
-          <div class="analytics-chart-panel">
-            <div class="panel-heading"><div><span class="panel-heading__mark"><i class="fas fa-server"></i></span><div><h3>渠道调用排行</h3><p>按请求量排序</p></div></div></div>
-            <div id="channel-ranking"><div class="analytics-empty"><p>暂无数据</p></div></div>
           </div>
         </div>
       </section>
@@ -1930,21 +1926,38 @@ async function testMdl(id, mid, idx) {
 async function genKey() {
   const name = await pM('输入 Key 名称（可选）')
   if (name === null) return
-  showM('<h3><i class="fas fa-key c-p"></i> 生成转发 Key</h3><div class="fg"><label>有效期</label><select id="exp"><option value="30d">30 天</option><option value="90d">90 天</option><option value="180d">180 天</option><option value="1y">1 年</option><option value="forever" selected>永久</option></select></div><div class="fa"><button class="btn btn-s" id="gKc">取消</button><button class="btn btn-p" id="gKo">生成</button></div>')
+  showM('<h3><i class="fas fa-key c-p"></i> 生成转发 Key</h3><div class="fg"><label>有效期类型</label><select id="expType" onchange="toggleKeyExpiry()"><option value="forever" selected>永久</option><option value="preset">预设</option><option value="custom">自定义</option></select></div><div id="expPreset" class="fg hd"><label>预设有效期</label><select id="exp"><option value="30d">30 天</option><option value="90d">90 天</option><option value="180d">180 天</option><option value="1y">1 年</option></select></div><div id="expCustom" class="fg hd"><label>自定义有效期</label><div class="fc"><input type="number" id="expVal" min="1" max="3650" placeholder="数值" style="width:100px"><select id="expUnit"><option value="d">天</option><option value="h">小时</option></select></div></div><div class="fa"><button class="btn btn-s" id="gKc">取消</button><button class="btn btn-p" id="gKo">生成</button></div>')
   document.getElementById('gKc').addEventListener('click', closeM)
-  document.getElementById('gKo').addEventListener('click', function() { doGenKey(document.getElementById('exp').value, name) })
+  document.getElementById('gKo').addEventListener('click', function() { doGenKey(name) })
+  window.toggleKeyExpiry = function() {
+    const t = document.getElementById('expType').value
+    document.getElementById('expPreset').classList.toggle('hd', t !== 'preset')
+    document.getElementById('expCustom').classList.toggle('hd', t !== 'custom')
+  }
 }
 
-async function doGenKey(exp, name) {
+async function doGenKey(name) {
   if (adminSubmitting) return  // 防重复提交（UX3）
   closeM()
   const nm = name || ''
   adminSubmitting = true
   try {
+    const expType = document.getElementById('expType')?.value || 'forever'
+    let body = { name: nm }
+    if (expType === 'preset') {
+      body.expiresIn = document.getElementById('exp')?.value || '30d'
+    } else if (expType === 'custom') {
+      const expVal = parseInt(document.getElementById('expVal')?.value || '0', 10)
+      const expUnit = document.getElementById('expUnit')?.value || 'd'
+      if (expVal > 0) {
+        if (expUnit === 'h') body.expiresInHours = expVal
+        else body.expiresInDays = expVal
+      }
+    }
     const r = await fetch('/admin/api/proxy-keys', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ name: nm, expiresIn: exp })
+      body: JSON.stringify(body)
     })
     const d = await r.json()
     if (d.success && d.data) {

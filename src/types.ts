@@ -349,7 +349,12 @@ export interface PackageInfo {
 
 export interface CreateProxyKeyRequest {
   name?: string
-  expiresIn?: string // '30d' | '90d' | '180d' | '1y' | 'forever'
+  /** 预设有效期（兼容旧版）：'30d' | '90d' | '180d' | '1y' | 'forever' */
+  expiresIn?: string
+  /** 自定义天数（优先级高于 expiresIn） */
+  expiresInDays?: number
+  /** 自定义小时数（优先级低于 expiresInDays） */
+  expiresInHours?: number
 }
 
 export interface ApiResponse<T = unknown> {

@@ -513,10 +513,6 @@ label, legend { color: var(--color-ink-2); font-size: var(--text-xs); font-weigh
 .analytics-chart-panel .panel-heading { margin-block-end: var(--space-sm); }
 .analytics-empty { min-height: 8rem; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: var(--space-2xs); color: var(--color-muted); font-size: var(--text-xs); }
 .analytics-empty > i { font-size: var(--text-lg); }
-.trend-svg { width: 100%; height: auto; max-height: 14rem; overflow: visible; }
-.trend-axis { stroke: var(--color-rule-2); stroke-width: 1; }
-.trend-line { fill: none; stroke: var(--color-accent); stroke-width: 2; stroke-linejoin: round; stroke-linecap: round; }
-.trend-point { fill: var(--color-accent); cursor: pointer; }
 .ranking-row { min-width: 0; min-height: 2.5rem; padding: var(--space-2xs) 0; display: flex; align-items: center; gap: var(--space-xs); border-block-end: .0625rem solid var(--color-rule); }
 .ranking-row:last-child { border-block-end: 0; }
 .ranking-index { width: 1.5rem; flex: 0 0 auto; color: var(--color-muted); font-family: var(--font-mono); font-size: var(--text-xs); font-weight: 600; text-align: center; }
@@ -526,6 +522,7 @@ label, legend { color: var(--color-ink-2); font-size: var(--text-xs); font-weigh
 .ranking-main span { flex-shrink: 0; color: var(--color-muted); font-size: var(--text-xs); }
 .ranking-track { display: block; height: .375rem; margin-block-start: var(--space-3xs); border-radius: var(--radius-round); background: var(--color-paper-3); overflow: hidden; }
 .ranking-track i { display: block; height: 100%; border-radius: var(--radius-round); background: var(--color-accent-soft); transition: width var(--dur-panel) var(--ease-out); }
+.ranking-tabs { display: flex; gap: .25rem; margin-block-end: var(--space-sm); }
 .range-group { display: inline-flex; border: .0625rem solid var(--color-rule-2); border-radius: var(--radius-control); overflow: hidden; }
 .range-group .btn { min-height: 2rem; padding-inline: var(--space-xs); border: 0; border-radius: 0; font-size: var(--text-xs); }
 .range-group .btn.is-active { background: var(--color-accent-soft); color: var(--color-focus); }
@@ -559,7 +556,10 @@ label, legend { color: var(--color-ink-2); font-size: var(--text-xs); font-weigh
   .analytics-metrics { grid-template-columns: repeat(5, minmax(0, 1fr)); }
   .analytics-metrics > div:nth-child(even) { border-inline-end: .0625rem solid var(--color-rule); }
   .analytics-metrics > div:last-child { border-inline-end: 0; }
-  .analytics-charts { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); }
+}
+
+@media (min-width: 56rem) {
+  .analytics-charts { grid-template-columns: minmax(0, 1fr); }
   .analytics-charts > .analytics-chart-panel:first-child { grid-column: 1 / -1; }
   .analytics-log-filters, .syslog-filters { grid-template-columns: repeat(4, minmax(0, 1fr)); }
   .analytics-log-filters .log-time-range, .syslog-filters .log-time-range { grid-column: span 2; }

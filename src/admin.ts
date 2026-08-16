@@ -935,13 +935,21 @@ export async function handleCreateProxyKey(c: Context<AppEnv>) {
   const randomPart = crypto.randomUUID().replace(/-/g, '')
   const key = `${PROXY_KEY_PREFIX}${randomPart}`
 
-  // 计算过期时间
+  // 计算过期时间：自定义天数 > 自定义小时数 > 预设选项 > 永久
   let expiresAt: string | null = null
-  if (body.expiresIn && body.expiresIn !== 'forever') {
+  let ttlSeconds = 0
+
+  if (typeof body.expiresInDays === 'number' && body.expiresInDays > 0) {
+    ttlSeconds = body.expiresInDays * 24 * 60 * 60
+  } else if (typeof body.expiresInHours === 'number' && body.expiresInHours > 0) {
+    ttlSeconds = body.expiresInHours * 60 * 60
+  } else if (body.expiresIn && body.expiresIn !== 'forever') {
     const ttl = EXPIRY_OPTIONS[body.expiresIn]
-    if (ttl) {
-      expiresAt = new Date(Date.now() + ttl * 1000).toISOString()
-    }
+    if (ttl) ttlSeconds = ttl
+  }
+
+  if (ttlSeconds > 0) {
+    expiresAt = new Date(Date.now() + ttlSeconds * 1000).toISOString()
   }
 
   const proxyKey = {

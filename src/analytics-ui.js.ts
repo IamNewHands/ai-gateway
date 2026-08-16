@@ -6,6 +6,7 @@ let analyticsLogPage = 1
 let analyticsLogPageSize = parseInt(localStorage.getItem('usageLogPageSize') || '5', 10) || 5
 let analyticsLogRecords = []
 let analyticsController = null
+let modelRankingData = []  // 缓存模型排行数据，用于切换排序方式
 
 function formatMetric(value) {
   const number = Number(value || 0)
@@ -53,42 +54,34 @@ function renderOverview(data) {
   document.getElementById('metric-latency').textContent = formatLatency(data.avgLatencyMs)
 }
 
-function renderTrend(rows) {
-  const target = document.getElementById('analytics-trend')
+function renderRanking(rows, sortBy) {
+  const target = document.getElementById('model-ranking')
   if (!target) return
   if (!Array.isArray(rows) || rows.length === 0) {
-    target.innerHTML = '<div class="analytics-empty"><i class="fas fa-chart-line" aria-hidden="true"></i><p>当前范围内暂无趋势数据</p></div>'
+    target.innerHTML = '<div class="analytics-empty"><p>暂无模型调用数据</p></div>'
     return
   }
-  const width = 720, height = 220, padding = 28
-  const max = Math.max.apply(null, rows.map(function(row) { return Number(row.requests || 0) }).concat([1]))
-  const points = rows.map(function(row, index) {
-    const x = padding + (rows.length === 1 ? 0 : index * (width - padding * 2) / (rows.length - 1))
-    const y = height - padding - Number(row.requests || 0) / max * (height - padding * 2)
-    return x.toFixed(1) + ',' + y.toFixed(1)
-  }).join(' ')
-  target.innerHTML = '<svg class="trend-svg" viewBox="0 0 ' + width + ' ' + height + '" role="img" aria-label="请求量趋势">' +
-    '<line x1="' + padding + '" y1="' + (height-padding) + '" x2="' + (width-padding) + '" y2="' + (height-padding) + '" class="trend-axis" />' +
-    '<polyline points="' + points + '" class="trend-line" />' +
-    rows.map(function(row, index) {
-      const point = points.split(' ')[index].split(',')
-      return '<circle cx="' + point[0] + '" cy="' + point[1] + '" r="3" class="trend-point"><title>' + escapeHtml(String(row.bucket || '')) + '：' + formatMetric(row.requests) + ' 次</title></circle>'
-    }).join('') + '</svg>'
-}
-
-function renderRanking(targetId, rows, emptyText) {
-  const target = document.getElementById(targetId)
-  if (!target) return
-  if (!Array.isArray(rows) || rows.length === 0) {
-    target.innerHTML = '<div class="analytics-empty"><p>' + escapeHtml(emptyText) + '</p></div>'
-    return
-  }
-  const max = Math.max.apply(null, rows.map(function(row) { return Number(row.requests || 0) }).concat([1]))
-  target.innerHTML = rows.map(function(row, index) {
+  // 按请求数或 Token 总量排序
+  const sorted = [...rows].sort(function(a, b) {
+    if (sortBy === 'tokens') {
+      const aTokens = Number(a.prompt_tokens || 0) + Number(a.completion_tokens || 0)
+      const bTokens = Number(b.prompt_tokens || 0) + Number(b.completion_tokens || 0)
+      return bTokens - aTokens
+    }
+    return (Number(b.requests || 0) - Number(a.requests || 0))
+  })
+  const max = Math.max.apply(null, sorted.map(function(row) { return Number(row.requests || 0) }).concat([1]))
+  target.innerHTML = sorted.map(function(row, index) {
     const successRate = Number(row.requests || 0) ? Number(row.successes || 0) / Number(row.requests) * 100 : 0
     const label = row.name ? String(row.name) + ' · ' + String(row.label || '') : String(row.label || 'unknown')
-    return '<div class="ranking-row"><span class="ranking-index">' + (index + 1) + '</span><div class="ranking-main"><div><code title="' + escapeHtml(label) + '">' + escapeHtml(label) + '</code><span>' + formatMetric(row.requests) + ' 次 · ' + successRate.toFixed(1) + '%</span></div><span class="ranking-track"><i style="width:' + Math.max(2, Number(row.requests || 0) / max * 100).toFixed(1) + '%"></i></span></div></div>'
+    const totalTokens = Number(row.prompt_tokens || 0) + Number(row.completion_tokens || 0)
+    return '<div class="ranking-row"><span class="ranking-index">' + (index + 1) + '</span><div class="ranking-main"><div><code title="' + escapeHtml(label) + '">' + escapeHtml(label) + '</code><span>' + formatMetric(row.requests) + ' 次 · ' + successRate.toFixed(1) + '% · ' + formatMetric(totalTokens) + ' Token</span></div><span class="ranking-track"><i style="width:' + Math.max(2, Number(row.requests || 0) / max * 100).toFixed(1) + '%"></i></span></div></div>'
   }).join('')
+}
+
+function switchModelRanking(sortBy, button) {
+  document.querySelectorAll('[data-rank-tab]').forEach(function(item) { item.classList.toggle('is-active', item === button); item.setAttribute('aria-selected', item === button ? 'true' : 'false') })
+  renderRanking(modelRankingData, sortBy)
 }
 
 async function loadAnalytics() {
@@ -99,11 +92,11 @@ async function loadAnalytics() {
   try {
     const results = await Promise.all([
       fetchAnalytics('/admin/api/analytics/overview?range=' + analyticsRange, analyticsController.signal),
-      fetchAnalytics('/admin/api/analytics/trend?range=' + analyticsRange, analyticsController.signal),
-      fetchAnalytics('/admin/api/analytics/breakdown?range=' + analyticsRange + '&dimension=model', analyticsController.signal),
-      fetchAnalytics('/admin/api/analytics/breakdown?range=' + analyticsRange + '&dimension=channel', analyticsController.signal)
+      fetchAnalytics('/admin/api/analytics/breakdown?range=' + analyticsRange + '&dimension=model', analyticsController.signal)
     ])
-    renderOverview(results[0]); renderTrend(results[1]); renderRanking('model-ranking', results[2], '暂无模型调用数据'); renderRanking('channel-ranking', results[3], '暂无渠道调用数据')
+    renderOverview(results[0])
+    modelRankingData = results[1]
+    renderRanking(results[1], 'requests')
   } catch (error) {
     if (error.name !== 'AbortError') showAnalyticsError(error.message || '统计加载失败')
   } finally { setAnalyticsLoading(false) }
