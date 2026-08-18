@@ -595,6 +595,12 @@ const toolRefusalPatterns = [
   'refuse to fabricate', 'not actually registered', 'not actually available', 'not exposed in this',
   'not available in this session', 'cannot execute on this platform', '没有 Windows 执行接口',
   '回复通道没有', '没有执行接口', '不会虚构', '不会!转入', '不会转入',
+  // Sandbox hallucination 防护（移植自 M365-Copilot2API toolloop.go sandboxHallucinationPatterns）
+  'no Windows execution', "don't have a Windows", 'no execution channel', '没有 Windows 执行通道',
+  'cannot run commands on', "don't have command execution", '无法执行命令',
+  "I don't have SSH access tools", 'execution environment has changed', '执行环境已经切换',
+  'running in sandbox', 'executing in sandbox', 'code interpreter', 'python sandbox',
+  'sandbox environment', '/mnt/data', 'cloud sandbox', 'none of which can reach',
 ]
 
 /** 检测模型是否错误拒绝使用工具（触发纠正重试） */

@@ -35,6 +35,8 @@ import { isM365Provider, M365_MODELS, testM365Model } from './m365/proxy'
 import { listSessions as listM365Sessions, deleteSession as deleteM365Session } from './m365/session'
 import { listConversations as listM365Conversations, whitelistConversation, unwhitelistConversation, getCleanupMode, setCleanupMode, getCleanupConfig, setCleanupConfig, deleteConversationRecord } from './m365/conversation-manager'
 import { autoCleanupProvider } from './m365/auto-cleanup'
+import { getM365AccountInfo } from './m365/oauth'
+import { clearAccountHealth, isAccountAvailable, accountCooldownSeconds } from './m365/account-health'
 import type {
   AppEnv,
   Env,
@@ -1961,6 +1963,64 @@ export async function handleM365ConversationCleanup(c: Context<AppEnv>) {
     }
     const deleted = await autoCleanupProvider(c.env, provider as Provider)
     return c.json({ success: true, deleted })
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err)
+    return c.json({ error: { message: msg, type: 'internal_error' } }, 500)
+  }
+}
+
+/** M365 Token 健康状态查询 */
+export async function handleM365TokenHealth(c: Context<AppEnv>) {
+  const providerId = c.req.param('id')
+  if (!providerId) {
+    return c.json({ error: { message: '缺少 provider_id 参数', type: 'invalid_request_error' } }, 400)
+  }
+  const provider = await getProvider(c.env, providerId).catch(() => null)
+  if (!provider) {
+    return c.json({ error: { message: '提供商不存在', type: 'not_found' } }, 404)
+  }
+  if (!isM365Provider(provider)) {
+    return c.json({ error: { message: '该提供商不是 M365 类型', type: 'invalid_request_error' } }, 400)
+  }
+  try {
+    const info = await getM365AccountInfo(c.env, providerId)
+    const available = info?.connected ? await isAccountAvailable(c.env, providerId) : false
+    const cooldownSeconds = info?.connected ? await accountCooldownSeconds(c.env, providerId) : 0
+    return c.json({
+      success: true,
+      data: {
+        connected: info?.connected ?? false,
+        email: info?.email ?? null,
+        oid: info?.oid ?? null,
+        tid: info?.tid ?? null,
+        tokenExpiresAt: info?.expiresAt ?? null,
+        available,
+        cooldownSeconds,
+        healthy: available && cooldownSeconds === 0,
+      },
+    })
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err)
+    return c.json({ error: { message: msg, type: 'internal_error' } }, 500)
+  }
+}
+
+/** 手动清除 M365 账号冷却状态 */
+export async function handleM365ClearCooldown(c: Context<AppEnv>) {
+  const providerId = c.req.param('id')
+  if (!providerId) {
+    return c.json({ error: { message: '缺少 provider_id 参数', type: 'invalid_request_error' } }, 400)
+  }
+  const provider = await getProvider(c.env, providerId).catch(() => null)
+  if (!provider) {
+    return c.json({ error: { message: '提供商不存在', type: 'not_found' } }, 404)
+  }
+  if (!isM365Provider(provider)) {
+    return c.json({ error: { message: '该提供商不是 M365 类型', type: 'invalid_request_error' } }, 400)
+  }
+  try {
+    await clearAccountHealth(c.env, providerId)
+    return c.json({ success: true, message: '冷却状态已清除' })
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err)
     return c.json({ error: { message: msg, type: 'internal_error' } }, 500)
