@@ -2,7 +2,7 @@
 
 基于 Cloudflare Workers + Hono 的 AI 提供商 API 代理网关，统一 `/v1` 接口转发，支持多 Key 轮询、健康检查与自动故障转移。
 
-> **二次开发说明**：本仓库基于 [yutian81/ai-gateway](https://github.com/yutian81/ai-gateway) 二次开发。在原有多 Key 轮询 / 健康检查 / OpenCode 故障转移的基础上，新增了 **WorkBuddy/CodeBuddy OAuth 接入**、**每日签到**、**使用统计看板**、**对外管理 API**、**Anthropic/Responses 格式转换**、**Cline 白嫖模型反代（含一键授权）** 等能力，详见下方[「增量功能」](#增量功能基于源仓库的二次开发)。
+> **二次开发说明**：本仓库基于 [yutian81/ai-gateway](https://github.com/yutian81/ai-gateway) 二次开发。在原有多 Key 轮询 / 健康检查 / OpenCode 故障转移的基础上，新增了 **WorkBuddy/CodeBuddy OAuth 接入**、**每日签到**、**使用统计看板**、**对外管理 API**、**Anthropic/Responses 格式转换**、**Cline 白嫖模型反代（含一键授权）**、**M365 Copilot 接入（含 Agent 工具协议）**、**CNB 免登录免费模型** 等能力，详见下方[「增量功能」](#增量功能基于源仓库的二次开发)。
 
 ## 增量功能（基于源仓库的二次开发）
 
@@ -102,7 +102,71 @@
 
 > 数据采集是自动的，每次通过网关的代理请求都会记录用量到 `ai_gateway_usage` 数据集。查询凭据仅在面板读取时使用，不影响代理性能。
 
-### 8. 识图（Vision Bridge 图片转写桥）
+### 8. M365 Copilot 接入
+
+将 Microsoft 365 Copilot 订阅账号接入网关（移植自 [M365-Copilot2API](https://github.com/IamNewHands/M365-Copilot2API)），走官方 ChatHub 协议，支持 OpenAI / Anthropic / Responses 三种协议调用，含工具调用与图片生成。
+
+#### 8.1 授权方式
+
+- **PKCE 授权码（m365-pkce）**：浏览器完成授权后，把回调 URL 粘贴回后台换 token（推荐，`flowType=m365-pkce`）
+- **ROPC 账号密码（m365-ropc）**：企业订阅账号直接用账号密码换 token（`flowType=m365-ropc`）
+- **Token 自动刷新**：Cron 每 2 小时刷新 + 请求前惰性刷新（提前 60 秒），401 时按需重试
+
+#### 8.2 会话与对话管理
+
+- **Durable Object 会话**：`M365_SESSION` DO 承载 ChatHub WS 对话，同会话并发串行化，突破 Worker 墙钟限制
+- **会话绑定**：客户端可在请求体带 `m365_session_id`，或按末尾消息内容指纹自动分片；绑定信息持久化 KV，支持查询/解除（`GET/DELETE /v1/sessions`）
+- **云端对话管理**：查询对话列表、白名单保护、清理配置（keep_n / max_age / after_response / on_exit）、手动清理
+- **自动清理**：Cron 每小时自动清理过期云端对话
+
+#### 8.3 Agent 工具协议
+
+ChatHub 上游不支持标准 OpenAI function calling，采用「提示词注入 + fenced block」约定（移植自 `toolloop.go` / `tool_planning.go` / `agent_ledger.go` / `protocol_compat.go`）：
+
+- **Tool Router**：带 tools 时先发起一次独立路由对话，模型显式决策 `CALL_TOOL` / `NO_TOOL_NEEDED`；`tool_choice=required` 时强制重试
+- **多种工具调用提取**：`<m365-tool-call>` fenced block、`` ```name\n{json}\n``` `` 约定、原生工具事件树三种解析
+- **Agent Ledger（证据台账）**：从多轮消息历史构建已完成/待处理工具证据，去重过滤重复调用（同名称同参数不再触发）
+- **Completion Guard**：存在工具证据但回答声称「已完成」且无匹配结果时，替换为未确认措辞，防止模型虚构执行结果
+- **Sandbox Hallucination 防护**：检测模型声称在 Linux 沙箱/代码解释器中执行、拒绝 Windows 执行通道等幻觉表述，触发纠正重试
+- **JSON Schema 校验**：工具参数严格校验（enum / required / additionalProperties），未声明的工具调用直接拒绝
+
+#### 8.4 图片生成
+
+- **DALL-E 兼容**：`POST /v1/images/generations` / `/v1/images/edits`，走 M365 官方 GPT Image / Designer 生成
+- 返回 `b64_json` 或 `url`，支持多图、尺寸、编辑（multipart 或 JSON body）
+
+#### 8.5 账户健康与运维
+
+- **账户健康检测**：限流/鉴权失败自动冷却（默认 3 分钟，`Retry-After` 优先）；限流前先发一条最小消息做二次确认探测，避免误冷却
+- **Token 健康查询**：`GET /admin/api/m365/token-health/:id` — 查看连接状态、过期时间、可用性与冷却剩余秒数
+- **手动清除冷却**：`DELETE /admin/api/m365/cooldown/:id` — 误冷却后一键恢复
+
+> 调用示例：`POST /v1/chat/completions`，`model: <提供商ID>/gpt-5`；可用模型清单见 [src/m365/proxy.ts](./src/m365/proxy.ts)。
+
+### 9. CNB (cnb.cool) 接入
+
+内置 cnb.cool 免费模型提供商（移植自 [cnb2api](https://github.com/lwjlwjlwjlwj/cnb2api)，MIT）：
+
+- **免登录**：自动抓取首页 CSRF 凭证（csrfkey + window.csrftoken 配对），凭证内存 + KV 双缓存（TTL 30 分钟），401/403 自动换证重试
+- **内置模型**：`deepseek-v4-flash`、`deepseek-v4-pro`
+- **XYML 工具桥**：上游禁原生 tools（403 Agent calls not allowed），`provider.toolBridge` 开启后把客户端 tools 转成 XYML 提示词注入，流式解析回标准 `tool_calls` 返回客户端（[src/cnb/](./src/cnb/)）
+
+### 10. Gemini CLI 接入
+
+内置 Gemini CLI 提供商（移植自 [cpa-plugin-gemini-cli](https://github.com/router-for-me/cpa-plugin-gemini-cli)），使用 Gemini CLI 官方 OAuth 凭据：
+
+- **OAuth 设备码授权**：管理后台一键授权（`GEMINI_OAUTH_CLIENT_ID` / `GEMINI_OAUTH_CLIENT_SECRET` 环境变量或表单粘贴，与 cpa-plugin 官方凭据一致）
+- **协议自转换**：OpenAI chat.completions → Gemini `generateContent`（messages→contents、tools→function_declarations、system→systemInstruction），响应/流式反向转回 OpenAI SSE
+- **内置模型**：`gemini-2.5-pro` / `gemini-2.5-flash` / `gemini-3-pro-preview` 等（清单见 [src/gemini/proxy.ts](./src/gemini/proxy.ts)）
+
+### 11. WebSocket 桥接
+
+支持 Trae 等客户端自定义模型直连网关时走 WS 传输（`GET /v1/*` 带 `Upgrade: websocket` 即进入该通道）：
+
+- 接受 WS 握手后读取首条文本消息（兼容直接 body 或 `{method,path,headers,body}` 信封两种格式），复用 HTTP 转发核心，将上游 SSE/JSON 分块以 WS 帧回推
+- 日志仅记录结构信息（model / 消息数量 / 长度），不落盘 prompt 与工具定义全文
+
+### 12. 识图（Vision Bridge 图片转写桥）
 
 让不支持图片输入的纯文本模型具备图片理解能力：请求含图时，网关先调用「视觉模型链」把图片转写为文本，再用转写文本替换图片块转发给主模型。
 
@@ -138,22 +202,22 @@
 - **视觉转写属于不可信上下文**：仅作为普通用户文本注入，不放入 system 提示，避免被诱导执行越权指令
 
 
-### 8. QoderWork 接入（实验性，未验证通过）
+### 13. QoderWork 接入（实验性，未验证通过）
 
 移植自 `cpa-plugin/qoderwork`，作为内置特殊提供商 `qoder`，包含 COSY 签名、OAuth、请求体编码等完整实现（[src/qoder/](./src/qoder/)）。
 
 > ⚠️ **当前状态：未验证通过。** COSY 签名 / 编码链路已移植，但因 QoderWork 上游协议变动或签名校验升级，**实测未能成功跑通**，仅供后续调试参考。如不需要可忽略，不影响其他提供商正常使用。
 
-### 8. 管理后台体验优化
+### 14. 管理后台体验优化
 
 - **首页隐私保护**：首页不再展示模型目录、提供商统计数字；BASE_URL 与 curl 示例统一改用占位符 `https://自定义的域名/v1`，不泄露真实部署域名
 - **新增模型免保存即可测试**：编辑已有提供商时，新加的模型行可直接点「测试」按钮验证连通性，无需先点保存（移除了 `/test-model` 端点对模型必须已入库的多余校验）
 
-### 9. 从 aihub 移植的高级能力
+### 15. 从 aihub 移植的高级能力
 
 一系列面向 API 网关的高级能力，移植自 [yutian81/aihub](https://github.com/yutian81/aihub)，覆盖 MCP 工具聚合、多模型联合调度、缓存运维与转发增强。
 
-#### 9.1 MCP 聚合网关（`/v1/mcp`）
+#### 15.1 MCP 聚合网关（`/v1/mcp`）
 
 把多个 MCP Server 聚合成一个 OpenAI 兼容的工具调用入口，客户端仅需对接网关一个端点即可使用所有 MCP 工具。
 
@@ -165,7 +229,7 @@
 
 调用示例：把 `https://你的域名/v1/mcp` 配置为 LLM 客户端的 MCP Server，工具即来自所有已启用的 MCP Server。
 
-#### 9.2 uni-model 联合模型（Unified Model Failover）
+#### 15.2 uni-model 联合模型（Unified Model Failover）
 
 一个逻辑模型名映射一组候选模型，按顺序自动故障转移，任一候选成功即返回，无需客户端自行重试。
 
@@ -174,19 +238,19 @@
 - **自动注入模型列表**：启用且存在候选的联合模型会自动出现在 `/v1/models` 中，provider_name 显示「联合模型」——客户端无需额外配置即可发现
 - **兼容权限体系**：联合模型整体仍受转发 Key 的 `allowedModels` 白名单约束；候选模型格式为 `提供商ID/模型ID`
 
-#### 9.3 内存缓存可视化后台管理
+#### 15.3 内存缓存可视化后台管理
 
 - **管理 API**：`GET /admin/api/cache`（列表）、`DELETE /admin/api/cache`（清空全部）、`DELETE /admin/api/cache/:key`（单项清除）
 - **管理后台面板**：侧栏「内存缓存」入口，展示每个缓存项的类型、大小、年龄与剩余 TTL，支持单项清除与一键清空
 - 适用于 KV 数据更新后不重启 Worker 的即时生效场景
 
-#### 9.4 未配置模型透传（提供商级后台开关）
+#### 15.4 未配置模型透传（提供商级后台开关）
 
 - **provider.allowUnlistedModels 开关**（管理后台「模型策略」）：关闭（默认）时保持「模型必须预配置」原校验；开启后，请求该提供商的**任意 modelId 都直接转发**，模型是否有效交由上游判断
 - 适合模型频繁上架、不想每次后台手动加模型的提供商（如 OpenRouter）
 - 已禁用的模型不受开关影响，仍返回 403
 
-#### 9.5 请求头白名单透传
+#### 15.5 请求头白名单透传
 
 - 默认网关转发上游时只带 `Content-Type` 与 `Authorization`；现在客户端发来的 `x-` / `anthropic-` / `user-` / `referer` 前缀头会**原样透传**给上游
 - 场景举例：OpenRouter 的 `X-Title` / `HTTP-Referer`（后台显示调用来源应用名）、仅认 `x-api-key` 的上游供应商、Anthropic 的 `anthropic-version` / `anthropic-beta`、企业网关的 `user-` 身份头
@@ -241,6 +305,8 @@ npm run dev
 4. 部署完成后，进入 Worker 页面 → **Settings** → **Variables**，添加：
   - `ADMIN_USERNAME` — 管理后台登录用户名
   - `ADMIN_PASSWORD` — 管理后台登录密码
+  - `MANAGEMENT_TOKEN` — 对外管理 API（`/api/manage/*`）Bearer Token，不配置则返回 503
+  - `GEMINI_OAUTH_CLIENT_ID` / `GEMINI_OAUTH_CLIENT_SECRET` — Gemini CLI 一键授权凭据（可选，也可在管理后台表单粘贴）
   - `OPENCODE_MIRRORS_URL` — OpenCode 镜像地址列表，每行一个 URL或用 `,` 分隔。填写以下三个地址：
   
   ```
@@ -259,11 +325,17 @@ npm run dev
 
 2. 在 GitHub 仓库 Settings → **Secrets and variables** → **Actions** 中配置：
    - **Secrets**：`CF_API_TOKEN`（Cloudflare API Token，权限需包含 Workers 编辑）
-   - **Variables**：`ADMIN_USERNAME`、`ADMIN_PASSWORD`、`OPENCODE_MIRRORS_URL`（可选，追加额外镜像地址，每行一个，默认已包含上述三个镜像地址）
+   - **Variables**：`ADMIN_USERNAME`、`ADMIN_PASSWORD`、`MANAGEMENT_TOKEN`、`GEMINI_OAUTH_CLIENT_ID`、`GEMINI_OAUTH_CLIENT_SECRET`、`OPENCODE_MIRRORS_URL`（可选，追加额外镜像地址，每行一个，默认已包含上述三个镜像地址）
 
 3. 在 GitHub 仓库 Actions 页面手动触发 **Deploy to Cloudflare Workers** 工作流
 
 > 工作流会在 CI 中自动生成 `wrangler.toml`（含 KV 绑定和 ADMIN 凭据），无需手动配置 Dashboard。
+
+### 部署须知（新增绑定）
+
+- **KV 命名空间**：`wrangler.toml` 中 `[[kv_namespaces]]` 使用 `binding = "KV"`，需在 Dashboard 创建同名 KV 并绑定
+- **M365 Session Durable Object**：若使用 M365 Copilot 接入，需创建 `M365_SESSION` DO（SQLite 存储），`wrangler.toml` 已声明 `[durable_objects]` 与 `[exports.M365Session]`，首次部署会自动创建
+- **Analytics Engine**：使用统计看板需创建 `ai_gateway_usage` 数据集并配置 `CF_ACCOUNT_ID` / `CF_API_TOKEN`（见上文「使用统计看板」章节）
 
 ## 使用方法
 
@@ -282,17 +354,20 @@ OpenCode 默认不需要上游 Key。若在管理后台为 OpenCode 添加 Key�
 ```
 ai-gateway/
 ├── src/
-│   ├── index.ts                 # 入口，路由注册
+│   ├── index.ts                 # 入口，路由注册 + Cron 定时任务
 │   ├── types.ts                 # 类型定义
-│   ├── config.ts                # 默认配置
-│   ├── storage.ts               # KV 存储层
-│   ├── auth.ts                  # 认证系统
+│   ├── config.ts                # 默认配置 / 常量
+│   ├── storage.ts               # KV 存储层（提供商 / Key / MCP / 联合模型）
+│   ├── auth.ts                  # 认证系统（登录 Session / 转发 Key / 管理 Token）
 │   ├── proxy.ts                 # API 转发核心（Key 轮询 + 健康检查 + 自动恢复）
 │   ├── opencode.ts              # OpenCode 官方 API 与公共镜像故障转移
-│   ├── admin.ts                 # 管理 API（含服务端 Key/模型测试代理）
-│   ├── pages.ts                 # 前端页面模板
-│   ├── pages.css.ts             # 样式
-│   ├── shared.js.ts             # 共享 JS 工具函数
+│   ├── admin.ts                 # 管理 API（含服务端 Key/模型测试代理、M365 运维接口）
+│   ├── pages.ts / pages.css.ts / shared.js.ts   # 管理后台前端模板
+│   ├── oauth.ts                 # OAuth 设备码流程 + Token 自动刷新
+│   ├── checkin.ts               # WorkBuddy 每日签到
+│   ├── ws.ts                    # WebSocket 桥接
+│   ├── formats.ts               # 格式转换工具
+│   ├── mcp-gateway.ts           # MCP 聚合网关（JSON-RPC：initialize / tools/list / tools/call）
 │   ├── analytics/
 │   │   ├── types.ts             # Analytics Engine 类型定义
 │   │   ├── usage-logger.ts      # 用量数据采集
@@ -301,26 +376,29 @@ ai-gateway/
 │   ├── analytics-ui.js.ts       # 前端看板 JS
 │   ├── vision/                  # 识图转写桥接
 │   │   └── bridge.ts
-│   ├── cline/                   # Cline 白嫖模型反代
+│   ├── cline/                   # Cline 白嫖模型反代（多账号池 + 一键授权）
 │   │   └── proxy.ts
-│   ├── gemini/                  # Gemini 接入
+│   ├── gemini/                  # Gemini CLI 接入
 │   │   └── proxy.ts
-│   ├── qoder/                   # QoderWork 接入
-│   │   ├── proxy.ts
-│   │   ├── body.ts
-│   │   ├── cosy.ts
-│   │   ├── md5.ts
-│   │   ├── billing.ts
-│   │   └── baseprompt.json
-│   ├── oauth.ts                 # OAuth 设备码流程
-│   ├── checkin.ts               # 每日签到
-│   ├── ws.ts                    # WebSocket 桥接
-│   ├── formats.ts               # 格式转换工具
-│   ├── mcp-gateway.ts           # MCP 聚合网关（JSON-RPC：initialize / tools/list / tools/call）
-│   ├── config.ts                # 默认配置
-│   └── storage.ts               # KV 存储层
-├── analytics-ui.js.ts           # 分析看板前端 JS
-├── wrangler.toml
+│   ├── cnb/                     # CNB (cnb.cool) 免登录免费模型
+│   │   ├── proxy.ts             # CSRF 凭证抓取与请求转发
+│   │   └── xyml.ts              # XYML 工具桥（提示词注入 + ToolSieve 流式解析）
+│   ├── m365/                    # M365 Copilot 接入
+│   │   ├── proxy.ts             # 协议适配（OpenAI/Anthropic/Responses → M365）
+│   │   ├── oauth.ts             # PKCE / ROPC 授权 + token 刷新
+│   │   ├── chathub.ts           # ChatHub SignalR WebSocket 客户端
+│   │   ├── durable.ts           # M365 Session Durable Object（会话串行化）
+│   │   ├── session.ts           # 会话绑定（KV 持久化）
+│   │   ├── conversation-manager.ts # 云端对话管理 + 清理策略
+│   │   ├── auto-cleanup.ts      # Cron 自动清理
+│   │   ├── account-health.ts    # 账户健康 / 冷却 / 限流确认探测
+│   │   ├── tools.ts             # Agent 工具协议（Tool Router / Ledger / Completion Guard）
+│   │   ├── events.ts            # 事件流解析
+│   │   ├── cloud-api.ts         # m365.cloud.microsoft 管理面 API
+│   │   └── images.ts            # DALL-E 图片生成
+│   └── qoder/                   # QoderWork 接入（实验性，未验证通过）
+│       ├── proxy.ts / body.ts / cosy.ts / md5.ts / billing.ts / baseprompt.json
+├── wrangler.toml                # KV / Durable Object / Analytics Engine / Cron 声明
 ├── package.json
 ├── tsconfig.json
 └── .github/workflows/deploy.yml
