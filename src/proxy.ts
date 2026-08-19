@@ -992,6 +992,71 @@ export async function forwardProxy(
           JSON.stringify({ providerId, subPath, body: bodySummary }).substring(0, 4000)
         ))
       } catch { /* log failure must not break */ }
+      // 非成功响应直接返回
+      if (!response.ok) return response
+      // Anthropic 格式转换：TRAE 返回 OpenAI SSE，客户端期望 Anthropic SSE 时需转换
+      if (provider.apiType === 'anthropic' && (forwardBody as any)?.stream !== false && response.body) {
+        const acc = createAnthropicSSEAccumulator()
+        const readable = new ReadableStream({
+          async start(controller) {
+            const decoder = new TextDecoderStream()
+            const textReader = response.body!.pipeThrough(decoder).getReader()
+            let lineBuffer = ''
+            try {
+              while (true) {
+                const { done, value } = await textReader.read()
+                if (done) break
+                const combined = lineBuffer + value
+                const lines = combined.split('\n')
+                lineBuffer = lines.pop() || ''
+                for (const line of lines) {
+                  const trimmed = line.trim()
+                  if (!trimmed.startsWith('data:')) continue
+                  const data = trimmed.slice(5).trim()
+                  if (!data || data === '[DONE]') continue
+                  try {
+                    const chunk = JSON.parse(data)
+                    cleanChunkDelta(chunk)
+                    const anthropicSSE = openAIChunkToAnthropicSSE(chunk, acc)
+                    if (anthropicSSE) controller.enqueue(new TextEncoder().encode(anthropicSSE))
+                  } catch { /* skip malformed */ }
+                }
+              }
+              if (lineBuffer.trim().startsWith('data:')) {
+                const data = lineBuffer.trim().slice(5).trim()
+                if (data && data !== '[DONE]') {
+                  try {
+                    const chunk = JSON.parse(data)
+                    cleanChunkDelta(chunk)
+                    const anthropicSSE = openAIChunkToAnthropicSSE(chunk, acc)
+                    if (anthropicSSE) controller.enqueue(new TextEncoder().encode(anthropicSSE))
+                  } catch { /* skip */ }
+                }
+              }
+            } catch { /* stream error */ }
+            const finalizeDiag = diagnoseAnthropicAccumulator(acc)
+            const finalized = finalizeAnthropicStream(acc)
+            if (finalized) {
+              try { controller.enqueue(new TextEncoder().encode(finalized)) } catch { /* enqueue failed */ }
+              try {
+                c.executionCtx.waitUntil(writeLog(c.env, 'warn',
+                  `[${provider.name}] 流结束兜底触发 ${model}`,
+                  JSON.stringify({ providerId: provider.id, model, ...finalizeDiag })
+                ))
+              } catch { /* log failure must not break */ }
+            }
+            controller.close()
+          },
+        })
+        return new Response(readable, {
+          status: 200,
+          headers: {
+            'Content-Type': 'text/event-stream',
+            'Cache-Control': 'no-store',
+            'X-Accel-Buffering': 'no',
+          },
+        })
+      }
       return response
     }
 
@@ -1787,6 +1852,114 @@ export async function handleAnthropicMessages(c: Context<AppEnv>) {
         }
       } catch { /* stream error */ }
 
+      const anthropicResp = aggregateOpenAIToAnthropic(allChunks)
+      return c.json(anthropicResp)
+    }
+
+    // TRAE：账号池管理，转发 OpenAI 格式后转回 Anthropic SSE
+    if (isTraeProvider(provider)) {
+      const response = await proxyTraeChatRequest(c.env, provider, openaiBody as Record<string, unknown>)
+      if (!response.ok) {
+        const errText = await response.text()
+        try {
+          c.executionCtx.waitUntil(writeLog(c.env, 'error', `[anthropic] ${model} → ${response.status} TRAE`, JSON.stringify({ error: errText, body: summarizeRequestBody(openaiBody) }).substring(0, 4000)))
+        } catch { /* log failure must not break request */ }
+        return c.json({
+          type: 'error',
+          error: { type: 'upstream_error', message: `Upstream error: ${sanitizeUpstreamError(errText)}` },
+        }, response.status as Parameters<typeof c.json>[1])
+      }
+      try { c.executionCtx.waitUntil(writeLog(c.env, 'request', `[anthropic] ${model} → 200 TRAE`, `stream=${originalStream}`)) } catch {}
+
+      // 流式：OpenAI SSE → Anthropic SSE 实时转换
+      if (originalStream && response.body) {
+        const acc = createAnthropicSSEAccumulator()
+        const readable = new ReadableStream({
+          async start(controller) {
+            const decoder = new TextDecoderStream()
+            const textReader = response.body!.pipeThrough(decoder).getReader()
+            let lineBuffer = ''
+            try {
+              while (true) {
+                const { done, value } = await textReader.read()
+                if (done) break
+                const combined = lineBuffer + value
+                const lines = combined.split('\n')
+                lineBuffer = lines.pop() || ''
+                for (const line of lines) {
+                  const trimmed = line.trim()
+                  if (!trimmed.startsWith('data:')) continue
+                  const data = trimmed.slice(5).trim()
+                  if (!data || data === '[DONE]') continue
+                  try {
+                    const chunk = JSON.parse(data)
+                    cleanChunkDelta(chunk)
+                    const anthropicSSE = openAIChunkToAnthropicSSE(chunk, acc)
+                    if (anthropicSSE) controller.enqueue(new TextEncoder().encode(anthropicSSE))
+                  } catch { /* skip malformed */ }
+                }
+              }
+              if (lineBuffer.trim().startsWith('data:')) {
+                const data = lineBuffer.trim().slice(5).trim()
+                if (data && data !== '[DONE]') {
+                  try {
+                    const chunk = JSON.parse(data)
+                    cleanChunkDelta(chunk)
+                    const anthropicSSE = openAIChunkToAnthropicSSE(chunk, acc)
+                    if (anthropicSSE) controller.enqueue(new TextEncoder().encode(anthropicSSE))
+                  } catch { /* skip */ }
+                }
+              }
+            } catch { /* stream error */ }
+            const finalizeDiag = diagnoseAnthropicAccumulator(acc)
+            const finalized = finalizeAnthropicStream(acc)
+            if (finalized) {
+              try { controller.enqueue(new TextEncoder().encode(finalized)) } catch { /* enqueue failed */ }
+              try {
+                c.executionCtx.waitUntil(writeLog(c.env, 'warn',
+                  `[anthropic] 流结束兜底触发 ${model} (trae)`,
+                  JSON.stringify({ providerId: provider.id, model, ...finalizeDiag })
+                ))
+              } catch { /* log failure must not break */ }
+            }
+            controller.close()
+          },
+        })
+        return new Response(readable, {
+          status: 200,
+          headers: {
+            'Content-Type': 'text/event-stream',
+            'Cache-Control': 'no-store',
+            'X-Accel-Buffering': 'no',
+          },
+        })
+      }
+
+      // 非流式：收集所有 OpenAI SSE → 聚合 → Anthropic
+      const allChunks: any[] = []
+      const decoder2 = new TextDecoderStream()
+      const textReader2 = response.body!.pipeThrough(decoder2).getReader()
+      let lineBuffer2 = ''
+      try {
+        while (true) {
+          const { done, value } = await textReader2.read()
+          if (done) break
+          const combined = lineBuffer2 + value
+          const lines = combined.split('\n')
+          lineBuffer2 = lines.pop() || ''
+          for (const line of lines) {
+            const trimmed = line.trim()
+            if (!trimmed.startsWith('data:')) continue
+            const data = trimmed.slice(5).trim()
+            if (!data || data === '[DONE]') continue
+            try {
+              const chunk = JSON.parse(data)
+              cleanChunkDelta(chunk)
+              allChunks.push(chunk)
+            } catch { /* skip */ }
+          }
+        }
+      } catch { /* stream error */ }
       const anthropicResp = aggregateOpenAIToAnthropic(allChunks)
       return c.json(anthropicResp)
     }
