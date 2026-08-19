@@ -319,6 +319,17 @@ export function soloStreamToOpenAIStream(
         if (ev) events.push(ev)
         processEvents(controller, events)
       }
+      // 处理未关闭的 SSE 事件：上游在 event/data 行后直接结束流（无空行触发事件边界）
+      // 工具调用（tool_calls）时上游的 done 事件末尾可能无 \n，导致 finish_reason 丢失，
+      // 客户端收不到 finish_reason 报 "truncated: stream ended"。
+      if (st.event !== '' || st.data !== '') {
+        const ev = parseSoloLine(st.event, st.data)
+        resetState(st)
+        if (ev) {
+          const events: SOLOEvent[] = [ev]
+          processEvents(controller, events)
+        }
+      }
       // 幂等兜底：上游中断（无 done）仍写 [DONE]
       if (!sawDone) writeDone(controller)
     },
