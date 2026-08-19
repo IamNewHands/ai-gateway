@@ -36,6 +36,11 @@ export const KV_KEYS = {
   LOGIN_RATE: 'login:rate:',
   MCPS: 'mcps',
   UNIMODELS: 'unimodels',
+  // TRAE SOLO 账号池 / 登录流程 / 签到结果 / 动态模型缓存
+  TRAE_POOL_PREFIX: 'trae:pool:',
+  TRAE_LOGIN_PREFIX: 'trae:login:',
+  TRAE_CHECKIN_PREFIX: 'trae:checkin:',
+  TRAE_MODELS_PREFIX: 'trae:models:',
 } as const
 
 /** uni-model 虚拟提供商 ID（模型 ID 前缀，如 unimodel/xxx） */

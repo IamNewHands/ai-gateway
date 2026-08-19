@@ -66,6 +66,16 @@ import {
 import { refreshAllOauthTokens } from './oauth'
 import { runAllCheckins, handleCheckinTrigger, handleCheckinStatus } from './checkin'
 import { autoCleanupAll } from './m365/auto-cleanup'
+import {
+  handleTraeLoginConnect,
+  handleTraeLoginCallback,
+  handleTraeCheckin,
+  handleTraeModels,
+  handleTraeStatus,
+  handleTraeAccountRemove,
+  runTraeCheckins,
+  refreshTraeTokens,
+} from './trae/admin'
 import { M365Session } from './m365/durable'
 import type { AppEnv, Env, Provider } from './types'
 
@@ -165,6 +175,14 @@ app.post('/admin/api/oauth/:id/m365-ropc', handleOAuthM365ROPC)
 app.post('/admin/api/cline/oauth/:id/connect', handleClineOAuthConnect)
 app.post('/admin/api/cline/oauth/:id/poll', handleClineOAuthPoll)
 
+// TRAE SOLO 管理：登录闭环 / 签到 / 模型发现 / 账号状态（面板）
+app.post('/admin/api/trae/:id/login/connect', handleTraeLoginConnect)
+app.post('/admin/api/trae/:id/login/callback', handleTraeLoginCallback)
+app.post('/admin/api/trae/:id/checkin', handleTraeCheckin)
+app.post('/admin/api/trae/:id/models', handleTraeModels)
+app.get('/admin/api/trae/:id/status', handleTraeStatus)
+app.post('/admin/api/trae/:id/account/remove', handleTraeAccountRemove)
+
 // Analytics Engine 总览与详细日志
 app.get('/admin/api/analytics/overview', handleAnalyticsOverview)
 app.get('/admin/api/analytics/trend', handleAnalyticsTrend)
@@ -206,6 +224,12 @@ app.delete('/api/manage/providers/:id', handleDeleteProvider)
 // 签到（手机脚本手动触发，需管理 Token）
 app.post('/api/manage/checkin', handleCheckinTrigger)
 app.post('/api/manage/checkin/:id', handleCheckinTrigger)
+// TRAE 签到（手机脚本手动触发，需管理 Token）
+app.post('/api/manage/trae/checkin', async (c) => {
+  const summary = await runTraeCheckins(c.env, true)
+  return c.json({ success: true, data: summary })
+})
+app.post('/api/manage/trae/checkin/:id', handleTraeCheckin)
 
 // ===== API 转发路由（需转发 Key 验证） =====
 app.use('/v1/*', proxyKeyAuthMiddleware)
@@ -342,9 +366,11 @@ app.onError((err, c) => {
 //    default.scheduled，cron 触发后会被静默丢弃 → 定时签到/token 刷新均不执行。
 async function scheduled(event: ScheduledEvent, env: Env, ctx: ExecutionContext) {
   if (event.cron === '0 1,13 * * *') {
-    // 签到
+    // 签到（WorkBuddy/QoderWork + TRAE SOLO）
     const summary = await runAllCheckins(env)
     console.log(`[checkin] cron done: total=${summary.total} ok=${summary.success} already=${summary.already} fail=${summary.fail} skipped=${summary.skipped}`)
+    const trae = await runTraeCheckins(env, true)
+    console.log(`[trae-checkin] cron done: total=${trae.total} ok=${trae.ok} already=${trae.already} fail=${trae.fail}`)
     return
   }
   if (event.cron === '0 * * * *') {
@@ -353,11 +379,13 @@ async function scheduled(event: ScheduledEvent, env: Env, ctx: ExecutionContext)
     console.log(`[auto-cleanup] cron done: total=${result.total} providers=${result.providers} errors=${result.errors}`)
     return
   }
-  // token 刷新（默认 / "0 */2 * * *"）
+  // token 刷新（默认 / "0 */2 * * *"）——OAuth 提供商 + TRAE SOLO 预刷新
   const providers = (await getProviders(env)) as Provider[]
   const oauthProviders = providers.filter((p) => p.authType === 'oauth-device' && p.oauth)
   const result = await refreshAllOauthTokens(env, oauthProviders)
   console.log(`[oauth] cron refresh done: ${result.ok} ok, ${result.fail} fail`)
+  const traeRefresh = await refreshTraeTokens(env)
+  console.log(`[trae] cron refresh done: ${traeRefresh.ok} ok, ${traeRefresh.fail} fail`)
 }
 
 // fetch 与 scheduled 必须都挂在 default export 上，Cloudflare 才会注册并调用。

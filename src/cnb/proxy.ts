@@ -23,6 +23,7 @@ import {
   renderToolCall,
   openAIToolCalls,
   randomId,
+  scrubToolFragments,
   ToolSieve,
 } from './xyml'
 
@@ -649,8 +650,10 @@ function buildStreamResponse(upstream: Response, opts: BridgeOptions): Response 
           if (choice.finish_reason) upstreamFinishReason = choice.finish_reason
           const content = delta.content || ''
           const reasoning = delta.reasoning_content || ''
-          // 推理内容与正文分开透传（bridge 模式 reasoning 不进 sieve，避免误判工具标记）
-          if (reasoning) write(stdChunk(stdID, stdModel, stdCreated, { reasoning_content: reasoning }, null))
+          // 推理内容与正文分开透传（bridge 模式 reasoning 不进 sieve，避免误判工具标记），
+          // 但仍清洗混入推理的 XYML 工具标记残片（模型思考时常把计划执行的搜索/取数工具
+          // XML 草案混进 reasoning，若不清理会以脏标签形式展示给客户端）。
+          if (reasoning) write(stdChunk(stdID, stdModel, stdCreated, { reasoning_content: scrubToolFragments(reasoning) }, null))
           if (content) {
             if (sieve) {
               for (const ev of sieve.processChunk(content)) {
@@ -725,7 +728,7 @@ async function buildNonStreamResponse(upstream: Response, opts: BridgeOptions): 
   }
 
   const message: Record<string, unknown> = { role: 'assistant', content }
-  if (reasoning) message['reasoning_content'] = reasoning
+  if (reasoning) message['reasoning_content'] = scrubToolFragments(reasoning)
   if (toolCalls.length) {
     message['tool_calls'] = toolCalls
     finish = 'tool_calls'

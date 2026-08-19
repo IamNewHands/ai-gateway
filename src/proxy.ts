@@ -18,6 +18,7 @@ import { isVisionBridgeProvider, buildVisionBridgeRequestBody } from './vision/b
 import { isGeminiProvider, proxyGeminiChatRequest } from './gemini/proxy'
 import { isCnbProvider, proxyCnbChatRequest } from './cnb/proxy'
 import { isM365Provider, proxyM365ChatRequest } from './m365/proxy'
+import { isTraeProvider, proxyTraeChatRequest } from './trae/proxy'
 import { writeLog } from './admin'
 import { getOauthAccessToken, readOauthToken, refreshOauthToken, detectTokenRealm, buildOauthHeaders } from './oauth'
 import {
@@ -967,6 +968,21 @@ export async function forwardProxy(
         } catch { /* log failure must not break */ }
         throw err
       }
+    }
+
+    // TRAE SOLO：免费模型多账号反代（移植自 traework2api）。账号池在 src/trae/ 内部管理
+    // （积分最高者优先、1005/429/401 冷却或禁用、签到解冻），账号凭证存在 provider.apiKeys。
+    if (isTraeProvider(provider)) {
+      const response = await proxyTraeChatRequest(c.env, provider, forwardBody as Record<string, unknown>)
+      const logLevel = response.ok ? 'request' : (response.status >= 500 ? 'error' : 'warn')
+      try {
+        const bodySummary = summarizeRequestBody(forwardBody)
+        c.executionCtx.waitUntil(writeLog(c.env, logLevel,
+          `[${provider.name}] ${model} → ${response.status}`,
+          JSON.stringify({ providerId, subPath, body: bodySummary }).substring(0, 4000)
+        ))
+      } catch { /* log failure must not break */ }
+      return response
     }
 
     // M365 Copilot：ChatHub WS 对话（OAuth flowType ∈ m365-pkce/m365-ropc），

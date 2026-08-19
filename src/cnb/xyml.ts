@@ -1178,7 +1178,7 @@ function firstClosedBlockEnd(text: string, config: ToolCallConfig): number {
  * 普通 XML 工具标签、行首协议说明行），避免原始工具标记显示给客户端。
  * 仅作兜底：正常情况下工具块都已被 ToolSieve 捕获解析，此处只处理截断/残缺块。
  */
-function scrubToolFragments(text: unknown): string {
+export function scrubToolFragments(text: unknown): string {
   let t = String(text ?? '')
   t = t.replace(/<!\[CDATA\[/g, '')
   t = t.replace(/\]\]>/g, '')
@@ -1187,6 +1187,9 @@ function scrubToolFragments(text: unknown): string {
   t = t.replace(/<\s*\/?\s*\|\s*[A-Za-z][A-Za-z0-9_]*\s*\|?>/gi, '')
   // 截断残片（无 >）：</|XYML|、<|XYML|、</|XYML —— 精确匹配标签本身，不吞后续正文（如路径/行号）
   t = t.replace(/<\s*\/?\s*\|\s*[A-Za-z][A-Za-z0-9_]*\s*\|?/gi, '')
+  // 缺 <|X 前缀的协议标签残片（XYML→YML / QNML→NML，开头被截断，如 YML|parameter name="...">）。
+  // 只认协议名残片 + parameter/invoke/tool_calls 关键字，避免误伤正常竖线分隔正文（如 HTML|CSS、a|b）。
+  t = t.replace(/\b(?:YML|NML)\s*\|\s*(?:parameter|invoke|tool_calls)\b[^>]*>/gi, '')
   t = t.replace(/<\/?(?:tool_call|tool_use|function|invoke|parameter)\b[^>]*>/gi, '')
   t = t.replace(/^=+\s*(?:XYML|QNML)\s+TOOL CALL PROTOCOL\s*=+$/gim, '')
   t = t.replace(/^Default protocol for new tool calls:.*$/gim, '')

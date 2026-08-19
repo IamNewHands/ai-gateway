@@ -65,6 +65,10 @@ const escapePageJs = (value: unknown) => String(value ?? '')
  */
 const escapePageJsx = (value: unknown) => escapePageHtml(escapePageJs(value))
 
+/** 是否 TRAE SOLO 提供商（id 固定或用 trae 域，与 src/trae/proxy.ts isTraeProvider 对齐） */
+const isTraeProviderUI = (p: { id?: string; baseUrl?: string }) =>
+  p.id === 'trae' || (typeof p.baseUrl === 'string' && p.baseUrl.includes('trae'))
+
 // UX8：厂商预设与 OAuth 预置模板——单一数据源。
 // SSR 下拉 option 与客户端 applyProviderPreset / applyOauthPreset* 共用，
 // 注入为页面 script 常量，消除服务端/客户端两套重复预设表。
@@ -104,6 +108,9 @@ const PROVIDER_PRESETS: Record<string, { name: string; id: string; baseUrl: stri
   },
   visionbridge: { name: 'Vision Bridge (图片转写桥)', id: 'visionbridge', baseUrl: 'https://example.com/v1', apiType: 'openai' },
   m365:         { name: 'M365 Copilot (OAuth)',   id: 'm365',         baseUrl: 'https://substrate.office.com',                     apiType: 'openai', authType: 'oauth-device', oauthPreset: 'm365' },
+  trae:         { name: 'TRAE SOLO (多账号反代)', id: 'trae',         baseUrl: 'https://trae-api-cn.mchost.guru',                  apiType: 'openai',
+    models: ['glm-5.2', 'glm-5-turbo', 'glm-5', 'DeepSeek-V4-Pro', 'DeepSeek-V4-Flash', 'DeepSeek-V4-Flash-Official', 'DeepSeek-V4', 'kimi-k3', 'kimi-k2.7-code', 'qwen-3.7-plus', 'Doubao-Seed-2.1-Pro', 'Doubao-Seed-2.0-Code', 'minimax-m3'],
+  },
 }
 
 const OAUTH_PRESETS: Record<string, { label: string; flowType: string; deviceCodeUrl: string; deviceTokenUrl: string; refreshTokenUrl: string; clientId: string; clientSecret?: string; scope?: string; tokenHeader: string; tokenHeaderPrefix: string; extraHeaders: Record<string, string>; _baseUrl?: string; _modelsUrl?: string; _globalBaseUrl?: string; _globalModelsUrl?: string; _globalOrigin?: string; _redirectUri?: string }> = {
@@ -658,8 +665,20 @@ ${H('管理')}
                   <div class="fc mt-1 field-row"><button class="btn btn-s" onclick="oauthConnect('${escapePageJsx(p.id)}')"><i class="fas fa-plug" aria-hidden="true"></i>发起连接</button><button class="btn btn-gh" onclick="fetchOauthModels('${escapePageJsx(p.id)}')"><i class="fas fa-cloud-download-alt" aria-hidden="true"></i>获取模型</button><button class="btn btn-gh" onclick="oauthStatus('${escapePageJsx(p.id)}')"><i class="fas fa-sync" aria-hidden="true"></i>状态</button><button class="btn btn-gh" onclick="oauthDisconnect('${escapePageJsx(p.id)}')"><i class="fas fa-unlink" aria-hidden="true"></i>断开</button><span id="oauth-st-${escapePageHtml(p.id)}" class="oauth-status"></span></div>
                 </fieldset>
               </div>
-              <fieldset class="form-group ${p.authType==='oauth-device'?'hd':''}" id="keys-fs-${escapePageHtml(p.id)}"><legend id="key-legend-${escapePageHtml(p.id)}">${p.id==='cline'?'Cline RefreshTokens（每个账号一行）':'上游 API Keys'}</legend><div id="keys-${escapePageHtml(p.id)}">${p.apiKeys.map((k, ki)=>`<div class="fc mb-3 field-row" data-kidx="${ki}"><input type="password" value="${escapePageHtml(k.key)}" class="fx1" id="k-${escapePageHtml(p.id)}-${ki}" placeholder="API Key" aria-label="API Key"><button class="icon-btn" onclick="toggleKeyText(this)" title="显示/隐藏 Key"><i class="fas fa-eye" aria-hidden="true"></i></button><label class="tg"><input type="checkbox" ${k.enabled?'checked':''} id="ken-${escapePageHtml(p.id)}-${ki}" aria-label="启用 Key"><span class="sl"></span></label><button class="btn btn-gh btn-xs" onclick="testKeyRow('${escapePageJsx(p.id)}',${ki})" title="测试 Key"><i class="fas fa-plug" aria-hidden="true"></i><span>测试</span></button><button class="icon-btn" onclick="rmKeyRow('${escapePageJsx(p.id)}',${ki})" aria-label="移除 Key"><i class="fas fa-times" aria-hidden="true"></i></button></div>`).join('')}</div><div class="fc mt-1 field-row"><input type="password" id="nk-${escapePageHtml(p.id)}" placeholder="${p.id==='cline'?'新的 RefreshToken（一个账号一行）':'新的 API Key'}" class="fx1"><button class="btn btn-s btn-xs" onclick="addKeyRow('${escapePageJsx(p.id)}')"><i class="fas fa-plus" aria-hidden="true"></i>添加</button></div><span id="key-hint-${escapePageHtml(p.id)}" class="form-helper">${p.id==='cline'?'Cline 使用 Cline 账号的 refreshToken（长期钥匙）。每个账号一行，额度用完自动切换；留空禁用某个账号。':' '}</span></fieldset>
+              <fieldset class="form-group ${p.authType==='oauth-device'?'hd':''}" id="keys-fs-${escapePageHtml(p.id)}"><legend id="key-legend-${escapePageHtml(p.id)}">${isTraeProviderUI(p)?'TRAE 账号凭证（每个账号一行 JSON）':(p.id==='cline'?'Cline RefreshTokens（每个账号一行）':'上游 API Keys')}</legend><div id="keys-${escapePageHtml(p.id)}">${p.apiKeys.map((k, ki)=>`<div class="fc mb-3 field-row" data-kidx="${ki}"><input type="password" value="${escapePageHtml(k.key)}" class="fx1" id="k-${escapePageHtml(p.id)}-${ki}" placeholder="API Key" aria-label="API Key"><button class="icon-btn" onclick="toggleKeyText(this)" title="显示/隐藏 Key"><i class="fas fa-eye" aria-hidden="true"></i></button><label class="tg"><input type="checkbox" ${k.enabled?'checked':''} id="ken-${escapePageHtml(p.id)}-${ki}" aria-label="启用 Key"><span class="sl"></span></label><button class="btn btn-gh btn-xs" onclick="testKeyRow('${escapePageJsx(p.id)}',${ki})" title="测试 Key"><i class="fas fa-plug" aria-hidden="true"></i><span>测试</span></button><button class="icon-btn" onclick="rmKeyRow('${escapePageJsx(p.id)}',${ki})" aria-label="移除 Key"><i class="fas fa-times" aria-hidden="true"></i></button></div>`).join('')}</div><div class="fc mt-1 field-row"><input type="password" id="nk-${escapePageHtml(p.id)}" placeholder="${isTraeProviderUI(p)?'新的 TRAE 凭证 JSON（或点「登录账号」自动写入）':(p.id==='cline'?'新的 RefreshToken（一个账号一行）':'新的 API Key')}" class="fx1"><button class="btn btn-s btn-xs" onclick="addKeyRow('${escapePageJsx(p.id)}')"><i class="fas fa-plus" aria-hidden="true"></i>添加</button></div><span id="key-hint-${escapePageHtml(p.id)}" class="form-helper">${isTraeProviderUI(p)?'TRAE SOLO 账号凭证为登录后自动写入的 JSON（也可粘贴 trae 登录脚本落盘的 trae-*.json 内容）。每行一个账号、按剩余积分自动挑选，额度用尽自动冷却轮换；禁用该 Key 即停用账号。':(p.id==='cline'?'Cline 使用 Cline 账号的 refreshToken（长期钥匙）。每个账号一行，额度用完自动切换；留空禁用某个账号。':' ')}</span></fieldset>
               <fieldset class="form-group" id="models-fs-${escapePageHtml(p.id)}"><legend>模型</legend><div id="ml-${escapePageHtml(p.id)}">${p.models.map((m,mi)=>`<div class="fc mb-3 field-row" data-idx="${mi}"><input type="text" value="${escapePageHtml(m.id)}" class="fx1" id="mid-${escapePageHtml(p.id)}-${mi}" placeholder="模型 ID"><label class="tg"><input type="checkbox" ${m.enabled?'checked':''} id="men-${escapePageHtml(p.id)}-${mi}" aria-label="启用模型"><span class="sl"></span></label><button class="btn btn-gh btn-xs" onclick="testMdl('${escapePageJsx(p.id)}','${escapePageJsx(m.id)}',${mi})" title="测试模型"><i class="fas fa-plug" aria-hidden="true"></i><span>测试</span></button><button class="icon-btn" onclick="rmMdl('${escapePageJsx(p.id)}',${mi})" aria-label="移除模型"><i class="fas fa-times" aria-hidden="true"></i></button></div>`).join('')}</div><div class="fc mt-1 field-row"><input type="text" id="nmid-${escapePageHtml(p.id)}" placeholder="新的模型 ID" class="fx1"><button class="btn btn-s btn-xs" onclick="addMdl('${escapePageJsx(p.id)}')"><i class="fas fa-plus" aria-hidden="true"></i>添加</button></div></fieldset>
+              ${isTraeProviderUI(p)?`
+              <fieldset class="form-group" id="trae-fs-${escapePageHtml(p.id)}"><legend>TRAE SOLO 账号池</legend><span class="form-helper">免费积分多账号反代：登录成功后凭证自动写入上方账号列表；转发时按剩余积分自动挑选账号，额度用尽自动冷却轮换（1005/429/401 各按策略冷却/禁用），每日 01:00/13:00 自动签到补积分并解冻。</span>
+                <div class="fc mt-1 field-row">
+                  <button class="btn btn-s" onclick="traeLogin('${escapePageJsx(p.id)}')"><i class="fas fa-sign-in-alt" aria-hidden="true"></i>登录账号</button>
+                  <button class="btn btn-s" onclick="traeCheckin('${escapePageJsx(p.id)}')"><i class="fas fa-calendar-check" aria-hidden="true"></i>全部签到</button>
+                  <button class="btn btn-s" onclick="traeModels('${escapePageJsx(p.id)}')"><i class="fas fa-cloud-download-alt" aria-hidden="true"></i>拉取模型</button>
+                  <button class="btn btn-gh" onclick="traeStatus('${escapePageJsx(p.id)}')"><i class="fas fa-sync" aria-hidden="true"></i>刷新状态</button>
+                </div>
+                <div id="trae-st-${escapePageHtml(p.id)}" class="oauth-status" aria-live="polite"></div>
+                <div id="trae-acc-${escapePageHtml(p.id)}" class="mt-1"></div>
+                <div id="trae-checkin-${escapePageHtml(p.id)}" class="mt-1"></div>
+              </fieldset>`:''}
               <div class="collapse-section">
                 <button class="collapse-btn" onclick="toggleVbCollapse('vb-fs-${escapePageJsx(p.id)}', this)" type="button" aria-expanded="false">
                   <i class="fas fa-chevron-right collapse-icon" aria-hidden="true"></i> 识图模型配置（可选）
@@ -672,7 +691,7 @@ ${H('管理')}
               </div>
               <fieldset class="form-group" id="atb-fs-${escapePageHtml(p.id)}"><legend>工具桥</legend><label class="switch-label"><span>启用工具桥（XYML 提示词注入 + 流式解析回 tool_calls，仅 CNB 需要）</span><span class="tg"><input type="checkbox" id="atb-${escapePageHtml(p.id)}" ${p.toolBridge?'checked':''}><span class="sl"></span></span></label></fieldset>
               <fieldset class="form-group" id="aum-fs-${escapePageHtml(p.id)}"><legend>模型策略</legend><label class="switch-label"><span>允许未配置模型透传——开启后请求该提供商的任意 modelId 都直接转发（跳过「未配置」校验），适合模型频繁上架、不想每次手动加模型的提供商（如 OpenRouter）。</span><span class="tg"><input type="checkbox" id="aum-${escapePageHtml(p.id)}" ${p.allowUnlistedModels?'checked':''}><span class="sl"></span></span></label></fieldset>
-              <div class="detail-actions"><div id="tr-${escapePageHtml(p.id)}" aria-live="polite"></div><div>${((p.id === 'cnb' || (p.baseUrl && p.baseUrl.indexOf('cnb.cool') !== -1)) || ((p.oauth && (p.oauth.flowType === 'm365-pkce' || p.oauth.flowType === 'm365-ropc')))) ? '<button class="btn btn-s" onclick="fetchOauthModels(\'' + escapePageJsx(p.id) + '\')"><i class="fas fa-download" aria-hidden="true"></i>获取模型</button>' : (p.apiType === 'openai' || p.id === 'cline' || p.id === 'opencode') ? '<button class="btn btn-s" onclick="fetchEditModels(\'' + escapePageJsx(p.id) + '\')"><i class="fas fa-download" aria-hidden="true"></i>获取模型</button>' : ''}${p.id === 'cline' ? '<button class="btn btn-s" onclick="clineOAuthConnect(\'' + escapePageJsx(p.id) + '\')"><i class="fas fa-sign-in-alt" aria-hidden="true"></i>一键授权获取 Token</button>' : ''}<button class="btn btn-d" onclick="del('${escapePageJsx(p.id)}')"><i class="fas fa-trash" aria-hidden="true"></i>删除</button><button class="btn btn-p" onclick="save('${escapePageJsx(p.id)}')"><i class="fas fa-save" aria-hidden="true"></i>保存更改</button></div></div>
+              <div class="detail-actions"><div id="tr-${escapePageHtml(p.id)}" aria-live="polite"></div><div>${((p.id === 'cnb' || (p.baseUrl && p.baseUrl.indexOf('cnb.cool') !== -1)) || ((p.oauth && (p.oauth.flowType === 'm365-pkce' || p.oauth.flowType === 'm365-ropc')))) ? '<button class="btn btn-s" onclick="fetchOauthModels(\'' + escapePageJsx(p.id) + '\')"><i class="fas fa-download" aria-hidden="true"></i>获取模型</button>' : ((p.apiType === 'openai' || p.id === 'cline' || p.id === 'opencode') && !isTraeProviderUI(p)) ? '<button class="btn btn-s" onclick="fetchEditModels(\'' + escapePageJsx(p.id) + '\')"><i class="fas fa-download" aria-hidden="true"></i>获取模型</button>' : ''}${p.id === 'cline' ? '<button class="btn btn-s" onclick="clineOAuthConnect(\'' + escapePageJsx(p.id) + '\')"><i class="fas fa-sign-in-alt" aria-hidden="true"></i>一键授权获取 Token</button>' : ''}<button class="btn btn-d" onclick="del('${escapePageJsx(p.id)}')"><i class="fas fa-trash" aria-hidden="true"></i>删除</button><button class="btn btn-p" onclick="save('${escapePageJsx(p.id)}')"><i class="fas fa-save" aria-hidden="true"></i>保存更改</button></div></div>
             </div>
           </article>`).join('') : `<div class="empty-state"><i class="fas fa-server" aria-hidden="true"></i><h3>还没有提供商</h3><p>添加第一个上游提供商，配置 API 地址、Key 和模型。</p><button class="btn btn-p" onclick="showAdd()">添加提供商</button></div>`}
         </div>
@@ -902,6 +921,8 @@ function tog(id) {
   const d = document.getElementById('dt-' + id), c = document.getElementById('ch-' + id)
   d.classList.toggle('open')
   c.style.transform = d.classList.contains('open') ? 'rotate(90deg)' : ''
+  // TRAE SOLO：展开时自动刷新账号池状态
+  if (d.classList.contains('open') && document.getElementById('trae-acc-' + id)) traeStatus(id)
 }
 
 // UX2：保存/删除等操作后 location.reload() 会把页面打回顶部、收起所有面板。
@@ -1257,6 +1278,10 @@ function applyProviderPreset(name) {
     // 官方纯 API Key 直连（OpenAI 兼容端点），无需 OAuth，直接填好模型
     applyClineKeyHint(false)
     if (p.models && p.models.length) fillPresetModels(p.models)
+  } else if (p.id === 'trae') {
+    // TRAE SOLO：Key 区填登录凭证（登录后自动写入），预填实测模型
+    applyTraeKeyHint(true)
+    if (p.models && p.models.length) fillPresetModels(p.models)
   } else {
     applyClineKeyHint(false)
   }
@@ -1291,6 +1316,12 @@ function applyClineKeyHint(on) {
   if (hint) hint.textContent = on ? 'Cline 使用 refreshToken（Cline 账号的长期钥匙）。每个 token 一行、一个账号；额度用完会自动切换，支持多账号。' : ''
   const legend = document.getElementById('akey-legend')
   if (legend) legend.textContent = on ? 'Cline RefreshTokens（每个账号一行）' : '上游 API Keys'
+}
+function applyTraeKeyHint(on) {
+  const hint = document.getElementById('akey-hint')
+  if (hint) hint.textContent = on ? 'TRAE SOLO 账号凭证为登录后自动写入的 JSON（也可粘贴 trae 登录脚本落盘的 trae-*.json 内容）。每个账号一行；创建后点「登录账号」可一键登录，额度用尽自动冷却轮换。' : ''
+  const legend = document.getElementById('akey-legend')
+  if (legend) legend.textContent = on ? 'TRAE 账号凭证（每个账号一行 JSON）' : '上游 API Keys'
 }
 
 function toggleAuthType() {
@@ -1464,6 +1495,121 @@ function oauthPoll(id) {
     if (st) st.textContent = d.message || '等待授权…'
     return false
   }).catch(() => { if (pollSt) pollSt.textContent = '轮询失败，请重试' })
+}
+
+// ===== TRAE SOLO 账号池：登录 / 签到 / 模型 / 状态 =====
+function traeLogin(id) {
+  if (adminSubmitting) return
+  const st = document.getElementById('trae-st-' + id)
+  if (st) st.textContent = '正在生成登录链接…'
+  adminSubmitting = true
+  return fetch('/admin/api/trae/' + encodeURIComponent(id) + '/login/connect', { method: 'POST' }).then(r => r.json()).then(d => {
+    adminSubmitting = false
+    if (!d.success || !d.data) { if (st) showResult(st, false, d.message || '发起失败'); return }
+    const url = d.data.loginUrl
+    window.open(url, '_blank')
+    showM('<h3><i class="fas fa-sign-in-alt c-p" aria-hidden="true"></i> TRAE 登录</h3>' +
+      '<p>登录链接已在浏览器新标签页打开。若未自动打开，请手动访问：</p>' +
+      '<p style="word-break:break-all"><a href="' + escapeHtml(url) + '" target="_blank" rel="noreferrer">' + escapeHtml(url) + '</a></p>' +
+      '<p>完成登录后，<strong>复制浏览器地址栏跳转后的完整链接</strong>（形如 <code>http://127.0.0.1:18080/authorize?refreshToken=...</code>），粘贴到下方：</p>' +
+      '<div class="fg"><input type="text" id="trae-cb" placeholder="http://127.0.0.1:18080/authorize?refreshToken=..." style="font-size:12px"></div>' +
+      '<div class="fa"><button class="btn btn-s" onclick="closeM()">取消</button><button class="btn btn-p" onclick="traeLoginSubmit(\\'' + escapeJsAttr(id) + '\\')">完成登录</button></div>')
+  }).catch(() => { adminSubmitting = false; if (st) showResult(st, false, '网络错误，请重试') })
+}
+function traeLoginSubmit(id) {
+  const inp = document.getElementById('trae-cb')
+  const url = (inp && inp.value || '').trim()
+  if (!url) { toast('请粘贴回调链接', 'error'); return }
+  const st = document.getElementById('trae-st-' + id)
+  if (st) st.textContent = '正在换取 Token…'
+  fetch('/admin/api/trae/' + encodeURIComponent(id) + '/login/callback', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ callbackUrl: url }),
+  }).then(r => r.json()).then(d => {
+    if (!d.success) { toast(d.message || '登录失败', 'error'); if (st) showResult(st, false, d.message || '登录失败'); return }
+    closeM()
+    const dd = d.data || {}
+    if (st) showResult(st, true, '登录成功 uid=' + (dd.uid || '') + ' 积分=' + (dd.credits || 0))
+    traeStatus(id)
+    setTimeout(function () { reloadAdmin() }, 1500)
+  }).catch(() => { if (st) showResult(st, false, '网络错误，请重试') })
+}
+function traeCheckin(id) {
+  const st = document.getElementById('trae-st-' + id)
+  if (st) { st.textContent = '签到中…'; showSpinner(st) }
+  fetch('/admin/api/trae/' + encodeURIComponent(id) + '/checkin', { method: 'POST' }).then(r => r.json()).then(d => {
+    if (!d.success) { if (st) showResult(st, false, d.message || '签到失败'); return }
+    const results = d.data || []
+    renderTraeCheckin(id, results)
+    if (st) showResult(st, true, '签到完成：' + results.length + ' 个账号')
+    traeStatus(id)
+  }).catch(() => { if (st) showResult(st, false, '网络错误，请重试') })
+}
+function traeModels(id) {
+  const st = document.getElementById('trae-st-' + id)
+  if (st) { st.textContent = '拉取模型中…'; showSpinner(st) }
+  fetch('/admin/api/trae/' + encodeURIComponent(id) + '/models', { method: 'POST' }).then(r => r.json()).then(d => {
+    if (!d.success) { if (st) showResult(st, false, d.message || '拉取模型失败'); return }
+    const entries = (d.data && d.data.data) || []
+    showEditModelsList(id, entries)
+    const from = (d.data && d.data.from) || 'static'
+    if (st) showResult(st, true, '已拉取 ' + entries.length + ' 个模型（' + (from === 'dynamic' ? '动态' : '静态回退') + '），点击 + 添加或直接保存')
+  }).catch(() => { if (st) showResult(st, false, '网络错误，请重试') })
+}
+function traeStatus(id) {
+  const st = document.getElementById('trae-st-' + id)
+  const box = document.getElementById('trae-acc-' + id)
+  if (!box) return
+  fetch('/admin/api/trae/' + encodeURIComponent(id) + '/status', { method: 'GET' }).then(r => r.json()).then(d => {
+    if (!d.success || !d.data) { if (st) showResult(st, false, d.message || '状态获取失败'); return }
+    const accs = d.data.accounts || []
+    const checkin = d.data.checkin || []
+    if (st) st.textContent = ''
+    if (accs.length === 0) {
+      box.innerHTML = '<p class="form-helper">暂无账号。点击「登录账号」添加第一个 TRAE 账号。</p>'
+    } else {
+      box.innerHTML = '<div style="max-height:260px;overflow:auto"><table class="usage-log-table" style="margin:0">' +
+        '<thead><tr><th>UID</th><th>昵称</th><th>积分</th><th>状态</th><th>冷却至</th><th>操作</th></tr></thead><tbody>' +
+        accs.map(function (a) {
+          const stTxt = a.disabled ? '<span style="color:var(--color-danger,#ef4444)">已禁用</span>' : a.cooling ? '<span style="color:var(--color-warn,#d97706)">冷却中</span>' : '<span style="color:var(--color-success,#16a34a)">正常</span>'
+          const until = a.cooling && a.until ? new Date(a.until).toLocaleString() : ''
+          const reason = a.reason ? '<small>' + escapeHtml(a.reason) + '</small>' : ''
+          return '<tr><td><code>' + escapeHtml(a.uid) + '</code></td><td>' + escapeHtml(a.nickname || '-') + '</td>' +
+            '<td>' + (a.credits || 0) + '</td><td>' + stTxt + (reason ? '<br>' + reason : '') + '</td><td>' + escapeHtml(until) + '</td>' +
+            '<td><button class="btn btn-d btn-xs" onclick="traeRemoveAccount(\\'' + escapeJsAttr(id) + '\\',\\'' + escapeJsAttr(a.uid) + '\\')">删除</button></td></tr>'
+        }).join('') + '</tbody></table></div>' +
+        '<p class="form-helper">共 ' + accs.length + ' 个账号' + (checkin.length ? '；最近签到 ' + checkin.length + ' 条记录（见下）' : '') + '</p>'
+    }
+    renderTraeCheckin(id, checkin)
+  }).catch(() => { if (st) showResult(st, false, '网络错误，请重试') })
+}
+function traeRemoveAccount(id, uid) {
+  cM('确定删除账号 ' + uid + ' 吗？该账号将退出账号池。').then(function (ok) {
+    if (!ok) return
+    const st = document.getElementById('trae-st-' + id)
+    fetch('/admin/api/trae/' + encodeURIComponent(id) + '/account/remove', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ uid: uid }),
+    }).then(r => r.json()).then(d => {
+      if (!d.success) { if (st) showResult(st, false, d.message || '删除失败'); return }
+      if (st) showResult(st, true, d.message || '已删除')
+      traeStatus(id)
+      setTimeout(function () { reloadAdmin() }, 1200)
+    }).catch(() => { if (st) showResult(st, false, '网络错误，请重试') })
+  })
+}
+function renderTraeCheckin(id, results) {
+  const box = document.getElementById('trae-checkin-' + id)
+  if (!box) return
+  if (!results || results.length === 0) { box.innerHTML = ''; return }
+  box.innerHTML = '<div class="checkin-grid">' + results.map(function (r) {
+    const ok = r.success ? '<span class="bd bd-on">成功</span>' : '<span class="bd bd-off">失败</span>'
+    return '<div class="ki" style="margin-bottom:6px"><div class="key-main"><span class="key-icon"><i class="fas fa-calendar-check"></i></span>' +
+      '<div><h3>' + escapeHtml(r.nickname || r.uid) + ' ' + ok + (r.checkedIn ? ' <span class="bd bd-on">已签到</span>' : '') + '</h3>' +
+      '<p>' + escapeHtml(r.message || '') + (r.credits !== undefined && r.credits !== null ? ' · 剩余积分 ' + r.credits : '') + '</p></div></div></div>'
+  }).join('') + '</div>'
 }
 
 // Gemini 授权码模式：提交用户粘贴的回调 URL，后台换 token 并拉取模型
