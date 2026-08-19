@@ -169,7 +169,7 @@ export async function proxyTraeChatRequest(
       }
       // 流内业务错误（1005 plan/5xx 等）→ 冷却账号，错误信息注入 SSE
       const onErr = (se: SOLOStreamError) => { void applyStreamError(env, provider.id, account.uid, se) }
-      return new Response(resp.body.pipeThrough(soloStreamToOpenAIStream(configName, onErr)), {
+      return new Response(soloStreamToOpenAIStream(resp.body, configName, onErr), {
         status: resp.status,
         headers: {
           'Content-Type': 'text/event-stream; charset=utf-8',

@@ -220,118 +220,130 @@ function mergeToolCallDelta(merged: Record<string, any>, delta: Record<string, a
   }
 }
 
-// ===== 流式转换：SOLO SSE → OpenAI SSE chunk（TransformStream） =====
+// ===== 流式转换：SOLO SSE → OpenAI SSE chunk（ReadableStream + start 回调） =====
+// ！
+// 使用 ReadableStream 而非 TransformStream + pipeThrough，因为 CF Workers 中
+// pipeThrough 的 flush 在 fetch 响应体结束时可能不被可靠调用，导致残留事件未处理、
+// [DONE] 未发送，客户端报 "truncated: stream ended"（尤其工具调用场景）。
+// ReadableStream 的 start 回调在循环结束后总处理残留缓冲并主动 close，保证流正确结束。
 
 function encodeSse(data: string): Uint8Array {
   return new TextEncoder().encode(`data: ${data}\n\n`)
 }
 
 /**
- * 流式转换：SOLO SSE → OpenAI SSE chunk，每 chunk flush，保证至少一个 [DONE]。
+ * 流式转换：SOLO SSE → OpenAI SSE chunk，使用 ReadableStream 确保流正确结束。
  * 上游流内 error 事件：回调 onErr（供冷却账号/记录日志）并注入一条 error 事件。
+ * @param upstream 上游 SOLO SSE 响应体（ReadableStream<Uint8Array>）。
  * @param model 写入 chunk 的模型名（OpenAI 兼容客户端校验用）。
  */
 export function soloStreamToOpenAIStream(
+  upstream: ReadableStream<Uint8Array>,
   model: string,
   onErr?: (se: SOLOStreamError) => void
-): TransformStream<Uint8Array, Uint8Array> {
-  const st: SseState = { event: '', data: '' }
-  const id = `chatcmpl-${Date.now()}`
-  let pendingUsage: Record<string, any> | null = null
-  let sawDone = false
-  let leftover = ''
+): ReadableStream<Uint8Array> {
+  return new ReadableStream({
+    async start(controller) {
+      const st: SseState = { event: '', data: '' }
+      const id = `chatcmpl-${Date.now()}`
+      let pendingUsage: Record<string, any> | null = null
+      let sawDone = false
+      let lineBuffer = ''
 
-  const writeChunk = (controller: TransformStreamDefaultController<Uint8Array>, delta: Record<string, any>, finish: string): void => {
-    const chunk: Record<string, any> = {
-      id,
-      object: 'chat.completion.chunk',
-      created: Math.floor(Date.now() / 1000),
-      model,
-      choices: [{ index: 0, delta }],
-    }
-    if (finish !== '') chunk['choices'][0]['finish_reason'] = finish
-    if (pendingUsage) {
-      chunk['usage'] = pendingUsage
-      pendingUsage = null
-    }
-    controller.enqueue(encodeSse(JSON.stringify(chunk)))
-  }
-  const writeDone = (controller: TransformStreamDefaultController<Uint8Array>): void => {
-    controller.enqueue(encodeSse('[DONE]'))
-  }
+      const writeChunk = (delta: Record<string, any>, finish: string): void => {
+        const chunk: Record<string, any> = {
+          id,
+          object: 'chat.completion.chunk',
+          created: Math.floor(Date.now() / 1000),
+          model,
+          choices: [{ index: 0, delta }],
+        }
+        if (finish !== '') chunk['choices'][0]['finish_reason'] = finish
+        if (pendingUsage) {
+          chunk['usage'] = pendingUsage
+          pendingUsage = null
+        }
+        controller.enqueue(encodeSse(JSON.stringify(chunk)))
+      }
+      const writeDone = (): void => {
+        controller.enqueue(encodeSse('[DONE]'))
+      }
 
-  const processEvents = (controller: TransformStreamDefaultController<Uint8Array>, events: SOLOEvent[]): void => {
-    for (const ev of events) {
-      switch (ev.event) {
-        case 'output': {
-          const delta: Record<string, any> = {}
-          if (ev.response !== '') delta['content'] = ev.response
-          if (ev.reasoning !== '') delta['reasoning_content'] = ev.reasoning
-          if (ev.toolCalls !== null && ev.toolCalls !== undefined && ev.toolCalls !== 'null') {
-            const tc = normalizeStreamToolCalls(ev.toolCalls)
-            if (tc) delta['tool_calls'] = tc
+      const processEvents = (events: SOLOEvent[]): void => {
+        for (const ev of events) {
+          switch (ev.event) {
+            case 'output': {
+              const delta: Record<string, any> = {}
+              if (ev.response !== '') delta['content'] = ev.response
+              if (ev.reasoning !== '') delta['reasoning_content'] = ev.reasoning
+              if (ev.toolCalls !== null && ev.toolCalls !== undefined && ev.toolCalls !== 'null') {
+                const tc = normalizeStreamToolCalls(ev.toolCalls)
+                if (tc) delta['tool_calls'] = tc
+              }
+              if (Object.keys(delta).length > 0) writeChunk(delta, '')
+              break
+            }
+            case 'token_usage':
+              pendingUsage = ev.usage
+              break
+            case 'done':
+              writeChunk({}, ev.finishReason)
+              writeDone()
+              sawDone = true
+              break
+            case 'error': {
+              const se: SOLOStreamError = { code: ev.errorCode, msg: ev.errorMessage }
+              if (onErr) onErr(se)
+              const msg = `solo error code=${ev.errorCode} msg=${ev.errorMessage}`
+              controller.enqueue(new TextEncoder().encode(`event: error\ndata: ${JSON.stringify(msg)}\n\n`))
+              writeDone()
+              sawDone = true
+              break
+            }
           }
-          if (Object.keys(delta).length > 0) writeChunk(controller, delta, '')
-          break
-        }
-        case 'token_usage':
-          pendingUsage = ev.usage
-          break
-        case 'done':
-          writeChunk(controller, {}, ev.finishReason)
-          writeDone(controller)
-          sawDone = true
-          break
-        case 'error': {
-          const se: SOLOStreamError = { code: ev.errorCode, msg: ev.errorMessage }
-          if (onErr) onErr(se)
-          const msg = `solo error code=${ev.errorCode} msg=${ev.errorMessage}`
-          controller.enqueue(new TextEncoder().encode(`event: error\ndata: ${JSON.stringify(msg)}\n\n`))
-          writeDone(controller)
-          sawDone = true
-          break
         }
       }
-    }
-  }
 
-  return new TransformStream<Uint8Array, Uint8Array>({
-    transform(chunk, controller) {
-      const text = new TextDecoder().decode(chunk, { stream: true })
-      const combined = leftover + text
-      leftover = ''
-      const lines = combined.split('\n')
-      // 末尾一行可能不完整，留到下一段
-      leftover = lines.pop() || ''
-      const events: SOLOEvent[] = []
-      for (const line of lines) {
-        const ev = scanLine(st, line.replace(/\r$/, ''))
-        if (ev) events.push(ev)
-      }
-      processEvents(controller, events)
-    },
-    flush(controller) {
-      // 处理残留缓冲（上游流未以 \n 结束）
-      if (leftover !== '') {
+      // 读取上游 SSE 流
+      const decoder = new TextDecoderStream()
+      const textReader = upstream.pipeThrough(decoder).getReader()
+
+      try {
+        while (true) {
+          const { done, value } = await textReader.read()
+          if (done) break
+          const combined = lineBuffer + value
+          const lines = combined.split('\n')
+          lineBuffer = lines.pop() || ''
+
+          const events: SOLOEvent[] = []
+          for (const line of lines) {
+            const ev = scanLine(st, line.replace(/\r$/, ''))
+            if (ev) events.push(ev)
+          }
+          processEvents(events)
+        }
+      } catch { /* stream error */ }
+
+      // 处理残留行缓冲（上游流未以 \n 结束）
+      if (lineBuffer !== '') {
         const events: SOLOEvent[] = []
-        const ev = scanLine(st, leftover.replace(/\r$/, ''))
-        leftover = ''
+        const ev = scanLine(st, lineBuffer.replace(/\r$/, ''))
+        lineBuffer = ''
         if (ev) events.push(ev)
-        processEvents(controller, events)
+        processEvents(events)
       }
       // 处理未关闭的 SSE 事件：上游在 event/data 行后直接结束流（无空行触发事件边界）
-      // 工具调用（tool_calls）时上游的 done 事件末尾可能无 \n，导致 finish_reason 丢失，
-      // 客户端收不到 finish_reason 报 "truncated: stream ended"。
       if (st.event !== '' || st.data !== '') {
         const ev = parseSoloLine(st.event, st.data)
         resetState(st)
         if (ev) {
-          const events: SOLOEvent[] = [ev]
-          processEvents(controller, events)
+          processEvents([ev])
         }
       }
       // 幂等兜底：上游中断（无 done）仍写 [DONE]
-      if (!sawDone) writeDone(controller)
+      if (!sawDone) writeDone()
+      controller.close()
     },
   })
 }
