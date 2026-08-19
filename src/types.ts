@@ -134,6 +134,20 @@ export interface OAuthDeviceConfig {
   globalBaseUrl?: string
   globalModelsUrl?: string
   globalOrigin?: string
+  /**
+   * Global 域（海外账户，workbuddy.ai）的 OAuth 登录端点（browser 模式专用）。
+   * 与 deviceCodeUrl/deviceTokenUrl/refreshTokenUrl 同协议，只是换到 www.workbuddy.ai 域。
+   * 留空则对应操作只能走 CN 端点。
+   */
+  globalDeviceCodeUrl?: string
+  globalDeviceTokenUrl?: string
+  globalRefreshTokenUrl?: string
+  /**
+   * 发起浏览器登录时使用的域（browser 模式）。
+   * 'cn'（默认）走 copilot.tencent.com 端点；'global' 走 www.workbuddy.ai 端点。
+   * 仅影响登录流程；登录成功后 token 的 CN/Global 域仍按 JWT iss 自动路由。
+   */
+  loginRealm?: 'cn' | 'global'
 }
 
 /** KV 中保存的 OAuth token 状态 */
@@ -183,6 +197,8 @@ export interface DeviceFlowState {
   verifier?: string
   /** qoder 模式：设备授权 nonce（与授权链接配对） */
   nonce?: string
+  /** browser 模式：本次登录使用的域（发起时按 cfg.loginRealm 固化，轮询/刷新时复用） */
+  loginRealm?: 'cn' | 'global'
 }
 
 export interface ProxyKey {

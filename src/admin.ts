@@ -130,6 +130,9 @@ function validateOAuthUrls(oauth?: OAuthDeviceConfig): string | null {
     ['modelsUrl', oauth.modelsUrl],
     ['globalBaseUrl', oauth.globalBaseUrl],
     ['globalModelsUrl', oauth.globalModelsUrl],
+    ['globalDeviceCodeUrl', oauth.globalDeviceCodeUrl],
+    ['globalDeviceTokenUrl', oauth.globalDeviceTokenUrl],
+    ['globalRefreshTokenUrl', oauth.globalRefreshTokenUrl],
   ]
   for (const [name, v] of names) {
     if (v && !isSafeHttpUrl(v)) return `OAuth ${name} 必须是合法的 http/https 公网地址`

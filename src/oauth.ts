@@ -260,14 +260,35 @@ async function pollOauthDeviceCodeFlow(env: Env, providerId: string, cfg: OAuthD
 //   3. GET  {deviceTokenUrl}?state=xxx  → {code:0, data:{accessToken, refreshToken, expiresIn, domain}}
 //   4. 刷新 POST {refreshTokenUrl} header X-Refresh-Token  → 同上
 
-/** 构造 browser 模式的公共请求头 */
-function browserCommonHeaders(cfg: OAuthDeviceConfig): Record<string, string> {
-  return {
+/** 构造 browser 模式的公共请求头；realm='global' 时用 globalOrigin 覆盖 Origin/Referer */
+function browserCommonHeaders(cfg: OAuthDeviceConfig, realm?: 'cn' | 'global'): Record<string, string> {
+  const headers: Record<string, string> = {
     'Content-Type': 'application/json',
     'Accept': 'application/json, text/plain, */*',
     'X-Requested-With': 'XMLHttpRequest',
     ...cfg.extraHeaders,
   }
+  if (realm === 'global' && cfg.globalOrigin) {
+    headers['Origin'] = cfg.globalOrigin
+    headers['Referer'] = cfg.globalOrigin + '/'
+  }
+  return headers
+}
+
+/** browser 模式：解析本次登录使用的域（device 优先，其次 cfg，默认 cn） */
+function browserRealm(cfg: OAuthDeviceConfig, device?: DeviceFlowState): 'cn' | 'global' {
+  return (device?.loginRealm || cfg.loginRealm) === 'global' ? 'global' : 'cn'
+}
+
+/** browser 模式：按域解析发起/轮询/刷新端点（Global 端点未配则回退 CN 端点） */
+function browserCodeUrl(cfg: OAuthDeviceConfig, realm: 'cn' | 'global'): string {
+  return realm === 'global' && cfg.globalDeviceCodeUrl ? cfg.globalDeviceCodeUrl : cfg.deviceCodeUrl
+}
+function browserTokenUrl(cfg: OAuthDeviceConfig, realm: 'cn' | 'global'): string {
+  return realm === 'global' && cfg.globalDeviceTokenUrl ? cfg.globalDeviceTokenUrl : cfg.deviceTokenUrl
+}
+function browserRefreshUrl(cfg: OAuthDeviceConfig, realm: 'cn' | 'global'): string {
+  return realm === 'global' && cfg.globalRefreshTokenUrl ? cfg.globalRefreshTokenUrl : cfg.refreshTokenUrl
 }
 
 /** CodeBuddy/WorkBuddy 的响应信封：{code, msg, data} */
@@ -291,9 +312,11 @@ interface CodeBuddyAuthStateData {
 
 async function startOauthBrowserFlow(env: Env, providerId: string, cfg: OAuthDeviceConfig): Promise<DeviceFlowResult> {
   try {
-    const res = await fetch(cfg.deviceCodeUrl, {
+    // 发起登录前先确定域：WorkBuddy 国际版账号必须走 www.workbuddy.ai 端点
+    const realm = browserRealm(cfg)
+    const res = await fetch(browserCodeUrl(cfg, realm), {
       method: 'POST',
-      headers: browserCommonHeaders(cfg),
+      headers: browserCommonHeaders(cfg, realm),
       body: JSON.stringify({}),
       signal: AbortSignal.timeout(15000),
     })
@@ -323,6 +346,7 @@ async function startOauthBrowserFlow(env: Env, providerId: string, cfg: OAuthDev
       expires_at: Date.now() + 5 * 60 * 1000, // 5 分钟超时（参考插件 loginTTL）
       flowType: 'browser',
       cookies: setCookie || undefined,
+      loginRealm: realm,
     }
     await env.KV.put(deviceKey(providerId), JSON.stringify(device), { expirationTtl: 900 })
     return { success: true, message: '登录链接已生成', device }
@@ -339,12 +363,19 @@ async function pollOauthBrowserFlow(env: Env, providerId: string, cfg: OAuthDevi
 
   const state = device.device_code // browser 模式下存的是 state
   try {
-    const sep = cfg.deviceTokenUrl.includes('?') ? '&' : '?'
-    const pollUrl = `${cfg.deviceTokenUrl}${sep}state=${encodeURIComponent(state)}`
+    // 轮询必须与发起登录同域（device.loginRealm 固化），否则 state 在另一域无效
+    const realm = browserRealm(cfg, device)
+    const sep = browserTokenUrl(cfg, realm).includes('?') ? '&' : '?'
+    const pollUrl = `${browserTokenUrl(cfg, realm)}${sep}state=${encodeURIComponent(state)}`
     const pollHeaders: Record<string, string> = {
       'Accept': 'application/json, text/plain, */*',
       'X-Requested-With': 'XMLHttpRequest',
       ...cfg.extraHeaders,
+    }
+    // Global 域用 workbuddy.ai Origin/Referer 覆盖（extraHeaders 里是 codebuddy.cn）
+    if (realm === 'global' && cfg.globalOrigin) {
+      pollHeaders['Origin'] = cfg.globalOrigin
+      pollHeaders['Referer'] = cfg.globalOrigin + '/'
     }
     // cpa-plugin 核心要求：轮询必须复用同一个 cookie jar，否则 token 无效导致 401
     if (device.cookies) {
@@ -1021,10 +1052,12 @@ async function refreshOauthTokenBrowser(env: Env, providerId: string, cfg: OAuth
   if (!state?.refresh_token) return false
 
   try {
-    const res = await fetch(cfg.refreshTokenUrl, {
+    // 按 token 的 JWT iss 判断域：Global 账号必须用 workbuddy.ai 刷新端点，否则 401
+    const realm = detectTokenRealm(state.access_token) === 'global' ? 'global' : 'cn'
+    const res = await fetch(browserRefreshUrl(cfg, realm), {
       method: 'POST',
       headers: {
-        ...browserCommonHeaders(cfg),
+        ...browserCommonHeaders(cfg, realm),
         'X-Refresh-Token': state.refresh_token,
       },
       body: '',

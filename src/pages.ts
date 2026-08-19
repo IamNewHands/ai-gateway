@@ -113,7 +113,7 @@ const PROVIDER_PRESETS: Record<string, { name: string; id: string; baseUrl: stri
   },
 }
 
-const OAUTH_PRESETS: Record<string, { label: string; flowType: string; deviceCodeUrl: string; deviceTokenUrl: string; refreshTokenUrl: string; clientId: string; clientSecret?: string; scope?: string; tokenHeader: string; tokenHeaderPrefix: string; extraHeaders: Record<string, string>; _baseUrl?: string; _modelsUrl?: string; _globalBaseUrl?: string; _globalModelsUrl?: string; _globalOrigin?: string; _redirectUri?: string }> = {
+const OAUTH_PRESETS: Record<string, { label: string; flowType: string; deviceCodeUrl: string; deviceTokenUrl: string; refreshTokenUrl: string; clientId: string; clientSecret?: string; scope?: string; tokenHeader: string; tokenHeaderPrefix: string; extraHeaders: Record<string, string>; _baseUrl?: string; _modelsUrl?: string; _globalBaseUrl?: string; _globalModelsUrl?: string; _globalOrigin?: string; _globalDeviceCodeUrl?: string; _globalDeviceTokenUrl?: string; _globalRefreshTokenUrl?: string; _redirectUri?: string }> = {
   workbuddy: {
     label: 'WorkBuddy（浏览器登录）',
     flowType: 'browser',
@@ -133,6 +133,10 @@ const OAUTH_PRESETS: Record<string, { label: string; flowType: string; deviceCod
     _globalBaseUrl: 'https://www.workbuddy.ai/v2',
     _globalModelsUrl: 'https://www.workbuddy.ai/console/enterprises/personal/models',
     _globalOrigin: 'https://www.workbuddy.ai',
+    // 国际版 OAuth 登录端点：与 CN 同协议，换 www.workbuddy.ai 域
+    _globalDeviceCodeUrl: 'https://www.workbuddy.ai/v2/plugin/auth/state?platform=CLI',
+    _globalDeviceTokenUrl: 'https://www.workbuddy.ai/v2/plugin/auth/token',
+    _globalRefreshTokenUrl: 'https://www.workbuddy.ai/v2/plugin/auth/token/refresh',
   },
   qoder: {
     label: 'QoderWork（Qoder 设备授权）',
@@ -594,6 +598,7 @@ ${H('管理')}
             <div id="oauth-new" class="hd form-group">
               <fieldset class="form-group"><legend>OAuth 配置</legend>
                 <div class="fg"><label>登录流程类型</label><select id="ao8" class="select-sm"><option value="device">设备码（RFC 8628）</option><option value="browser">浏览器登录（WorkBuddy）</option><option value="qoder">Qoder 设备授权（QoderWork）</option><option value="gemini">Gemini 授权码（Gemini CLI）</option><option value="m365-pkce">M365 授权码（PKCE）</option><option value="m365-ropc">M365 账号密码（ROPC）</option></select></div>
+                <div class="fg"><label>登录域（browser 模式）</label><select id="ao15" class="select-sm"><option value="cn">国内版（codebuddy.cn）</option><option value="global">国际版（workbuddy.ai）</option></select><span class="form-helper">国际版账号必须选「国际版」，登录链接与轮询将走 www.workbuddy.ai。</span></div>
                 <div class="fg"><label>发起端点 (deviceCodeUrl)</label><input type="url" id="ao1" placeholder="https://.../auth/device/code"></div>
                 <div class="fg"><label>轮询端点 (deviceTokenUrl)</label><input type="url" id="ao2" placeholder="https://.../auth/device/token"></div>
                 <div class="fg"><label>Token 刷新端点 (refreshTokenUrl)</label><input type="url" id="ao3" placeholder="https://.../auth/oauth_token/refresh"></div>
@@ -608,6 +613,9 @@ ${H('管理')}
                 <div class="fg"><label>Global 域 baseUrl</label><input type="url" id="ao11" placeholder="https://www.workbuddy.ai/v2"></div>
                 <div class="fg"><label>Global 域模型 URL</label><input type="url" id="ao12" placeholder="https://www.workbuddy.ai/console/enterprises/personal/models"></div>
                 <div class="fg"><label>Global 域 Origin</label><input type="url" id="ao13" placeholder="https://www.workbuddy.ai"></div>
+                <div class="fg"><label>Global 域发起端点</label><input type="url" id="ao16" placeholder="https://www.workbuddy.ai/v2/plugin/auth/state?platform=CLI"><span class="form-helper">登录域选「国际版」时使用，留空回退国内端点。</span></div>
+                <div class="fg"><label>Global 域轮询端点</label><input type="url" id="ao17" placeholder="https://www.workbuddy.ai/v2/plugin/auth/token"></div>
+                <div class="fg"><label>Global 域刷新端点</label><input type="url" id="ao18" placeholder="https://www.workbuddy.ai/v2/plugin/auth/token/refresh"></div>
                 <div class="fg"><label>预置模板</label><select class="select-sm" onchange="applyOauthPreset(this.value)"><option value="">— 选择 —</option>${Object.entries(OAUTH_PRESETS).map(([k, pre]) => `<option value="${k}">${escapePageHtml(pre.label)}</option>`).join('')}</select></div>
                 <div class="fc mt-1 field-row"><button class="btn btn-p" onclick="createProv({afterCreate:function(id){location.href='/admin?connect='+encodeURIComponent(id)}})"><i class="fas fa-plug" aria-hidden="true"></i>创建并发起连接</button><span class="form-helper">先创建提供商，保存后自动弹出 OAuth 登录链接；登录成功会自动拉取模型。</span></div>
               </fieldset>
@@ -648,6 +656,7 @@ ${H('管理')}
               <div id="oauth-edit-${escapePageHtml(p.id)}" class="${p.authType==='oauth-device'?'form-group':'hd form-group'}">
                 <fieldset class="form-group"><legend>OAuth 配置</legend>
                   <div class="fg"><label>登录流程类型</label><select id="eao8-${escapePageHtml(p.id)}" class="select-sm"><option value="device" ${((p.oauth&&p.oauth.flowType)||'device')==='device'?'selected':''}>设备码（RFC 8628）</option><option value="browser" ${(p.oauth&&p.oauth.flowType)==='browser'?'selected':''}>浏览器登录（WorkBuddy）</option><option value="qoder" ${(p.oauth&&p.oauth.flowType)==='qoder'?'selected':''}>Qoder 设备授权（QoderWork）</option><option value="gemini" ${(p.oauth&&p.oauth.flowType)==='gemini'?'selected':''}>Gemini 授权码（Gemini CLI）</option><option value="m365-pkce" ${(p.oauth&&p.oauth.flowType)==='m365-pkce'?'selected':''}>M365 授权码（PKCE）</option><option value="m365-ropc" ${(p.oauth&&p.oauth.flowType)==='m365-ropc'?'selected':''}>M365 账号密码（ROPC）</option></select></div>
+                  <div class="fg"><label>登录域（browser 模式）</label><select id="eao15-${escapePageHtml(p.id)}" class="select-sm"><option value="cn" ${(p.oauth&&p.oauth.loginRealm)!=='global'?'selected':''}>国内版（codebuddy.cn）</option><option value="global" ${(p.oauth&&p.oauth.loginRealm)==='global'?'selected':''}>国际版（workbuddy.ai）</option></select><span class="form-helper">国际版账号必须选「国际版」，登录链接与轮询将走 www.workbuddy.ai。</span></div>
                   <div class="fg"><label>发起端点</label><input type="url" id="eao1-${escapePageHtml(p.id)}" value="${escapePageHtml((p.oauth&&p.oauth.deviceCodeUrl)||'')}" placeholder="https://.../auth/device/code"></div>
                   <div class="fg"><label>轮询端点</label><input type="url" id="eao2-${escapePageHtml(p.id)}" value="${escapePageHtml((p.oauth&&p.oauth.deviceTokenUrl)||'')}" placeholder="https://.../auth/device/token"></div>
                   <div class="fg"><label>Token 刷新端点</label><input type="url" id="eao3-${escapePageHtml(p.id)}" value="${escapePageHtml((p.oauth&&p.oauth.refreshTokenUrl)||'')}" placeholder="https://.../auth/oauth_token/refresh"></div>
@@ -661,6 +670,9 @@ ${H('管理')}
                   <div class="fg"><label>Global 域 baseUrl（海外账户，可选）</label><input type="url" id="eao11-${escapePageHtml(p.id)}" value="${escapePageHtml((p.oauth&&p.oauth.globalBaseUrl)||'')}" placeholder="https://www.workbuddy.ai/v2"></div>
                   <div class="fg"><label>Global 域模型 URL（可选）</label><input type="url" id="eao12-${escapePageHtml(p.id)}" value="${escapePageHtml((p.oauth&&p.oauth.globalModelsUrl)||'')}" placeholder="https://www.workbuddy.ai/console/enterprises/personal/models"></div>
                   <div class="fg"><label>Global 域 Origin（可选）</label><input type="url" id="eao13-${escapePageHtml(p.id)}" value="${escapePageHtml((p.oauth&&p.oauth.globalOrigin)||'')}" placeholder="https://www.workbuddy.ai"></div>
+                  <div class="fg"><label>Global 域发起端点（可选）</label><input type="url" id="eao16-${escapePageHtml(p.id)}" value="${escapePageHtml((p.oauth&&p.oauth.globalDeviceCodeUrl)||'')}" placeholder="https://www.workbuddy.ai/v2/plugin/auth/state?platform=CLI"><span class="form-helper">登录域选「国际版」时使用，留空回退国内端点。</span></div>
+                  <div class="fg"><label>Global 域轮询端点（可选）</label><input type="url" id="eao17-${escapePageHtml(p.id)}" value="${escapePageHtml((p.oauth&&p.oauth.globalDeviceTokenUrl)||'')}" placeholder="https://www.workbuddy.ai/v2/plugin/auth/token"></div>
+                  <div class="fg"><label>Global 域刷新端点（可选）</label><input type="url" id="eao18-${escapePageHtml(p.id)}" value="${escapePageHtml((p.oauth&&p.oauth.globalRefreshTokenUrl)||'')}" placeholder="https://www.workbuddy.ai/v2/plugin/auth/token/refresh"></div>
                   <div class="fg"><label>预置模板</label><select class="select-sm" onchange="applyOauthPresetEdit('${escapePageJsx(p.id)}',this.value)"><option value="" ${detectOauthPreset(p.oauth)===''?'selected':''}>— 选择 —</option>${Object.entries(OAUTH_PRESETS).map(([k, pre]) => `<option value="${k}" ${detectOauthPreset(p.oauth)===k?'selected':''}>${escapePageHtml(pre.label)}</option>`).join('')}</select></div>
                   <div class="fc mt-1 field-row"><button class="btn btn-s" onclick="oauthConnect('${escapePageJsx(p.id)}')"><i class="fas fa-plug" aria-hidden="true"></i>发起连接</button><button class="btn btn-gh" onclick="fetchOauthModels('${escapePageJsx(p.id)}')"><i class="fas fa-cloud-download-alt" aria-hidden="true"></i>获取模型</button><button class="btn btn-gh" onclick="oauthStatus('${escapePageJsx(p.id)}')"><i class="fas fa-sync" aria-hidden="true"></i>状态</button><button class="btn btn-gh" onclick="oauthDisconnect('${escapePageJsx(p.id)}')"><i class="fas fa-unlink" aria-hidden="true"></i>断开</button><span id="oauth-st-${escapePageHtml(p.id)}" class="oauth-status"></span></div>
                 </fieldset>
@@ -1149,6 +1161,7 @@ function collectOauthNew() {
   try { extraHeaders = g('ao7') ? JSON.parse(g('ao7')) : undefined } catch { extraHeaders = undefined }
   return {
     flowType: g('ao8') || 'device',
+    loginRealm: g('ao15') === 'global' ? 'global' : 'cn',
     deviceCodeUrl: g('ao1'),
     deviceTokenUrl: g('ao2'),
     refreshTokenUrl: g('ao3'),
@@ -1162,6 +1175,9 @@ function collectOauthNew() {
     globalBaseUrl: g('ao11') || undefined,
     globalModelsUrl: g('ao12') || undefined,
     globalOrigin: g('ao13') || undefined,
+    globalDeviceCodeUrl: g('ao16') || undefined,
+    globalDeviceTokenUrl: g('ao17') || undefined,
+    globalRefreshTokenUrl: g('ao18') || undefined,
   }
 }
 
@@ -1237,6 +1253,7 @@ function collectOauthEdit(id) {
   try { extraHeaders = g('7') ? JSON.parse(g('7')) : undefined } catch { extraHeaders = undefined }
   return {
     flowType: g('8') || 'device',
+    loginRealm: g('15') === 'global' ? 'global' : 'cn',
     deviceCodeUrl: g('1'),
     deviceTokenUrl: g('2'),
     refreshTokenUrl: g('3'),
@@ -1250,6 +1267,9 @@ function collectOauthEdit(id) {
     globalBaseUrl: g('11') || undefined,
     globalModelsUrl: g('12') || undefined,
     globalOrigin: g('13') || undefined,
+    globalDeviceCodeUrl: g('16') || undefined,
+    globalDeviceTokenUrl: g('17') || undefined,
+    globalRefreshTokenUrl: g('18') || undefined,
   }
 }
 
@@ -1360,6 +1380,10 @@ function applyOauthPreset(name) {
   const gb = document.getElementById('ao11'); if (gb) gb.value = p._globalBaseUrl || ''
   const gm = document.getElementById('ao12'); if (gm) gm.value = p._globalModelsUrl || ''
   const go = document.getElementById('ao13'); if (go) go.value = p._globalOrigin || ''
+  const gdc = document.getElementById('ao16'); if (gdc) gdc.value = p._globalDeviceCodeUrl || ''
+  const gdt = document.getElementById('ao17'); if (gdt) gdt.value = p._globalDeviceTokenUrl || ''
+  const grf = document.getElementById('ao18'); if (grf) grf.value = p._globalRefreshTokenUrl || ''
+  const lr = document.getElementById('ao15'); if (lr) lr.value = 'cn'
   // 强制覆盖 baseUrl（不再仅在空时填）
   if (p._baseUrl) { const bu = document.getElementById('aurl'); if (bu) bu.value = p._baseUrl }
   document.getElementById('aat').value = 'oauth-device'
@@ -1382,6 +1406,10 @@ function applyOauthPresetEdit(id, name) {
   const gb = document.getElementById('eao11-' + id); if (gb) gb.value = p._globalBaseUrl || ''
   const gm = document.getElementById('eao12-' + id); if (gm) gm.value = p._globalModelsUrl || ''
   const go = document.getElementById('eao13-' + id); if (go) go.value = p._globalOrigin || ''
+  const gdc = document.getElementById('eao16-' + id); if (gdc) gdc.value = p._globalDeviceCodeUrl || ''
+  const gdt = document.getElementById('eao17-' + id); if (gdt) gdt.value = p._globalDeviceTokenUrl || ''
+  const grf = document.getElementById('eao18-' + id); if (grf) grf.value = p._globalRefreshTokenUrl || ''
+  const lr = document.getElementById('eao15-' + id); if (lr) lr.value = 'cn'
   // 强制覆盖 baseUrl
   if (p._baseUrl) { const bu = document.getElementById('url-' + id); if (bu) bu.value = p._baseUrl }
   document.getElementById('auth-' + id).value = 'oauth-device'
