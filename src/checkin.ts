@@ -22,6 +22,9 @@ import { getOauthAccessToken, detectTokenRealm, readOauthToken } from './oauth'
 import { writeLog } from './admin'
 import { isQoderProvider } from './qoder/proxy'
 import { fetchQoderCheckinStatus, performQoderCheckin, fetchQoderUserResource, fetchQoderPaymentType } from './qoder/billing'
+import { isTraeProvider } from './trae/proxy'
+import { runTraeCheckins } from './trae/admin'
+import type { TraeCheckinResult } from './trae/types'
 
 const CHECKIN_BASE_CN = 'https://www.codebuddy.cn'
 
@@ -611,27 +614,46 @@ export async function handleCheckinTrigger(c: Context<{ Bindings: Env }>) {
   }
 
   const summary = await runAllCheckins(c.env, !!body.silent)
-  return c.json<ApiResponse>({ success: true, data: summary })
+  // 统一调度入口：全量签到同时覆盖 TRAE SOLO，返回合并摘要
+  let traeSummary: Awaited<ReturnType<typeof runTraeCheckins>> | null = null
+  try {
+    traeSummary = await runTraeCheckins(c.env, !!body.silent)
+  } catch { /* trae 签到失败不影响 workbuddy 结果 */ }
+  return c.json<ApiResponse>({ success: true, data: { summary, trae: traeSummary } })
 }
 
-/** GET /admin/api/checkin/status：返回所有 provider 的签到结果（面板展示）。 */
+/** GET /admin/api/checkin/status：返回所有 provider 的签到结果（面板展示）。
+ *  聚合两类：workbuddy（每 provider 一条 CheckinResult）+ trae（每 provider 一组账号结果）。 */
 export async function handleCheckinStatus(c: Context<{ Bindings: Env }>) {
   const providers = (await getProviders(c.env)) as Provider[]
-  const oauthProviders = providers.filter((p) => p.authType === 'oauth-device' && p.oauth && p.oauth.flowType !== 'm365-pkce' && p.oauth.flowType !== 'm365-ropc')
 
-  const list: CheckinResult[] = []
+  // WorkBuddy / QoderWork：oauth-device 家族
+  const oauthProviders = providers.filter((p) => p.authType === 'oauth-device' && p.oauth && p.oauth.flowType !== 'm365-pkce' && p.oauth.flowType !== 'm365-ropc' && !isTraeProvider(p))
+
+  const workbuddy: CheckinResult[] = []
   for (const p of oauthProviders) {
     const r = await readCheckinResult(c.env, p.id)
     if (r) {
-      list.push(r)
+      workbuddy.push(r)
     } else {
       // 无结果占位，让面板知道有此 WorkBuddy 账号但未签到
-      list.push({
+      workbuddy.push({
         providerId: p.id, name: p.name, realm: 'unknown',
         success: false, reason: 'skipped_no_token', message: '尚未签到',
         todayCheckedIn: false, updatedAt: 0,
       })
     }
   }
-  return c.json<ApiResponse<CheckinResult[]>>({ success: true, data: list })
+
+  // TRAE SOLO：多账号池，每个 provider 读独立 KV，返回账号级结果
+  const trae = await Promise.all(
+    providers.filter((p) => isTraeProvider(p)).map(async (p) => {
+      const raw = await c.env.KV.get(`${KV_KEYS.TRAE_CHECKIN_PREFIX}${p.id}`)
+      let results: TraeCheckinResult[] = []
+      try { results = raw ? JSON.parse(raw) : [] } catch { results = [] }
+      return { providerId: p.id, name: p.name, results }
+    })
+  )
+
+  return c.json<ApiResponse>({ success: true, data: { workbuddy, trae } })
 }

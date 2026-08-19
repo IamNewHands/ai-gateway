@@ -717,10 +717,11 @@ ${H('管理')}
         </div>
       </section>
       <section id="checkin" class="workspace-section" aria-labelledby="checkin-title">
-        <div class="section-heading section-heading--admin"><div><h2 id="checkin-title">WorkBuddy 签到</h2><p>每日签到领取免费积分。仅 CN 账号可签到，国际版自动跳过。定时任务每天 09:00/21:00 自动执行。</p></div><div><button class="btn btn-gh btn-xs" onclick="loadCheckin()" style="margin-left:8px"><i class="fas fa-sync-alt"></i></button><button class="btn btn-p btn-xs" onclick="triggerCheckin()"><i class="fas fa-calendar-check" aria-hidden="true"></i>全部签到</button></div></div>
+        <div class="section-heading section-heading--admin"><div><h2 id="checkin-title">签到状态</h2><p>WorkBuddy / QoderWork / TRAE SOLO 每日签到领取免费积分，一个面板统一管理。仅 CN 账号可签到（国际版自动跳过）。定时任务每天 09:00/21:00 自动执行。</p></div><div><button class="btn btn-gh btn-xs" onclick="loadCheckin()" style="margin-left:8px"><i class="fas fa-sync-alt"></i></button><button class="btn btn-p btn-xs" onclick="triggerCheckin()"><i class="fas fa-calendar-check" aria-hidden="true"></i>全部签到</button></div></div>
         <div id="checkin-list" class="key-list">
-          <div class="empty-state"><i class="fas fa-calendar-check" aria-hidden="true"></i><h3>暂无签到数据</h3><p>配置 WorkBuddy / QoderWork OAuth 提供商后，点击「全部签到」。</p></div>
+          <div class="empty-state"><i class="fas fa-calendar-check" aria-hidden="true"></i><h3>暂无签到数据</h3><p>配置 WorkBuddy / QoderWork / TRAE SOLO 账号后，登录并点击「全部签到」。</p></div>
         </div>
+        <div id="trae-checkin-list" class="mt-1"></div>
       </section>
 
       <!-- ===== MCP 聚合网关 ===== -->
@@ -2437,12 +2438,33 @@ async function loadCheckin() {
 function renderCheckinList(d) {
   const el = document.getElementById('checkin-list')
   if (!el) return
-  if (!d || !d.success || !d.data || d.data.length === 0) {
-    el.innerHTML = '<div class="empty-state"><i class="fas fa-calendar-check" aria-hidden="true"></i><h3>暂无签到数据</h3><p>配置 WorkBuddy / QoderWork OAuth 提供商后，点击「全部签到」。</p></div>'
-    return
+  // 兼容旧结构（data 为数组）/ 新结构（data = {workbuddy, trae}）
+  var dataArr = Array.isArray(d && d.data) ? d.data
+    : (d && d.data && Array.isArray(d.data.workbuddy) ? d.data.workbuddy : [])
+  if (!d || !d.success || dataArr.length === 0) {
+    el.innerHTML = '<div class="empty-state"><i class="fas fa-calendar-check" aria-hidden="true"></i><h3>暂无 WorkBuddy 签到数据</h3><p>配置 WorkBuddy / QoderWork OAuth 提供商后，点击「全部签到」。</p></div>'
+  } else {
+    const html = renderWorkbuddyCards(dataArr)
+    el.innerHTML = html
+    el.querySelectorAll('[data-cid]').forEach(function(btn) {
+      btn.addEventListener('click', function() { triggerCheckin(btn.getAttribute('data-cid')) })
+    })
+    el.querySelectorAll('[data-pkg]').forEach(function(btn) {
+      btn.addEventListener('click', function() { toggleCollapse(btn.getAttribute('data-pkg'), btn) })
+    })
   }
+  // 渲染 TRAE 认可账号级结果（新结构时）
+  if (d && d.data && !Array.isArray(d.data) && d.data.trae) {
+    renderTraeCheckinList(d.data.trae)
+  } else if (d && d.data && Array.isArray(d.data)) {
+    renderTraeCheckinList([])
+  }
+}
+
+/** 生成 WorkBuddy/QoderWork 的卡片 HTML（原 renderCheckinList 内联逻辑）。 */
+function renderWorkbuddyCards(list) {
   var html = ''
-  d.data.forEach(function(c, idx) {
+  list.forEach(function(c, idx) {
     var reason = c.reason || 'fail'
     var badge = reason === 'ok' ? '<span class="bd bd-on">签到成功</span>'
       : reason === 'already' ? '<span class="bd bd-on">今日已签</span>'
@@ -2471,8 +2493,8 @@ function renderCheckinList(d) {
         var cyc = (p.cycleEndTime && p.cycleEndTime.trim()) ? escapeHtml(p.cycleEndTime) : '—'
         var qty = ''
         if (p.size !== undefined && p.size !== null && p.size > 0) {
-          var used = (p.used !== undefined && p.used !== null) ? p.used : 0
-          qty = '<td class="numeric">' + used + ' / ' + p.size + (p.unit ? ' ' + escapeHtml(p.unit) : '') + '</td>'
+          var used2 = (p.used !== undefined && p.used !== null) ? p.used : 0
+          qty = '<td class="numeric">' + used2 + ' / ' + p.size + (p.unit ? ' ' + escapeHtml(p.unit) : '') + '</td>'
         } else {
           qty = '<td>—</td>'
         }
@@ -2482,12 +2504,33 @@ function renderCheckinList(d) {
     }
     html += '<article class="ki"><div class="key-main"><span class="key-icon" aria-hidden="true"><i class="fas fa-calendar-check"></i></span><div><div class="kv"><h3>' + title + '</h3>' + realmBadge + payBadge + badge + '</div><p>' + creditLine + '</p><p style="margin-top:2px">' + checkinLine + '</p>' + packLine + (c.message ? '<p class="mu" style="margin-top:2px">' + escapeHtml(c.message) + '</p>' : '') + '</div></div><div class="key-actions"><button class="btn btn-gh btn-xs" data-cid="' + escapeHtml(c.providerId) + '"><i class="fas fa-calendar-check" aria-hidden="true"></i>签到</button></div></article>'
   })
-  el.innerHTML = html
-  el.querySelectorAll('[data-cid]').forEach(function(btn) {
-    btn.addEventListener('click', function() { triggerCheckin(btn.getAttribute('data-cid')) })
+  return html
+}
+
+/** 渲染 TRAE SOLO 账号级签到结果（新结构 data.trae）。 */
+function renderTraeCheckinList(traeList) {
+  const el = document.getElementById('trae-checkin-list')
+  if (!el) return
+  const list = traeList || []
+  if (list.length === 0) { el.innerHTML = ''; return }
+  var html = '<div class="section-heading section-heading--admin" style="margin-top:16px"><div><h2>TRAE SOLO 签到</h2><p>按账号展示最近一次签到与剩余积分。</p></div></div>'
+  list.forEach(function(t) {
+    html += '<div class="ki" style="margin-bottom:6px"><div class="key-main"><span class="key-icon"><i class="fas fa-calendar-check"></i></span><div><h3>' + escapeHtml(t.name) + '</h3>'
+    if (!t.results || t.results.length === 0) {
+      html += '<p class="mu">尚未签到</p>'
+    } else {
+      html += t.results.map(function(r) {
+        const ok = r.success ? (r.checkedIn ? '<span class="bd bd-on">已签到</span>' : '<span class="bd bd-on">成功</span>') : '<span class="bd bd-off">失败</span>'
+        return '<div style="margin-top:4px"><span class="bd bd-on">' + escapeHtml(r.nickname || r.uid) + '</span> ' + ok +
+          ' <span style="color:var(--muted)">' + escapeHtml(r.message || '') + '</span>' +
+          ((r.credits !== undefined && r.credits !== null) ? ' · 剩余积分 ' + r.credits : '') + '</div>'
+      }).join('')
+    }
+    html += '</div></div><div class="key-actions"><button class="btn btn-gh btn-xs" data-trae-checkin="' + escapeHtml(t.providerId) + '"><i class="fas fa-calendar-check" aria-hidden="true"></i>签到</button></div></div>'
   })
-  el.querySelectorAll('[data-pkg]').forEach(function(btn) {
-    btn.addEventListener('click', function() { toggleCollapse(btn.getAttribute('data-pkg'), btn) })
+  el.innerHTML = html
+  el.querySelectorAll('[data-trae-checkin]').forEach(function(btn) {
+    btn.addEventListener('click', function() { traeCheckin(btn.getAttribute('data-trae-checkin')) })
   })
 }
 
@@ -2495,9 +2538,7 @@ async function refreshCheckinInBackground() {
   try {
     const r = await fetch('/admin/api/checkin', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ silent: true }) })
     const d = await r.json()
-    if (d.success && d.data && d.data.results) {
-      renderCheckinList({ success: true, data: d.data.results })
-    }
+    if (d.success) loadCheckin()
   } catch(e) { /* 静默刷新失败不提示 */ }
 }
 
@@ -2508,10 +2549,22 @@ async function triggerCheckin(id) {
     const r = await fetch('/admin/api/checkin', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: body })
     const d = await r.json()
     if (d.success) {
-      var msg = id ? '签到完成' : '签到完成：成功 ' + (d.data.success||0) + ' / 已签 ' + (d.data.already||0) + ' / 失败 ' + (d.data.fail||0) + ' / 跳过 ' + (d.data.skipped||0)
+      var msg
+      var results
+      if (id) {
+        msg = '签到完成'
+        results = [d.data]
+      } else {
+        // 全量：d.data = { summary, trae }
+        var s = (d.data && d.data.summary) || d.data || {}
+        var t = (d.data && d.data.trae) ? d.data.trae : { ok: 0, already: 0, fail: 0 }
+        msg = '签到完成：WorkBuddy 成功 ' + (s.success||0) + ' / 已签 ' + (s.already||0) + ' / 失败 ' + (s.fail||0) + ' / 跳过 ' + (s.skipped||0) +
+          '；TRAE 成功 ' + (t.ok||0) + ' / 已签 ' + (t.already||0) + ' / 失败 ' + (t.fail||0)
+        results = s.results || []
+      }
       toast(msg, 'success')
-      var results = id ? [d.data] : (d.data.results || [])
       renderCheckinList({ success: true, data: results })
+      if (!id) loadCheckin()
     } else {
       toast(d.message || '签到失败', 'error')
     }
