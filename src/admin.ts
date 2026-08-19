@@ -214,6 +214,7 @@ export async function handleCreateProvider(c: Context<AppEnv>) {
     type: body.type,
     visionBridge: body.visionBridge,
     toolBridge: body.toolBridge,
+    cnbPool: body.cnbPool,
     allowUnlistedModels: body.allowUnlistedModels,
     apiKeys: normalizeArray(body.apiKeys, (k) => ({ key: k, enabled: true })),
     models: body.models
@@ -251,6 +252,7 @@ export async function handleUpdateProvider(c: Context<AppEnv>) {
   if (body.type !== undefined) updates.type = body.type ?? undefined
   if (body.visionBridge !== undefined) updates.visionBridge = body.visionBridge ?? undefined
   if (body.toolBridge !== undefined) updates.toolBridge = body.toolBridge ?? undefined
+  if (body.cnbPool !== undefined) updates.cnbPool = body.cnbPool ?? undefined
   if (body.allowUnlistedModels !== undefined) updates.allowUnlistedModels = body.allowUnlistedModels
 if (body.apiKeys !== undefined) {
     updates.apiKeys = normalizeArray(body.apiKeys, (k) => ({ key: k, enabled: true }))
@@ -319,6 +321,8 @@ export async function handleUpsertProvider(c: Context<AppEnv>) {
       apiKeys: incomingKeys,
       models: incomingModels,
       enabled: body.enabled !== undefined ? body.enabled : true,
+      toolBridge: body.toolBridge,
+      cnbPool: body.cnbPool,
       createdAt: now,
       updatedAt: now,
     }
@@ -337,6 +341,8 @@ export async function handleUpsertProvider(c: Context<AppEnv>) {
   }
   if (body.apiType !== undefined) updates.apiType = body.apiType
   if (body.authType !== undefined) updates.authType = body.authType
+  if (body.toolBridge !== undefined) updates.toolBridge = body.toolBridge
+  if (body.cnbPool !== undefined) updates.cnbPool = body.cnbPool
   if (body.enabled !== undefined) updates.enabled = body.enabled
 
   // keys 合并：以现有为底，按 key 字符串去重追加，保留原 enabled

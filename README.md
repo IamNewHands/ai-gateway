@@ -147,7 +147,7 @@ ChatHub 上游不支持标准 OpenAI function calling，采用「提示词注入
 
 内置 cnb.cool 免费模型提供商（移植自 [cnb2api](https://github.com/lwjlwjlwjlwj/cnb2api)，MIT）：
 
-- **免登录**：自动抓取首页 CSRF 凭证（csrfkey + window.csrftoken 配对），凭证内存 + KV 双缓存（TTL 30 分钟），401/403 自动换证重试
+- **免登录**：自动抓取首页 CSRF 凭证（csrfkey + window.csrftoken 配对）；**凭证池**（默认 2~8 个独立会话 round-robin 轮转，TTL 30 分钟，可用 `provider.cnbPool` 覆盖 min/max/ttlMinutes），过期/连续失败自动淘汰并补证，401/403 自动换证重试；凭证内存 + KV 双缓存（冷启动复用）
 - **内置模型**：`deepseek-v4-flash`、`deepseek-v4-pro`
 - **XYML 工具桥**：上游禁原生 tools（403 Agent calls not allowed），`provider.toolBridge` 开启后把客户端 tools 转成 XYML 提示词注入，流式解析回标准 `tool_calls` 返回客户端（[src/cnb/](./src/cnb/)）
 

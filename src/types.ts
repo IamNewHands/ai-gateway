@@ -26,6 +26,13 @@ export interface Provider {
    * 并将模型输出的 XYML 文本流式解析回标准 tool_calls 返回客户端。
    */
   toolBridge?: boolean
+  /**
+   * CNB 凭证池配置（仅 cnb 提供商生效，见 src/cnb/proxy.ts）。
+   * CNB 免登录凭证是匿名单会话（csrfkey + csrftoken 配对），单会话并发受限；
+   * 池 = 多个独立会话 round-robin 轮转，提升并发与稳定性，过期/失败自动淘汰补证。
+   * 不配则用默认值：min=2 / max=8 / ttl=30 分钟。
+   */
+  cnbPool?: { min?: number; max?: number; ttlMinutes?: number }
   createdAt: string
   updatedAt: string
   /**
@@ -251,6 +258,7 @@ export interface CreateProviderRequest {
   type?: 'vision-bridge'
   visionBridge?: VisionBridgeConfig
   toolBridge?: boolean
+  cnbPool?: { min?: number; max?: number; ttlMinutes?: number }
   allowUnlistedModels?: boolean
 }
 
@@ -268,6 +276,7 @@ export interface UpdateProviderRequest {
   visionBridge?: VisionBridgeConfig | null
   /** 传 null 可清除工具桥开关 */
   toolBridge?: boolean | null
+  cnbPool?: { min?: number; max?: number; ttlMinutes?: number } | null
   allowUnlistedModels?: boolean
 }
 
@@ -289,6 +298,7 @@ export interface UpsertProviderRequest {
   models?: Array<Model | string>
   enabled?: boolean
   toolBridge?: boolean
+  cnbPool?: { min?: number; max?: number; ttlMinutes?: number }
   allowUnlistedModels?: boolean
 }
 

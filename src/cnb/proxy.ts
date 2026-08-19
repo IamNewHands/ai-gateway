@@ -6,7 +6,10 @@
  *      页面内嵌 window.csrftoken（40hex），二者配对使用（免登录、免费）。
  *   2. POST /ai/chat/completions 带 iCsrftoken 头 + csrfkey Cookie + Origin/Referer，
  *      上游强制 stream:true，返回 OpenAI 格式 SSE（delta.content + reasoning_content）。
- *   3. 凭证缓存：内存 + KV（TTL 30min），401/403 含 csrf 关键字自动换证重试（最多 3 次）。
+ *   3. 凭证池（移植自 cnb2api）：免登录凭证是匿名单会话，单个并发受限，故维护
+ *      多个独立会话凭证 round-robin 轮转（默认 min=2 / max=8 / ttl=30min，可用
+ *      provider.cnbPool 覆盖）；过期/连续失败自动淘汰、低于 min 后台补证；
+ *      内存 + KV 双缓存（冷启动复用），401/403 含 csrf 关键字自动换证重试。
  *
  * 工具桥（provider.toolBridge）：上游禁原生 tools（403 Agent calls not allowed），
  * 开启后把客户端 tools 转成 XYML 提示词注入（见 ./xyml.ts），模型文本流经 ToolSieve
@@ -29,7 +32,6 @@ export const CNB_CHAT_PATH = '/ai/chat/completions'
 export const CNB_MODELS = ['deepseek-v4-flash', 'deepseek-v4-pro']
 
 const CNB_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36'
-const CSRF_TTL_MS = 30 * 60 * 1000
 const CSRF_MAX_ERR = 3
 
 /** 是否是 CNB 提供商（id 固定或用 cnb.cool 域） */
@@ -37,8 +39,15 @@ export function isCnbProvider(provider: Provider): boolean {
   return Boolean(provider.id === 'cnb' || (provider.baseUrl && provider.baseUrl.includes('cnb.cool')))
 }
 
-// ===== CSRF 凭证 =====
+// ===== CSRF 凭证池（移植自 cnb2api internal/auth 的池机制） =====
 
+/**
+ * CNB 免登录凭证是「匿名单会话」（csrfkey cookie + csrftoken 配对），单会话并发请求
+ * 多了容易互相挤占/触发风控，故做成凭证池：
+ * - 多个独立会话凭证 round-robin 轮转，天然支持并发；
+ * - 凭证过期（ttl）/连续失败（errCnt ≥ 3）自动淘汰，低于 pool_min 时后台补证；
+ * - 池整体持久化到 KV（冷启动复用），内存 + KV 双缓存。
+ */
 interface CnbCsrf {
   key: string
   token: string
@@ -46,12 +55,105 @@ interface CnbCsrf {
   errCnt: number
 }
 
-const csrfMem = new Map<string, CnbCsrf>()
+interface CnbPool {
+  creds: CnbCsrf[]
+  /** round-robin 游标 */
+  idx: number
+  /** 进行中的补证任务（防并发重复抓证） */
+  refilling: Promise<void> | null
+}
+
+interface CnbPoolConfig {
+  min: number
+  max: number
+  ttlMs: number
+}
+
+const POOL_DEFAULT_MIN = 2
+const POOL_DEFAULT_MAX = 8
+const POOL_DEFAULT_TTL_MINUTES = 30
+
+const csrfPools = new Map<string, CnbPool>()
 
 const kvKey = (providerId: string) => `cnb:csrf:${providerId}`
 
-function validCsrf(cs: CnbCsrf | null | undefined): cs is CnbCsrf {
-  return Boolean(cs && cs.key && cs.token && Date.now() - cs.created < CSRF_TTL_MS && (cs.errCnt || 0) < CSRF_MAX_ERR)
+/** 池配置：provider.cnbPool 覆盖默认值（min=2 / max=8 / ttl=30min），min≤max 恒成立 */
+function poolConfig(provider: Provider): CnbPoolConfig {
+  const c = provider.cnbPool
+  const min = Math.max(1, Math.floor(c?.min ?? POOL_DEFAULT_MIN))
+  const max = Math.max(min, Math.floor(c?.max ?? POOL_DEFAULT_MAX))
+  return { min, max, ttlMs: Math.max(60_000, (c?.ttlMinutes ?? POOL_DEFAULT_TTL_MINUTES) * 60_000) }
+}
+
+function csrfValid(cs: CnbCsrf, cfg: CnbPoolConfig): boolean {
+  return Boolean(cs && cs.key && cs.token && Date.now() - cs.created < cfg.ttlMs && (cs.errCnt || 0) < CSRF_MAX_ERR)
+}
+
+function getMemPool(providerId: string): CnbPool {
+  let p = csrfPools.get(providerId)
+  if (!p) {
+    p = { creds: [], idx: 0, refilling: null }
+    csrfPools.set(providerId, p)
+  }
+  return p
+}
+
+/** 淘汰过期/超错凭证，返回淘汰数 */
+function prunePool(pool: CnbPool, cfg: CnbPoolConfig): number {
+  const before = pool.creds.length
+  if (before === 0) return 0
+  pool.creds = pool.creds.filter((c) => csrfValid(c, cfg))
+  if (pool.idx >= pool.creds.length) pool.idx = 0
+  return before - pool.creds.length
+}
+
+/** 冷启动从 KV 恢复池；兼容旧版单凭证格式（{key,token,...}） */
+async function restorePool(env: Env, providerId: string, pool: CnbPool, cfg: CnbPoolConfig): Promise<void> {
+  if (pool.creds.length) return
+  try {
+    const raw = await env.KV.get(kvKey(providerId))
+    if (!raw) return
+    const parsed = JSON.parse(raw) as { creds?: CnbCsrf[] } | CnbCsrf
+    const list = Array.isArray(parsed && 'creds' in parsed && parsed.creds)
+      ? (parsed as { creds: CnbCsrf[] }).creds
+      : (parsed && 'key' in parsed && 'token' in parsed ? [parsed as CnbCsrf] : [])
+    pool.creds = list.filter((c) => csrfValid(c, cfg)).slice(0, cfg.max)
+    pool.idx = 0
+  } catch { /* 损坏缓存：重新抓取 */ }
+}
+
+/** 持久化池到 KV（尽力而为，失败不影响主流程） */
+function persistPool(env: Env, providerId: string, pool: CnbPool, cfg: CnbPoolConfig): void {
+  try {
+    void env.KV.put(kvKey(providerId), JSON.stringify({ creds: pool.creds.slice(0, cfg.max) }), {
+      expirationTtl: Math.max(Math.floor(cfg.ttlMs / 1000), 3600),
+    })
+  } catch { /* KV 不可用时内存兜底 */ }
+}
+
+/**
+ * 后台补证：并发抓取新会话凭证直到 target 个（不超过 max）。
+ * refilling 单飞防并发重复抓取（多请求同时冷启动时只抓一份）。
+ */
+function ensureCredCount(env: Env, provider: Provider, pool: CnbPool, cfg: CnbPoolConfig, target: number): Promise<void> {
+  if (pool.creds.length >= target || target > cfg.max) return Promise.resolve()
+  if (pool.refilling) return pool.refilling
+  pool.refilling = (async () => {
+    try {
+      while (pool.creds.length < target) {
+        try {
+          const cs = await fetchCsrfFresh()
+          pool.creds.push(cs)
+          persistPool(env, provider.id, pool, cfg)
+        } catch {
+          break // 抓证失败（网络/上游变更）：维持现有池，等下次请求再补
+        }
+      }
+    } finally {
+      pool.refilling = null
+    }
+  })()
+  return pool.refilling
 }
 
 /** 用全新会话访问首页，提取 csrfkey(cookie) + csrftoken(html) 配对。 */
@@ -75,34 +177,52 @@ async function fetchCsrfFresh(): Promise<CnbCsrf> {
   return { key: keyMatch[1], token: tokenMatch[1], created: Date.now(), errCnt: 0 }
 }
 
-async function getCsrf(env: Env, providerId: string): Promise<CnbCsrf> {
-  const mem = csrfMem.get(providerId)
-  if (validCsrf(mem)) return mem
-  try {
-    const raw = await env.KV.get(kvKey(providerId))
-    if (raw) {
-      const cached = JSON.parse(raw) as CnbCsrf
-      if (validCsrf(cached)) {
-        csrfMem.set(providerId, cached)
-        return cached
-      }
+/** round-robin 取下一个有效凭证；池不足 min 时先补证 */
+async function acquireCsrf(env: Env, provider: Provider): Promise<CnbCsrf> {
+  const cfg = poolConfig(provider)
+  const pool = getMemPool(provider.id)
+  await restorePool(env, provider.id, pool, cfg)
+  prunePool(pool, cfg)
+  if (pool.creds.length < cfg.min) {
+    await ensureCredCount(env, provider, pool, cfg, cfg.min)
+    prunePool(pool, cfg)
+  }
+  if (pool.creds.length === 0) {
+    // 兜底：补证失败时现抓一个（首次请求 + 上游异常时）
+    const cs = await fetchCsrfFresh()
+    pool.creds.push(cs)
+    persistPool(env, provider.id, pool, cfg)
+  }
+  // round-robin 扫描：从游标起找第一个有效凭证
+  const start = pool.idx % pool.creds.length
+  for (let i = 0; i < pool.creds.length; i++) {
+    const c = pool.creds[(start + i) % pool.creds.length]
+    if (csrfValid(c, cfg)) {
+      pool.idx = (start + i + 1) % pool.creds.length
+      return c
     }
-  } catch { /* corrupt cache: refetch */ }
-  const fresh = await fetchCsrfFresh()
-  csrfMem.set(providerId, fresh)
-  try {
-    await env.KV.put(kvKey(providerId), JSON.stringify(fresh), { expirationTtl: Math.floor(CSRF_TTL_MS / 1000) })
-  } catch { /* KV 不可用时内存兜底 */ }
-  return fresh
+  }
+  const cs = await fetchCsrfFresh()
+  pool.creds.push(cs)
+  persistPool(env, provider.id, pool, cfg)
+  return cs
 }
 
-async function invalidateCsrf(env: Env, providerId: string): Promise<void> {
-  csrfMem.delete(providerId)
-  try { await env.KV.delete(kvKey(providerId)) } catch { /* ignore */ }
-}
-
-function bumpCsrfErr(cs: CnbCsrf): void {
-  cs.errCnt = (cs.errCnt || 0) + 1
+/** 上报凭证 CSRF 失败：错误计数+1，超限淘汰；池低于 min 时后台补证 */
+async function reportCsrfError(env: Env, provider: Provider, cs: CnbCsrf): Promise<void> {
+  const cfg = poolConfig(provider)
+  const pool = getMemPool(provider.id)
+  const found = pool.creds.find((c) => c.key === cs.key)
+  if (found) {
+    found.errCnt = (found.errCnt || 0) + 1
+    if (found.errCnt >= CSRF_MAX_ERR) {
+      pool.creds = pool.creds.filter((c) => c.key !== cs.key)
+    }
+    persistPool(env, provider.id, pool, cfg)
+  }
+  if (pool.creds.length < cfg.min) {
+    await ensureCredCount(env, provider, pool, cfg, cfg.min)
+  }
 }
 
 /** 判定 401/403 响应体是否 CSRF 校验失败（区别于业务拒绝，如 Agent calls not allowed）。 */
@@ -296,11 +416,10 @@ function buildUpstreamBody(input: UpstreamBodyInput, messages: CnbMessage[], too
 // ===== 上游请求 =====
 
 async function chatOnce(
-  env: Env,
   provider: Provider,
   upBody: Record<string, unknown>,
+  csrf: CnbCsrf,
 ): Promise<Response> {
-  const csrf = await getCsrf(env, provider.id)
   const resp = await streamFetchWithTimeout(CNB_BASE_URL + CNB_CHAT_PATH, {
     method: 'POST',
     headers: {
@@ -314,13 +433,10 @@ async function chatOnce(
     },
     body: JSON.stringify(upBody),
   })
-  // 凭证失效（401/403 且响应体含 csrf）：标记重试由调用方处理
+  // 凭证失效（401/403 且响应体含 csrf）：抛错由调用方上报（记错/淘汰）并换证重试
   if (resp.status === 401 || resp.status === 403) {
     const text = await resp.clone().text()
     if (isCsrfErrorBody(text)) {
-      bumpCsrfErr(csrf)
-      // 内存缓存更新（KV 由 invalidate 删除）
-      csrfMem.set(provider.id, csrf)
       throw new CnbCsrfError(resp.status, text.slice(0, 500))
     }
   }
@@ -346,17 +462,22 @@ export async function proxyCnbChatRequest(
   const upBody = buildUpstreamBody(clientBody as UpstreamBodyInput, messages, tools, bridge)
   const isStream = clientBody.stream === true
 
+  // 凭证池重试：每次尝试换下一个 round-robin 凭证；CSRF 失败上报（记错/淘汰）后重试。
+  // 重试上限 = clamp(poolMax, 3, 6)：池小少试、池大多试，避免单个请求串太久。
+  const cfg = poolConfig(provider)
+  const attempts = Math.min(6, Math.max(3, cfg.max))
   let lastResp: Response | null = null
-  for (let attempt = 0; attempt < 3; attempt++) {
+  for (let attempt = 0; attempt < attempts; attempt++) {
+    const csrf = await acquireCsrf(env, provider)
     try {
-      const resp = await chatOnce(env, provider, upBody)
+      const resp = await chatOnce(provider, upBody, csrf)
       lastResp = resp
       if (!resp.ok) return resp // 非 2xx（业务拒绝等）原样透传
       if (isStream) return buildStreamResponse(resp, { bridge, tools })
       return await buildNonStreamResponse(resp, { bridge, tools })
     } catch (err) {
-      if (err instanceof CnbCsrfError && attempt < 2) {
-        await invalidateCsrf(env, provider.id)
+      if (err instanceof CnbCsrfError && attempt < attempts - 1) {
+        await reportCsrfError(env, provider, csrf)
         continue
       }
       if (lastResp && !lastResp.ok) return lastResp
@@ -374,10 +495,15 @@ interface BridgeOptions {
   tools: unknown[]
 }
 
-/** 读上游 SSE 流，逐 chunk 回调解码后的对象；done=true 表示 [DONE]。 */
+/**
+ * 读上游 SSE 流，逐 chunk 回调解码后的对象；done=true 表示流结束，
+ * cleanEnd=true 表示正常收到 [DONE] 收尾；cleanEnd=false 表示上游直接关流
+ * （未发 [DONE]），调用方可据此区分「完整结束」与「可能被截断」，避免把
+ * 中途断流误报为完成（客户端误判后只能手工发「继续」续命）。
+ */
 async function readUpstreamSSE(
   body: ReadableStream<Uint8Array> | null,
-  onChunk: (obj: UpstreamChunk | null, done: boolean) => Promise<void> | void,
+  onChunk: (obj: UpstreamChunk | null, done: boolean, cleanEnd: boolean) => Promise<void> | void,
 ): Promise<void> {
   if (!body) return
   const reader = body.getReader()
@@ -395,13 +521,13 @@ async function readUpstreamSSE(
         if (!line.startsWith('data:')) continue
         const payload = line.slice(5).trim()
         if (payload === '[DONE]') {
-          await onChunk(null, true)
+          await onChunk(null, true, true)
           return
         }
         if (payload === '' ) continue
         try {
           const obj = JSON.parse(payload) as UpstreamChunk
-          await onChunk(obj, false)
+          await onChunk(obj, false, true)
         } catch { /* 单块解析失败跳过 */ }
       }
     }
@@ -413,11 +539,11 @@ async function readUpstreamSSE(
       if (payload !== '[DONE]' && payload.startsWith('{')) {
         try {
           const obj = JSON.parse(payload) as UpstreamChunk
-          await onChunk(obj, false)
+          await onChunk(obj, false, true)
         } catch { /* ignore */ }
       }
     }
-    await onChunk(null, true)
+    await onChunk(null, true, false)
   } finally {
     try { await reader.cancel() } catch { /* ignore */ }
   }
@@ -448,6 +574,10 @@ function buildStreamResponse(upstream: Response, opts: BridgeOptions): Response 
   let stdID = '', stdModel = CNB_MODELS[0], stdCreated = Math.floor(Date.now() / 1000), stdUsage: unknown = null
   let finished = false
   let emittedToolCalls = false
+  // 上游显式给出的 finish_reason（如 length=输出上限/被截断，需透传而非一律伪报 stop）
+  let upstreamFinishReason: string | null = null
+  // 流是否正常收尾（收到 [DONE]）；false=上游直接关流（可能中途断流）
+  let cleanEnd = true
   // bridge 模式下始终启用 ToolSieve：即使当前请求未携带 tools（多轮对话时客户端可能只在首轮传 tools，
   // 但历史仍让模型按 XYML 输出），也要拦截并剥离原始 XYML 标记，避免泄漏给客户端。
   const sieve = opts.bridge ? new ToolSieve(opts.tools) : null
@@ -481,10 +611,11 @@ function buildStreamResponse(upstream: Response, opts: BridgeOptions): Response 
 
   ;(async () => {
     try {
-      await readUpstreamSSE(upstream.body, (obj, isDone) => {
+      await readUpstreamSSE(upstream.body, (obj, isDone, clean) => {
         if (finished) return
         if (isDone) {
           finished = true
+          cleanEnd = clean
           // 收尾：先 flush sieve 剩余内容 / 工具调用，再写 finish chunk + [DONE]
           if (sieve) {
             for (const ev of sieve.flush()) {
@@ -492,10 +623,14 @@ function buildStreamResponse(upstream: Response, opts: BridgeOptions): Response 
               else if (ev.text) write(stdChunk(stdID || randomId(), stdModel, stdCreated, { content: ev.text }, null))
             }
           }
+          // finish_reason 优先级：已发工具调用 > 上游显式 finish_reason > [DONE] 正常结束
+          // > 上游无 finish 直接关流（视为被截断，报 length 让客户端自动续写，避免手工发「继续」）
+          const finalReason = emittedToolCalls ? 'tool_calls'
+            : (upstreamFinishReason ?? (cleanEnd ? 'stop' : 'length'))
           const final: Record<string, unknown> = {
             id: stdID || randomId(), model: stdModel, created: stdCreated,
             object: 'chat.completion.chunk',
-            choices: [{ index: 0, delta: {}, finish_reason: emittedToolCalls ? 'tool_calls' : 'stop' }],
+            choices: [{ index: 0, delta: {}, finish_reason: finalReason }],
           }
           if (stdUsage) final['usage'] = stdUsage
           write('data: ' + JSON.stringify(final) + '\n\n')
@@ -510,6 +645,8 @@ function buildStreamResponse(upstream: Response, opts: BridgeOptions): Response 
         const choices = obj.choices || []
         for (const choice of choices) {
           const delta = choice.delta || {}
+          // 记录上游显式 finish_reason（如 length），供收尾时透传，避免一律伪报 stop
+          if (choice.finish_reason) upstreamFinishReason = choice.finish_reason
           const content = delta.content || ''
           const reasoning = delta.reasoning_content || ''
           // 推理内容与正文分开透传（bridge 模式 reasoning 不进 sieve，避免误判工具标记）
@@ -550,12 +687,15 @@ async function buildNonStreamResponse(upstream: Response, opts: BridgeOptions): 
   let stdID = '', stdModel = '', stdCreated = Math.floor(Date.now() / 1000)
   let stdUsage: unknown = null
   let finish = 'stop'
+  let sawUpstreamFinish = false
+  let cleanEnd = true
   // bridge 模式下始终启用 ToolSieve（理由同 buildStreamResponse：避免无 tools 请求时 XYML 泄漏）
   const sieve = opts.bridge ? new ToolSieve(opts.tools) : null
   const toolCalls: Array<Record<string, unknown>> = []
 
-  await readUpstreamSSE(upstream.body, (obj, isDone) => {
-    if (isDone || !obj) return
+  await readUpstreamSSE(upstream.body, (obj, isDone, clean) => {
+    if (isDone) { cleanEnd = clean; return }
+    if (!obj) return
     if (obj.id) stdID = obj.id
     if (obj.model) stdModel = obj.model
     if (obj.created) stdCreated = obj.created
@@ -574,7 +714,7 @@ async function buildNonStreamResponse(upstream: Response, opts: BridgeOptions): 
           content += c
         }
       }
-      if (choice.finish_reason) finish = choice.finish_reason
+      if (choice.finish_reason) { finish = choice.finish_reason; sawUpstreamFinish = true }
     }
   })
   if (sieve) {
@@ -589,6 +729,9 @@ async function buildNonStreamResponse(upstream: Response, opts: BridgeOptions): 
   if (toolCalls.length) {
     message['tool_calls'] = toolCalls
     finish = 'tool_calls'
+  } else if (!sawUpstreamFinish && !cleanEnd) {
+    // 上游无 finish_reason 且直接关流：视为中途被截断，报 length 而非伪报 stop
+    finish = 'length'
   }
   const respObj: Record<string, unknown> = {
     id: stdID || `chatcmpl-cnb-${randomId()}`,
@@ -604,14 +747,15 @@ async function buildNonStreamResponse(upstream: Response, opts: BridgeOptions): 
   })
 }
 
-/** 获取 CSRF 凭证并发一个最小 chat 请求，验证 CNB 完整链路（凭证 + 模型连通性）。 */
+/** 取一个池凭证并发一个最小 chat 请求，验证 CNB 完整链路（凭证池 + 模型连通性）。 */
 export async function testCnbConnection(
   env: Env,
   provider: Provider,
   model?: string,
 ): Promise<{ success: boolean; statusCode?: number; message?: string; data?: unknown }> {
   try {
-    const csrf = await getCsrf(env, provider.id)
+    const cfg = poolConfig(provider)
+    const csrf = await acquireCsrf(env, provider)
     const modelName = model
       || (Array.isArray(provider.models) && provider.models[0]?.id)
       || 'deepseek-v4-flash'
@@ -647,6 +791,10 @@ export async function testCnbConnection(
       data: {
         cnb: true,
         model: modelName,
+        poolSize: getMemPool(provider.id).creds.length,
+        poolMin: cfg.min,
+        poolMax: cfg.max,
+        ttlMinutes: cfg.ttlMs / 60000,
         csrfKeyLen: csrf.key.length,
         csrfTokenLen: csrf.token.length,
         reply: content.substring(0, 200),
