@@ -598,7 +598,7 @@ ${H('管理')}
             <div id="oauth-new" class="hd form-group">
               <fieldset class="form-group"><legend>OAuth 配置</legend>
                 <div class="fg"><label>登录流程类型</label><select id="ao8" class="select-sm"><option value="device">设备码（RFC 8628）</option><option value="browser">浏览器登录（WorkBuddy）</option><option value="qoder">Qoder 设备授权（QoderWork）</option><option value="gemini">Gemini 授权码（Gemini CLI）</option><option value="m365-pkce">M365 授权码（PKCE）</option><option value="m365-ropc">M365 账号密码（ROPC）</option></select></div>
-                <div class="fg"><label>登录域（browser 模式）</label><select id="ao15" class="select-sm"><option value="cn">国内版（codebuddy.cn）</option><option value="global">国际版（workbuddy.ai）</option></select><span class="form-helper">国际版账号必须选「国际版」，登录链接与轮询将走 www.workbuddy.ai。</span></div>
+                <div class="fg"><label>登录域（browser 模式）</label><select id="ao15" class="select-sm" onchange="syncGlobalOauthNew()"><option value="cn">国内版（codebuddy.cn）</option><option value="global">国际版（workbuddy.ai）</option></select><span class="form-helper">国际版账号必须选「国际版」，登录链接与轮询将走 www.workbuddy.ai。</span></div>
                 <div class="fg"><label>发起端点 (deviceCodeUrl)</label><input type="url" id="ao1" placeholder="https://.../auth/device/code"></div>
                 <div class="fg"><label>轮询端点 (deviceTokenUrl)</label><input type="url" id="ao2" placeholder="https://.../auth/device/token"></div>
                 <div class="fg"><label>Token 刷新端点 (refreshTokenUrl)</label><input type="url" id="ao3" placeholder="https://.../auth/oauth_token/refresh"></div>
@@ -656,7 +656,7 @@ ${H('管理')}
               <div id="oauth-edit-${escapePageHtml(p.id)}" class="${p.authType==='oauth-device'?'form-group':'hd form-group'}">
                 <fieldset class="form-group"><legend>OAuth 配置</legend>
                   <div class="fg"><label>登录流程类型</label><select id="eao8-${escapePageHtml(p.id)}" class="select-sm"><option value="device" ${((p.oauth&&p.oauth.flowType)||'device')==='device'?'selected':''}>设备码（RFC 8628）</option><option value="browser" ${(p.oauth&&p.oauth.flowType)==='browser'?'selected':''}>浏览器登录（WorkBuddy）</option><option value="qoder" ${(p.oauth&&p.oauth.flowType)==='qoder'?'selected':''}>Qoder 设备授权（QoderWork）</option><option value="gemini" ${(p.oauth&&p.oauth.flowType)==='gemini'?'selected':''}>Gemini 授权码（Gemini CLI）</option><option value="m365-pkce" ${(p.oauth&&p.oauth.flowType)==='m365-pkce'?'selected':''}>M365 授权码（PKCE）</option><option value="m365-ropc" ${(p.oauth&&p.oauth.flowType)==='m365-ropc'?'selected':''}>M365 账号密码（ROPC）</option></select></div>
-                  <div class="fg"><label>登录域（browser 模式）</label><select id="eao15-${escapePageHtml(p.id)}" class="select-sm"><option value="cn" ${(p.oauth&&p.oauth.loginRealm)!=='global'?'selected':''}>国内版（codebuddy.cn）</option><option value="global" ${(p.oauth&&p.oauth.loginRealm)==='global'?'selected':''}>国际版（workbuddy.ai）</option></select><span class="form-helper">国际版账号必须选「国际版」，登录链接与轮询将走 www.workbuddy.ai。</span></div>
+                  <div class="fg"><label>登录域（browser 模式）</label><select id="eao15-${escapePageHtml(p.id)}" class="select-sm" onchange="syncGlobalOauthEdit('${escapePageJsx(p.id)}')"><option value="cn" ${(p.oauth&&p.oauth.loginRealm)!=='global'?'selected':''}>国内版（codebuddy.cn）</option><option value="global" ${(p.oauth&&p.oauth.loginRealm)==='global'?'selected':''}>国际版（workbuddy.ai）</option></select><span class="form-helper">国际版账号必须选「国际版」，登录链接与轮询将走 www.workbuddy.ai。</span></div>
                   <div class="fg"><label>发起端点</label><input type="url" id="eao1-${escapePageHtml(p.id)}" value="${escapePageHtml((p.oauth&&p.oauth.deviceCodeUrl)||'')}" placeholder="https://.../auth/device/code"></div>
                   <div class="fg"><label>轮询端点</label><input type="url" id="eao2-${escapePageHtml(p.id)}" value="${escapePageHtml((p.oauth&&p.oauth.deviceTokenUrl)||'')}" placeholder="https://.../auth/device/token"></div>
                   <div class="fg"><label>Token 刷新端点</label><input type="url" id="eao3-${escapePageHtml(p.id)}" value="${escapePageHtml((p.oauth&&p.oauth.refreshTokenUrl)||'')}" placeholder="https://.../auth/oauth_token/refresh"></div>
@@ -1115,6 +1115,10 @@ async function createProv(opts) {
   const enabled = document.getElementById('aen').checked
   if (!nm || !id || !url) { toast('请填写名称、ID 和 API 地址', 'error'); return }
   if (authType === 'oauth-device') {
+    // 国际版必须带 Global 发起端点，否则保存后发起登录会静默走国内端点
+    if (oauth.loginRealm === 'global' && !oauth.globalDeviceCodeUrl) {
+      toast('登录域为国际版，请填写「Global 域发起端点」或点预置补全后再保存', 'error'); return
+    }
     // gemini / m365（PKCE 授权码、ROPC 账密）由后端专用流程处理，端点与 Client ID 均有默认值，
     // 无需强制三端点；先保存，认证在「连接」里引导
     const specialFlow = oauth.flowType === 'gemini' || oauth.flowType === 'm365-pkce' || oauth.flowType === 'm365-ropc'
@@ -1153,6 +1157,30 @@ async function createProv(opts) {
     adminSubmitting = false
     btns.forEach(idleBtn)
   }
+}
+
+// 选「登录域=国际版」时，若 Global 三个端点为空则自动从 workbuddy 预置补全，
+// 避免用户只看到国内「发起端点」没填 Global 端点，保存后静默回退国内地址。
+function syncGlobalOauthNew() {
+  const lr = document.getElementById('ao15')
+  if (!lr || lr.value !== 'global') return
+  const p = OAUTH_PRESETS['workbuddy']
+  if (!p) return
+  const f = function(id) { return document.getElementById(id) }
+  const fill = function(id, val) { const el = f(id); if (el && !el.value) el.value = val || '' }
+  fill('ao16', p._globalDeviceCodeUrl)
+  fill('ao17', p._globalDeviceTokenUrl)
+  fill('ao18', p._globalRefreshTokenUrl)
+}
+function syncGlobalOauthEdit(id) {
+  const lr = document.getElementById('eao15-' + id)
+  if (!lr || lr.value !== 'global') return
+  const p = OAUTH_PRESETS['workbuddy']
+  if (!p) return
+  const fill = function(suffix, val) { const el = document.getElementById('eao' + suffix + '-' + id); if (el && !el.value) el.value = val || '' }
+  fill('16', p._globalDeviceCodeUrl)
+  fill('17', p._globalDeviceTokenUrl)
+  fill('18', p._globalRefreshTokenUrl)
 }
 
 function collectOauthNew() {
@@ -1936,6 +1964,10 @@ async function save(id) {
   const keys = getKeys(id)
   const models = getMdl(id), enabled = document.getElementById('en-' + id).checked
   if (authType === 'oauth-device') {
+    // 国际版必须带 Global 发起端点，否则发起登录会静默走国内端点
+    if (oauth.loginRealm === 'global' && !oauth.globalDeviceCodeUrl) {
+      toast('登录域为国际版，请填写「Global 域发起端点」或点预置补全后再保存', 'error'); return
+    }
     // gemini / m365 同创建校验：后端专用流程无需三端点，允许先保存再连接认证
     const specialFlow = oauth.flowType === 'gemini' || oauth.flowType === 'm365-pkce' || oauth.flowType === 'm365-ropc'
     if (!specialFlow) {

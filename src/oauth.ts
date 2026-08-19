@@ -280,15 +280,15 @@ function browserRealm(cfg: OAuthDeviceConfig, device?: DeviceFlowState): 'cn' | 
   return (device?.loginRealm || cfg.loginRealm) === 'global' ? 'global' : 'cn'
 }
 
-/** browser 模式：按域解析发起/轮询/刷新端点（Global 端点未配则回退 CN 端点） */
+/** browser 模式：按域解析发起/轮询/刷新端点；Global 端点缺失时返回空串（由调用方报错，不再静默回退国内端点） */
 function browserCodeUrl(cfg: OAuthDeviceConfig, realm: 'cn' | 'global'): string {
-  return realm === 'global' && cfg.globalDeviceCodeUrl ? cfg.globalDeviceCodeUrl : cfg.deviceCodeUrl
+  return realm === 'global' ? (cfg.globalDeviceCodeUrl || '') : cfg.deviceCodeUrl
 }
 function browserTokenUrl(cfg: OAuthDeviceConfig, realm: 'cn' | 'global'): string {
-  return realm === 'global' && cfg.globalDeviceTokenUrl ? cfg.globalDeviceTokenUrl : cfg.deviceTokenUrl
+  return realm === 'global' ? (cfg.globalDeviceTokenUrl || '') : cfg.deviceTokenUrl
 }
 function browserRefreshUrl(cfg: OAuthDeviceConfig, realm: 'cn' | 'global'): string {
-  return realm === 'global' && cfg.globalRefreshTokenUrl ? cfg.globalRefreshTokenUrl : cfg.refreshTokenUrl
+  return realm === 'global' ? (cfg.globalRefreshTokenUrl || '') : cfg.refreshTokenUrl
 }
 
 /** CodeBuddy/WorkBuddy 的响应信封：{code, msg, data} */
@@ -314,7 +314,11 @@ async function startOauthBrowserFlow(env: Env, providerId: string, cfg: OAuthDev
   try {
     // 发起登录前先确定域：WorkBuddy 国际版账号必须走 www.workbuddy.ai 端点
     const realm = browserRealm(cfg)
-    const res = await fetch(browserCodeUrl(cfg, realm), {
+    const codeUrl = browserCodeUrl(cfg, realm)
+    if (!codeUrl) {
+      return { success: false, message: '登录域为国际版但未配置 Global 域发起端点（globalDeviceCodeUrl），请在 OAuth 配置中补全或改回国内版' }
+    }
+    const res = await fetch(codeUrl, {
       method: 'POST',
       headers: browserCommonHeaders(cfg, realm),
       body: JSON.stringify({}),
@@ -365,8 +369,12 @@ async function pollOauthBrowserFlow(env: Env, providerId: string, cfg: OAuthDevi
   try {
     // 轮询必须与发起登录同域（device.loginRealm 固化），否则 state 在另一域无效
     const realm = browserRealm(cfg, device)
-    const sep = browserTokenUrl(cfg, realm).includes('?') ? '&' : '?'
-    const pollUrl = `${browserTokenUrl(cfg, realm)}${sep}state=${encodeURIComponent(state)}`
+    const tokenUrl = browserTokenUrl(cfg, realm)
+    if (!tokenUrl) {
+      return { status: 'error', message: '登录域为国际版但未配置 Global 域轮询端点（globalDeviceTokenUrl），请在 OAuth 配置中补全或改回国内版' }
+    }
+    const sep = tokenUrl.includes('?') ? '&' : '?'
+    const pollUrl = `${tokenUrl}${sep}state=${encodeURIComponent(state)}`
     const pollHeaders: Record<string, string> = {
       'Accept': 'application/json, text/plain, */*',
       'X-Requested-With': 'XMLHttpRequest',
@@ -1054,7 +1062,12 @@ async function refreshOauthTokenBrowser(env: Env, providerId: string, cfg: OAuth
   try {
     // 按 token 的 JWT iss 判断域：Global 账号必须用 workbuddy.ai 刷新端点，否则 401
     const realm = detectTokenRealm(state.access_token) === 'global' ? 'global' : 'cn'
-    const res = await fetch(browserRefreshUrl(cfg, realm), {
+    const refreshUrl = browserRefreshUrl(cfg, realm)
+    if (!refreshUrl) {
+      console.warn(`[oauth-refresh] provider=${providerId} 国际版 token 但未配置 globalRefreshTokenUrl，跳过刷新`)
+      return false
+    }
+    const res = await fetch(refreshUrl, {
       method: 'POST',
       headers: {
         ...browserCommonHeaders(cfg, realm),
