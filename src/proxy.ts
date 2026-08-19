@@ -16,7 +16,7 @@ import { isQoderProvider, proxyQoderChatRequest } from './qoder/proxy'
 import { isClineProvider, proxyClineChatRequest } from './cline/proxy'
 import { isVisionBridgeProvider, buildVisionBridgeRequestBody } from './vision/bridge'
 import { isGeminiProvider, proxyGeminiChatRequest } from './gemini/proxy'
-import { isCnbProvider, proxyCnbChatRequest } from './cnb/proxy'
+import { isCnbProvider, proxyCnbChatRequest, CnbStreamDiag } from './cnb/proxy'
 import { isM365Provider, proxyM365ChatRequest } from './m365/proxy'
 import { isTraeProvider, proxyTraeChatRequest } from './trae/proxy'
 import { writeLog } from './admin'
@@ -947,7 +947,17 @@ export async function forwardProxy(
     // 并把上游 SSE 转回 OpenAI 格式；开启 toolBridge 时走 XYML 工具桥（见 src/cnb/proxy.ts）。
     if (isCnbProvider(provider)) {
       try {
-        const response = await proxyCnbChatRequest(c.env, provider, forwardBody as Record<string, unknown>)
+        const diagLog = (diag: CnbStreamDiag) => {
+          // 流式收尾诊断：区分「内容未说完就停」是上游发了 [DONE](cleanEnd 且无 finish_reason，
+          // 被网关补报 stop) 还是上游直接关流(cleanEnd=false)。这决定客户端是否自动续写。
+          try {
+            const detail = JSON.stringify({ providerId, subPath, diag, toolBridge: provider.toolBridge === true }).substring(0, 2000)
+            c.executionCtx.waitUntil(writeLog(c.env, diag.finalReason === 'length' ? 'warn' : 'request',
+              `[${provider.name}] ${model} → stream finish=${diag.finalReason} clean=${diag.cleanEnd}`,
+              detail))
+          } catch { /* log failure must not break */ }
+        }
+        const response = await proxyCnbChatRequest(c.env, provider, forwardBody as Record<string, unknown>, diagLog)
         const logLevel = response.ok ? 'request' : (response.status >= 500 ? 'error' : 'warn')
         try {
           const bodySummary = summarizeRequestBody(forwardBody)

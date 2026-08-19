@@ -456,6 +456,7 @@ export async function proxyCnbChatRequest(
   env: Env,
   provider: Provider,
   clientBody: Record<string, unknown>,
+  onFinish?: (diag: CnbStreamDiag) => void,
 ): Promise<Response> {
   const bridge = provider.toolBridge === true
   const tools = Array.isArray(clientBody.tools) ? clientBody.tools : []
@@ -474,7 +475,7 @@ export async function proxyCnbChatRequest(
       const resp = await chatOnce(provider, upBody, csrf)
       lastResp = resp
       if (!resp.ok) return resp // 非 2xx（业务拒绝等）原样透传
-      if (isStream) return buildStreamResponse(resp, { bridge, tools })
+      if (isStream) return buildStreamResponse(resp, { bridge, tools }, onFinish)
       return await buildNonStreamResponse(resp, { bridge, tools })
     } catch (err) {
       if (err instanceof CnbCsrfError && attempt < attempts - 1) {
@@ -494,6 +495,15 @@ export async function proxyCnbChatRequest(
 interface BridgeOptions {
   bridge: boolean
   tools: unknown[]
+}
+
+/** 每轮流式收尾的诊断快照，供上层写日志定位「内容未说完就停」的根因。 */
+export interface CnbStreamDiag {
+  cleanEnd: boolean            // true=收到上游 [DONE]；false=上游直接关流
+  upstreamFinishReason: string | null  // 上游显式给出的 finish_reason（如 length）
+  finalReason: string          // 网关最终下发给客户端的 finish_reason
+  toolCalls: boolean           // 本轮是否发出过工具调用增量
+  outChars: number             // 网关实际透传给客户端的正文总字符数
 }
 
 /**
@@ -568,11 +578,12 @@ function stdChunk(id: string, model: string, created: number, delta: Record<stri
   }) + '\n\n'
 }
 
-function buildStreamResponse(upstream: Response, opts: BridgeOptions): Response {
+function buildStreamResponse(upstream: Response, opts: BridgeOptions, onFinish?: (diag: CnbStreamDiag) => void): Response {
   const { readable, writable } = new TransformStream<Uint8Array, Uint8Array>()
   const writer = writable.getWriter()
   const encoder = new TextEncoder()
   let stdID = '', stdModel = CNB_MODELS[0], stdCreated = Math.floor(Date.now() / 1000), stdUsage: unknown = null
+  let outChars = 0
   let finished = false
   let emittedToolCalls = false
   // 上游显式给出的 finish_reason（如 length=输出上限/被截断，需透传而非一律伪报 stop）
@@ -636,6 +647,9 @@ function buildStreamResponse(upstream: Response, opts: BridgeOptions): Response 
           if (stdUsage) final['usage'] = stdUsage
           write('data: ' + JSON.stringify(final) + '\n\n')
           write('data: [DONE]\n\n')
+          // 诊断埋点：把本轮收尾的关键证据上报，供日志确认「内容未说完就停」是否因
+          // 上游发 [DONE]（cleanEnd）而未带 finish_reason，被网关误报 stop 导致客户端不续写。
+          if (onFinish) onFinish({ cleanEnd, upstreamFinishReason, finalReason, toolCalls: emittedToolCalls, outChars })
           return
         }
         if (!obj) return
@@ -658,9 +672,10 @@ function buildStreamResponse(upstream: Response, opts: BridgeOptions): Response 
             if (sieve) {
               for (const ev of sieve.processChunk(content)) {
                 if (ev.type === 'tool_calls' && ev.calls) emitToolCallDeltas(openAIToolCalls(ev.calls))
-                else if (ev.text) write(stdChunk(stdID, stdModel, stdCreated, { content: ev.text }, null))
+                else if (ev.text) { outChars += ev.text.length; write(stdChunk(stdID, stdModel, stdCreated, { content: ev.text }, null)) }
               }
             } else {
+              outChars += content.length
               write(stdChunk(stdID, stdModel, stdCreated, { content }, null))
             }
           }

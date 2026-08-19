@@ -234,6 +234,36 @@ async function doJson(
   }
 }
 
+/** 同 doJson 但返回原始响应文本（诊断/需要保留 JSON 原始结构时用）。 */
+async function doJsonText(
+  url: string,
+  headers: Record<string, string>,
+  bodyObj: Record<string, any>,
+  timeoutMs = 30000
+): Promise<string> {
+  let response: Response
+  try {
+    response = await fetch(url, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify(bodyObj),
+      signal: AbortSignal.timeout(timeoutMs),
+    })
+  } catch (e) {
+    throw new Error(`request failed: ${(e as Error).message || String(e)}`)
+  }
+  const raw = await response.text()
+  if (response.status >= 400) {
+    const kind = classifyTraeError(response.status, raw)
+    const err = new Error(`upstream ${kind} (http ${response.status}): ${raw.substring(0, 200)}`) as Error & { kind?: TraeErrKind; status?: number; msg?: string }
+    ;(err as any).kind = kind
+    ;(err as any).status = response.status
+    ;(err as any).msg = raw.substring(0, 200)
+    throw err
+  }
+  return raw
+}
+
 // ===== ExchangeToken / 用户信息 =====
 
 export interface TokenExchangeResult {
@@ -355,12 +385,21 @@ export async function performCheckinClaim(account: TraeAccount): Promise<void> {
 
 /** 聚合积分（ide_user_ent_usage 的 credits_limit 求和）。 */
 export async function fetchUserEntUsage(account: TraeAccount): Promise<number> {
-  const data = await doJson(TRAE_CONSTANTS.UgHost + TRAE_CONSTANTS.EpEntUsage, ugHeaders(account), {})
+  const raw = await doJsonText(TRAE_CONSTANTS.UgHost + TRAE_CONSTANTS.EpEntUsage, ugHeaders(account), {})
+  let data: any
+  try { data = JSON.parse(raw) } catch { data = null }
+  // 诊断：打印原始响应，便于确认「已用」字段名（可用 wrangler tail 观察）
+  console.warn('[trae.ent-usage] ' + account.uid + ' raw=' + raw.substring(0, 2000))
   const packs = data?.user_entitlement_pack_list
   if (!Array.isArray(packs)) throw new Error('ent usage parse: missing user_entitlement_pack_list')
   let remain = 0
   for (const p of packs) {
-    remain += Number(p?.entitlement_base_info?.quota?.credits_limit) || 0
+    const quota: Record<string, any> = p?.entitlement_base_info?.quota || {}
+    // 打印每个 quota 的完整字段，便于定位可扣减「已用」的真实字段名
+    if (Object.keys(quota).length > 0) {
+      console.warn('[trae.ent-usage] ' + account.uid + ' quota=' + JSON.stringify(quota))
+    }
+    remain += Number(quota?.credits_limit) || 0
   }
   return remain
 }
