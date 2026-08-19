@@ -384,32 +384,26 @@ export async function performCheckinClaim(account: TraeAccount): Promise<void> {
   await doJson(TRAE_CONSTANTS.UgHost + TRAE_CONSTANTS.EpCheckinClaim, ugHeaders(account), {})
 }
 
-/** 聚合积分（ide_user_ent_usage 的 credits_limit 求和）。
- *  传 env 时会把每个 quota 的原始字段写入面板日志（诊断「已用」字段名用）。 */
+/** 聚合剩余积分（ide_user_ent_usage）：每包 credits_limit（总量）− credits_amount（已用），负值按 0。 */
 export async function fetchUserEntUsage(account: TraeAccount, env?: Env): Promise<number> {
   const raw = await doJsonText(TRAE_CONSTANTS.UgHost + TRAE_CONSTANTS.EpEntUsage, ugHeaders(account), {})
   let data: any
   try { data = JSON.parse(raw) } catch { data = null }
   const packs = data?.user_entitlement_pack_list
   if (!Array.isArray(packs)) throw new Error('ent usage parse: missing user_entitlement_pack_list')
-  // 诊断：完整原始响应写入面板日志（便于确认顶层是否有已用/剩余字段）
+  // 诊断：完整原始响应写入面板日志（临时，确认剩余值后删除）
   if (env) {
     try {
       const { writeLog } = await import('../admin')
       await writeLog(env, 'info', '[trae.ent-usage] ' + account.uid + ' raw', raw.substring(0, 3500))
     } catch { /* 日志写入失败不影响积分计算 */ }
   }
-  console.warn('[trae.ent-usage] ' + account.uid + ' raw=' + raw.substring(0, 2000))
-  const quotaLines: string[] = []
   let remain = 0
   for (const p of packs) {
     const quota: Record<string, any> = p?.entitlement_base_info?.quota || {}
-    if (Object.keys(quota).length > 0) {
-      const line = JSON.stringify(quota)
-      quotaLines.push(line)
-      console.warn('[trae.ent-usage] ' + account.uid + ' quota=' + line)
-    }
-    remain += Number(quota?.credits_limit) || 0
+    const used = Number(p?.usage?.credits_amount) || 0
+    const limit = Number(quota?.credits_limit) || 0
+    remain += Math.max(0, limit - used)
   }
   return remain
 }
