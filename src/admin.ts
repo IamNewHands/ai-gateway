@@ -1429,6 +1429,12 @@ export async function handleOAuthModels(c: Context<AppEnv>) {
   for (const ep of candidates) {
     try {
       const reqHeaders = buildOauthHeaders(cfg, token, { origin: ep.origin, cookies })
+      // 国际版（workbuddy.ai）的 /console/.../models 端点不接受 Authorization 头
+      // （带了返回 500），只认 x-api-key；国内版（copilot.tencent.com）两者均可。
+      if (ep.label === 'Global' && reqHeaders['Authorization']) {
+        reqHeaders['x-api-key'] = reqHeaders['Authorization']
+        delete reqHeaders['Authorization']
+      }
       debug['requestUrl'] = ep.url
       // 只记请求头名与是否有 Cookie（值长度），绝不打印 token / cookie 值
       debug['requestHeaders'] = Object.keys(reqHeaders).reduce((acc, k) => {
