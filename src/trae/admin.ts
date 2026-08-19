@@ -215,7 +215,7 @@ export async function handleTraeLoginCallback(c: Context<AppEnv>) {
   // e. 初始积分（失败不阻塞登录）
   let credits = 0
   try {
-    credits = await fetchUserEntUsage(account)
+    credits = await fetchUserEntUsage(account, c.env)
     await setTraeCredits(c.env, id, uid, credits)
   } catch (e) {
     console.warn(`[trae-login] ent usage failed: ${(e as Error).message}`)
@@ -289,7 +289,7 @@ async function checkinTraeAccount(env: Env, provider: Provider, account: TraeAcc
   }
   // 查积分 + 解冻（签到就是为了解冻冷却账号）
   try {
-    const remain = await fetchUserEntUsage(account)
+    const remain = await fetchUserEntUsage(account, env)
     await reenableTraeIfCredits(env, provider.id, account.uid, remain)
     base.credits = remain
   } catch (e) {

@@ -468,26 +468,32 @@ export async function proxyCnbChatRequest(
   // 重试上限 = clamp(poolMax, 3, 6)：池小少试、池大多试，避免单个请求串太久。
   const cfg = poolConfig(provider)
   const attempts = Math.min(6, Math.max(3, cfg.max))
-  let lastResp: Response | null = null
-  for (let attempt = 0; attempt < attempts; attempt++) {
-    const csrf = await acquireCsrf(env, provider)
-    try {
-      const resp = await chatOnce(provider, upBody, csrf)
-      lastResp = resp
-      if (!resp.ok) return resp // 非 2xx（业务拒绝等）原样透传
-      if (isStream) return buildStreamResponse(resp, { bridge, tools }, onFinish)
-      return await buildNonStreamResponse(resp, { bridge, tools })
-    } catch (err) {
-      if (err instanceof CnbCsrfError && attempt < attempts - 1) {
-        await reportCsrfError(env, provider, csrf)
-        continue
+  // 统一发上游请求（带凭证池重试）：首轮与自动续写轮共用同一套凭证/重试逻辑。
+  const chat = async (body: Record<string, unknown>): Promise<Response> => {
+    let lastResp: Response | null = null
+    for (let attempt = 0; attempt < attempts; attempt++) {
+      const csrf = await acquireCsrf(env, provider)
+      try {
+        const resp = await chatOnce(provider, body, csrf)
+        lastResp = resp
+        if (!resp.ok) return resp // 非 2xx（业务拒绝等）原样透传
+        return resp
+      } catch (err) {
+        if (err instanceof CnbCsrfError && attempt < attempts - 1) {
+          await reportCsrfError(env, provider, csrf)
+          continue
+        }
+        if (lastResp && !lastResp.ok) return lastResp
+        throw err
       }
-      if (lastResp && !lastResp.ok) return lastResp
-      throw err
     }
+    if (lastResp && !lastResp.ok) return lastResp
+    throw new Error('cnb: chat failed after retries')
   }
-  if (lastResp && !lastResp.ok) return lastResp
-  throw new Error('cnb: chat failed after retries')
+
+  const resp = await chat(upBody)
+  if (isStream) return buildStreamResponse(resp, { bridge, tools, upBody, chat }, onFinish)
+  return await buildNonStreamResponse(resp, { bridge, tools })
 }
 
 // ===== 流式响应 =====
@@ -495,6 +501,9 @@ export async function proxyCnbChatRequest(
 interface BridgeOptions {
   bridge: boolean
   tools: unknown[]
+  // 自动续写所需：首轮上游 body（复用来构造续写 messages）与「再发一次上游请求」的能力
+  upBody?: Record<string, unknown>
+  chat?: (body: Record<string, unknown>) => Promise<Response>
 }
 
 /** 每轮流式收尾的诊断快照，供上层写日志定位「内容未说完就停」的根因。 */
@@ -504,6 +513,7 @@ export interface CnbStreamDiag {
   finalReason: string          // 网关最终下发给客户端的 finish_reason
   toolCalls: boolean           // 本轮是否发出过工具调用增量
   outChars: number             // 网关实际透传给客户端的正文总字符数
+  rounds: number               // 自动续写轮数（0=未续写；>0=网关自动续写过 N 次）
 }
 
 /**
@@ -578,13 +588,47 @@ function stdChunk(id: string, model: string, created: number, delta: Record<stri
   }) + '\n\n'
 }
 
+/**
+ * 启发式判断「回答是否疑似没说完」。CNB 上游 deepseek-v4-flash 在内容未说完时
+ * 常自报 finish_reason=stop（cleanEnd=true、无 length），客户端因此不自动续写。
+ * 网关据此特征自动再发一轮「请继续」。只看结尾特征，避免误伤真正完整的小段回答：
+ * - 未闭合代码块 / 内联代码 → 明显截断
+ * - 以句号/问号/叹号等完整标点收尾 → 视为完整
+ * - 以逗号/顿号/省略号/中文助词（的了着吗呢吧啊）收尾 → 半句，视为截断
+ * - 其他不以标点收尾（列表中间、行尾、裸词）→ 保守视为疑似截断
+ */
+function looksTruncated(text: unknown): boolean {
+  const t = String(text ?? '').trimEnd()
+  if (!t) return false
+  // 未闭合的围栏代码块（``` 数量为奇数）→ 明显没写完
+  const fences = (t.match(/```/g) || []).length
+  if (fences % 2 === 1) return true
+  // 取最后一段（按空行切）作为结尾特征样本
+  const lastBlock = t.split(/\n\s*\n/).filter((s) => s.trim()).pop() ?? ''
+  const tail = lastBlock.trimEnd()
+  if (!tail) return false
+  // 未闭合内联代码（` 数量为奇数）
+  if ((tail.match(/`/g) || []).length % 2 === 1) return true
+  // 以常见完整结束标点收尾 → 视为完整
+  if (/[。！？；：．.!?;:…]$/.test(tail)) return false
+  // 短确认型回答白名单（是的/好的/可以等，不以标点收尾也视为完整，避免误触发续写）
+  if (/^(是的|好的|可以|行|没问题|已完成|完成|收到|明白|ok|OK|可以了|好的好的|好|嗯|对|了解)$/.test(t.trim())) return false
+  // 短文本：仅以明显半句助词/系词（的了着吗呢吧啊是）结尾才视为截断，其余视为完整
+  if (tail.length < 12) return /[的了着吗呢吧啊是]$/.test(tail)
+  // 长文本：以中文助词/半句词结尾（“它的作用是”“需要确认”“正在处理”等）→ 截断
+  if (/[的了着吗呢吧啊是]$/.test(tail)) return true
+  // 其他不以标点收尾的长文本 → 保守判定为「疑似没说完」
+  return true
+}
+
 function buildStreamResponse(upstream: Response, opts: BridgeOptions, onFinish?: (diag: CnbStreamDiag) => void): Response {
+  // 非 2xx（业务拒绝/上游错误）原样透传，不包 SSE
+  if (!upstream.ok) return upstream
   const { readable, writable } = new TransformStream<Uint8Array, Uint8Array>()
   const writer = writable.getWriter()
   const encoder = new TextEncoder()
   let stdID = '', stdModel = CNB_MODELS[0], stdCreated = Math.floor(Date.now() / 1000), stdUsage: unknown = null
   let outChars = 0
-  let finished = false
   let emittedToolCalls = false
   // 上游显式给出的 finish_reason（如 length=输出上限/被截断，需透传而非一律伪报 stop）
   let upstreamFinishReason: string | null = null
@@ -594,6 +638,12 @@ function buildStreamResponse(upstream: Response, opts: BridgeOptions, onFinish?:
   // 但历史仍让模型按 XYML 输出），也要拦截并剥离原始 XYML 标记，避免泄漏给客户端。
   const sieve = opts.bridge ? new ToolSieve(opts.tools) : null
   let toolIdx = 0
+  // 已透传的纯正文（含 flush 降级内容），用于自动续写时让模型接着往下写
+  let allText = ''
+  // 自动续写上限：最多续写 3 次（共最多 4 轮），避免模型持续不自停而耗尽上游额度
+  const MAX_CONTINUE_ROUNDS = 3
+  // 续写提示：要求从中断处继续、不重复已写内容（网关内部请求，客户端不可见）
+  const CONTINUE_PROMPT = '（网关自动续写）请直接接着上一段内容继续写，从中断处往下写，不要重复已经写过的内容。'
 
   const write = (s: string) => writer.write(encoder.encode(s))
   const done = (): Promise<void> => writer.close()
@@ -621,66 +671,100 @@ function buildStreamResponse(upstream: Response, opts: BridgeOptions, onFinish?:
     }
   }
 
+  // 写收尾 chunk + [DONE]，并上报诊断快照。rounds=实际完成的续写轮数。
+  const finishRound = (rounds: number): void => {
+    const finalReason = emittedToolCalls ? 'tool_calls'
+      : (upstreamFinishReason ?? (cleanEnd ? 'stop' : 'length'))
+    const final: Record<string, unknown> = {
+      id: stdID || randomId(), model: stdModel, created: stdCreated,
+      object: 'chat.completion.chunk',
+      choices: [{ index: 0, delta: {}, finish_reason: finalReason }],
+    }
+    if (stdUsage) final['usage'] = stdUsage
+    write('data: ' + JSON.stringify(final) + '\n\n')
+    write('data: [DONE]\n\n')
+    if (onFinish) onFinish({ cleanEnd, upstreamFinishReason, finalReason, toolCalls: emittedToolCalls, outChars, rounds })
+  }
+
   ;(async () => {
     try {
-      await readUpstreamSSE(upstream.body, (obj, isDone, clean) => {
-        if (finished) return
-        if (isDone) {
-          finished = true
-          cleanEnd = clean
-          // 收尾：先 flush sieve 剩余内容 / 工具调用，再写 finish chunk + [DONE]
-          if (sieve) {
-            for (const ev of sieve.flush()) {
-              if (ev.type === 'tool_calls' && ev.calls) emitToolCallDeltas(openAIToolCalls(ev.calls))
-              else if (ev.text) write(stdChunk(stdID || randomId(), stdModel, stdCreated, { content: ev.text }, null))
-            }
-          }
-          // finish_reason 优先级：已发工具调用 > 上游显式 finish_reason > [DONE] 正常结束
-          // > 上游无 finish 直接关流（视为被截断，报 length 让客户端自动续写，避免手工发「继续」）
-          const finalReason = emittedToolCalls ? 'tool_calls'
-            : (upstreamFinishReason ?? (cleanEnd ? 'stop' : 'length'))
-          const final: Record<string, unknown> = {
-            id: stdID || randomId(), model: stdModel, created: stdCreated,
-            object: 'chat.completion.chunk',
-            choices: [{ index: 0, delta: {}, finish_reason: finalReason }],
-          }
-          if (stdUsage) final['usage'] = stdUsage
-          write('data: ' + JSON.stringify(final) + '\n\n')
-          write('data: [DONE]\n\n')
-          // 诊断埋点：把本轮收尾的关键证据上报，供日志确认「内容未说完就停」是否因
-          // 上游发 [DONE]（cleanEnd）而未带 finish_reason，被网关误报 stop 导致客户端不续写。
-          if (onFinish) onFinish({ cleanEnd, upstreamFinishReason, finalReason, toolCalls: emittedToolCalls, outChars })
-          return
-        }
-        if (!obj) return
-        if (obj.id) stdID = obj.id
-        if (obj.model) stdModel = obj.model
-        if (obj.created) stdCreated = obj.created
-        if (obj.usage) stdUsage = obj.usage
-        const choices = obj.choices || []
-        for (const choice of choices) {
-          const delta = choice.delta || {}
-          // 记录上游显式 finish_reason（如 length），供收尾时透传，避免一律伪报 stop
-          if (choice.finish_reason) upstreamFinishReason = choice.finish_reason
-          const content = delta.content || ''
-          const reasoning = delta.reasoning_content || ''
-          // 推理内容与正文分开透传（bridge 模式 reasoning 不进 sieve，避免误判工具标记），
-          // 但仍清洗混入推理的 XYML 工具标记残片（模型思考时常把计划执行的搜索/取数工具
-          // XML 草案混进 reasoning，若不清理会以脏标签形式展示给客户端）。
-          if (reasoning) write(stdChunk(stdID, stdModel, stdCreated, { reasoning_content: scrubToolFragments(reasoning) }, null))
-          if (content) {
+      let resp = upstream
+      let rounds = 0
+      while (true) {
+        // 每轮独立判断收尾标志（续写轮重新累计）
+        cleanEnd = true
+        upstreamFinishReason = null
+        await readUpstreamSSE(resp.body, (obj, isDone, clean) => {
+          if (isDone) {
+            cleanEnd = clean
+            // 收尾：先 flush sieve 剩余内容 / 工具调用，再决定是否续写
             if (sieve) {
-              for (const ev of sieve.processChunk(content)) {
+              for (const ev of sieve.flush()) {
                 if (ev.type === 'tool_calls' && ev.calls) emitToolCallDeltas(openAIToolCalls(ev.calls))
-                else if (ev.text) { outChars += ev.text.length; write(stdChunk(stdID, stdModel, stdCreated, { content: ev.text }, null)) }
+                else if (ev.text) { allText += ev.text; outChars += ev.text.length; write(stdChunk(stdID || randomId(), stdModel, stdCreated, { content: ev.text }, null)) }
               }
-            } else {
-              outChars += content.length
-              write(stdChunk(stdID, stdModel, stdCreated, { content }, null))
+            }
+            return
+          }
+          if (!obj) return
+          if (obj.id) stdID = obj.id
+          if (obj.model) stdModel = obj.model
+          if (obj.created) stdCreated = obj.created
+          if (obj.usage) stdUsage = obj.usage
+          const choices = obj.choices || []
+          for (const choice of choices) {
+            const delta = choice.delta || {}
+            // 记录上游显式 finish_reason（如 length），供收尾时透传，避免一律伪报 stop
+            if (choice.finish_reason) upstreamFinishReason = choice.finish_reason
+            const content = delta.content || ''
+            const reasoning = delta.reasoning_content || ''
+            // 推理内容与正文分开透传（bridge 模式 reasoning 不进 sieve，避免误判工具标记），
+            // 但仍清洗混入推理的 XYML 工具标记残片（模型思考时常把计划执行的搜索/取数工具
+            // XML 草案混进 reasoning，若不清理会以脏标签形式展示给客户端）。
+            if (reasoning) write(stdChunk(stdID, stdModel, stdCreated, { reasoning_content: scrubToolFragments(reasoning) }, null))
+            if (content) {
+              if (sieve) {
+                for (const ev of sieve.processChunk(content)) {
+                  if (ev.type === 'tool_calls' && ev.calls) emitToolCallDeltas(openAIToolCalls(ev.calls))
+                  else if (ev.text) { allText += ev.text; outChars += ev.text.length; write(stdChunk(stdID, stdModel, stdCreated, { content: ev.text }, null)) }
+                }
+              } else {
+                allText += content; outChars += content.length
+                write(stdChunk(stdID, stdModel, stdCreated, { content }, null))
+              }
             }
           }
+        })
+
+        // 是否需要自动续写：上游自报 stop（内容疑似没说完）、未发工具调用（工具轮交给客户端执行）、还有续写额度
+        const finalReason = emittedToolCalls ? 'tool_calls'
+          : (upstreamFinishReason ?? (cleanEnd ? 'stop' : 'length'))
+        const shouldContinue = !emittedToolCalls && finalReason === 'stop'
+          && rounds < MAX_CONTINUE_ROUNDS
+          && !!opts.chat && !!opts.upBody && looksTruncated(allText)
+        if (!shouldContinue) {
+          finishRound(rounds)
+          break
         }
-      })
+        // 构造续写请求：原始上游 messages + 已输出正文 + 继续提示
+        rounds++
+        const upMsgs = (opts.upBody!.messages || []) as Array<Record<string, unknown>>
+        const contBody: Record<string, unknown> = {
+          ...opts.upBody!,
+          messages: [...upMsgs, { role: 'assistant', content: allText }, { role: 'user', content: CONTINUE_PROMPT }],
+        }
+        try {
+          resp = await opts.chat!(contBody)
+        } catch {
+          // 续写请求失败（凭证/网络等）：不中断已输出的主流，直接收尾
+          finishRound(rounds - 1)
+          break
+        }
+        if (!resp.ok || !resp.body) {
+          finishRound(rounds - 1)
+          break
+        }
+      }
     } catch (e) {
       await fail(e)
       return

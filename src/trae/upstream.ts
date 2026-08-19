@@ -5,6 +5,7 @@
 import { TRAE_CONSTANTS, TRAE_UA } from './constants'
 import { prepareBody } from './payload'
 import type { TraeAccount, TraeErrKind, TraeModelInfo } from './types'
+import type { Env } from '../types'
 
 // ===== 错误分类（SPEC §4.3） =====
 
@@ -383,23 +384,31 @@ export async function performCheckinClaim(account: TraeAccount): Promise<void> {
   await doJson(TRAE_CONSTANTS.UgHost + TRAE_CONSTANTS.EpCheckinClaim, ugHeaders(account), {})
 }
 
-/** 聚合积分（ide_user_ent_usage 的 credits_limit 求和）。 */
-export async function fetchUserEntUsage(account: TraeAccount): Promise<number> {
+/** 聚合积分（ide_user_ent_usage 的 credits_limit 求和）。
+ *  传 env 时会把每个 quota 的原始字段写入面板日志（诊断「已用」字段名用）。 */
+export async function fetchUserEntUsage(account: TraeAccount, env?: Env): Promise<number> {
   const raw = await doJsonText(TRAE_CONSTANTS.UgHost + TRAE_CONSTANTS.EpEntUsage, ugHeaders(account), {})
   let data: any
   try { data = JSON.parse(raw) } catch { data = null }
-  // 诊断：打印原始响应，便于确认「已用」字段名（可用 wrangler tail 观察）
-  console.warn('[trae.ent-usage] ' + account.uid + ' raw=' + raw.substring(0, 2000))
   const packs = data?.user_entitlement_pack_list
   if (!Array.isArray(packs)) throw new Error('ent usage parse: missing user_entitlement_pack_list')
+  const quotaLines: string[] = []
   let remain = 0
   for (const p of packs) {
     const quota: Record<string, any> = p?.entitlement_base_info?.quota || {}
-    // 打印每个 quota 的完整字段，便于定位可扣减「已用」的真实字段名
     if (Object.keys(quota).length > 0) {
-      console.warn('[trae.ent-usage] ' + account.uid + ' quota=' + JSON.stringify(quota))
+      const line = JSON.stringify(quota)
+      quotaLines.push(line)
+      console.warn('[trae.ent-usage] ' + account.uid + ' quota=' + line)
     }
     remain += Number(quota?.credits_limit) || 0
+  }
+  // 写面板日志，便于直接在界面详情里确认「已用」字段名
+  if (env && quotaLines.length > 0) {
+    try {
+      const { writeLog } = await import('../admin')
+      await writeLog(env, 'info', '[trae.ent-usage] ' + account.uid + ' quota', quotaLines.join('\n'))
+    } catch { /* 日志写入失败不影响积分计算 */ }
   }
   return remain
 }
