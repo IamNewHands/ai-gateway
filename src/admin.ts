@@ -1001,10 +1001,32 @@ export async function handleDeleteProxyKey(c: Context<AppEnv>) {
 export async function handleUpdateProxyKey(c: Context<AppEnv>) {
   const id = c.req.param('id')
   if (!id) return c.json<ApiResponse>({ success: false, message: '缺少 id 参数' }, 400)
-  const body = await c.req.json<{ enabled?: boolean; allowedModels?: string[] }>()
+  const body = await c.req.json<{
+    enabled?: boolean
+    allowedModels?: string[]
+    expiresIn?: string
+    expiresInDays?: number
+    expiresInHours?: number
+  }>()
   const updates: Partial<import('./types').ProxyKey> = {}
   if (body.enabled !== undefined) updates.enabled = body.enabled
   if (body.allowedModels !== undefined) updates.allowedModels = body.allowedModels
+  // 续期/修改过期时间：传了任一有效期字段时重算 expiresAt。
+  // 语义为「从当前时间起重新计算新有效期」——已过期的 Key 也能直接续期恢复，
+  // 无需删掉重加（新增会生成全新的 Key 字符串，客户端配置全要改）。
+  // 优先级：自定义天数 > 自定义小时数 > 预设选项；'forever' 或全部无效 → 永久有效。
+  if (body.expiresIn !== undefined || body.expiresInDays !== undefined || body.expiresInHours !== undefined) {
+    let ttlSeconds = 0
+    if (typeof body.expiresInDays === 'number' && body.expiresInDays > 0) {
+      ttlSeconds = body.expiresInDays * 24 * 60 * 60
+    } else if (typeof body.expiresInHours === 'number' && body.expiresInHours > 0) {
+      ttlSeconds = body.expiresInHours * 60 * 60
+    } else if (body.expiresIn && body.expiresIn !== 'forever') {
+      const ttl = EXPIRY_OPTIONS[body.expiresIn]
+      if (ttl) ttlSeconds = ttl
+    }
+    updates.expiresAt = ttlSeconds > 0 ? new Date(Date.now() + ttlSeconds * 1000).toISOString() : null
+  }
   const updated = await updateProxyKey(c.env, id, updates)
   if (!updated) {
     return c.json<ApiResponse>({ success: false, message: '转发 Key 不存在' }, 404)
@@ -1525,8 +1547,7 @@ export interface LogEntry {
 
 const LOG_PREFIX = 'log:'
 const DEFAULT_LOG_RETENTION_DAYS = 7 // 默认日志保留天数
-// 搜索模式下 KV.get 次数上限：KV.list(≤5 次) + 990 次 KV.get ≈ 995 subrequest，
-// 留余量低于 Workers 单请求 1000 subrequest 上限。
+// 搜索模式下 KV.get 次数上限（与 KV.list 页数合计 ≤950 subrequest，动态收紧，见 handleLogs）
 const SEARCH_SCAN = 990
 
 /**
@@ -1635,17 +1656,21 @@ export async function handleLogs(c: Context<AppEnv>) {
   const hasFilter = !!(type || keyword || !Number.isNaN(startTime) || !Number.isNaN(endTime))
 
   // P5：KV.list 只拉 key 名（便宜）。
-  // 注意：KV.list 按字典序升序返回（旧→新）。旧逻辑只截断前 TOTAL_CAP=5000 个 key，
-  // 会漏掉写在字典序末尾的「最新日志」，导致系统日志永远停在旧窗口、看不到新写入的日志。
-  // 因此遍历到 list_complete（或达到 MAX_KEY_SCAN 安全上限），保证最新日志一定能查到。
-  const MAX_KEY_SCAN = 100000
+  // 注意：KV.list 按字典序升序返回（旧→新），新日志写在字典序末尾。
+  // 旧实现按 MAX_KEY_SCAN=10 万条截断，一旦保留窗口内日志超过该数量，
+  // 会漏掉字典序末尾的「最新日志」，导致系统日志停在旧窗口、看起来"突然不记录了"。
+  // 因此必须遍历到 list_complete，保证最新日志一定能查到；
+  // 只设 MAX_LIST_PAGES 防单请求 subrequest 超限（每页 1 次 KV.list）。
+  const MAX_LIST_PAGES = 700 // 700 页 × 1000 = 70 万条，为后续 KV.get 留足 subrequest 余量
   const names: string[] = []
   let cursor: string | undefined
+  let listPages = 0
   do {
     const list = await c.env.KV.list({ prefix: LOG_PREFIX, limit: 1000, cursor })
     cursor = list.list_complete ? undefined : list.cursor
     for (const k of list.keys) names.push(k.name)
-  } while (cursor && names.length < MAX_KEY_SCAN)
+    listPages++
+  } while (cursor && listPages < MAX_LIST_PAGES)
   // key 名 = 'log:' + Date.now().toString(36) + 随机，字典序正序 = 旧→新；取最新在前
   names.reverse()
   const kvTotal = names.length
@@ -1676,8 +1701,9 @@ export async function handleLogs(c: Context<AppEnv>) {
     if (Number.isNaN(ts)) return true
     return ts >= startMs && ts <= endMs
   })
-  // 控 subrequest：候选 key 上限 SEARCH_SCAN（list 已用 ≤5，990 get = 995，留余量）
-  const scan = byDate.slice(0, SEARCH_SCAN)
+  // 控 subrequest：候选 key 上限 SEARCH_SCAN，并按已用 KV.list 页数动态收紧，
+  // 保证 listPages + KV.get 总数不超 Workers 单请求 1000 subrequest 上限。
+  const scan = byDate.slice(0, Math.min(SEARCH_SCAN, Math.max(0, 950 - listPages)))
   const matched: LogEntry[] = []
   for (let i = 0; i < scan.length; i += 25) {
     const raws = await Promise.all(scan.slice(i, i + 25).map((n) => c.env.KV.get(n)))

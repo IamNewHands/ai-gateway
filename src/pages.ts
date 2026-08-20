@@ -713,7 +713,7 @@ ${H('管理')}
         <div class="section-heading section-heading--admin"><div><h2 id="proxy-keys-title">转发 Key</h2><p>客户端使用这些 Key 访问统一的 <code>/v1</code> 接口。</p></div><button class="btn btn-p" onclick="genKey()"><i class="fas fa-plus" aria-hidden="true"></i>生成转发 Key</button></div>
         <div class="key-list">
           ${proxyKeys.length===0?'<div class="empty-state"><i class="fas fa-key" aria-hidden="true"></i><h3>暂无转发 Key</h3><p>生成一个 Key 后，客户端才能访问网关。</p><button class="btn btn-p" onclick="genKey()">生成转发 Key</button></div>':''}
-          ${proxyKeys.map(k=>`<article class="ki" data-id="${escapePageHtml(k.id)}"><div class="key-main"><span class="key-icon" aria-hidden="true"><i class="fas fa-key"></i></span><div><div class="kv"><span id="kv-${escapePageHtml(k.id)}" data-full="${escapePageHtml(k.key)}">${escapePageHtml(k.key.length>12?k.key.substring(0,8)+'••••'+k.key.substring(k.key.length-4):k.key)}</span><button class="icon-btn" onclick="toggleKeyVis('${escapePageJsx(k.id)}')" title="显示或隐藏" aria-label="显示或隐藏 Key"><i class="far fa-eye" aria-hidden="true"></i></button><button class="icon-btn" onclick='copyText("${escapePageJsx(k.key)}",this)' title="复制" aria-label="复制 Key"><i class="far fa-copy" aria-hidden="true"></i></button></div><h3>${escapePageHtml(k.name)}</h3><p>创建于 ${new Date(k.createdAt).toLocaleDateString()} · ${k.expiresAt?'有效至 '+new Date(k.expiresAt).toLocaleDateString():'永久有效'} · <span class="bd ${k.allowedModels&&k.allowedModels.length>0?'bd-on':'bd-off'}">${k.allowedModels&&k.allowedModels.length>0?k.allowedModels.length+' 个模型':'全部模型'}</span></p></div></div><div class="key-actions"><label class="tg"><input type="checkbox" ${k.enabled?'checked':''} onchange="toggleProxyKey('${escapePageJsx(k.id)}',this.checked)" aria-label="启用 ${escapePageHtml(k.name)}"><span class="sl"></span></label><span class="bd ${k.enabled?'bd-on':'bd-off'}">${k.enabled?'已启用':'已禁用'}</span><button class="btn btn-gh btn-xs" onclick="editKeyModels('${escapePageJsx(k.id)}')" title="模型筛选"><i class="fas fa-filter" aria-hidden="true"></i>模型筛选</button><button class="btn btn-d btn-xs" onclick="rmKey('${escapePageJsx(k.id)}')"><i class="fas fa-trash" aria-hidden="true"></i>删除</button></div></article>`).join('')}
+          ${proxyKeys.map(k=>`<article class="ki" data-id="${escapePageHtml(k.id)}"><div class="key-main"><span class="key-icon" aria-hidden="true"><i class="fas fa-key"></i></span><div><div class="kv"><span id="kv-${escapePageHtml(k.id)}" data-full="${escapePageHtml(k.key)}">${escapePageHtml(k.key.length>12?k.key.substring(0,8)+'••••'+k.key.substring(k.key.length-4):k.key)}</span><button class="icon-btn" onclick="toggleKeyVis('${escapePageJsx(k.id)}')" title="显示或隐藏" aria-label="显示或隐藏 Key"><i class="far fa-eye" aria-hidden="true"></i></button><button class="icon-btn" onclick='copyText("${escapePageJsx(k.key)}",this)' title="复制" aria-label="复制 Key"><i class="far fa-copy" aria-hidden="true"></i></button></div><h3>${escapePageHtml(k.name)}</h3><p>创建于 ${new Date(k.createdAt).toLocaleDateString()} · ${k.expiresAt?(new Date(k.expiresAt).getTime()>Date.now()?'有效至 '+new Date(k.expiresAt).toLocaleDateString():'<span class="c-d">已过期</span>'):'永久有效'} · <span class="bd ${k.allowedModels&&k.allowedModels.length>0?'bd-on':'bd-off'}">${k.allowedModels&&k.allowedModels.length>0?k.allowedModels.length+' 个模型':'全部模型'}</span></p></div></div><div class="key-actions"><label class="tg"><input type="checkbox" ${k.enabled?'checked':''} onchange="toggleProxyKey('${escapePageJsx(k.id)}',this.checked)" aria-label="启用 ${escapePageHtml(k.name)}"><span class="sl"></span></label><span class="bd ${k.enabled?'bd-on':'bd-off'}">${k.enabled?'已启用':'已禁用'}</span><button class="btn btn-gh btn-xs" onclick="editKeyExpiry('${escapePageJsx(k.id)}')" title="修改过期时间 / 续期"><i class="fas fa-clock" aria-hidden="true"></i>续期</button><button class="btn btn-gh btn-xs" onclick="editKeyModels('${escapePageJsx(k.id)}')" title="模型筛选"><i class="fas fa-filter" aria-hidden="true"></i>模型筛选</button><button class="btn btn-d btn-xs" onclick="rmKey('${escapePageJsx(k.id)}')"><i class="fas fa-trash" aria-hidden="true"></i>删除</button></div></article>`).join('')}
         </div>
       </section>
       <section id="logs" class="workspace-section" aria-labelledby="logs-title">
@@ -2200,6 +2200,57 @@ async function doGenKey(name) {
     } else toast(d.message || '生成失败', 'error')
   } catch (e) { toast('生成失败', 'error') }
   finally { adminSubmitting = false }
+}
+
+// 修改过期时间 / 续期：已过期的 Key 也能直接续期恢复，无需删掉重加（Key 字符串不变）
+async function editKeyExpiry(id) {
+  const keyRes = await fetch('/admin/api/proxy-keys')
+  const kd = await keyRes.json()
+  const key = (kd.data || []).find(function(k) { return k.id === id })
+  if (!key) { toast('Key 不存在', 'error'); return }
+  const expired = !!(key.expiresAt && new Date(key.expiresAt).getTime() <= Date.now())
+  const curText = expired ? '已过期，续期后立即恢复可用' : (key.expiresAt ? '当前有效至 ' + new Date(key.expiresAt).toLocaleString() : '当前永久有效')
+  showM('<h3><i class="fas fa-clock c-p"></i> 修改过期时间 / 续期</h3><p style="font-size:12px;color:var(--muted,#64748b)">' + escapeHtml(key.name) + (expired ? ' · <span class="c-d">已过期</span>' : '') + ' · ' + escapeHtml(curText) + '。新有效期从当前时间重新起算。</p><div class="fg"><label>有效期类型</label><select id="expType2" onchange="toggleKeyExpiry2()"><option value="preset" selected>预设</option><option value="custom">自定义</option><option value="forever">永久</option></select></div><div id="expPreset2" class="fg"><label>预设有效期</label><select id="exp2"><option value="30d">30 天</option><option value="90d">90 天</option><option value="180d">180 天</option><option value="1y">1 年</option></select></div><div id="expCustom2" class="fg hd"><label>自定义有效期</label><div class="fc"><input type="number" id="expVal2" min="1" max="3650" placeholder="数值" style="width:100px"><select id="expUnit2"><option value="d">天</option><option value="h">小时</option></select></div></div><div class="fa"><button class="btn btn-s" onclick="closeM()">取消</button><button class="btn btn-p" id="eKo">保存</button></div>')
+  window.toggleKeyExpiry2 = function() {
+    const t = document.getElementById('expType2').value
+    document.getElementById('expPreset2').classList.toggle('hd', t !== 'preset')
+    document.getElementById('expCustom2').classList.toggle('hd', t !== 'custom')
+  }
+  document.getElementById('eKo').addEventListener('click', function() { doEditKeyExpiry(id) })
+}
+
+async function doEditKeyExpiry(id) {
+  if (adminSubmitting) return  // 防重复提交（UX3）
+  const expType = document.getElementById('expType2').value
+  let body = {}
+  if (expType === 'preset') {
+    body.expiresIn = document.getElementById('exp2').value
+  } else if (expType === 'custom') {
+    const expVal = parseInt(document.getElementById('expVal2').value || '0', 10)
+    const expUnit = document.getElementById('expUnit2').value || 'd'
+    if (expVal <= 0) { toast('请输入有效的自定义有效期', 'error'); return }
+    if (expUnit === 'h') body.expiresInHours = expVal
+    else body.expiresInDays = expVal
+  } else {
+    body.expiresIn = 'forever'
+  }
+  const btn = document.getElementById('eKo')
+  adminSubmitting = true
+  busyBtn(btn)
+  try {
+    const r = await fetch('/admin/api/proxy-keys/' + encodeURIComponent(id), {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body)
+    })
+    const d = await r.json()
+    if (d.success) { toast(expType === 'forever' ? '已改为永久有效' : '续期成功', 'success'); closeM(); setTimeout(function() { reloadAdmin() }, 500) }
+    else toast(d.message || '保存失败', 'error')
+  } catch (e) { toast('保存失败', 'error') }
+  finally {
+    adminSubmitting = false
+    idleBtn(btn)
+  }
 }
 
 async function rmKey(id) {
