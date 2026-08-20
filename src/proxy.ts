@@ -637,11 +637,14 @@ export async function testModelConnection(
     }
 
     let errorBody = ''
+    // body 只能读一次：先取全文，再按 JSON 解析（json() 失败后 catch 里再 text()
+    // 会抛 "Body has already been used. Use tee() first"——同一 body 被消费两次）
+    const rawText = await response.text().catch(() => '')
     try {
-      const errorData = await response.json() as { error?: { message?: string } }
+      const errorData = JSON.parse(rawText) as { error?: { message?: string } }
       errorBody = errorData?.error?.message || JSON.stringify(errorData)
     } catch {
-      errorBody = await response.text()
+      errorBody = rawText
     }
 
     return {
@@ -1215,8 +1218,15 @@ export async function forwardProxy(
           continue
         }
 
-        // 其他错误（400/404 等）直接返回
-        const errorData = await response.json().catch(async () => ({ error: { message: await response.text() } }))
+        // 其他错误（400/404 等）直接返回。
+        // body 只能读一次：json() 失败后再 text() 会抛 "Body has already been used"，
+        // 改为先取全文再 JSON.parse。
+        const errRaw = await response.text().catch(() => '')
+        let errorData: any = { error: { message: errRaw || `HTTP ${response.status}` } }
+        try {
+          const parsed = JSON.parse(errRaw)
+          if (parsed && typeof parsed === 'object') errorData = parsed
+        } catch { /* 非 JSON，保留原文 */ }
         try { c.executionCtx.waitUntil(writeLog(c.env, 'error', `[${provider.name}] ${model} → ${response.status} ${forwardUrl}`, JSON.stringify({ error: errorData, body: summarizeRequestBody(forwardBody), url: forwardUrl }).substring(0, 4000))) } catch {}
         return c.json(errorData, response.status as Parameters<typeof c.json>[1])
       } catch (err) {
