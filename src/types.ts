@@ -51,6 +51,12 @@ export interface Provider {
    * 关闭（默认）则保持原有预配置校验。
    */
   allowUnlistedModels?: boolean
+  /**
+   * TRAE 首选账号 UID（面板下拉框手工指定，仅 trae 提供商生效）。
+   * 填写后转发时优先使用该账号（按 uid 精确匹配），
+   * 被冷却/禁用/失败时才回退到池内其他账号。留空 = 维持按剩余积分自动挑选。
+   */
+  preferTraeUid?: string
 }
 
 /**

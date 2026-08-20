@@ -118,16 +118,28 @@ export async function removeTraeAccount(env: Env, providerId: string, uid: strin
 
 // ===== 挑选 / 状态机 =====
 
-/** 挑选：healthy 中积分最高者；tried 中的 uid 跳过（请求级轮换）。 */
+/**
+ * 挑选账号：
+ *  - 若指定 preferUid（面板手工指定），且该 uid 账号 healthy 且尚未 tried，则优先返回它；
+ *  - 否则在 healthy 且未 tried 的账号中按剩余积分最多者挑选（原自动策略兜底）。
+ */
 export async function pickTraeAccount(
   env: Env,
   providerId: string,
   accounts: TraeAccount[],
-  tried: Set<string>
+  tried: Set<string>,
+  preferUid?: string
 ): Promise<TraeAccount | null> {
   if (accounts.length === 0) return null
   const pool = await readTraePool(env, providerId)
   const now = Date.now()
+
+  // 手工指定优先：精确匹配首选 uid，只在 healthy 且未 tried 时采用
+  if (preferUid) {
+    const preferred = accounts.find(a => a.uid === preferUid && !tried.has(a.uid) && isTraeHealthy(pool[a.uid], now))
+    if (preferred) return preferred
+  }
+
   let best: TraeAccount | null = null
   let bestCredits = -Infinity
   for (const a of accounts) {

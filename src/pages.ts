@@ -680,7 +680,7 @@ ${H('管理')}
               <fieldset class="form-group ${p.authType==='oauth-device'?'hd':''}" id="keys-fs-${escapePageHtml(p.id)}"><legend id="key-legend-${escapePageHtml(p.id)}">${isTraeProviderUI(p)?'TRAE 账号凭证（每个账号一行 JSON）':(p.id==='cline'?'Cline RefreshTokens（每个账号一行）':'上游 API Keys')}</legend><div id="keys-${escapePageHtml(p.id)}">${p.apiKeys.map((k, ki)=>`<div class="fc mb-3 field-row" data-kidx="${ki}"><input type="password" value="${escapePageHtml(k.key)}" class="fx1" id="k-${escapePageHtml(p.id)}-${ki}" placeholder="API Key" aria-label="API Key"><button class="icon-btn" onclick="toggleKeyText(this)" title="显示/隐藏 Key"><i class="fas fa-eye" aria-hidden="true"></i></button><label class="tg"><input type="checkbox" ${k.enabled?'checked':''} id="ken-${escapePageHtml(p.id)}-${ki}" aria-label="启用 Key"><span class="sl"></span></label><button class="btn btn-gh btn-xs" onclick="testKeyRow('${escapePageJsx(p.id)}',${ki})" title="测试 Key"><i class="fas fa-plug" aria-hidden="true"></i><span>测试</span></button><button class="icon-btn" onclick="rmKeyRow('${escapePageJsx(p.id)}',${ki})" aria-label="移除 Key"><i class="fas fa-times" aria-hidden="true"></i></button></div>`).join('')}</div><div class="fc mt-1 field-row"><input type="password" id="nk-${escapePageHtml(p.id)}" placeholder="${isTraeProviderUI(p)?'新的 TRAE 凭证 JSON（或点「登录账号」自动写入）':(p.id==='cline'?'新的 RefreshToken（一个账号一行）':'新的 API Key')}" class="fx1"><button class="btn btn-s btn-xs" onclick="addKeyRow('${escapePageJsx(p.id)}')"><i class="fas fa-plus" aria-hidden="true"></i>添加</button></div><span id="key-hint-${escapePageHtml(p.id)}" class="form-helper">${isTraeProviderUI(p)?'TRAE SOLO 账号凭证为登录后自动写入的 JSON（也可粘贴 trae 登录脚本落盘的 trae-*.json 内容）。每行一个账号、按剩余积分自动挑选，额度用尽自动冷却轮换；禁用该 Key 即停用账号。':(p.id==='cline'?'Cline 使用 Cline 账号的 refreshToken（长期钥匙）。每个账号一行，额度用完自动切换；留空禁用某个账号。':' ')}</span></fieldset>
               <fieldset class="form-group" id="models-fs-${escapePageHtml(p.id)}"><legend>模型</legend><div id="ml-${escapePageHtml(p.id)}">${p.models.map((m,mi)=>`<div class="fc mb-3 field-row" data-idx="${mi}"><input type="text" value="${escapePageHtml(m.id)}" class="fx1" id="mid-${escapePageHtml(p.id)}-${mi}" placeholder="模型 ID"><label class="tg"><input type="checkbox" ${m.enabled?'checked':''} id="men-${escapePageHtml(p.id)}-${mi}" aria-label="启用模型"><span class="sl"></span></label><button class="btn btn-gh btn-xs" onclick="testMdl('${escapePageJsx(p.id)}','${escapePageJsx(m.id)}',${mi})" title="测试模型"><i class="fas fa-plug" aria-hidden="true"></i><span>测试</span></button><button class="icon-btn" onclick="rmMdl('${escapePageJsx(p.id)}',${mi})" aria-label="移除模型"><i class="fas fa-times" aria-hidden="true"></i></button></div>`).join('')}</div><div class="fc mt-1 field-row"><input type="text" id="nmid-${escapePageHtml(p.id)}" placeholder="新的模型 ID" class="fx1"><button class="btn btn-s btn-xs" onclick="addMdl('${escapePageJsx(p.id)}')"><i class="fas fa-plus" aria-hidden="true"></i>添加</button></div></fieldset>
               ${isTraeProviderUI(p)?`
-              <fieldset class="form-group" id="trae-fs-${escapePageHtml(p.id)}"><legend>TRAE SOLO 账号池</legend><span class="form-helper">免费积分多账号反代：登录成功后凭证自动写入上方账号列表；转发时按剩余积分自动挑选账号，额度用尽自动冷却轮换（1005/429/401 各按策略冷却/禁用），每日 01:00/13:00 自动签到补积分并解冻。</span>
+              <fieldset class="form-group" id="trae-fs-${escapePageHtml(p.id)}"><legend>TRAE SOLO 账号池</legend><span class="form-helper">免费积分多账号反代：登录成功后凭证自动写入上方账号列表；转发时默认按剩余积分自动挑选账号，也可在下方「首选账号」下拉框中手工指定固定账号（被冷却/禁用/失败时才回退其他账号），额度用尽自动冷却轮换（1005/429/401 各按策略冷却/禁用），每日 01:00/13:00 自动签到补积分并解冻。</span>
                 <div class="fc mt-1 field-row">
                   <button class="btn btn-s" onclick="traeLogin('${escapePageJsx(p.id)}')"><i class="fas fa-sign-in-alt" aria-hidden="true"></i>登录账号</button>
                   <button class="btn btn-s" onclick="traeCheckin('${escapePageJsx(p.id)}')"><i class="fas fa-calendar-check" aria-hidden="true"></i>全部签到</button>
@@ -1626,7 +1626,18 @@ function traeStatus(id) {
     if (accs.length === 0) {
       box.innerHTML = '<p class="form-helper">暂无账号。点击「登录账号」添加第一个 TRAE 账号。</p>'
     } else {
-      box.innerHTML = '<div style="max-height:260px;overflow:auto"><table class="usage-log-table" style="margin:0">' +
+      const preferUid = d.data.preferTraeUid || ''
+      const opts = ['<option value="">自动挑选（按积分）</option>'].concat(accs.map(function (a) {
+        const sel = a.uid === preferUid ? ' selected' : ''
+        return '<option value="' + escapeHtml(a.uid) + '"' + sel + '>' + escapeHtml((a.nickname || a.uid)) + '</option>'
+      })).join('')
+      const preferBar = '<div class="fc mt-1 field-row" style="align-items:center;gap:8px"><label style="margin:0;white-space:nowrap">首选账号：</label>' +
+        '<select id="trae-prefer-' + escapeHtml(id) + '" class="select-sm" style="max-width:320px">' + opts + '</select>' +
+        '<button class="btn btn-s btn-xs" onclick="traeSetPrefer(\\'' + escapeJsAttr(id) + '\\')">指定</button>' +
+        '<button class="btn btn-gh btn-xs" onclick="traeSetPrefer(\\'' + escapeJsAttr(id) + '\\',\\'\\')">恢复自动</button>' +
+        '<span id="trae-prefer-msg-' + escapeHtml(id) + '"></span></div>'
+      box.innerHTML = preferBar +
+        '<div style="max-height:260px;overflow:auto"><table class="usage-log-table" style="margin:0">' +
         '<thead><tr><th>UID</th><th>昵称</th><th>积分</th><th>状态</th><th>冷却至</th><th>操作</th></tr></thead><tbody>' +
         accs.map(function (a) {
           const stTxt = a.disabled ? '<span style="color:var(--color-danger,#ef4444)">已禁用</span>' : a.cooling ? '<span style="color:var(--color-warn,#d97706)">冷却中</span>' : '<span style="color:var(--color-success,#16a34a)">正常</span>'
@@ -1640,6 +1651,22 @@ function traeStatus(id) {
     }
     renderTraeCheckin(id, checkin)
   }).catch(() => { if (st) showResult(st, false, '网络错误，请重试') })
+}
+function traeSetPrefer(id, forcedUid) {
+  const sel = document.getElementById('trae-prefer-' + id)
+  const msg = document.getElementById('trae-prefer-msg-' + id)
+  const uid = (forcedUid !== undefined ? forcedUid : ((sel || {}).value || '')).trim()
+  if (msg) msg.textContent = ''
+  fetch('/admin/api/trae/' + encodeURIComponent(id) + '/account/prefer', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ uid: uid }),
+  }).then(r => r.json()).then(d => {
+    if (!d.success) { if (msg) { msg.textContent = (d.message || '设置失败'); msg.style.color = 'var(--color-danger,#ef4444)' } return }
+    if (msg) { msg.textContent = (d.message || '已设置'); msg.style.color = 'var(--color-success,#16a34a)' }
+    if (sel) sel.value = uid
+    setTimeout(function () { traeStatus(id) }, 800)
+  }).catch(() => { if (msg) { msg.textContent = '网络错误，请重试'; msg.style.color = 'var(--color-danger,#ef4444)' } })
 }
 function traeRemoveAccount(id, uid) {
   cM('确定删除账号 ' + uid + ' 吗？该账号将退出账号池。').then(function (ok) {

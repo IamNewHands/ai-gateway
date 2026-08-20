@@ -477,8 +477,24 @@ export async function handleTraeStatus(c: Context<AppEnv>) {
   const checkin = await readCheckinResults(c.env, id)
   return c.json<ApiResponse>({
     success: true,
-    data: { accounts, checkin, accountCount: getTraeAccounts(provider).length },
+    data: { accounts, checkin, accountCount: getTraeAccounts(provider).length, preferTraeUid: provider.preferTraeUid || '' },
   })
+}
+
+/** POST /admin/api/trae/:id/account/prefer：设置首选账号（面板下拉框指定，留空则恢复自动挑选）。 */
+export async function handleTraeSetPrefer(c: Context<AppEnv>) {
+  const id = c.req.param('id') || ''
+  if (!id) return c.json<ApiResponse>({ success: false, message: '缺少 id 参数' }, 400)
+  const provider = await getProvider(c.env, id)
+  if (!provider) return c.json<ApiResponse>({ success: false, message: '提供商不存在' }, 404)
+  let body: { uid?: string } = {}
+  try { body = await c.req.json() } catch { /* 空 body */ }
+  const uid = (body.uid || '').trim()
+  // 校验 uid 必须是已配置账号，防止乱填
+  const uids = getTraeAccounts(provider).map(a => a.uid)
+  if (uid && !uids.includes(uid)) return c.json<ApiResponse>({ success: false, message: '账号不存在' }, 400)
+  await updateProvider(c.env, id, { preferTraeUid: uid || undefined })
+  return c.json<ApiResponse>({ success: true, message: uid ? '已指定首选账号 ' + uid : '已恢复自动挑选' })
 }
 
 /** POST /admin/api/trae/:id/account/remove：删除指定 uid 账号。 */

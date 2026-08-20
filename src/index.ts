@@ -73,6 +73,7 @@ import {
   handleTraeModels,
   handleTraeStatus,
   handleTraeAccountRemove,
+  handleTraeSetPrefer,
   runTraeCheckins,
   refreshTraeTokens,
 } from './trae/admin'
@@ -182,6 +183,7 @@ app.post('/admin/api/trae/:id/checkin', handleTraeCheckin)
 app.post('/admin/api/trae/:id/models', handleTraeModels)
 app.get('/admin/api/trae/:id/status', handleTraeStatus)
 app.post('/admin/api/trae/:id/account/remove', handleTraeAccountRemove)
+app.post('/admin/api/trae/:id/account/prefer', handleTraeSetPrefer)
 
 // Analytics Engine 总览与详细日志
 app.get('/admin/api/analytics/overview', handleAnalyticsOverview)

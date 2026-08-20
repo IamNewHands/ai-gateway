@@ -129,7 +129,7 @@ export async function proxyTraeChatRequest(
   let lastErr: Error | null = null
 
   for (let i = 0; i < MAX_ROTATE; i++) {
-    const account = await pickTraeAccount(env, provider.id, accounts, tried)
+    const account = await pickTraeAccount(env, provider.id, accounts, tried, provider.preferTraeUid)
     if (!account) break
     tried.add(account.uid)
 
