@@ -422,6 +422,7 @@ export async function chatStream(account: TraeAccount, bodyObj: Record<string, a
       method: 'POST',
       headers: soloHeaders(account, true),
       body: payload,
+      signal: AbortSignal.timeout(30000),
     })
   } catch (e) {
     throw new Error(`chat transport error: ${(e as Error).message || String(e)}`)
