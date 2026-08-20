@@ -11,7 +11,8 @@
  *      404 → 60s 短冷却（不累计 errCount）；其余 → 累计错误 3 次冷却 10m。
  */
 import type { Env, Provider } from '../types'
-import { TRAE_DEFAULT_MODEL, TRAE_STATIC_MODEL_IDS, normalizeTraeModelName } from './constants'
+import { withSSEKeepAlive } from '../opencode'
+import { TRAE_DEFAULT_MODEL, TRAE_KEEPALIVE_MS, TRAE_STATIC_MODEL_IDS, TRAE_STREAM_IDLE_TIMEOUT_MS, normalizeTraeModelName } from './constants'
 import { chatStream, exchangeToken, needsTraeRefresh } from './upstream'
 import { aggregateSoloSse, soloStreamToOpenAIStream } from './sse'
 import type { SOLOStreamError } from './types'
@@ -223,7 +224,15 @@ export async function proxyTraeChatRequest(
       }
       // 流内业务错误（1005 plan/5xx 等）→ 冷却账号，错误信息注入 SSE
       const onErr = (se: SOLOStreamError) => { void applyStreamError(env, provider.id, account.uid, se) }
-      return new Response(soloStreamToOpenAIStream(resp.body, configName, onErr), {
+      // 包 SSE 心跳 + idle 兜底：思考模型静默期客户端会因无事件 idle 超时判定流结束
+      //（实测 ~15-20s 自动截断），`: keep-alive\n\n` 注释行重置客户端计时器；上游
+      // 超过 TRAE_STREAM_IDLE_TIMEOUT_MS 完全无数据则主动结束流防挂起。
+      const sseBody = withSSEKeepAlive(
+        soloStreamToOpenAIStream(resp.body, configName, onErr),
+        TRAE_KEEPALIVE_MS,
+        TRAE_STREAM_IDLE_TIMEOUT_MS
+      )
+      return new Response(sseBody, {
         status: resp.status,
         headers: {
           'Content-Type': 'text/event-stream; charset=utf-8',

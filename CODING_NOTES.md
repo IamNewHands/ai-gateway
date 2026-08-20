@@ -110,5 +110,18 @@ TRAE 相关问题前先读本节。**
 
 ### 已知缺口
 
-- `/v1/responses`（Responses API）**尚无 TRAE 分支**，TRAE 模型走该端点会掉进通用转发失败。如需支持按上文「对接新接口」步骤补 `handleResponsesTrae`。
-- `/v1/responses` 同样无 Cline 分支。
+- ~~`/v1/responses`（Responses API）无 TRAE 分支~~ **已支持**：`handleResponses` 内加
+  `isTraeProvider` / `isClineProvider` 分支，复用 `handleResponsesSpecial`（OpenAI 请求体 →
+  专门转发函数拿 OpenAI SSE → `openAIChunkToResponsesSSE` 转 Responses SSE / `aggregateOpenAIToResponses` 聚合）。
+- `/v1/responses` 的 Gemini 分支尚未包 SSE 心跳（若 Gemini 思考模型静默期截断，参照 `handleResponsesSpecial` 的 `withSSEKeepAlive` 补上）。
+
+### 流式心跳配置（防模型静默期被客户端判为断流）
+
+TRAE 思考模型在推理阶段可能 15~20s 不发数据，客户端（AI SDK / iOS 严格解析器）通常有
+~15s 空闲超时，无数据即判定流结束 → 回答被截断。所有**发往客户端的 SSE 流**都应按需包
+`withSSEKeepAlive(stream, keepAliveMs, idleTimeoutMs)`（src/opencode.ts）：
+- 心跳：距上次输出超过 keepAliveMs 注入 `: keep-alive\n\n` 注释行（SSE 标准注释，客户端忽略但重置 idle 计时器）
+- idle 兜底：上游超过 idleTimeoutMs 完全无数据则主动结束流（防挂起）
+- TRAE 直出流（`trae/proxy.ts`）：`TRAE_KEEPALIVE_MS = 8000`、`TRAE_STREAM_IDLE_TIMEOUT_MS = 180000`
+- 转换后流（proxy.ts 的 Anthropic / Responses 转换）：`SSE_KEEPALIVE_MS = 8000`、`SSE_IDLE_TIMEOUT_MS = 180000`
+- 心跳注释行仅对**严格 SSE**（text/event-stream）安全；Anthropic / Responses 转换循环都以 `data:` 前缀过滤行，注释行会被自然跳过，不会污染解析

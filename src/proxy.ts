@@ -10,7 +10,9 @@ import {
   proxyOpenCodeRequest,
   resolveOpenCodeUrls,
   streamFetchWithTimeout,
+  withSSEKeepAlive,
   OPENCODE_KEEPALIVE_MS,
+  OPENCODE_STREAM_IDLE_TIMEOUT_MS,
 } from './opencode'
 import { isQoderProvider, proxyQoderChatRequest } from './qoder/proxy'
 import { isClineProvider, proxyClineChatRequest } from './cline/proxy'
@@ -43,6 +45,12 @@ interface KeyHealth {
   demotedAt?: number  // 首次达到降权阈值的时间戳 (Date.now())
 }
 type HealthMap = Record<string, KeyHealth>
+
+// 转换后 SSE 流（Anthropic/Responses）统一心跳配置：距上次输出超过 8s 注入
+// `: keep-alive\n\n` 注释行，防客户端（AI SDK / iOS 严格解析器，常见 ~15s 空闲超时）
+// 在模型静默期判定流结束而截断回答；上游超过 180s 完全无数据视为挂起，主动结束流。
+const SSE_KEEPALIVE_MS = 8000
+const SSE_IDLE_TIMEOUT_MS = 180000
 
 const HEALTH_KEY = (providerId: string) => KV_KEYS.KEY_HEALTH_PREFIX + providerId
 
@@ -1051,7 +1059,7 @@ export async function forwardProxy(
             controller.close()
           },
         })
-        return new Response(readable, {
+        return new Response(withSSEKeepAlive(readable, SSE_KEEPALIVE_MS, SSE_IDLE_TIMEOUT_MS), {
           status: 200,
           headers: {
             'Content-Type': 'text/event-stream',
@@ -1825,7 +1833,7 @@ export async function handleAnthropicMessages(c: Context<AppEnv>) {
           },
         })
 
-        return new Response(readable, {
+        return new Response(withSSEKeepAlive(readable, SSE_KEEPALIVE_MS, SSE_IDLE_TIMEOUT_MS), {
           status: 200,
           headers: {
             'Content-Type': 'text/event-stream',
@@ -1938,7 +1946,7 @@ export async function handleAnthropicMessages(c: Context<AppEnv>) {
             controller.close()
           },
         })
-        return new Response(readable, {
+        return new Response(withSSEKeepAlive(readable, SSE_KEEPALIVE_MS, SSE_IDLE_TIMEOUT_MS), {
           status: 200,
           headers: {
             'Content-Type': 'text/event-stream',
@@ -2717,6 +2725,16 @@ export async function handleResponses(c: Context<AppEnv>) {
       return await handleResponsesM365(c, provider, model, openaiBody, originalStream)
     }
 
+    // TRAE SOLO：账号池 + SOLO 协议转发（proxyTraeChatRequest 返回 OpenAI SSE），再转回 Responses 格式。
+    if (isTraeProvider(provider)) {
+      return handleResponsesSpecial(c, provider, model, openaiBody, originalStream, proxyTraeChatRequest, 'TRAE')
+    }
+
+    // Cline：refreshToken 账号池转发（proxyClineChatRequest 返回 OpenAI SSE），再转回 Responses 格式。
+    if (isClineProvider(provider.id)) {
+      return handleResponsesSpecial(c, provider, model, openaiBody, originalStream, proxyClineChatRequest, 'Cline')
+    }
+
     // OAuth 提供商
     if (provider.authType === 'oauth-device' && provider.oauth) {
       const cfg = provider.oauth
@@ -3144,7 +3162,7 @@ async function handleResponsesVisionBridge(
       },
     })
 
-    return new Response(readable, {
+    return new Response(withSSEKeepAlive(readable, SSE_KEEPALIVE_MS, SSE_IDLE_TIMEOUT_MS), {
       status: 200,
       headers: {
         'Content-Type': 'text/event-stream',

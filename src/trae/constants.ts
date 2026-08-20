@@ -29,6 +29,17 @@ export const TRAE_UA = `Trae/${TRAE_CONSTANTS.IdeVersion}`
 /** 默认模型（实测可用） */
 export const TRAE_DEFAULT_MODEL = 'glm-5.2'
 
+/**
+ * 流式响应心跳：距上次向客户端输出超过该值即注入 `: keep-alive\n\n` SSE 注释行。
+ * TRAE 思考模型在推理阶段可能长时间不发数据，客户端（AI SDK / iOS 严格解析器）通常
+ * 有 ~15s 的空闲超时，无数据即判定流结束 → 回答被截断（用户实测 15~20s 自动停止）。
+ * 心跳注释行客户端会忽略但能重置 idle 计时器（同 opencode 的 OPENCODE_KEEPALIVE_MS）。
+ */
+export const TRAE_KEEPALIVE_MS = 8000
+
+/** 流式 idle 兜底：上游超过该时长完全无数据视为挂起，主动结束流（防无限挂起）。 */
+export const TRAE_STREAM_IDLE_TIMEOUT_MS = 180000
+
 /** 静态 SOLO 模型表（32 个 config_name，来自逆向报告；动态拉取失败时回退） */
 export const TRAE_STATIC_MODEL_IDS: string[] = [
   'Doubao-Seed-2.1-Pro',
