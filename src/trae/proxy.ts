@@ -59,6 +59,60 @@ export function mapTraeModel(model: string, known: ReadonlySet<string>): string 
   throw new Error(`unknown model ${model}`)
 }
 
+/**
+ * 管理后台"测试连接"（handleTestModel 的 TRAE 分支）。
+ * 不能像普通 OpenAI 提供商那样 POST baseUrl/chat/completions——TRAE 上游是 SOLO 私有协议，
+ * 且账号凭证存于 provider.apiKeys（每个 key 是一个账号 JSON），Bearer 直发必然失败。
+ * 这里走真实账号池发最小请求验证：挑健康账号 → llm_utils_chat → 读到首个字节即视为连接成功。
+ */
+export async function testTraeModel(
+  env: Env,
+  provider: Provider,
+  modelId: string
+): Promise<{ success: boolean; message: string; statusCode?: number }> {
+  const known = new Set<string>()
+  for (const m of provider.models || []) known.add(m.id)
+  for (const id of TRAE_STATIC_MODEL_IDS) known.add(id)
+  let configName: string
+  try {
+    configName = mapTraeModel(modelId, known)
+  } catch {
+    return { success: false, message: `未知模型 ${modelId}` }
+  }
+  const accounts = getTraeAccounts(provider)
+  if (accounts.length === 0) {
+    return { success: false, message: '未配置 TRAE 账号，请先「登录账号」后再测试' }
+  }
+  const account = await pickTraeAccount(env, provider.id, accounts, new Set(), provider.preferTraeUid)
+  if (!account) {
+    return { success: false, message: '没有可用账号（全部冷却/禁用），请刷新状态或签到解冻' }
+  }
+  try {
+    const resp = await chatStream(account, {
+      model: configName,
+      messages: [{ role: 'user', content: 'hi' }],
+      max_tokens: 1,
+      stream: true,
+    })
+    if (!resp.body) return { success: false, message: '上游返回空响应体' }
+    // 读到首个字节即视为连接成功（minimal 请求，不校验内容）
+    const reader = resp.body.getReader()
+    const { value } = await reader.read()
+    await reader.cancel().catch(() => {})
+    if (!value || value.length === 0) {
+      return { success: false, message: '上游无输出（可能被限流或 plan 权益不足）' }
+    }
+    return { success: true, message: '连接成功', statusCode: resp.status }
+  } catch (e) {
+    const err = e as Error & { kind?: string; status?: number }
+    return {
+      success: false,
+      message: `连接失败: ${(err.message || '未知错误').substring(0, 200)}`,
+      statusCode: err.status,
+    }
+  }
+}
+
 /** OpenAI 兼容错误响应。 */
 function openaiError(status: number, code: string, message: string): Response {
   return new Response(JSON.stringify({

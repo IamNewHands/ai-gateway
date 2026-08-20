@@ -417,6 +417,11 @@ function normalizeStreamToolCalls(raw: unknown): unknown[] | null {
     }
     // 流式 tool_call 增量必须带 index，缺失时按数组位补
     if (typeof call['index'] !== 'number') call['index'] = i
+    // 空字符串 id / name 直接删掉，只保留非空值：
+    // 严格客户端（openai-node 等）对增量可能"覆盖"而非"补缺"，空 id/name 会把
+    // 首个 chunk 已落定的合法值冲掉，最终工具调用 id/函数名丢失 → 解析失败/报错。
+    if (typeof call['id'] === 'string' && call['id'] === '') delete call['id']
+    if (fn && typeof fn === 'object' && typeof fn['name'] === 'string' && fn['name'] === '') delete fn['name']
     // 剔除无实质内容的空条目（如 {index:0} 或 {function:{}}），避免噪音
     const hasId = typeof call['id'] === 'string' && call['id'] !== ''
     const hasFn = !!fn && typeof fn === 'object' && Object.keys(fn).length > 0

@@ -24,6 +24,7 @@ import {
   type CacheEntryView,
 } from './storage'
 import { testModelConnection } from './proxy'
+import { isTraeProvider, testTraeModel } from './trae/proxy'
 import { fetchOpenCodeModels, isOpenCodeProvider, resolveOpenCodeUrls, testOpenCodeModel } from './opencode'
 import { isQoderProvider, fetchQoderModels } from './qoder/proxy'
 import { isClineProvider, fetchClineModels, testClineChat, testClineRefreshToken, startClineOAuth, pollClineOAuth } from './cline/proxy'
@@ -477,6 +478,13 @@ export async function handleTestModel(c: Context<AppEnv>) {
   if (isClineProvider(provider.id)) {
     const tokens = provider.apiKeys.filter(k => k.enabled).map(k => k.key)
     const result = await testClineChat(tokens, modelId)
+    return c.json<ApiResponse>({ success: true, data: result })
+  }
+
+  // TRAE SOLO：账号池 + SOLO 协议测试（不能走通用 OpenAI /chat/completions——
+  // 上游是 SOLO 私有协议，账号凭证在 provider.apiKeys，Bearer 直发必然失败）
+  if (isTraeProvider(provider)) {
+    const result = await testTraeModel(c.env, provider, modelId)
     return c.json<ApiResponse>({ success: true, data: result })
   }
 
