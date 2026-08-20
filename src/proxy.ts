@@ -1858,7 +1858,10 @@ export async function handleAnthropicMessages(c: Context<AppEnv>) {
 
     // TRAE：账号池管理，转发 OpenAI 格式后转回 Anthropic SSE
     if (isTraeProvider(provider)) {
-      const response = await proxyTraeChatRequest(c.env, provider, openaiBody as Record<string, unknown>)
+      // 强制流式（TRAE 上游只支持流式 SSE），由本层决定是否转非流式 Anthropic
+      const upstreamBody: Record<string, unknown> = { ...openaiBody, stream: true }
+      sanitizeUpstreamBody(upstreamBody)
+      const response = await proxyTraeChatRequest(c.env, provider, upstreamBody)
       if (!response.ok) {
         const errText = await response.text()
         try {
