@@ -40,6 +40,9 @@ export const TRAE_KEEPALIVE_MS = 8000
 /** 流式 idle 兜底：上游超过该时长完全无数据视为挂起，主动结束流（防无限挂起）。 */
 export const TRAE_STREAM_IDLE_TIMEOUT_MS = 180000
 
+/** chatStream 连接+响应头超时：仅覆盖建立连接与收到响应头的阶段，响应头到达后取消。 */
+export const TRAE_CHAT_CONNECT_TIMEOUT_MS = 30000
+
 /** 静态 SOLO 模型表（32 个 config_name，来自逆向报告；动态拉取失败时回退） */
 export const TRAE_STATIC_MODEL_IDS: string[] = [
   'Doubao-Seed-2.1-Pro',

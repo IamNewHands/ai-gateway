@@ -2,7 +2,7 @@
  * upstream.ts — SOLO 上游 HTTP 客户端（移植自 traework2api/internal/upstream/client.go + headers.go）。
  * llm_utils_chat / get_detail_param / ExchangeToken / checkin_credits / ide_user_ent_usage + 错误分类。
  */
-import { TRAE_CONSTANTS, TRAE_UA } from './constants'
+import { TRAE_CHAT_CONNECT_TIMEOUT_MS, TRAE_CONSTANTS, TRAE_UA } from './constants'
 import { prepareBody } from './payload'
 import type { TraeAccount, TraeErrKind, TraeModelInfo } from './types'
 import type { Env } from '../types'
@@ -416,17 +416,25 @@ export async function fetchUserEntUsage(account: TraeAccount, env?: Env): Promis
  */
 export async function chatStream(account: TraeAccount, bodyObj: Record<string, any>): Promise<Response> {
   const payload = prepareBody(JSON.stringify(bodyObj))
+  // 流式响应不能设总超时：思考模型（glm-5.2/DeepSeek-V4-Pro 等）可能思考数十秒
+  // 才出首字节，AbortSignal.timeout(30s) 会从 fetch 开始计时、在思考期间把整个流
+  // 掐断（用户实测思考 ~25s 后输出被截断）。只对"建立连接 + 响应头"设超时，
+  // 响应头到达后取消计时，body 流交给上层 withSSEKeepAlive（180s idle 兜底）自然结束。
+  const controller = new AbortController()
+  const connectTimer = setTimeout(() => controller.abort(), TRAE_CHAT_CONNECT_TIMEOUT_MS)
   let response: Response
   try {
     response = await fetch(TRAE_CONSTANTS.AgentHost + TRAE_CONSTANTS.EpChat, {
       method: 'POST',
       headers: soloHeaders(account, true),
       body: payload,
-      signal: AbortSignal.timeout(30000),
+      signal: controller.signal,
     })
   } catch (e) {
+    clearTimeout(connectTimer)
     throw new Error(`chat transport error: ${(e as Error).message || String(e)}`)
   }
+  clearTimeout(connectTimer)
   if (response.status >= 400) {
     const raw = await response.text().catch(() => '')
     const kind = classifyTraeError(response.status, raw)
