@@ -149,7 +149,17 @@ export function aggregateSoloSse(text: string): { resp: Record<string, any> | nu
   if (reasoning !== '') message['reasoning_content'] = reasoning
   if (toolOrder.length > 0) {
     toolOrder.sort((a, b) => a - b)
-    message['tool_calls'] = toolOrder.map((idx) => toolCalls.get(idx))
+    // OpenAI 非流式 tool_call：不含 index（index 仅流式增量用），type 缺省补 function
+    message['tool_calls'] = toolOrder.map((idx) => {
+      const call = toolCalls.get(idx)
+      if (call && typeof call === 'object') {
+        delete call['index']
+        if (typeof call['type'] !== 'string' || call['type'] === '') call['type'] = 'function'
+      }
+      return call
+    })
+    // 本回合模型发起工具调用 → finish_reason 必须是 tool_calls（上游常自报 stop）
+    finishReason = 'tool_calls'
   }
 
   const resp: Record<string, any> = {
@@ -187,7 +197,7 @@ function mergeToolCallJSON(toolCalls: Map<number, Record<string, any>>, toolOrde
     if (typeof call['index'] === 'number') idx = call['index']
     let merged = toolCalls.get(idx)
     if (!merged) {
-      merged = { index: idx }
+      merged = { index: idx, type: 'function' }
       toolCalls.set(idx, merged)
       toolOrder.push(idx)
     }
@@ -248,9 +258,16 @@ export function soloStreamToOpenAIStream(
       const id = `chatcmpl-${Date.now()}`
       let pendingUsage: Record<string, any> | null = null
       let sawDone = false
+      let sawToolCalls = false
+      let sentRole = false
       let lineBuffer = ''
 
       const writeChunk = (delta: Record<string, any>, finish: string): void => {
+        // OpenAI 兼容客户端通常期望首块 delta 带 role（openai SDK / AI SDK 均按此解析）
+        if (!sentRole && Object.keys(delta).length > 0) {
+          delta['role'] = 'assistant'
+          sentRole = true
+        }
         const chunk: Record<string, any> = {
           id,
           object: 'chat.completion.chunk',
@@ -278,7 +295,10 @@ export function soloStreamToOpenAIStream(
               if (ev.reasoning !== '') delta['reasoning_content'] = ev.reasoning
               if (ev.toolCalls !== null && ev.toolCalls !== undefined && ev.toolCalls !== 'null') {
                 const tc = normalizeStreamToolCalls(ev.toolCalls)
-                if (tc) delta['tool_calls'] = tc
+                if (tc) {
+                  delta['tool_calls'] = tc
+                  sawToolCalls = true
+                }
               }
               if (Object.keys(delta).length > 0) writeChunk(delta, '')
               break
@@ -286,16 +306,27 @@ export function soloStreamToOpenAIStream(
             case 'token_usage':
               pendingUsage = ev.usage
               break
-            case 'done':
-              writeChunk({}, ev.finishReason)
+            case 'done': {
+              // 上游 SOLO 的 done 常自报 finish_reason=stop，即使本回合已发起工具调用。
+              // OpenAI 协议规定：消息含 tool_calls 时 finish_reason 必须是 tool_calls，
+              // 否则客户端（如 opencode 用的 AI SDK runToolsTransform）收不到收尾信号，
+              // 缓存的工具调用永不落定 → 报 "truncated: stream ended"。
+              // 仅兜底 stop/缺失：length/content_filter 等真实截断保留原值。
+              let finish = ev.finishReason
+              if (sawToolCalls && (finish === '' || finish === 'stop')) finish = 'tool_calls'
+              if (!finish) finish = sawToolCalls ? 'tool_calls' : 'stop'
+              writeChunk({}, finish)
               writeDone()
               sawDone = true
               break
+            }
             case 'error': {
               const se: SOLOStreamError = { code: ev.errorCode, msg: ev.errorMessage }
               if (onErr) onErr(se)
               const msg = `solo error code=${ev.errorCode} msg=${ev.errorMessage}`
               controller.enqueue(new TextEncoder().encode(`event: error\ndata: ${JSON.stringify(msg)}\n\n`))
+              // 仍补标准收尾 chunk + [DONE]，避免客户端因无 finish_reason 而报 truncated
+              writeChunk({}, sawToolCalls ? 'tool_calls' : 'stop')
               writeDone()
               sawDone = true
               break
@@ -341,14 +372,22 @@ export function soloStreamToOpenAIStream(
           processEvents([ev])
         }
       }
-      // 幂等兜底：上游中断（无 done）仍写 [DONE]
-      if (!sawDone) writeDone()
+      // 幂等兜底：上游中断（无 done）仍写标准收尾 chunk + [DONE]，
+      // 否则客户端收到 [DONE] 却无 finish_reason → "truncated: stream ended"。
+      if (!sawDone) {
+        writeChunk({}, sawToolCalls ? 'tool_calls' : 'stop')
+        writeDone()
+      }
       controller.close()
     },
   })
 }
 
-/** 把 SOLO output.tool_calls 条目转成 OpenAI 标准（function_call → function，清 SOLO 专属字段）。 */
+/**
+ * 把 SOLO output.tool_calls 条目转成 OpenAI 标准（function_call → function，清 SOLO 专属字段）。
+ * 过滤空 tool_calls 数组 / 空 function 对象等噪音（strict 客户端会因空数组解码失败），
+ * 并补齐流式必填的 index 字段。
+ */
 function normalizeStreamToolCalls(raw: unknown): unknown[] | null {
   let arr: any[] | null = null
   if (Array.isArray(raw)) {
@@ -362,8 +401,10 @@ function normalizeStreamToolCalls(raw: unknown): unknown[] | null {
       else if (parsed && typeof parsed === 'object') arr = [parsed]
     } catch { return null }
   }
-  if (!arr) return null
-  for (const call of arr) {
+  if (!arr || arr.length === 0) return null
+  const out: any[] = []
+  for (let i = 0; i < arr.length; i++) {
+    const call = arr[i]
     if (!call || typeof call !== 'object') continue
     if (call['function_call'] && typeof call['function_call'] === 'object') {
       call['function'] = call['function_call']
@@ -374,6 +415,13 @@ function normalizeStreamToolCalls(raw: unknown): unknown[] | null {
       delete fn['namespace']
       delete fn['partial_arguments']
     }
+    // 流式 tool_call 增量必须带 index，缺失时按数组位补
+    if (typeof call['index'] !== 'number') call['index'] = i
+    // 剔除无实质内容的空条目（如 {index:0} 或 {function:{}}），避免噪音
+    const hasId = typeof call['id'] === 'string' && call['id'] !== ''
+    const hasFn = !!fn && typeof fn === 'object' && Object.keys(fn).length > 0
+    if (!hasId && !hasFn && call['type'] === undefined) continue
+    out.push(call)
   }
-  return arr
+  return out.length > 0 ? out : null
 }

@@ -173,7 +173,8 @@ export async function proxyTraeChatRequest(
         status: resp.status,
         headers: {
           'Content-Type': 'text/event-stream; charset=utf-8',
-          'Cache-Control': 'no-cache',
+          'Cache-Control': 'no-store',
+          'X-Accel-Buffering': 'no',
           Connection: 'keep-alive',
         },
       })

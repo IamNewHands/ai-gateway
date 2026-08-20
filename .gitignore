@@ -6,3 +6,4 @@ dist/
 worker-configuration.d.ts
 .zcode/
 docs/
+.testout/
