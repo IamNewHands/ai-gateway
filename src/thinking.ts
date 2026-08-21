@@ -112,4 +112,10 @@ export async function applyThinkingInjection(
 
   const prompt = await getThinkingPrompt(env)
   messages.unshift({ role: 'system', content: prompt })
+
+  // 调试观测点：记录本次注入的提示词指纹（首行标记 + 长度），便于验证「改提示词后实时生效」
+  try {
+    const { writeLog } = await import('./admin')
+    await writeLog(env, 'info', `[thinking] 已向 model=${modelId} 注入思维引导`, `len=${prompt.length} head=${prompt.split('\n')[0]?.slice(0, 40) ?? ''}`)
+  } catch { /* 日志失败不影响注入 */ }
 }
