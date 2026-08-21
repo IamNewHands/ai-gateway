@@ -53,6 +53,8 @@ import {
   handleM365ConversationCleanup,
   handleM365TokenHealth,
   handleM365ClearCooldown,
+  handleGetThinkingPrompt,
+  handleSetThinkingPrompt,
 } from './admin'
 import { handleMcpJsonRpc } from './mcp-gateway'
 import { renderHomePage, renderLoginPage, renderAdminPage } from './pages'
@@ -213,6 +215,8 @@ app.delete('/admin/api/unimodels/:id', handleDeleteUnimodel)
 app.get('/admin/api/cache', handleGetCache)
 app.delete('/admin/api/cache', handleClearCache)
 app.delete('/admin/api/cache/:key', handleDeleteCache)
+app.get('/admin/api/thinking-prompt', handleGetThinkingPrompt)
+app.put('/admin/api/thinking-prompt', handleSetThinkingPrompt)
 
 // 签到（浏览器面板用，需 session 认证）
 app.get('/admin/api/checkin/status', handleCheckinStatus)

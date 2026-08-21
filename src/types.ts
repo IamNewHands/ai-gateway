@@ -57,6 +57,13 @@ export interface Provider {
    * 被冷却/禁用/失败时才回退到池内其他账号。留空 = 维持按剩余积分自动挑选。
    */
   preferTraeUid?: string
+  /**
+   * 思维模式引导注入（provider 级勾选哪些模型启用）。
+   * 值为需注入的模型 ID 数组（如 ['deepseek-v4-flash']）。命中的模型在转发前会被注入
+   * 一段固定的思维引导 system 提示词（见 src/thinking.ts），未勾选的模型原样转发。
+   * 留空/不配 = 全部模型不注入，零影响。
+   */
+  thinkingInject?: string[]
 }
 
 /**
@@ -282,6 +289,7 @@ export interface CreateProviderRequest {
   toolBridge?: boolean
   cnbPool?: { min?: number; max?: number; ttlMinutes?: number }
   allowUnlistedModels?: boolean
+  thinkingInject?: string[]
 }
 
 export interface UpdateProviderRequest {
@@ -300,6 +308,8 @@ export interface UpdateProviderRequest {
   toolBridge?: boolean | null
   cnbPool?: { min?: number; max?: number; ttlMinutes?: number } | null
   allowUnlistedModels?: boolean
+  /** 传空数组可清空思维引导注入选择 */
+  thinkingInject?: string[] | null
 }
 
 /**
@@ -322,6 +332,7 @@ export interface UpsertProviderRequest {
   toolBridge?: boolean
   cnbPool?: { min?: number; max?: number; ttlMinutes?: number }
   allowUnlistedModels?: boolean
+  thinkingInject?: string[]
 }
 
 /**

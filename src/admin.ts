@@ -220,6 +220,7 @@ export async function handleCreateProvider(c: Context<AppEnv>) {
     toolBridge: body.toolBridge,
     cnbPool: body.cnbPool,
     allowUnlistedModels: body.allowUnlistedModels,
+    thinkingInject: body.thinkingInject,
     apiKeys: normalizeArray(body.apiKeys, (k) => ({ key: k, enabled: true })),
     models: body.models
       ? normalizeArray(body.models, (m) => ({ id: m, enabled: true }))
@@ -258,6 +259,7 @@ export async function handleUpdateProvider(c: Context<AppEnv>) {
   if (body.toolBridge !== undefined) updates.toolBridge = body.toolBridge ?? undefined
   if (body.cnbPool !== undefined) updates.cnbPool = body.cnbPool ?? undefined
   if (body.allowUnlistedModels !== undefined) updates.allowUnlistedModels = body.allowUnlistedModels
+  if (body.thinkingInject !== undefined) updates.thinkingInject = body.thinkingInject ?? undefined
 if (body.apiKeys !== undefined) {
     updates.apiKeys = normalizeArray(body.apiKeys, (k) => ({ key: k, enabled: true }))
   }
@@ -327,6 +329,7 @@ export async function handleUpsertProvider(c: Context<AppEnv>) {
       enabled: body.enabled !== undefined ? body.enabled : true,
       toolBridge: body.toolBridge,
       cnbPool: body.cnbPool,
+      thinkingInject: body.thinkingInject,
       createdAt: now,
       updatedAt: now,
     }
@@ -347,6 +350,7 @@ export async function handleUpsertProvider(c: Context<AppEnv>) {
   if (body.authType !== undefined) updates.authType = body.authType
   if (body.toolBridge !== undefined) updates.toolBridge = body.toolBridge
   if (body.cnbPool !== undefined) updates.cnbPool = body.cnbPool
+  if (body.thinkingInject !== undefined) updates.thinkingInject = body.thinkingInject
   if (body.enabled !== undefined) updates.enabled = body.enabled
 
   // keys 合并：以现有为底，按 key 字符串去重追加，保留原 enabled
@@ -2068,4 +2072,22 @@ export async function handleM365ClearCooldown(c: Context<AppEnv>) {
     const msg = err instanceof Error ? err.message : String(err)
     return c.json({ error: { message: msg, type: 'internal_error' } }, 500)
   }
+}
+
+// ===== 思维引导提示词设置（KV 存储，管理后台可编辑）=====
+
+/** 读取当前生效的思维引导提示词（含是否自定义标记） */
+export async function handleGetThinkingPrompt(c: Context<AppEnv>) {
+  const { getThinkingPrompt, isThinkingPromptCustom, DEFAULT_THINKING_PROMPT } = await import('./thinking')
+  const [prompt, isCustom] = await Promise.all([getThinkingPrompt(c.env), isThinkingPromptCustom(c.env)])
+  return c.json<ApiResponse>({ success: true, data: { prompt, isCustom, defaultPrompt: DEFAULT_THINKING_PROMPT } })
+}
+
+/** 保存（或清空）思维引导提示词。body.prompt 为空 → 清空回退默认。 */
+export async function handleSetThinkingPrompt(c: Context<AppEnv>) {
+  const { setThinkingPrompt } = await import('./thinking')
+  const body = await c.req.json<{ prompt?: string }>()
+  const prompt = typeof body?.prompt === 'string' ? body.prompt : ''
+  await setThinkingPrompt(c.env, prompt)
+  return c.json<ApiResponse>({ success: true, message: '已保存' })
 }
