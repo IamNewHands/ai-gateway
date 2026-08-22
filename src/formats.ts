@@ -1624,7 +1624,7 @@ export function createAnthropicSSEToOpenAI(modelHint: string, options?: { includ
   }
 }
 
-export function createAnthropicSSEToResponses(modelHint: string) {
+export function createAnthropicSSEToResponses(modelHint: string, opts?: { onCompleted?: (info: { responseId: string; textContent: string; toolCalls: Array<{ id: string; name: string; args: string }> }) => void }) {
   const state = {
     responseId: `resp_${Math.random().toString(36).slice(2, 12)}`,
     model: modelHint,
@@ -1730,6 +1730,17 @@ export function createAnthropicSSEToResponses(modelHint: string) {
         for (const [idx, args] of state.toolArgs) {
           const meta = state.toolMeta.get(idx) || { id: `fc_${Math.random().toString(36).slice(2, 10)}`, name: state.functionCallName }
           output.push({ type: 'function_call', id: meta.id, call_id: meta.id, name: meta.name, arguments: args })
+        }
+        // G5：让代理层在流结束时拿到最终 assistant 结果，用于保存多轮记忆
+        if (opts?.onCompleted) {
+          try {
+            const toolCalls: Array<{ id: string; name: string; args: string }> = []
+            for (const [idx, args] of state.toolArgs) {
+              const meta = state.toolMeta.get(idx) || { id: state.functionCallId, name: state.functionCallName }
+              toolCalls.push({ id: meta.id, name: meta.name, args })
+            }
+            opts.onCompleted({ responseId: state.responseId, textContent: state.textContent, toolCalls })
+          } catch { /* onCompleted 失败不影响响应 */ }
         }
         out.push(ss('response.completed', {
           type: 'response.completed',

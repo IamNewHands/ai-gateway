@@ -581,6 +581,8 @@ async function proxyAnthropicNativeUpstream(
   openaiBody: Record<string, unknown>,
   originalStream: boolean,
   route: 'messages' | 'chat' | 'responses',
+  g5Base?: unknown[],
+  g5Save?: (respId: string, fullHistory: unknown[]) => void
 ): Promise<Response> {
   const enabledKeys = provider.apiKeys.filter((k) => k.enabled)
   if (enabledKeys.length === 0) {
@@ -660,7 +662,11 @@ async function proxyAnthropicNativeUpstream(
   if (originalStream && response.body) {
     const so = openaiBody['stream_options'] as Record<string, unknown> | undefined
     const includeUsage = route === 'chat' ? (so === undefined ? true : so['include_usage'] === true) : true
-    const conv = route === 'chat' ? createAnthropicSSEToOpenAI(model, { includeUsage }) : createAnthropicSSEToResponses(model)
+    const conv = route === 'chat' ? createAnthropicSSEToOpenAI(model, { includeUsage }) : createAnthropicSSEToResponses(model, {
+      onCompleted: g5Save && g5Base ? (info) => {
+        try { g5Save(info.responseId, [...g5Base, buildG5AssistantMessage(info.textContent, info.toolCalls)]) } catch {}
+      } : undefined,
+    })
     const readable = new ReadableStream({
       async start(controller) {
         const decoder = new TextDecoderStream()
@@ -710,6 +716,16 @@ async function proxyAnthropicNativeUpstream(
   const converted = route === 'chat'
     ? anthropicResponseToOpenAI(payload || {}, model)
     : anthropicResponseToResponses(payload || {}, model)
+  // G5: 非流式 responses 路径保存多轮历史
+  if (route === 'responses' && g5Base && g5Save) {
+    try {
+      const r = converted as Record<string, unknown>
+      g5Save(String(r['id'] ?? ''), [
+        ...g5Base,
+        responsesOutputToAssistantMessage(r['output'] as Array<Record<string, unknown>> | undefined),
+      ])
+    } catch { /* 保存失败不影响响应 */ }
+  }
   return c.json(converted)
 }
 
@@ -2928,32 +2944,32 @@ export async function handleResponses(c: Context<AppEnv>) {
 
     // Vision Bridge：图片转写后转发给主文本模型（OpenAI 格式），再转回 Responses 格式。
     if (isVisionBridgeProvider(provider)) {
-      return await handleResponsesVisionBridge(c, provider, model, openaiBody, originalStream)
+      return await handleResponsesVisionBridge(c, provider, model, openaiBody, originalStream, g5Base, g5Save)
     }
 
     // Gemini：OAuth 授权码转发（OpenAI 格式），再转回 Responses 格式。
     if (isGeminiProvider(provider)) {
-      return await handleResponsesGemini(c, provider, model, openaiBody, originalStream)
+      return await handleResponsesGemini(c, provider, model, openaiBody, originalStream, g5Base, g5Save)
     }
 
     // CNB：CSRF 凭证转发（OpenAI 格式），再转回 Responses 格式。
     if (isCnbProvider(provider)) {
-      return await handleResponsesCnb(c, provider, model, openaiBody, originalStream)
+      return await handleResponsesCnb(c, provider, model, openaiBody, originalStream, g5Base, g5Save)
     }
 
     // M365 Copilot：OAuth 授权码转发（OpenAI 格式），再转回 Responses 格式。
     if (isM365Provider(provider)) {
-      return await handleResponsesM365(c, provider, model, openaiBody, originalStream)
+      return await handleResponsesM365(c, provider, model, openaiBody, originalStream, g5Base, g5Save)
     }
 
     // TRAE SOLO：账号池 + SOLO 协议转发（proxyTraeChatRequest 返回 OpenAI SSE），再转回 Responses 格式。
     if (isTraeProvider(provider)) {
-      return handleResponsesSpecial(c, provider, model, openaiBody, originalStream, proxyTraeChatRequest, 'TRAE')
+      return handleResponsesSpecial(c, provider, model, openaiBody, originalStream, proxyTraeChatRequest, 'TRAE', g5Base, g5Save)
     }
 
     // Cline：refreshToken 账号池转发（proxyClineChatRequest 返回 OpenAI SSE），再转回 Responses 格式。
     if (isClineProvider(provider.id)) {
-      return handleResponsesSpecial(c, provider, model, openaiBody, originalStream, proxyClineChatRequest, 'Cline')
+      return handleResponsesSpecial(c, provider, model, openaiBody, originalStream, proxyClineChatRequest, 'Cline', g5Base, g5Save)
     }
 
     // OAuth 提供商
@@ -3085,6 +3101,10 @@ export async function handleResponses(c: Context<AppEnv>) {
                 ))
               } catch { /* enqueue failed */ }
             }
+            // G5: 流式结束后保存多轮历史
+            try {
+              if (g5Base && g5Save) g5Save(acc.responseId || `resp_${Date.now()}`, [...g5Base, buildG5AssistantMessage(acc.textContent, acc.toolCalls)])
+            } catch { /* 保存失败不影响响应 */ }
             controller.close()
           },
         })
@@ -3128,13 +3148,17 @@ export async function handleResponses(c: Context<AppEnv>) {
 
       // 聚合为 OpenAI chat.completion 再转为 Responses
       const openaiResp = aggregateOpenAIToResponses(allChunks)
+      // G5: 保存本轮历史
+      try {
+        if (g5Base && g5Save) g5Save(String(openaiResp['id'] ?? ''), [...g5Base, responsesOutputToAssistantMessage(openaiResp['output'] as Array<Record<string, unknown>> | undefined)])
+      } catch { /* 保存失败不影响响应 */ }
       return c.json(openaiResp)
     }
 
     // Anthropic 原生上游（provider.apiType === 'anthropic'，如 api.anthropic.com）：
     // 请求体/认证头/路径都转成 Anthropic 原生格式，响应再转回 OpenAI Responses 格式
     if (provider.apiType === 'anthropic') {
-      return await proxyAnthropicNativeUpstream(c, provider, providerId, modelId, openaiBody, originalStream, 'responses')
+      return await proxyAnthropicNativeUpstream(c, provider, providerId, modelId, openaiBody, originalStream, 'responses', g5Base, g5Save)
     }
 
     // 非 OAuth 提供商：用 apiKey 标准转发，始终发 OpenAI 格式到上游
@@ -3313,12 +3337,26 @@ export async function handleResponses(c: Context<AppEnv>) {
  * 图片转写 → 替换图片块 → 递归 forwardProxy 发给 primary（OpenAI 格式）→
  * 将 primary 的 OpenAI 响应转回 Responses 格式（流式 / 非流式）。
  */
+/**
+ * G5 辅助：把流式 acc 累积的文本与工具调用，整理成一条 OpenAI Chat 格式的 assistant 消息。
+ */
+function buildG5AssistantMessage(textContent: string, toolCalls: Map<number, { id: string; name: string; args: string }> | Array<{ id: string; name: string; args: string }>): Record<string, unknown> {
+  const calls: Array<Record<string, unknown>> = []
+  const list = toolCalls instanceof Map ? Array.from(toolCalls.values()) : toolCalls
+  for (const t of list) calls.push({ id: t.id, type: 'function', function: { name: t.name, arguments: t.args } })
+  const msg: Record<string, unknown> = { role: 'assistant', content: textContent || null }
+  if (calls.length > 0) msg['tool_calls'] = calls
+  return msg
+}
+
 async function handleResponsesVisionBridge(
   c: Context<AppEnv>,
   provider: import('./types').Provider,
   model: string,
   openaiBody: Record<string, unknown>,
-  originalStream: boolean
+  originalStream: boolean,
+  g5Base?: unknown[],
+  g5Save?: (respId: string, fullHistory: unknown[]) => void
 ): Promise<Response> {
   // 1. 图片转写（含无图直通 primary），model 已被替换为 primary 的 providerId/modelId 引用
   const vbResult = await buildVisionBridgeRequestBody(c.env, provider, openaiBody as ProxyRequestBody)
@@ -3398,6 +3436,10 @@ async function handleResponsesVisionBridge(
             ))
           } catch { /* enqueue failed */ }
         }
+        // G5: 流式结束后保存多轮历史（已解析历史 + 本次输入 + assistant 输出）
+        try {
+          if (g5Base && g5Save) g5Save(acc.responseId || `resp_${Date.now()}`, [...g5Base, buildG5AssistantMessage(acc.textContent, acc.toolCalls)])
+        } catch { /* 保存失败不影响响应 */ }
         controller.close()
       },
     })
@@ -3439,6 +3481,10 @@ async function handleResponsesVisionBridge(
   } catch { /* stream error */ }
 
   const openaiResp = aggregateOpenAIToResponses(allChunks)
+  // G5: 保存本轮历史（已解析历史 + 本次输入 + assistant 输出）
+  try {
+    if (g5Base && g5Save) g5Save(String(openaiResp['id'] ?? ''), [...g5Base, responsesOutputToAssistantMessage(openaiResp['output'] as Array<Record<string, unknown>> | undefined)])
+  } catch { /* 保存失败不影响响应 */ }
   return c.json(openaiResp)
 }
 
@@ -3451,9 +3497,11 @@ async function handleResponsesGemini(
   provider: import('./types').Provider,
   model: string,
   openaiBody: Record<string, unknown>,
-  originalStream: boolean
+  originalStream: boolean,
+  g5Base?: unknown[],
+  g5Save?: (respId: string, fullHistory: unknown[]) => void
 ): Promise<Response> {
-  return handleResponsesSpecial(c, provider, model, openaiBody, originalStream, proxyGeminiChatRequest, 'Gemini')
+  return handleResponsesSpecial(c, provider, model, openaiBody, originalStream, proxyGeminiChatRequest, 'Gemini', g5Base, g5Save)
 }
 
 /** 特殊提供商（Gemini/CNB 等）的 Responses 格式转发共用实现。 */
@@ -3464,7 +3512,9 @@ async function handleResponsesSpecial(
   openaiBody: Record<string, unknown>,
   originalStream: boolean,
   proxyFn: SpecialChatProxy,
-  label: string
+  label: string,
+  g5Base?: unknown[],
+  g5Save?: (respId: string, fullHistory: unknown[]) => void
 ): Promise<Response> {
   // 上游支持流式；统一强制流式，由客户端格式决定最终转换
   const upstreamBody: Record<string, unknown> = { ...openaiBody, stream: true }
@@ -3556,6 +3606,10 @@ async function handleResponsesSpecial(
             ))
           } catch { /* enqueue failed */ }
         }
+        // G5: 流式结束后保存多轮历史
+        try {
+          if (g5Base && g5Save) g5Save(acc.responseId || `resp_${Date.now()}`, [...g5Base, buildG5AssistantMessage(acc.textContent, acc.toolCalls)])
+        } catch { /* 保存失败不影响响应 */ }
         controller.close()
       },
     })
@@ -3597,6 +3651,10 @@ async function handleResponsesSpecial(
   } catch { /* stream error */ }
 
   const openaiResp = aggregateOpenAIToResponses(allChunks)
+  // G5: 保存本轮历史
+  try {
+    if (g5Base && g5Save) g5Save(String(openaiResp['id'] ?? ''), [...g5Base, responsesOutputToAssistantMessage(openaiResp['output'] as Array<Record<string, unknown>> | undefined)])
+  } catch { /* 保存失败不影响响应 */ }
   return c.json(openaiResp)
 }
 
@@ -3609,9 +3667,11 @@ async function handleResponsesCnb(
   provider: import('./types').Provider,
   model: string,
   openaiBody: Record<string, unknown>,
-  originalStream: boolean
+  originalStream: boolean,
+  g5Base?: unknown[],
+  g5Save?: (respId: string, fullHistory: unknown[]) => void
 ): Promise<Response> {
-  return handleResponsesSpecial(c, provider, model, openaiBody, originalStream, proxyCnbChatRequest, 'CNB')
+  return handleResponsesSpecial(c, provider, model, openaiBody, originalStream, proxyCnbChatRequest, 'CNB', g5Base, g5Save)
 }
 
 /**
@@ -3623,12 +3683,14 @@ async function handleResponsesM365(
   provider: import('./types').Provider,
   model: string,
   openaiBody: Record<string, unknown>,
-  originalStream: boolean
+  originalStream: boolean,
+  g5Base?: unknown[],
+  g5Save?: (respId: string, fullHistory: unknown[]) => void
 ): Promise<Response> {
   // 透传 X-M365-Session-Id 请求头到 body（Responses 路径无 context 直传，靠 extractExplicitSession 识别）
   const sid = c.req.header('X-M365-Session-Id')
   if (sid) openaiBody['m365_session_id'] = sid
-  return handleResponsesSpecial(c, provider, model, openaiBody, originalStream, proxyM365ChatRequest, 'M365')
+  return handleResponsesSpecial(c, provider, model, openaiBody, originalStream, proxyM365ChatRequest, 'M365', g5Base, g5Save)
 }
 
 /**
