@@ -858,6 +858,38 @@ export function aggregateOpenAIToResponses(chunks: OpenAIChunk[]): Record<string
   }
 }
 
+/**
+ * G5：把 Responses 的输出项整理成一条 OpenAI Chat 格式的 assistant 消息，
+ * 用于存入 KV 多轮历史，供下一轮 previous_response_id 解析往返。
+ */
+export function responsesOutputToAssistantMessage(output: Array<Record<string, unknown>> | undefined): Record<string, unknown> {
+  const contentParts: string[] = []
+  const toolCalls: Array<Record<string, unknown>> = []
+  for (const item of output || []) {
+    const type = item['type']
+    if (type === 'output_text' && typeof item['text'] === 'string') {
+      contentParts.push(item['text'] as string)
+    } else if (type === 'message' && Array.isArray(item['content'])) {
+      for (const c of item['content'] as Array<Record<string, unknown>>) {
+        if (c['type'] === 'output_text' && typeof c['text'] === 'string') contentParts.push(c['text'] as string)
+      }
+    } else if (type === 'function_call') {
+      const args = item['arguments']
+      toolCalls.push({
+        id: (item['id'] as string) || '',
+        type: 'function',
+        function: {
+          name: (item['name'] as string) || '',
+          arguments: typeof args === 'string' ? args : JSON.stringify(args ?? {}),
+        },
+      })
+    }
+  }
+  const msg: Record<string, unknown> = { role: 'assistant', content: contentParts.length > 0 ? contentParts.join('') : null }
+  if (toolCalls.length > 0) msg['tool_calls'] = toolCalls
+  return msg
+}
+
 // ============================================================
 //  OpenAI Responses API ← Chat Completions  格式转换
 // ============================================================
@@ -1328,6 +1360,11 @@ export function openAIRequestToAnthropic(openaiReq: Record<string, unknown>): Re
     stream: openaiReq['stream'] ?? false,
   }
 
+  // G1: Anthropic 无原生 response_format，将 json_object/json_schema 约束注入 system 提示词
+  const rf = openaiReq['response_format'] as Record<string, unknown> | undefined
+  if (rf && (rf['type'] === 'json_object' || rf['type'] === 'json_schema')) {
+    systemParts.push('You must respond with valid JSON.')
+  }
   if (systemParts.length > 0) body['system'] = systemParts.join('\n\n')
 
   // max_tokens 必填（Anthropic）：取 max_tokens / max_completion_tokens，缺省给 4096
@@ -1336,8 +1373,12 @@ export function openAIRequestToAnthropic(openaiReq: Record<string, unknown>): Re
 
   if (openaiReq['temperature'] !== undefined) body['temperature'] = openaiReq['temperature']
   if (openaiReq['top_p'] !== undefined) body['top_p'] = openaiReq['top_p']
-  if (Array.isArray(openaiReq['stop']) && (openaiReq['stop'] as unknown[]).length > 0) {
-    body['stop_sequences'] = openaiReq['stop']
+  // G3a: stop 兼容字符串与数组（Anthropic 需要数组形态的 stop_sequences）
+  const stopVal = openaiReq['stop']
+  if (typeof stopVal === 'string' && stopVal) {
+    body['stop_sequences'] = [stopVal]
+  } else if (Array.isArray(stopVal) && (stopVal as unknown[]).length > 0) {
+    body['stop_sequences'] = stopVal
   }
 
   // tools：OpenAI function → Anthropic {name, description, input_schema}
@@ -1392,6 +1433,11 @@ export function openAIRequestToAnthropic(openaiReq: Record<string, unknown>): Re
 
   // parallel_tool_calls=false → disable_parallel_tool_use
   if (openaiReq['parallel_tool_calls'] === false) body['disable_parallel_tool_use'] = true
+
+  // G3b: user → metadata.user_id（Anthropic 可用 metadata 携带用户标识）
+  if (typeof openaiReq['user'] === 'string' && openaiReq['user']) {
+    body['metadata'] = { user_id: openaiReq['user'] }
+  }
 
   return body
 }
@@ -1493,7 +1539,7 @@ export function anthropicResponseToResponses(
 //  （eventName + data）调用 conv(eventName, data)，返回 OpenAI SSE 片段数组。
 // ============================================================
 
-export function createAnthropicSSEToOpenAI(modelHint: string) {
+export function createAnthropicSSEToOpenAI(modelHint: string, options?: { includeUsage?: boolean }) {
   const state = {
     messageId: `chatcmpl_${Math.random().toString(36).slice(2, 12)}`,
     model: modelHint,
@@ -1547,7 +1593,11 @@ export function createAnthropicSSEToOpenAI(modelHint: string) {
           out.push(chunk({ reasoning_content: d['thinking'] }))
         } else if (d?.['type'] === 'input_json_delta' && d['partial_json']) {
           const idx = state.blockToTool.get(data['index'] as number) ?? 0
-          out.push(chunk({ tool_calls: [{ index: idx, function: { arguments: d['partial_json'] } }] }))
+          // G4: 工具参数按 512 字符分片输出，避免超大单帧撑爆客户端单帧缓冲
+          const argStr = String(d['partial_json'])
+          for (let off = 0; off < argStr.length; off += 512) {
+            out.push(chunk({ tool_calls: [{ index: idx, function: { arguments: argStr.slice(off, off + 512) } }] }))
+          }
         }
         break
       }
@@ -1556,11 +1606,11 @@ export function createAnthropicSSEToOpenAI(modelHint: string) {
         const dd = data['delta'] as Record<string, unknown> | undefined
         state.outputTokens = ((data['usage'] as Record<string, number> | undefined)?.['output_tokens']) ?? state.outputTokens
         state.finished = true
-        out.push(chunk({}, mapAnthropicStopReason(dd?.['stop_reason'] as string), {
-          prompt_tokens: state.inputTokens,
-          completion_tokens: state.outputTokens,
-          total_tokens: state.inputTokens + state.outputTokens,
-        }))
+        // G2: stream_options.include_usage=false 时，结束分片不再携带 usage（默认 true 保持原有行为）
+        const use = (options?.includeUsage ?? true)
+          ? { prompt_tokens: state.inputTokens, completion_tokens: state.outputTokens, total_tokens: state.inputTokens + state.outputTokens }
+          : undefined
+        out.push(chunk({}, mapAnthropicStopReason(dd?.['stop_reason'] as string), use))
         break
       }
       case 'message_stop': {

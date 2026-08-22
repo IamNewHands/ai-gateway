@@ -1,5 +1,5 @@
 import { Context } from 'hono'
-import { getProvider, getProviders, getModelsListCache, setModelsListCache, getUnimodel, getUnimodels, resolveProviderBaseUrl } from './storage'
+import { getProvider, getProviders, getModelsListCache, setModelsListCache, getUnimodel, getUnimodels, resolveProviderBaseUrl, getResponseHistory, saveResponseHistory } from './storage'
 import { KV_KEYS, KEY_HEALTH_COOLDOWN_MS, KEY_HEALTH_MAX_FAILURES, UNIMODEL_PROVIDER_ID } from './config'
 import type { AppEnv, Env, ProxyRequestBody } from './types'
 import { createAnalyticsContext, normalizeAnthropicUsage, normalizeChatUsage, normalizeResponsesUsage, summarizeError } from './analytics/types'
@@ -34,6 +34,7 @@ import {
   responsesToOpenAI,
   openAIToResponses,
   openAIChunkToResponsesSSE,
+  responsesOutputToAssistantMessage,
   aggregateOpenAIToResponses,
   finalizeAnthropicStream,
   diagnoseAnthropicAccumulator,
@@ -657,7 +658,9 @@ async function proxyAnthropicNativeUpstream(
 
   // 流式：Anthropic SSE → OpenAI SSE / Responses SSE 实时转换
   if (originalStream && response.body) {
-    const conv = route === 'chat' ? createAnthropicSSEToOpenAI(model) : createAnthropicSSEToResponses(model)
+    const so = openaiBody['stream_options'] as Record<string, unknown> | undefined
+    const includeUsage = route === 'chat' ? (so === undefined ? true : so['include_usage'] === true) : true
+    const conv = route === 'chat' ? createAnthropicSSEToOpenAI(model, { includeUsage }) : createAnthropicSSEToResponses(model)
     const readable = new ReadableStream({
       async start(controller) {
         const decoder = new TextDecoderStream()
@@ -2888,10 +2891,29 @@ export async function handleResponses(c: Context<AppEnv>) {
     const responsesReq = responsesBody as any
     const openaiBody = responsesToOpenAI(responsesReq)
     openaiBody['model'] = modelId
+
+    // G5：解析 previous_response_id 指定的多轮历史（在缓存前缀/思维注入之前，避免把网关提示词写入会话历史）。
+    // g5Base = 已解析历史 + 本次输入（副本，防止随后的 unshift 注入污染会话历史）。
+    const inputMsgs = ((openaiBody['messages'] as unknown[]) || [])
+    let g5Base = [...inputMsgs]
+    const prevRespId = responsesBody['previous_response_id']
+    if (prevRespId) {
+      const prior = await getResponseHistory(c.env, String(prevRespId))
+      if (prior && prior.length > 0) {
+        openaiBody['messages'] = [...prior, ...inputMsgs]
+        g5Base = [...prior, ...g5Base]
+      }
+    }
+
     // 缓存前缀注入：提供商勾选该模型时，在 messages 头部注入固定缓存前缀（提升前缀缓存命中率）
     await applyCachePrefixInjection(c.env, provider, modelId, openaiBody)
     // 思维模式引导注入：提供商勾选该模型时，在 messages 头部注入思维引导 system 提示词
     await applyThinkingInjection(c.env, provider, modelId, openaiBody)
+
+    // G5：把「已解析历史 + 本次输入 + assistant 输出」按 response.id 存入 KV
+    const g5Save = (respId: string, fullHistory: unknown[]) => {
+      try { c.executionCtx.waitUntil(saveResponseHistory(c.env, respId, fullHistory)) } catch {}
+    }
 
     const originalStream = responsesReq.stream === true
 
@@ -3216,6 +3238,14 @@ export async function handleResponses(c: Context<AppEnv>) {
               }
             }
           } catch { /* stream error */ }
+          // G5: 本次流式结束后，保存「已解析历史 + 本次输入 + assistant 输出」供下一轮 previous_response_id
+          try {
+            const toolCalls: Array<Record<string, unknown>> = []
+            for (const [, t] of acc.toolCalls) toolCalls.push({ id: t.id, type: 'function', function: { name: t.name, arguments: t.args } })
+            const am = { role: 'assistant', content: acc.textContent || null } as Record<string, unknown>
+            if (toolCalls.length > 0) am['tool_calls'] = toolCalls
+            g5Save(acc.responseId || `resp_${Date.now()}`, [...g5Base, am])
+          } catch { /* 保存失败不影响响应 */ }
           // 确保发送 response.completed
           if (!acc.completed) {
             try {
@@ -3266,6 +3296,11 @@ export async function handleResponses(c: Context<AppEnv>) {
     } catch { /* stream error */ }
 
     const openaiResp = aggregateOpenAIToResponses(allChunks)
+    // G5: 保存本轮历史（已解析历史 + 本次输入 + assistant 输出）
+    try {
+      const am = responsesOutputToAssistantMessage(openaiResp['output'] as Array<Record<string, unknown>> | undefined)
+      g5Save(String(openaiResp['id'] ?? ''), [...g5Base, am])
+    } catch { /* 保存失败不影响响应 */ }
     return c.json(openaiResp)
   } catch (err) {
     console.error('[responses] error:', err)

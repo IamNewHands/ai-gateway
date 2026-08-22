@@ -1016,27 +1016,49 @@ function tog(id) {
 function reloadAdmin() {
   markSaved()  // UX8：保存成功即将刷新，清除未保存标记
   try {
+    // 关闭浏览器原生「按历史恢复滚动」，避免它和我们的恢复互相打架（尤其面板收起导致
+    // 页面高度变化时，原生恢复会被 clamp 到错误位置，表现为「刷新后不在原位置」）。
+    if ('scrollRestoration' in history) history.scrollRestoration = 'manual'
     const open = []
     document.querySelectorAll('.pd.open').forEach(function (d) { if (d.id) open.push(d.id) })
     const af = document.getElementById('af')
+    // 额外记住当前展开/收起表单时的滚动基线，供下方恢复时判断页面是否已被外界改动
+    uiScroll = window.scrollY
     localStorage.setItem('ui_state', JSON.stringify({ y: window.scrollY, open: open, add: !!(af && !af.classList.contains('hd')) }))
   } catch (e) { /* 忽略存储失败 */ }
   location.reload()
 }
+// 保存本次 reload 想要恢复到的那一版滚动位置（供 load 事件二次矫正用）
+let uiScroll = 0
+// 真正执行滚动复位（幂等，可多次调用）：只有文档高度足够时才生效，否则等下一次回调
+function applyUiScroll() {
+  try {
+    const y = uiScroll || 0
+    const max = Math.max(document.documentElement.scrollHeight, document.body.scrollHeight)
+    if (y > 0 && y <= max) window.scrollTo(0, y)
+  } catch (e) { /* 忽略 */ }
+}
 function restoreAdminState() {
   try {
     const s = JSON.parse(localStorage.getItem('ui_state') || 'null')
-    if (!s) { return }
-    (s.open || []).forEach(function (panelId) {
-      const d = document.getElementById(panelId)
-      const c = document.getElementById('ch-' + String(panelId).replace(/^dt-/, ''))
-      if (d && d.classList && !d.classList.contains('open')) { d.classList.add('open'); if (c) c.style.transform = 'rotate(90deg)' }
-    })
-    if (s.add) { const af = document.getElementById('af'); if (af) af.classList.remove('hd') }
-    if (s.y) window.scrollTo(0, s.y)
+    if (s) {
+      (s.open || []).forEach(function (panelId) {
+        const d = document.getElementById(panelId)
+        const c = document.getElementById('ch-' + String(panelId).replace(/^dt-/, ''))
+        if (d && d.classList && !d.classList.contains('open')) { d.classList.add('open'); if (c) c.style.transform = 'rotate(90deg)' }
+      })
+      if (s.add) { const af = document.getElementById('af'); if (af) af.classList.remove('hd') }
+      if (typeof s.y === 'number') uiScroll = s.y
+    }
   } catch (e) { /* 忽略损坏的状态 */ }
+  // 首次：等一帧（重开面板后高度同步变化），load 事件时再矫正一次（图片/字体加载完）
+  // 避免过早 scrollTo 被文档高度还没长全而 clamp 掉（这正是"刷新后不在原位置"的根因）。
+  applyUiScroll()
+  requestAnimationFrame(applyUiScroll)
   try { localStorage.removeItem('ui_state') } catch (e) { /* 忽略 */ }
 }
+// 图片/图标/懒加载内容落定后再矫正一次滚动，保证回到用户原来停的位置
+window.addEventListener('load', function () { applyUiScroll() })
 
 // UX3：表单提交中状态——防重复提交，按钮显示「处理中」
 let adminSubmitting = false

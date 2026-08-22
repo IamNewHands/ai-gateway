@@ -235,6 +235,30 @@ export async function deleteSession(env: Env, sessionId: string): Promise<void> 
   await env.KV.delete(KV_KEYS.SESSION_PREFIX + sessionId)
 }
 
+// ===== Responses 多轮记忆（G5：previous_response_id 解析历史） =====
+// 每次 Responses 完成后，把「已解析历史 + 本次输入 + 助手输出」按 response.id 存入 KV（带 TTL）。
+// 下次客户端用 previous_response_id 引用时，把该历史追加回 messages，实现多轮上下文的存续。
+const RESPONSES_HISTORY_TTL = 2 * 60 * 60 // 与 M365 convCache TTL(2h) 对齐
+
+export async function saveResponseHistory(env: Env, responseId: string, messages: unknown[]): Promise<void> {
+  if (!responseId) return
+  try {
+    await env.KV.put(KV_KEYS.RESPONSES_PREFIX + responseId, JSON.stringify(messages || []), {
+      expirationTtl: RESPONSES_HISTORY_TTL,
+    })
+  } catch { /* 记忆保存失败不影响响应 */ }
+}
+
+export async function getResponseHistory(env: Env, responseId: string): Promise<unknown[] | null> {
+  if (!responseId) return null
+  try {
+    const raw = await env.KV.get(KV_KEYS.RESPONSES_PREFIX + responseId)
+    if (!raw) return null
+    const parsed = JSON.parse(raw)
+    return Array.isArray(parsed) ? parsed : null
+  } catch { return null }
+}
+
 // ===== MCP Server CRUD（MCP 聚合网关） =====
 
 export async function getMcps(env: Env): Promise<McpServer[]> {
