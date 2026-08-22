@@ -23,6 +23,7 @@ import { isM365Provider, proxyM365ChatRequest } from './m365/proxy'
 import { isTraeProvider, proxyTraeChatRequest } from './trae/proxy'
 import { writeLog } from './admin'
 import { applyThinkingInjection } from './thinking'
+import { applyCachePrefixInjection } from './cache-prefix'
 import { getOauthAccessToken, readOauthToken, refreshOauthToken, detectTokenRealm, buildOauthHeaders } from './oauth'
 import {
   anthropicToOpenAI,
@@ -837,6 +838,8 @@ export async function forwardProxy(
 
     const enabledKeys = provider.apiKeys.filter(k => k.enabled)
     const forwardBody = { ...body, model: modelId }
+    // 缓存前缀注入：提供商勾选了该 modelId 时，在 messages 头部注入固定缓存前缀（提升前缀缓存命中率）
+    await applyCachePrefixInjection(c.env, provider, modelId, forwardBody as Record<string, unknown>)
     // 思维模式引导注入：提供商勾选了该 modelId 时，在 messages 头部注入思维引导 system 提示词
     await applyThinkingInjection(c.env, provider, modelId, forwardBody as Record<string, unknown>)
     const url = new URL(c.req.url)
@@ -1630,6 +1633,8 @@ export async function handleAnthropicMessages(c: Context<AppEnv>) {
     const openaiBody = anthropicToOpenAI(anthropicReq)
     // 替换为上游模型 ID
     openaiBody['model'] = modelId
+    // 缓存前缀注入：提供商勾选该模型时，在 messages 头部注入固定缓存前缀（提升前缀缓存命中率）
+    await applyCachePrefixInjection(c.env, provider, modelId, openaiBody)
     // 思维模式引导注入：提供商勾选该模型时，在 messages 头部注入思维引导 system 提示词
     await applyThinkingInjection(c.env, provider, modelId, openaiBody)
 
@@ -2698,6 +2703,8 @@ export async function handleResponses(c: Context<AppEnv>) {
     const responsesReq = responsesBody as any
     const openaiBody = responsesToOpenAI(responsesReq)
     openaiBody['model'] = modelId
+    // 缓存前缀注入：提供商勾选该模型时，在 messages 头部注入固定缓存前缀（提升前缀缓存命中率）
+    await applyCachePrefixInjection(c.env, provider, modelId, openaiBody)
     // 思维模式引导注入：提供商勾选该模型时，在 messages 头部注入思维引导 system 提示词
     await applyThinkingInjection(c.env, provider, modelId, openaiBody)
 

@@ -64,6 +64,13 @@ export interface Provider {
    * 留空/不配 = 全部模型不注入，零影响。
    */
   thinkingInject?: string[]
+  /**
+   * 缓存前缀注入（provider 级勾选哪些模型启用）。
+   * 值为需注入的模型 ID 数组。命中的模型在转发前会被注入一段固定的缓存前缀
+   * system 提示词（见 src/cache-prefix.ts），利用上游前缀缓存降低 token 成本。
+   * 未勾选的模型原样转发。留空/不配 = 全部模型不注入，零影响。
+   */
+  cachePrefixInject?: string[]
 }
 
 /**
@@ -290,6 +297,7 @@ export interface CreateProviderRequest {
   cnbPool?: { min?: number; max?: number; ttlMinutes?: number }
   allowUnlistedModels?: boolean
   thinkingInject?: string[]
+  cachePrefixInject?: string[]
 }
 
 export interface UpdateProviderRequest {
@@ -310,6 +318,8 @@ export interface UpdateProviderRequest {
   allowUnlistedModels?: boolean
   /** 传空数组可清空思维引导注入选择 */
   thinkingInject?: string[] | null
+  /** 传空数组可清空缓存前缀注入选择 */
+  cachePrefixInject?: string[] | null
 }
 
 /**
@@ -333,6 +343,7 @@ export interface UpsertProviderRequest {
   cnbPool?: { min?: number; max?: number; ttlMinutes?: number }
   allowUnlistedModels?: boolean
   thinkingInject?: string[]
+  cachePrefixInject?: string[]
 }
 
 /**

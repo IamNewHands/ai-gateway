@@ -83,9 +83,12 @@ export async function isThinkingPromptCustom(env: Env): Promise<boolean> {
 
 // ===== 注入逻辑 =====
 
-/** marker 前缀比对，判断一条内容是否为网关注入的引导 */
-function isInjected(message: { content?: unknown }): boolean {
-  return typeof message.content === 'string' && message.content.startsWith(THINKING_INJECT_MARK)
+/** 是否已存在网关注入的固定前缀（思维引导或缓存前缀），用于幂等去重 */
+function hasGatewayInjection(messages: unknown[]): boolean {
+  return messages.some((m) => {
+    const content = (m as { content?: unknown })?.content
+    return typeof content === 'string' && content.startsWith('[gateway-')
+  })
 }
 
 /**
@@ -107,8 +110,8 @@ export async function applyThinkingInjection(
   const messages = body['messages']
   if (!Array.isArray(messages) || messages.length === 0) return
 
-  // 幂等：首条已是注入引导则不重复（瞬时错误重试 / 递归转发时会复用同一 body）
-  if (isInjected(messages[0] as { content?: unknown })) return
+  // 幂等：已存在任一网关固定前缀（思维引导或缓存前缀）则不重复注入
+  if (hasGatewayInjection(messages)) return
 
   const prompt = await getThinkingPrompt(env)
   messages.unshift({ role: 'system', content: prompt })

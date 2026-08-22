@@ -221,6 +221,7 @@ export async function handleCreateProvider(c: Context<AppEnv>) {
     cnbPool: body.cnbPool,
     allowUnlistedModels: body.allowUnlistedModels,
     thinkingInject: body.thinkingInject,
+    cachePrefixInject: body.cachePrefixInject,
     apiKeys: normalizeArray(body.apiKeys, (k) => ({ key: k, enabled: true })),
     models: body.models
       ? normalizeArray(body.models, (m) => ({ id: m, enabled: true }))
@@ -260,6 +261,7 @@ export async function handleUpdateProvider(c: Context<AppEnv>) {
   if (body.cnbPool !== undefined) updates.cnbPool = body.cnbPool ?? undefined
   if (body.allowUnlistedModels !== undefined) updates.allowUnlistedModels = body.allowUnlistedModels
   if (body.thinkingInject !== undefined) updates.thinkingInject = body.thinkingInject ?? undefined
+  if (body.cachePrefixInject !== undefined) updates.cachePrefixInject = body.cachePrefixInject ?? undefined
 if (body.apiKeys !== undefined) {
     updates.apiKeys = normalizeArray(body.apiKeys, (k) => ({ key: k, enabled: true }))
   }
@@ -330,6 +332,7 @@ export async function handleUpsertProvider(c: Context<AppEnv>) {
       toolBridge: body.toolBridge,
       cnbPool: body.cnbPool,
       thinkingInject: body.thinkingInject,
+      cachePrefixInject: body.cachePrefixInject,
       createdAt: now,
       updatedAt: now,
     }
@@ -351,6 +354,7 @@ export async function handleUpsertProvider(c: Context<AppEnv>) {
   if (body.toolBridge !== undefined) updates.toolBridge = body.toolBridge
   if (body.cnbPool !== undefined) updates.cnbPool = body.cnbPool
   if (body.thinkingInject !== undefined) updates.thinkingInject = body.thinkingInject
+  if (body.cachePrefixInject !== undefined) updates.cachePrefixInject = body.cachePrefixInject
   if (body.enabled !== undefined) updates.enabled = body.enabled
 
   // keys 合并：以现有为底，按 key 字符串去重追加，保留原 enabled
@@ -2089,5 +2093,23 @@ export async function handleSetThinkingPrompt(c: Context<AppEnv>) {
   const body = await c.req.json<{ prompt?: string }>()
   const prompt = typeof body?.prompt === 'string' ? body.prompt : ''
   await setThinkingPrompt(c.env, prompt)
+  return c.json<ApiResponse>({ success: true, message: '已保存' })
+}
+
+// ===== 缓存前缀设置（KV 存储，管理后台可编辑）=====
+
+/** 读取当前生效的缓存前缀（含是否自定义标记） */
+export async function handleGetCachePrefix(c: Context<AppEnv>) {
+  const { getCachePrefix, isCachePrefixCustom, DEFAULT_CACHE_PREFIX } = await import('./cache-prefix')
+  const [prefix, isCustom] = await Promise.all([getCachePrefix(c.env), isCachePrefixCustom(c.env)])
+  return c.json<ApiResponse>({ success: true, data: { prefix, isCustom, defaultPrefix: DEFAULT_CACHE_PREFIX } })
+}
+
+/** 保存（或清空）缓存前缀。body.prefix 为空 → 清空回退默认。 */
+export async function handleSetCachePrefix(c: Context<AppEnv>) {
+  const { setCachePrefix } = await import('./cache-prefix')
+  const body = await c.req.json<{ prefix?: string }>()
+  const prefix = typeof body?.prefix === 'string' ? body.prefix : ''
+  await setCachePrefix(c.env, prefix)
   return c.json<ApiResponse>({ success: true, message: '已保存' })
 }
