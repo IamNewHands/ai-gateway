@@ -1370,14 +1370,23 @@ export function openAIRequestToAnthropic(openaiReq: Record<string, unknown>): Re
     }
   }
 
-  // reasoning_effort → thinking（None → disabled；low/medium/high → enabled 带预算）
+  // reasoning_effort → thinking（None/minimal → disabled；low/medium/high → enabled 带预算）
+  // 档位归一化：除 OpenAI 标准 low/medium/high 外，识别客户端自定义"超高"档
+  // （ultra/max/extreme/super 等）→ 更高预算，避免被降级为中等档；none/off/minimal → disabled。
   const re = openaiReq['reasoning_effort'] as string | undefined
   if (re) {
-    if (re === 'none' || re === 'off') {
+    const level = String(re).trim().toLowerCase()
+    if (level === 'none' || level === 'off' || level === 'disabled' || level === 'minimal') {
       body['thinking'] = { type: 'disabled' }
+    } else if (level === 'low') {
+      body['thinking'] = { type: 'enabled', budget_tokens: 2048 }
+    } else if (level === 'high') {
+      body['thinking'] = { type: 'enabled', budget_tokens: 16384 }
+    } else if (level === 'ultra' || level === 'max' || level === 'extreme' || level === 'super' || level === 'x') {
+      body['thinking'] = { type: 'enabled', budget_tokens: 32768 }
     } else {
-      const budget = re === 'low' ? 2048 : re === 'high' ? 16384 : 8192
-      body['thinking'] = { type: 'enabled', budget_tokens: budget }
+      // medium 及未识别值
+      body['thinking'] = { type: 'enabled', budget_tokens: 8192 }
     }
   }
 

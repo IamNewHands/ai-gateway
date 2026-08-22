@@ -68,7 +68,7 @@
 | `stop` | `stop_sequences` | ✅ |
 | `tools` | `input_schema` | ✅ |
 | `tool_choice` auto/none/required/`{fn}` | auto/none/any/`{type:tool}` | ✅ |
-| `reasoning_effort` | `thinking`(disabled/enabled+预算) | ⚠️ 粗略映射 |
+| `reasoning_effort` | `thinking`(disabled/enabled+预算)。档位归一化：none/off/minimal→disabled，low→2048，medium→8192，high→16384，ultra/max/extreme/super→32768 | ⚠️ 粗略映射，但超高档不再被降级为中等 |
 | `parallel_tool_calls:false` | `disable_parallel_tool_use` | ✅ |
 
 ## 二、响应体转换
