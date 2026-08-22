@@ -37,6 +37,11 @@ import {
   aggregateOpenAIToResponses,
   finalizeAnthropicStream,
   diagnoseAnthropicAccumulator,
+  openAIRequestToAnthropic,
+  anthropicResponseToOpenAI,
+  anthropicResponseToResponses,
+  createAnthropicSSEToOpenAI,
+  createAnthropicSSEToResponses,
 } from './formats'
 
 // ===== Key 健康状态类型和辅助函数 =====
@@ -553,6 +558,156 @@ const TRANSIENT_RETRY_DELAY_MS = 400
 /** 瞬时性上游状态码：可安全对同一请求重试（区别于 4xx 的确定性错误） */
 function isTransientStatus(status: number): boolean {
   return status === 500 || status === 502 || status === 503 || status === 504
+}
+
+/**
+ * Anthropic 原生上游转发（provider.apiType === 'anthropic'，如 api.anthropic.com）。
+ * 请求体 / 认证 / 路径都走 Anthropic 原生格式：
+ * - URL：{base}/v1/messages（自动去掉 baseUrl 末尾的 /v1）
+ * - 认证：x-api-key + anthropic-version: 2023-06-01（+ 浏览器直连标记）
+ * - 请求体：内部 OpenAI 规范格式经 openAIRequestToAnthropic 转回 Anthropic
+ * 响应按客户端 route 处理：
+ * - 'messages'：Anthropic → Anthropic，直接透传（保真度最高，thinking/tool_use 原样保留）
+ * - 'chat'    ：Anthropic → OpenAI chat.completion（非流式 / 流式）
+ * - 'responses'：Anthropic → OpenAI Responses（非流式 / 流式）
+ * 多 Key 顺序 failover，与 messages / responses 通用兜底路径一致。
+ */
+async function proxyAnthropicNativeUpstream(
+  c: Context<AppEnv>,
+  provider: import('./types').Provider,
+  providerId: string,
+  model: string,
+  openaiBody: Record<string, unknown>,
+  originalStream: boolean,
+  route: 'messages' | 'chat' | 'responses',
+): Promise<Response> {
+  const enabledKeys = provider.apiKeys.filter((k) => k.enabled)
+  if (enabledKeys.length === 0) {
+    return c.json({
+      error: { type: 'configuration_error', message: `提供商 "${provider.name}" 未配置可用的 API Key` },
+    }, 500)
+  }
+
+  const resolvedBase = resolveProviderBaseUrl(c.env, provider.baseUrl)
+  if (!resolvedBase) {
+    return c.json({
+      error: { type: 'configuration_error', message: `提供商 "${provider.name}" 的 baseUrl 含 {CF_ACCOUNT_ID} 占位符，但环境变量 CF_ACCOUNT_ID 未配置` },
+    }, 500)
+  }
+  // 归一 baseUrl：去掉末尾斜杠与 /v1，统一拼 v1/messages
+  //（兼容 https://api.anthropic.com 与 https://api.anthropic.com/v1 两种写法）
+  let cleanBase = resolvedBase.replace(/\/+$/, '')
+  cleanBase = cleanBase.replace(/\/v1\/?$/, '')
+  const forwardUrl = `${cleanBase}/v1/messages`
+
+  const upstreamBody = openAIRequestToAnthropic(openaiBody)
+
+  // R3 风格多 Key 顺序 failover：单 key 故障（HTTP 非 2xx 或网络异常）自动切换下一个
+  let response: Response | undefined
+  let lastErrText = ''
+  let lastStatus = 502
+  for (const key of enabledKeys) {
+    try {
+      const r = await fetchUpstream(c.env, forwardUrl, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-api-key': key.key,
+          'anthropic-version': '2023-06-01',
+          'anthropic-dangerous-direct-browser-access': 'true',
+          ...buildPassthroughHeaders(c),
+        },
+        body: JSON.stringify(upstreamBody),
+      }, originalStream === true)
+      if (r.ok) { response = r; break }
+      lastStatus = r.status
+      lastErrText = await r.text().catch(() => '')
+    } catch (err) {
+      lastStatus = 502
+      lastErrText = (err as Error).message || '网络错误'
+    }
+  }
+
+  if (!response) {
+    try { c.executionCtx.waitUntil(writeLog(c.env, 'error', `[anthropic-native] ${model} → failover 全部失败 ${forwardUrl}`, JSON.stringify({ error: lastErrText, body: summarizeRequestBody(openaiBody), url: forwardUrl }).substring(0, 4000))) } catch {}
+    return c.json({
+      error: { type: 'upstream_error', message: `Upstream error: ${sanitizeUpstreamError(lastErrText)}` },
+    }, lastStatus as Parameters<typeof c.json>[1])
+  }
+
+  try { c.executionCtx.waitUntil(writeLog(c.env, 'request', `[anthropic-native] ${model} → 200 ${forwardUrl}`, `route=${route} stream=${originalStream}`)) } catch {}
+
+  // ---- route: messages —— Anthropic → Anthropic，直接透传（最大保真） ----
+  if (route === 'messages') {
+    if (originalStream && response.body) {
+      return new Response(withSSEKeepAlive(response.body, SSE_KEEPALIVE_MS, SSE_IDLE_TIMEOUT_MS), {
+        status: response.status,
+        statusText: response.statusText,
+        headers: {
+          'Content-Type': 'text/event-stream',
+          'Cache-Control': 'no-store',
+          'X-Accel-Buffering': 'no',
+        },
+      })
+    }
+    return new Response(response.body, { status: response.status, statusText: response.statusText, headers: response.headers })
+  }
+
+  // ---- route: chat / responses —— Anthropic → OpenAI 反向转换 ----
+
+  // 流式：Anthropic SSE → OpenAI SSE / Responses SSE 实时转换
+  if (originalStream && response.body) {
+    const conv = route === 'chat' ? createAnthropicSSEToOpenAI(model) : createAnthropicSSEToResponses(model)
+    const readable = new ReadableStream({
+      async start(controller) {
+        const decoder = new TextDecoderStream()
+        const textReader = response.body!.pipeThrough(decoder).getReader()
+        let lineBuffer = ''
+        let currentEvent = ''
+        try {
+          while (true) {
+            const { done, value } = await textReader.read()
+            if (done) break
+            lineBuffer += value
+            let nl: number
+            while ((nl = lineBuffer.indexOf('\n')) >= 0) {
+              const line = lineBuffer.slice(0, nl)
+              lineBuffer = lineBuffer.slice(nl + 1)
+              const trimmed = line.trim()
+              if (!trimmed) continue
+              if (trimmed.startsWith('event:')) {
+                currentEvent = trimmed.slice(6).trim()
+              } else if (trimmed.startsWith('data:')) {
+                const data = trimmed.slice(5).trim()
+                if (!data) continue
+                let parsed: Record<string, unknown>
+                try { parsed = JSON.parse(data) as Record<string, unknown> } catch { continue }
+                for (const s of conv(currentEvent, parsed)) {
+                  controller.enqueue(new TextEncoder().encode(s))
+                }
+              }
+            }
+          }
+        } catch { /* stream error */ }
+        controller.close()
+      },
+    })
+    return new Response(readable, {
+      status: 200,
+      headers: {
+        'Content-Type': 'text/event-stream',
+        'Cache-Control': 'no-store',
+        'X-Accel-Buffering': 'no',
+      },
+    })
+  }
+
+  // 非流式：Anthropic JSON → OpenAI / Responses
+  const payload = await response.json().catch(() => null) as Record<string, unknown> | null
+  const converted = route === 'chat'
+    ? anthropicResponseToOpenAI(payload || {}, model)
+    : anthropicResponseToResponses(payload || {}, model)
+  return c.json(converted)
 }
 
 const normalizeUsage = (route: string, provider: import('./types').Provider, payload: unknown): UsageMetrics | null => {
@@ -1105,6 +1260,20 @@ export async function forwardProxy(
     // OAuth 设备码提供商：使用 KV 中保存的 access_token 转发，401 时尝试刷新后重试
     if (provider.authType === 'oauth-device' && provider.oauth) {
       return await proxyOAuthRequest(c, provider, subPath, url.search, forwardBody, method)
+    }
+
+    // Anthropic 原生上游（provider.apiType === 'anthropic'，如 api.anthropic.com）：
+    // 请求体/认证头/路径都转成 Anthropic 原生格式，响应再按客户端 route 转回 OpenAI
+    if (provider.apiType === 'anthropic' && subPath === 'chat/completions') {
+      return await proxyAnthropicNativeUpstream(
+        c,
+        provider,
+        providerId,
+        modelId,
+        forwardBody as Record<string, unknown>,
+        isStreamRequest(forwardBody as ProxyRequestBody),
+        'chat',
+      )
     }
 
     if (enabledKeys.length === 0) {
@@ -2003,6 +2172,12 @@ export async function handleAnthropicMessages(c: Context<AppEnv>) {
       } catch { /* stream error */ }
       const anthropicResp = aggregateOpenAIToAnthropic(allChunks)
       return c.json(anthropicResp)
+    }
+
+    // Anthropic 原生上游（provider.apiType === 'anthropic'，如 api.anthropic.com）：
+    // 请求体/认证头/路径都转成 Anthropic 原生格式，响应原样透传（Anthropic → Anthropic，保真度最高）
+    if (provider.apiType === 'anthropic') {
+      return await proxyAnthropicNativeUpstream(c, provider, providerId, modelId, openaiBody, originalStream, 'messages')
     }
 
     // 非 OAuth 提供商：用 apiKey 标准转发，始终发 OpenAI 格式到上游
@@ -2932,6 +3107,12 @@ export async function handleResponses(c: Context<AppEnv>) {
       // 聚合为 OpenAI chat.completion 再转为 Responses
       const openaiResp = aggregateOpenAIToResponses(allChunks)
       return c.json(openaiResp)
+    }
+
+    // Anthropic 原生上游（provider.apiType === 'anthropic'，如 api.anthropic.com）：
+    // 请求体/认证头/路径都转成 Anthropic 原生格式，响应再转回 OpenAI Responses 格式
+    if (provider.apiType === 'anthropic') {
+      return await proxyAnthropicNativeUpstream(c, provider, providerId, modelId, openaiBody, originalStream, 'responses')
     }
 
     // 非 OAuth 提供商：用 apiKey 标准转发，始终发 OpenAI 格式到上游

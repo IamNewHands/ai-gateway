@@ -19,7 +19,7 @@ interface AnthropicContentBlock {
   id?: string
   name?: string
   input?: Record<string, unknown>
-  source?: { type: string; media_type: string; data: string }
+  source?: { type: 'base64'; media_type: string; data: string } | { type: 'url'; url: string }
   tool_use_id?: string
   content?: string | AnthropicContentBlock[]
   is_error?: boolean
@@ -187,10 +187,11 @@ function anthropicUserToOpenAI(msg: AnthropicMessage): Record<string, unknown> |
     } else if (block.type === 'text') {
       parts.push({ type: 'text', text: block.text || '' })
     } else if (block.type === 'image' && block.source) {
-      parts.push({
-        type: 'image_url',
-        image_url: { url: `data:${block.source.media_type};base64,${block.source.data}` },
-      })
+      const src = block.source
+      let imageUrl: string
+      if (src.type === 'url') imageUrl = src.url
+      else imageUrl = `data:${src.media_type};base64,${src.data}`
+      parts.push({ type: 'image_url', image_url: { url: imageUrl } })
     }
   }
 
@@ -1189,4 +1190,510 @@ export function openAIChunkToResponsesSSE(
 
   // SSE: events separated by double newline
   return formatAnthropicSSE(events)
+}
+
+// ============================================================
+//  OpenAI Chat Completions 请求 → Anthropic Messages 请求  反向转换
+//  （用于 apiType=anthropic 的原生上游，如 api.anthropic.com）
+// ============================================================
+
+/** 把 OpenAI content（string | content 数组 | null/undefined）折叠为字符串 */
+function openaiContentToString(content: unknown): string {
+  if (typeof content === 'string') return content
+  if (Array.isArray(content)) {
+    return (content as Array<Record<string, unknown>>)
+      .map((c) => (c['type'] === 'text' ? (c['text'] as string) || '' : ''))
+      .join('\n')
+  }
+  return ''
+}
+
+/** 解析 data:media_type;base64,xxx 形式的图片 data URL */
+function parseAnthropicImageUrl(url: string): { media_type: string; data: string } | undefined {
+  if (!url || !url.startsWith('data:')) return undefined
+  const m = /^data:([^;,]+);base64,(.*)$/s.exec(url)
+  if (!m) return undefined
+  return { media_type: m[1], data: m[2] }
+}
+
+/** Anthropic stop_reason → OpenAI finish_reason 映射 */
+function mapAnthropicStopReason(stopReason: string | undefined): string | null {
+  switch (stopReason) {
+    case 'end_turn': return 'stop'
+    case 'stop_sequence': return 'stop'
+    case 'max_tokens': return 'length'
+    case 'tool_use': return 'tool_calls'
+    case 'pause_turn': return 'stop'
+    default: return stopReason || 'stop'
+  }
+}
+
+/**
+ * 将 OpenAI Chat Completions 请求转换为 Anthropic Messages 请求。
+ * 这是 anthropicToOpenAI 的反向转换，供 apiType=anthropic 的原生上游使用：
+ * 内部保持 OpenAI 规范格式（消息/工具/注入等中间件都作用于 OpenAI 形态），
+ * 在出口处转回 Anthropic 发送给 api.anthropic.com。
+ */
+export function openAIRequestToAnthropic(openaiReq: Record<string, unknown>): Record<string, unknown> {
+  const messages = (openaiReq['messages'] as Array<Record<string, unknown>>) || []
+  const systemParts: string[] = []
+  const anthropicMessages: Array<{ role: 'user' | 'assistant'; content: string | AnthropicContentBlock[] }> = []
+  // 累积 role:'tool' 消息，合并进紧随其后的 user 消息（Anthropic 要求 tool_result 位于 user 消息内）
+  let pendingToolResults: AnthropicContentBlock[] = []
+
+  // 冲刷挂起的 tool_result：与紧随的用户内容合并为同一条 user 消息
+  //（Anthropic 要求 tool_result 及其后的用户文本在同一条 user 消息内，
+  //  拆成两条连续 user 消息会破坏多轮工具调用语义）。
+  const flushUser = (content?: string | AnthropicContentBlock[]): void => {
+    if (pendingToolResults.length === 0) {
+      if (content !== undefined && (typeof content === 'string' ? content.length > 0 : content.length > 0)) {
+        anthropicMessages.push({ role: 'user', content })
+      }
+      return
+    }
+    const merged: AnthropicContentBlock[] = [...pendingToolResults]
+    pendingToolResults = []
+    if (content !== undefined) {
+      if (typeof content === 'string') {
+        if (content) merged.push({ type: 'text', text: content })
+      } else if (content.length > 0) {
+        merged.push(...content)
+      }
+    }
+    anthropicMessages.push({ role: 'user', content: merged })
+  }
+
+  for (const m of messages) {
+    const role = m['role'] as string
+    if (role === 'system') {
+      const s = openaiContentToString(m['content'])
+      if (s) systemParts.push(s)
+      continue
+    }
+    if (role === 'tool') {
+      pendingToolResults.push({
+        type: 'tool_result',
+        tool_use_id: (m['tool_call_id'] as string) || '',
+        content: openaiContentToString(m['content']),
+      })
+      continue
+    }
+    if (role === 'assistant') {
+      flushUser()
+      const content = m['content']
+      const toolCalls = m['tool_calls'] as Array<Record<string, unknown>> | undefined
+      const text = openaiContentToString(content)
+      if (toolCalls && toolCalls.length > 0) {
+        const blocks: AnthropicContentBlock[] = []
+        if (text) blocks.push({ type: 'text', text })
+        for (const tc of toolCalls) {
+          const fn = (tc['function'] as Record<string, unknown>) || {}
+          blocks.push({
+            type: 'tool_use',
+            id: (tc['id'] as string) || '',
+            name: (fn['name'] as string) || '',
+            input: parseArgs(fn['arguments'] as string | undefined),
+          })
+        }
+        anthropicMessages.push({ role: 'assistant', content: blocks })
+      } else {
+        anthropicMessages.push({ role: 'assistant', content: text })
+      }
+      continue
+    }
+    // role === 'user'
+    const content = m['content']
+    if (typeof content === 'string') {
+      flushUser(content)
+    } else if (Array.isArray(content)) {
+      const blocks: AnthropicContentBlock[] = []
+      for (const part of content as Array<Record<string, unknown>>) {
+        if (part['type'] === 'text') {
+          blocks.push({ type: 'text', text: (part['text'] as string) || '' })
+        } else if (part['type'] === 'image_url') {
+          const url = ((part['image_url'] as Record<string, unknown>)?.['url'] as string) || ''
+          const img = parseAnthropicImageUrl(url)
+          if (img) blocks.push({ type: 'image', source: { type: 'base64', ...img } })
+          else if (url.startsWith('http')) blocks.push({ type: 'image', source: { type: 'url', url } })
+        }
+      }
+      flushUser(blocks)
+    }
+  }
+  flushUser()
+
+  const body: Record<string, unknown> = {
+    model: openaiReq['model'],
+    messages: anthropicMessages,
+    stream: openaiReq['stream'] ?? false,
+  }
+
+  if (systemParts.length > 0) body['system'] = systemParts.join('\n\n')
+
+  // max_tokens 必填（Anthropic）：取 max_tokens / max_completion_tokens，缺省给 4096
+  const maxTokens = (openaiReq['max_tokens'] as number | undefined) ?? (openaiReq['max_completion_tokens'] as number | undefined)
+  body['max_tokens'] = typeof maxTokens === 'number' && maxTokens > 0 ? maxTokens : 4096
+
+  if (openaiReq['temperature'] !== undefined) body['temperature'] = openaiReq['temperature']
+  if (openaiReq['top_p'] !== undefined) body['top_p'] = openaiReq['top_p']
+  if (Array.isArray(openaiReq['stop']) && (openaiReq['stop'] as unknown[]).length > 0) {
+    body['stop_sequences'] = openaiReq['stop']
+  }
+
+  // tools：OpenAI function → Anthropic {name, description, input_schema}
+  if (Array.isArray(openaiReq['tools']) && (openaiReq['tools'] as unknown[]).length > 0) {
+    body['tools'] = (openaiReq['tools'] as Array<Record<string, unknown>>).map((t) => {
+      const fn = (t['function'] as Record<string, unknown>) || {}
+      return {
+        name: (fn['name'] as string) || (t['name'] as string) || '',
+        description: (fn['description'] as string) || '',
+        input_schema: (fn['parameters'] as object) || { type: 'object' },
+      }
+    })
+  }
+
+  // tool_choice：OpenAI auto/none/required/{type:function} → Anthropic auto/none/any/{type:tool}
+  const tc = openaiReq['tool_choice']
+  if (typeof tc === 'string') {
+    if (tc === 'required') body['tool_choice'] = { type: 'any' }
+    else if (tc === 'none') body['tool_choice'] = { type: 'none' }
+    else body['tool_choice'] = { type: 'auto' }
+  } else if (tc && typeof tc === 'object') {
+    const t = tc as Record<string, unknown>
+    const fnName = ((t['function'] as Record<string, unknown>)?.['name']) as string | undefined
+    if ((t['type'] === 'function' || t['type'] === 'tool') && fnName) {
+      body['tool_choice'] = { type: 'tool', name: fnName }
+    } else if (t['type'] === 'required' || t['type'] === 'any') {
+      body['tool_choice'] = { type: 'any' }
+    } else {
+      body['tool_choice'] = { type: 'auto' }
+    }
+  }
+
+  // reasoning_effort → thinking（None → disabled；low/medium/high → enabled 带预算）
+  const re = openaiReq['reasoning_effort'] as string | undefined
+  if (re) {
+    if (re === 'none' || re === 'off') {
+      body['thinking'] = { type: 'disabled' }
+    } else {
+      const budget = re === 'low' ? 2048 : re === 'high' ? 16384 : 8192
+      body['thinking'] = { type: 'enabled', budget_tokens: budget }
+    }
+  }
+
+  // parallel_tool_calls=false → disable_parallel_tool_use
+  if (openaiReq['parallel_tool_calls'] === false) body['disable_parallel_tool_use'] = true
+
+  return body
+}
+
+// ============================================================
+//  Anthropic Messages 响应 → OpenAI Chat Completions 响应  反向转换
+//  （apiType=anthropic 原生上游 + /v1/chat/completions 客户端）
+// ============================================================
+
+/** 非流式：Anthropic Messages 响应 → OpenAI chat.completion 响应 */
+export function anthropicResponseToOpenAI(
+  anthropicResp: Record<string, unknown>,
+  model: string,
+): Record<string, unknown> {
+  const blocks = (anthropicResp['content'] as Array<Record<string, unknown>>) || []
+  const text: string[] = []
+  const toolCalls: Array<Record<string, unknown>> = []
+  const reasoning: string[] = []
+  for (const b of blocks) {
+    if (b['type'] === 'text') text.push((b['text'] as string) || '')
+    else if (b['type'] === 'tool_use') {
+      toolCalls.push({
+        id: (b['id'] as string) || '',
+        type: 'function',
+        function: { name: (b['name'] as string) || '', arguments: JSON.stringify(b['input'] ?? {}) },
+      })
+    } else if (b['type'] === 'thinking') {
+      reasoning.push((b['thinking'] as string) || '')
+    }
+  }
+  const message: Record<string, unknown> = { role: 'assistant' }
+  if (text.length > 0) message['content'] = text.join('')
+  if (reasoning.length > 0) message['reasoning_content'] = reasoning.join('')
+  if (toolCalls.length > 0) message['tool_calls'] = toolCalls
+
+  const u = anthropicResp['usage'] as Record<string, number> | undefined
+  const inputTokens = u?.['input_tokens'] ?? 0
+  const outputTokens = u?.['output_tokens'] ?? 0
+  return {
+    id: (anthropicResp['id'] as string) || `chatcmpl_${Date.now()}`,
+    object: 'chat.completion',
+    created: Math.floor(Date.now() / 1000),
+    model: model || '',
+    choices: [{
+      index: 0,
+      message,
+      finish_reason: mapAnthropicStopReason(anthropicResp['stop_reason'] as string),
+      logprobs: null,
+    }],
+    usage: {
+      prompt_tokens: inputTokens,
+      completion_tokens: outputTokens,
+      total_tokens: inputTokens + outputTokens,
+      prompt_tokens_details: { cached_tokens: u?.['cache_read_input_tokens'] ?? 0 },
+    },
+  }
+}
+
+/** 非流式：Anthropic Messages 响应 → OpenAI Responses 响应 */
+export function anthropicResponseToResponses(
+  anthropicResp: Record<string, unknown>,
+  model: string,
+): Record<string, unknown> {
+  const blocks = (anthropicResp['content'] as Array<Record<string, unknown>>) || []
+  const output: Array<Record<string, unknown>> = []
+  for (const b of blocks) {
+    if (b['type'] === 'text') {
+      output.push({ type: 'message', role: 'assistant', content: [{ type: 'output_text', text: (b['text'] as string) || '' }] })
+    } else if (b['type'] === 'tool_use') {
+      const id = (b['id'] as string) || ''
+      const args = JSON.stringify(b['input'] ?? {})
+      output.push({ type: 'function_call', id, call_id: id, name: (b['name'] as string) || '', arguments: args })
+    }
+  }
+  const u = anthropicResp['usage'] as Record<string, number> | undefined
+  const inputTokens = u?.['input_tokens'] ?? 0
+  const outputTokens = u?.['output_tokens'] ?? 0
+  return {
+    id: (anthropicResp['id'] as string) || `resp_${Date.now()}`,
+    object: 'response',
+    created_at: Math.floor(Date.now() / 1000),
+    status: 'completed',
+    model: model || '',
+    output,
+    parallel_tool_calls: true,
+    usage: {
+      input_tokens: inputTokens,
+      output_tokens: outputTokens,
+      total_tokens: inputTokens + outputTokens,
+      input_tokens_details: { cached_tokens: u?.['cache_read_input_tokens'] ?? 0 },
+    },
+  }
+}
+
+// ============================================================
+//  Anthropic SSE → OpenAI SSE / Responses SSE  流式反向转换
+//  （apiType=anthropic 原生上游 + 流式 chat/completions 或 responses 客户端）
+//  用法：const conv = createAnthropicSSEToOpenAI(model)；对每条 SSE 记录
+//  （eventName + data）调用 conv(eventName, data)，返回 OpenAI SSE 片段数组。
+// ============================================================
+
+export function createAnthropicSSEToOpenAI(modelHint: string) {
+  const state = {
+    messageId: `chatcmpl_${Math.random().toString(36).slice(2, 12)}`,
+    model: modelHint,
+    created: Math.floor(Date.now() / 1000),
+    inputTokens: 0,
+    outputTokens: 0,
+    toolOrdinal: 0,
+    blockToTool: new Map<number, number>(),
+    // message_delta 可能多次出现（usage 更新也会触发），finish_reason 只输出一次
+    finished: false,
+  }
+  const chunk = (delta: Record<string, unknown>, finish_reason: string | null = null, usage?: Record<string, unknown>): string =>
+    `data: ${JSON.stringify({
+      id: state.messageId,
+      object: 'chat.completion.chunk',
+      created: state.created,
+      model: state.model,
+      choices: [{ index: 0, delta, logprobs: null, finish_reason }],
+      ...(usage ? { usage } : {}),
+    })}\n\n`
+
+  return (eventName: string, data: Record<string, unknown>): string[] => {
+    const out: string[] = []
+    switch (eventName) {
+      case 'message_start': {
+        const m = data['message'] as Record<string, unknown> | undefined
+        if (m?.['id']) state.messageId = `chatcmpl_${String(m['id']).replace(/^msg_/, '')}`
+        if (m?.['model']) state.model = String(m['model'])
+        const mu = m?.['usage'] as Record<string, number> | undefined
+        if (mu) { state.inputTokens = mu['input_tokens'] || 0; state.outputTokens = mu['output_tokens'] || 0 }
+        out.push(chunk({ role: 'assistant', content: '' }))
+        break
+      }
+      case 'content_block_start': {
+        const cb = data['content_block'] as Record<string, unknown> | undefined
+        if (cb?.['type'] === 'tool_use') {
+          const idx = state.toolOrdinal++
+          const blockIndex = data['index'] as number
+          if (typeof blockIndex === 'number') state.blockToTool.set(blockIndex, idx)
+          out.push(chunk({
+            tool_calls: [{ index: idx, id: (cb['id'] as string) || '', type: 'function', function: { name: (cb['name'] as string) || '', arguments: '' } }],
+          }))
+        }
+        break
+      }
+      case 'content_block_delta': {
+        const d = data['delta'] as Record<string, unknown> | undefined
+        if (d?.['type'] === 'text_delta' && d['text']) {
+          out.push(chunk({ content: d['text'] }))
+        } else if (d?.['type'] === 'thinking_delta' && d['thinking']) {
+          out.push(chunk({ reasoning_content: d['thinking'] }))
+        } else if (d?.['type'] === 'input_json_delta' && d['partial_json']) {
+          const idx = state.blockToTool.get(data['index'] as number) ?? 0
+          out.push(chunk({ tool_calls: [{ index: idx, function: { arguments: d['partial_json'] } }] }))
+        }
+        break
+      }
+      case 'message_delta': {
+        if (state.finished) break
+        const dd = data['delta'] as Record<string, unknown> | undefined
+        state.outputTokens = ((data['usage'] as Record<string, number> | undefined)?.['output_tokens']) ?? state.outputTokens
+        state.finished = true
+        out.push(chunk({}, mapAnthropicStopReason(dd?.['stop_reason'] as string), {
+          prompt_tokens: state.inputTokens,
+          completion_tokens: state.outputTokens,
+          total_tokens: state.inputTokens + state.outputTokens,
+        }))
+        break
+      }
+      case 'message_stop': {
+        out.push('data: [DONE]\n\n')
+        break
+      }
+      default:
+        break
+    }
+    return out
+  }
+}
+
+export function createAnthropicSSEToResponses(modelHint: string) {
+  const state = {
+    responseId: `resp_${Math.random().toString(36).slice(2, 12)}`,
+    model: modelHint,
+    created: Math.floor(Date.now() / 1000),
+    inputTokens: 0,
+    outputTokens: 0,
+    textContent: '',
+    itemId: '',
+    functionCallId: '',
+    functionCallName: '',
+    toolArgs: new Map<number, string>(),
+    // 每个 tool 的 id/name（多条 tool_use 时避免全局变量被最后一个覆盖）
+    toolMeta: new Map<number, { id: string; name: string }>(),
+    blockToTool: new Map<number, number>(),
+    toolOrdinal: 0,
+    textItemDone: false,
+    toolItemDone: new Set<number>(),
+    // message_delta 可能多次出现（usage 更新也会触发），response.completed 只输出一次
+    completedSent: false,
+  }
+  const ss = (event: string, data: Record<string, unknown>): string =>
+    `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`
+
+  return (eventName: string, data: Record<string, unknown>): string[] => {
+    const out: string[] = []
+    switch (eventName) {
+      case 'message_start': {
+        const m = data['message'] as Record<string, unknown> | undefined
+        if (m?.['id']) state.responseId = `resp_${String(m['id']).replace(/^msg_/, '')}`
+        if (m?.['model']) state.model = String(m['model'])
+        const mu = m?.['usage'] as Record<string, number> | undefined
+        if (mu) { state.inputTokens = mu['input_tokens'] || 0; state.outputTokens = mu['output_tokens'] || 0 }
+        const base = { id: state.responseId, object: 'response', created_at: state.created, status: 'in_progress', model: state.model, output: [], parallel_tool_calls: true, usage: null }
+        out.push(ss('response.created', { type: 'response.created', response: base }))
+        out.push(ss('response.in_progress', { type: 'response.in_progress', response: base }))
+        break
+      }
+      case 'content_block_start': {
+        const cb = data['content_block'] as Record<string, unknown> | undefined
+        if (cb?.['type'] === 'text') {
+          state.itemId = `msg_${Math.random().toString(36).slice(2, 10)}`
+          out.push(ss('response.output_item.added', {
+            type: 'response.output_item.added',
+            output_index: 0,
+            item: { id: state.itemId, type: 'message', role: 'assistant', status: 'in_progress', content: [] },
+          }))
+          out.push(ss('response.content_part.added', {
+            type: 'response.content_part.added',
+            item_id: state.itemId,
+            output_index: 0,
+            content_index: 0,
+            part: { type: 'output_text', text: '', annotations: [] },
+          }))
+        } else if (cb?.['type'] === 'tool_use') {
+          const idx = state.toolOrdinal++
+          const blockIndex = data['index'] as number
+          if (typeof blockIndex === 'number') state.blockToTool.set(blockIndex, idx)
+          const id = `fc_${(cb['id'] as string) || Math.random().toString(36).slice(2, 10)}`
+          state.functionCallId = id
+          state.functionCallName = (cb['name'] as string) || ''
+          state.toolMeta.set(idx, { id, name: state.functionCallName })
+          state.toolArgs.set(idx, '')
+          out.push(ss('response.output_item.added', {
+            type: 'response.output_item.added',
+            output_index: idx + 1,
+            item: { id, type: 'function_call', status: 'in_progress', call_id: id, name: state.functionCallName, arguments: '' },
+          }))
+        }
+        break
+      }
+      case 'content_block_delta': {
+        const d = data['delta'] as Record<string, unknown> | undefined
+        if (d?.['type'] === 'text_delta' && d['text']) {
+          state.textContent += d['text']
+          out.push(ss('response.output_text.delta', {
+            type: 'response.output_text.delta',
+            item_id: state.itemId,
+            output_index: 0,
+            content_index: 0,
+            delta: d['text'],
+          }))
+        } else if (d?.['type'] === 'input_json_delta' && d['partial_json']) {
+          const idx = state.blockToTool.get(data['index'] as number) ?? 0
+          state.toolArgs.set(idx, (state.toolArgs.get(idx) || '') + (d['partial_json'] as string))
+          const meta = state.toolMeta.get(idx) || { id: state.functionCallId, name: state.functionCallName }
+          out.push(ss('response.function_call_arguments.delta', {
+            type: 'response.function_call_arguments.delta',
+            item_id: meta.id,
+            output_index: idx + 1,
+            delta: d['partial_json'],
+          }))
+        }
+        break
+      }
+      case 'message_delta': {
+        if (state.completedSent) break
+        state.completedSent = true
+        state.outputTokens = ((data['usage'] as Record<string, number> | undefined)?.['output_tokens']) ?? state.outputTokens
+        const output: Array<Record<string, unknown>> = []
+        if (state.textContent) {
+          output.push({ type: 'message', role: 'assistant', content: [{ type: 'output_text', text: state.textContent }] })
+        }
+        for (const [idx, args] of state.toolArgs) {
+          const meta = state.toolMeta.get(idx) || { id: `fc_${Math.random().toString(36).slice(2, 10)}`, name: state.functionCallName }
+          output.push({ type: 'function_call', id: meta.id, call_id: meta.id, name: meta.name, arguments: args })
+        }
+        out.push(ss('response.completed', {
+          type: 'response.completed',
+          response: {
+            id: state.responseId,
+            object: 'response',
+            created_at: state.created,
+            status: 'completed',
+            model: state.model,
+            output,
+            parallel_tool_calls: true,
+            usage: {
+              input_tokens: state.inputTokens,
+              output_tokens: state.outputTokens,
+              total_tokens: state.inputTokens + state.outputTokens,
+            },
+          },
+        }))
+        break
+      }
+      default:
+        break
+    }
+    return out
+  }
 }
