@@ -2113,3 +2113,21 @@ export async function handleSetCachePrefix(c: Context<AppEnv>) {
   await setCachePrefix(c.env, prefix)
   return c.json<ApiResponse>({ success: true, message: '已保存' })
 }
+
+// ===== 性能设置（超时分级，KV 存储，管理后台可编辑）=====
+
+/** 读取当前性能设置（含是否自定义与内置默认值） */
+export async function handleGetPerfSettings(c: Context<AppEnv>) {
+  const { getPerfSettings, isPerfSettingsCustom, DEFAULT_PERF_SETTINGS } = await import('./perf')
+  const [settings, isCustom] = await Promise.all([getPerfSettings(c.env), isPerfSettingsCustom(c.env)])
+  return c.json<ApiResponse>({ success: true, data: { settings, isCustom, defaults: DEFAULT_PERF_SETTINGS } })
+}
+
+/** 保存性能设置（部分字段合并，空对象 → 清空回退默认） */
+export async function handleSetPerfSettings(c: Context<AppEnv>) {
+  const { setPerfSettings } = await import('./perf')
+  const body = await c.req.json<{ settings?: Partial<import('./perf').PerfSettings> }>()
+  const settings = body?.settings ?? {}
+  await setPerfSettings(c.env, settings)
+  return c.json<ApiResponse>({ success: true, message: '已保存（最多 10s 生效）' })
+}

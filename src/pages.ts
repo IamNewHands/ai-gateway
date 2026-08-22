@@ -483,6 +483,7 @@ ${H('管理')}
       <a class="admin-nav__link" href="#cache"><i class="fas fa-memory" aria-hidden="true"></i><span>内存缓存</span></a>
       <a class="admin-nav__link" href="#thinking"><i class="fas fa-brain" aria-hidden="true"></i><span>思维引导</span></a>
       <a class="admin-nav__link" href="#cache-prefix"><i class="fas fa-database" aria-hidden="true"></i><span>缓存前缀</span></a>
+      <a class="admin-nav__link" href="#perf"><i class="fas fa-tachometer-alt" aria-hidden="true"></i><span>性能设置</span></a>
     </nav>
     <div class="admin-rail__foot">
       <a href="/" class="admin-nav__link"><i class="fas fa-arrow-left" aria-hidden="true"></i><span>返回首页</span></a>
@@ -493,7 +494,7 @@ ${H('管理')}
   <div class="admin-main">
     <header class="admin-topbar">
       <a class="brand" href="/"><span class="brand__mark" aria-hidden="true"><i class="fas fa-cloud"></i></span><span class="brand__name">${SITE_CONFIG.title}</span></a>
-      <nav aria-label="移动端控制台导航"><a href="#overview">概览</a><a href="#providers">提供商</a><a href="#proxy-keys">Key</a><a href="#analytics">统计</a><a href="#usage-logs">日志</a><a href="#checkin">签到</a><a href="#mcps">MCP</a><a href="#unimodels">联合</a><a href="#cache">缓存</a><a href="#thinking">思维引导</a><a href="#cache-prefix">缓存前缀</a><a href="#logs">系统日志</a></nav>
+      <nav aria-label="移动端控制台导航"><a href="#overview">概览</a><a href="#providers">提供商</a><a href="#proxy-keys">Key</a><a href="#analytics">统计</a><a href="#usage-logs">日志</a><a href="#checkin">签到</a><a href="#mcps">MCP</a><a href="#unimodels">联合</a><a href="#cache">缓存</a><a href="#thinking">思维引导</a><a href="#cache-prefix">缓存前缀</a><a href="#perf">性能</a><a href="#logs">系统日志</a></nav>
       <a class="icon-btn" href="javascript:void(0)" onclick="doLogout()" aria-label="退出登录"><i class="fas fa-sign-out-alt" aria-hidden="true"></i></a>
     </header>
 
@@ -829,6 +830,37 @@ ${H('管理')}
           <span class="form-helper">前缀首行会被加上网关注入标记以做幂等，请勿手动移除或复制该标记行。注意：前缀会注入到每次请求，编辑后所有上游缓存将失效重新建立。</span>
         </div>
         <div id="cache-prefix-result" class="mt-1" aria-live="polite"></div>
+      </section>
+
+      <section id="perf" class="workspace-section" aria-labelledby="perf-title">
+        <div class="section-heading section-heading--admin">
+          <div><h2 id="perf-title">性能设置</h2><p>通用转发（OpenAI / OAuth / Anthropic / Responses）的上游超时分级阈值。流式请求不再被整体超时掐断，改为「连接/首字节超时 + 无数据 idle 兜底 + 心跳」三级控制。保存后最多 10s 生效。</p></div>
+          <div><span class="mu" id="perf-state" style="font-size:12px"></span></div>
+        </div>
+        <div class="form-grid">
+          <label class="fg">
+            <span>非流式整体超时（ms，默认 300000）</span>
+            <input type="number" id="perf-total" min="5000" max="3600000" step="1000" class="fx1">
+          </label>
+          <label class="fg">
+            <span>流式连接/首字节超时（ms，默认 90000）</span>
+            <input type="number" id="perf-connect" min="1000" max="300000" step="1000" class="fx1">
+          </label>
+          <label class="fg">
+            <span>流式无数据 idle 超时（ms，默认 240000）</span>
+            <input type="number" id="perf-idle" min="1000" max="600000" step="1000" class="fx1">
+          </label>
+          <label class="fg">
+            <span>SSE 心跳间隔（ms，默认 15000；0 = 不注入心跳）</span>
+            <input type="number" id="perf-keepalive" min="0" max="120000" step="1000" class="fx1">
+          </label>
+        </div>
+        <div class="fc mt-1 field-row">
+          <button class="btn btn-p btn-xs" onclick="savePerfSettings()"><i class="fas fa-save" aria-hidden="true"></i>保存</button>
+          <button class="btn btn-gh btn-xs" onclick="resetPerfSettings()"><i class="fas fa-undo" aria-hidden="true"></i>恢复默认</button>
+          <span class="form-helper">调低连接超时可更快失败切换；长思考/agent 场景请保持 idle 超时较大；心跳 0 时不注入，避免干扰私有 SSE 解析器。</span>
+        </div>
+        <div id="perf-result" class="mt-1" aria-live="polite"></div>
       </section>
     </main>
 
@@ -3013,6 +3045,61 @@ adminNavLinks.forEach(function (link) {
 })
 window.addEventListener('hashchange', function () { maybeLoadCachePrefix(location.hash) })
 setTimeout(loadCachePrefix, 100)
+// ===== 性能设置 =====
+let perfDefaults = {}
+async function loadPerfSettings() {
+  const els = ['perf-total', 'perf-connect', 'perf-idle', 'perf-keepalive'].map(id => document.getElementById(id))
+  const st = document.getElementById('perf-state')
+  if (els.some(e => !e)) return
+  try {
+    const r = await fetch('/admin/api/perf-settings')
+    const d = await r.json()
+    if (!d.success) { if (st) st.textContent = '加载失败'; return }
+    const s = d.data.settings || {}
+    perfDefaults = d.data.defaults || {}
+    els[0].value = s.totalTimeoutMs; els[1].value = s.connectTimeoutMs
+    els[2].value = s.idleTimeoutMs; els[3].value = s.keepAliveMs
+    if (st) st.textContent = d.data.isCustom ? '已自定义' : '使用内置默认'
+  } catch (e) { if (st) st.textContent = '加载失败' }
+}
+async function savePerfSettings() {
+  const out = document.getElementById('perf-result')
+  if (out) { out.textContent = ''; out.style.color = '' }
+  const settings = {
+    totalTimeoutMs: parseInt(document.getElementById('perf-total').value) || undefined,
+    connectTimeoutMs: parseInt(document.getElementById('perf-connect').value) || undefined,
+    idleTimeoutMs: parseInt(document.getElementById('perf-idle').value) || undefined,
+    keepAliveMs: parseInt(document.getElementById('perf-keepalive').value) || 0,
+  }
+  try {
+    const r = await fetch('/admin/api/perf-settings', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ settings })
+    })
+    const d = await r.json()
+    if (d.success) { toast('已保存（最多 10s 生效）', 'success'); loadPerfSettings() }
+    else toast(d.message || '保存失败', 'error')
+  } catch (e) { toast('保存失败', 'error') }
+}
+function resetPerfSettings() {
+  cM('恢复为内置默认性能设置？当前自定义值将被清空。').then(function (ok) {
+    if (!ok) return
+    document.getElementById('perf-total').value = perfDefaults.totalTimeoutMs
+    document.getElementById('perf-connect').value = perfDefaults.connectTimeoutMs
+    document.getElementById('perf-idle').value = perfDefaults.idleTimeoutMs
+    document.getElementById('perf-keepalive').value = perfDefaults.keepAliveMs
+    savePerfSettings()
+  })
+}
+function maybeLoadPerf(hash) { if (hash === '#perf') loadPerfSettings() }
+adminNavLinks.forEach(function (link) {
+  if (link.getAttribute('href') === '#perf') {
+    link.addEventListener('click', function () { setTimeout(loadPerfSettings, 50) })
+  }
+})
+window.addEventListener('hashchange', function () { maybeLoadPerf(location.hash) })
+setTimeout(loadPerfSettings, 100)
 setTimeout(loadCache, 0)
 </script>
 </body></html>`)

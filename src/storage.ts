@@ -20,6 +20,9 @@ export function resolveProviderBaseUrl(env: Env, baseUrl: string): string | null
 interface RawCacheEntry { text: string; at: number }
 const providersCache = new Map<string, RawCacheEntry>()
 const proxyKeysCache = new Map<string, RawCacheEntry>()
+// /v1/models 列表的纯内存派生缓存（非 KV 键）：复用同一套 TTL + 管理后台可视化/清空
+const MODELS_LIST_CACHE_KEY = 'models:list'
+const modelsListCache = new Map<string, RawCacheEntry>()
 
 function rawCacheGet(cache: Map<string, RawCacheEntry>, key: string): string | undefined {
   const entry = cache.get(key)
@@ -54,7 +57,17 @@ export interface CacheEntryView {
 const cacheRegistry: Array<{ key: string; label: string; cache: Map<string, RawCacheEntry> }> = [
   { key: KV_KEYS.PROVIDERS, label: '提供商配置 (providers)', cache: providersCache },
   { key: KV_KEYS.PROXY_KEYS, label: '转发 Key (proxy:keys)', cache: proxyKeysCache },
+  { key: MODELS_LIST_CACHE_KEY, label: '模型列表缓存 (models:list)', cache: modelsListCache },
 ]
+
+/** 读取 /v1/models 列表缓存（未命中/过期返回 undefined） */
+export function getModelsListCache(): string | undefined {
+  return rawCacheGet(modelsListCache, MODELS_LIST_CACHE_KEY)
+}
+/** 写入 /v1/models 列表缓存 */
+export function setModelsListCache(text: string): void {
+  rawCacheSet(modelsListCache, MODELS_LIST_CACHE_KEY, text)
+}
 
 export function getCacheEntries(): CacheEntryView[] {
   const now = Date.now()

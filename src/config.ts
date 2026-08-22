@@ -43,6 +43,7 @@ export const KV_KEYS = {
   TRAE_MODELS_PREFIX: 'trae:models:',
   THINKING_PROMPT: 'thinking:prompt',
   CACHE_PREFIX: 'cache:prefix',
+  PERF_SETTINGS: 'perf:settings',
 } as const
 
 /** uni-model 虚拟提供商 ID（模型 ID 前缀，如 unimodel/xxx） */

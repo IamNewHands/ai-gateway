@@ -57,6 +57,8 @@ import {
   handleSetThinkingPrompt,
   handleGetCachePrefix,
   handleSetCachePrefix,
+  handleGetPerfSettings,
+  handleSetPerfSettings,
 } from './admin'
 import { handleMcpJsonRpc } from './mcp-gateway'
 import { renderHomePage, renderLoginPage, renderAdminPage } from './pages'
@@ -221,6 +223,8 @@ app.get('/admin/api/thinking-prompt', handleGetThinkingPrompt)
 app.put('/admin/api/thinking-prompt', handleSetThinkingPrompt)
 app.get('/admin/api/cache-prefix', handleGetCachePrefix)
 app.put('/admin/api/cache-prefix', handleSetCachePrefix)
+app.get('/admin/api/perf-settings', handleGetPerfSettings)
+app.put('/admin/api/perf-settings', handleSetPerfSettings)
 
 // 签到（浏览器面板用，需 session 认证）
 app.get('/admin/api/checkin/status', handleCheckinStatus)
@@ -400,7 +404,25 @@ async function scheduled(event: ScheduledEvent, env: Env, ctx: ExecutionContext)
 
 // fetch 与 scheduled 必须都挂在 default export 上，Cloudflare 才会注册并调用。
 // Hono 的 fetch 为实例箭头属性，解构后 this 仍绑定 app，可安全赋值。
+// 外层包装：X-Request-Id 全链路追踪——
+//   - 取客户端 x-request-id / x-correlation-id，缺失则生成 UUID；
+//   - 写回请求头（经 proxy 的白名单 x- 前缀自动透传到上游）；
+//   - 响应头回写同 ID，客户端/日志可按 ID 串联网关与上游。
 export default {
-  fetch: app.fetch,
+  async fetch(req: Request, env: Env, ctx: ExecutionContext) {
+    // WebSocket 升级请求原样透传：重建 Request/Response 会丢失 webSocket 升级属性
+    const upgrade = (req.headers.get('Upgrade') || '').toLowerCase()
+    if (upgrade === 'websocket' || req.headers.has('Sec-WebSocket-Key')) {
+      return app.fetch(req, env, ctx)
+    }
+    const reqId = req.headers.get('x-request-id') || req.headers.get('x-correlation-id') || crypto.randomUUID()
+    const reqHeaders = new Headers(req.headers)
+    reqHeaders.set('x-request-id', reqId)
+    const newReq = new Request(req, { headers: reqHeaders })
+    const res = await app.fetch(newReq, env, ctx)
+    const resHeaders = new Headers(res.headers)
+    resHeaders.set('x-request-id', reqId)
+    return new Response(res.body, { status: res.status, statusText: res.statusText, headers: resHeaders })
+  },
   scheduled,
 }

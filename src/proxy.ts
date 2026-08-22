@@ -1,5 +1,5 @@
 import { Context } from 'hono'
-import { getProvider, getProviders, getUnimodel, getUnimodels, resolveProviderBaseUrl } from './storage'
+import { getProvider, getProviders, getModelsListCache, setModelsListCache, getUnimodel, getUnimodels, resolveProviderBaseUrl } from './storage'
 import { KV_KEYS, KEY_HEALTH_COOLDOWN_MS, KEY_HEALTH_MAX_FAILURES, UNIMODEL_PROVIDER_ID } from './config'
 import type { AppEnv, Env, ProxyRequestBody } from './types'
 import { createAnalyticsContext, normalizeAnthropicUsage, normalizeChatUsage, normalizeResponsesUsage, summarizeError } from './analytics/types'
@@ -11,7 +11,6 @@ import {
   resolveOpenCodeUrls,
   streamFetchWithTimeout,
   withSSEKeepAlive,
-  OPENCODE_KEEPALIVE_MS,
   OPENCODE_STREAM_IDLE_TIMEOUT_MS,
 } from './opencode'
 import { isQoderProvider, proxyQoderChatRequest } from './qoder/proxy'
@@ -22,6 +21,7 @@ import { isCnbProvider, proxyCnbChatRequest, CnbStreamDiag } from './cnb/proxy'
 import { isM365Provider, proxyM365ChatRequest } from './m365/proxy'
 import { isTraeProvider, proxyTraeChatRequest } from './trae/proxy'
 import { writeLog } from './admin'
+import { getPerfSettings } from './perf'
 import { applyThinkingInjection } from './thinking'
 import { applyCachePrefixInjection } from './cache-prefix'
 import { getOauthAccessToken, readOauthToken, refreshOauthToken, detectTokenRealm, buildOauthHeaders } from './oauth'
@@ -520,11 +520,28 @@ export function buildPassthroughHeaders(c: Context<AppEnv>): Record<string, stri
 
 /**
  * P2：上游 fetch——取消「5 分钟整体超时」对流式 body 的持续生效（长思考/agent 中途被掐断）。
- * - 非流式：保持原有 AbortSignal.timeout(总超时) 行为。
- * - 流式：连接/首字节超时（90s），拿到 response 后 clearTimeout；
- *   SSE body 额外包 withSSEKeepAlive（idle 兜底 240s 无数据自动结束 + 15s 心跳防客户端断流）。
+ * - 非流式：保持整体超时（totalTimeoutMs，默认 5 分钟）行为。
+ * - 流式：连接/首字节超时（connectTimeoutMs，默认 90s），拿到 response 后 clearTimeout；
+ *   SSE body 额外包 withSSEKeepAlive（idle 兜底 + 心跳，默认 240s / 15s）。
+ * 以上阈值均来自「性能设置」（KV 可编辑，见 src/perf.ts），后台可调。
  */
-const UPSTREAM_TOTAL_TIMEOUT_MS = 300000
+function fetchUpstream(
+  env: Env,
+  url: string,
+  init: RequestInit,
+  isStream: boolean,
+): Promise<Response> {
+  return getPerfSettings(env).then((perf) => {
+    if (!isStream) {
+      return fetch(url, { ...init, signal: AbortSignal.timeout(perf.totalTimeoutMs) })
+    }
+    return streamFetchWithTimeout(url, init, {
+      connectTimeoutMs: perf.connectTimeoutMs,
+      idleTimeoutMs: perf.idleTimeoutMs,
+      keepAliveMs: perf.keepAliveMs,
+    })
+  })
+}
 
 // ===== 瞬时错误自动重试 =====
 // Trae 等客户端直连网关时，上游偶发瞬时 5xx/网络抖动会直接透传失败，
@@ -536,18 +553,6 @@ const TRANSIENT_RETRY_DELAY_MS = 400
 /** 瞬时性上游状态码：可安全对同一请求重试（区别于 4xx 的确定性错误） */
 function isTransientStatus(status: number): boolean {
   return status === 500 || status === 502 || status === 503 || status === 504
-}
-
-/** P2：通用/OAuth/Anthropic/Responses 路径统一走「连接超时 + idle 兜底 + 心跳」 */
-function fetchUpstream(
-  url: string,
-  init: RequestInit,
-  isStream: boolean,
-): Promise<Response> {
-  if (!isStream) {
-    return fetch(url, { ...init, signal: AbortSignal.timeout(UPSTREAM_TOTAL_TIMEOUT_MS) })
-  }
-  return streamFetchWithTimeout(url, init, { keepAliveMs: OPENCODE_KEEPALIVE_MS })
 }
 
 const normalizeUsage = (route: string, provider: import('./types').Provider, payload: unknown): UsageMetrics | null => {
@@ -1183,7 +1188,7 @@ export async function forwardProxy(
       try {
         // 瞬时错误自动重试：对同一 key 的瞬时 5xx / 网络抖动重试，
         // 消除"偶发 500/断连，客户端重试一次又正常"的体验问题。
-        let response = await fetchUpstream(forwardUrl, {
+        let response = await fetchUpstream(c.env, forwardUrl, {
           method,
           headers: forwardHeaders,
           body: requestBody,
@@ -1193,7 +1198,7 @@ export async function forwardProxy(
           transientRetries++
           try { c.executionCtx.waitUntil(writeLog(c.env, 'warn', `[${provider.name}] ${model} → 瞬时 ${response.status}，${transientRetries}/${TRANSIENT_RETRY_MAX} 次重试`)) } catch {}
           await new Promise((r) => setTimeout(r, TRANSIENT_RETRY_DELAY_MS * transientRetries))
-          response = await fetchUpstream(forwardUrl, {
+          response = await fetchUpstream(c.env, forwardUrl, {
             method,
             headers: forwardHeaders,
             body: requestBody,
@@ -1254,7 +1259,7 @@ export async function forwardProxy(
           try { c.executionCtx.waitUntil(writeLog(c.env, 'warn', `[${provider.name}] ${model} → 网络瞬时错误，${netRetries}/${TRANSIENT_RETRY_MAX} 次重试: ${String(error.message || error).substring(0, 200)}`)) } catch {}
           await new Promise((r) => setTimeout(r, TRANSIENT_RETRY_DELAY_MS * netRetries))
           try {
-            const retryResp = await fetchUpstream(forwardUrl, {
+            const retryResp = await fetchUpstream(c.env, forwardUrl, {
               method,
               headers: forwardHeaders,
               body: requestBody,
@@ -1380,7 +1385,7 @@ async function proxyOAuthRequest(
     if (provider.id.startsWith('workbuddy') && body.stream !== true) {
       body.stream = true
     }
-    return fetchUpstream(buildForwardUrl(r), {
+    return fetchUpstream(c.env, buildForwardUrl(r), {
       method,
       headers: buildOauthHeaders(cfg, token, { origin: buildOrigin(r), apiType: provider.apiType, cookies: tokenState?.cookies }),
       body: method === 'GET' || method === 'HEAD' ? undefined : JSON.stringify(body),
@@ -1512,60 +1517,65 @@ async function proxyOAuthRequest(
   }
 }
 
-/** 处理 /v1/models — 返回所有已启用的模型（含提供商前缀） */
+/** 处理 /v1/models — 返回所有已启用的模型（含提供商前缀）。
+ * 全量列表在内存中缓存（TTL 同 providers，可经管理后台「内存缓存」查看/清空），
+ * 之后按转发 Key 的 allowedModels 逐请求过滤；并回写 Cache-Control 让客户端/CDN 缓存。 */
 export async function handleModels(c: Context<AppEnv>) {
-  const providers = await getProviders(c.env)
-  // 从中间件获取转发 Key（可能带有 allowedModels 过滤）
-  const proxyKey = (c as any).get('proxyKey') as import('./types').ProxyKey | undefined
-  const allowed = proxyKey?.allowedModels
-  const allowSet = allowed && allowed.length > 0 ? new Set(allowed) : null
-
-  const models: Array<{
+  const cached = getModelsListCache()
+  let models: Array<{
     id: string
     provider: string
     provider_name: string
     object: string
     created: number
     owned_by: string
-  }> = []
+  }> = cached ? JSON.parse(cached) : []
 
-  for (const provider of providers) {
-    if (!provider.enabled) continue
-    for (const model of provider.models) {
-      if (!model.enabled) continue
-      const fullId = `${provider.id}/${model.id}`
-      // 如果转发 Key 配置了 allowedModels，只返回允许的模型
-      if (allowSet && !allowSet.has(fullId)) continue
+  if (!cached) {
+    const providers = await getProviders(c.env)
+    const nowTs = Math.floor(Date.now() / 1000)
+    for (const provider of providers) {
+      if (!provider.enabled) continue
+      for (const model of provider.models) {
+        if (!model.enabled) continue
+        const fullId = `${provider.id}/${model.id}`
+        models.push({
+          id: fullId,
+          provider: provider.id,
+          provider_name: provider.name,
+          object: 'model',
+          created: nowTs,
+          owned_by: provider.id,
+        })
+      }
+    }
+    // 注入联合模型（uni-model）条目（模型 ID 形如 unimodel/xxx）
+    const unimodels = await getUnimodels(c.env)
+    for (const um of unimodels) {
+      if (!um.enabled) continue
+      const fullId = `${UNIMODEL_PROVIDER_ID}/${um.name}`
       models.push({
         id: fullId,
-        provider: provider.id,
-        provider_name: provider.name,
+        provider: UNIMODEL_PROVIDER_ID,
+        provider_name: '联合模型',
         object: 'model',
-        created: Math.floor(Date.now() / 1000),
-        owned_by: provider.id,
+        created: nowTs,
+        owned_by: UNIMODEL_PROVIDER_ID,
       })
     }
+    setModelsListCache(JSON.stringify(models))
   }
 
-  // 注入联合模型（uni-model）条目（模型 ID 形如 unimodel/xxx）
-  const unimodels = await getUnimodels(c.env)
-  for (const um of unimodels) {
-    if (!um.enabled) continue
-    const fullId = `${UNIMODEL_PROVIDER_ID}/${um.name}`
-    if (allowSet && !allowSet.has(fullId)) continue
-    models.push({
-      id: fullId,
-      provider: UNIMODEL_PROVIDER_ID,
-      provider_name: '联合模型',
-      object: 'model',
-      created: Math.floor(Date.now() / 1000),
-      owned_by: UNIMODEL_PROVIDER_ID,
-    })
-  }
+  // 从中间件获取转发 Key（可能带有 allowedModels 过滤）—— 过滤在缓存之后，保证各 Key 命中同一份全量列表
+  const proxyKey = (c as any).get('proxyKey') as import('./types').ProxyKey | undefined
+  const allowed = proxyKey?.allowedModels
+  const allowSet = allowed && allowed.length > 0 ? new Set(allowed) : null
+  const filtered = allowSet ? models.filter((m) => allowSet.has(m.id)) : models
 
+  c.header('Cache-Control', 'public, max-age=10')
   return c.json({
     object: 'list',
-    data: models,
+    data: filtered,
   })
 }
 
@@ -1733,7 +1743,7 @@ export async function handleAnthropicMessages(c: Context<AppEnv>) {
         cookies: tokenState.cookies,
       })
 
-      let response = await fetchUpstream(upstreamUrl, {
+      let response = await fetchUpstream(c.env, upstreamUrl, {
         method: 'POST',
         headers,
         body: JSON.stringify(upstreamBody),
@@ -1749,7 +1759,7 @@ export async function handleAnthropicMessages(c: Context<AppEnv>) {
               origin,
               cookies: freshState.cookies,
             })
-            response = await fetchUpstream(upstreamUrl, {
+            response = await fetchUpstream(c.env, upstreamUrl, {
               method: 'POST',
               headers: retryHeaders,
               body: JSON.stringify(upstreamBody),
@@ -2032,7 +2042,7 @@ export async function handleAnthropicMessages(c: Context<AppEnv>) {
     let lastStatus = 502
     for (const key of enabledKeys) {
       try {
-        const r = await fetchUpstream(forwardUrl, {
+        const r = await fetchUpstream(c.env, forwardUrl, {
           method: 'POST',
           headers: {
             'Content-Type': 'application/json',
@@ -2789,7 +2799,7 @@ export async function handleResponses(c: Context<AppEnv>) {
         cookies: tokenState.cookies,
       })
 
-      let response = await fetchUpstream(upstreamUrl, {
+      let response = await fetchUpstream(c.env, upstreamUrl, {
         method: 'POST',
         headers,
         body: JSON.stringify(upstreamBody),
@@ -2806,7 +2816,7 @@ export async function handleResponses(c: Context<AppEnv>) {
               apiType: provider.apiType,
               cookies: freshState.cookies,
             })
-            response = await fetchUpstream(upstreamUrl, {
+            response = await fetchUpstream(c.env, upstreamUrl, {
               method: 'POST',
               headers: retryHeaders,
               body: JSON.stringify(upstreamBody),
@@ -2951,7 +2961,7 @@ export async function handleResponses(c: Context<AppEnv>) {
     let lastStatus = 502
     for (const key of enabledKeys) {
       try {
-        const r = await fetchUpstream(forwardUrl, {
+        const r = await fetchUpstream(c.env, forwardUrl, {
           method: 'POST',
           headers: {
             'Content-Type': 'application/json',
