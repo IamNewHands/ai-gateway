@@ -39,12 +39,21 @@ import { writeLog } from '../admin'
 
 // ===== 工具 =====
 
-/** 生成 n 字节 hex 字符串（机器/设备/登录 trace id）。 */
+/** 生成 n 字节 hex 字符串（机器/登录 trace id）。 */
 function randomHex(n: number): string {
   const buf = new Uint8Array(n)
   crypto.getRandomValues(buf)
   let s = ''
   for (let i = 0; i < n; i++) s += buf[i].toString(16).padStart(2, '0')
+  return s
+}
+
+/** 生成 15 位数字 device_id（TraeWork 签到/积分接口要求，服务端绑定账号；随机 hex 会被以 9074 拒绝）。 */
+function randomDeviceId(): string {
+  const b = new Uint8Array(15)
+  crypto.getRandomValues(b)
+  let s = String((b[0] % 9) + 1) // 首位 1-9，避免前导 0
+  for (let i = 1; i < 15; i++) s += String(b[i] % 10)
   return s
 }
 
@@ -74,7 +83,7 @@ export async function handleTraeLoginConnect(c: Context<AppEnv>) {
   if (!isTraeProvider(provider)) return c.json<ApiResponse>({ success: false, message: '不是 TRAE 提供商' }, 400)
 
   const machineId = randomHex(16)
-  const deviceId = randomHex(16)
+  const deviceId = randomDeviceId()
   const loginTraceId = randomHex(8)
   const state: TraeLoginState = { machineId, deviceId, loginTraceId, createdAt: Date.now() }
   try {
@@ -97,9 +106,9 @@ export async function handleTraeLoginConnect(c: Context<AppEnv>) {
     device_id: deviceId,
     x_device_id: deviceId,
     x_machine_id: machineId,
-    x_device_brand: 'PC',
-    x_device_type: 'PC',
-    x_os_version: '1.0',
+    x_device_brand: TRAE_CONSTANTS.DeviceBrand,
+    x_device_type: 'windows',
+    x_os_version: TRAE_CONSTANTS.OSVersion,
     x_app_version: TRAE_CONSTANTS.IdeVersion,
     x_app_type: 'stable',
   }
@@ -143,7 +152,7 @@ export async function handleTraeLoginCallback(c: Context<AppEnv>) {
     if (raw) state = JSON.parse(raw) as TraeLoginState
   } catch { /* ignore */ }
   const machineId = state?.machineId || randomHex(16)
-  const deviceId = state?.deviceId || randomHex(16)
+  const deviceId = state?.deviceId || randomDeviceId()
 
   let uid = String(userInfo['UserID'] || '')
   let nickname = String(userInfo['ScreenName'] || '')
@@ -266,9 +275,15 @@ async function checkinTraeAccount(env: Env, provider: Provider, account: TraeAcc
     } else if (st.enable) {
       try {
         await performCheckinClaim(account)
-        base.success = true
-        base.checkedIn = true
-        base.message = '签到成功'
+        // 后置校验：claim 业务码不为 0 也可能幂等成功（如 9095 今日已签），以 status 实测为准
+        const st2 = await fetchCheckinStatus(account)
+        if (st2.checkedIn) {
+          base.success = true
+          base.checkedIn = true
+          base.message = '签到成功'
+        } else {
+          base.message = '签到校验失败: claim 后 checked_in 仍为 false（请稍后重试）'
+        }
       } catch (e) {
         const msg = (e as Error).message || String(e)
         // 业务软失败（已签到类）→ 视为成功已签

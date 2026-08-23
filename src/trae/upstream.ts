@@ -70,7 +70,13 @@ export function ugHeaders(account: TraeAccount): Record<string, string> {
     Authorization: `Cloud-IDE-JWT ${account.accessToken}`,
     'X-User-Region': 'CN',
   }
-  if (account.deviceId) h['X-Device-Id'] = account.deviceId
+  // 设备指纹头（checkin_credits/* 与积分接口必需）：官方客户端 bb() 注入。
+  // 缺失或与账号绑定的 device_id 不一致会被上游以 9074 拒绝。
+  if (account.deviceId) h['x-device-id'] = account.deviceId
+  h['x-device-brand'] = TRAE_CONSTANTS.DeviceBrand
+  h['x-device-type'] = 'windows'
+  h['x-os-version'] = TRAE_CONSTANTS.OSVersion
+  h['x-app-version'] = TRAE_CONSTANTS.IdeVersion
   return h
 }
 
@@ -371,8 +377,44 @@ export interface TraeCheckinStatus {
   enable: boolean
 }
 
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms))
+}
+
+/** 从签到/积分响应里取业务 code（可能顶层也可能在 data 里）。 */
+function checkinCode(data: any): number {
+  if (data && typeof data === 'object') {
+    if (typeof data.code === 'number') return data.code
+    if (data.data && typeof data.data === 'object' && typeof data.data.code === 'number') return data.data.code
+  }
+  return 0
+}
+
+/** success 字段显式为 false 视为业务失败。 */
+function checkinRejected(data: any): boolean {
+  return !!(data && typeof data === 'object' && data.success === false)
+}
+
+function checkinMessage(message?: string, msg?: string): string {
+  const m = (message || '').trim()
+  return m || (msg || '').trim()
+}
+
+/** 把业务 code 转成可读错误；9074 是设备指纹失败（需重新登录换合法 device_id）。 */
+function checkinBizError(code: number, msg: string): string {
+  if (code === 9074 || /9074/.test(msg)) {
+    return `设备指纹校验失败（9074）：账号绑定的 device_id 无效，请重新登录该账号以更新设备标识（${msg || ''}）`.trim()
+  }
+  const trimmed = msg || `code=${code}`
+  return code !== 0 ? `code=${code} msg=${trimmed}` : trimmed
+}
+
 export async function fetchCheckinStatus(account: TraeAccount): Promise<TraeCheckinStatus> {
   const data = await doJson(TRAE_CONSTANTS.UgHost + TRAE_CONSTANTS.EpCheckinStatus, ugHeaders(account), {})
+  const code = checkinCode(data)
+  if (code !== 0 || checkinRejected(data)) {
+    throw new Error(checkinBizError(code, checkinMessage(data?.message, data?.msg)))
+  }
   return {
     checkedIn: data?.checked_in === true,
     credits: Number(data?.credits) || 0,
@@ -380,8 +422,28 @@ export async function fetchCheckinStatus(account: TraeAccount): Promise<TraeChec
   }
 }
 
+/** 9074 限流/指纹失败后的重试等待（对齐 workbuddy-wild 生产默认 8s）。 */
+const CHECKIN_RETRY_DELAY_MS = 8000
+
 export async function performCheckinClaim(account: TraeAccount): Promise<void> {
-  await doJson(TRAE_CONSTANTS.UgHost + TRAE_CONSTANTS.EpCheckinClaim, ugHeaders(account), {})
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const data = await doJson(TRAE_CONSTANTS.UgHost + TRAE_CONSTANTS.EpCheckinClaim, ugHeaders(account), {})
+    const code = checkinCode(data)
+    const rejected = checkinRejected(data)
+    // 9074 → 稍候重试一次（幂等，重试后仍失败再抛错）
+    if (code === 9074 && attempt === 0) {
+      await sleep(CHECKIN_RETRY_DELAY_MS)
+      continue
+    }
+    // 9095 = 当前设备今日已签到（幂等，视为成功，交由后置 status 校验最终状态）
+    if (code === 9095) return
+    if (code !== 0 || rejected) {
+      const msg = checkinMessage(data?.message, data?.msg)
+      throw new Error(checkinBizError(code, msg) + (rejected && code === 0 ? ' (success=false)' : ''))
+    }
+    return
+  }
+  throw new Error('checkin claim failed: code=9074 持续限流/指纹失败')
 }
 
 /** 聚合剩余积分（ide_user_ent_usage）：每包 credits_limit（总量）− credits_amount（已用），负值按 0。 */
