@@ -1073,6 +1073,19 @@ export async function handleOAuthStatus(c: Context<AppEnv>) {
     oid: token?.oid ?? null,
     tid: token?.tid ?? null,
   }
+  // M365：token 存于账号池（oauth:token:{id}:pool），从池读首个账号，避免 status 误报"未连接"
+  if (isM365Provider(provider)) {
+    const infos = await getM365AccountInfos(c.env, id)
+    const first = infos[0] || null
+    data.connected = first ? first.connected : false
+    data.expiresAt = first?.expiresAt ?? null
+    data.email = first?.email ?? null
+    data.oid = first?.oid ?? null
+    data.tid = first?.tid ?? null
+    data.updatedAt = null
+    data.hasCookies = false
+    data.accountCount = infos.length
+  }
   // WorkBuddy 多账号池：返回池账号状态（脱敏）供面板展示
   if (isOAuthPoolProvider(provider)) {
     try { await seedOauthPoolFromSingle(c.env, id) } catch { /* ignore */ }
