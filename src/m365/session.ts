@@ -35,9 +35,24 @@ export interface ResolveResult {
 }
 
 const M365_SESSION_PREFIX = 'm365:sessions:'
-const SESSION_TTL_MS = 2 * 60 * 60 * 1000
-const CONTEXT_TTL_MS = 2 * 60 * 60 * 1000
+const DEFAULT_TTL_MS = 2 * 60 * 60 * 1000
 const MAX_SESSIONS = 1000
+
+/** 会话签名/绑定 TTL（环境变量 M365_SESSION_TTL_HOURS，默认 2 小时） */
+export function sessionTtlMs(env: Env): number {
+  return hoursToMs(env.M365_SESSION_TTL_HOURS)
+}
+
+/** 上下文内容复用 TTL（环境变量 M365_CONTEXT_TTL_HOURS，默认 2 小时） */
+export function contextTtlMs(env: Env): number {
+  return hoursToMs(env.M365_CONTEXT_TTL_HOURS)
+}
+
+function hoursToMs(raw: string | undefined): number {
+  const n = Number(raw)
+  if (!Number.isFinite(n) || n <= 0) return DEFAULT_TTL_MS
+  return n * 60 * 60 * 1000
+}
 
 function kvKey(providerId: string): string {
   return M365_SESSION_PREFIX + providerId
@@ -89,7 +104,7 @@ async function readAll(env: Env, providerId: string): Promise<SessionBinding[]> 
 
 async function writeAll(env: Env, providerId: string, list: SessionBinding[]): Promise<void> {
   try {
-    await env.KV.put(kvKey(providerId), JSON.stringify(list), { expirationTtl: Math.floor((SESSION_TTL_MS * 2) / 1000) })
+    await env.KV.put(kvKey(providerId), JSON.stringify(list), { expirationTtl: Math.floor((sessionTtlMs(env) * 2) / 1000) })
   } catch { /* KV 写入失败不影响主流程 */ }
 }
 
@@ -158,9 +173,9 @@ function cloneMessages(msgs: OaiMsgLite[]): OaiMsgLite[] {
   return msgs.map((m) => ({ ...m, content: Array.isArray(m.content) ? [...m.content] : m.content, tool_calls: m.tool_calls ? [...m.tool_calls] : m.tool_calls }))
 }
 
-function evict(list: SessionBinding[]): SessionBinding[] {
+function evict(list: SessionBinding[], ttlMs: number): SessionBinding[] {
   const now = Date.now()
-  let out = list.filter((s) => now - s.lastUsedAt <= SESSION_TTL_MS)
+  let out = list.filter((s) => now - s.lastUsedAt <= ttlMs)
   if (out.length > MAX_SESSIONS) {
     out = [...out].sort((a, b) => b.lastUsedAt - a.lastUsedAt).slice(0, MAX_SESSIONS)
   }
@@ -173,7 +188,7 @@ function evict(list: SessionBinding[]): SessionBinding[] {
  */
 export async function resolveSession(env: Env, providerId: string, msgs: OaiMsgLite[], ctx: ContextLike): Promise<ResolveResult> {
   let list = await readAll(env, providerId)
-  list = evict(list)
+  list = evict(list, sessionTtlMs(env))
 
   const explicitID = ctx.explicitSessionId || ''
   if (explicitID) {
@@ -191,7 +206,7 @@ export async function resolveSession(env: Env, providerId: string, msgs: OaiMsgL
     let best: { id: string; n: number; recent: number } | null = null
     for (const s of list) {
       if (!s.ipFingerprint || s.ipFingerprint !== ipFinger) continue
-      if (Date.now() - s.lastUsedAt > CONTEXT_TTL_MS) continue
+      if (Date.now() - s.lastUsedAt > contextTtlMs(env)) continue
       if (!s.contextHistory || s.contextHistory.length === 0) continue
       const n = contextPrefixLen(s.contextHistory, msgs)
       if (n >= 1 && (!best || n > best.n || (n === best.n && s.lastUsedAt > best.recent))) {
@@ -208,7 +223,7 @@ export async function resolveSession(env: Env, providerId: string, msgs: OaiMsgL
     let bestS: { id: string; n: number; recent: number } | null = null
     for (const s of list) {
       if (!s.ipFingerprint || s.ipFingerprint !== ipFinger) continue
-      if (Date.now() - s.lastUsedAt > CONTEXT_TTL_MS) continue
+      if (Date.now() - s.lastUsedAt > contextTtlMs(env)) continue
       if (!s.contextHistory || s.contextHistory.length < 2) continue
       const n = suffixMatchLen(s.contextHistory, msgs)
       if (n >= 2 && (!bestS || n > bestS.n || (n === bestS.n && s.lastUsedAt > bestS.recent))) {
@@ -232,7 +247,7 @@ export async function resolveSession(env: Env, providerId: string, msgs: OaiMsgL
  */
 export async function bindSession(env: Env, providerId: string, sessionId: string, conversationId: string, accountId: string, msgs: OaiMsgLite[], assistantText: string, ctx: ContextLike): Promise<void> {
   let list = await readAll(env, providerId)
-  list = evict(list)
+  list = evict(list, sessionTtlMs(env))
 
   const now = Date.now()
   const history = cloneMessages(msgs)
@@ -272,7 +287,7 @@ export async function bindSession(env: Env, providerId: string, sessionId: strin
 
 /** 列出某 provider 的所有会话（管理后台用） */
 export async function listSessions(env: Env, providerId: string): Promise<SessionBinding[]> {
-  return evict(await readAll(env, providerId))
+  return evict(await readAll(env, providerId), sessionTtlMs(env))
 }
 
 /** 删除某 provider 的会话 */
@@ -301,7 +316,7 @@ export async function unbindByConversation(env: Env, providerId: string, convers
 export async function cleanupSessions(env: Env, providerId: string): Promise<number> {
   let list = await readAll(env, providerId)
   const before = list.length
-  list = evict(list)
+  list = evict(list, sessionTtlMs(env))
   if (list.length !== before) await writeAll(env, providerId, list)
   return before - list.length
 }

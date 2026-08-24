@@ -187,6 +187,30 @@ function schemaValid(args: Record<string, unknown>, fn: Record<string, unknown>)
 }
 
 /**
+ * 工具调用信任边界校验（同原版 tooldecision.go validateDetectedToolCalls）。
+ * 模型输出天然不可信——可能调用未注册工具或拼出不符合 schema 的参数。
+ * 这里按客户端注册的工具定义做二次校验：未知工具名、参数解析失败、参数不合法一律剔除。
+ * 返回过滤后的合法调用与剔除数量（供日志/告警）。
+ */
+export function validateDetectedToolCalls(calls: DetectedToolCall[], tools: ToolDef[]): { calls: DetectedToolCall[]; dropped: number } {
+  const out: DetectedToolCall[] = []
+  let dropped = 0
+  for (const c of calls) {
+    const fn = toolFunction(c.name, tools)
+    if (!fn) { dropped++; continue }
+    let args: Record<string, unknown>
+    try {
+      const v = JSON.parse(c.arguments)
+      if (v === null || typeof v !== 'object' || Array.isArray(v)) { dropped++; continue }
+      args = v
+    } catch { dropped++; continue }
+    if (schemaValid(args, fn) !== null) { dropped++; continue }
+    out.push({ ...c, arguments: JSON.stringify(args) })
+  }
+  return { calls: out, dropped }
+}
+
+/**
  * 从响应文本解析 <m365-tool-call> fenced block（与 M365 官方协议一致）。
  * 支持文本中多个独立块，每个块可含单个对象或数组（同原版 tooldecision.extractToolCalls）。
  * 返回 (工具调用列表, 是否包含调用块)。
@@ -479,7 +503,19 @@ export interface AgentLedger {
   toolRounds: number
   repeatedCall: boolean
   repeatedFailure: boolean
+  /** 同一调用（name+args）被反复执行 >=3 次，判定陷入死循环（同原版 StuckLoop） */
+  stuckLoop?: boolean
   repetitionSignature?: string
+}
+
+/** 单次对话允许的最大工具轮数（同原版 maxToolRounds / M365_MAX_TOOL_ROUNDS 默认） */
+export const MAX_TOOL_ROUNDS_DEFAULT = 8
+
+/** 是否允许继续发起工具轮：死循环或超轮数则停止 */
+export function canContinue(l: AgentLedger, maxRounds = MAX_TOOL_ROUNDS_DEFAULT): boolean {
+  if (l.stuckLoop) return false
+  if (l.toolRounds >= maxRounds) return false
+  return true
 }
 
 const failureSignal = /(exit\s*(code|status)?\s*[:=]?\s*[1-9]\d*|\berror\b|\bfailed\b|\bfailure\b|exception|traceback|timed?\s*out|permission denied|not found|refused)/i
@@ -522,14 +558,20 @@ export function buildAgentLedger(messages: OaiMsgLite[]): AgentLedger {
   const l: AgentLedger = { completed: [], pending: [], toolRounds: 0, repeatedCall: false, repeatedFailure: false }
   const seenCall: Record<string, number> = {}
   const seenFailure: Record<string, number> = {}
+  const seenAny: Record<string, number> = {}
   for (const id of order) {
     const e = calls[id]
     l.toolRounds++
     const sig = e.name + '\x00' + e.arguments
     seenCall[sig] = (seenCall[sig] || 0) + 1
+    seenAny[sig] = (seenAny[sig] || 0) + 1
     if (seenCall[sig] >= 2) {
       l.repeatedCall = true
       l.repetitionSignature = sig
+    }
+    // 同一调用被执行 >=3 次 → 死循环（同原版 StuckLoop），提示模型停止重复
+    if (seenAny[sig] >= 3) {
+      l.stuckLoop = true
     }
     if (e.result === '') {
       l.pending.push(e)
@@ -554,6 +596,7 @@ export function ledgerRouterContext(l: AgentLedger): string {
   const json = JSON.stringify(compact)
   let hint = 'Use only this compact evidence. A completed call is final evidence; do not issue the same name and arguments again.'
   if (l.repeatedFailure) hint += ' The same call failed repeatedly; change strategy instead of retrying unchanged.'
+  if (l.stuckLoop) hint += ' STOP: the same call has looped repeatedly with no progress. Do not re-invoke it; change approach or conclude.'
   return hint + '\nEVIDENCE_LEDGER: ' + json
 }
 

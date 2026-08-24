@@ -37,6 +37,10 @@ storage = "sqlite"
 [vars]
 USAGE_ANALYTICS_DATASET = "ai_gateway_usage"
 
+# M365：会话/上下文 TTL（小时，可选；缺省 2）
+# M365_SESSION_TTL_HOURS = "2"
+# M365_CONTEXT_TTL_HOURS = "2"
+
 [[analytics_engine_datasets]]
 binding = "USAGE_ANALYTICS"
 dataset = "ai_gateway_usage"

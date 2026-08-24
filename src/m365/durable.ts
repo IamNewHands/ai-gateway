@@ -12,13 +12,14 @@
 import type { Env } from '../types'
 import { chatWithHandlers, classifyChatHubNotice } from './chathub'
 import type { ChatHubAccount, ChatHubTool, ChatHubResult } from './chathub'
-import { flattenPromptMessages, modelToolRouterPrompt, parseModelToolDecision, fencedToolCalls, nativeToolCalls, compactToolResult, buildAgentLedger, ledgerRouterContext, filterCompletedCalls, completionEvidenceAllows, isToolRefusal } from './tools'
+import { flattenPromptMessages, modelToolRouterPrompt, parseModelToolDecision, fencedToolCalls, nativeToolCalls, compactToolResult, buildAgentLedger, ledgerRouterContext, filterCompletedCalls, validateDetectedToolCalls, completionEvidenceAllows, isToolRefusal } from './tools'
 import type { DetectedToolCall, AgentLedger, OaiMsgLite } from './tools'
 import { resolveSession, bindSession } from './session'
 import type { ResolveResult } from './session'
 import { listM365Accounts } from './oauth'
 import { recordConversation, shouldCleanup, cleanupConversations, getCleanupMode, getCleanupConfig } from './conversation-manager'
-import { markAccountSuccess, markAccountFailure, markAccountImageLimited, accountCooldownSeconds, isAccountAvailable, isRateLimited, isAuthFailure, isEmptyCompletion } from './account-health'
+import { markAccountSuccess, markAccountFailure, markAccountImageLimited, accountCooldownSeconds, isAccountAvailable, isRateLimited, isAuthFailure, isEmptyCompletion, confirmAndMarkRateLimit } from './account-health'
+import type { RateLimitProbeFn } from './account-health'
 import { writeLog } from '../admin'
 import { acquireSlot, releaseSlot, fluxSnapshot } from './account-flux'
 
@@ -29,6 +30,8 @@ export interface M365ChatPayload {
   body: Record<string, unknown>
   stream: boolean
   explicitSessionId?: string
+  /** 客户端指定使用的账号（oid），缺省由网关轮询/failover */
+  explicitAccountId?: string
   user?: string
   ip?: string
   userAgent?: string
@@ -94,7 +97,7 @@ export class M365Session {
   }
 
   private async handleChat(payload: M365ChatPayload): Promise<Response> {
-    const { providerId, model, body, stream, explicitSessionId, user, ip, userAgent } = payload
+    const { providerId, model, body, stream, explicitSessionId, explicitAccountId, user, ip, userAgent } = payload
     const messages = (body['messages'] as Array<Record<string, unknown>>) || []
     const tools = (body['tools'] as unknown[]) || []
     const toolChoice = body['tool_choice']
@@ -126,8 +129,11 @@ export class M365Session {
     const ledgerCtx = ledger.toolRounds > 0 ? ledgerRouterContext(ledger) : ''
 
     // 3) 账号池选择：见 selectAccounts 注释。返回按尝试顺序排好的候选账号。
-    const ordered = await this.selectAccounts(providerId, resolved)
+    const ordered = await this.selectAccounts(providerId, resolved, explicitAccountId)
     if (ordered.length === 0) {
+      if (explicitAccountId) {
+        return cjson({ error: { message: '指定的 M365 账号（m365_account_id）不存在或不可用', type: 'account_error' } }, 404)
+      }
       return cjson({ error: { message: 'M365 账号未授权、token 失效或全部处于冷却，请在后台添加/授权账号', type: 'auth_error' } }, 401)
     }
     const acc = ordered[0]
@@ -214,8 +220,12 @@ export class M365Session {
         // 记录完整 ChatHub 错误（含微软服务端返回的 detail）便于排查真实对话 500
         const msg = err instanceof Error ? err.message : String(err)
         const errObj = err instanceof Error ? err : new Error(msg)
-        const retryAfter = isRateLimited(errObj) ? 60 : 0
-        await markAccountFailure(this.env, usedAcc.oid, errObj, retryAfter)
+        // 限流先做二次确认探测（误报不冷却），鉴权/其他失败直接标记
+        if (isRateLimited(errObj)) {
+          await confirmAndMarkRateLimit(this.env, usedAcc.oid, errObj, this.createRateLimitProbe(usedAcc))
+        } else {
+          await markAccountFailure(this.env, usedAcc.oid, errObj)
+        }
         const cls = classifyChatHubNotice(msg)
         const detail =
           `model=${model} isNew=${resolved.isNew} account=${usedAcc.oid} tools=${toolDefs.length} ` +
@@ -267,7 +277,12 @@ export class M365Session {
     const rawCalls: DetectedToolCall[] =
       fencedToolCalls(result.text || streamedText, toolDefs, toolChoice)
     const allCalls = rawCalls.length > 0 ? rawCalls : nativeToolCalls(result.events, toolDefs)
-    const calls = filterCompletedCalls(allCalls, ledger)
+    // 信任边界：模型输出不可信，二次校验（未知工具/参数不合 schema 一律剔除）
+    const validated = validateDetectedToolCalls(allCalls, toolDefs)
+    if (validated.dropped > 0) {
+      console.warn(`[m365:${providerId}] 剔除 ${validated.dropped} 个不合规工具调用（信任边界校验）`)
+    }
+    const calls = filterCompletedCalls(validated.calls, ledger)
 
     let finalText = result.text
     // 兜底 3：若存在工具证据但回答声称"已完成"，且无匹配工具结果，则替换为未确认措辞
@@ -325,7 +340,7 @@ export class M365Session {
    * - 新会话：返回所有健康账号，按最近未用优先（round-robin），便于在限流/鉴权失败时切号重试。
    * 返回按尝试顺序排列的 ChatHubAccount 候选数组。
    */
-  private async selectAccounts(providerId: string, resolved: ResolveResult): Promise<ChatHubAccount[]> {
+  private async selectAccounts(providerId: string, resolved: ResolveResult, explicitAccountId?: string): Promise<ChatHubAccount[]> {
     const accounts = await listM365Accounts(this.env, providerId)
     if (accounts.length === 0) return []
     const snapshot: { limit: number; inflight: Record<string, number> } =
@@ -339,6 +354,11 @@ export class M365Session {
       if (inflight >= snapshot.limit) continue
       healthy.push({ accessToken: a.accessToken, oid: a.oid, tid: a.tid })
     }
+    // 客户端显式指定账号：仅用该账号（须在池中且健康）
+    if (explicitAccountId && explicitAccountId !== '') {
+      const target = healthy.find((a) => a.oid === explicitAccountId)
+      return target ? [target] : []
+    }
     if (!resolved.isNew && resolved.accountId) {
       // 已绑定会话：仅允许使用绑定账号（云端对话归属它）
       const pinned = healthy.find((a) => a.oid === resolved.accountId)
@@ -350,6 +370,25 @@ export class M365Session {
       if (pref) return [pref, ...healthy.filter((a) => a.oid !== resolved.accountId)]
     }
     return healthy
+  }
+
+  /** 限流二次确认探测：用最小消息发全新 ChatHub 对话，30s 内成功即判定上次限流为误报（不冷却） */
+  private createRateLimitProbe(account: ChatHubAccount): RateLimitProbeFn {
+    return async () => {
+      try {
+        await chatWithHandlers(
+          account,
+          { text: 'Reply with exactly: OK', conversationId: undefined, sessionId: undefined, started: true, attachments: undefined },
+          { timeoutMs: 30_000 },
+        )
+        // 成功取到回复 → 上次限流是误报，不标记冷却
+        return false
+      } catch (probeErr) {
+        // 探测仍限流/失败 → 确认限流
+        console.log(`[m365:rate-limit-probe] ${account.oid} still failing: ${probeErr instanceof Error ? probeErr.message : String(probeErr)}`)
+        return true
+      }
+    }
   }
 
   /** 把主回答的 ChatHub 错误归类为合适的 HTTP 响应（429/401/502/500） */

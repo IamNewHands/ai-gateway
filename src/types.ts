@@ -466,6 +466,10 @@ export interface Env {
   M365_FLUX: DurableObjectNamespace
   /** M365 每账号最大并发对话数（默认 8） */
   M365_ACCOUNT_DEFAULT_CONCURRENCY?: string
+  /** M365 会话签名/绑定 TTL（小时，默认 2） */
+  M365_SESSION_TTL_HOURS?: string
+  /** M365 上下文内容复用 TTL（小时，默认 2） */
+  M365_CONTEXT_TTL_HOURS?: string
 }
 
 export interface AnalyticsEngineDatasetBinding {

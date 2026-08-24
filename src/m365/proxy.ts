@@ -74,6 +74,8 @@ export async function proxyM365ChatRequest(
     body,
     stream: body['stream'] === true,
     explicitSessionId,
+    /** 客户端可指定用某个账号（m365_account_id = 该账号 oid），缺省由网关轮询/failover */
+    explicitAccountId: typeof body['m365_account_id'] === 'string' && body['m365_account_id'].trim() !== '' ? body['m365_account_id'].trim() : undefined,
     user: context?.user,
     ip: context?.ip,
     userAgent: context?.userAgent,

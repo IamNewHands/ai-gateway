@@ -15,7 +15,7 @@
 
 | 功能 | 本地缺失处 | 原仓文件 | 状态 |
 |---|---|---|---|
-| 多账号池 + round-robin/lastHealthy 故障转移 | `durable.ts` / `cloud-api.ts` 只有单 `getM365Account` | `auth/cache.go`、`server.go resolveAccount/nextHealthyAccount` | ✅(账号池存取·轮询·新会话 failover·按账号健康·管理端)/🚧(每账号并发闸门·显式账号参数透传) |
+| 多账号池 + round-robin/lastHealthy 故障转移 | `durable.ts` / `cloud-api.ts` 只有单 `getM365Account` | `auth/cache.go`、`server.go resolveAccount/nextHealthyAccount` | ✅(账号池存取·轮询·新会话 failover·按账号健康·管理端·每账号并发闸门·显式账号参数透传) |
 | 账号级冷却 + 并发闸门（每账号并发上限，区别于会话串行队列） | `account-health.ts` 无 `imageLimited`；`durable.ts` `queue` 为会话级 | `account_concurrency.go`、`account_health.go` | ✅(账号级冷却/图片额度 24h + 每账号并发闸门 DO) |
 | 模型→ChatHub tone 映射 + 动态模型目录 | `proxy.ts` 静态 `M365_MODELS`，无 tone 映射 | `codex_catalog.go`、`server.go modelTone` | ⏳(需上游 tone 实测，避免臆造) |
 | 完整 Result 元数据（throttling/suggestedResponses/rawResult/references/citations/metering） | `ChatHubResult` 字段过少 | `client.go` Result | ✅(部分：throttling/rawResult/images 透传入 `m365` 块) |
@@ -25,10 +25,10 @@
 
 | 功能 | 本地缺失处 | 原仓文件 | 状态 |
 |---|---|---|---|
-| 工具规划模式(native vs router) + tool_progress 进度事件 + validateDetectedToolCalls 信任边界 + writeToolResponse 分块 | `durable.ts` 硬编码 router | `tool_planning/tool_progress/tooldecision/tool_response.go` | ✅(buildSSE 分块)/⏳(规划·进度·信任边界) |
-| ledger StuckLoop / CanContinue / maxToolRounds | `tools.ts AgentLedger` 无此层级 | `agent_ledger.go` | ⏳ |
-| 限流二次确认探测接线（原版 30s 新会话 `Reply with exactly: OK`） | `account-health.ts` 有函数但 `durable.ts` 未调用、探针缺失 | `server.go confirmRateLimitNotice` | 🚧 |
-| 会话解析多索引 + 清理级联解绑 UnbindByConversation + TTL 可配 | `session.ts` 单列表、无级联解绑、TTL 硬编码 | `session_resolver.go` | ✅(UnbindByConversation)/⏳(多索引·TTL) |
+| 工具规划模式(native vs router) + tool_progress 进度事件 + validateDetectedToolCalls 信任边界 + writeToolResponse 分块 | `durable.ts` 硬编码 router | `tool_planning/tool_progress/tooldecision/tool_response.go` | ✅(buildSSE 分块·validateDetectedToolCalls 信任边界 schema 校验)/⏳(规划模式·进度事件) |
+| ledger StuckLoop / CanContinue / maxToolRounds | `tools.ts AgentLedger` 无此层级 | `agent_ledger.go` | ✅(StuckLoop/CanContinue/maxToolRounds=8，注入路由提示词) |
+| 限流二次确认探测接线（原版 30s 新会话 `Reply with exactly: OK`） | `account-health.ts` 有函数但 `durable.ts` 未调用、探针缺失 | `server.go confirmRateLimitNotice` | ✅(confirmAndMarkRateLimit 接线 + 30s OK 探针，误报不冷却) |
+| 会话解析多索引 + 清理级联解绑 UnbindByConversation + TTL 可配 | `session.ts` 单列表、无级联解绑、TTL 硬编码 | `session_resolver.go` | ✅(UnbindByConversation + TTL 环境变量 M365_SESSION/CONTEXT_TTL_HOURS 可配)/⏳(多索引) |
 | MCP 工具经 ChatHub 原生插件注入（Source:MCPServer）打通 `mcp-gateway` | `clientPlugins` 只有 API 类 | `chathub/tools.go` | 🚧 |
 | ChatHub 连接池复用/预热/GC | 每次新建 WS | `connpool.go` | 🚧 |
 | optionsSets / allowedMessageTypes / buildWSURL（XRoutingParameterSessionKey、可配 licenseType/scenario）刷新 | `chathub.ts` 集合过旧/过少 | `client.go` | ✅(optionsSets·allowedMessageTypes)/⏳(buildWSURL) |
