@@ -17,6 +17,7 @@ import type { Env, Provider } from '../types'
 import { getOauthAccessToken, readOauthToken, refreshOauthToken } from '../oauth'
 import { buildQoderBody, cpaToUpstreamKey } from './body'
 import { qoderEncode, cosySessionFor, cosyHeaders, buildBearer, type CosySession } from './cosy'
+import { classifyQoderError, qoderOpenAIErrorBody, type QoderClassified } from './classify'
 import { streamFetchWithTimeout } from '../opencode'
 
 export const QODER_PROVIDER_ID = 'qoder'
@@ -270,13 +271,16 @@ function unwrapQoderSSE(upstreamBody: ReadableStream<Uint8Array>, model: string)
   })
 }
 
-/** 上游错误体 → OpenAI 错误格式。 */
-function qoderErrorResponse(status: number, bodyText: string): Response {
-  const text = bodyText.substring(0, 500)
-  return new Response(
-    JSON.stringify({ error: { message: `QoderWork 上游 HTTP ${status}: ${text}`, type: 'upstream_error' } }),
-    { status: status || 502, headers: { 'Content-Type': 'application/json; charset=utf-8' } }
-  )
+/** 上游错误体 → 分类 → 结构化 OpenAI 错误（含 code/type/kind 与可选 Retry-After）。 */
+function qoderErrorResponse(status: number, bodyText: string, headers?: Headers): Response {
+  const c: QoderClassified = classifyQoderError({
+    status,
+    body: bodyText,
+    retryAfter: headers?.get('retry-after') || undefined,
+  })
+  const respHeaders: Record<string, string> = { 'Content-Type': 'application/json; charset=utf-8' }
+  if (c.cooldownSeconds > 0) respHeaders['Retry-After'] = String(c.cooldownSeconds)
+  return new Response(qoderOpenAIErrorBody(c), { status: c.status, headers: respHeaders })
 }
 
 export interface QoderProxyOptions {
@@ -339,7 +343,7 @@ export async function proxyQoderChatRequest(
 
   if (!resp.ok || !resp.body) {
     const errText = await resp.text().catch(() => '')
-    return qoderErrorResponse(resp.status, errText)
+    return qoderErrorResponse(resp.status, errText, resp.headers)
   }
 
   const wantStream = opts ? opts.stream : forwardBody.stream === true
