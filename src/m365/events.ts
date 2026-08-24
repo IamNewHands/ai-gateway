@@ -111,9 +111,25 @@ export function extractToolEvents(value: unknown, seen: Set<string>): ChatHubStr
   return out
 }
 
-/** 从事件列表提取图片 URL（供多模态结果转写，非核心路径） */
+/** 判断是否像图片 URL（disk 扩展名 / data:image / 常见图片键名，同原版 chathub imageURLs 启发式） */
+function looksLikeImageURL(v: string): boolean {
+  if (v.startsWith('data:image/')) return true
+  const low = v.toLowerCase()
+  if (!low.startsWith('https://')) return false
+  const path = low.split('?')[0]
+  if (/\.(png|jpe?g|gif|webp|bmp|svg)$/.test(path)) return true
+  return false
+}
+
+/**
+ * 从事件列表提取图片 URL（供多模态结果转写）。
+ * 兼容原版启发式：键 url/imageurl/thumbnailurl/downloadurl/src/value/data、
+ * 结尾为 *Urls/videoUrls 的数组、以及 data:image base64。
+ */
 export function imageURLs(events: unknown[]): string[] {
   const out: string[] = []
+  const seen = new Set<string>()
+  const IMG_KEYS = new Set(['url', 'imageurl', 'thumbnailurl', 'downloadurl', 'src'])
   const walk = (x: unknown) => {
     if (Array.isArray(x)) {
       for (const item of x) walk(item)
@@ -121,9 +137,30 @@ export function imageURLs(events: unknown[]): string[] {
     }
     if (x && typeof x === 'object') {
       const m = x as Record<string, unknown>
-      const t = m['type']
-      if (t === 'Image' && typeof m['url'] === 'string') out.push(m['url'])
-      for (const k of Object.keys(m)) walk(m[k])
+      for (const [k, v] of Object.entries(m)) {
+        const lk = k.toLowerCase()
+        if (typeof v === 'string') {
+          if (lk === 'value' || lk === 'data') {
+            if (v.startsWith('data:image/')) pushImage(v)
+          } else if (IMG_KEYS.has(lk)) {
+            pushImage(v)
+          } else {
+            walk(v)
+          }
+        } else if (Array.isArray(v) && (lk.endsWith('urls') || lk.endsWith('videourls'))) {
+          for (const item of v) {
+            if (typeof item === 'string') pushImage(item)
+          }
+        } else {
+          walk(v)
+        }
+      }
+    }
+  }
+  const pushImage = (s: string) => {
+    if (looksLikeImageURL(s) && !seen.has(s)) {
+      seen.add(s)
+      out.push(s)
     }
   }
   for (const e of events) walk(e)

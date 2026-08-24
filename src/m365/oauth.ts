@@ -67,9 +67,20 @@ function decodeJWTClaims(token: string): Record<string, string> {
   return out
 }
 
-function buildTokenState(data: { access_token: string; refresh_token?: string; expires_in?: number }): OAuthTokenState {
+function buildTokenState(data: { access_token: string; refresh_token?: string; expires_in?: number; id_token?: string }): OAuthTokenState {
   const claims = decodeJWTClaims(data.access_token)
-  const email = firstNonEmpty(claims['email'], claims['unique_name'], claims['upn'], claims['preferred_username'])
+  // 优先用 id_token 解析账号标识（原版 token.go 同时解 access_token 与 id_token）
+  const idClaims = data.id_token ? decodeJWTClaims(data.id_token) : {}
+  const email = firstNonEmpty(
+    idClaims['email'],
+    idClaims['unique_name'],
+    idClaims['upn'],
+    idClaims['preferred_username'],
+    claims['email'],
+    claims['unique_name'],
+    claims['upn'],
+    claims['preferred_username'],
+  )
   return {
     access_token: data.access_token,
     refresh_token: data.refresh_token,
@@ -77,9 +88,9 @@ function buildTokenState(data: { access_token: string; refresh_token?: string; e
     updated_at: Date.now(),
     email: email || undefined,
     // M365 特有：ChatHub WS 需要 oid/tid
-    oid: claims['oid'] || claims['sub'] || undefined,
-    tid: claims['tid'] || claims['tenant_id'] || undefined,
-    nickname: firstNonEmpty(claims['name'], email) || undefined,
+    oid: idClaims['oid'] || idClaims['home_oid'] || claims['oid'] || claims['sub'] || undefined,
+    tid: idClaims['tid'] || idClaims['tenant_id'] || claims['tid'] || claims['tenant_id'] || undefined,
+    nickname: firstNonEmpty(idClaims['name'], claims['name'], email) || undefined,
   }
 }
 
@@ -210,7 +221,7 @@ export async function submitM365PKCECallback(env: Env, providerId: string, cfg: 
       const text = await res.text()
       return { success: false, message: `换 token 失败 HTTP ${res.status}: ${text.substring(0, 300)}` }
     }
-    const data = (await res.json()) as { access_token: string; refresh_token?: string; expires_in?: number }
+    const data = (await res.json()) as { access_token: string; refresh_token?: string; expires_in?: number; id_token?: string }
     if (!data.access_token) {
       return { success: false, message: '换取 token 的响应缺少 access_token' }
     }
@@ -286,7 +297,9 @@ export async function m365ROPC(env: Env, providerId: string, cfg: OAuthDeviceCon
       password,
       scope: conf.scope,
     })
-    const res = await fetch(M365_OAUTH.tokenUrl, {
+    // ROPC 使用 /organizations 通用企业端点（同原版 Authority()+"/organizations/oauth2/v2.0/token"，避免 /common 对特定 tenant 换错）
+    const tokenEndpoint = 'https://login.microsoftonline.com/organizations/oauth2/v2.0/token'
+    const res = await fetch(tokenEndpoint, {
       method: 'POST',
       headers: { 'Content-Type': 'application/x-www-form-urlencoded', Accept: 'application/json' },
       body: params.toString(),
@@ -301,7 +314,7 @@ export async function m365ROPC(env: Env, providerId: string, cfg: OAuthDeviceCon
       } catch { /* keep */ }
       return { success: false, message: `登录失败 ${errMsg}` }
     }
-    const data = JSON.parse(text) as { access_token: string; refresh_token?: string; expires_in?: number }
+    const data = JSON.parse(text) as { access_token: string; refresh_token?: string; expires_in?: number; id_token?: string }
     if (!data.access_token) {
       return { success: false, message: '登录响应缺少 access_token' }
     }
@@ -345,7 +358,7 @@ async function doRefreshM365Token(env: Env, providerId: string, cfg: OAuthDevice
       signal: AbortSignal.timeout(20000),
     })
     if (!res.ok) return false
-    const data = (await res.json()) as { access_token: string; refresh_token?: string; expires_in?: number }
+    const data = (await res.json()) as { access_token: string; refresh_token?: string; expires_in?: number; id_token?: string }
     if (!data.access_token) return false
     const fresh = buildTokenState(data)
     // 刷新响应一般不带账号信息，保留原值

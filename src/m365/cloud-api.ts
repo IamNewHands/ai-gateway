@@ -8,6 +8,7 @@
  */
 import type { Env } from '../types'
 import { getM365Account } from './oauth'
+import { unbindByConversation } from './session'
 
 interface CloudChat {
   conversationId?: string
@@ -126,6 +127,11 @@ export async function cleanupCloudConversations(
   let deleted = 0
   let kept = 0
 
+  // 云端删除后级联清理本地会话绑定，防止死绑定被复用串号
+  const deleteConversationLocal = async (cid: string): Promise<void> => {
+    await unbindByConversation(env, providerId, cid)
+  }
+
   for (let round = 0; round < 100; round++) {
     let chats: CloudChat[]
     try {
@@ -151,6 +157,7 @@ export async function cleanupCloudConversations(
       if (age > maxAgeMs) {
         try {
           await deleteConversation(env, providerId, convId)
+          await deleteConversationLocal(convId)
           deleted++
           anyDeleted = true
         } catch (err) {
@@ -161,6 +168,7 @@ export async function cleanupCloudConversations(
         if (kept >= keepN) {
           try {
             await deleteConversation(env, providerId, convId)
+            await deleteConversationLocal(convId)
             deleted++
             anyDeleted = true
           } catch (err) {

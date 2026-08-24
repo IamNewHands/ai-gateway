@@ -15,15 +15,18 @@
 import type { Env } from '../types'
 
 const ACCOUNT_HEALTH_PREFIX = 'm365:health:'
-const RATE_LIMIT_COOLDOWN_MS = 3 * 60 * 1000 // 3 分钟（同原版 rateLimitCooldown）
+const RATE_LIMIT_COOLDOWN_MS = 60 * 1000 // 1 分钟（对齐原版 ~30-60s）
 const MAX_COOLDOWN_MS = 30 * 60 * 1000 // 最大冷却 30 分钟
 const AUTH_FAIL_COOLDOWN_MS = 2 * 60 * 1000 // 鉴权失败冷却 2 分钟
+const IMAGE_LIMIT_COOLDOWN_MS = 24 * 60 * 60 * 1000 // 图片额度耗尽冷却 24h（同原版 MarkImageLimited）
 
 export interface AccountHealthState {
   /** 冷却到期时间（Unix ms），0 表示未冷却 */
   cooldownUntil: number
   /** 是否鉴权失败（token 无效） */
   authFailed: boolean
+  /** 图片额度耗尽到期时间（Unix ms），0 表示正常 */
+  imageLimitedUntil: number
   /** 最后更新时间 */
   updatedAt: number
 }
@@ -31,10 +34,16 @@ export interface AccountHealthState {
 async function readHealth(env: Env, accountId: string): Promise<AccountHealthState> {
   try {
     const raw = await env.KV.get(ACCOUNT_HEALTH_PREFIX + accountId)
-    if (!raw) return { cooldownUntil: 0, authFailed: false, updatedAt: 0 }
-    return JSON.parse(raw) as AccountHealthState
+    if (!raw) return { cooldownUntil: 0, authFailed: false, imageLimitedUntil: 0, updatedAt: 0 }
+    const s = JSON.parse(raw) as Partial<AccountHealthState>
+    return {
+      cooldownUntil: s.cooldownUntil || 0,
+      authFailed: !!s.authFailed,
+      imageLimitedUntil: s.imageLimitedUntil || 0,
+      updatedAt: s.updatedAt || 0,
+    }
   } catch {
-    return { cooldownUntil: 0, authFailed: false, updatedAt: 0 }
+    return { cooldownUntil: 0, authFailed: false, imageLimitedUntil: 0, updatedAt: 0 }
   }
 }
 
@@ -58,7 +67,7 @@ export function isRateLimited(err: Error | string): boolean {
   )
 }
 
-/** 判断错误是否是鉴权失败 */
+/** 判断错误是否是鉴权失败（对齐原版：仅明确鉴权信号，避免把普通错误误判为鉴权失败） */
 export function isAuthFailure(err: Error | string): boolean {
   const msg = typeof err === 'string' ? err : err.message || ''
   const low = msg.toLowerCase()
@@ -69,7 +78,7 @@ export function isAuthFailure(err: Error | string): boolean {
     low.includes('forbidden') ||
     low.includes('token expired') ||
     low.includes('invalid_grant') ||
-    low.includes('auth')
+    low.includes('authentication failed')
   )
 }
 
@@ -111,25 +120,37 @@ export async function markAccountFailure(
   console.log(`[account-health] ${accountId} marked failure: authFailed=${state.authFailed} cooldown=${Math.ceil((state.cooldownUntil - now) / 1000)}s`)
 }
 
+/** 标记图片额度耗尽（24h 冷却，同原版 MarkImageLimited） */
+export async function markAccountImageLimited(env: Env, accountId: string, hours = 24): Promise<void> {
+  const state = await readHealth(env, accountId)
+  state.imageLimitedUntil = Date.now() + Math.min(hours, 48) * 60 * 60 * 1000
+  state.cooldownUntil = 0
+  state.authFailed = false
+  await writeHealth(env, accountId, state)
+  console.log(`[account-health] ${accountId} marked image-limited until ${new Date(state.imageLimitedUntil).toISOString()}`)
+}
+
 /** 标记账户成功（清除所有失败状态） */
 export async function markAccountSuccess(env: Env, accountId: string): Promise<void> {
-  await writeHealth(env, accountId, { cooldownUntil: 0, authFailed: false, updatedAt: Date.now() })
+  await writeHealth(env, accountId, { cooldownUntil: 0, authFailed: false, imageLimitedUntil: 0, updatedAt: Date.now() })
 }
 
 /** 账户是否可用 */
 export async function isAccountAvailable(env: Env, accountId: string): Promise<boolean> {
   const state = await readHealth(env, accountId)
   if (state.authFailed) return false
+  if (state.imageLimitedUntil > 0 && Date.now() < state.imageLimitedUntil) return false
   if (state.cooldownUntil > 0 && Date.now() < state.cooldownUntil) return false
   return true
 }
 
-/** 获取冷却剩余秒数（用于 Retry-After） */
+/** 获取冷却剩余秒数（用于 Retry-After，综合限流冷却与图片额度） */
 export async function accountCooldownSeconds(env: Env, accountId: string): Promise<number> {
   const state = await readHealth(env, accountId)
-  if (state.cooldownUntil <= 0) return 0
-  const remaining = Math.ceil((state.cooldownUntil - Date.now()) / 1000)
-  return Math.max(0, remaining)
+  let remaining = 0
+  if (state.cooldownUntil > 0) remaining = Math.max(remaining, state.cooldownUntil - Date.now())
+  if (state.imageLimitedUntil > 0) remaining = Math.max(remaining, state.imageLimitedUntil - Date.now())
+  return Math.ceil(remaining / 1000)
 }
 
 /** 获取所有账户的健康快照 */

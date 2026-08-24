@@ -285,6 +285,18 @@ export async function deleteSession(env: Env, providerId: string, sessionId: str
   return true
 }
 
+/**
+ * 按云端对话 ID 级联解绑会话（同原版 UnbindByConversation）。
+ * 云端对话被清理后调用，避免残留死绑定被后续复用导致串号。
+ */
+export async function unbindByConversation(env: Env, providerId: string, conversationId: string): Promise<void> {
+  if (!conversationId) return
+  let list = await readAll(env, providerId)
+  const before = list.length
+  list = list.filter((s) => s.conversationId !== conversationId)
+  if (list.length !== before) await writeAll(env, providerId, list)
+}
+
 /** 清理过期会话（Cron 用） */
 export async function cleanupSessions(env: Env, providerId: string): Promise<number> {
   let list = await readAll(env, providerId)

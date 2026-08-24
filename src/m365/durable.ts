@@ -10,14 +10,14 @@
  * 其中 sessionKey = providerId + ':' + explicitSessionId | contextFingerprint
  */
 import type { Env } from '../types'
-import { chatWithHandlers } from './chathub'
+import { chatWithHandlers, classifyChatHubNotice } from './chathub'
 import type { ChatHubAccount, ChatHubTool, ChatHubResult } from './chathub'
 import { flattenPromptMessages, modelToolRouterPrompt, parseModelToolDecision, fencedToolCalls, nativeToolCalls, compactToolResult, buildAgentLedger, ledgerRouterContext, filterCompletedCalls, completionEvidenceAllows, isToolRefusal } from './tools'
 import type { DetectedToolCall, AgentLedger, OaiMsgLite } from './tools'
 import { resolveSession, bindSession } from './session'
 import { getM365Account } from './oauth'
 import { recordConversation, shouldCleanup, cleanupConversations, getCleanupMode, getCleanupConfig } from './conversation-manager'
-import { markAccountSuccess, markAccountFailure, accountCooldownSeconds, isRateLimited, isAuthFailure, isEmptyCompletion } from './account-health'
+import { markAccountSuccess, markAccountFailure, markAccountImageLimited, accountCooldownSeconds, isRateLimited, isAuthFailure, isEmptyCompletion } from './account-health'
 import { writeLog } from '../admin'
 
 export interface M365ChatPayload {
@@ -38,6 +38,8 @@ interface ChatOutcome {
   conversationId: string
   sessionId: string
   toolCalls: DetectedToolCall[]
+  /** 附加元数据（conversation/images/throttling 等，非流式响应透传为 m365 块） */
+  metadata?: Record<string, unknown>
 }
 
 function sha256Hex(s: string): string {
@@ -208,12 +210,21 @@ export class M365Session {
 
       // 上游限流：返回 429 + Retry-After（同原版 upstreamStatus / writeUpstreamError），
       // 让客户端退避重试，而不是报 500/502 误导为服务端内部错误。
+      if (classifyChatHubNotice(msg) === 'image_quota') {
+        // 图片额度耗尽：标记账号 24h 封禁并返回 429（同原版 MarkImageLimited）
+        await markAccountImageLimited(this.env, providerId, 24)
+        return cjson({ error: { message: 'M365 image generation quota is exhausted; try again later or use another account', type: 'rate_limit_error' } }, 429, { 'Retry-After': '86400' })
+      }
       if (isRateLimited(errObj)) {
         const cooldown = await accountCooldownSeconds(this.env, providerId)
         return cjson({ error: { message: 'upstream is rate limiting; try again shortly', type: 'rate_limit_error' } }, 429, { 'Retry-After': String(Math.max(cooldown || 60, 60)) })
       }
       if (isAuthFailure(errObj)) {
         return cjson({ error: { message: 'M365 account authentication failed; re-authorize required', type: 'auth_error' } }, 401)
+      }
+      // 上游内容策略拦截：明确报 502，避免被客户端误判为内部错误
+      if (classifyChatHubNotice(msg) === 'content_policy') {
+        return cjson({ error: { message: 'M365 upstream declined the request due to content policy; try rephrasing', type: 'content_policy' } }, 502)
       }
       return cjson({ error: { message: msg, type: 'internal_error' } }, 500)
     }
@@ -250,6 +261,11 @@ export class M365Session {
       conversationId: result.conversationId,
       sessionId: result.sessionId,
       toolCalls: calls,
+      metadata: {
+        conversationId: result.conversationId,
+        images: result.images,
+        throttling: result.throttling ?? undefined,
+      },
     }
 
     // 6) 绑定会话（记录全量历史 + 助手回复）
@@ -361,14 +377,19 @@ function buildJSON(id: string, model: string, o: ChatOutcome): Response {
     msg['tool_calls'] = o.toolCalls.map((tc) => ({ id: tc.id, type: tc.type, function: { name: tc.name, arguments: tc.arguments } }))
     finish = 'tool_calls'
   }
-  return cjson({
+  const usage = { prompt_tokens: pt, completion_tokens: ct, total_tokens: pt + ct, m365_conversation: o.conversationId }
+  const resp: Record<string, unknown> = {
     id,
     object: 'chat.completion',
     created: Math.floor(Date.now() / 1000),
     model,
     choices: [{ index: 0, message: msg, finish_reason: finish }],
-    usage: { prompt_tokens: pt, completion_tokens: ct, total_tokens: pt + ct, m365_conversation: o.conversationId },
-  }, 200)
+    usage,
+  }
+  if (o.metadata && Object.keys(o.metadata).length) {
+    resp['m365'] = o.metadata
+  }
+  return cjson(resp, 200)
 }
 
 function buildSSE(id: string, model: string, o: ChatOutcome, payload: M365ChatPayload): Response {
@@ -399,7 +420,34 @@ function buildSSE(id: string, model: string, o: ChatOutcome, payload: M365ChatPa
     // 工具块外的前置文本
     if (o.text.trim() !== '') push(base({ content: o.text }, null))
     o.toolCalls.forEach((tc, i) => {
-      push(base({ tool_calls: [{ index: i, id: tc.id, type: tc.type, function: { name: tc.name, arguments: tc.arguments } }] }, null))
+      const args = tc.arguments || ''
+      if (args.length <= 512) {
+        push(base({ tool_calls: [{ index: i, id: tc.id, type: tc.type, function: { name: tc.name, arguments: args } }] }, null))
+        return
+      }
+      // 大参数按 512 字符分块，且不切断 UTF-16 代理对（对齐原版 writeToolResponse 分块语义）
+      let offset = 0
+      let first = true
+      while (offset < args.length) {
+        let end = Math.min(offset + 512, args.length)
+        if (end < args.length) {
+          while (end > offset) {
+            const prev = args.charCodeAt(end - 1)
+            const cur = args.charCodeAt(end)
+            if (prev >= 0xd800 && prev <= 0xdbff && cur >= 0xdc00 && cur <= 0xdfff) end--
+            else break
+          }
+          if (end === offset) end = Math.min(offset + 512, args.length)
+        }
+        const frag = args.substring(offset, end)
+        if (first) {
+          push(base({ tool_calls: [{ index: i, id: tc.id, type: tc.type, function: { name: tc.name, arguments: frag } }] }, null))
+          first = false
+        } else {
+          push(base({ tool_calls: [{ index: i, function: { arguments: frag } }] }, null))
+        }
+        offset = end
+      }
     })
     const usageChunk = {
       id, object: 'chat.completion.chunk', created, model,

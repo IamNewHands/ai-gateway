@@ -188,32 +188,34 @@ function schemaValid(args: Record<string, unknown>, fn: Record<string, unknown>)
 
 /**
  * 从响应文本解析 <m365-tool-call> fenced block（与 M365 官方协议一致）。
+ * 支持文本中多个独立块，每个块可含单个对象或数组（同原版 tooldecision.extractToolCalls）。
  * 返回 (工具调用列表, 是否包含调用块)。
  */
 export function extractToolCalls(text: string, tools: ToolDef[], choice: unknown): DetectedToolCall[] {
-  const start = text.indexOf('<m365-tool-call>')
-  const end = text.indexOf('</m365-tool-call>')
-  if (start < 0 || end <= start) return []
-  let raw: unknown
-  try {
-    raw = JSON.parse(text.substring(start + '<m365-tool-call>'.length, end))
-  } catch {
-    return []
-  }
-  const items = Array.isArray(raw) ? raw : [raw]
   const allowed = allowedToolNames(tools)
   const out: DetectedToolCall[] = []
-  for (const item of items) {
-    if (!item || typeof item !== 'object' || Array.isArray(item)) continue
-    const m = item as Record<string, unknown>
-    const name = typeof m['name'] === 'string' ? m['name'] : ''
-    if (!allowed.has(name) || !toolChoiceAllows(choice, name)) continue
-    let args = '{}'
+  const re = /<m365-tool-call>([\s\S]*?)<\/m365-tool-call>/g
+  let m: RegExpExecArray | null
+  while ((m = re.exec(text)) !== null) {
+    let raw: unknown
     try {
-      const s = m['arguments'] === undefined ? undefined : JSON.stringify(m['arguments'])
-      if (s !== undefined && s !== '') args = s
-    } catch { /* keep {} */ }
-    out.push({ id: `call_${crypto.randomUUID()}`, type: toolTypeOf(name, tools), name, arguments: args })
+      raw = JSON.parse(m[1])
+    } catch {
+      continue
+    }
+    const items = Array.isArray(raw) ? raw : [raw]
+    for (const item of items) {
+      if (!item || typeof item !== 'object' || Array.isArray(item)) continue
+      const mi = item as Record<string, unknown>
+      const name = typeof mi['name'] === 'string' ? mi['name'] : ''
+      if (!allowed.has(name) || !toolChoiceAllows(choice, name)) continue
+      let args = '{}'
+      try {
+        const s = mi['arguments'] === undefined ? undefined : JSON.stringify(mi['arguments'])
+        if (s !== undefined && s !== '') args = s
+      } catch { /* keep {} */ }
+      out.push({ id: `call_${crypto.randomUUID()}`, type: toolTypeOf(name, tools), name, arguments: args })
+    }
   }
   return out
 }
@@ -265,9 +267,10 @@ export function parseModelToolDecision(text: string, tools: ToolDef[], choice: u
       const argsStr = rest.slice(start + 1, end)
       try {
         const args = JSON.parse(argsStr) as Record<string, unknown>
-        if (args !== null && typeof args === 'object' && toolChoiceAllows(choice, name)) {
+        if (args !== null && typeof args === 'object') {
           const fn = toolFunction(name, tools)
-          if (fn) {
+          // 同原版 model_tool_router：必须通过 schema 校验才采用，避免不合 schema 的调用
+          if (fn && schemaValid(args, fn) && toolChoiceAllows(choice, name)) {
             return {
               calls: [{ id: `call_${crypto.randomUUID()}`, type: toolTypeOf(name, tools), name, arguments: JSON.stringify(args) }],
               parsed: true,
@@ -425,7 +428,15 @@ export function extractAttachments(content: unknown): { type: 'image'; url: stri
 
 export function compactToolResult(text: string, max = 4000): string {
   const s = String(text || '')
-  return s.length > max ? s.substring(0, max) + `\n...[truncated ${s.length - max} chars]` : s
+  if (s.length <= max) return s
+  // 保留头部前 1/3 与尾部 80 字符，中间标注截断（同原版 agent_ledger.go compactResult）
+  const tail = 80
+  const head = Math.floor(max * 0.6) - Math.floor(tail / 2)
+  const keepHead = Math.max(0, Math.min(head, s.length))
+  const trimmed = s.length - max
+  const headPart = s.substring(0, keepHead)
+  const tailPart = s.substring(s.length - Math.min(tail, max - keepHead))
+  return headPart + `\n...[truncated ${trimmed} chars]...\n` + tailPart
 }
 
 export function flattenPromptMessages(messages: OaiMsgLite[], attachments?: { type: 'image'; url: string }[]): { prompt: string; attachments: { type: 'image'; url: string }[] } {
@@ -576,7 +587,7 @@ export function completedCallIDs(l: AgentLedger): string[] {
 /** 主回答是否允许作为"已完成"结论（存在待处理调用时不允许；有完成证据时不允许含失败措辞） */
 export function completionEvidenceAllows(answer: string, l: AgentLedger): boolean {
   if (l.pending.length > 0) return false
-  if (l.completed.length === 0 && l.pending.length === 0) return true
+  if (l.completed.length === 0 && l.pending.length === 0) return !unsupportedSuccess.test(answer)
   const low = answer.toLowerCase()
   const failureKeywords = ['cannot confirm', 'not confirmed', 'unable to confirm', 'no tool result', 'no matching tool results were returned', 'no external action has been verified']
   let hasFailure = false
@@ -603,8 +614,9 @@ const toolRefusalPatterns = [
   'sandbox environment', '/mnt/data', 'cloud sandbox', 'none of which can reach',
 ]
 
-/** 检测模型是否错误拒绝使用工具（触发纠正重试） */
+/** 检测模型是否错误拒绝使用工具（触发纠正重试）。同原版 toolloop.go：长文本不判定，避免误判 */
 export function isToolRefusal(text: string): boolean {
+  if (text.length >= 200) return false
   const low = text.toLowerCase()
   for (const p of toolRefusalPatterns) if (low.includes(p)) return true
   return false

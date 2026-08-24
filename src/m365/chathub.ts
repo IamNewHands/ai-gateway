@@ -74,6 +74,10 @@ export interface ChatHubResult {
   requestId: string
   events: unknown[]
   images: string[]
+  /** 上游最终 message / result.value 原文（含图片元数据，供上层提取） */
+  rawResult?: string
+  /** 上游限流 / 风险提示元数据 */
+  throttling?: unknown
 }
 
 export type ChatHubStreamHandler = (ev: ChatHubStreamEvent) => void
@@ -121,6 +125,41 @@ function isSafeDownloadURL(url: string): boolean {
   } catch {
     return false
   }
+}
+
+/** 上游内容策略 / 图片额度 / 限流 / 空返回 的语义分类（同原版 IsContentPolicyBlock 等） */
+export type ChatHubErrorClass = 'rate_limit' | 'content_policy' | 'image_quota' | 'empty' | null
+const contentPolicyPatterns = [
+  'can\'t respond to this request', 'cannot respond to this request', '抱歉，我无法回答这个问题',
+  'i\'m sorry, but i cannot', "i'm sorry, i can't", 'as an ai, i cannot', '我不能提供', '无法提供该',
+  'inappropriate', 'harassment', 'self-harm', 'you may need to rephrase',
+]
+const imageLimitPatterns = [
+  'image generation quota', 'daily image limit', 'generate any more images',
+  '无法再生成图片', '请明天再试', '图片生成额度',
+]
+
+/** 判断错误是否与上游内容策略拦截相关 */
+function isContentPolicyBlock(text: string): boolean {
+  const low = text.toLowerCase()
+  for (const p of contentPolicyPatterns) if (low.includes(p)) return true
+  return false
+}
+
+/** 分类非协议错误的上游提示（供 durable 映射为 429/502/400 等） */
+export function classifyChatHubNotice(text: string): ChatHubErrorClass {
+  if (!text) return null
+  const low = text.toLowerCase()
+  if (
+    low.includes('temporarily unable to respond to this many requests') ||
+    low.includes('太多请求') ||
+    low.includes('无法响应这么多请求') ||
+    low.includes('too many requests') ||
+    (low.includes('please retry') && low.includes('later'))
+  ) return 'rate_limit'
+  if (isContentPolicyBlock(text)) return 'content_policy'
+  for (const p of imageLimitPatterns) if (low.includes(p)) return 'image_quota'
+  return null
 }
 
 /**
@@ -211,9 +250,18 @@ function chatPayload(req: ChatHubRequest, requestID: string, firstTurn: boolean)
   const hasPlugins = clientPlugins(tools).length > 0
   const text = toolProtocolPrompt(req.text, tools, req.toolChoice, hasPlugins)
 
+  // 序列化进 message.attachments 的 wire 对象：剥离内部字段 docId/fileType（对齐原版 json:"-"），
+  // docId/fileType 只通过 messageAnnotations 里携带，避免上游收到形状不一致的 attachment。
+  const wireAttachments = attachments.map((a) => {
+    const w: Record<string, unknown> = { type: a.type, url: a.url }
+    if (a.mimeType) w['mimeType'] = a.mimeType
+    if (a.name) w['name'] = a.name
+    return w
+  })
+
   const message: Record<string, unknown> = {
     author: 'user',
-    attachments,
+    attachments: wireAttachments,
     inputMethod: 'Keyboard',
     text,
     entityAnnotationTypes: ['People', 'File', 'Event', 'Email', 'TeamsMessage'],
@@ -278,6 +326,8 @@ function chatPayload(req: ChatHubRequest, requestID: string, firstTurn: boolean)
     'flux_v3_progress_messages',
     'enable_batch_token_processing',
     'enable_gg_gpt',
+    'cwc_code_interpreter_v3',
+    'rich_responses',
   ]
 
   const chat = {
@@ -288,7 +338,7 @@ function chatPayload(req: ChatHubRequest, requestID: string, firstTurn: boolean)
         sessionId: req.sessionId,
         optionsSets,
         options: {},
-        allowedMessageTypes: ['Chat', 'Suggestion', 'Disengaged', 'Progress', 'EndOfRequest', 'InternalLoaderMessage'],
+        allowedMessageTypes: ['Chat', 'Suggestion', 'Disengaged', 'Progress', 'EndOfRequest', 'InternalLoaderMessage', 'GeneratedCode', 'SearchQuery', 'TriggerPlugin', 'MemoryUpdate', 'SideBySide', 'ReferencesListComplete', 'RichResponse'],
         sliceIds: [],
         threadLevelGptId: {},
         conversationId: req.conversationId,
@@ -453,6 +503,8 @@ export async function chatWithHandlers(
     let throttling: unknown
     /** 收集原生工具事件（含 messages[] 之外的插件调用），供上层 nativeToolCalls 提取 */
     const collectedEvents: unknown[] = []
+    /** 收集所有 update 帧的 arguments，供 complete 时提取图片 URL */
+    const rawFrames: unknown[] = []
 
     const rateLimited = (text: string): boolean => {
       if (streamedText !== '') return false
@@ -466,7 +518,9 @@ export async function chatWithHandlers(
       )
     }
 
-    // ChatHub 以"全量快照 + 光标重写"方式送文本，只输出未见过的后缀
+    // ChatHub 以"全量快照 + 光标重写"方式送文本，只输出未见过的后缀。
+    // 对齐原版 client.go emitSnapshot：仅当新快照以前缀命中当前文本时才补发尾部，
+    // 非前缀的重写直接跳过，避免吐出重复/错乱片段。
     const emitSnapshot = (snapshot: string): void => {
       if (!snapshot) return
       if (rateLimited(snapshot)) throw new Error('upstream rate-limit notice')
@@ -481,21 +535,7 @@ export async function chatWithHandlers(
         if (tail) { streamedText = snapshot; onDelta?.(tail) }
         return
       }
-      const i = snapshot.indexOf(cur)
-      if (i >= 0) {
-        const tail = snapshot.substring(i + cur.length)
-        if (tail) { streamedText = snapshot; onDelta?.(tail) }
-        return
-      }
-      if (snapshot.length > cur.length && snapshot.endsWith(cur)) {
-        const head = snapshot.substring(0, snapshot.length - cur.length)
-        if (head) { streamedText = snapshot; onDelta?.(head) }
-        return
-      }
-      if (snapshot.length > cur.length) {
-        streamedText = snapshot
-        onDelta?.(snapshot)
-      }
+      // 非前缀重写：原版跳过（仅记录），这里不做任何透出
     }
 
     while (Date.now() < deadline) {
@@ -518,6 +558,7 @@ export async function chatWithHandlers(
 
         // update：流式文本 / 推理 / 工具 / 进度
         if (frame.type === 1 && frame.target === 'update') {
+          if (frame.arguments && Array.isArray(frame.arguments)) rawFrames.push(...frame.arguments)
           for (const arg of frame.arguments || []) {
             if (!arg || typeof arg !== 'object' || Array.isArray(arg)) continue
             const a = arg as Record<string, unknown>
@@ -577,6 +618,10 @@ export async function chatWithHandlers(
           if (frame.error) throw new Error(`chathub completion error: ${JSON.stringify(frame.error)}`)
           const text = finalText || streamedText
           if (rateLimited(text)) throw new Error('upstream rate-limit notice')
+          // 空返回：既无正文也无工具/推理事件 → 视为空完成（同原版 ErrEmptyCompletion）
+          if (text.trim() === '' && reasoningBuf.trim() === '' && collectedEvents.length === 0) {
+            throw new Error('empty completion')
+          }
           return {
             text,
             reasoning: reasoningBuf,
@@ -584,7 +629,9 @@ export async function chatWithHandlers(
             sessionId,
             requestId: requestID,
             events: collectedEvents,
-            images: imageURLs([]),
+            rawResult,
+            throttling,
+            images: imageURLs(rawFrames),
           }
         }
       }

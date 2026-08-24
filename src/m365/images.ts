@@ -39,6 +39,16 @@ function isDesignerImageURL(url: string): boolean {
   }
 }
 
+/** 分块转 base64，避免对 20MB 大数组展开导致调用栈溢出（同 chathub bytesToBase64） */
+function bytesToBase64(bytes: Uint8Array): string {
+  let binary = ''
+  const chunk = 0x8000
+  for (let i = 0; i < bytes.length; i += chunk) {
+    binary += String.fromCharCode.apply(null, bytes.subarray(i, i + chunk) as unknown as number[])
+  }
+  return btoa(binary)
+}
+
 /** 获取 Designer 下载 token（通过 refresh_token 换取 Designer scope） */
 async function getDesignerToken(env: Env, providerId: string, _provider: Provider): Promise<string> {
   const account = await getM365Account(env, providerId)
@@ -73,19 +83,45 @@ async function getDesignerToken(env: Env, providerId: string, _provider: Provide
   return json['access_token'] as string
 }
 
-/** 下载 Designer 图片 */
-async function downloadDesignerImage(url: string, token: string): Promise<{ data: Uint8Array; contentType: string }> {
+/** 下载 Designer 图片。重定向仅允许落到 designerapp 主机、最多 3 跳，鉴权只发给目标图床（防 token 泄露 / SSRF） */
+async function downloadDesignerImage(url: string, token: string, hops = 0): Promise<{ data: Uint8Array; contentType: string }> {
+  const MAX_REDIRECTS = 3
+  if (hops > MAX_REDIRECTS) {
+    throw new Error('Designer image download exceeded redirect limit')
+  }
+  const targetIsDesigner = (() => {
+    try { return new URL(url).hostname === 'designerapp.officeapps.live.com' } catch { return false }
+  })()
+
+  const headers: Record<string, string> = { Accept: 'image/*' }
+  // 鉴权只发给 designerapp 图床；重定向到未知主机不带 Bearer，避免 token 落第三方
+  if (targetIsDesigner) headers['Authorization'] = `Bearer ${token}`
+
   const resp = await fetch(url, {
-    headers: { Authorization: `Bearer ${token}`, Accept: 'image/*' },
+    headers,
     signal: AbortSignal.timeout(30000),
     redirect: 'manual',
   })
-  // Designer 可能返回 302/307 重定向到真实 CDN
   if (resp.status >= 300 && resp.status < 400) {
     const location = resp.headers.get('Location')
-    if (location) {
-      return downloadDesignerImage(location, token)
+    if (!location) throw new Error('Designer image redirect without Location')
+    // 仅允许重定向到 designerapp（主图床）或与当前同域的 CDN
+    let next = location
+    if (!next.startsWith('http')) next = new URL(location, url).toString()
+    let nextHost = ''
+    try { nextHost = new URL(next).hostname } catch { throw new Error('Designer image redirect to invalid URL') }
+    if (nextHost === 'designerapp.officeapps.live.com') {
+      return downloadDesignerImage(next, token, hops + 1)
     }
+    // 非 designer 域的图床：视为一次跨域跳转，改用无鉴权下载
+    const anon = await fetch(next, { headers: { Accept: 'image/*' }, signal: AbortSignal.timeout(30000), redirect: 'follow' })
+    if (!anon.ok) throw new Error(`Designer image download HTTP ${anon.status}`)
+    const buf = await anon.arrayBuffer()
+    if (buf.byteLength > 20 * 1024 * 1024) {
+      throw new Error('generated image exceeds 20MiB')
+    }
+    const ct = anon.headers.get('Content-Type') || 'image/png'
+    return { data: new Uint8Array(buf), contentType: ct }
   }
   if (!resp.ok) {
     throw new Error(`Designer image download HTTP ${resp.status}`)
@@ -271,12 +307,12 @@ export async function handleImageGeneration(
     try {
       const { data: imgData, contentType } = await downloadDesignerImage(imgUrl, designerToken)
       if (format === 'b64_json') {
-        data.push({ b64_json: btoa(String.fromCharCode(...imgData)) })
+        data.push({ b64_json: bytesToBase64(imgData) })
       } else {
-        // 存储到 KV 并返回本地 URL
+        // 存储到 KV 并返回本地 URL（记录实际 Content-Type）
         const id = crypto.randomUUID()
         const kvKey = `image:${id}`
-        await env.KV.put(kvKey, btoa(String.fromCharCode(...imgData)), { expirationTtl: 900 })
+        await env.KV.put(kvKey, JSON.stringify({ d: bytesToBase64(imgData), c: contentType }), { expirationTtl: 900 })
         data.push({ url: `/v1/images/files/${id}` })
       }
     } catch (err) {
@@ -294,6 +330,7 @@ export async function handleImageGeneration(
 
 /**
  * 提供本地存储的图片文件（/v1/images/files/:id）。
+ * KV 存 {"d":<base64>,"c":<contentType>}；兼容旧版裸 base64（回退 image/png）。
  */
 export async function handleImageFile(env: Env, id: string): Promise<Response> {
   const kvKey = `image:${id}`
@@ -301,12 +338,21 @@ export async function handleImageFile(env: Env, id: string): Promise<Response> {
   if (!raw) {
     return new Response(JSON.stringify({ error: { message: 'image not found or expired', type: 'not_found' } }), { status: 404, headers: { 'Content-Type': 'application/json' } })
   }
+  let b64 = raw
+  let contentType = 'image/png'
   try {
-    const binary = Uint8Array.from(atob(raw), (c) => c.charCodeAt(0))
+    const obj = JSON.parse(raw) as { d?: string; c?: string }
+    if (typeof obj.d === 'string') {
+      b64 = obj.d
+      if (typeof obj.c === 'string' && obj.c.trim() !== '') contentType = obj.c
+    }
+  } catch { /* 旧版裸 base64 */ }
+  try {
+    const binary = Uint8Array.from(atob(b64), (c) => c.charCodeAt(0))
     return new Response(binary, {
       status: 200,
       headers: {
-        'Content-Type': 'image/png',
+        'Content-Type': contentType,
         'Cache-Control': 'private, max-age=300',
         'Content-Length': String(binary.length),
       },
