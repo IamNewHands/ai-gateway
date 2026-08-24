@@ -321,6 +321,14 @@ label, legend { color: var(--color-ink-2); font-size: var(--text-xs); font-weigh
 .admin-metrics p { margin-block-start: var(--space-xs); color: var(--color-ink); font-weight: 600; }
 .admin-metrics small { color: var(--color-muted); font-size: var(--text-xs); }
 .workspace-section { margin-block-start: var(--space-xl); }
+/* P2：概览驾驶舱聚合 KPI 卡片（额度/签到/调用量/成功率 + 进度条） */
+.overview-kpi { margin-block-start: var(--space-sm); display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: var(--space-xs); }
+.overview-kpi .kpi { min-width: 0; padding: var(--space-sm); border: .0625rem solid var(--color-rule); border-radius: var(--radius-panel); background: var(--color-paper); }
+.overview-kpi .kpi > span { color: var(--color-ink); font-family: var(--font-display); font-size: var(--text-lg); font-weight: 600; line-height: 1.2; }
+.overview-kpi .kpi p { margin-block-start: var(--space-3xs); color: var(--color-ink); font-weight: 600; font-size: var(--text-xs); }
+.overview-kpi .kpi small { color: var(--color-muted); font-size: var(--text-xs); }
+.kpi-bar { margin-block-start: var(--space-2xs); height: .375rem; border-radius: var(--radius-round); background: var(--color-paper-3); overflow: hidden; }
+.kpi-bar i { display: block; height: 100%; border-radius: var(--radius-round); background: var(--color-accent); transition: width var(--dur-panel) var(--ease-out); }
 .section-heading--admin { padding-block-end: var(--space-md); border-block-end: .0625rem solid var(--color-rule); }
 .section-heading--admin code { font-size: var(--text-xs); }
 .af-w { display: grid; grid-template-columns: minmax(0, 1fr); gap: var(--space-sm); margin-block-end: var(--space-md); }
@@ -454,6 +462,7 @@ label, legend { color: var(--color-ink-2); font-size: var(--text-xs); font-weigh
   .admin-heading, .section-heading--admin { grid-template-columns: minmax(0, 1fr) auto; }
   .admin-heading__actions { justify-content: flex-end; }
   .admin-metrics { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+  .overview-kpi { grid-template-columns: repeat(4, minmax(0, 1fr)); }
   .admin-metrics > div { border-block-end: 0; }
   .admin-metrics > div:nth-child(even) { border-inline-end: .0625rem solid var(--color-rule); }
   .admin-metrics > div:last-child { border-inline-end: 0; }

@@ -41,6 +41,7 @@ import {
   fetchWorkbuddyCredits,
   fetchWorkbuddyPaymentType,
 } from './workbuddy-billing'
+import { queryUsageOverview } from './analytics/query'
 
 /** 查询签到状态。依次试两个端点（CPA fallback 模式）。 */
 async function fetchCheckinStatus(
@@ -603,4 +604,49 @@ export async function handleCheckinStatus(c: Context<{ Bindings: Env }>) {
   )
 
   return c.json<ApiResponse>({ success: true, data: { workbuddy, trae } })
+}
+
+/**
+ * GET /admin/api/overview：概览驾驶舱聚合数据（P2）。
+ * 聚合两类来源：签到 KV（额度/签到进度）+ Analytics Engine 24h 调用概况。
+ * 任一来源失败不阻塞另一来源（analytics 不可用时 usage 为 null，前端降级显示占位）。
+ */
+export async function handleAdminOverview(c: Context<{ Bindings: Env }>) {
+  const providers = (await getProviders(c.env)) as Provider[]
+
+  // WorkBuddy/QoderWork 签到结果聚合：池账号逐个累加，单账号直接取
+  const oauthProviders = providers.filter((p) => p.authType === 'oauth-device' && p.oauth && p.oauth.flowType !== 'm365-pkce' && p.oauth.flowType !== 'm365-ropc' && !isTraeProvider(p))
+  let checkedIn = 0, totalAccounts = 0, remain = 0, size = 0
+  for (const p of oauthProviders) {
+    const r = await readCheckinResult(c.env, p.id)
+    if (!r) continue
+    if (r.accounts && r.accounts.length > 0) {
+      for (const a of r.accounts) {
+        totalAccounts++
+        if (a.todayCheckedIn) checkedIn++
+        if (typeof a.totalRemain === 'number') remain += a.totalRemain
+        if (typeof a.totalSize === 'number') size += a.totalSize
+      }
+    } else {
+      totalAccounts++
+      if (r.todayCheckedIn) checkedIn++
+      if (typeof r.totalRemain === 'number') remain += r.totalRemain
+      if (typeof r.totalSize === 'number') size += r.totalSize
+    }
+  }
+
+  // 24h 调用概况（Analytics Engine 可能未启用/失败，降级为 null）
+  let usage: { requests: number; successRate: number } | null = null
+  try {
+    const ov = await queryUsageOverview(c as unknown as Parameters<typeof queryUsageOverview>[0], '24h')
+    usage = { requests: ov.requests, successRate: ov.successRate }
+  } catch { /* analytics 不可用 */ }
+
+  return c.json<ApiResponse>({
+    success: true,
+    data: {
+      checkin: { checkedIn, totalAccounts, remain, size },
+      usage,
+    },
+  })
 }

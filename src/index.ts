@@ -73,7 +73,7 @@ import {
   handleUsageLogs,
 } from './analytics/admin-api'
 import { refreshAllOauthTokens } from './oauth'
-import { runAllCheckins, handleCheckinTrigger, handleCheckinStatus } from './checkin'
+import { runAllCheckins, handleCheckinTrigger, handleCheckinStatus, handleAdminOverview } from './checkin'
 import { autoCleanupAll } from './m365/auto-cleanup'
 import {
   handleTraeLoginConnect,
@@ -235,6 +235,9 @@ app.put('/admin/api/perf-settings', handleSetPerfSettings)
 // 签到（浏览器面板用，需 session 认证）
 app.get('/admin/api/checkin/status', handleCheckinStatus)
 app.post('/admin/api/checkin', handleCheckinTrigger)
+
+// 概览驾驶舱聚合（P2）：签到额度 + 24h 调用概况
+app.get('/admin/api/overview', handleAdminOverview)
 
 // ===== 对外管理 API（需管理 Token 验证，供手机脚本等外部调用） =====
 app.use('/api/manage/*', managementAuthMiddleware)

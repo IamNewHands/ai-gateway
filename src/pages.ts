@@ -517,6 +517,8 @@ ${H('管理')}
           <div><span>${proxyKeys.length}</span><p>转发 Key</p><small>${enabledProxyKeysCount} 个可用</small></div>
           <div><span class="status-dot status-dot--online"><i aria-hidden="true"></i>已配置</span><p>存储</p><small>Cloudflare KV</small></div>
         </div>
+        <!-- P2：概览驾驶舱聚合 KPI（客户端拉取 /admin/api/overview 填充） -->
+        <div id="overview-kpi" class="overview-kpi" aria-label="运营概况"></div>
       </section>
 
       <!-- ===== Analytics Engine 使用统计 ===== -->
@@ -2563,6 +2565,46 @@ adminNavLinks.forEach(function (link) {
   }
 })
 setTimeout(loadCheckin, 0)
+
+// P2：概览驾驶舱聚合 KPI —— 拉取 /admin/api/overview 渲染额度/签到/调用量/成功率卡片
+;(async function loadOverviewKpi() {
+  var root = document.getElementById('overview-kpi')
+  if (!root) return
+  function kpiCard(value, label, sub, pct) {
+    var bar = ''
+    if (pct !== null && pct !== undefined) {
+      var w = Math.max(0, Math.min(100, Math.round(pct)))
+      bar = '<div class="kpi-bar" aria-hidden="true"><i style="width:' + w + '%"></i></div>'
+    }
+    return '<div class="kpi"><span>' + value + '</span><p>' + label + '</p><small>' + sub + '</small>' + bar + '</div>'
+  }
+  try {
+    var r = await fetch('/admin/api/overview')
+    var d = await r.json()
+    if (!d.success || !d.data) return
+    var ck = d.data.checkin || {}
+    var ckTotal = ck.totalAccounts || 0
+    var html = ''
+    // 可用额度：remain/size 进度条；无签到数据时降级占位
+    if (ckTotal > 0) {
+      html += kpiCard(String(ck.remain ?? '—'), 'WorkBuddy 可用额度', '额度池 ' + (ck.size ?? '—'), ck.size > 0 ? ck.remain / ck.size * 100 : null)
+      html += kpiCard(ck.checkedIn + '/' + ckTotal, '今日签到', ck.checkedIn >= ckTotal ? '全部完成' : ((ckTotal - ck.checkedIn) + ' 个待签'), ckTotal ? ck.checkedIn / ckTotal * 100 : null)
+    } else {
+      html += kpiCard('—', 'WorkBuddy 可用额度', '暂无签到数据', null)
+      html += kpiCard('—', '今日签到', '暂无签到数据', null)
+    }
+    // 24h 调用：analytics 不可用时降级
+    var u = d.data.usage
+    if (u) {
+      html += kpiCard(String(u.requests), '24h 调用量', 'Analytics Engine', null)
+      html += kpiCard(u.successRate.toFixed(1) + '%', '24h 成功率', u.successRate >= 95 ? '健康' : (u.successRate >= 80 ? '注意' : '异常'), u.successRate)
+    } else {
+      html += kpiCard('—', '24h 调用量', '统计未启用', null)
+      html += kpiCard('—', '24h 成功率', '统计未启用', null)
+    }
+    root.innerHTML = html
+  } catch (e) { /* 聚合接口失败保持空白，不打扰配置统计展示 */ }
+})()
 
 // 通过 ?connect=id 进入时自动发起 OAuth 登录（"创建并发起连接"按钮创建后跳转过来）
 ;(function () {
