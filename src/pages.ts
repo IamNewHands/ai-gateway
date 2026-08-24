@@ -475,7 +475,6 @@ ${H('管理')}
       <p class="admin-nav__group" aria-hidden="true">接入资源</p>
       <a class="admin-nav__link" href="#providers"><i class="fas fa-server" aria-hidden="true"></i><span>提供商</span><b>${providers.length}</b></a>
       <a class="admin-nav__link" href="#proxy-keys"><i class="fas fa-key" aria-hidden="true"></i><span>转发 Key</span><b>${proxyKeys.length}</b></a>
-<a class="admin-nav__link" href="#checkin"><i class="fas fa-calendar-check" aria-hidden="true"></i><span>签到</span><b>${providers.filter((p:any)=>p.authType==='oauth-device'&&p.oauth&&p.oauth.flowType!=='m365-pkce'&&p.oauth.flowType!=='m365-ropc').length}</b></a>
       <p class="admin-nav__group" aria-hidden="true">观测分析</p>
       <a class="admin-nav__link" href="#analytics"><i class="fas fa-chart-bar" aria-hidden="true"></i><span>使用统计</span></a>
       <a class="admin-nav__link" href="#usage-logs"><i class="fas fa-clipboard-list" aria-hidden="true"></i><span>详细日志</span></a>
@@ -498,7 +497,7 @@ ${H('管理')}
   <div class="admin-main">
     <header class="admin-topbar">
       <a class="brand" href="/"><span class="brand__mark" aria-hidden="true"><i class="fas fa-cloud"></i></span><span class="brand__name">${SITE_CONFIG.title}</span></a>
-      <nav aria-label="移动端控制台导航"><a href="#overview">概览</a><a href="#providers">提供商</a><a href="#proxy-keys">Key</a><a href="#checkin">签到</a><a href="#analytics">统计</a><a href="#usage-logs">日志</a><a href="#logs">系统日志</a><a href="#mcps">MCP</a><a href="#unimodels">联合</a><a href="#thinking">思维引导</a><a href="#cache">缓存</a><a href="#cache-prefix">缓存前缀</a><a href="#perf">性能</a></nav>
+      <nav aria-label="移动端控制台导航"><a href="#overview">概览</a><a href="#providers">提供商</a><a href="#proxy-keys">Key</a><a href="#analytics">统计</a><a href="#usage-logs">日志</a><a href="#logs">系统日志</a><a href="#mcps">MCP</a><a href="#unimodels">联合</a><a href="#thinking">思维引导</a><a href="#cache">缓存</a><a href="#cache-prefix">缓存前缀</a><a href="#perf">性能</a></nav>
       <a class="icon-btn" href="javascript:void(0)" onclick="doLogout()" aria-label="退出登录"><i class="fas fa-sign-out-alt" aria-hidden="true"></i></a>
     </header>
 
@@ -766,13 +765,6 @@ ${H('管理')}
         <div id="log-list" class="key-list">
           <div class="empty-state"><i class="fas fa-list-alt" aria-hidden="true"></i><h3>暂无日志</h3><p>开启日志开关后，API 请求和错误会被记录。</p></div>
         </div>
-      </section>
-      <section id="checkin" class="workspace-section" aria-labelledby="checkin-title">
-        <div class="section-heading section-heading--admin"><div><h2 id="checkin-title">签到状态</h2><p>WorkBuddy / QoderWork / TRAE SOLO 每日签到领取免费积分，一个面板统一管理。仅 CN 账号可签到（国际版自动跳过）。定时任务每天 09:00/21:00 自动执行。</p></div><div><button class="btn btn-gh btn-xs" onclick="loadCheckin()" style="margin-left:8px"><i class="fas fa-sync-alt"></i></button><button class="btn btn-p btn-xs" onclick="triggerCheckin()"><i class="fas fa-calendar-check" aria-hidden="true"></i>全部签到</button></div></div>
-        <div id="checkin-list" class="key-list">
-          <div class="empty-state"><i class="fas fa-calendar-check" aria-hidden="true"></i><h3>暂无签到数据</h3><p>配置 WorkBuddy / QoderWork / TRAE SOLO 账号后，登录并点击「全部签到」。</p></div>
-        </div>
-        <div id="trae-checkin-list" class="mt-1"></div>
       </section>
 
       <!-- ===== MCP 聚合网关 ===== -->
@@ -2707,17 +2699,6 @@ window.addEventListener('hashchange', function () {
   if (location.hash === '#m365-accounts') location.replace('#providers')
 })
 
-// 签到状态：页面加载后总是加载一次（区块同屏展示，避免签到区默认停在静态占位）；进入 #checkin 时再刷新
-// 注意：仅读取状态，不触发签到（签到只能通过手动点击按钮或 cron 定时触发）
-function maybeLoadCheckin(hash) { if (hash === '#checkin') loadCheckin() }
-window.addEventListener('hashchange', function () { maybeLoadCheckin(location.hash) })
-adminNavLinks.forEach(function (link) {
-  if (link.getAttribute('href') === '#checkin') {
-    link.addEventListener('click', function () { setTimeout(loadCheckin, 50) })
-  }
-})
-setTimeout(loadCheckin, 0)
-
 // P2：概览驾驶舱聚合 KPI —— 拉取 /admin/api/overview 渲染额度/签到/调用量/成功率卡片
 ;(async function loadOverviewKpi() {
   var root = document.getElementById('overview-kpi')
@@ -2983,156 +2964,7 @@ async function deleteExpiredLogs() {
   } else toast(d.message || '删除失败', 'error')
 }
 
-// ===== WorkBuddy 签到 =====
-async function loadCheckin() {
-  const el = document.getElementById('checkin-list')
-  if (!el) return
-  el.innerHTML = '<div class="empty-state"><i class="fas fa-spinner fa-pulse"></i><h3>加载中…</h3></div>'
-  try {
-    const r = await fetch('/admin/api/checkin/status')
-    const d = await r.json()
-    renderCheckinList(d)
-  } catch(e) {
-    el.innerHTML = '<div class="empty-state"><i class="fas fa-exclamation-triangle c-l"></i><h3>加载失败</h3></div>'
-    return
-  }
-}
-
-function renderCheckinList(d) {
-  const el = document.getElementById('checkin-list')
-  if (!el) return
-  // 兼容旧结构（data 为数组）/ 新结构（data = {workbuddy, trae}）
-  var dataArr = Array.isArray(d && d.data) ? d.data
-    : (d && d.data && Array.isArray(d.data.workbuddy) ? d.data.workbuddy : [])
-  if (!d || !d.success || dataArr.length === 0) {
-    el.innerHTML = '<div class="empty-state"><i class="fas fa-calendar-check" aria-hidden="true"></i><h3>暂无 WorkBuddy 签到数据</h3><p>配置 WorkBuddy / QoderWork OAuth 提供商后，点击「全部签到」。</p></div>'
-  } else {
-    const html = renderWorkbuddyCards(dataArr)
-    el.innerHTML = html
-    el.querySelectorAll('[data-cid]').forEach(function(btn) {
-      btn.addEventListener('click', function() { triggerCheckin(btn.getAttribute('data-cid')) })
-    })
-    el.querySelectorAll('[data-pkg]').forEach(function(btn) {
-      btn.addEventListener('click', function() { toggleCollapse(btn.getAttribute('data-pkg'), btn) })
-    })
-  }
-  // 渲染 TRAE 认可账号级结果（新结构时）
-  if (d && d.data && !Array.isArray(d.data) && d.data.trae) {
-    renderTraeCheckinList(d.data.trae)
-  } else if (d && d.data && Array.isArray(d.data)) {
-    renderTraeCheckinList([])
-  }
-}
-
-/** 生成 WorkBuddy/QoderWork 的卡片 HTML（原 renderCheckinList 内联逻辑）。 */
-function renderWorkbuddyCards(list) {
-  var html = ''
-  list.forEach(function(c, idx) {
-    var reason = c.reason || 'fail'
-    var badge = reason === 'ok' ? '<span class="bd bd-on">签到成功</span>'
-      : reason === 'already' ? '<span class="bd bd-on">今日已签</span>'
-      : reason === 'skipped_global' ? '<span class="bd bd-off">国际版跳过</span>'
-      : reason === 'skipped_no_token' ? '<span class="bd bd-off">未签到</span>'
-      : '<span class="bd bd-danger">失败</span>'
-    var lastTime = c.lastCheckinAt ? new Date(c.lastCheckinAt).toLocaleString() : '—'
-    var streak = (c.streakDays !== undefined && c.streakDays !== null) ? c.streakDays + ' 天' : '—'
-    var credits = (c.totalCredits !== undefined && c.totalCredits !== null) ? c.totalCredits : '—'
-    var realmBadge = c.realm === 'cn' ? '<span class="bd bd-on">CN</span>' : c.realm === 'global' ? '<span class="bd bd-off">Global</span>' : '<span class="bd bd-off">未知</span>'
-    var payBadge = c.paymentType ? '<span class="bd bd-on">' + escapeHtml(c.paymentType) + '</span>' : ''
-    var title = c.nickname ? escapeHtml(c.nickname) + ' <small style="color:var(--muted)">' + escapeHtml(c.name) + '</small>' : escapeHtml(c.name)
-    var remain = (c.totalRemain !== undefined && c.totalRemain !== null) ? c.totalRemain : '—'
-    var used = (c.totalUsed !== undefined && c.totalUsed !== null) ? c.totalUsed : '—'
-    var size = (c.totalSize !== undefined && c.totalSize !== null) ? c.totalSize : '—'
-    var packs = (c.packCount !== undefined && c.packCount !== null) ? c.packCount + ' 个包' : '—'
-    var pct = (c.totalSize > 0 && c.totalUsed !== undefined && c.totalUsed !== null) ? Math.round(c.totalUsed / c.totalSize * 100) + '%' : ''
-    var creditLine = '可用 ' + remain + ' · 已用 ' + used + (pct ? ' · ' + pct : '') + ' · 额度池 ' + size + ' · ' + packs
-    var checkinCredit = (c.checkinCredit !== undefined && c.checkinCredit !== null) ? '+' + c.checkinCredit : ''
-    var checkinLine = '连续签到：' + streak + (checkinCredit ? ' · 本次签到 ' + checkinCredit + ' 积分' : '') + ' · 总积分：' + credits + ' · 上次签到：' + escapeHtml(lastTime)
-    var packLine = ''
-    if (c.packages && c.packages.length > 0) {
-      var pkgId = 'pkg-' + idx
-      var rows = c.packages.map(function(p) {
-        var exp = (p.expireAt && p.expireAt.trim()) ? escapeHtml(p.expireAt) : '长期'
-        var cyc = (p.cycleEndTime && p.cycleEndTime.trim()) ? escapeHtml(p.cycleEndTime) : '—'
-        var qty = ''
-        if (p.size !== undefined && p.size !== null && p.size > 0) {
-          var used2 = (p.used !== undefined && p.used !== null) ? p.used : 0
-          qty = '<td class="numeric">' + used2 + ' / ' + p.size + (p.unit ? ' ' + escapeHtml(p.unit) : '') + '</td>'
-        } else {
-          qty = '<td>—</td>'
-        }
-        return '<tr><td>' + escapeHtml(p.name) + '</td><td>' + exp + '</td><td>' + cyc + '</td>' + qty + '</tr>'
-      }).join('')
-      packLine = '<div class="collapse-section" style="margin-top:6px"><button class="collapse-btn" data-pkg="' + pkgId + '" type="button" aria-expanded="false"><i class="fas fa-chevron-right collapse-icon" aria-hidden="true"></i> 权益包明细（' + c.packages.length + '）</button><div id="' + pkgId + '" class="hd usage-log-table-wrap"><table class="usage-log-table"><thead><tr><th>名称</th><th>到期时间</th><th>周期结束</th><th>已用/总额度</th></tr></thead><tbody>' + rows + '</tbody></table></div></div>'
-    }
-    // WorkBuddy 多账号池：逐账号展示签到结果
-    var accountsLine = ''
-    if (c.accounts && c.accounts.length > 0) {
-      accountsLine = '<div class="mu" style="margin-top:4px">' + c.accounts.map(function(a, ai) {
-        const ab = a.success ? '<span class="bd bd-on">' + (a.reason === 'already' ? '已签' : '成功') + '</span>' : '<span class="bd bd-danger">失败</span>'
-        const nm = a.nickname ? escapeHtml(a.nickname) : escapeHtml(a.uid)
-        const rem = (a.totalRemain !== undefined && a.totalRemain !== null) ? ' · 可用 ' + a.totalRemain : ''
-        // 逐账号权益包明细（与单账号卡片一致，展示该账号额度由哪些包构成）
-        var pkg = ''
-        if (a.packages && a.packages.length > 0) {
-          var aid = 'apkg-' + idx + '-' + ai
-          var rows = a.packages.map(function(p) {
-            var exp = (p.expireAt && p.expireAt.trim()) ? escapeHtml(p.expireAt) : '长期'
-            var cyc = (p.cycleEndTime && p.cycleEndTime.trim()) ? escapeHtml(p.cycleEndTime) : '—'
-            var qty = ''
-            if (p.size !== undefined && p.size !== null && p.size > 0) {
-              var used2 = (p.used !== undefined && p.used !== null) ? p.used : 0
-              qty = '<td class="numeric">' + used2 + ' / ' + p.size + (p.unit ? ' ' + escapeHtml(p.unit) : '') + '</td>'
-            } else {
-              qty = '<td>—</td>'
-            }
-            return '<tr><td>' + escapeHtml(p.name) + '</td><td>' + exp + '</td><td>' + cyc + '</td>' + qty + '</tr>'
-          }).join('')
-          pkg = '<div class="collapse-section" style="margin-top:4px"><button class="collapse-btn" data-pkg="' + aid + '" type="button" aria-expanded="false"><i class="fas fa-chevron-right collapse-icon" aria-hidden="true"></i> 权益包明细（' + a.packages.length + '）</button><div id="' + aid + '" class="hd usage-log-table-wrap"><table class="usage-log-table"><thead><tr><th>名称</th><th>到期时间</th><th>周期结束</th><th>已用/总额度</th></tr></thead><tbody>' + rows + '</tbody></table></div></div>'
-        }
-        return '<div style="margin-top:2px">' + nm + ' ' + ab + ' <span style="color:var(--muted)">' + escapeHtml(a.message || '') + '</span>' + rem + pkg + '</div>'
-      }).join('') + '</div>'
-    }
-    html += '<article class="ki"><div class="key-main"><span class="key-icon" aria-hidden="true"><i class="fas fa-calendar-check"></i></span><div><div class="kv"><h3>' + title + '</h3>' + realmBadge + payBadge + badge + '</div><p>' + creditLine + '</p><p style="margin-top:2px">' + checkinLine + '</p>' + packLine + accountsLine + (c.message ? '<p class="mu" style="margin-top:2px">' + escapeHtml(c.message) + '</p>' : '') + '</div></div><div class="key-actions"><button class="btn btn-gh btn-xs" data-cid="' + escapeHtml(c.providerId) + '"><i class="fas fa-calendar-check" aria-hidden="true"></i>签到</button></div></article>'
-  })
-  return html
-}
-
-/** 渲染 TRAE SOLO 账号级签到结果（新结构 data.trae）。 */
-function renderTraeCheckinList(traeList) {
-  const el = document.getElementById('trae-checkin-list')
-  if (!el) return
-  const list = traeList || []
-  if (list.length === 0) { el.innerHTML = ''; return }
-  var html = '<div class="section-heading section-heading--admin" style="margin-top:16px"><div><h2>TRAE SOLO 签到</h2><p>按账号展示最近一次签到与剩余积分。</p></div></div>'
-  list.forEach(function(t) {
-    html += '<div class="ki" style="margin-bottom:6px"><div class="key-main"><span class="key-icon"><i class="fas fa-calendar-check"></i></span><div><h3>' + escapeHtml(t.name) + '</h3>'
-    if (!t.results || t.results.length === 0) {
-      html += '<p class="mu">尚未签到</p>'
-    } else {
-      html += t.results.map(function(r) {
-        const ok = r.success ? (r.checkedIn ? '<span class="bd bd-on">已签到</span>' : '<span class="bd bd-on">成功</span>') : '<span class="bd bd-danger">失败</span>'
-        return '<div style="margin-top:4px"><span class="bd bd-on">' + escapeHtml(r.nickname || r.uid) + '</span> ' + ok +
-          ' <span style="color:var(--muted)">' + escapeHtml(r.message || '') + '</span>' +
-          ((r.credits !== undefined && r.credits !== null) ? ' · 剩余积分 ' + r.credits : '') + '</div>'
-      }).join('')
-    }
-    html += '</div></div><div class="key-actions"><button class="btn btn-gh btn-xs" data-trae-checkin="' + escapeHtml(t.providerId) + '"><i class="fas fa-calendar-check" aria-hidden="true"></i>签到</button></div></div>'
-  })
-  el.innerHTML = html
-  el.querySelectorAll('[data-trae-checkin]').forEach(function(btn) {
-    btn.addEventListener('click', function() { traeCheckin(btn.getAttribute('data-trae-checkin')) })
-  })
-}
-
-async function refreshCheckinInBackground() {
-  try {
-    const r = await fetch('/admin/api/checkin', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ silent: true }) })
-    const d = await r.json()
-    if (d.success) loadCheckin()
-  } catch(e) { /* 静默刷新失败不提示 */ }
-}
-
+// ===== 签到（各池已迁移进 provider 卡，见 wbp-/qdp-/trae- 账号池的「立即签到」） =====
 async function triggerCheckin(id) {
   toast('签到中…', 'info')
   try {
@@ -3154,14 +2986,18 @@ async function triggerCheckin(id) {
         results = s.results || []
       }
       toast(msg, 'success')
-      renderCheckinList({ success: true, data: results })
-      if (!id) loadCheckin()
-      // 签到数据已更新：同步刷新已展开的 WorkBuddy 池（明细/徽章即时更新）
+      // 签到数据已更新：同步刷新各账号池（明细/徽章即时更新）
+      // WorkBuddy 池
       document.querySelectorAll('.pd.open [id^="wbp-acc-"]').forEach(function (el) {
         var pid = String(el.id).replace(/^wbp-acc-/, '')
         if (document.getElementById('wbp-st-' + pid)) oauthPoolStatus(pid)
       })
-      // TRAE 池同样刷新（签到列更新）
+      // Qoder 池
+      document.querySelectorAll('.pd.open [id^="qdp-acc-"]').forEach(function (el) {
+        var pid = String(el.id).replace(/^qdp-acc-/, '')
+        if (document.getElementById('qdp-st-' + pid)) qoderPoolStatus(pid)
+      })
+      // TRAE SOLO 池（签到列更新）
       document.querySelectorAll('.pd.open [id^="trae-acc-"]').forEach(function (el) {
         traeStatus(String(el.id).replace(/^trae-acc-/, ''))
       })

@@ -331,12 +331,14 @@ function unwrapQoderSSE(upstreamBody: ReadableStream<Uint8Array>, model: string)
 }
 
 export interface QoderProxyOptions {
-  /** 客户端是否要求流式（false 时聚合为非流式 chat.completion） */
-  stream: boolean
+  /** 客户端是否要求流式（false 时聚合为非流式 chat.completion）；缺省按 forwardBody.stream */
+  stream?: boolean
   /** 签名用的 model key（已 cpaToUpstreamKey 映射） */
   modelKey?: string
   /** 会话注入（测试/工具调用用），缺省按 provider 从 KV 拉取 */
   session?: { session: CosySession }
+  /** 请求头 X-Qoder-Account：客户端固定使用指定账号（池内 uid）。缺省自动挑选。 */
+  preferUid?: string
 }
 
 /** 单次上游发送的结果：成功 Response，或分类后的错误（供池循环决定冷却与轮转）。 */
@@ -467,7 +469,7 @@ export async function proxyQoderChatRequest(
   const messages = Array.isArray(forwardBody.messages) ? (forwardBody.messages as any[]) : []
   const body = buildQoderBody(messages, modelKey)
   const encodedBody = qoderEncode(body)
-  const wantStream = opts ? opts.stream : forwardBody.stream === true
+  const wantStream = opts?.stream ?? forwardBody.stream === true
 
   // 会话注入（测试/工具）：单次直发，不经过池
   if (opts?.session) {
@@ -490,7 +492,8 @@ export async function proxyQoderChatRequest(
     for (let i = 0; i < poolLen; i++) {
       let account: QoderPoolAccount | null = null
       try {
-        account = await pickQoderAccount(env, provider.id, tried)
+        // 账号固定：首轮优先用 X-Qoder-Account 指定的 uid，之后自动挑号轮转
+        account = await pickQoderAccount(env, provider.id, tried, i === 0 ? opts?.preferUid : undefined)
       } catch { /* ignore */ }
       if (!account) break
       tried.add(account.uid)

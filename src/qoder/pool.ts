@@ -125,14 +125,20 @@ export async function seedQoderPoolFromSingle(env: Env, providerId: string): Pro
   return true
 }
 
-/** 挑号：healthy + 未 tried 中剩余积分最多者优先。 */
+/** 挑号：health + 未 tried 中剩余积分最多者优先；若指定 preferUid（账号固定）且该账号健康则固定返回它。 */
 export async function pickQoderAccount(
   env: Env,
   providerId: string,
-  tried: Set<string>
+  tried: Set<string>,
+  preferUid?: string
 ): Promise<QoderPoolAccount | null> {
   const pool = await readQoderPool(env, providerId)
   const now = Date.now()
+  // 账号固定：客户端 X-Qoder-Account 指定的账号（uid）若健康则强制使用
+  if (preferUid) {
+    const pinned = pool.find((a) => a.uid === preferUid)
+    if (pinned && !tried.has(pinned.uid) && isQoderAccountHealthy(pinned, now)) return pinned
+  }
   let best: QoderPoolAccount | null = null
   let bestCredits = -Infinity
   for (const a of pool) {

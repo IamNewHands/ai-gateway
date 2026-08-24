@@ -1147,7 +1147,11 @@ export async function forwardProxy(
     // QoderWork：COSY 签名转发（flowType=qoder）。与 opencode 一样需记录日志，
     // 否则请求成功但后台无记录。
     if (isQoderProvider(providerId)) {
-      const response = await proxyQoderChatRequest(c.env, provider, forwardBody as Record<string, unknown>)
+      // 账号固定：客户端可带 X-Qoder-Account 请求头强制使用指定池账号（uid）
+      const preferUid = (c.req.header('X-Qoder-Account') || '').trim() || undefined
+      const response = await proxyQoderChatRequest(c.env, provider, forwardBody as Record<string, unknown>, {
+        preferUid,
+      })
       const logLevel = response.ok ? 'request' : (response.status >= 500 ? 'error' : 'warn')
       try {
         const bodySummary = summarizeRequestBody(forwardBody)
@@ -2648,7 +2652,8 @@ async function handleAnthropicQoder(
     delete upstreamBody['max_completion_tokens']
   }
 
-  const response = await proxyQoderChatRequest(c.env, provider, upstreamBody, { stream: true })
+  const preferUid = (c.req.header('X-Qoder-Account') || '').trim() || undefined
+  const response = await proxyQoderChatRequest(c.env, provider, upstreamBody, { stream: true, preferUid })
 
   if (!response.ok) {
     const errText = await response.text().catch(() => '')

@@ -108,6 +108,11 @@ app.use('*', async (c, next) => {
   return next()
 })
 
+// ===== 健康检查（无需鉴权，供 LB/探活/监控） =====
+app.get('/health', async (c) =>
+  c.json({ status: 'ok', ts: Date.now(), uptime: (globalThis as any).__startAt ? Date.now() - (globalThis as any).__startAt : 0 })
+)
+
 // ===== 首页 =====
 app.get('/', async (c) => {
   const { getCookie } = await import('hono/cookie')
