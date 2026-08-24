@@ -15,9 +15,10 @@ import type { ChatHubAccount, ChatHubTool, ChatHubResult } from './chathub'
 import { flattenPromptMessages, modelToolRouterPrompt, parseModelToolDecision, fencedToolCalls, nativeToolCalls, compactToolResult, buildAgentLedger, ledgerRouterContext, filterCompletedCalls, completionEvidenceAllows, isToolRefusal } from './tools'
 import type { DetectedToolCall, AgentLedger, OaiMsgLite } from './tools'
 import { resolveSession, bindSession } from './session'
-import { getM365Account } from './oauth'
+import type { ResolveResult } from './session'
+import { listM365Accounts } from './oauth'
 import { recordConversation, shouldCleanup, cleanupConversations, getCleanupMode, getCleanupConfig } from './conversation-manager'
-import { markAccountSuccess, markAccountFailure, markAccountImageLimited, accountCooldownSeconds, isRateLimited, isAuthFailure, isEmptyCompletion } from './account-health'
+import { markAccountSuccess, markAccountFailure, markAccountImageLimited, accountCooldownSeconds, isAccountAvailable, isRateLimited, isAuthFailure, isEmptyCompletion } from './account-health'
 import { writeLog } from '../admin'
 
 export interface M365ChatPayload {
@@ -97,18 +98,11 @@ export class M365Session {
     const tools = (body['tools'] as unknown[]) || []
     const toolChoice = body['tool_choice']
 
-    // 1) 账号 token（KV 中该 provider 的 OAuth token；过期自动刷新）
-    const account = await getM365Account(this.env, providerId)
-    if (!account || !account.accessToken) {
-      return cjson({ error: { message: 'M365 账号未授权或 token 失效，请在管理后台重新授权', type: 'auth_error' } }, 401)
-    }
-    const acc: ChatHubAccount = { accessToken: account.accessToken, oid: account.oid, tid: account.tid }
-
-    // 2) 会话解析（显式 ID / 内容键）
+    // 1) 会话解析（显式 ID / 内容键）
     const ctx = { explicitSessionId, user, ip, userAgent }
     const resolved = await resolveSession(this.env, providerId, messages as never[], ctx)
 
-    // 3) 构建 ChatHub 请求：messages 扁平化为单文本 prompt；复用命中只发增量
+    // 2) 构建 ChatHub 请求：messages 扁平化为单文本 prompt；复用命中只发增量
     const { prompt, attachments } = flattenPromptMessages(messages as never[])
     let answerPrompt = prompt
     if (!resolved.isNew && resolved.historyLen > 0 && resolved.historyLen < messages.length) {
@@ -130,10 +124,16 @@ export class M365Session {
     const ledger: AgentLedger = buildAgentLedger(messages as OaiMsgLite[])
     const ledgerCtx = ledger.toolRounds > 0 ? ledgerRouterContext(ledger) : ''
 
+    // 3) 账号池选择：见 selectAccounts 注释。返回按尝试顺序排好的候选账号。
+    const ordered = await this.selectAccounts(providerId, resolved)
+    if (ordered.length === 0) {
+      return cjson({ error: { message: 'M365 账号未授权、token 失效或全部处于冷却，请在后台添加/授权账号', type: 'auth_error' } }, 401)
+    }
+    const acc = ordered[0]
+
     // 4) 工具路由：带 tools 且 toolChoice != none 时，先发起一次独立的路由对话，
     //    注入完整工具定义 + ledger 证据让模型显式决策是否调用工具（同原版 planningMode="router"）。
     //    路由对话是临时会话（started=true，不绑定持久会话）。
-    //    注意：路由对话的 WS 连接失败时降级到主回答（不带工具），避免 502 透传。
     const choiceStr = String(toolChoice ?? 'auto').toLowerCase()
     let toolRouterFailed = false
     if (toolDefs.length > 0 && choiceStr !== 'none') {
@@ -165,8 +165,8 @@ export class M365Session {
       }
     }
 
-    // 5) 执行主回答对话（持久会话）
-    //    多轮时在主回答注入 ledger 证据 + 最终回答规则，避免模型虚构未经验证的操作
+    // 5) 执行主回答对话（持久会话），带账号级 failover：
+    //    限流/鉴权失败且为"新会话"时自动切换到下一个健康账号重试；已绑定会话不切号（云端对话归属该账号）。
     let mainPrompt = answerPrompt
     if (ledger.completed.length > 0 || ledger.pending.length > 0) mainPrompt += '\n' + ledgerCtx
     if (ledger.completed.length > 0) mainPrompt += '\nFINAL ANSWER RULE: Report only actions supported by completed tool results. If the goal is not fully verified, state exactly what remains unconfirmed.'
@@ -177,57 +177,54 @@ export class M365Session {
 
     let streamedText = ''
     let reasoning = ''
-    let result: Awaited<ReturnType<typeof chatWithHandlers>>
-    try {
-      result = await chatWithHandlers(
-        acc,
-        {
-          text: mainPrompt,
-          conversationId: resolved.isNew ? undefined : resolved.conversationId,
-          sessionId: resolved.isNew ? undefined : resolved.sessionId,
-          started: resolved.isNew,
-          attachments,
-          tools: mainTools,
-          toolChoice: mainChoice,
-        },
-        { timeoutMs: 300_000 },
-        (delta) => { streamedText += delta },
-        (ev) => { if (ev.kind === 'reasoning') reasoning += ev.text || '' },
-      )
-    } catch (err) {
-      // 记录完整 ChatHub 错误（含微软服务端返回的 detail）便于排查真实对话 500
-      const msg = err instanceof Error ? err.message : String(err)
-      const detail =
-        `model=${model} isNew=${resolved.isNew} tools=${toolDefs.length} ` +
-        `promptLen=${mainPrompt.length} stream=${stream} historyLen=${resolved.historyLen} ` +
-        `err=${msg}`
-      try { await writeLog(this.env, 'error', `[m365-chat] provider=${providerId} → ${msg}`, detail) } catch { /* ignore */ }
+    let result: Awaited<ReturnType<typeof chatWithHandlers>> | undefined
+    let usedAcc = acc
+    let failoverLastResp: Response | null = null
+    for (let i = 0; i < ordered.length; i++) {
+      usedAcc = ordered[i]
+      try {
+        result = await chatWithHandlers(
+          usedAcc,
+          {
+            text: mainPrompt,
+            conversationId: resolved.isNew ? undefined : resolved.conversationId,
+            sessionId: resolved.isNew ? undefined : resolved.sessionId,
+            started: resolved.isNew,
+            attachments,
+            tools: mainTools,
+            toolChoice: mainChoice,
+          },
+          { timeoutMs: 300_000 },
+          (delta) => { streamedText += delta },
+          (ev) => { if (ev.kind === 'reasoning') reasoning += ev.text || '' },
+        )
+        break
+      } catch (err) {
+        // 记录完整 ChatHub 错误（含微软服务端返回的 detail）便于排查真实对话 500
+        const msg = err instanceof Error ? err.message : String(err)
+        const errObj = err instanceof Error ? err : new Error(msg)
+        const retryAfter = isRateLimited(errObj) ? 60 : 0
+        await markAccountFailure(this.env, usedAcc.oid, errObj, retryAfter)
+        const cls = classifyChatHubNotice(msg)
+        const detail =
+          `model=${model} isNew=${resolved.isNew} account=${usedAcc.oid} tools=${toolDefs.length} ` +
+          `promptLen=${mainPrompt.length} stream=${stream} historyLen=${resolved.historyLen} ` +
+          `err=${msg}`
+        try { await writeLog(this.env, 'error', `[m365-chat] provider=${providerId} → ${msg}`, detail) } catch { /* ignore */ }
 
-      // 账户健康检测：标记失败 + 提取 Retry-After
-      const errObj = err instanceof Error ? err : new Error(msg)
-      const retryAfter = isRateLimited(errObj) ? 60 : 0
-      await markAccountFailure(this.env, providerId, errObj, retryAfter)
-
-      // 上游限流：返回 429 + Retry-After（同原版 upstreamStatus / writeUpstreamError），
-      // 让客户端退避重试，而不是报 500/502 误导为服务端内部错误。
-      if (classifyChatHubNotice(msg) === 'image_quota') {
-        // 图片额度耗尽：标记账号 24h 封禁并返回 429（同原版 MarkImageLimited）
-        await markAccountImageLimited(this.env, providerId, 24)
-        return cjson({ error: { message: 'M365 image generation quota is exhausted; try again later or use another account', type: 'rate_limit_error' } }, 429, { 'Retry-After': '86400' })
+        if (cls === 'image_quota') {
+          // 图片额度耗尽：标记该账号 24h 封禁并返回 429（同原版 MarkImageLimited）
+          await markAccountImageLimited(this.env, usedAcc.oid, 24)
+          return cjson({ error: { message: 'M365 image generation quota is exhausted; try again later or use another account', type: 'rate_limit_error' } }, 429, { 'Retry-After': '86400' })
+        }
+        failoverLastResp = this.mapChatError(msg)
+        const canFailover = isRateLimited(errObj) || isAuthFailure(errObj)
+        // 上游限流/鉴权失败且为全新会话时允许切号；已绑定会话直接返回退避响应
+        if (!canFailover || !resolved.isNew) return failoverLastResp
+        if (i === ordered.length - 1) return failoverLastResp
       }
-      if (isRateLimited(errObj)) {
-        const cooldown = await accountCooldownSeconds(this.env, providerId)
-        return cjson({ error: { message: 'upstream is rate limiting; try again shortly', type: 'rate_limit_error' } }, 429, { 'Retry-After': String(Math.max(cooldown || 60, 60)) })
-      }
-      if (isAuthFailure(errObj)) {
-        return cjson({ error: { message: 'M365 account authentication failed; re-authorize required', type: 'auth_error' } }, 401)
-      }
-      // 上游内容策略拦截：明确报 502，避免被客户端误判为内部错误
-      if (classifyChatHubNotice(msg) === 'content_policy') {
-        return cjson({ error: { message: 'M365 upstream declined the request due to content policy; try rephrasing', type: 'content_policy' } }, 502)
-      }
-      return cjson({ error: { message: msg, type: 'internal_error' } }, 500)
     }
+    if (!result) return failoverLastResp || cjson({ error: { message: 'upstream failed on all accounts', type: 'upstream_error' } }, 502)
     streamedText = streamedText || result.text
 
     // 主回答兜底 1：模型错误拒绝使用工具时，发起纠正对话重试（同原版 isToolRefusal）
@@ -235,7 +232,7 @@ export class M365Session {
       const correction =
         'Your previous response incorrectly denied that caller tools are available. They are real, active, and callable on the caller\'s Windows machine. Call the appropriate tool now. Do not explain tool availability.\n\nUser request:\n' + mainPrompt
       try {
-        const corrRes = await chatWithHandlers(acc, { text: correction, conversationId: resolved.isNew ? undefined : resolved.conversationId, sessionId: resolved.isNew ? undefined : resolved.sessionId, started: resolved.isNew, attachments }, { timeoutMs: 300_000 })
+        const corrRes = await chatWithHandlers(usedAcc, { text: correction, conversationId: resolved.isNew ? undefined : resolved.conversationId, sessionId: resolved.isNew ? undefined : resolved.sessionId, started: resolved.isNew, attachments }, { timeoutMs: 300_000 })
         if (!isToolRefusal(corrRes.text)) {
           result = { ...corrRes, events: result.events }
           streamedText = corrRes.text
@@ -268,17 +265,17 @@ export class M365Session {
       },
     }
 
-    // 6) 绑定会话（记录全量历史 + 助手回复）
-    await bindSession(this.env, providerId, outcome.sessionId, outcome.conversationId, providerId, messages as never[], outcome.text + (outcome.reasoning ? '\n<reasoning>\n' + outcome.reasoning + '\n</reasoning>' : ''), ctx)
+    // 6) 绑定会话（记录全量历史 + 助手回复），把实际使用的账号 oid 记为 accountId
+    await bindSession(this.env, providerId, outcome.sessionId, outcome.conversationId, usedAcc.oid || providerId, messages as never[], outcome.text + (outcome.reasoning ? '\n<reasoning>\n' + outcome.reasoning + '\n</reasoning>' : ''), ctx)
 
     // 标记账户健康：成功
-    await markAccountSuccess(this.env, providerId)
+    await markAccountSuccess(this.env, usedAcc.oid)
 
     // 7) 对话管理器：记录云端对话 + 按模式清理
     const promptText = typeof messages[messages.length - 1]?.['content'] === 'string'
       ? String(messages[messages.length - 1]['content']).substring(0, 100)
       : ''
-    await recordConversation(this.env, providerId, outcome.conversationId, providerId, promptText)
+    await recordConversation(this.env, providerId, outcome.conversationId, usedAcc.oid || providerId, promptText)
     if (await shouldCleanup(this.env, providerId)) {
       const cfg = await getCleanupConfig(this.env, providerId)
       const mode = await getCleanupMode(this.env, providerId)
@@ -297,6 +294,52 @@ export class M365Session {
       return buildSSE(id, model, outcome, payload)
     }
     return buildJSON(id, model, outcome)
+  }
+
+  /**
+   * 账号池选择（多账号 failover 的入口）：
+   * - 已绑定会话（非新）：只返回绑定的账号（oid）；该账号若不在池中/不健康则返回空（走 401/退避）。
+   * - 新会话：返回所有健康账号，按最近未用优先（round-robin），便于在限流/鉴权失败时切号重试。
+   * 返回按尝试顺序排列的 ChatHubAccount 候选数组。
+   */
+  private async selectAccounts(providerId: string, resolved: ResolveResult): Promise<ChatHubAccount[]> {
+    const accounts = await listM365Accounts(this.env, providerId)
+    if (accounts.length === 0) return []
+    const healthy: ChatHubAccount[] = []
+    for (const a of accounts) {
+      if (!a.accessToken || !a.oid) continue
+      if (!(await isAccountAvailable(this.env, a.oid))) continue
+      healthy.push({ accessToken: a.accessToken, oid: a.oid, tid: a.tid })
+    }
+    if (!resolved.isNew && resolved.accountId) {
+      // 已绑定会话：仅允许使用绑定账号（云端对话归属它）
+      const pinned = healthy.find((a) => a.oid === resolved.accountId)
+      return pinned ? [pinned] : []
+    }
+    if (resolved.isNew && resolved.accountId) {
+      // 新会话但存在 content 指纹命中的历史账号偏好：优先复用，其次健康账号轮询
+      const pref = healthy.find((a) => a.oid === resolved.accountId)
+      if (pref) return [pref, ...healthy.filter((a) => a.oid !== resolved.accountId)]
+    }
+    return healthy
+  }
+
+  /** 把主回答的 ChatHub 错误归类为合适的 HTTP 响应（429/401/502/500） */
+  private mapChatError(msg: string): Response {
+    const cls = classifyChatHubNotice(msg)
+    if (cls === 'rate_limit') {
+      return cjson({ error: { message: 'upstream is rate limiting; try again shortly', type: 'rate_limit_error' } }, 429, { 'Retry-After': '60' })
+    }
+    if (cls === 'content_policy') {
+      return cjson({ error: { message: 'M365 upstream declined the request due to content policy; try rephrasing', type: 'content_policy' } }, 502)
+    }
+    if (isRateLimited(msg)) {
+      return cjson({ error: { message: 'upstream is rate limiting; try again shortly', type: 'rate_limit_error' } }, 429, { 'Retry-After': '60' })
+    }
+    if (isAuthFailure(msg)) {
+      return cjson({ error: { message: 'M365 account authentication failed; re-authorize required', type: 'auth_error' } }, 401)
+    }
+    return cjson({ error: { message: msg, type: 'internal_error' } }, 500)
   }
 
   /**

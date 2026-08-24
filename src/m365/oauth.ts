@@ -37,6 +37,10 @@ function tokenKey(providerId: string): string {
 function deviceKey(providerId: string): string {
   return KV_KEYS.OAUTH_DEVICE_PREFIX + providerId
 }
+/** 每 provider 的账号池 KV key */
+function poolKey(providerId: string): string {
+  return KV_KEYS.OAUTH_TOKEN_PREFIX + providerId + ':pool'
+}
 
 async function readJson<T>(env: Env, key: string): Promise<T | null> {
   const raw = await env.KV.get(key)
@@ -44,11 +48,85 @@ async function readJson<T>(env: Env, key: string): Promise<T | null> {
   try { return JSON.parse(raw) as T } catch { return null }
 }
 
+/** 账号池中的单条账号（复用 OAuthTokenState 字段，另带 lastUsedAt 供轮询） */
+export type PooledAccount = OAuthTokenState & { lastUsedAt?: number }
+
+/**
+ * 读取某 provider 的账号池。兼容旧版单账号存储（oauth:token:{providerId}），
+ * 首次读取时自动迁移进池。返回的数组按 lastUsedAt 升序（越久未用越靠前，利于轮询）。
+ */
+async function readAccounts(env: Env, providerId: string): Promise<PooledAccount[]> {
+  const raw = await env.KV.get(poolKey(providerId))
+  if (raw) {
+    try {
+      const a = JSON.parse(raw) as PooledAccount[]
+      if (Array.isArray(a)) return a.sort((x, y) => (x.lastUsedAt || 0) - (y.lastUsedAt || 0))
+    } catch { /* 损坏则丢弃重来 */ }
+  }
+  // 旧版单账号迁移
+  const old = await env.KV.get(tokenKey(providerId))
+  if (old) {
+    try {
+      const s = JSON.parse(old) as PooledAccount
+      if (s && s.access_token) {
+        const list = [{ ...s, lastUsedAt: Date.now() }]
+        await env.KV.put(poolKey(providerId), JSON.stringify(list), { expirationTtl: 86400 * 30 })
+        return list
+      }
+    } catch { /* ignore */ }
+  }
+  return []
+}
+
+async function persistAccounts(env: Env, providerId: string, list: PooledAccount[]): Promise<void> {
+  try {
+    await env.KV.put(poolKey(providerId), JSON.stringify(list), { expirationTtl: 86400 * 30 })
+  } catch { /* 写入失败不影响主流程 */ }
+}
+
+/** 把 account 状态写回账号池（按 oid upsert） */
 async function writeToken(env: Env, providerId: string, state: OAuthTokenState): Promise<void> {
-  const ttlSeconds = state.refresh_token
-    ? 86400 * 30
-    : Math.min(Math.max(Math.ceil((state.expires_at - Date.now()) / 1000), 60), 86400 * 30)
-  await env.KV.put(tokenKey(providerId), JSON.stringify(state), { expirationTtl: ttlSeconds })
+  const list = await readAccounts(env, providerId)
+  const rec: PooledAccount = { ...state, lastUsedAt: Date.now() }
+  const oid = state.oid || ''
+  if (oid) {
+    const idx = list.findIndex((a) => a.oid === oid)
+    if (idx >= 0) list[idx] = rec
+    else list.push(rec)
+  } else {
+    list.push(rec)
+  }
+  await persistAccounts(env, providerId, list)
+}
+
+/** 从账号池删除指定账号（oid），返回是否删除 */
+export async function removeM365Account(env: Env, providerId: string, oid: string): Promise<boolean> {
+  const list = await readAccounts(env, providerId)
+  if (!oid) {
+    await env.KV.delete(poolKey(providerId))
+    return list.length > 0
+  }
+  const before = list.length
+  const next = list.filter((a) => a.oid !== oid)
+  if (next.length === before) return false
+  await persistAccounts(env, providerId, next)
+  return true
+}
+
+/** 列出账号池中的账号（管理后台用） */
+export async function listM365Accounts(env: Env, providerId: string): Promise<M365Account[]> {
+  const list = await readAccounts(env, providerId)
+  return list
+    .filter((s) => s.access_token)
+    .map((s) => ({
+      accessToken: s.access_token,
+      refreshToken: s.refresh_token,
+      oid: String(s.oid || ''),
+      tid: String(s.tid || ''),
+      email: s.email,
+      displayName: s.nickname,
+      expiresAt: s.expires_at,
+    }))
 }
 
 /** 解析 JWT 载荷（不校验签名，仅读取账号标识字段） */
@@ -330,18 +408,20 @@ export async function m365ROPC(env: Env, providerId: string, cfg: OAuthDeviceCon
 
 const refreshInflight = new Map<string, Promise<boolean>>()
 
-export function refreshM365Token(env: Env, providerId: string, cfg: OAuthDeviceConfig): Promise<boolean> {
-  const existing = refreshInflight.get(providerId)
+export function refreshM365Token(env: Env, providerId: string, cfg: OAuthDeviceConfig, oid?: string): Promise<boolean> {
+  const key = providerId + ':' + (oid || '*')
+  const existing = refreshInflight.get(key)
   if (existing) return existing
-  const task = doRefreshM365Token(env, providerId, cfg).finally(() => {
-    refreshInflight.delete(providerId)
+  const task = doRefreshM365Token(env, providerId, cfg, oid).finally(() => {
+    refreshInflight.delete(key)
   })
-  refreshInflight.set(providerId, task)
+  refreshInflight.set(key, task)
   return task
 }
 
-async function doRefreshM365Token(env: Env, providerId: string, cfg: OAuthDeviceConfig): Promise<boolean> {
-  const state = await readJson<OAuthTokenState>(env, tokenKey(providerId))
+async function doRefreshM365Token(env: Env, providerId: string, cfg: OAuthDeviceConfig, oid?: string): Promise<boolean> {
+  const list = await readAccounts(env, providerId)
+  const state = oid ? list.find((a) => a.oid === oid) : list[0]
   if (!state?.refresh_token) return false
   try {
     const conf = m365ClientConfig(cfg)
@@ -361,7 +441,7 @@ async function doRefreshM365Token(env: Env, providerId: string, cfg: OAuthDevice
     const data = (await res.json()) as { access_token: string; refresh_token?: string; expires_in?: number; id_token?: string }
     if (!data.access_token) return false
     const fresh = buildTokenState(data)
-    // 刷新响应一般不带账号信息，保留原值
+    // 刷新响应一般不带账号信息，保留原值；按 oid 写回池
     await writeToken(env, providerId, {
       access_token: fresh.access_token,
       refresh_token: fresh.refresh_token || state.refresh_token,
@@ -380,23 +460,41 @@ async function doRefreshM365Token(env: Env, providerId: string, cfg: OAuthDevice
 
 // ===== 账号读取（供 ChatHub 调用） =====
 
+function toM365Account(state: PooledAccount, accessToken: string, expiresAt: number): M365Account {
+  return {
+    accessToken,
+    refreshToken: state.refresh_token,
+    oid: String(state.oid || ''),
+    tid: String(state.tid || ''),
+    email: state.email,
+    displayName: state.nickname,
+    expiresAt,
+  }
+}
+
 /**
- * 读取 M365 账号：返回可用的 access_token + oid/tid。
+ * 读取 M365 账号池中的单个账号（oid 指定，缺省取池中第一个）。
  * 临近过期自动刷新；无 token 或刷新失败返回 null。
  */
-export async function getM365Account(env: Env, providerId: string): Promise<M365Account | null> {
-  const state = await readJson<OAuthTokenState>(env, tokenKey(providerId))
-  if (!state?.access_token) return null
+export async function getM365Account(env: Env, providerId: string, oid?: string): Promise<M365Account | null> {
+  let list = await readAccounts(env, providerId)
+  let state = oid && oid !== '' ? list.find((a) => a.oid === oid) || null : list[0] || null
+  if (!state || !state.access_token) {
+    // oid 指定但不在池中：可能是旧绑定，回退首个可用账号
+    if (oid && oid !== '' && list.length > 0) state = list[0]
+    if (!state || !state.access_token) return null
+  }
 
   let accessToken = state.access_token
   let expiresAt = state.expires_at
   if (state.expires_at - Date.now() < OAUTH_TOKEN_REFRESH_MARGIN_MS && state.refresh_token) {
-    const ok = await refreshM365Token(env, providerId, {} as OAuthDeviceConfig)
+    const ok = await refreshM365Token(env, providerId, {} as OAuthDeviceConfig, state.oid)
     if (ok) {
-      const fresh = await readJson<OAuthTokenState>(env, tokenKey(providerId))
-      if (fresh?.access_token) {
-        accessToken = fresh.access_token
-        expiresAt = fresh.expires_at
+      const refreshed = (await readAccounts(env, providerId)).find((a) => a.oid === state!.oid)
+      if (refreshed?.access_token) {
+        accessToken = refreshed.access_token
+        expiresAt = refreshed.expires_at
+        state = refreshed
       }
     }
   }
@@ -410,44 +508,34 @@ export async function getM365Account(env: Env, providerId: string): Promise<M365
         oid: state.oid || claims['oid'] || claims['sub'],
         tid: state.tid || claims['tid'] || claims['tenant_id'],
         access_token: accessToken,
+        updated_at: Date.now(),
       }
       await writeToken(env, providerId, enriched as OAuthTokenState)
-      return {
-        accessToken,
-        refreshToken: enriched.refresh_token,
-        oid: String(enriched.oid || ''),
-        tid: String(enriched.tid || ''),
-        email: enriched.email,
-        displayName: enriched.nickname,
-        expiresAt,
-      }
+      return toM365Account(enriched as PooledAccount, accessToken, expiresAt)
     }
   }
-  return {
-    accessToken,
-    refreshToken: state.refresh_token,
-    oid: String(state.oid || ''),
-    tid: String(state.tid || ''),
-    email: state.email,
-    displayName: state.nickname,
-    expiresAt,
-  }
+  return toM365Account(state, accessToken, expiresAt)
 }
 
-/** 管理后台展示用：读取账号概要 */
+/** 管理后台展示用：账号池概要列表 */
+export async function getM365AccountInfos(env: Env, providerId: string): Promise<Array<{ connected: boolean; email?: string; oid?: string; tid?: string; expiresAt?: number }>> {
+  const list = await readAccounts(env, providerId)
+  return list.map((s) => ({
+    connected: !!s.access_token,
+    email: s.email,
+    oid: s.oid,
+    tid: s.tid,
+    expiresAt: s.expires_at,
+  }))
+}
+
+/** 兼容旧接口：读取账号池中第一个账号的概要 */
 export async function getM365AccountInfo(env: Env, providerId: string): Promise<{ connected: boolean; email?: string; oid?: string; tid?: string; expiresAt?: number } | null> {
-  const state = await readJson<OAuthTokenState>(env, tokenKey(providerId))
-  if (!state) return null
-  return {
-    connected: !!state.access_token,
-    email: state.email,
-    oid: state.oid,
-    tid: state.tid,
-    expiresAt: state.expires_at,
-  }
+  const infos = await getM365AccountInfos(env, providerId)
+  return infos[0] || null
 }
 
-/** 断开 M365 授权 */
+/** 断开 M365 授权（清空账号池） */
 export async function deleteM365Account(env: Env, providerId: string): Promise<void> {
-  await env.KV.delete(tokenKey(providerId))
+  await env.KV.delete(poolKey(providerId))
 }

@@ -17,6 +17,7 @@ import { isM365Provider } from './proxy'
 import { cleanupCloudConversations } from './cloud-api'
 import { listConversations, whitelistedIDs, getCleanupConfig } from './conversation-manager'
 import { listSessions, cleanupSessions } from './session'
+import { listM365Accounts } from './oauth'
 
 /**
  * 收集活跃对话 ID 集合（受保护的对话，不会被清理）。
@@ -72,12 +73,19 @@ export async function autoCleanupProvider(env: Env, provider: Provider): Promise
   console.log(`[auto-cleanup] provider=${providerId} maxAge=${config.maxAgeHours}h keepN=${keepN} active=${activeIds.size}`)
 
   let deleted = 0
-  try {
-    deleted = await cleanupCloudConversations(env, providerId, maxAgeMs, keepN, activeIds)
-  } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err)
-    console.log(`[auto-cleanup] provider=${providerId} cleanup failed: ${msg}`)
+  // 多账号：对账号池中每个账号分别清理其云端对话
+  const accounts = await listM365Accounts(env, providerId)
+  if (accounts.length === 0) {
+    console.log(`[auto-cleanup] provider=${providerId} has no authorized accounts`)
     return 0
+  }
+  for (const acc of accounts) {
+    try {
+      deleted += await cleanupCloudConversations(env, providerId, maxAgeMs, keepN, activeIds, acc.oid)
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err)
+      console.log(`[auto-cleanup] provider=${providerId} account=${acc.oid} cleanup failed: ${msg}`)
+    }
   }
 
   if (deleted > 0) {

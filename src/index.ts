@@ -54,6 +54,7 @@ import {
   handleM365ConversationCleanup,
   handleM365TokenHealth,
   handleM365ClearCooldown,
+  handleM365Accounts,
   handleGetThinkingPrompt,
   handleSetThinkingPrompt,
   handleGetCachePrefix,
@@ -274,6 +275,9 @@ app.post('/admin/api/m365/conversations/cleanup', handleM365ConversationCleanup)
 // M365 Token 健康状态与冷却管理
 app.get('/admin/api/m365/token-health/:id', handleM365TokenHealth)
 app.delete('/admin/api/m365/cooldown/:id', handleM365ClearCooldown)
+app.all('/admin/api/m365/cooldown/:id', handleM365ClearCooldown)
+// M365 账号池管理（GET 列出账号；DELETE ?oid= 移除账号）
+app.all('/admin/api/m365/accounts/:id', handleM365Accounts)
 
 // M365 DALL-E 图片生成（/v1/images/generations, /v1/images/edits）—— 需在通用转发之前注册
 app.post('/v1/images/generations', async (c) => {

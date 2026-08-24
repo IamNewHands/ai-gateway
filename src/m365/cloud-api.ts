@@ -16,11 +16,11 @@ interface CloudChat {
   [key: string]: unknown
 }
 
-/** 调用 m365.cloud.microsoft/chat API */
-async function doCloudAPI(env: Env, providerId: string, action: string, payload: Record<string, unknown>): Promise<Record<string, unknown>> {
-  const account = await getM365Account(env, providerId)
+/** 调用 m365.cloud.microsoft/chat API；oid 指定账号，缺省取账号池第一个 */
+async function doCloudAPI(env: Env, providerId: string, action: string, payload: Record<string, unknown>, oid?: string): Promise<Record<string, unknown>> {
+  const account = await getM365Account(env, providerId, oid)
   if (!account || !account.accessToken) {
-    throw new Error('M365 账号未授权或 token 失效')
+    throw new Error(oid ? `M365 账号 ${oid} 未授权或 token 失效` : 'M365 账号未授权或 token 失效')
   }
 
   const reqBody: Record<string, unknown> = {
@@ -58,7 +58,7 @@ async function doCloudAPI(env: Env, providerId: string, action: string, payload:
 }
 
 /** 删除云端对话 */
-export async function deleteConversation(env: Env, providerId: string, conversationId: string): Promise<void> {
+export async function deleteConversation(env: Env, providerId: string, conversationId: string, oid?: string): Promise<void> {
   console.log(`[m365-cloud] deleting conversation ${conversationId}`)
   await doCloudAPI(env, providerId, 'DeleteConversation', {
     conversationId,
@@ -67,12 +67,12 @@ export async function deleteConversation(env: Env, providerId: string, conversat
         chats: [],
       },
     },
-  })
+  }, oid)
 }
 
 /** 列出云端对话列表 */
-export async function listConversations(env: Env, providerId: string): Promise<CloudChat[]> {
-  const result = await doCloudAPI(env, providerId, 'RefreshNavPane', {})
+export async function listConversations(env: Env, providerId: string, oid?: string): Promise<CloudChat[]> {
+  const result = await doCloudAPI(env, providerId, 'RefreshNavPane', {}, oid)
 
   const store = result['store'] as Record<string, unknown> | undefined
   if (!store) {
@@ -122,6 +122,7 @@ export async function cleanupCloudConversations(
   maxAgeMs: number,
   keepN: number,
   activeConversationIds: Set<string>,
+  oid?: string,
 ): Promise<number> {
   const now = Date.now()
   let deleted = 0
@@ -135,7 +136,7 @@ export async function cleanupCloudConversations(
   for (let round = 0; round < 100; round++) {
     let chats: CloudChat[]
     try {
-      chats = await listConversations(env, providerId)
+      chats = await listConversations(env, providerId, oid)
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err)
       console.log(`[m365-cloud] list failed: ${msg}`)
@@ -156,7 +157,7 @@ export async function cleanupCloudConversations(
       const age = now - createTime
       if (age > maxAgeMs) {
         try {
-          await deleteConversation(env, providerId, convId)
+          await deleteConversation(env, providerId, convId, oid)
           await deleteConversationLocal(convId)
           deleted++
           anyDeleted = true
@@ -167,7 +168,7 @@ export async function cleanupCloudConversations(
       } else {
         if (kept >= keepN) {
           try {
-            await deleteConversation(env, providerId, convId)
+            await deleteConversation(env, providerId, convId, oid)
             await deleteConversationLocal(convId)
             deleted++
             anyDeleted = true
@@ -184,6 +185,6 @@ export async function cleanupCloudConversations(
     if (!anyDeleted) break
   }
 
-  console.log(`[m365-cloud] cleanup done: deleted=${deleted} kept=${kept}`)
+  console.log(`[m365-cloud] cleanup done(oid=${oid || '*'}): deleted=${deleted} kept=${kept}`)
   return deleted
 }
