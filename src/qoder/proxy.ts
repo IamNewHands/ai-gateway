@@ -14,10 +14,22 @@
  */
 
 import type { Env, Provider } from '../types'
-import { getOauthAccessToken, readOauthToken, refreshOauthToken } from '../oauth'
+import { getOauthAccessToken, readOauthToken, refreshOauthToken, refreshQoderTokenPair } from '../oauth'
 import { buildQoderBody, cpaToUpstreamKey } from './body'
 import { qoderEncode, cosySessionFor, cosyHeaders, buildBearer, type CosySession } from './cosy'
 import { classifyQoderError, qoderOpenAIErrorBody, type QoderClassified } from './classify'
+import {
+  seedQoderPoolFromSingle,
+  readQoderPool,
+  pickQoderAccount,
+  refreshQoderPoolAccountIfNeeded,
+  cooldownQoderAccount,
+  disableQoderAccount,
+  noteQoderError,
+  noteQoderSuccess,
+  resolveQoderCooldown,
+  type QoderPoolAccount,
+} from './pool'
 import { streamFetchWithTimeout } from '../opencode'
 
 export const QODER_PROVIDER_ID = 'qoder'
@@ -38,7 +50,7 @@ function stripProviderPrefix(model: string): string {
   return model
 }
 
-/** 构造 COSY 会话（token 自动刷新）。拿不到 token 返回 null。 */
+/** 构造 COSY 会话（单 token 回退路径，token 自动刷新）。拿不到 token 返回 null。 */
 async function buildQoderSession(
   env: Env,
   provider: Provider
@@ -59,6 +71,53 @@ async function buildQoderSession(
     state?.nickname || ''
   )
   return { session, accessToken: token }
+}
+
+/** 从池账号构造 COSY 会话（必要时刷新 token 并写回池）。 */
+async function buildQoderAccountSession(
+  env: Env,
+  provider: Provider,
+  account: QoderPoolAccount
+): Promise<CosySession | null> {
+  const cfg = provider.oauth
+  if (!cfg) return null
+  const refreshed = await refreshQoderPoolAccountIfNeeded(env, provider.id, account.uid, cfg, refreshQoderTokenPair)
+  if (!refreshed) return null
+  const t = refreshed.token
+  return cosySessionFor(t.access_token, t.refresh_token || '', refreshed.uid, refreshed.nickname || '')
+}
+
+/**
+ * 按错误分类对池账号施加冷却/禁用（对齐 cli2api pool.MarkClassified 语义）：
+ *   quota      → 长冷却（planMs，签到恢复积分后自动解冻）
+ *   rate_limit → 短冷却（Retry-After 优先，回退 softMs）
+ *   auth       → 禁用（需重新登录）
+ *   其余       → 分类器给出的冷却时长（>0 时），并记一次连续错误
+ */
+async function markQoderAccountClassified(
+  env: Env,
+  provider: Provider,
+  uid: string,
+  c: QoderClassified
+): Promise<void> {
+  const cd = resolveQoderCooldown(provider)
+  switch (c.kind) {
+    case 'quota':
+      await cooldownQoderAccount(env, provider.id, uid, cd.planMs, '额度耗尽（' + c.message.substring(0, 80) + '）')
+      break
+    case 'auth':
+      await disableQoderAccount(env, provider.id, uid, '鉴权失败：' + c.message.substring(0, 80))
+      break
+    case 'rate_limit':
+      await cooldownQoderAccount(env, provider.id, uid, (c.cooldownSeconds || 0) * 1000 || cd.softMs, '限流（429）')
+      break
+    default:
+      if (c.cooldownSeconds > 0) {
+        await cooldownQoderAccount(env, provider.id, uid, c.cooldownSeconds * 1000, c.kind + ': ' + c.message.substring(0, 60))
+      } else {
+        await noteQoderError(env, provider.id, uid, cd)
+      }
+  }
 }
 
 /** 判断一个 SSE 字段是否为「零值」（空壳），应被剥离。 */
@@ -271,18 +330,6 @@ function unwrapQoderSSE(upstreamBody: ReadableStream<Uint8Array>, model: string)
   })
 }
 
-/** 上游错误体 → 分类 → 结构化 OpenAI 错误（含 code/type/kind 与可选 Retry-After）。 */
-function qoderErrorResponse(status: number, bodyText: string, headers?: Headers): Response {
-  const c: QoderClassified = classifyQoderError({
-    status,
-    body: bodyText,
-    retryAfter: headers?.get('retry-after') || undefined,
-  })
-  const respHeaders: Record<string, string> = { 'Content-Type': 'application/json; charset=utf-8' }
-  if (c.cooldownSeconds > 0) respHeaders['Retry-After'] = String(c.cooldownSeconds)
-  return new Response(qoderOpenAIErrorBody(c), { status: c.status, headers: respHeaders })
-}
-
 export interface QoderProxyOptions {
   /** 客户端是否要求流式（false 时聚合为非流式 chat.completion） */
   stream: boolean
@@ -292,40 +339,20 @@ export interface QoderProxyOptions {
   session?: { session: CosySession }
 }
 
-/**
- * 转发一次 chat 请求到 QoderWork 上游。
- * 返回 Response：
- *   - stream=true：OpenAI SSE（解包+清洗后的内层 chunk）
- *   - stream=false：聚合的非流式 chat.completion JSON
- */
-export async function proxyQoderChatRequest(
-  env: Env,
-  provider: Provider,
-  forwardBody: Record<string, unknown>,
-  opts?: QoderProxyOptions
-): Promise<Response> {
-  const model = (forwardBody.model as string) || 'auto'
-  const modelKey = opts?.modelKey || cpaToUpstreamKey(stripProviderPrefix(model))
-  const messages = Array.isArray(forwardBody.messages) ? (forwardBody.messages as any[]) : []
-  const body = buildQoderBody(messages, modelKey)
-  const encodedBody = qoderEncode(body)
+/** 单次上游发送的结果：成功 Response，或分类后的错误（供池循环决定冷却与轮转）。 */
+type QoderSendResult =
+  | { ok: true; response: Response }
+  | { ok: false; classified: QoderClassified }
 
-  let session: CosySession
-  if (opts?.session) {
-    session = opts.session.session
-  } else {
-    const data = await buildQoderSession(env, provider)
-    if (!data) {
-      return new Response(
-        JSON.stringify({
-          error: { message: 'OAuth 未连接或 Token 已失效，请在管理后台重新授权', type: 'oauth_not_connected' },
-        }),
-        { status: 502, headers: { 'Content-Type': 'application/json; charset=utf-8' } }
-      )
-    }
-    session = data.session
-  }
-
+/** 用给定 COSY 会话发送一次 chat 请求并构造客户端响应（流式/非流式）。 */
+async function sendQoderChatOnce(
+  session: CosySession,
+  encodedBody: string,
+  modelKey: string,
+  model: string,
+  wantStream: boolean,
+  accountUid?: string
+): Promise<QoderSendResult> {
   const headers = cosyHeaders(session, encodedBody, QODER_CHAT_URL, 'text/event-stream', true)
   headers['x-model-key'] = modelKey
   headers['x-model-source'] = 'system'
@@ -338,26 +365,42 @@ export async function proxyQoderChatRequest(
       body: encodedBody,
     })
   } catch (err) {
-    return qoderErrorResponse(502, (err as Error).message || '网络请求失败')
+    return {
+      ok: false,
+      classified: classifyQoderError({ status: 0, body: (err as Error).message || '网络请求失败' }),
+    }
   }
 
   if (!resp.ok || !resp.body) {
     const errText = await resp.text().catch(() => '')
-    return qoderErrorResponse(resp.status, errText, resp.headers)
+    return {
+      ok: false,
+      classified: classifyQoderError({
+        status: resp.status,
+        body: errText,
+        retryAfter: resp.headers.get('retry-after') || undefined,
+      }),
+    }
   }
 
-  const wantStream = opts ? opts.stream : forwardBody.stream === true
+  const extraHeaders: Record<string, string> = accountUid
+    ? { 'X-Qoder-Account': accountUid }
+    : {}
 
   if (wantStream) {
     const readable = unwrapQoderSSE(resp.body, model)
-    return new Response(readable, {
-      status: 200,
-      headers: {
-        'Content-Type': 'text/event-stream',
-        'Cache-Control': 'no-store',
-        'X-Accel-Buffering': 'no',
-      },
-    })
+    return {
+      ok: true,
+      response: new Response(readable, {
+        status: 200,
+        headers: {
+          'Content-Type': 'text/event-stream',
+          'Cache-Control': 'no-store',
+          'X-Accel-Buffering': 'no',
+          ...extraHeaders,
+        },
+      }),
+    }
   }
 
   // 非流式：收集全部内层 chunk 聚合
@@ -388,10 +431,129 @@ export async function proxyQoderChatRequest(
     }
   }
   const aggregated = aggregateQoderChunks(chunks.join(''), model)
-  return new Response(aggregated, {
-    status: 200,
-    headers: { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' },
-  })
+  return {
+    ok: true,
+    response: new Response(aggregated, {
+      status: 200,
+      headers: { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store', ...extraHeaders },
+    }),
+  }
+}
+
+/** 分类错误 → 结构化 OpenAI 错误 Response。 */
+function classifiedErrorResponse(c: QoderClassified): Response {
+  const respHeaders: Record<string, string> = { 'Content-Type': 'application/json; charset=utf-8' }
+  if (c.cooldownSeconds > 0) respHeaders['Retry-After'] = String(c.cooldownSeconds)
+  return new Response(qoderOpenAIErrorBody(c), { status: c.status, headers: respHeaders })
+}
+
+/**
+ * 转发一次 chat 请求到 QoderWork 上游（多账号池模式）。
+ * 返回 Response：
+ *   - stream=true：OpenAI SSE（解包+清洗后的内层 chunk）
+ *   - stream=false：聚合的非流式 chat.completion JSON
+ *
+ * 池模式：兼容种子单 token → 按「剩余积分最高且健康」挑号 → 失败按错误分类
+ * 冷却/禁用并自动轮转下一个账号（quota 也轮转，全部耗尽才向客户端报 429）。
+ */
+export async function proxyQoderChatRequest(
+  env: Env,
+  provider: Provider,
+  forwardBody: Record<string, unknown>,
+  opts?: QoderProxyOptions
+): Promise<Response> {
+  const model = (forwardBody.model as string) || 'auto'
+  const modelKey = opts?.modelKey || cpaToUpstreamKey(stripProviderPrefix(model))
+  const messages = Array.isArray(forwardBody.messages) ? (forwardBody.messages as any[]) : []
+  const body = buildQoderBody(messages, modelKey)
+  const encodedBody = qoderEncode(body)
+  const wantStream = opts ? opts.stream : forwardBody.stream === true
+
+  // 会话注入（测试/工具）：单次直发，不经过池
+  if (opts?.session) {
+    const r = await sendQoderChatOnce(opts.session.session, encodedBody, modelKey, model, wantStream)
+    return r.ok ? r.response : classifiedErrorResponse(r.classified)
+  }
+
+  // 池路径：兼容迁移（池空时把单 token 种子进池），然后挑号轮转
+  try { await seedQoderPoolFromSingle(env, provider.id) } catch { /* ignore */ }
+  let poolLen = 0
+  try {
+    const pool = await readQoderPool(env, provider.id)
+    poolLen = pool.length
+  } catch { /* ignore */ }
+
+  if (poolLen > 0) {
+    const tried = new Set<string>()
+    let lastErr: QoderClassified | null = null
+
+    for (let i = 0; i < poolLen; i++) {
+      let account: QoderPoolAccount | null = null
+      try {
+        account = await pickQoderAccount(env, provider.id, tried)
+      } catch { /* ignore */ }
+      if (!account) break
+      tried.add(account.uid)
+
+      // 会话构造（含按账号刷新 token）；刷新失败视为鉴权失效 → 禁用并轮转
+      let session: CosySession | null = null
+      try {
+        session = await buildQoderAccountSession(env, provider, account)
+      } catch { /* ignore */ }
+      if (!session) {
+        await disableQoderAccount(env, provider.id, account.uid, 'token 刷新失败（需重新登录）')
+        lastErr = {
+          status: 401,
+          kind: 'auth',
+          failover: true,
+          cooldownSeconds: 0,
+          message: `账号 ${account.nickname || account.uid} token 刷新失败，已禁用并轮转`,
+          code: 'unauthorized',
+          type: 'api_error',
+        }
+        continue
+      }
+
+      const r = await sendQoderChatOnce(session, encodedBody, modelKey, model, wantStream, account.uid)
+      if (r.ok) {
+        await noteQoderSuccess(env, provider.id, account.uid)
+        return r.response
+      }
+      // 失败：按分类冷却/禁用，然后轮转下一个账号
+      await markQoderAccountClassified(env, provider, account.uid, r.classified)
+      lastErr = r.classified
+    }
+
+    if (lastErr) {
+      // 全部账号失败：把最后一个（或最有代表性的）错误返回给客户端
+      return classifiedErrorResponse(lastErr)
+    }
+    // 无健康账号可用（全冷却/禁用）
+    return new Response(
+      JSON.stringify({
+        error: {
+          message: 'QoderWork 所有账号均不可用（冷却中或已禁用），请稍后重试或在管理后台重新登录',
+          type: 'api_error',
+          code: 'no_available_account',
+          kind: 'not_ready',
+        },
+      }),
+      { status: 503, headers: { 'Content-Type': 'application/json; charset=utf-8' } }
+    )
+  }
+
+  // 回退：无池（旧部署未登录池账号）→ 单 token 直发
+  const data = await buildQoderSession(env, provider)
+  if (!data) {
+    return new Response(
+      JSON.stringify({
+        error: { message: 'OAuth 未连接或 Token 已失效，请在管理后台重新授权', type: 'oauth_not_connected' },
+      }),
+      { status: 502, headers: { 'Content-Type': 'application/json; charset=utf-8' } }
+    )
+  }
+  const r = await sendQoderChatOnce(data.session, encodedBody, modelKey, model, wantStream)
+  return r.ok ? r.response : classifiedErrorResponse(r.classified)
 }
 
 /**
@@ -404,18 +566,26 @@ export async function fetchQoderModels(
 ): Promise<{ ok: boolean; message: string; models?: Array<{ id: string }>; status?: number; debug?: Record<string, unknown> }> {
   const debug: Record<string, unknown> = {}
   console.log(`[qoder-models] start provider=${provider.id} flowType=${provider.oauth?.flowType}`)
-  let data: { session: CosySession; accessToken: string } | null
+  let session: CosySession | null = null
   try {
-    data = await buildQoderSession(env, provider)
+    // 优先用池内账号（挑剩余积分最高的健康账号），池空回退单 token
+    try { await seedQoderPoolFromSingle(env, provider.id) } catch { /* ignore */ }
+    const acc = await pickQoderAccount(env, provider.id, new Set())
+    if (acc) {
+      session = await buildQoderAccountSession(env, provider, acc)
+    }
+    if (!session) {
+      const data = await buildQoderSession(env, provider)
+      session = data?.session || null
+    }
   } catch (err) {
     console.error(`[qoder-models] buildQoderSession threw:`, err)
     return { ok: false, message: `构建 COSY 会话失败: ${(err as Error).stack || (err as Error).message || err}`, debug }
   }
-  if (!data) {
+  if (!session) {
     console.warn(`[qoder-models] no valid token (缺失或刷新失败)`)
     return { ok: false, message: 'OAuth 未连接或 Token 已失效，请先发起连接', debug }
   }
-  const { session } = data
   console.log(`[qoder-models] session ok uid=${session.uid || '(empty)'} machineType=${session.machineType.slice(0, 8)}...`)
   // 只记长度，绝不打印 machineToken / info / cosyKey 原文（均为会话凭据）
   console.log(`[qoder-models] machineId=${session.machineId} machineToken len=${session.machineToken.length}`)

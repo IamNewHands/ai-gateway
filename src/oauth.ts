@@ -613,6 +613,15 @@ async function pollOauthQoderFlow(env: Env, providerId: string, cfg: OAuthDevice
       updated_at: Date.now(),
       user_id: data.user_id || undefined,
     })
+    // Qoder 多账号池：每次成功登录把一个账号 upsert 进池（按 user_id 去重），
+    // 池内多个账号按剩余积分自动挑选、错误冷却轮换。多登一个 = 多个账号。
+    await qoderPoolUpsert(env, providerId, {
+      access_token: token,
+      refresh_token: data.refresh_token,
+      expires_at: qoderExpiryUnix(data),
+      updated_at: Date.now(),
+      user_id: data.user_id || undefined,
+    })
     await env.KV.delete(deviceKey(providerId))
     return { status: 'success', message: 'OAuth 连接成功' }
   } catch (err) {
@@ -620,19 +629,20 @@ async function pollOauthQoderFlow(env: Env, providerId: string, cfg: OAuthDevice
   }
 }
 
-/** Qoder 设备 token 刷新（POST JSON: {refresh_token: drt-}）。 */
-async function refreshOauthTokenQoder(env: Env, providerId: string, cfg: OAuthDeviceConfig): Promise<boolean> {
-  const state = await readOauthToken(env, providerId)
-  if (!state?.refresh_token) return false
-
+/** Qoder 设备 token 刷新的公共请求（POST JSON: {refresh_token: drt-}），返回新 token 状态或 null。 */
+export async function refreshQoderTokenPair(
+  cfg: OAuthDeviceConfig,
+  refreshToken: string,
+  prev?: OAuthTokenState
+): Promise<OAuthTokenState | null> {
   try {
     const res = await fetch(cfg.refreshTokenUrl, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
-      body: JSON.stringify({ refresh_token: state.refresh_token }),
+      body: JSON.stringify({ refresh_token: refreshToken }),
       signal: AbortSignal.timeout(15000),
     })
-    if (!res.ok) return false
+    if (!res.ok) return null
 
     const data = (await res.json().catch(() => null)) as {
       token?: string
@@ -643,21 +653,80 @@ async function refreshOauthTokenQoder(env: Env, providerId: string, cfg: OAuthDe
       expires_at?: string
     } | null
     const token = data?.token || data?.device_token
-    if (!token || !data?.refresh_token) return false
+    if (!token || !data?.refresh_token) return null
 
-    await writeOauthToken(env, providerId, {
+    return {
       access_token: token,
       refresh_token: data.refresh_token,
       expires_at: qoderExpiryUnix(data),
       updated_at: Date.now(),
       // 刷新响应一般不带 user_id，保留原值
-      user_id: state.user_id,
-      nickname: state.nickname,
-    })
-    return true
+      user_id: data.user_id || prev?.user_id,
+      nickname: prev?.nickname,
+    }
   } catch {
-    return false
+    return null
   }
+}
+
+/** Qoder 设备 token 刷新（单 token 路径；池账号由 qoder/pool.ts 按账号刷新）。 */
+async function refreshOauthTokenQoder(env: Env, providerId: string, cfg: OAuthDeviceConfig): Promise<boolean> {
+  const state = await readOauthToken(env, providerId)
+  if (!state?.refresh_token) return false
+  const fresh = await refreshQoderTokenPair(cfg, state.refresh_token, state)
+  if (!fresh) return false
+  await writeOauthToken(env, providerId, fresh)
+  // 同步池内同 uid 账号（池为主用时保持一致）
+  try { await qoderPoolSyncToken(env, providerId, fresh) } catch { /* ignore */ }
+  return true
+}
+
+/** 把一次成功登录的 Qoder token upsert 进账号池（按 user_id 去重）。 */
+async function qoderPoolUpsert(env: Env, providerId: string, token: OAuthTokenState): Promise<void> {
+  const uid = token.user_id || token.access_token.slice(0, 16)
+  if (!uid) return
+  try {
+    const key = KV_KEYS.QODER_POOL_PREFIX + providerId
+    const raw = await env.KV.get(key)
+    let pool: Array<Record<string, any>> = []
+    try { pool = raw ? JSON.parse(raw) : [] } catch { pool = [] }
+    if (!Array.isArray(pool)) pool = []
+    const existing = pool.find((a) => a && a.uid === uid)
+    if (existing) {
+      existing.token = token
+      existing.enabled = true
+      existing.updatedAt = Date.now()
+    } else {
+      pool.push({
+        uid,
+        nickname: token.nickname,
+        token,
+        enabled: true,
+        state: { credits: 0, disabled: false, until: 0, errCount: 0 },
+        updatedAt: Date.now(),
+      })
+    }
+    await env.KV.put(key, JSON.stringify(pool))
+  } catch (e) {
+    console.warn(`[qoder-pool] upsert failed: ${(e as Error).message}`)
+  }
+}
+
+/** 把一份新 token 同步进 Qoder 池（按 uid 匹配更新凭证；池不存在该账号时不新增）。 */
+async function qoderPoolSyncToken(env: Env, providerId: string, token: OAuthTokenState): Promise<void> {
+  const uid = token.user_id || token.access_token.slice(0, 16)
+  const key = KV_KEYS.QODER_POOL_PREFIX + providerId
+  let pool: Array<Record<string, any>> = []
+  try {
+    const raw = await env.KV.get(key)
+    pool = raw ? JSON.parse(raw) : []
+    if (!Array.isArray(pool)) pool = []
+  } catch { pool = [] }
+  const existing = pool.find((a) => a && a.uid === uid)
+  if (!existing) return
+  existing.token = token
+  existing.updatedAt = Date.now()
+  await env.KV.put(key, JSON.stringify(pool))
 }
 
 // ===== Gemini CLI 授权流程（Google OAuth，参考 cpa-plugin-gemini-cli/auth/oauth.go） =====

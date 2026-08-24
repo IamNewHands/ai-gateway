@@ -18,10 +18,18 @@ import { Context } from 'hono'
 import type { Env, Provider, CheckinResult, ApiResponse } from './types'
 import { KV_KEYS, CHECKIN_RESULT_TTL_SEC, OAUTH_TOKEN_REFRESH_MARGIN_MS } from './config'
 import { getProviders } from './storage'
-import { getOauthAccessToken, detectTokenRealm, readOauthToken } from './oauth'
+import { getOauthAccessToken, detectTokenRealm, refreshQoderTokenPair } from './oauth'
 import { writeLog } from './admin'
 import { isQoderProvider } from './qoder/proxy'
 import { fetchQoderCheckinStatus, performQoderCheckin, fetchQoderUserResource, fetchQoderPaymentType } from './qoder/billing'
+import {
+  readQoderPool,
+  seedQoderPoolFromSingle,
+  refreshQoderPoolAccountIfNeeded,
+  reenableQoderIfCredits,
+  setQoderPoolAccountNickname,
+  type QoderPoolAccount,
+} from './qoder/pool'
 import { isTraeProvider } from './trae/proxy'
 import { runTraeCheckins } from './trae/admin'
 import type { TraeCheckinResult } from './trae/types'
@@ -140,15 +148,41 @@ async function fillQoderCredits(env: Env, base: CheckinResult, token: string) {
 }
 
 /**
- * QoderWork 单账号签到：GET status → 已签则跳过 → 否则 POST claim → 刷新额度。
- * dt- token 非 JWT，昵称从 OAuthTokenState.nickname 取。
+ * QoderWork 池内单账号签到：状态探测 → 已签跳过 → 否则签到 → 拉额度 → 回写池（积分/解冻/昵称）。
  */
-async function checkinQoderAccount(env: Env, provider: Provider, base: CheckinResult, token: string): Promise<CheckinResult> {
-  base.realm = 'cn'
-  try {
-    const st = await readOauthToken(env, provider.id)
-    if (st?.nickname) base.nickname = st.nickname
-  } catch { /* ignore */ }
+async function checkinQoderPoolAccount(env: Env, provider: Provider, account: QoderPoolAccount): Promise<CheckinResult> {
+  const now = Date.now()
+  const base: CheckinResult = {
+    providerId: provider.id,
+    name: provider.name,
+    uid: account.uid || undefined,
+    realm: 'cn',
+    success: false,
+    reason: 'fail',
+    message: '',
+    todayCheckedIn: false,
+    updatedAt: now,
+    nickname: account.nickname || account.uid,
+  }
+
+  let token = account.token?.access_token || ''
+  if (!token) {
+    base.reason = 'skipped_no_token'
+    base.message = '无 access token'
+    return base
+  }
+  // 临近过期先刷新（写回池）
+  if (account.token.refresh_token && account.token.expires_at - Date.now() < OAUTH_TOKEN_REFRESH_MARGIN_MS) {
+    try {
+      const refreshed = await refreshQoderPoolAccountIfNeeded(env, provider.id, account.uid, provider.oauth!, refreshQoderTokenPair)
+      if (refreshed) token = refreshed.token.access_token
+    } catch { /* 刷新失败继续用旧 token */ }
+  }
+  if (!token) {
+    base.reason = 'skipped_no_token'
+    base.message = 'token 刷新失败，无可用 access token'
+    return base
+  }
 
   // 状态探测
   let status: Awaited<ReturnType<typeof fetchQoderCheckinStatus>> = null
@@ -168,7 +202,7 @@ async function checkinQoderAccount(env: Env, provider: Provider, base: CheckinRe
       base.message = '今日已签到'
       base.lastCheckinAt = Date.now()
       await fillQoderCredits(env, base, token)
-      await writeCheckinResult(env, provider.id, base)
+      await syncQoderPoolCredits(env, provider.id, account, base)
       return base
     }
   }
@@ -183,7 +217,91 @@ async function checkinQoderAccount(env: Env, provider: Provider, base: CheckinRe
 
   // 签到成功后额度已变化，拉最新额度
   await fillQoderCredits(env, base, token)
+  await syncQoderPoolCredits(env, provider.id, account, base)
+  return base
+}
 
+/** 签到后把额度/昵称回写 Qoder 池：积分>0 的冷却账号自动解冻（对齐 WorkBuddy 池）。 */
+async function syncQoderPoolCredits(env: Env, providerId: string, account: QoderPoolAccount, base: CheckinResult): Promise<void> {
+  try {
+    if (typeof base.totalRemain === 'number' && base.totalRemain > 0) {
+      await reenableQoderIfCredits(env, providerId, account.uid, base.totalRemain)
+    }
+    if (base.nickname && base.nickname !== account.nickname) {
+      await setQoderPoolAccountNickname(env, providerId, account.uid, base.nickname)
+    }
+  } catch { /* 回写失败不影响签到结果 */ }
+}
+
+/**
+ * QoderWork 多账号池签到：遍历池内所有账号各自签到，返回带 accounts 的汇总结果。
+ */
+async function checkinQoderPoolAccounts(env: Env, provider: Provider): Promise<CheckinResult> {
+  const now = Date.now()
+  const base: CheckinResult = {
+    providerId: provider.id,
+    name: provider.name,
+    realm: 'cn',
+    success: false,
+    reason: 'fail',
+    message: '',
+    todayCheckedIn: false,
+    updatedAt: now,
+  }
+  // 兼容迁移：池空时把既有单 token 种子进池
+  try { await seedQoderPoolFromSingle(env, provider.id) } catch { /* ignore */ }
+  const pool = await readQoderPool(env, provider.id)
+  if (pool.length === 0) {
+    base.reason = 'skipped_no_token'
+    base.message = '账号池为空（未登录任何账号）'
+    return base
+  }
+
+  const accounts: CheckinResult[] = []
+  let success = 0, already = 0, fail = 0, skipped = 0
+  for (const acc of pool) {
+    try {
+      const r = await checkinQoderPoolAccount(env, provider, acc)
+      accounts.push(r)
+      if (r.success) {
+        if (r.reason === 'already') already++
+        else if (r.reason === 'ok') success++
+        else skipped++
+      } else {
+        fail++
+      }
+    } catch (e) {
+      accounts.push({
+        providerId: provider.id, name: provider.name, uid: acc.uid || undefined, realm: 'cn',
+        success: false, reason: 'fail', message: (e as Error).message || String(e),
+        todayCheckedIn: false, updatedAt: Date.now(), nickname: acc.nickname || acc.uid,
+      })
+      fail++
+    }
+  }
+
+  base.accounts = accounts
+  base.todayCheckedIn = accounts.some((a) => a.todayCheckedIn)
+  base.success = success > 0 || already > 0
+  base.reason = base.success ? 'ok' : (fail > 0 ? 'fail' : 'skipped_no_token')
+  base.message = `共 ${accounts.length} 个账号：成功 ${success} / 已签 ${already} / 失败 ${fail} / 跳过 ${skipped}`
+  // 汇总：额度取剩余最多的账号（挑号依据）
+  let bestAcc: CheckinResult | null = null
+  for (const a of accounts) {
+    if (a.reason === 'ok' || a.reason === 'already') {
+      if (!bestAcc || (a.totalRemain || 0) > (bestAcc.totalRemain || 0)) bestAcc = a
+    }
+  }
+  if (bestAcc) {
+    base.totalRemain = bestAcc.totalRemain
+    base.totalUsed = bestAcc.totalUsed
+    base.totalSize = bestAcc.totalSize
+    base.packCount = bestAcc.packCount
+    base.paymentType = bestAcc.paymentType
+    base.nickname = bestAcc.nickname
+    base.streakDays = bestAcc.streakDays
+    base.totalCredits = bestAcc.totalCredits
+  }
   await writeCheckinResult(env, provider.id, base)
   return base
 }
@@ -405,6 +523,11 @@ export async function checkinOneAccount(env: Env, provider: Provider): Promise<C
     return checkinOauthPoolAccounts(env, provider)
   }
 
+  // QoderWork 多账号池：遍历池内所有账号各自签到，返回带 accounts 的汇总结果
+  if (provider.oauth?.flowType === 'qoder' || isQoderProvider(provider.id)) {
+    return checkinQoderPoolAccounts(env, provider)
+  }
+
   const now = Date.now()
   const base: CheckinResult = {
     providerId: provider.id,
@@ -425,11 +548,6 @@ export async function checkinOneAccount(env: Env, provider: Provider): Promise<C
     base.reason = 'skipped_no_token'
     base.message = '无可用 token（未登录或刷新失败）'
     return base
-  }
-
-  // QoderWork：dt- token 非 JWT，走独立的签到/额度协议
-  if (provider.oauth?.flowType === 'qoder' || isQoderProvider(provider.id)) {
-    return await checkinQoderAccount(env, provider, base, token)
   }
 
   // 从 JWT 解出 uid / enterpriseId / nickname（额度接口与面板展示用）

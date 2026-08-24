@@ -700,6 +700,12 @@ ${H('管理')}
                     <div id="wbp-acc-${escapePageHtml(p.id)}" class="mt-1"></div>
                     <div class="fc mt-1 field-row" style="gap:8px"><input type="number" id="cd-plan-${escapePageHtml(p.id)}" value="${p.cooldown&&p.cooldown.planMs?Math.round(p.cooldown.planMs/60000):''}" style="width:88px" placeholder="plan冷却(分)"><input type="number" id="cd-soft-${escapePageHtml(p.id)}" value="${p.cooldown&&p.cooldown.softMs?Math.round(p.cooldown.softMs/1000):''}" style="width:88px" placeholder="429冷却(秒)"><input type="number" id="cd-err-${escapePageHtml(p.id)}" value="${p.cooldown&&p.cooldown.errThreshold?p.cooldown.errThreshold:''}" style="width:76px" placeholder="错误阈值"><input type="number" id="cd-errms-${escapePageHtml(p.id)}" value="${p.cooldown&&p.cooldown.errMs?Math.round(p.cooldown.errMs/60000):''}" style="width:88px" placeholder="错误冷却(分)"><span class="mu" style="font-size:12px">冷却参数（保存后生效）</span></div>
                   </fieldset>`:''}
+                  ${(p.oauth&&p.oauth.flowType==='qoder')||p.id==='qoder'?`
+                  <fieldset class="form-group" id="qdp-fs-${escapePageHtml(p.id)}"><legend>Qoder 多账号池</legend><span class="form-helper">设备授权流每次成功登录都会把该账号加入账号池（按 user_id 去重，多登一个 = 多个账号）。转发按剩余积分自动挑选账号，额度耗尽/429/鉴权失败按策略冷却或禁用并自动轮换下一个账号；每日签到后积分恢复自动解冻。冷却参数留空 = 默认（额度耗尽 12h / 429 60s / 连续 5 次错误冷却 10m）。</span>
+                    <div class="fc mt-1 field-row"><button class="btn btn-s" onclick="qoderPoolStatus('${escapePageJsx(p.id)}')"><i class="fas fa-sync" aria-hidden="true"></i>刷新账号池</button><button class="btn btn-s" onclick="oauthConnect('${escapePageJsx(p.id)}')"><i class="fas fa-sign-in-alt" aria-hidden="true"></i>登录新账号</button><button class="btn btn-p" onclick="triggerCheckin('${escapePageJsx(p.id)}')"><i class="fas fa-calendar-check" aria-hidden="true"></i>立即签到</button><span id="qdp-st-${escapePageHtml(p.id)}" class="oauth-status"></span></div>
+                    <div id="qdp-acc-${escapePageHtml(p.id)}" class="mt-1"></div>
+                    <div class="fc mt-1 field-row" style="gap:8px"><input type="number" id="cd-plan-${escapePageHtml(p.id)}" value="${p.cooldown&&p.cooldown.planMs?Math.round(p.cooldown.planMs/60000):''}" style="width:88px" placeholder="额度耗尽冷却(分)"><input type="number" id="cd-soft-${escapePageHtml(p.id)}" value="${p.cooldown&&p.cooldown.softMs?Math.round(p.cooldown.softMs/1000):''}" style="width:88px" placeholder="429冷却(秒)"><input type="number" id="cd-err-${escapePageHtml(p.id)}" value="${p.cooldown&&p.cooldown.errThreshold?p.cooldown.errThreshold:''}" style="width:76px" placeholder="错误阈值"><input type="number" id="cd-errms-${escapePageHtml(p.id)}" value="${p.cooldown&&p.cooldown.errMs?Math.round(p.cooldown.errMs/60000):''}" style="width:88px" placeholder="错误冷却(分)"><span class="mu" style="font-size:12px">冷却参数（保存后生效）</span></div>
+                  </fieldset>`:''}
                   ${(p.oauth&&(p.oauth.flowType==='m365-pkce'||p.oauth.flowType==='m365-ropc'))?`
                   <fieldset class="form-group" id="m365-fs-${escapePageHtml(p.id)}"><legend>M365 账号池</legend><span class="form-helper">本提供商可挂多个订阅账号（授权码/账密各连一次即入池）。网关按健康与并发自动轮询，限流/超限自动切换。每账号默认并发上限 8（可变 M365_ACCOUNT_DEFAULT_CONCURRENCY）。</span>
                     <div class="fc mt-1 field-row"><button class="btn btn-s" onclick="oauthConnect('${escapePageJsx(p.id)}')"><i class="fas fa-sign-in-alt" aria-hidden="true"></i>连接新账号</button><button class="btn btn-s" onclick="m365Render('${escapePageJsx(p.id)}')"><i class="fas fa-sync" aria-hidden="true"></i>刷新账号池</button></div>
@@ -1041,6 +1047,8 @@ function tog(id) {
   if (d.classList.contains('open') && document.getElementById('trae-acc-' + id)) traeStatus(id)
   // P3：M365 提供商展开时自动加载账号池（账号池已内嵌提供商卡）
   if (d.classList.contains('open') && document.getElementById('m365-acc-' + id)) m365Render(id)
+  // Qoder：展开时自动加载账号池状态
+  if (d.classList.contains('open') && document.getElementById('qdp-acc-' + id)) qoderPoolStatus(id)
 }
 
 // P3：M365 账号池渲染 —— 独立页并入提供商详情后按 providerId 定位容器
@@ -1753,9 +1761,70 @@ function oauthPoolRemove(id, uid) {
       method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ uid })
     }).then(r => r.json()).then(function(d) {
       toast(d.message || (d.success ? '已移除' : '移除失败'), d.success ? 'success' : 'error')
-      if (d.success) oauthPoolStatus(id)
+      if (d.success) {
+        // Qoder 池与 WorkBuddy 池共用移除接口，按容器存在性刷新对应池
+        if (document.getElementById('qdp-acc-' + id)) qoderPoolStatus(id)
+        else oauthPoolStatus(id)
+      }
     }).catch(function() { toast('移除失败', 'error') })
   })
+}
+
+// ===== Qoder 多账号池：状态 / 移除 =====
+function qoderPoolStatus(id) {
+  const st = document.getElementById('qdp-st-' + id)
+  if (st) { st.textContent = '查询中…'; showSpinner(st) }
+  return Promise.all([
+    fetch('/admin/api/oauth/' + encodeURIComponent(id) + '/status').then(r => r.json()),
+    fetch('/admin/api/checkin/status').then(r => r.json()).catch(() => null),
+  ]).then(res => {
+    const d = res[0], cd = res[1]
+    if (!d.success) { if (st) showResult(st, false, d.message || '查询失败'); return }
+    const pool = (d.data && d.data.pool) || []
+    if (st) showResult(st, true, '共 ' + pool.length + ' 个账号')
+    // 签到状态按 uid 匹配逐账号明细
+    let ciAccounts = []
+    if (cd && cd.success && cd.data && Array.isArray(cd.data.workbuddy)) {
+      const entry = cd.data.workbuddy.find(function (w) { return w && w.providerId === id })
+      if (entry && Array.isArray(entry.accounts)) ciAccounts = entry.accounts
+    }
+    const ciByUid = {}
+    ciAccounts.forEach(function (a, ai) {
+      if (!a) return
+      if (a.uid) ciByUid[a.uid] = a
+      a.__idx = ai
+    })
+    renderQoderPoolAccounts(id, pool, ciByUid, ciAccounts)
+  }).catch(() => { if (st) showResult(st, false, '查询失败') })
+}
+function renderQoderPoolAccounts(id, accs, ciByUid, ciAccounts) {
+  const box = document.getElementById('qdp-acc-' + id)
+  if (!box) return
+  if (!accs.length) { box.innerHTML = '<p class="mu">账号池为空：点「登录新账号」每授权一个 Qoder 账号即自动加入（可登录多个账号，老单账号会自动迁入）。</p>'; return }
+  ciByUid = ciByUid || {}
+  ciAccounts = ciAccounts || []
+  const idxFallback = ciAccounts.length === accs.length ? ciAccounts : null
+  box.innerHTML = accs.map(function(a, i) {
+    const badge = a.disabled ? '<span class="bd bd-off">已禁用</span>' : (a.cooling ? '<span class="bd bd-off">冷却中</span>' : '<span class="bd bd-on">健康</span>')
+    const ci = ciByUid[a.uid] || (idxFallback ? idxFallback[i] : null)
+    let ciBadge = ''
+    if (ci) {
+      ciBadge = ci.success ? ' <span class="bd bd-on">' + (ci.reason === 'already' ? '今日已签' : '签到成功') + '</span>'
+        : ' <span class="bd bd-danger">签到失败</span>'
+      if (ci.message) ciBadge += ' <span style="color:var(--muted)">' + escapeHtml(ci.message) + '</span>'
+    } else {
+      ciBadge = ' <span class="bd bd-off">未签</span>'
+    }
+    let creditLine = ''
+    if (ci && (ci.totalRemain !== undefined && ci.totalRemain !== null)) {
+      const used = (ci.totalUsed !== undefined && ci.totalUsed !== null) ? ci.totalUsed : '—'
+      creditLine = '<div class="mu" style="margin-top:2px">可用 ' + ci.totalRemain + ' · 已用 ' + used + '</div>'
+    }
+    let line = (a.nickname ? escapeHtml(a.nickname) : 'uid=' + escapeHtml(a.uid)) + ' · 积分=' + (a.credits || 0)
+    if (a.cooling && a.until) line += ' · 冷却至 ' + new Date(a.until).toLocaleString()
+    if (a.reason) line += ' · ' + escapeHtml(a.reason)
+    return '<div class="fc mb-2 field-row" style="align-items:flex-start"><div class="fx1" style="font-size:12px;min-width:0"><div>' + line + ' ' + badge + ciBadge + '</div>' + creditLine + '</div><button class="btn btn-gh btn-xs" onclick="oauthPoolRemove(\\'' + escapeJsAttr(id) + '\\',\\'' + escapeJsAttr(a.uid) + '\\')"><i class="fas fa-trash" aria-hidden="true"></i>移除</button></div>'
+  }).join('')
 }
 /** 收集冷却参数（trae / workbuddy 池共用 cd-* 输入）；无输入框返回 undefined，全空返回 null（恢复默认）。 */
 function collectCooldown(id) {

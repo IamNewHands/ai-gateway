@@ -33,6 +33,7 @@ import { isCnbProvider, testCnbConnection, CNB_MODELS } from './cnb/proxy'
 import { PROXY_KEY_PREFIX, EXPIRY_OPTIONS, OPENCODE_DEFAULT_URL } from './config'
 import { startOauthDeviceFlow, pollOauthDeviceFlow, readOauthToken, deleteOauthToken, getOauthAccessToken, buildOauthHeaders, detectTokenRealm, submitOauthGeminiCallback, submitOauthM365Callback, submitOauthM365ROPC, OAUTH_POOL_KV_PREFIX } from './oauth'
 import { isOAuthPoolProvider, seedOauthPoolFromSingle, listOauthPoolStatus, removeOauthAccount } from './oauth-pool'
+import { seedQoderPoolFromSingle, listQoderPoolStatus, removeQoderAccount } from './qoder/pool'
 import { isM365Provider, M365_MODELS, testM365Model } from './m365/proxy'
 import { listSessions as listM365Sessions, deleteSession as deleteM365Session } from './m365/session'
 import { listConversations as listM365Conversations, whitelistConversation, unwhitelistConversation, getCleanupMode, setCleanupMode, getCleanupConfig, setCleanupConfig, deleteConversationRecord } from './m365/conversation-manager'
@@ -1091,22 +1092,33 @@ export async function handleOAuthStatus(c: Context<AppEnv>) {
     try { await seedOauthPoolFromSingle(c.env, id) } catch { /* ignore */ }
     data.pool = await listOauthPoolStatus(c.env, id)
   }
+  // QoderWork 多账号池：返回池账号状态（脱敏）供面板展示
+  if (provider.oauth?.flowType === 'qoder' || isQoderProvider(provider.id)) {
+    try { await seedQoderPoolFromSingle(c.env, id) } catch { /* ignore */ }
+    const qpool = await listQoderPoolStatus(c.env, id)
+    data.pool = qpool
+    data.connected = qpool.length > 0
+    data.accountCount = qpool.length
+  }
   return c.json<ApiResponse>({ success: true, data })
 }
 
-/** 删除 WorkBuddy 池内指定 uid 账号。 */
+/** 删除 WorkBuddy / Qoder 池内指定 uid 账号。 */
 export async function handleOAuthPoolRemove(c: Context<AppEnv>) {
   const id = c.req.param('id')
   if (!id) return c.json<ApiResponse>({ success: false, message: '缺少 id 参数' }, 400)
   const provider = await getProvider(c.env, id)
   if (!provider) return c.json<ApiResponse>({ success: false, message: '提供商不存在' }, 404)
-  if (!isOAuthPoolProvider(provider)) {
-    return c.json<ApiResponse>({ success: false, message: '该提供商不是 WorkBuddy 多账号池模式' }, 400)
+  const isQoder = provider.oauth?.flowType === 'qoder' || isQoderProvider(provider.id)
+  if (!isOAuthPoolProvider(provider) && !isQoder) {
+    return c.json<ApiResponse>({ success: false, message: '该提供商不是多账号池模式' }, 400)
   }
   const body = await c.req.json<{ uid?: string }>().catch(() => ({})) as { uid?: string }
   const uid = String(body?.uid || '').trim()
   if (!uid) return c.json<ApiResponse>({ success: false, message: '缺少 uid 参数' }, 400)
-  const removed = await removeOauthAccount(c.env, id, uid)
+  const removed = isQoder
+    ? await removeQoderAccount(c.env, id, uid)
+    : await removeOauthAccount(c.env, id, uid)
   if (!removed) return c.json<ApiResponse>({ success: false, message: '账号不存在' }, 404)
   return c.json<ApiResponse>({ success: true, message: '已从账号池删除 ' + uid })
 }

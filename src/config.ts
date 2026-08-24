@@ -41,6 +41,8 @@ export const KV_KEYS = {
   TRAE_LOGIN_PREFIX: 'trae:login:',
   TRAE_CHECKIN_PREFIX: 'trae:checkin:',
   TRAE_MODELS_PREFIX: 'trae:models:',
+  // QoderWork 账号池（多账号轮转 + 冷却）
+  QODER_POOL_PREFIX: 'qoder:pool:',
   THINKING_PROMPT: 'thinking:prompt',
   CACHE_PREFIX: 'cache:prefix',
   PERF_SETTINGS: 'perf:settings',
