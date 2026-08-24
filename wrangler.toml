@@ -31,7 +31,7 @@ storage = "sqlite"
 
 [exports.AccountFlux]
 type = "durable-object"
-storage = "memcache"
+storage = "sqlite"
 
 # Analytics Engine 数据集 — 记录代理请求用量统计
 [vars]
