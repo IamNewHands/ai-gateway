@@ -473,6 +473,7 @@ ${H('管理')}
     <nav class="admin-nav">
       <a class="admin-nav__link is-active" href="#overview"><i class="fas fa-chart-pie" aria-hidden="true"></i><span>概览</span></a>
       <a class="admin-nav__link" href="#providers"><i class="fas fa-server" aria-hidden="true"></i><span>提供商</span><b>${providers.length}</b></a>
+      <a class="admin-nav__link" href="#m365-accounts"><i class="fas fa-users" aria-hidden="true"></i><span>M365 账号池</span></a>
       <a class="admin-nav__link" href="#proxy-keys"><i class="fas fa-key" aria-hidden="true"></i><span>转发 Key</span><b>${proxyKeys.length}</b></a>
       <a class="admin-nav__link" href="#analytics"><i class="fas fa-chart-bar" aria-hidden="true"></i><span>使用统计</span></a>
       <a class="admin-nav__link" href="#usage-logs"><i class="fas fa-clipboard-list" aria-hidden="true"></i><span>详细日志</span></a>
@@ -717,6 +718,53 @@ ${H('管理')}
             </div>
           </article>`).join('') : `<div class="empty-state"><i class="fas fa-server" aria-hidden="true"></i><h3>还没有提供商</h3><p>添加第一个上游提供商，配置 API 地址、Key 和模型。</p><button class="btn btn-p" onclick="showAdd()">添加提供商</button></div>`}
         </div>
+      </section>
+
+      <section id="m365-accounts" class="workspace-section" aria-labelledby="m365-accounts-title">
+        <div class="section-heading section-heading--admin">
+          <div><h2 id="m365-accounts-title">M365 账号池</h2><p>每个 M365 提供商可挂多个订阅账号（授权码/账密各连一次即入池）。网关按健康与并发自动轮询，限流/超限自动切换，避免单号封禁。新增账号请到「提供商 → 对应 M365 提供商 → 连接」。</p></div>
+          <div class="fc">
+            <select id="m365-acc-prov" class="select-sm" onchange="m365Render(this.value)">
+              ${providers.filter((p:any)=>p.oauth&&(p.oauth.flowType==='m365-pkce'||p.oauth.flowType==='m365-ropc')).map((p:any)=>'<option value="'+escapePageHtml(p.id)+'">'+escapePageHtml(p.name||p.id)+'</option>').join('')||'<option value="">无 M365 提供商</option>'}
+            </select>
+            <button class="btn btn-gh" onclick="m365Render(document.getElementById('m365-acc-prov').value)"><i class="fas fa-sync-alt"></i>刷新</button>
+          </div>
+        </div>
+        <div id="m365-accounts-root"><p class="mu">选择一个 M365 提供商以加载其账号池。</p></div>
+        <script>
+          function m365Esc(s) { return String(s == null ? '' : s).replace(/[&<>"']/g, function (c) { return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]; }); }
+          function m365Render(providerId) {
+            var root = document.getElementById('m365-accounts-root');
+            if (!providerId) { if (root) root.innerHTML = '<p class="mu">暂无 M365 提供商。</p>'; return; }
+            if (root) root.innerHTML = '<p class="mu">加载中…</p>';
+            fetch('/admin/api/m365/accounts/' + encodeURIComponent(providerId))
+              .then(function (r) { return r.json().then(function (j) { return { ok: r.ok, j: j }; }); })
+              .then(function (res) {
+                if (!res.ok || !res.success) { if (root) root.innerHTML = '<p class="c-d">加载失败：' + m365Esc(((res.j && res.j.message) || (res.j && res.j.error) || '未知错误')) + '</p>'; return; }
+                var accs = (res.j.data && res.j.data.accounts) || [];
+                if (!root) return;
+                if (accs.length === 0) { root.innerHTML = '<div class="empty-state"><i class="fas fa-users"></i><h3>暂无账号</h3><p>到「提供商 → ' + m365Esc(providerId) + '」用授权码或账密连接，第一个账号也会进入此池。</p></div>'; return; }
+                root.innerHTML = '<table class="tbl"><thead><tr><th>账号</th><th>OID</th><th>状态</th><th>操作</th></tr></thead><tbody>' +
+                  accs.map(function (a) {
+                    var status = a.connected ? (a.healthy ? '<span class="bd bd-on">健康</span>' : '<span class="bd bd-off">不可用</span>') : '<span class="bd bd-off">未连接</span>';
+                    return '<tr><td>' + m365Esc(a.email || a.oid || '?') + '</td><td><code>' + m365Esc(a.oid || '') + '</code></td><td>' + status + '</td>' +
+                      '<td><button class="btn btn-d btn-xs" onclick="m365Remove(\'' + m365Esc(providerId) + '\',\'' + m365Esc(a.oid || '') + '\',this)"><i class="fas fa-trash"></i>移除</button></td></tr>';
+                  }).join('') + '</tbody></table>' +
+                  '<p class="mu" style="margin-top:8px">共 ' + accs.length + ' 个账号。每账号默认并发上限 8（可变 M365_ACCOUNT_DEFAULT_CONCURRENCY）。</p>';
+              })
+              .catch(function (e) { if (root) root.innerHTML = '<p class="c-d">请求异常：' + m365Esc(String(e && e.message || e)) + '</p>'; });
+          }
+          function m365Remove(providerId, oid, btn) {
+            if (!oid) return;
+            if (!window.confirm('确认移除账号 ' + oid + '？')) return;
+            if (btn) btn.disabled = true;
+            fetch('/admin/api/m365/accounts/' + encodeURIComponent(providerId) + '?oid=' + encodeURIComponent(oid), { method: 'DELETE' })
+              .then(function (r) { return r.json().then(function (j) { return { ok: r.ok, j: j }; }); })
+              .then(function (res) { if (btn) btn.disabled = false; if (res.ok) m365Render(providerId); else window.alert((res.j && res.j.message) || '移除失败'); })
+              .catch(function () { if (btn) btn.disabled = false; window.alert('请求异常'); });
+          }
+          setTimeout(function () { var s = document.getElementById('m365-acc-prov'); if (s && s.value) m365Render(s.value); }, 0);
+        </script>
       </section>
 
       <section id="proxy-keys" class="workspace-section" aria-labelledby="proxy-keys-title">

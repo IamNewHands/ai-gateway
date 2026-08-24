@@ -18,6 +18,7 @@ binding = "KV"
 [durable_objects]
 bindings = [
   { name = "M365_SESSION", class_name = "M365Session" },
+  { name = "M365_FLUX", class_name = "AccountFlux" },
 ]
 
 # M365Session 生命周期用声明式 exports（与 legacy [[migrations]] 互斥，只能二选一）。
@@ -27,6 +28,10 @@ bindings = [
 [exports.M365Session]
 type = "durable-object"
 storage = "sqlite"
+
+[exports.AccountFlux]
+type = "durable-object"
+storage = "memcache"
 
 # Analytics Engine 数据集 — 记录代理请求用量统计
 [vars]

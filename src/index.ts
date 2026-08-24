@@ -86,9 +86,10 @@ import {
   refreshTraeTokens,
 } from './trae/admin'
 import { M365Session } from './m365/durable'
+import { AccountFlux } from './m365/account-flux'
 import type { AppEnv, Env, Provider } from './types'
 
-export { M365Session }
+export { M365Session, AccountFlux }
 
 const app = new Hono<AppEnv>()
 

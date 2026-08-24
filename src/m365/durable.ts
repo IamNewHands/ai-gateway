@@ -20,6 +20,7 @@ import { listM365Accounts } from './oauth'
 import { recordConversation, shouldCleanup, cleanupConversations, getCleanupMode, getCleanupConfig } from './conversation-manager'
 import { markAccountSuccess, markAccountFailure, markAccountImageLimited, accountCooldownSeconds, isAccountAvailable, isRateLimited, isAuthFailure, isEmptyCompletion } from './account-health'
 import { writeLog } from '../admin'
+import { acquireSlot, releaseSlot, fluxSnapshot } from './account-flux'
 
 export interface M365ChatPayload {
   providerId: string
@@ -138,6 +139,7 @@ export class M365Session {
     let toolRouterFailed = false
     if (toolDefs.length > 0 && choiceStr !== 'none') {
       let route: Awaited<ReturnType<typeof this.tryToolRouter>> | null = null
+      const routerAcquired = await acquireSlot(this.env, providerId, acc.oid)
       try {
         route = await this.tryToolRouter(acc, answerPrompt, toolDefs, toolChoice, attachments, ledgerCtx)
       } catch (err) {
@@ -145,6 +147,8 @@ export class M365Session {
         const detail = `model=${model} tools=${toolDefs.length} promptLen=${answerPrompt.length} err=${msg}`
         try { await writeLog(this.env, 'error', `[m365-chat] provider=${providerId} → tool router failed, falling back to main chat`, detail) } catch { /* ignore */ }
         toolRouterFailed = true
+      } finally {
+        if (routerAcquired) await releaseSlot(this.env, providerId, acc.oid)
       }
       if (route && route.calls.length > 0) {
         // 有工具调用：直接返回 tool_calls 给客户端（客户端执行后再续聊）
@@ -180,8 +184,15 @@ export class M365Session {
     let result: Awaited<ReturnType<typeof chatWithHandlers>> | undefined
     let usedAcc = acc
     let failoverLastResp: Response | null = null
+    let allBusy = false
     for (let i = 0; i < ordered.length; i++) {
       usedAcc = ordered[i]
+      // 并发闸门：占用该账号一个并发位；满则轮询等待，超时后该账号视为"忙"试下一个
+      const acquired = await acquireSlot(this.env, providerId, usedAcc.oid)
+      if (!acquired) {
+        allBusy = true
+        continue
+      }
       try {
         result = await chatWithHandlers(
           usedAcc,
@@ -222,22 +233,34 @@ export class M365Session {
         // 上游限流/鉴权失败且为全新会话时允许切号；已绑定会话直接返回退避响应
         if (!canFailover || !resolved.isNew) return failoverLastResp
         if (i === ordered.length - 1) return failoverLastResp
+      } finally {
+        await releaseSlot(this.env, providerId, usedAcc.oid)
       }
     }
-    if (!result) return failoverLastResp || cjson({ error: { message: 'upstream failed on all accounts', type: 'upstream_error' } }, 502)
+    if (!result) {
+      // 全部候选忙（并发闸门打满）或全部失败
+      if (failoverLastResp) return failoverLastResp
+      if (allBusy) {
+        return cjson({ error: { message: 'all M365 accounts are busy or rate-limited; try again shortly', type: 'rate_limit_error' } }, 429, { 'Retry-After': '5' })
+      }
+      return cjson({ error: { message: 'upstream failed on all accounts', type: 'upstream_error' } }, 502)
+    }
     streamedText = streamedText || result.text
 
     // 主回答兜底 1：模型错误拒绝使用工具时，发起纠正对话重试（同原版 isToolRefusal）
     if (toolDefs.length > 0 && isToolRefusal(result.text || streamedText)) {
       const correction =
         'Your previous response incorrectly denied that caller tools are available. They are real, active, and callable on the caller\'s Windows machine. Call the appropriate tool now. Do not explain tool availability.\n\nUser request:\n' + mainPrompt
+      const corrAcquired = await acquireSlot(this.env, providerId, usedAcc.oid)
       try {
         const corrRes = await chatWithHandlers(usedAcc, { text: correction, conversationId: resolved.isNew ? undefined : resolved.conversationId, sessionId: resolved.isNew ? undefined : resolved.sessionId, started: resolved.isNew, attachments }, { timeoutMs: 300_000 })
         if (!isToolRefusal(corrRes.text)) {
           result = { ...corrRes, events: result.events }
           streamedText = corrRes.text
         }
-      } catch { /* keep original result */ }
+      } catch { /* keep original result */ } finally {
+        if (corrAcquired) await releaseSlot(this.env, providerId, usedAcc.oid)
+      }
     }
 
     // 主回答兜底 2：提取工具调用。先 fenced block（<m365-tool-call> / ```name\n{json}```），再原生工具事件；用 ledger 过滤已完成调用
@@ -305,10 +328,15 @@ export class M365Session {
   private async selectAccounts(providerId: string, resolved: ResolveResult): Promise<ChatHubAccount[]> {
     const accounts = await listM365Accounts(this.env, providerId)
     if (accounts.length === 0) return []
+    const snapshot: { limit: number; inflight: Record<string, number> } =
+      await fluxSnapshot(this.env, providerId).catch(() => ({ limit: 8, inflight: {} }))
     const healthy: ChatHubAccount[] = []
     for (const a of accounts) {
       if (!a.accessToken || !a.oid) continue
       if (!(await isAccountAvailable(this.env, a.oid))) continue
+      // 并发闸门：已打满（inflight >= limit）的账号视为不可用，避免选到忙号
+      const inflight = snapshot.inflight[a.oid] || 0
+      if (inflight >= snapshot.limit) continue
       healthy.push({ accessToken: a.accessToken, oid: a.oid, tid: a.tid })
     }
     if (!resolved.isNew && resolved.accountId) {

@@ -462,6 +462,10 @@ export interface Env {
   CF_API_TOKEN?: string
   /** M365 Session Durable Object 绑定（承载 ChatHub WS 对话与会话串行化） */
   M365_SESSION: DurableObjectNamespace
+  /** M365 账号级并发闸门 Durable Object（每 provider 一个，跨会话共享并发计数） */
+  M365_FLUX: DurableObjectNamespace
+  /** M365 每账号最大并发对话数（默认 8） */
+  M365_ACCOUNT_DEFAULT_CONCURRENCY?: string
 }
 
 export interface AnalyticsEngineDatasetBinding {

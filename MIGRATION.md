@@ -16,7 +16,7 @@
 | 功能 | 本地缺失处 | 原仓文件 | 状态 |
 |---|---|---|---|
 | 多账号池 + round-robin/lastHealthy 故障转移 | `durable.ts` / `cloud-api.ts` 只有单 `getM365Account` | `auth/cache.go`、`server.go resolveAccount/nextHealthyAccount` | ✅(账号池存取·轮询·新会话 failover·按账号健康·管理端)/🚧(每账号并发闸门·显式账号参数透传) |
-| 账号级冷却 + 并发闸门（每账号并发上限，区别于会话串行队列） | `account-health.ts` 无 `imageLimited`；`durable.ts` `queue` 为会话级 | `account_concurrency.go`、`account_health.go` | ✅(账号级冷却/图片额度 24h)/🚧(每账号并发闸门) |
+| 账号级冷却 + 并发闸门（每账号并发上限，区别于会话串行队列） | `account-health.ts` 无 `imageLimited`；`durable.ts` `queue` 为会话级 | `account_concurrency.go`、`account_health.go` | ✅(账号级冷却/图片额度 24h + 每账号并发闸门 DO) |
 | 模型→ChatHub tone 映射 + 动态模型目录 | `proxy.ts` 静态 `M365_MODELS`，无 tone 映射 | `codex_catalog.go`、`server.go modelTone` | ⏳(需上游 tone 实测，避免臆造) |
 | 完整 Result 元数据（throttling/suggestedResponses/rawResult/references/citations/metering） | `ChatHubResult` 字段过少 | `client.go` Result | ✅(部分：throttling/rawResult/images 透传入 `m365` 块) |
 | 图片额度/内容策略/空返回硬错误（ErrImageLimit/ErrOffensiveContent/ErrEmptyCompletion + 多语 IsContentPolicyBlock） | `chathub.ts rateLimited` 单判别 | `client.go`、`toolloop.go` | ✅ |
@@ -125,6 +125,17 @@
 | `src/m365/auto-cleanup.ts` | 清理遍历账号池中每个账号的云端对话 |
 | `src/admin.ts` | `handleM365TokenHealth` 返回账号池数组；`handleM365ClearCooldown` 支持 ?oid= 或清全部；新增 `handleM365Accounts`（GET 列表 / DELETE ?oid= 移除，联动清健康） |
 | `src/index.ts` | 注册 `/admin/api/m365/accounts/:id` |
+
+### 三轮：每账号并发闸门 + 账号池管理页
+
+| 文件 | 变更概要 |
+|---|---|
+| `src/m365/account-flux.ts`（新增） | `AccountFlux` DO（每 provider 一个，单线程内存维护 `inflight[oid]`）：`/acquire`（超限返回 busy）/`/release`/`/snapshot`；辅助 `acquireSlot`（带有限等待轮询）/`releaseSlot`/`fluxSnapshot` |
+| `src/m365/durable.ts` | 主回答按账号 acquire→chatWithHandlers→finally release；工具路由/纠正重试也占用并发位；`selectAccounts` 用快照跳过已打满账号；全忙返回 429 Retry-After |
+| `src/types.ts` | `Env` 增加 `M365_FLUX` 绑定与 `M365_ACCOUNT_DEFAULT_CONCURRENCY` 可选变量 |
+| `wrangler.toml` | 注册 `M365_FLUX` 绑定 + `[exports.AccountFlux]`（memcache 存储） |
+| `src/index.ts` | 导出 `AccountFlux` |
+| `src/pages.ts` | 新增「M365 账号池」管理面板（nav 链接 + 区块）：选择 M365 提供商 → 列出账号(email/OID/健康) → 移除账号，内联脚本自包含 |
 
 > 校验：`cd /workspace && npx tsc --noEmit` 通过（exit 0）。
 > 新增管理接口：
