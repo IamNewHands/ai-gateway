@@ -1665,7 +1665,7 @@ function oauthStatus(id) {
 // ===== WorkBuddy 多账号池：状态 / 移除 / 冷却参数 =====
 function oauthPoolStatus(id) {
   const st = document.getElementById('wbp-st-' + id)
-  if (st) { st.textContent = '查询中…'; showSpinner(st) }
+  if (st) st.innerHTML = '<span class="mu"><i class="fas fa-spinner fa-spin"></i> 加载账号池…</span>'
   // 并行拉取账号池 + 签到状态，按 uid 合并出签到/额度/权益包明细
   return Promise.all([
     fetch('/admin/api/oauth/' + encodeURIComponent(id) + '/status').then(r => r.json()),
@@ -1770,7 +1770,7 @@ function oauthPoolRemove(id, uid) {
 // ===== Qoder 多账号池：状态 / 移除 =====
 function qoderPoolStatus(id) {
   const st = document.getElementById('qdp-st-' + id)
-  if (st) { st.textContent = '查询中…'; showSpinner(st) }
+  if (st) st.innerHTML = '<span class="mu"><i class="fas fa-spinner fa-spin"></i> 加载账号池…</span>'
   return Promise.all([
     fetch('/admin/api/oauth/' + encodeURIComponent(id) + '/status').then(r => r.json()),
     fetch('/admin/api/checkin/status').then(r => r.json()).catch(() => null),

@@ -47,7 +47,7 @@ function showSpinner(el) {
 }
 function showResult(el, success, msg) {
   el.innerHTML = success
-    ? '<div class="al al-s"><i class="fas fa-check-circle"></i> 连接成功</div>'
+    ? '<div class="al al-s"><i class="fas fa-check-circle"></i> ' + escapeHtml(msg || '连接成功') + '</div>'
     : '<div class="al al-e"><i class="fas fa-times-circle"></i> ' + escapeHtml(msg || '连接失败') + '</div>'
 }
 
