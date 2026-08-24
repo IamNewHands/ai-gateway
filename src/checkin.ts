@@ -36,6 +36,14 @@ import type { OAuthPoolAccount } from './oauth-pool'
 
 const CHECKIN_BASE_CN = 'https://www.codebuddy.cn'
 
+/**
+ * get-user-resource 的 PackageEndTimeRangeEnd 过滤上界（ms）。
+ * 请求体用 begin=now（排除已过期包）+ end=该远期值，保证所有有效权益包都被纳入额度聚合。
+ * 沿用原实现的数值（365×101 天 ≈ 100.9 年，刻意取足够大的"远期"值，行为不得改动；
+ * 套餐通常为月/年度，该值只保证不漏包，与取 1 年结果一致）。
+ */
+const PACKAGE_END_HORIZON_MS = 365 * 101 * 24 * 60 * 60 * 1000
+
 /** CPA billing 信封 */
 interface BillingEnvelope {
   code: number
@@ -240,7 +248,7 @@ async function fetchUserResource(
   env?: Env
 ): Promise<{ totalRemain: number; totalUsed: number; totalSize: number; packCount: number; packages: PackageInfo[] } | null> {
   const now = new Date()
-  const end = new Date(now.getTime() + 365 * 101 * 24 * 60 * 60 * 1000)
+  const end = new Date(now.getTime() + PACKAGE_END_HORIZON_MS)
   const body = {
     PageNumber: 1,
     PageSize: 100,
