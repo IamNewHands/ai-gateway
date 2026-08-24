@@ -71,9 +71,13 @@ async function readAccounts(env: Env, providerId: string): Promise<PooledAccount
       if (s && s.access_token) {
         const list = [{ ...s, lastUsedAt: Date.now() }]
         await env.KV.put(poolKey(providerId), JSON.stringify(list), { expirationTtl: 86400 * 30 })
+        console.log(`[m365:accpool] provider=${providerId} 从旧单 token 迁移 1 个账号进池 oid=${s.oid || '无'} email=${s.email || '无'}`)
         return list
       }
     } catch { /* ignore */ }
+  } else {
+    // 诊断辅助：池与单 token 均不存在（可能 30 天 TTL 过期或从未写入）
+    console.log(`[m365:accpool] provider=${providerId} 账号池为空且无旧单 token（pool key 不存在）`)
   }
   return []
 }
@@ -533,6 +537,66 @@ export async function getM365AccountInfos(env: Env, providerId: string): Promise
 export async function getM365AccountInfo(env: Env, providerId: string): Promise<{ connected: boolean; email?: string; oid?: string; tid?: string; expiresAt?: number } | null> {
   const infos = await getM365AccountInfos(env, providerId)
   return infos[0] || null
+}
+
+/** 账号池诊断结果（只读，不回传 token 明文） */
+export interface M365PoolDiagnostic {
+  providerId: string
+  /** oauth:token:{id}:pool 是否存在 */
+  poolKeyExists: boolean
+  /** 池内账号数 */
+  poolCount: number
+  /** 旧式单 token key（oauth:token:{id}）是否存在 */
+  singleKeyExists: boolean
+  singleOid?: string
+  singleHasToken?: boolean
+  accounts: Array<{ oid?: string; tid?: string; email?: string; hasToken: boolean; lastUsedAt?: number; expiresAt?: number }>
+}
+
+/** 读取某提供商账号池的底层存储状态（诊断"面板空"用） */
+export async function m365PoolDiagnostic(env: Env, providerId: string): Promise<M365PoolDiagnostic> {
+  const poolRaw = await env.KV.get(poolKey(providerId))
+  const accounts: M365PoolDiagnostic['accounts'] = []
+  let poolCount = 0
+  if (poolRaw) {
+    try {
+      const arr = JSON.parse(poolRaw)
+      if (Array.isArray(arr)) {
+        poolCount = arr.length
+        for (const s of arr) {
+          if (!s || typeof s !== 'object') continue
+          const o = s as Record<string, unknown>
+          accounts.push({
+            oid: typeof o.oid === 'string' ? o.oid : undefined,
+            tid: typeof o.tid === 'string' ? o.tid : undefined,
+            email: typeof o.email === 'string' ? o.email : undefined,
+            hasToken: typeof o.access_token === 'string' && o.access_token !== '',
+            lastUsedAt: typeof o.lastUsedAt === 'number' ? o.lastUsedAt : undefined,
+            expiresAt: typeof o.expires_at === 'number' ? o.expires_at : undefined,
+          })
+        }
+      }
+    } catch { /* 损坏 JSON：poolCount 保持 0 */ }
+  }
+  const singleRaw = await env.KV.get(tokenKey(providerId))
+  let singleOid: string | undefined
+  let singleHasToken: boolean | undefined
+  if (singleRaw) {
+    try {
+      const s = JSON.parse(singleRaw) as Record<string, unknown>
+      singleOid = typeof s?.oid === 'string' ? s.oid : undefined
+      singleHasToken = typeof s?.access_token === 'string' && s.access_token !== ''
+    } catch { /* 损坏 JSON */ }
+  }
+  return {
+    providerId,
+    poolKeyExists: !!poolRaw,
+    poolCount,
+    singleKeyExists: !!singleRaw,
+    singleOid,
+    singleHasToken,
+    accounts,
+  }
 }
 
 /** 断开 M365 授权（清空账号池） */

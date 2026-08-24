@@ -37,7 +37,7 @@ import { isM365Provider, M365_MODELS, testM365Model } from './m365/proxy'
 import { listSessions as listM365Sessions, deleteSession as deleteM365Session } from './m365/session'
 import { listConversations as listM365Conversations, whitelistConversation, unwhitelistConversation, getCleanupMode, setCleanupMode, getCleanupConfig, setCleanupConfig, deleteConversationRecord } from './m365/conversation-manager'
 import { autoCleanupProvider } from './m365/auto-cleanup'
-import { getM365AccountInfos, listM365Accounts, removeM365Account } from './m365/oauth'
+import { getM365AccountInfos, listM365Accounts, removeM365Account, m365PoolDiagnostic } from './m365/oauth'
 import { clearAccountHealth, isAccountAvailable, accountCooldownSeconds } from './m365/account-health'
 import type {
   AppEnv,
@@ -2170,7 +2170,28 @@ export async function handleM365Accounts(c: Context<AppEnv>) {
   }
 }
 
-// ===== 思维引导提示词设置（KV 存储，管理后台可编辑）=====
+/** M365 账号池底层存储诊断（只读）——排查"面板显示空"：池/旧单 token key 是否存在、账号数、oid 是否缺失、TTL 是否可能过期 */
+export async function handleM365Diag(c: Context<AppEnv>) {
+  try {
+    const providers = (await getProviders(c.env)) as Provider[]
+    const m365 = providers.filter((p) => isM365Provider(p))
+    const results: Array<Awaited<ReturnType<typeof m365PoolDiagnostic>>> = []
+    for (const p of m365) {
+      results.push(await m365PoolDiagnostic(c.env, p.id))
+    }
+    return c.json({
+      success: true,
+      data: {
+        totalM365Providers: m365.length,
+        note: 'pool key 与 single key 均不存在 → 该 provider 账号存储缺失（30 天 KV TTL 过期或从未写入）。若 singleKeyExists=true 而 poolKeyExists=false，会在下次读取时自动迁移。',
+        providers: results,
+      },
+    })
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err)
+    return c.json({ error: { message: msg, type: 'internal_error' } }, 500)
+  }
+}
 
 /** 读取当前生效的思维引导提示词（含是否自定义标记） */
 export async function handleGetThinkingPrompt(c: Context<AppEnv>) {
