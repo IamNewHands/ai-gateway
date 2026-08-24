@@ -2870,11 +2870,29 @@ function renderWorkbuddyCards(list) {
     // WorkBuddy 多账号池：逐账号展示签到结果
     var accountsLine = ''
     if (c.accounts && c.accounts.length > 0) {
-      accountsLine = '<div class="mu" style="margin-top:4px">' + c.accounts.map(function(a) {
+      accountsLine = '<div class="mu" style="margin-top:4px">' + c.accounts.map(function(a, ai) {
         const ab = a.success ? '<span class="bd bd-on">' + (a.reason === 'already' ? '已签' : '成功') + '</span>' : '<span class="bd bd-off">失败</span>'
         const nm = a.nickname ? escapeHtml(a.nickname) : escapeHtml(a.uid)
         const rem = (a.totalRemain !== undefined && a.totalRemain !== null) ? ' · 可用 ' + a.totalRemain : ''
-        return '<div style="margin-top:2px">' + nm + ' ' + ab + ' <span style="color:var(--muted)">' + escapeHtml(a.message || '') + '</span>' + rem + '</div>'
+        // 逐账号权益包明细（与单账号卡片一致，展示该账号额度由哪些包构成）
+        var pkg = ''
+        if (a.packages && a.packages.length > 0) {
+          var aid = 'apkg-' + idx + '-' + ai
+          var rows = a.packages.map(function(p) {
+            var exp = (p.expireAt && p.expireAt.trim()) ? escapeHtml(p.expireAt) : '长期'
+            var cyc = (p.cycleEndTime && p.cycleEndTime.trim()) ? escapeHtml(p.cycleEndTime) : '—'
+            var qty = ''
+            if (p.size !== undefined && p.size !== null && p.size > 0) {
+              var used2 = (p.used !== undefined && p.used !== null) ? p.used : 0
+              qty = '<td class="numeric">' + used2 + ' / ' + p.size + (p.unit ? ' ' + escapeHtml(p.unit) : '') + '</td>'
+            } else {
+              qty = '<td>—</td>'
+            }
+            return '<tr><td>' + escapeHtml(p.name) + '</td><td>' + exp + '</td><td>' + cyc + '</td>' + qty + '</tr>'
+          }).join('')
+          pkg = '<div class="collapse-section" style="margin-top:4px"><button class="collapse-btn" data-pkg="' + aid + '" type="button" aria-expanded="false"><i class="fas fa-chevron-right collapse-icon" aria-hidden="true"></i> 权益包明细（' + a.packages.length + '）</button><div id="' + aid + '" class="hd usage-log-table-wrap"><table class="usage-log-table"><thead><tr><th>名称</th><th>到期时间</th><th>周期结束</th><th>已用/总额度</th></tr></thead><tbody>' + rows + '</tbody></table></div></div>'
+        }
+        return '<div style="margin-top:2px">' + nm + ' ' + ab + ' <span style="color:var(--muted)">' + escapeHtml(a.message || '') + '</span>' + rem + pkg + '</div>'
       }).join('') + '</div>'
     }
     html += '<article class="ki"><div class="key-main"><span class="key-icon" aria-hidden="true"><i class="fas fa-calendar-check"></i></span><div><div class="kv"><h3>' + title + '</h3>' + realmBadge + payBadge + badge + '</div><p>' + creditLine + '</p><p style="margin-top:2px">' + checkinLine + '</p>' + packLine + accountsLine + (c.message ? '<p class="mu" style="margin-top:2px">' + escapeHtml(c.message) + '</p>' : '') + '</div></div><div class="key-actions"><button class="btn btn-gh btn-xs" data-cid="' + escapeHtml(c.providerId) + '"><i class="fas fa-calendar-check" aria-hidden="true"></i>签到</button></div></article>'
