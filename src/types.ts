@@ -377,6 +377,8 @@ export interface UpsertProviderRequest {
 export interface CheckinResult {
   providerId: string
   name: string
+  /** 池账号 uid（多账号池逐账号签到结果才有，供面板按 uid 与账号池对齐） */
+  uid?: string
   /** 账号领域：cn 可签到，global 跳过 */
   realm: 'cn' | 'global' | 'unknown'
   success: boolean

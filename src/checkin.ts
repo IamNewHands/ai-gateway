@@ -239,6 +239,7 @@ async function checkinOauthPoolAccount(
   const base: CheckinResult = {
     providerId: provider.id,
     name: provider.name,
+    uid: account.uid || undefined,
     realm: 'unknown',
     success: false,
     reason: 'fail',
@@ -361,7 +362,7 @@ async function checkinOauthPoolAccounts(env: Env, provider: Provider): Promise<C
       }
     } catch (e) {
       accounts.push({
-        providerId: provider.id, name: provider.name, realm: 'unknown',
+        providerId: provider.id, name: provider.name, uid: acc.uid || undefined, realm: 'unknown',
         success: false, reason: 'fail', message: (e as Error).message || String(e),
         todayCheckedIn: false, updatedAt: Date.now(), nickname: acc.nickname || acc.uid,
       })

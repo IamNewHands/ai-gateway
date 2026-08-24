@@ -1657,18 +1657,26 @@ function oauthPoolStatus(id) {
       if (entry && Array.isArray(entry.accounts)) ciAccounts = entry.accounts
     }
     const ciByUid = {}
-    ciAccounts.forEach(function (a) { if (a && a.uid) ciByUid[a.uid] = a })
-    renderOauthPoolAccounts(id, pool, ciByUid)
+    const ciByNick = {}
+    ciAccounts.forEach(function (a) {
+      if (!a) return
+      if (a.uid) ciByUid[a.uid] = a
+      // 旧数据无 uid：用 nickname 兜底匹配（同名账号概率低，仅过渡期使用）
+      if (a.nickname) ciByNick[a.nickname] = a
+    })
+    renderOauthPoolAccounts(id, pool, ciByUid, ciByNick)
   }).catch(() => { if (st) showResult(st, false, '查询失败') })
 }
-function renderOauthPoolAccounts(id, accs, ciByUid) {
+function renderOauthPoolAccounts(id, accs, ciByUid, ciByNick) {
   const box = document.getElementById('wbp-acc-' + id)
   if (!box) return
   if (!accs.length) { box.innerHTML = '<p class="mu">账号池为空：点「发起连接」每登录一个 WorkBuddy 账号即自动加入（可登录多个账号）。</p>'; return }
   ciByUid = ciByUid || {}
+  ciByNick = ciByNick || {}
   box.innerHTML = accs.map(function(a, i) {
     const badge = a.disabled ? '<span class="bd bd-off">已禁用</span>' : (a.cooling ? '<span class="bd bd-off">冷却中</span>' : '<span class="bd bd-on">健康</span>')
-    const ci = ciByUid[a.uid]
+    // 签到结果匹配：优先 uid，旧数据回退 nickname
+    const ci = ciByUid[a.uid] || (a.nickname ? ciByNick[a.nickname] : null)
     // 签到状态徽章（今日已签 / 失败 / 未签）
     let ciBadge = ''
     if (ci) {
