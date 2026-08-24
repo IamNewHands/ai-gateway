@@ -686,7 +686,7 @@ ${H('管理')}
                   <div class="fc mt-1 field-row"><button class="btn btn-s" onclick="oauthConnect('${escapePageJsx(p.id)}')"><i class="fas fa-plug" aria-hidden="true"></i>发起连接</button><button class="btn btn-gh" onclick="fetchOauthModels('${escapePageJsx(p.id)}')"><i class="fas fa-cloud-download-alt" aria-hidden="true"></i>获取模型</button><button class="btn btn-gh" onclick="oauthStatus('${escapePageJsx(p.id)}')"><i class="fas fa-sync" aria-hidden="true"></i>状态</button><button class="btn btn-gh" onclick="oauthDisconnect('${escapePageJsx(p.id)}')"><i class="fas fa-unlink" aria-hidden="true"></i>断开</button><span id="oauth-st-${escapePageHtml(p.id)}" class="oauth-status"></span></div>
                   ${(p.oauth&&p.oauth.flowType==='browser')?`
                   <fieldset class="form-group" id="wbp-fs-${escapePageHtml(p.id)}"><legend>WorkBuddy 多账号池</legend><span class="form-helper">浏览器登录流每次成功登录都会把该账号加入账号池（按 uid 去重，多登一个 = 多个账号）。转发按剩余积分自动挑选账号，429/plan/401 等按策略冷却或禁用并轮换其他账号；每日签到后积分恢复自动解冻。冷却参数留空 = 默认（plan 12h / 429 60s / 连续 5 次错误冷却 10m）。</span>
-                    <div class="fc mt-1 field-row"><button class="btn btn-s" onclick="oauthPoolStatus('${escapePageJsx(p.id)}')"><i class="fas fa-sync" aria-hidden="true"></i>刷新账号池</button><button class="btn btn-s" onclick="oauthConnect('${escapePageJsx(p.id)}')"><i class="fas fa-sign-in-alt" aria-hidden="true"></i>登录新账号</button><span id="wbp-st-${escapePageHtml(p.id)}" class="oauth-status"></span></div>
+                    <div class="fc mt-1 field-row"><button class="btn btn-s" onclick="oauthPoolStatus('${escapePageJsx(p.id)}')"><i class="fas fa-sync" aria-hidden="true"></i>刷新账号池</button><button class="btn btn-s" onclick="oauthConnect('${escapePageJsx(p.id)}')"><i class="fas fa-sign-in-alt" aria-hidden="true"></i>登录新账号</button><button class="btn btn-p" onclick="triggerCheckin('${escapePageJsx(p.id)}')"><i class="fas fa-calendar-check" aria-hidden="true"></i>立即签到</button><span id="wbp-st-${escapePageHtml(p.id)}" class="oauth-status"></span></div>
                     <div id="wbp-acc-${escapePageHtml(p.id)}" class="mt-1"></div>
                     <div class="fc mt-1 field-row" style="gap:8px"><input type="number" id="cd-plan-${escapePageHtml(p.id)}" value="${p.cooldown&&p.cooldown.planMs?Math.round(p.cooldown.planMs/60000):''}" style="width:88px" placeholder="plan冷却(分)"><input type="number" id="cd-soft-${escapePageHtml(p.id)}" value="${p.cooldown&&p.cooldown.softMs?Math.round(p.cooldown.softMs/1000):''}" style="width:88px" placeholder="429冷却(秒)"><input type="number" id="cd-err-${escapePageHtml(p.id)}" value="${p.cooldown&&p.cooldown.errThreshold?p.cooldown.errThreshold:''}" style="width:76px" placeholder="错误阈值"><input type="number" id="cd-errms-${escapePageHtml(p.id)}" value="${p.cooldown&&p.cooldown.errMs?Math.round(p.cooldown.errMs/60000):''}" style="width:88px" placeholder="错误冷却(分)"><span class="mu" style="font-size:12px">冷却参数（保存后生效）</span></div>
                   </fieldset>`:''}
@@ -1658,25 +1658,30 @@ function oauthPoolStatus(id) {
     }
     const ciByUid = {}
     const ciByNick = {}
-    ciAccounts.forEach(function (a) {
+    ciAccounts.forEach(function (a, ai) {
       if (!a) return
       if (a.uid) ciByUid[a.uid] = a
-      // 旧数据无 uid：用 nickname 兜底匹配（同名账号概率低，仅过渡期使用）
+      // 旧数据无 uid：用 nickname 兜底匹配
       if (a.nickname) ciByNick[a.nickname] = a
+      // 均缺失时挂到序号上（账号数一致时按池顺序对齐，最后兜底）
+      a.__idx = ai
     })
-    renderOauthPoolAccounts(id, pool, ciByUid, ciByNick)
+    renderOauthPoolAccounts(id, pool, ciByUid, ciByNick, ciAccounts)
   }).catch(() => { if (st) showResult(st, false, '查询失败') })
 }
-function renderOauthPoolAccounts(id, accs, ciByUid, ciByNick) {
+function renderOauthPoolAccounts(id, accs, ciByUid, ciByNick, ciAccounts) {
   const box = document.getElementById('wbp-acc-' + id)
   if (!box) return
   if (!accs.length) { box.innerHTML = '<p class="mu">账号池为空：点「发起连接」每登录一个 WorkBuddy 账号即自动加入（可登录多个账号）。</p>'; return }
   ciByUid = ciByUid || {}
   ciByNick = ciByNick || {}
+  ciAccounts = ciAccounts || []
+  // 旧 KV 签到数据无 uid 且昵称可能两侧均空：账号数一致时按池顺序对齐作最后兜底
+  const idxFallback = ciAccounts.length === accs.length ? ciAccounts : null
   box.innerHTML = accs.map(function(a, i) {
     const badge = a.disabled ? '<span class="bd bd-off">已禁用</span>' : (a.cooling ? '<span class="bd bd-off">冷却中</span>' : '<span class="bd bd-on">健康</span>')
-    // 签到结果匹配：优先 uid，旧数据回退 nickname
-    const ci = ciByUid[a.uid] || (a.nickname ? ciByNick[a.nickname] : null)
+    // 签到结果匹配：uid → nickname → 顺序兜底（仅账号数一致时）
+    const ci = ciByUid[a.uid] || (a.nickname && ciByNick[a.nickname]) || (idxFallback ? idxFallback[i] : null)
     // 签到状态徽章（今日已签 / 失败 / 未签）
     let ciBadge = ''
     if (ci) {
@@ -3062,6 +3067,15 @@ async function triggerCheckin(id) {
       toast(msg, 'success')
       renderCheckinList({ success: true, data: results })
       if (!id) loadCheckin()
+      // 签到数据已更新：同步刷新已展开的 WorkBuddy 池（明细/徽章即时更新）
+      document.querySelectorAll('.pd.open [id^="wbp-acc-"]').forEach(function (el) {
+        var pid = String(el.id).replace(/^wbp-acc-/, '')
+        if (document.getElementById('wbp-st-' + pid)) oauthPoolStatus(pid)
+      })
+      // TRAE 池同样刷新（签到列更新）
+      document.querySelectorAll('.pd.open [id^="trae-acc-"]').forEach(function (el) {
+        traeStatus(String(el.id).replace(/^trae-acc-/, ''))
+      })
     } else {
       toast(d.message || '签到失败', 'error')
     }

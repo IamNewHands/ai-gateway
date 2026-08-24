@@ -31,6 +31,7 @@ import {
   refreshOauthPoolAccount,
   reenableOauthIfCredits,
   seedOauthPoolFromSingle,
+  setOauthPoolAccountNickname,
 } from './oauth-pool'
 import type { OAuthPoolAccount } from './oauth-pool'
 import {
@@ -222,6 +223,13 @@ async function syncPoolCredits(env: Env, provider: Provider, account: OAuthPoolA
   try {
     if (typeof base.totalRemain === 'number') {
       await reenableOauthIfCredits(env, provider.id, account.uid, base.totalRemain)
+    }
+  } catch { /* ignore */ }
+  // 回写昵称到池账号：池侧 nickname 常为空（登录时未解出 JWT），签到时从
+  // token 解出后写回，保证账号池列表与签到结果可用 nickname 对齐
+  try {
+    if (base.nickname && base.nickname !== account.nickname) {
+      await setOauthPoolAccountNickname(env, provider.id, account.uid, base.nickname)
     }
   } catch { /* ignore */ }
 }

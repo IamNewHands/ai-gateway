@@ -252,6 +252,15 @@ export async function reenableOauthIfCredits(env: Env, providerId: string, uid: 
   await writeOauthPool(env, providerId, pool)
 }
 
+/** 签到时回写昵称：池账号登录时可能未解出 JWT 昵称，签到后补齐供面板展示/对齐。 */
+export async function setOauthPoolAccountNickname(env: Env, providerId: string, uid: string, nickname: string): Promise<void> {
+  const pool = await readOauthPool(env, providerId)
+  const acc = pool.find((a) => a.uid === uid)
+  if (!acc || acc.nickname === nickname) return
+  acc.nickname = nickname
+  await writeOauthPool(env, providerId, pool)
+}
+
 /** 删除指定 uid 账号。 */
 export async function removeOauthAccount(env: Env, providerId: string, uid: string): Promise<boolean> {
   const pool = await readOauthPool(env, providerId)
