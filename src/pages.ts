@@ -1041,6 +1041,8 @@ function tog(id) {
   if (d.classList.contains('open') && document.getElementById('m365-acc-' + id)) m365Render(id)
   // Qoder：展开时自动加载账号池状态
   if (d.classList.contains('open') && document.getElementById('qdp-acc-' + id)) qoderPoolStatus(id)
+  // WorkBuddy：展开时自动加载账号池状态
+  if (d.classList.contains('open') && document.getElementById('wbp-acc-' + id)) oauthPoolStatus(id)
 }
 
 // P3：M365 账号池渲染 —— 独立页并入提供商详情后按 providerId 定位容器
@@ -1110,9 +1112,12 @@ function restoreAdminState() {
         const d = document.getElementById(panelId)
         const c = document.getElementById('ch-' + String(panelId).replace(/^dt-/, ''))
         if (d && d.classList && !d.classList.contains('open')) { d.classList.add('open'); if (c) c.style.transform = 'rotate(90deg)' }
-        // P3：恢复展开态时同步加载内嵌账号池（TRAE / M365），与手动 tog 行为一致
+        // P3：恢复展开态时同步加载内嵌账号池（TRAE / M365 / Qoder / WorkBuddy），与手动 tog 行为一致
         const pid = String(panelId).replace(/^dt-/, '')
         if (document.getElementById('m365-acc-' + pid)) m365Render(pid)
+        if (document.getElementById('trae-acc-' + pid)) traeStatus(pid)
+        if (document.getElementById('qdp-acc-' + pid)) qoderPoolStatus(pid)
+        if (document.getElementById('wbp-acc-' + pid)) oauthPoolStatus(pid)
       })
       if (s.add) { const af = document.getElementById('af'); if (af) af.classList.remove('hd') }
       if (typeof s.y === 'number') uiScroll = s.y
