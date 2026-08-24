@@ -709,7 +709,6 @@ ${H('管理')}
                 </div>
                 <div id="trae-st-${escapePageHtml(p.id)}" class="oauth-status" aria-live="polite"></div>
                 <div id="trae-acc-${escapePageHtml(p.id)}" class="mt-1"></div>
-                <div id="trae-checkin-${escapePageHtml(p.id)}" class="mt-1"></div>
                 <div class="fc mt-1 field-row" style="gap:8px"><input type="number" id="cd-plan-${escapePageHtml(p.id)}" value="${p.cooldown&&p.cooldown.planMs?Math.round(p.cooldown.planMs/60000):''}" style="width:88px" placeholder="plan冷却(分)"><input type="number" id="cd-soft-${escapePageHtml(p.id)}" value="${p.cooldown&&p.cooldown.softMs?Math.round(p.cooldown.softMs/1000):''}" style="width:88px" placeholder="429冷却(秒)"><input type="number" id="cd-err-${escapePageHtml(p.id)}" value="${p.cooldown&&p.cooldown.errThreshold?p.cooldown.errThreshold:''}" style="width:76px" placeholder="错误阈值"><input type="number" id="cd-errms-${escapePageHtml(p.id)}" value="${p.cooldown&&p.cooldown.errMs?Math.round(p.cooldown.errMs/60000):''}" style="width:88px" placeholder="错误冷却(分)"><span class="mu" style="font-size:12px">冷却参数（留空 = 默认 plan 12h / 429 60s / 连续 3 次错误冷却 10m）</span></div>
               </fieldset>`:''}
               <div class="collapse-section">
@@ -1642,24 +1641,77 @@ function oauthStatus(id) {
 function oauthPoolStatus(id) {
   const st = document.getElementById('wbp-st-' + id)
   if (st) { st.textContent = '查询中…'; showSpinner(st) }
-  return fetch('/admin/api/oauth/' + encodeURIComponent(id) + '/status').then(r => r.json()).then(d => {
+  // 并行拉取账号池 + 签到状态，按 uid 合并出签到/额度/权益包明细
+  return Promise.all([
+    fetch('/admin/api/oauth/' + encodeURIComponent(id) + '/status').then(r => r.json()),
+    fetch('/admin/api/checkin/status').then(r => r.json()).catch(() => null),
+  ]).then(res => {
+    const d = res[0], cd = res[1]
     if (!d.success) { if (st) showResult(st, false, d.message || '查询失败'); return }
     const pool = (d.data && d.data.pool) || []
     if (st) showResult(st, true, '共 ' + pool.length + ' 个账号')
-    renderOauthPoolAccounts(id, pool)
+    // 从签到状态里找本提供商的逐账号明细（data.workbuddy[].providerId === id）
+    let ciAccounts = []
+    if (cd && cd.success && cd.data && Array.isArray(cd.data.workbuddy)) {
+      const entry = cd.data.workbuddy.find(function (w) { return w && w.providerId === id })
+      if (entry && Array.isArray(entry.accounts)) ciAccounts = entry.accounts
+    }
+    const ciByUid = {}
+    ciAccounts.forEach(function (a) { if (a && a.uid) ciByUid[a.uid] = a })
+    renderOauthPoolAccounts(id, pool, ciByUid)
   }).catch(() => { if (st) showResult(st, false, '查询失败') })
 }
-function renderOauthPoolAccounts(id, accs) {
+function renderOauthPoolAccounts(id, accs, ciByUid) {
   const box = document.getElementById('wbp-acc-' + id)
   if (!box) return
   if (!accs.length) { box.innerHTML = '<p class="mu">账号池为空：点「发起连接」每登录一个 WorkBuddy 账号即自动加入（可登录多个账号）。</p>'; return }
-  box.innerHTML = accs.map(function(a) {
+  ciByUid = ciByUid || {}
+  box.innerHTML = accs.map(function(a, i) {
     const badge = a.disabled ? '<span class="bd bd-off">已禁用</span>' : (a.cooling ? '<span class="bd bd-off">冷却中</span>' : '<span class="bd bd-on">健康</span>')
+    const ci = ciByUid[a.uid]
+    // 签到状态徽章（今日已签 / 失败 / 未签）
+    let ciBadge = ''
+    if (ci) {
+      ciBadge = ci.success ? ' <span class="bd bd-on">' + (ci.reason === 'already' ? '今日已签' : '签到成功') + '</span>'
+        : ' <span class="bd bd-danger">签到失败</span>'
+      if (ci.message) ciBadge += ' <span style="color:var(--muted)">' + escapeHtml(ci.message) + '</span>'
+    } else {
+      ciBadge = ' <span class="bd bd-off">未签</span>'
+    }
+    // 额度明细（可用/已用/额度池），与签到区口径一致
+    let creditLine = ''
+    if (ci && (ci.totalRemain !== undefined && ci.totalRemain !== null)) {
+      const used = (ci.totalUsed !== undefined && ci.totalUsed !== null) ? ci.totalUsed : '—'
+      const size = (ci.totalSize !== undefined && ci.totalSize !== null) ? ci.totalSize : '—'
+      const packs = (ci.packCount !== undefined && ci.packCount !== null) ? ' · ' + ci.packCount + ' 个包' : ''
+      const pct = (ci.totalSize > 0 && ci.totalUsed !== undefined && ci.totalUsed !== null) ? ' · ' + Math.round(ci.totalUsed / ci.totalSize * 100) + '%' : ''
+      creditLine = '<div class="mu" style="margin-top:2px">可用 ' + ci.totalRemain + ' · 已用 ' + used + pct + ' · 额度池 ' + size + packs + '</div>'
+    }
+    // 权益包明细折叠表（与签到区相同的表格结构）
+    let pkgHtml = ''
+    if (ci && ci.packages && ci.packages.length > 0) {
+      const aid = 'wbpkg-' + escapeHtml(id) + '-' + i
+      const rows = ci.packages.map(function(p) {
+        const exp = (p.expireAt && p.expireAt.trim()) ? escapeHtml(p.expireAt) : '长期'
+        const cyc = (p.cycleEndTime && p.cycleEndTime.trim()) ? escapeHtml(p.cycleEndTime) : '—'
+        let qty = '—'
+        if (p.size !== undefined && p.size !== null && p.size > 0) {
+          const used2 = (p.used !== undefined && p.used !== null) ? p.used : 0
+          qty = used2 + ' / ' + p.size + (p.unit ? ' ' + p.unit : '')
+        }
+        return '<tr><td>' + escapeHtml(p.name) + '</td><td>' + exp + '</td><td>' + cyc + '</td><td class="numeric">' + qty + '</td></tr>'
+      }).join('')
+      pkgHtml = '<div class="collapse-section" style="margin-top:4px"><button class="collapse-btn" data-pkg="' + aid + '" type="button" aria-expanded="false"><i class="fas fa-chevron-right collapse-icon" aria-hidden="true"></i> 权益包明细（' + ci.packages.length + '）</button><div id="' + aid + '" class="hd usage-log-table-wrap"><table class="usage-log-table"><thead><tr><th>名称</th><th>到期时间</th><th>周期结束</th><th>已用/总额度</th></tr></thead><tbody>' + rows + '</tbody></table></div></div>'
+    }
     let line = 'uid=' + escapeHtml(a.uid) + (a.nickname ? '（' + escapeHtml(a.nickname) + '）' : '') + ' · 积分=' + (a.credits || 0)
     if (a.cooling && a.until) line += ' · 冷却至 ' + new Date(a.until).toLocaleString()
     if (a.reason) line += ' · ' + escapeHtml(a.reason)
-    return '<div class="fc mb-2 field-row"><span class="fx1" style="font-size:12px">' + line + '</span>' + badge + '<button class="btn btn-gh btn-xs" onclick="oauthPoolRemove(\\'' + escapeJsAttr(id) + '\\',\\'' + escapeJsAttr(a.uid) + '\\')"><i class="fas fa-trash" aria-hidden="true"></i>移除</button></div>'
+    return '<div class="fc mb-2 field-row" style="align-items:flex-start"><div class="fx1" style="font-size:12px;min-width:0"><div>' + line + ' ' + badge + ciBadge + '</div>' + creditLine + pkgHtml + '</div><button class="btn btn-gh btn-xs" onclick="oauthPoolRemove(\\'' + escapeJsAttr(id) + '\\',\\'' + escapeJsAttr(a.uid) + '\\')"><i class="fas fa-trash" aria-hidden="true"></i>移除</button></div>'
   }).join('')
+  // 绑定权益包折叠按钮（与签到区相同的 toggleCollapse 交互）
+  box.querySelectorAll('[data-pkg]').forEach(function(btn) {
+    btn.addEventListener('click', function() { toggleCollapse(btn.getAttribute('data-pkg'), btn) })
+  })
 }
 function oauthPoolRemove(id, uid) {
   cM('确定从账号池移除 ' + uid + ' 吗？该账号将不再被轮换使用。').then(function(ok) {
@@ -1838,6 +1890,9 @@ function traeStatus(id) {
     if (!d.success || !d.data) { if (st) showResult(st, false, d.message || '状态获取失败'); return }
     const accs = d.data.accounts || []
     const checkin = d.data.checkin || []
+    // 签到记录并入账号表：按 uid 匹配，表格直接显示「今日签到」列，不再单独渲染签到列表
+    const ciByUid = {}
+    checkin.forEach(function (r) { if (r && r.uid) ciByUid[r.uid] = r })
     if (st) st.textContent = ''
     if (accs.length === 0) {
       box.innerHTML = '<p class="form-helper">暂无账号。点击「登录账号」添加第一个 TRAE 账号。</p>'
@@ -1852,20 +1907,25 @@ function traeStatus(id) {
         '<button class="btn btn-s btn-xs" onclick="traeSetPrefer(\\'' + escapeJsAttr(id) + '\\')">指定</button>' +
         '<button class="btn btn-gh btn-xs" onclick="traeSetPrefer(\\'' + escapeJsAttr(id) + '\\',\\'\\')">恢复自动</button>' +
         '<span id="trae-prefer-msg-' + escapeHtml(id) + '"></span></div>'
+      const ciOk = accs.filter(function (a) { const r = ciByUid[a.uid]; return r && (r.success || r.checkedIn) }).length
       box.innerHTML = preferBar +
         '<div style="max-height:260px;overflow:auto"><table class="usage-log-table" style="margin:0">' +
-        '<thead><tr><th>UID</th><th>昵称</th><th>积分</th><th>状态</th><th>冷却至</th><th>操作</th></tr></thead><tbody>' +
+        '<thead><tr><th>UID</th><th>昵称</th><th>积分</th><th>今日签到</th><th>状态</th><th>冷却至</th><th>操作</th></tr></thead><tbody>' +
         accs.map(function (a) {
           const stTxt = a.disabled ? '<span style="color:var(--color-danger,#ef4444)">已禁用</span>' : a.cooling ? '<span style="color:var(--color-warn,#d97706)">冷却中</span>' : '<span style="color:var(--color-success,#16a34a)">正常</span>'
           const until = a.cooling && a.until ? new Date(a.until).toLocaleString() : ''
           const reason = a.reason ? '<small>' + escapeHtml(a.reason) + '</small>' : ''
+          const ci = ciByUid[a.uid]
+          const ciTxt = !ci ? '<span class="bd bd-off">未签</span>'
+            : ci.success ? (ci.checkedIn ? '<span class="bd bd-on">已签到</span>' : '<span class="bd bd-on">成功</span>')
+            : '<span class="bd bd-danger">失败</span>'
+          const ciTip = ci && ci.message ? ' title="' + escapeHtml(ci.message) + '"' : ''
           return '<tr><td><code>' + escapeHtml(a.uid) + '</code></td><td>' + escapeHtml(a.nickname || '-') + '</td>' +
-            '<td>' + (a.credits || 0) + '</td><td>' + stTxt + (reason ? '<br>' + reason : '') + '</td><td>' + escapeHtml(until) + '</td>' +
+            '<td>' + (a.credits || 0) + '</td><td' + ciTip + '>' + ciTxt + '</td><td>' + stTxt + (reason ? '<br>' + reason : '') + '</td><td>' + escapeHtml(until) + '</td>' +
             '<td><button class="btn btn-d btn-xs" onclick="traeRemoveAccount(\\'' + escapeJsAttr(id) + '\\',\\'' + escapeJsAttr(a.uid) + '\\')">删除</button></td></tr>'
         }).join('') + '</tbody></table></div>' +
-        '<p class="form-helper">共 ' + accs.length + ' 个账号' + (checkin.length ? '；最近签到 ' + checkin.length + ' 条记录（见下）' : '') + '</p>'
+        '<p class="form-helper">共 ' + accs.length + ' 个账号；今日已签 ' + ciOk + ' / ' + accs.length + '</p>'
     }
-    renderTraeCheckin(id, checkin)
   }).catch(() => { if (st) showResult(st, false, '网络错误，请重试') })
 }
 function traeSetPrefer(id, forcedUid) {
@@ -1900,18 +1960,6 @@ function traeRemoveAccount(id, uid) {
     }).catch(() => { if (st) showResult(st, false, '网络错误，请重试') })
   })
 }
-function renderTraeCheckin(id, results) {
-  const box = document.getElementById('trae-checkin-' + id)
-  if (!box) return
-  if (!results || results.length === 0) { box.innerHTML = ''; return }
-  box.innerHTML = '<div class="checkin-grid">' + results.map(function (r) {
-    const ok = r.success ? '<span class="bd bd-on">成功</span>' : '<span class="bd bd-danger">失败</span>'
-    return '<div class="ki" style="margin-bottom:6px"><div class="key-main"><span class="key-icon"><i class="fas fa-calendar-check"></i></span>' +
-      '<div><h3>' + escapeHtml(r.nickname || r.uid) + ' ' + ok + (r.checkedIn ? ' <span class="bd bd-on">已签到</span>' : '') + '</h3>' +
-      '<p>' + escapeHtml(r.message || '') + (r.credits !== undefined && r.credits !== null ? ' · 剩余积分 ' + r.credits : '') + '</p></div></div></div>'
-  }).join('') + '</div>'
-}
-
 // Gemini 授权码模式：提交用户粘贴的回调 URL，后台换 token 并拉取模型
 function oauthSubmitGemini(id) {
   const st = document.getElementById('gemini-cb-st')
