@@ -740,7 +740,7 @@ ${H('管理')}
             fetch('/admin/api/m365/accounts/' + encodeURIComponent(providerId))
               .then(function (r) { return r.json().then(function (j) { return { ok: r.ok, j: j }; }); })
               .then(function (res) {
-                if (!res.ok || !res.success) { if (root) root.innerHTML = '<p class="c-d">加载失败：' + m365Esc(((res.j && res.j.message) || (res.j && res.j.error) || '未知错误')) + '</p>'; return; }
+                if (!res.ok || !res.j.success) { if (root) root.innerHTML = '<p class="c-d">加载失败：' + m365Esc(((res.j && res.j.message) || (res.j && res.j.error) || '未知错误')) + '</p>'; return; }
                 var accs = (res.j.data && res.j.data.accounts) || [];
                 if (!root) return;
                 if (accs.length === 0) { root.innerHTML = '<div class="empty-state"><i class="fas fa-users"></i><h3>暂无账号</h3><p>到「提供商 → ' + m365Esc(providerId) + '」用授权码或账密连接，第一个账号也会进入此池。</p></div>'; return; }
