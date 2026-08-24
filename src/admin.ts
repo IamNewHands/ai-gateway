@@ -31,7 +31,8 @@ import { isClineProvider, fetchClineModels, testClineChat, testClineRefreshToken
 import { isGeminiProvider, testGeminiModel, GEMINI_MODELS } from './gemini/proxy'
 import { isCnbProvider, testCnbConnection, CNB_MODELS } from './cnb/proxy'
 import { PROXY_KEY_PREFIX, EXPIRY_OPTIONS, OPENCODE_DEFAULT_URL } from './config'
-import { startOauthDeviceFlow, pollOauthDeviceFlow, readOauthToken, deleteOauthToken, getOauthAccessToken, buildOauthHeaders, detectTokenRealm, submitOauthGeminiCallback, submitOauthM365Callback, submitOauthM365ROPC } from './oauth'
+import { startOauthDeviceFlow, pollOauthDeviceFlow, readOauthToken, deleteOauthToken, getOauthAccessToken, buildOauthHeaders, detectTokenRealm, submitOauthGeminiCallback, submitOauthM365Callback, submitOauthM365ROPC, OAUTH_POOL_KV_PREFIX } from './oauth'
+import { isOAuthPoolProvider, seedOauthPoolFromSingle, listOauthPoolStatus, removeOauthAccount } from './oauth-pool'
 import { isM365Provider, M365_MODELS, testM365Model } from './m365/proxy'
 import { listSessions as listM365Sessions, deleteSession as deleteM365Session } from './m365/session'
 import { listConversations as listM365Conversations, whitelistConversation, unwhitelistConversation, getCleanupMode, setCleanupMode, getCleanupConfig, setCleanupConfig, deleteConversationRecord } from './m365/conversation-manager'
@@ -219,6 +220,7 @@ export async function handleCreateProvider(c: Context<AppEnv>) {
     visionBridge: body.visionBridge,
     toolBridge: body.toolBridge,
     cnbPool: body.cnbPool,
+    cooldown: body.cooldown,
     allowUnlistedModels: body.allowUnlistedModels,
     thinkingInject: body.thinkingInject,
     cachePrefixInject: body.cachePrefixInject,
@@ -259,6 +261,7 @@ export async function handleUpdateProvider(c: Context<AppEnv>) {
   if (body.visionBridge !== undefined) updates.visionBridge = body.visionBridge ?? undefined
   if (body.toolBridge !== undefined) updates.toolBridge = body.toolBridge ?? undefined
   if (body.cnbPool !== undefined) updates.cnbPool = body.cnbPool ?? undefined
+  if (body.cooldown !== undefined) updates.cooldown = body.cooldown ?? undefined
   if (body.allowUnlistedModels !== undefined) updates.allowUnlistedModels = body.allowUnlistedModels
   if (body.thinkingInject !== undefined) updates.thinkingInject = body.thinkingInject ?? undefined
   if (body.cachePrefixInject !== undefined) updates.cachePrefixInject = body.cachePrefixInject ?? undefined
@@ -331,6 +334,7 @@ export async function handleUpsertProvider(c: Context<AppEnv>) {
       enabled: body.enabled !== undefined ? body.enabled : true,
       toolBridge: body.toolBridge,
       cnbPool: body.cnbPool,
+      cooldown: body.cooldown,
       thinkingInject: body.thinkingInject,
       cachePrefixInject: body.cachePrefixInject,
       createdAt: now,
@@ -353,6 +357,7 @@ export async function handleUpsertProvider(c: Context<AppEnv>) {
   if (body.authType !== undefined) updates.authType = body.authType
   if (body.toolBridge !== undefined) updates.toolBridge = body.toolBridge
   if (body.cnbPool !== undefined) updates.cnbPool = body.cnbPool
+  if (body.cooldown !== undefined) updates.cooldown = body.cooldown
   if (body.thinkingInject !== undefined) updates.thinkingInject = body.thinkingInject
   if (body.cachePrefixInject !== undefined) updates.cachePrefixInject = body.cachePrefixInject
   if (body.enabled !== undefined) updates.enabled = body.enabled
@@ -1044,7 +1049,7 @@ export async function handleUpdateProxyKey(c: Context<AppEnv>) {
 
 // ===== OAuth 设备码管理 =====
 
-/** 查询某 OAuth 提供商的连接状态（token 是否存在/过期时间） */
+/** 查询某 OAuth 提供商的连接状态（token 是否存在/过期时间；池提供商额外返回账号池状态） */
 export async function handleOAuthStatus(c: Context<AppEnv>) {
   const id = c.req.param('id')
   if (!id) return c.json<ApiResponse>({ success: false, message: '缺少 id 参数' }, 400)
@@ -1056,21 +1061,41 @@ export async function handleOAuthStatus(c: Context<AppEnv>) {
   }
 
   const token = await readOauthToken(c.env, id)
-  return c.json<ApiResponse>({
-    success: true,
-    data: {
-      connected: !!token,
-      expiresAt: token?.expires_at ?? null,
-      updatedAt: token?.updated_at ?? null,
-      // 只暴露是否有 Cookie，绝不返回 Cookie 片段（会话凭据）
-      hasCookies: !!(token?.cookies),
-      email: token?.email ?? null,
-      projectId: token?.projectId ?? null,
-      // M365：账号标识（来自 access_token JWT，非敏感凭据）
-      oid: token?.oid ?? null,
-      tid: token?.tid ?? null,
-    },
-  })
+  const data: Record<string, unknown> = {
+    connected: !!token,
+    expiresAt: token?.expires_at ?? null,
+    updatedAt: token?.updated_at ?? null,
+    // 只暴露是否有 Cookie，绝不返回 Cookie 片段（会话凭据）
+    hasCookies: !!(token?.cookies),
+    email: token?.email ?? null,
+    projectId: token?.projectId ?? null,
+    // M365：账号标识（来自 access_token JWT，非敏感凭据）
+    oid: token?.oid ?? null,
+    tid: token?.tid ?? null,
+  }
+  // WorkBuddy 多账号池：返回池账号状态（脱敏）供面板展示
+  if (isOAuthPoolProvider(provider)) {
+    try { await seedOauthPoolFromSingle(c.env, id) } catch { /* ignore */ }
+    data.pool = await listOauthPoolStatus(c.env, id)
+  }
+  return c.json<ApiResponse>({ success: true, data })
+}
+
+/** 删除 WorkBuddy 池内指定 uid 账号。 */
+export async function handleOAuthPoolRemove(c: Context<AppEnv>) {
+  const id = c.req.param('id')
+  if (!id) return c.json<ApiResponse>({ success: false, message: '缺少 id 参数' }, 400)
+  const provider = await getProvider(c.env, id)
+  if (!provider) return c.json<ApiResponse>({ success: false, message: '提供商不存在' }, 404)
+  if (!isOAuthPoolProvider(provider)) {
+    return c.json<ApiResponse>({ success: false, message: '该提供商不是 WorkBuddy 多账号池模式' }, 400)
+  }
+  const body = await c.req.json<{ uid?: string }>().catch(() => ({})) as { uid?: string }
+  const uid = String(body?.uid || '').trim()
+  if (!uid) return c.json<ApiResponse>({ success: false, message: '缺少 uid 参数' }, 400)
+  const removed = await removeOauthAccount(c.env, id, uid)
+  if (!removed) return c.json<ApiResponse>({ success: false, message: '账号不存在' }, 404)
+  return c.json<ApiResponse>({ success: true, message: '已从账号池删除 ' + uid })
 }
 
 /** 发起 OAuth 设备码授权流程，返回授权链接与用户码 */
@@ -1111,13 +1136,17 @@ export async function handleOAuthPoll(c: Context<AppEnv>) {
   })
 }
 
-/** 断开 OAuth 连接，删除 KV 中的 token */
+/** 断开 OAuth 连接，删除 KV 中的 token（池提供商一并清空账号池） */
 export async function handleOAuthDisconnect(c: Context<AppEnv>) {
   const id = c.req.param('id')
   if (!id) return c.json<ApiResponse>({ success: false, message: '缺少 id 参数' }, 400)
   await deleteOauthToken(c.env, id)
-  // M365：一并清理该提供商的会话绑定（云端对话随账号断开失效）
+  // WorkBuddy 多账号池：断开即清空池内全部账号
   const p = await getProvider(c.env, id).catch(() => null)
+  if (p && isOAuthPoolProvider(p)) {
+    await c.env.KV.delete(OAUTH_POOL_KV_PREFIX + id).catch(() => {})
+  }
+  // M365：一并清理该提供商的会话绑定（云端对话随账号断开失效）
   if (p && isM365Provider(p)) {
     await c.env.KV.delete(`m365:sessions:${id}`).catch(() => {})
   }

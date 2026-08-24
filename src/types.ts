@@ -3,6 +3,22 @@ export interface Model {
   enabled: boolean
 }
 
+/**
+ * 账号池冷却参数（trae 与 workbuddy 账号池共用，provider.cooldown 可覆盖默认值）。
+ * 对齐 workbuddy-wild 的 cooldown.* 配置：余额不足（plan）/ 429（soft）/ 连续错误。
+ * 单位均为毫秒；errThreshold 为连续错误触发冷却的阈值（次）。
+ */
+export interface CooldownConfig {
+  /** plan 权益不足长冷却（ms） */
+  planMs?: number
+  /** 429 短冷却（ms） */
+  softMs?: number
+  /** 连续错误触发冷却的阈值（次） */
+  errThreshold?: number
+  /** 连续错误冷却（ms） */
+  errMs?: number
+}
+
 export interface ApiKeyEntry {
   key: string
   enabled: boolean
@@ -33,6 +49,10 @@ export interface Provider {
    * 不配则用默认值：min=2 / max=8 / ttl=30 分钟。
    */
   cnbPool?: { min?: number; max?: number; ttlMinutes?: number }
+  /**
+   * 账号池冷却参数（trae 与 workbuddy 账号池共用）。不配则用各池默认值。
+   */
+  cooldown?: CooldownConfig
   createdAt: string
   updatedAt: string
   /**
@@ -295,6 +315,7 @@ export interface CreateProviderRequest {
   visionBridge?: VisionBridgeConfig
   toolBridge?: boolean
   cnbPool?: { min?: number; max?: number; ttlMinutes?: number }
+  cooldown?: CooldownConfig
   allowUnlistedModels?: boolean
   thinkingInject?: string[]
   cachePrefixInject?: string[]
@@ -315,6 +336,8 @@ export interface UpdateProviderRequest {
   /** 传 null 可清除工具桥开关 */
   toolBridge?: boolean | null
   cnbPool?: { min?: number; max?: number; ttlMinutes?: number } | null
+  /** 传 null 可恢复各池默认冷却参数 */
+  cooldown?: CooldownConfig | null
   allowUnlistedModels?: boolean
   /** 传空数组可清空思维引导注入选择 */
   thinkingInject?: string[] | null
@@ -341,6 +364,7 @@ export interface UpsertProviderRequest {
   enabled?: boolean
   toolBridge?: boolean
   cnbPool?: { min?: number; max?: number; ttlMinutes?: number }
+  cooldown?: CooldownConfig
   allowUnlistedModels?: boolean
   thinkingInject?: string[]
   cachePrefixInject?: string[]
@@ -383,6 +407,11 @@ export interface CheckinResult {
   nickname?: string
   /** 权益包明细（每个包的名称 + 到期时间），来自 get-user-resource Accounts[] */
   packages?: PackageInfo[]
+  /**
+   * WorkBuddy 多账号池：本 provider 下每个池账号的独立签到结果（池提供商才有）。
+   * 面板可按账号逐条展示；汇总字段（success/credits 等）为池整体快照。
+   */
+  accounts?: CheckinResult[]
 }
 
 /** 单个权益包信息（来自 get-user-resource 的 Accounts[] 元素） */

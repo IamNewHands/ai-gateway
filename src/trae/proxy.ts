@@ -17,18 +17,16 @@ import { chatStream, exchangeToken, needsTraeRefresh } from './upstream'
 import { aggregateSoloSse, soloStreamToOpenAIStream } from './sse'
 import type { SOLOStreamError } from './types'
 import {
-  TRAE_ERR_COOLDOWN_MS,
-  TRAE_ERR_THRESHOLD,
-  TRAE_PLAN_COOLDOWN_MS,
-  TRAE_SOFT_COOLDOWN_MS,
   cooldownTraeAccount,
   disableTraeAccount,
   getTraeAccounts,
   noteTraeError,
   noteTraeSuccess,
   pickTraeAccount,
+  resolveTraeCooldown,
   saveTraeAccount,
 } from './pool'
+import type { TraeCooldownConfig } from './pool'
 
 export const TRAE_PROVIDER_ID = 'trae'
 
@@ -125,32 +123,32 @@ function openaiError(status: number, code: string, message: string): Response {
 }
 
 /** HTTP 错误分类 → 冷却状态机（Go chatCompletions status >= 400 分支）。 */
-async function applyChatError(env: Env, providerId: string, uid: string, kind: string): Promise<void> {
+async function applyChatError(env: Env, providerId: string, uid: string, kind: string, cd: TraeCooldownConfig): Promise<void> {
   switch (kind) {
     case 'plan_limit':
-      await cooldownTraeAccount(env, providerId, uid, TRAE_PLAN_COOLDOWN_MS, 'plan 权益不足')
+      await cooldownTraeAccount(env, providerId, uid, cd.planMs, 'plan 权益不足')
       break
     case 'soft_rate':
-      await cooldownTraeAccount(env, providerId, uid, TRAE_SOFT_COOLDOWN_MS, '429 rate limit')
+      await cooldownTraeAccount(env, providerId, uid, cd.softMs, '429 rate limit')
       break
     case 'session_dead':
       await disableTraeAccount(env, providerId, uid, 'session dead')
       break
     case 'not_found':
       // 404 短冷却不累计 errCount（防雪崩）
-      await cooldownTraeAccount(env, providerId, uid, TRAE_SOFT_COOLDOWN_MS, 'upstream 404')
+      await cooldownTraeAccount(env, providerId, uid, cd.softMs, 'upstream 404')
       break
     default:
-      await noteTraeError(env, providerId, uid, TRAE_ERR_THRESHOLD, TRAE_ERR_COOLDOWN_MS)
+      await noteTraeError(env, providerId, uid, cd.errThreshold, cd.errMs)
   }
 }
 
 /** 流内业务错误 → 冷却状态机（Go handleStreamError：1005 plan → 长冷却；其余累计错误）。 */
-async function applyStreamError(env: Env, providerId: string, uid: string, se: SOLOStreamError): Promise<void> {
+async function applyStreamError(env: Env, providerId: string, uid: string, se: SOLOStreamError, cd: TraeCooldownConfig): Promise<void> {
   if (se.code === 1005) {
-    await cooldownTraeAccount(env, providerId, uid, TRAE_PLAN_COOLDOWN_MS, 'plan 权益不足')
+    await cooldownTraeAccount(env, providerId, uid, cd.planMs, 'plan 权益不足')
   } else {
-    await noteTraeError(env, providerId, uid, TRAE_ERR_THRESHOLD, TRAE_ERR_COOLDOWN_MS)
+    await noteTraeError(env, providerId, uid, cd.errThreshold, cd.errMs)
   }
 }
 
@@ -180,6 +178,7 @@ export async function proxyTraeChatRequest(
   body['model'] = configName // setModelInBody：替换为 config_name
 
   const accounts = getTraeAccounts(provider)
+  const cd = resolveTraeCooldown(provider)
   const tried = new Set<string>()
   let lastErr: Error | null = null
 
@@ -203,7 +202,7 @@ export async function proxyTraeChatRequest(
       if (kind === 'session_dead') {
         await disableTraeAccount(env, provider.id, account.uid, 'refresh session dead')
       } else {
-        await cooldownTraeAccount(env, provider.id, account.uid, TRAE_ERR_COOLDOWN_MS, 'refresh: ' + ((e as Error).message || '').substring(0, 120))
+        await cooldownTraeAccount(env, provider.id, account.uid, cd.errMs, 'refresh: ' + ((e as Error).message || '').substring(0, 120))
       }
       continue
     }
@@ -213,7 +212,7 @@ export async function proxyTraeChatRequest(
       resp = await chatStream(account, body)
     } catch (e) {
       lastErr = e as Error
-      await applyChatError(env, provider.id, account.uid, (e as any).kind || 'client')
+      await applyChatError(env, provider.id, account.uid, (e as any).kind || 'client', cd)
       continue
     }
 
@@ -223,7 +222,7 @@ export async function proxyTraeChatRequest(
         return openaiError(502, 'upstream_empty', 'upstream returned empty body')
       }
       // 流内业务错误（1005 plan/5xx 等）→ 冷却账号，错误信息注入 SSE
-      const onErr = (se: SOLOStreamError) => { void applyStreamError(env, provider.id, account.uid, se) }
+      const onErr = (se: SOLOStreamError) => { void applyStreamError(env, provider.id, account.uid, se, cd) }
       // 包 SSE 心跳 + idle 兜底：思考模型静默期客户端会因无事件 idle 超时判定流结束
       //（实测 ~15-20s 自动截断），`: keep-alive\n\n` 注释行重置客户端计时器；上游
       // 超过 TRAE_STREAM_IDLE_TIMEOUT_MS 完全无数据则主动结束流防挂起。
@@ -248,7 +247,7 @@ export async function proxyTraeChatRequest(
     const agg = aggregateSoloSse(text)
     if (agg.err) {
       lastErr = new Error(`solo stream error code=${agg.err.code} msg=${agg.err.msg}`)
-      await applyStreamError(env, provider.id, account.uid, agg.err)
+      await applyStreamError(env, provider.id, account.uid, agg.err, cd)
       continue
     }
     await noteTraeSuccess(env, provider.id, account.uid)

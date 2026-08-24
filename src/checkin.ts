@@ -16,7 +16,7 @@
  */
 import { Context } from 'hono'
 import type { Env, Provider, CheckinResult, PackageInfo, ApiResponse } from './types'
-import { KV_KEYS, CHECKIN_RESULT_TTL_SEC } from './config'
+import { KV_KEYS, CHECKIN_RESULT_TTL_SEC, OAUTH_TOKEN_REFRESH_MARGIN_MS } from './config'
 import { getProviders } from './storage'
 import { getOauthAccessToken, detectTokenRealm, readOauthToken } from './oauth'
 import { writeLog } from './admin'
@@ -25,6 +25,14 @@ import { fetchQoderCheckinStatus, performQoderCheckin, fetchQoderUserResource, f
 import { isTraeProvider } from './trae/proxy'
 import { runTraeCheckins } from './trae/admin'
 import type { TraeCheckinResult } from './trae/types'
+import {
+  isOAuthPoolProvider,
+  readOauthPool,
+  refreshOauthPoolAccount,
+  reenableOauthIfCredits,
+  seedOauthPoolFromSingle,
+} from './oauth-pool'
+import type { OAuthPoolAccount } from './oauth-pool'
 
 const CHECKIN_BASE_CN = 'https://www.codebuddy.cn'
 
@@ -446,7 +454,179 @@ async function writeCheckinResult(env: Env, providerId: string, result: CheckinR
 
 // ===== 单账号签到 =====
 
+/**
+ * WorkBuddy 池内单账号签到 + 额度刷新 + 解冻。
+ * 账号 credentials 来自池（oauth:pool:<id>），token 临近过期先刷新（写回池）。
+ */
+async function checkinOauthPoolAccount(
+  env: Env,
+  provider: Provider,
+  account: OAuthPoolAccount
+): Promise<CheckinResult> {
+  const now = Date.now()
+  const base: CheckinResult = {
+    providerId: provider.id,
+    name: provider.name,
+    realm: 'unknown',
+    success: false,
+    reason: 'fail',
+    message: '',
+    todayCheckedIn: false,
+    updatedAt: now,
+    nickname: account.nickname || undefined,
+  }
+
+  let token = account.token?.access_token || ''
+  if (!token) {
+    base.reason = 'skipped_no_token'
+    base.message = '无 access token'
+    return base
+  }
+  // 临近过期先刷新（写回池）
+  if (account.token.refresh_token && account.token.expires_at - Date.now() < OAUTH_TOKEN_REFRESH_MARGIN_MS) {
+    try {
+      const refreshed = await refreshOauthPoolAccount(env, provider.id, account.uid, provider.oauth!)
+      if (refreshed) token = refreshed.token.access_token
+    } catch { /* 刷新失败继续用旧 token */ }
+  }
+  if (!token) {
+    base.reason = 'skipped_no_token'
+    base.message = 'token 刷新失败，无可用 access token'
+    return base
+  }
+
+  const claims = decodeJwtClaims(token)
+  const uid = account.uid || pickClaim(claims, 'uid', 'user_id', 'userId', 'sub')
+  const enterpriseId = pickClaim(claims, 'enterprise_id', 'enterpriseId', 'tenant_id', 'tenantId')
+  if (!base.nickname) {
+    const nickname = pickClaim(claims, 'nickname', 'name', 'username', 'nick')
+    if (nickname) base.nickname = nickname
+  }
+
+  const realm = detectTokenRealm(token)
+  if (realm === 'global') {
+    base.realm = 'global'
+    base.reason = 'skipped_global'
+    base.message = '国际版账号无签到功能'
+    base.success = true
+    await fillCredits(env, base, token, 'global', uid, enterpriseId)
+    return base
+  }
+  if (realm !== 'cn') {
+    base.realm = 'unknown'
+    base.reason = 'fail'
+    base.message = '无法判断账号领域（非 WorkBuddy token）'
+    return base
+  }
+  base.realm = 'cn'
+
+  // 状态探测
+  const status = await fetchCheckinStatus(token, 'cn')
+  if (status) {
+    base.todayCheckedIn = status.todayCheckedIn
+    base.streakDays = status.streakDays
+    base.totalCredits = status.totalCredits
+    base.dailyCredit = status.dailyCredit
+    if (status.todayCheckedIn) {
+      base.success = true
+      base.reason = 'already'
+      base.message = '今日已签到'
+      base.lastCheckinAt = now
+      await fillCredits(env, base, token, 'cn', uid, enterpriseId)
+      return base
+    }
+  }
+
+  // 执行签到
+  const res = await performCheckin(token, 'cn', env)
+  base.success = res.success
+  base.message = res.message
+  base.reason = res.success ? 'ok' : 'fail'
+  base.lastCheckinAt = now
+  if (res.success) base.todayCheckedIn = true
+
+  // 额度信息 + 解冻（签到就是为了解冻冷却账号，对齐 workbuddy-wild ReenableIfCredits）
+  await fillCredits(env, base, token, 'cn', uid, enterpriseId)
+  try {
+    if (typeof base.totalRemain === 'number') {
+      await reenableOauthIfCredits(env, provider.id, account.uid, base.totalRemain)
+    }
+  } catch { /* ignore */ }
+  return base
+}
+
+/** WorkBuddy 池全账号签到，返回带 accounts 的汇总 CheckinResult（存 KV 供面板展示）。 */
+async function checkinOauthPoolAccounts(env: Env, provider: Provider): Promise<CheckinResult> {
+  const now = Date.now()
+  const base: CheckinResult = {
+    providerId: provider.id,
+    name: provider.name,
+    realm: 'unknown',
+    success: false,
+    reason: 'fail',
+    message: '',
+    todayCheckedIn: false,
+    updatedAt: now,
+  }
+  // 兼容迁移：池空时把既有单 token 种子进池
+  try { await seedOauthPoolFromSingle(env, provider.id) } catch { /* ignore */ }
+  const pool = await readOauthPool(env, provider.id)
+  if (pool.length === 0) {
+    base.reason = 'skipped_no_token'
+    base.message = '账号池为空（未登录任何账号）'
+    return base
+  }
+
+  const accounts: CheckinResult[] = []
+  let success = 0, already = 0, fail = 0, skipped = 0
+  for (const acc of pool) {
+    try {
+      const r = await checkinOauthPoolAccount(env, provider, acc)
+      accounts.push(r)
+      if (r.success) {
+        if (r.reason === 'already') already++
+        else if (r.reason === 'ok') success++
+        else skipped++
+      } else {
+        fail++
+      }
+    } catch (e) {
+      accounts.push({
+        providerId: provider.id, name: provider.name, realm: 'unknown',
+        success: false, reason: 'fail', message: (e as Error).message || String(e),
+        todayCheckedIn: false, updatedAt: Date.now(), nickname: acc.nickname || acc.uid,
+      })
+      fail++
+    }
+  }
+
+  base.accounts = accounts
+  base.todayCheckedIn = accounts.some((a) => a.todayCheckedIn)
+  base.success = success > 0 || already > 0
+  base.reason = base.success ? 'ok' : (fail > 0 ? 'fail' : 'skipped_no_token')
+  base.message = `共 ${accounts.length} 个账号：成功 ${success} / 已签 ${already} / 失败 ${fail} / 跳过 ${skipped}`
+  // 汇总额度：取任一成功账号
+  const okOne = accounts.find((a) => a.reason === 'ok' || a.reason === 'already')
+  if (okOne) {
+    base.totalRemain = okOne.totalRemain
+    base.totalUsed = okOne.totalUsed
+    base.totalSize = okOne.totalSize
+    base.packCount = okOne.packCount
+    base.paymentType = okOne.paymentType
+    base.nickname = okOne.nickname
+    base.streakDays = okOne.streakDays
+    base.totalCredits = okOne.totalCredits
+  }
+  await writeCheckinResult(env, provider.id, base)
+  return base
+}
+
 export async function checkinOneAccount(env: Env, provider: Provider): Promise<CheckinResult> {
+  // WorkBuddy 多账号池：browser 登录流提供商遍历池内所有账号各自签到，返回带 accounts 的汇总结果
+  if (isOAuthPoolProvider(provider)) {
+    return checkinOauthPoolAccounts(env, provider)
+  }
+
   const now = Date.now()
   const base: CheckinResult = {
     providerId: provider.id,

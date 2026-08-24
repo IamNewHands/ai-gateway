@@ -24,6 +24,7 @@ import {
   handleOAuthConnect,
   handleOAuthPoll,
   handleOAuthDisconnect,
+  handleOAuthPoolRemove,
   handleOAuthModels,
   handleOAuthGeminiCallback,
   handleOAuthM365Callback,
@@ -170,6 +171,8 @@ app.get('/admin/api/oauth/:id/status', handleOAuthStatus)
 app.post('/admin/api/oauth/:id/connect', handleOAuthConnect)
 app.post('/admin/api/oauth/:id/poll', handleOAuthPoll)
 app.post('/admin/api/oauth/:id/disconnect', handleOAuthDisconnect)
+// WorkBuddy 多账号池：删除池内指定 uid 账号
+app.post('/admin/api/oauth/:id/pool/remove', handleOAuthPoolRemove)
 // S5：模型拉取有副作用（请求上游并自动合并保存到 provider.models），改 POST 防链接型 CSRF
 app.post('/admin/api/oauth/:id/models', handleOAuthModels)
 // Gemini 授权回调：浏览器授权后把地址栏 URL 粘贴回后台提交（POST { callbackUrl }）

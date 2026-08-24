@@ -5,7 +5,6 @@
 import { TRAE_CHAT_CONNECT_TIMEOUT_MS, TRAE_CONSTANTS, TRAE_UA } from './constants'
 import { prepareBody } from './payload'
 import type { TraeAccount, TraeErrKind, TraeModelInfo } from './types'
-import type { Env } from '../types'
 
 // ===== 错误分类（SPEC §4.3） =====
 
@@ -447,19 +446,12 @@ export async function performCheckinClaim(account: TraeAccount): Promise<void> {
 }
 
 /** 聚合剩余积分（ide_user_ent_usage）：每包 credits_limit（总量）− credits_amount（已用），负值按 0。 */
-export async function fetchUserEntUsage(account: TraeAccount, env?: Env): Promise<number> {
+export async function fetchUserEntUsage(account: TraeAccount): Promise<number> {
   const raw = await doJsonText(TRAE_CONSTANTS.UgHost + TRAE_CONSTANTS.EpEntUsage, ugHeaders(account), {})
   let data: any
   try { data = JSON.parse(raw) } catch { data = null }
   const packs = data?.user_entitlement_pack_list
   if (!Array.isArray(packs)) throw new Error('ent usage parse: missing user_entitlement_pack_list')
-  // 诊断：完整原始响应写入面板日志（临时，确认剩余值后删除）
-  if (env) {
-    try {
-      const { writeLog } = await import('../admin')
-      await writeLog(env, 'info', '[trae.ent-usage] ' + account.uid + ' raw', raw.substring(0, 3500))
-    } catch { /* 日志写入失败不影响积分计算 */ }
-  }
   let remain = 0
   for (const p of packs) {
     const quota: Record<string, any> = p?.entitlement_base_info?.quota || {}

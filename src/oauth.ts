@@ -7,6 +7,28 @@ import { startM365PKCE, submitM365PKCECallback, m365ROPC, refreshM365Token } fro
 const deviceKey = (providerId: string) => KV_KEYS.OAUTH_DEVICE_PREFIX + providerId
 const tokenKey = (providerId: string) => KV_KEYS.OAUTH_TOKEN_PREFIX + providerId
 
+/** WorkBuddy 多账号池 KV 前缀（oauth-pool.ts 复用，避免循环依赖）。 */
+export const OAUTH_POOL_KV_PREFIX = 'oauth:pool:'
+
+/** 从 JWT payload 提取 uid（不验签；非 JWT 或无法解析返回空串）。 */
+export function decodeJwtUid(token: string): string {
+  try {
+    const parts = token.split('.')
+    if (parts.length < 2) return ''
+    let b64 = parts[1].replace(/-/g, '+').replace(/_/g, '/')
+    while (b64.length % 4) b64 += '='
+    const payload = JSON.parse(atob(b64)) as Record<string, any>
+    if (!payload || typeof payload !== 'object') return ''
+    for (const k of ['uid', 'user_id', 'userId', 'sub', 'UserID']) {
+      const v = payload[k]
+      if (v !== undefined && v !== null && String(v).trim() !== '') return String(v).trim()
+    }
+    return ''
+  } catch {
+    return ''
+  }
+}
+
 async function readJson<T>(env: Env, key: string): Promise<T | null> {
   const raw = await env.KV.get(key)
   if (!raw) return null
@@ -412,17 +434,61 @@ async function pollOauthBrowserFlow(env: Env, providerId: string, cfg: OAuthDevi
     // 只记录是否有 Cookie（长度），绝不打印原文
     console.log(`[oauth-poll] provider=${providerId} set-cookie from poll response: ${newCookies ? `yes (${newCookies.length} chars)` : '(none)'}`)
     console.log(`[oauth-poll] provider=${providerId} device.cookies from login: ${device.cookies ? `yes (${device.cookies.length} chars)` : '(none)'}`)
-    await writeOauthToken(env, providerId, {
+    const tokenState: OAuthTokenState = {
       access_token: tok.accessToken,
       refresh_token: tok.refreshToken,
       expires_at: Date.now() + expiresInSec * 1000,
       updated_at: Date.now(),
       cookies: newCookies,
-    })
+    }
+    await writeOauthToken(env, providerId, tokenState)
+    // WorkBuddy 多账号池：每次成功登录把一个账号 upsert 进池（按 JWT uid 去重），
+    // 池内多个账号按剩余积分自动挑选、错误冷却轮换。
+    await browserPoolUpsert(env, providerId, tokenState)
     await env.KV.delete(deviceKey(providerId))
     return { status: 'success', message: 'OAuth 连接成功' }
   } catch (err) {
     return { status: 'error', message: `轮询异常: ${(err as Error).message || '未知错误'}` }
+  }
+}
+
+/** 池内账号的最小结构（与 src/oauth-pool.ts 的 OAuthPoolAccount 保持字段兼容）。 */
+interface BrowserPoolAccount {
+  uid: string
+  nickname?: string
+  token: OAuthTokenState
+  enabled: boolean
+  state: { credits: number; disabled: boolean; reason?: string; until: number; errCount: number }
+  updatedAt: number
+}
+
+/** 把一次成功登录的 browser token upsert 进 WorkBuddy 账号池（按 uid）。 */
+async function browserPoolUpsert(env: Env, providerId: string, token: OAuthTokenState): Promise<void> {
+  const uid = decodeJwtUid(token.access_token)
+  if (!uid) return // 非 JWT（无法确定账号身份）不进池
+  try {
+    const key = OAUTH_POOL_KV_PREFIX + providerId
+    const raw = await env.KV.get(key)
+    let pool: BrowserPoolAccount[] = []
+    try { pool = raw ? JSON.parse(raw) : [] } catch { pool = [] }
+    if (!Array.isArray(pool)) pool = []
+    const existing = pool.find((a) => a.uid === uid)
+    if (existing) {
+      existing.token = token
+      existing.enabled = true
+      existing.updatedAt = Date.now()
+    } else {
+      pool.push({
+        uid,
+        token,
+        enabled: true,
+        state: { credits: 0, disabled: false, until: 0, errCount: 0 },
+        updatedAt: Date.now(),
+      })
+    }
+    await env.KV.put(key, JSON.stringify(pool))
+  } catch (e) {
+    console.warn(`[oauth-pool] upsert failed: ${(e as Error).message}`)
   }
 }
 
@@ -1054,18 +1120,34 @@ async function refreshOauthTokenDevice(env: Env, providerId: string, cfg: OAuthD
   }
 }
 
-/** 浏览器登录模式的 token 刷新（POST header X-Refresh-Token） */
+/** 浏览器登录模式的 token 刷新（POST header X-Refresh-Token）。 */
 async function refreshOauthTokenBrowser(env: Env, providerId: string, cfg: OAuthDeviceConfig): Promise<boolean> {
   const state = await readOauthToken(env, providerId)
   if (!state?.refresh_token) return false
+  const fresh = await refreshBrowserTokenState(env, providerId, cfg, state)
+  if (!fresh) return false
+  await writeOauthToken(env, providerId, fresh)
+  return true
+}
 
+/**
+ * 对指定的 browser token state 执行刷新，返回新 state（供单 token 与 WorkBuddy 多账号池共用）。
+ * 失败返回 null（调用方决定禁用/冷却账号）。
+ */
+export async function refreshBrowserTokenState(
+  env: Env,
+  providerId: string,
+  cfg: OAuthDeviceConfig,
+  state: OAuthTokenState
+): Promise<OAuthTokenState | null> {
+  if (!state?.refresh_token) return null
   try {
     // 按 token 的 JWT iss 判断域：Global 账号必须用 workbuddy.ai 刷新端点，否则 401
     const realm = detectTokenRealm(state.access_token) === 'global' ? 'global' : 'cn'
     const refreshUrl = browserRefreshUrl(cfg, realm)
     if (!refreshUrl) {
       console.warn(`[oauth-refresh] provider=${providerId} 国际版 token 但未配置 globalRefreshTokenUrl，跳过刷新`)
-      return false
+      return null
     }
     const res = await fetch(refreshUrl, {
       method: 'POST',
@@ -1076,23 +1158,22 @@ async function refreshOauthTokenBrowser(env: Env, providerId: string, cfg: OAuth
       body: '',
       signal: AbortSignal.timeout(15000),
     })
-    if (!res.ok) return false
+    if (!res.ok) return null
 
     const env_resp = (await res.json().catch(() => null)) as CodeBuddyEnvelope<CodeBuddyTokenData> | null
-    if (!env_resp || env_resp.code !== 0 || !env_resp.data?.accessToken) return false
+    if (!env_resp || env_resp.code !== 0 || !env_resp.data?.accessToken) return null
 
     const tok = env_resp.data
-    await writeOauthToken(env, providerId, {
+    return {
       access_token: tok.accessToken,
       refresh_token: tok.refreshToken || state.refresh_token,
       expires_at: Date.now() + (tok.expiresIn || 7200) * 1000,
       updated_at: Date.now(),
       // R5：刷新后必须保留/更新 cookie jar——browser 模式上游 API 依赖 cookie 会话
       cookies: res.headers.get('Set-Cookie') || state.cookies,
-    })
-    return true
+    }
   } catch {
-    return false
+    return null
   }
 }
 

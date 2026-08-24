@@ -1,6 +1,6 @@
 import { Context } from 'hono'
 import { getProvider, getProviders, getModelsListCache, setModelsListCache, getUnimodel, getUnimodels, resolveProviderBaseUrl, getResponseHistory, saveResponseHistory } from './storage'
-import { KV_KEYS, KEY_HEALTH_COOLDOWN_MS, KEY_HEALTH_MAX_FAILURES, UNIMODEL_PROVIDER_ID } from './config'
+import { KV_KEYS, KEY_HEALTH_COOLDOWN_MS, KEY_HEALTH_MAX_FAILURES, OAUTH_TOKEN_REFRESH_MARGIN_MS, UNIMODEL_PROVIDER_ID } from './config'
 import type { AppEnv, Env, ProxyRequestBody } from './types'
 import { createAnalyticsContext, normalizeAnthropicUsage, normalizeChatUsage, normalizeResponsesUsage, summarizeError } from './analytics/types'
 import type { AnalyticsContext, UsageMetrics } from './analytics/types'
@@ -25,6 +25,17 @@ import { getPerfSettings } from './perf'
 import { applyThinkingInjection } from './thinking'
 import { applyCachePrefixInjection } from './cache-prefix'
 import { getOauthAccessToken, readOauthToken, refreshOauthToken, detectTokenRealm, buildOauthHeaders } from './oauth'
+import {
+  cooldownOauthAccount,
+  disableOauthAccount,
+  isOAuthPoolProvider,
+  noteOauthError,
+  noteOauthSuccess,
+  pickOauthAccount,
+  refreshOauthPoolAccount,
+  resolveOauthCooldown,
+  seedOauthPoolFromSingle,
+} from './oauth-pool'
 import {
   anthropicToOpenAI,
   openAIToAnthropic,
@@ -221,6 +232,68 @@ function sanitizeText(s: string): string {
     'Default\u200B branch (you will usually use this for PRs)'
   )
   return s
+}
+
+/**
+ * 是否为 WorkBuddy/CodeBuddy 提供商（browser 登录流，或 id 以 workbuddy 开头）。
+ * 上游 copilot.tencent.com 只支持流式、只接受字符串 tool_choice，且对 developer 角色敏感，
+ * 因此这类提供商在转发前需要额外的请求体改写（见 sanitizeUpstreamBody / normalizeOpenAIToolChoice）。
+ */
+function isWorkbuddyProvider(provider: { id?: string; authType?: string; oauth?: { flowType?: string } }): boolean {
+  return Boolean(
+    (provider.authType === 'oauth-device' && provider.oauth?.flowType === 'browser') ||
+    (typeof provider.id === 'string' && provider.id.startsWith('workbuddy'))
+  )
+}
+
+/**
+ * 归一化 OpenAI tool_choice（对齐 traework2api / workbuddy-wild 的 PrepareBody 不变量）：
+ * WorkBuddy 上游只接受字符串形式，对象形式会 400 code=11101。
+ *  - "none" / {"type":"none"} → 删 tool_choice + 删 tools/functions
+ *  - {"type":"auto"/"required"} → 字符串 "auto"/"required"
+ *  - {"type":"function","function":{"name":"x"}} → 字符串 "x"
+ *  - 其他对象/非标量 → 删 tool_choice
+ */
+function normalizeOpenAIToolChoice(body: Record<string, unknown>): void {
+  const tc = body['tool_choice']
+  if (tc === undefined) return
+  const suppressTools = () => {
+    delete body['tools']
+    delete body['functions']
+  }
+  if (typeof tc === 'string') {
+    if (tc.trim().toLowerCase() === 'none') {
+      delete body['tool_choice']
+      suppressTools()
+    }
+    return
+  }
+  if (tc && typeof tc === 'object' && !Array.isArray(tc)) {
+    const o = tc as Record<string, unknown>
+    const typ = typeof o['type'] === 'string' ? o['type'].trim().toLowerCase() : ''
+    switch (typ) {
+      case 'none':
+        delete body['tool_choice']
+        suppressTools()
+        break
+      case 'auto':
+      case 'required':
+        body['tool_choice'] = typ
+        break
+      case 'function': {
+        const fn = o['function'] as Record<string, unknown> | undefined
+        const name = (
+          fn && typeof fn === 'object' ? String(fn['name'] || '') : String(o['name'] || '')
+        ).trim()
+        body['tool_choice'] = name !== '' ? name : 'auto'
+        break
+      }
+      default:
+        delete body['tool_choice']
+    }
+    return
+  }
+  delete body['tool_choice']
 }
 
 /**
@@ -502,6 +575,9 @@ function passthroughResponse(response: Response, cleanFn?: (chunk: string) => st
 
 const isStreamRequest = (body: ProxyRequestBody): boolean => body.stream === true
 const getRoute = (url: URL): string => url.pathname.replace(/^\/v1\//, '') || 'chat/completions'
+
+/** WorkBuddy 多账号池单请求最多换号次数（对齐 trae MAX_ROTATE / Go 默认 3）。 */
+const MAX_OAUTH_ROTATE = 3
 
 // P7：上游请求头白名单透传（从 aihub 移植）。
 // 客户端发来的一层自定义头（如 OpenRouter 的 X-Title / HTTP-Referer、x-api-key 认证、
@@ -1533,6 +1609,190 @@ function logOAuthRequest(c: Context<AppEnv>, provider: import('./types').Provide
   } catch { /* log failure must not break */ }
 }
 
+/**
+ * WorkBuddy 多账号池转发核心：每请求最多轮转 MAX_OAUTH_ROTATE 个账号。
+ * 挑号（剩余积分最高）→ 临近过期先刷新 → 转发；失败按错误分类冷却/禁用并换号：
+ *   401/403（session 失效）→ 先刷新一次，仍失败禁用该账号；
+ *   429 → 短冷却；404 → 短冷却（不累计 errCount）；5xx/其他 → 累计错误达阈值中冷却；
+ *   plan 权益不足（响应体 1005/plan）→ 长冷却。签到后 credits>0 自动解冻。
+ * 成功返回原始上游 Response（由调用方决定透传/聚合/转 Anthropic）；无健康账号抛错。
+ */
+async function proxyOAuthRequestPooledCore(
+  c: Context<AppEnv>,
+  provider: import('./types').Provider,
+  subPath: string,
+  search: string,
+  forwardBody: object,
+  method: string = c.req.method
+): Promise<{ response: Response; originalStream: boolean }> {
+  const cfg = provider.oauth!
+  const cd = resolveOauthCooldown(provider)
+
+  // 兼容迁移：池空时把既有单 token 种子进池
+  try { await seedOauthPoolFromSingle(c.env, provider.id) } catch { /* ignore */ }
+
+  const resolveRealm = (token: string): 'cn' | 'global' => {
+    return detectTokenRealm(token) === 'global' ? 'global' : 'cn'
+  }
+  const buildForwardUrl = (realm: 'cn' | 'global') => {
+    const realmBase = (realm === 'global' && cfg.globalBaseUrl ? cfg.globalBaseUrl : provider.baseUrl).replace(/\/$/, '')
+    return `${realmBase}/${subPath}${search}`
+  }
+  const buildOrigin = (realm: 'cn' | 'global') => {
+    return realm === 'global' && cfg.globalOrigin ? cfg.globalOrigin : (cfg.extraHeaders?.Origin)
+  }
+  // 备用域（401 自动切换用）：CN token 不尝试 Global 域（必然 401）
+  const altRealm = (realm: 'cn' | 'global'): 'cn' | 'global' | null => {
+    if (realm === 'cn') return null
+    return 'cn'
+  }
+
+  const doFetch = (token: string, cookies: string | undefined, realm?: 'cn' | 'global') => {
+    const r = realm || resolveRealm(token)
+    const body = { ...forwardBody } as Record<string, unknown>
+    // 捕获客户端原始 stream 意图（force 前），供非流式聚合判断
+    const originalStream = body.stream === true
+    if (isWorkbuddyProvider(provider) && body.stream !== true) body.stream = true
+    if (isWorkbuddyProvider(provider)) {
+      sanitizeUpstreamBody(body)
+      normalizeOpenAIToolChoice(body)
+    }
+    return fetchUpstream(c.env, buildForwardUrl(r), {
+      method,
+      headers: buildOauthHeaders(cfg, token, { origin: buildOrigin(r), apiType: provider.apiType, cookies }),
+      body: method === 'GET' || method === 'HEAD' ? undefined : JSON.stringify(body),
+    }, (body as Record<string, unknown>).stream === true || isWorkbuddyProvider(provider)).then(resp => ({ resp, originalStream }))
+  }
+
+  const doFetchWithRetry = async (token: string, cookies: string | undefined, realm?: 'cn' | 'global') => {
+    let result = await doFetch(token, cookies, realm)
+    let transientRetries = 0
+    while (isTransientStatus(result.resp.status) && transientRetries < TRANSIENT_RETRY_MAX) {
+      transientRetries++
+      await new Promise((r) => setTimeout(r, TRANSIENT_RETRY_DELAY_MS * transientRetries))
+      result = await doFetch(token, cookies, realm)
+    }
+    return result
+  }
+
+  const tried = new Set<string>()
+  let lastErr: Error | null = null
+
+  for (let i = 0; i < MAX_OAUTH_ROTATE; i++) {
+    const account = await pickOauthAccount(c.env, provider.id, tried)
+    if (!account) break
+    tried.add(account.uid)
+
+    // 临近过期 → 先刷新（写回池）
+    let token = account.token.access_token
+    if (account.token.refresh_token && account.token.expires_at - Date.now() < OAUTH_TOKEN_REFRESH_MARGIN_MS) {
+      try {
+        const refreshed = await refreshOauthPoolAccount(c.env, provider.id, account.uid, cfg)
+        if (refreshed) token = refreshed.token.access_token
+      } catch { /* 刷新失败继续用旧 token，走 401 兜底 */ }
+    }
+    if (!token) {
+      await disableOauthAccount(c.env, provider.id, account.uid, 'no access token')
+      continue
+    }
+
+    const primaryRealm = resolveRealm(token)
+    let { resp: response, originalStream } = await doFetchWithRetry(token, account.token.cookies)
+
+    // 401/403：先刷新一次（仍 401 则尝试备用域；再失败禁用换号）
+    if (response.status === 401 || response.status === 403) {
+      let refreshedToken: string | null = null
+      if (account.token.refresh_token) {
+        const refreshed = await refreshOauthPoolAccount(c.env, provider.id, account.uid, cfg)
+        if (refreshed) refreshedToken = refreshed.token.access_token
+      }
+      if (refreshedToken) {
+        const retry = await doFetchWithRetry(refreshedToken, account.token.cookies)
+        if (retry.resp.ok || retry.resp.status !== 401) {
+          response = retry.resp
+          originalStream = retry.originalStream
+        }
+      }
+      // 刷新后仍 401 → 尝试备用域一次
+      if (response.status === 401) {
+        const alt = altRealm(primaryRealm)
+        if (alt) {
+          const altResult = await doFetchWithRetry(refreshedToken || token, account.token.cookies, alt)
+          if (altResult.resp.ok || altResult.resp.status !== 401) {
+            response = altResult.resp
+            originalStream = altResult.originalStream
+          }
+        }
+      }
+      if (response.status === 401 || response.status === 403) {
+        await disableOauthAccount(c.env, provider.id, account.uid, 'session dead (401/403)')
+        lastErr = new Error(`account ${account.uid} session dead`)
+        continue
+      }
+    } else if (response.status === 429) {
+      await cooldownOauthAccount(c.env, provider.id, account.uid, cd.softMs, '429 rate limit')
+      lastErr = new Error(`account ${account.uid} rate limited`)
+      continue
+    } else if (response.status === 404) {
+      await cooldownOauthAccount(c.env, provider.id, account.uid, cd.softMs, 'upstream 404')
+      lastErr = new Error(`account ${account.uid} upstream 404`)
+      continue
+    } else if (!response.ok) {
+      // plan 权益不足（1005/plan）→ 长冷却；其余累计错误
+      const text = await response.text().catch(() => '')
+      if (text.includes('1005') || text.toLowerCase().includes('plan')) {
+        await cooldownOauthAccount(c.env, provider.id, account.uid, cd.planMs, 'plan 权益不足')
+      } else {
+        await noteOauthError(c.env, provider.id, account.uid, cd)
+      }
+      lastErr = new Error(`account ${account.uid} http ${response.status}`)
+      continue
+    }
+
+    // 成功：记账成功，返回原始上游响应
+    await noteOauthSuccess(c.env, provider.id, account.uid)
+    return { response, originalStream }
+  }
+
+  throw new Error('no healthy account (cooling/disabled)' + (lastErr ? ': ' + lastErr.message : ''))
+}
+
+/** WorkBuddy 多账号池 OpenAI 转发入口（透传/聚合 + 错误 JSON）。 */
+async function proxyOAuthRequestPooled(
+  c: Context<AppEnv>,
+  provider: import('./types').Provider,
+  subPath: string,
+  search: string,
+  forwardBody: object,
+  method: string = c.req.method
+): Promise<Response> {
+  const model = (forwardBody as Record<string, unknown>).model as string
+  try {
+    const { response, originalStream } = await proxyOAuthRequestPooledCore(c, provider, subPath, search, forwardBody, method)
+    // WorkBuddy 非流式请求：收集 SSE 流并聚合成非流式 chat.completion 返回
+    if (response.ok && originalStream !== true && isWorkbuddyProvider(provider) && response.body) {
+      try {
+        const aggregated = await aggregateWorkbuddySSE(response.body, model)
+        logOAuthRequest(c, provider, model, subPath, forwardBody, 200)
+        return new Response(aggregated, {
+          status: 200,
+          headers: { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' },
+        })
+      } catch (aggErr) {
+        console.error('[proxy-oauth-pool] SSE aggregation failed:', aggErr)
+        // 聚合失败回退透传
+      }
+    }
+    logOAuthRequest(c, provider, model, subPath, forwardBody, response.status)
+    return passthroughResponse(response, cleanWorkbuddyChunk)
+  } catch (err) {
+    logOAuthRequest(c, provider, model, subPath, forwardBody, 503)
+    return c.json({
+      error: { message: `OAuth 账号池无可用账号：${(err as Error).message || '未知错误'}`, type: 'no_healthy_account' },
+    }, 503)
+  }
+}
+
 async function proxyOAuthRequest(
   c: Context<AppEnv>,
   provider: import('./types').Provider,
@@ -1542,6 +1802,12 @@ async function proxyOAuthRequest(
   method: string = c.req.method
 ): Promise<Response> {
   const cfg = provider.oauth!
+
+  // WorkBuddy 多账号池：browser 登录流提供商走池化转发（挑号 + 冷却/禁用 + 轮转）
+  if (isOAuthPoolProvider(provider)) {
+    return proxyOAuthRequestPooled(c, provider, subPath, search, forwardBody, method)
+  }
+
   const model = (forwardBody as Record<string, unknown>).model as string
 
   // 先从 KV 读取 token 状态（含 cookies）
@@ -1570,14 +1836,20 @@ async function proxyOAuthRequest(
     const body = { ...forwardBody } as Record<string, unknown>
     // WorkBuddy 只支持流式请求，强制 stream: true（所有以 workbuddy 开头的 provider ID）
     const originalStream = body.stream
-    if (provider.id.startsWith('workbuddy') && body.stream !== true) {
+    if (isWorkbuddyProvider(provider) && body.stream !== true) {
       body.stream = true
+    }
+    // WorkBuddy 上游改写三件套：developer→system / 删 reasoning_effort / 空 content + tool_choice 归一化
+    //（对齐 workbuddy-wild PrepareBody 关键不变量；仅 workbuddy 提供商，避免影响其他 oauth 提供商）
+    if (isWorkbuddyProvider(provider)) {
+      sanitizeUpstreamBody(body)
+      normalizeOpenAIToolChoice(body)
     }
     return fetchUpstream(c.env, buildForwardUrl(r), {
       method,
       headers: buildOauthHeaders(cfg, token, { origin: buildOrigin(r), apiType: provider.apiType, cookies: tokenState?.cookies }),
       body: method === 'GET' || method === 'HEAD' ? undefined : JSON.stringify(body),
-    }, (body as Record<string, unknown>).stream === true || provider.id.startsWith('workbuddy')).then(resp => ({ resp, originalStream }))
+    }, (body as Record<string, unknown>).stream === true || isWorkbuddyProvider(provider)).then(resp => ({ resp, originalStream }))
   }
 
   // 瞬时错误自动重试：对同一 token 的瞬时 5xx / 网络抖动重试 1 次，
@@ -1647,7 +1919,7 @@ async function proxyOAuthRequest(
     // WorkBuddy 非流式请求：收集 SSE 流并聚合成非流式 chat.completion 返回
     // 注意：WorkBuddy 上游 API 不直接支持非流式请求，必须发流式请求再聚合。
     // 所有以 workbuddy 开头的 provider ID 均需此处理（workbuddy, workbuddy2 等）。
-    if (response.ok && originalStream !== true && provider.id.startsWith('workbuddy') && response.body) {
+    if (response.ok && originalStream !== true && isWorkbuddyProvider(provider) && response.body) {
       try {
         const aggregated = await aggregateWorkbuddySSE(response.body, (forwardBody as Record<string, unknown>).model as string)
         logOAuthRequest(c, provider, model, subPath, forwardBody, 200)
@@ -1659,39 +1931,6 @@ async function proxyOAuthRequest(
         console.error('[proxy-oauth] SSE aggregation failed:', aggErr)
         // 聚合失败，回退到透传（客户端可能能处理）
       }
-    }
-
-    // 诊断：WorkBuddy 流式透传前，统计上游响应实际字节数并采样内容。
-    // 用于区分 "Trae 收到的为空响应" 与 "上游正常返回但客户端解析为空"。
-    if (provider.id.startsWith('workbuddy') && originalStream === true && response.status === 200 && response.body) {
-      const [countStream, teeStream] = response.body.tee()
-      const counter = (async () => {
-        let bytes = 0
-        let sample = ''
-        const rr = countStream.getReader()
-        try {
-          while (true) {
-            const { done, value } = await rr.read()
-            if (done) break
-            bytes += value?.byteLength || 0
-            if (sample.length < 1500) sample += new TextDecoder().decode(value).slice(0, 1500 - sample.length)
-          }
-        } catch { /* ignore */ }
-        return { bytes, sample }
-      })()
-      c.executionCtx.waitUntil(counter.then(({ bytes, sample }) =>
-        writeLog(c.env, 'request',
-          `[WorkBuddyDebug] ${model} → 上游响应字节`,
-          `HTTP ${response.status}, bytes=${bytes}, stream=${originalStream}\nSAMPLE: ${sample}`
-        ).catch(() => {})
-      ))
-      const respForLog = new Response(teeStream, {
-        status: response.status,
-        statusText: response.statusText,
-        headers: response.headers,
-      })
-      logOAuthRequest(c, provider, model, subPath, forwardBody, response.status)
-      return passthroughResponse(respForLog, cleanWorkbuddyChunk)
     }
 
     logOAuthRequest(c, provider, model, subPath, forwardBody, response.status)
@@ -1896,62 +2135,82 @@ export async function handleAnthropicMessages(c: Context<AppEnv>) {
       }
       // 清理被 CodeBuddy 内容过滤器屏蔽的 Claude Code 模板短语
       sanitizeBlockedTemplates(upstreamBody)
-
-      // 读取 token 状态
-      let tokenState = await readOauthToken(c.env, providerId)
-      if (!tokenState?.access_token) {
-        // 尝试刷新
-        const refreshed = await refreshOauthToken(c.env, providerId, cfg)
-        if (refreshed) tokenState = await readOauthToken(c.env, providerId)
-      }
-      if (!tokenState?.access_token) {
-        return c.json({
-          type: 'error',
-          error: { type: 'authentication_error', message: 'OAuth token not available. Please login first.' },
-        }, 401)
+      // tool_choice 归一化：对象形式（如 Anthropic 转换后的 {type:function,function:{name}}）
+      // 会被 WorkBuddy 上游以 400 code=11101 拒绝，需转字符串（对齐 workbuddy-wild PrepareBody 不变量）
+      if (isWorkbuddyProvider(provider)) {
+        normalizeOpenAIToolChoice(upstreamBody)
       }
 
-      // 域路由：根据 JWT iss 判断 CN vs Global
-      const realm = detectTokenRealm(tokenState.access_token)
-      const isGlobal = realm === 'global'
-      const realmBase = (isGlobal && cfg.globalBaseUrl ? cfg.globalBaseUrl : provider.baseUrl).replace(/\/$/, '')
-      const origin = isGlobal && cfg.globalOrigin ? cfg.globalOrigin : (cfg.extraHeaders?.Origin)
-      const upstreamUrl = `${realmBase}/chat/completions`
-
-      // Global 域需要 system message
-      if (isGlobal) {
-        const msgs = upstreamBody['messages'] as any[]
-        if (msgs && !msgs.some((m: any) => m.role === 'system')) {
-          msgs.unshift({ role: 'system', content: 'You are a helpful assistant.' })
+      // WorkBuddy 多账号池：browser 登录流提供商走池化转发（挑号 + 冷却/禁用 + 轮转）
+      let response: Response
+      let upstreamUrl = `${provider.baseUrl.replace(/\/$/, '')}/chat/completions`
+      if (isOAuthPoolProvider(provider)) {
+        try {
+          const core = await proxyOAuthRequestPooledCore(c, provider, 'chat/completions', '', upstreamBody, 'POST')
+          response = core.response
+        } catch (e) {
+          return c.json({
+            type: 'error',
+            error: { type: 'no_healthy_account', message: 'OAuth 账号池无可用账号：' + ((e as Error).message || '') },
+          }, 503)
         }
-      }
+      } else {
+        // 读取 token 状态
+        let tokenState = await readOauthToken(c.env, providerId)
+        if (!tokenState?.access_token) {
+          // 尝试刷新
+          const refreshed = await refreshOauthToken(c.env, providerId, cfg)
+          if (refreshed) tokenState = await readOauthToken(c.env, providerId)
+        }
+        if (!tokenState?.access_token) {
+          return c.json({
+            type: 'error',
+            error: { type: 'authentication_error', message: 'OAuth token not available. Please login first.' },
+          }, 401)
+        }
 
-      const headers = buildOauthHeaders(cfg, tokenState.access_token, {
-        origin,
-        cookies: tokenState.cookies,
-      })
+        // 域路由：根据 JWT iss 判断 CN vs Global
+        const realm = detectTokenRealm(tokenState.access_token)
+        const isGlobal = realm === 'global'
+        const realmBase = (isGlobal && cfg.globalBaseUrl ? cfg.globalBaseUrl : provider.baseUrl).replace(/\/$/, '')
+        const origin = isGlobal && cfg.globalOrigin ? cfg.globalOrigin : (cfg.extraHeaders?.Origin)
+        upstreamUrl = `${realmBase}/chat/completions`
 
-      let response = await fetchUpstream(c.env, upstreamUrl, {
-        method: 'POST',
-        headers,
-        body: JSON.stringify(upstreamBody),
-      }, originalStream === true)
+        // Global 域需要 system message
+        if (isGlobal) {
+          const msgs = upstreamBody['messages'] as any[]
+          if (msgs && !msgs.some((m: any) => m.role === 'system')) {
+            msgs.unshift({ role: 'system', content: 'You are a helpful assistant.' })
+          }
+        }
 
-      // 401/403 时刷新 token 重试
-      if ((response.status === 401 || response.status === 403) && tokenState.refresh_token) {
-        const refreshed = await refreshOauthToken(c.env, providerId, cfg)
-        if (refreshed) {
-          const freshState = await readOauthToken(c.env, providerId)
-          if (freshState?.access_token) {
-            const retryHeaders = buildOauthHeaders(cfg, freshState.access_token, {
-              origin,
-              cookies: freshState.cookies,
-            })
-            response = await fetchUpstream(c.env, upstreamUrl, {
-              method: 'POST',
-              headers: retryHeaders,
-              body: JSON.stringify(upstreamBody),
-            }, originalStream === true)
+        const headers = buildOauthHeaders(cfg, tokenState.access_token, {
+          origin,
+          cookies: tokenState.cookies,
+        })
+
+        response = await fetchUpstream(c.env, upstreamUrl, {
+          method: 'POST',
+          headers,
+          body: JSON.stringify(upstreamBody),
+        }, originalStream === true)
+
+        // 401/403 时刷新 token 重试
+        if ((response.status === 401 || response.status === 403) && tokenState.refresh_token) {
+          const refreshed = await refreshOauthToken(c.env, providerId, cfg)
+          if (refreshed) {
+            const freshState = await readOauthToken(c.env, providerId)
+            if (freshState?.access_token) {
+              const retryHeaders = buildOauthHeaders(cfg, freshState.access_token, {
+                origin,
+                cookies: freshState.cookies,
+              })
+              response = await fetchUpstream(c.env, upstreamUrl, {
+                method: 'POST',
+                headers: retryHeaders,
+                body: JSON.stringify(upstreamBody),
+              }, originalStream === true)
+            }
           }
         }
       }

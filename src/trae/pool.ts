@@ -26,20 +26,55 @@ export const TRAE_SOFT_COOLDOWN_MS = 60 * 1000
 export const TRAE_ERR_THRESHOLD = 3
 export const TRAE_ERR_COOLDOWN_MS = 10 * 60 * 1000
 
-const poolKey = (providerId: string) => `${KV_KEYS.TRAE_POOL_PREFIX}${providerId}`
+/** 解析后的冷却参数（默认值已被 provider.cooldown 覆盖）。 */
+export interface TraeCooldownConfig {
+  planMs: number
+  softMs: number
+  errThreshold: number
+  errMs: number
+}
 
-export async function readTraePool(env: Env, providerId: string): Promise<TraePool> {
-  try {
-    const raw = await env.KV.get(poolKey(providerId))
-    if (!raw) return {}
-    const parsed = JSON.parse(raw) as unknown
-    return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? (parsed as TraePool) : {}
-  } catch {
-    return {}
+/** 合并 provider.cooldown 与默认值；未配置/非法值回退默认。 */
+export function resolveTraeCooldown(provider: Provider): TraeCooldownConfig {
+  const c = provider.cooldown
+  return {
+    planMs: c?.planMs && c.planMs > 0 ? c.planMs : TRAE_PLAN_COOLDOWN_MS,
+    softMs: c?.softMs && c.softMs > 0 ? c.softMs : TRAE_SOFT_COOLDOWN_MS,
+    errThreshold: c?.errThreshold && c.errThreshold > 0 ? c.errThreshold : TRAE_ERR_THRESHOLD,
+    errMs: c?.errMs && c.errMs > 0 ? c.errMs : TRAE_ERR_COOLDOWN_MS,
   }
 }
 
+const poolKey = (providerId: string) => `${KV_KEYS.TRAE_POOL_PREFIX}${providerId}`
+
+// ===== 内存 + KV 双缓存 =====
+// Worker 多 isolate 下池状态以 KV 为准（跨 isolate 共享冷却/禁用/积分），但请求热路径上
+// 每次 pick 都读 KV 会放大 KV 读。这里加一层当前 isolate 的短 TTL 内存缓存（同 cnb 池模式）：
+// 读优先命中内存（≤1s 新鲜），写始终落 KV 并同步刷新内存，保证写不改语义、读明显减负。
+// 多 isolate 间的最终一致性由 KV 写保证，短 TTL 缓存只影响最多 1s 内的读视图。
+const poolCache = new Map<string, { pool: TraePool; at: number }>()
+const POOL_CACHE_TTL_MS = 1000
+
+export async function readTraePool(env: Env, providerId: string): Promise<TraePool> {
+  const hit = poolCache.get(providerId)
+  if (hit && Date.now() - hit.at < POOL_CACHE_TTL_MS) return hit.pool
+  let pool: TraePool = {}
+  try {
+    const raw = await env.KV.get(poolKey(providerId))
+    if (raw) {
+      const parsed = JSON.parse(raw) as unknown
+      pool = parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? (parsed as TraePool) : {}
+    }
+  } catch {
+    pool = {}
+  }
+  poolCache.set(providerId, { pool, at: Date.now() })
+  return pool
+}
+
 async function writeTraePool(env: Env, providerId: string, pool: TraePool): Promise<void> {
+  // 先刷新内存缓存（同 isolate 后续读直接命中最新值），再异步落 KV
+  poolCache.set(providerId, { pool, at: Date.now() })
   try {
     await env.KV.put(poolKey(providerId), JSON.stringify(pool))
   } catch {
