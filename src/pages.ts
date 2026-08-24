@@ -474,7 +474,6 @@ ${H('管理')}
       <a class="admin-nav__link is-active" href="#overview"><i class="fas fa-chart-pie" aria-hidden="true"></i><span>概览</span></a>
       <p class="admin-nav__group" aria-hidden="true">接入资源</p>
       <a class="admin-nav__link" href="#providers"><i class="fas fa-server" aria-hidden="true"></i><span>提供商</span><b>${providers.length}</b></a>
-      <a class="admin-nav__link" href="#m365-accounts"><i class="fas fa-users" aria-hidden="true"></i><span>M365 账号池</span></a>
       <a class="admin-nav__link" href="#proxy-keys"><i class="fas fa-key" aria-hidden="true"></i><span>转发 Key</span><b>${proxyKeys.length}</b></a>
 <a class="admin-nav__link" href="#checkin"><i class="fas fa-calendar-check" aria-hidden="true"></i><span>签到</span><b>${providers.filter((p:any)=>p.authType==='oauth-device'&&p.oauth&&p.oauth.flowType!=='m365-pkce'&&p.oauth.flowType!=='m365-ropc').length}</b></a>
       <p class="admin-nav__group" aria-hidden="true">观测分析</p>
@@ -499,7 +498,7 @@ ${H('管理')}
   <div class="admin-main">
     <header class="admin-topbar">
       <a class="brand" href="/"><span class="brand__mark" aria-hidden="true"><i class="fas fa-cloud"></i></span><span class="brand__name">${SITE_CONFIG.title}</span></a>
-      <nav aria-label="移动端控制台导航"><a href="#overview">概览</a><a href="#providers">提供商</a><a href="#m365-accounts">M365 池</a><a href="#proxy-keys">Key</a><a href="#checkin">签到</a><a href="#analytics">统计</a><a href="#usage-logs">日志</a><a href="#logs">系统日志</a><a href="#mcps">MCP</a><a href="#unimodels">联合</a><a href="#thinking">思维引导</a><a href="#cache">缓存</a><a href="#cache-prefix">缓存前缀</a><a href="#perf">性能</a></nav>
+      <nav aria-label="移动端控制台导航"><a href="#overview">概览</a><a href="#providers">提供商</a><a href="#proxy-keys">Key</a><a href="#checkin">签到</a><a href="#analytics">统计</a><a href="#usage-logs">日志</a><a href="#logs">系统日志</a><a href="#mcps">MCP</a><a href="#unimodels">联合</a><a href="#thinking">思维引导</a><a href="#cache">缓存</a><a href="#cache-prefix">缓存前缀</a><a href="#perf">性能</a></nav>
       <a class="icon-btn" href="javascript:void(0)" onclick="doLogout()" aria-label="退出登录"><i class="fas fa-sign-out-alt" aria-hidden="true"></i></a>
     </header>
 
@@ -686,10 +685,15 @@ ${H('管理')}
                   <div class="fg"><label>预置模板</label><select class="select-sm" onchange="applyOauthPresetEdit('${escapePageJsx(p.id)}',this.value)"><option value="" ${detectOauthPreset(p.oauth)===''?'selected':''}>— 选择 —</option>${Object.entries(OAUTH_PRESETS).map(([k, pre]) => `<option value="${k}" ${detectOauthPreset(p.oauth)===k?'selected':''}>${escapePageHtml(pre.label)}</option>`).join('')}</select></div>
                   <div class="fc mt-1 field-row"><button class="btn btn-s" onclick="oauthConnect('${escapePageJsx(p.id)}')"><i class="fas fa-plug" aria-hidden="true"></i>发起连接</button><button class="btn btn-gh" onclick="fetchOauthModels('${escapePageJsx(p.id)}')"><i class="fas fa-cloud-download-alt" aria-hidden="true"></i>获取模型</button><button class="btn btn-gh" onclick="oauthStatus('${escapePageJsx(p.id)}')"><i class="fas fa-sync" aria-hidden="true"></i>状态</button><button class="btn btn-gh" onclick="oauthDisconnect('${escapePageJsx(p.id)}')"><i class="fas fa-unlink" aria-hidden="true"></i>断开</button><span id="oauth-st-${escapePageHtml(p.id)}" class="oauth-status"></span></div>
                   ${(p.oauth&&p.oauth.flowType==='browser')?`
-                  <fieldset class="form-group" id="wbp-fs-${escapePageHtml(p.id)}"><legend>WorkBuddy 多账号池</legend><span class="form-helper">浏览器登录流每次成功登录都会把该账号加入账号池（按 uid 去重，多登一个 = 多一个账号）。转发按剩余积分自动挑选账号，429/plan/401 等按策略冷却或禁用并轮换其他账号；每日签到后积分恢复自动解冻。冷却参数留空 = 默认（plan 12h / 429 60s / 连续 5 次错误冷却 10m）。</span>
-                    <div class="fc mt-1 field-row"><button class="btn btn-s" onclick="oauthPoolStatus('${escapePageJsx(p.id)}')"><i class="fas fa-sync" aria-hidden="true"></i>刷新账号池</button><span id="wbp-st-${escapePageHtml(p.id)}" class="oauth-status"></span></div>
+                  <fieldset class="form-group" id="wbp-fs-${escapePageHtml(p.id)}"><legend>WorkBuddy 多账号池</legend><span class="form-helper">浏览器登录流每次成功登录都会把该账号加入账号池（按 uid 去重，多登一个 = 多个账号）。转发按剩余积分自动挑选账号，429/plan/401 等按策略冷却或禁用并轮换其他账号；每日签到后积分恢复自动解冻。冷却参数留空 = 默认（plan 12h / 429 60s / 连续 5 次错误冷却 10m）。</span>
+                    <div class="fc mt-1 field-row"><button class="btn btn-s" onclick="oauthPoolStatus('${escapePageJsx(p.id)}')"><i class="fas fa-sync" aria-hidden="true"></i>刷新账号池</button><button class="btn btn-s" onclick="oauthConnect('${escapePageJsx(p.id)}')"><i class="fas fa-sign-in-alt" aria-hidden="true"></i>登录新账号</button><span id="wbp-st-${escapePageHtml(p.id)}" class="oauth-status"></span></div>
                     <div id="wbp-acc-${escapePageHtml(p.id)}" class="mt-1"></div>
                     <div class="fc mt-1 field-row" style="gap:8px"><input type="number" id="cd-plan-${escapePageHtml(p.id)}" value="${p.cooldown&&p.cooldown.planMs?Math.round(p.cooldown.planMs/60000):''}" style="width:88px" placeholder="plan冷却(分)"><input type="number" id="cd-soft-${escapePageHtml(p.id)}" value="${p.cooldown&&p.cooldown.softMs?Math.round(p.cooldown.softMs/1000):''}" style="width:88px" placeholder="429冷却(秒)"><input type="number" id="cd-err-${escapePageHtml(p.id)}" value="${p.cooldown&&p.cooldown.errThreshold?p.cooldown.errThreshold:''}" style="width:76px" placeholder="错误阈值"><input type="number" id="cd-errms-${escapePageHtml(p.id)}" value="${p.cooldown&&p.cooldown.errMs?Math.round(p.cooldown.errMs/60000):''}" style="width:88px" placeholder="错误冷却(分)"><span class="mu" style="font-size:12px">冷却参数（保存后生效）</span></div>
+                  </fieldset>`:''}
+                  ${(p.oauth&&(p.oauth.flowType==='m365-pkce'||p.oauth.flowType==='m365-ropc'))?`
+                  <fieldset class="form-group" id="m365-fs-${escapePageHtml(p.id)}"><legend>M365 账号池</legend><span class="form-helper">本提供商可挂多个订阅账号（授权码/账密各连一次即入池）。网关按健康与并发自动轮询，限流/超限自动切换。每账号默认并发上限 8（可变 M365_ACCOUNT_DEFAULT_CONCURRENCY）。</span>
+                    <div class="fc mt-1 field-row"><button class="btn btn-s" onclick="oauthConnect('${escapePageJsx(p.id)}')"><i class="fas fa-sign-in-alt" aria-hidden="true"></i>连接新账号</button><button class="btn btn-s" onclick="m365Render('${escapePageJsx(p.id)}')"><i class="fas fa-sync" aria-hidden="true"></i>刷新账号池</button></div>
+                    <div id="m365-acc-${escapePageHtml(p.id)}" class="mt-1"><p class="mu">展开后自动加载账号池。</p></div>
                   </fieldset>`:''}
                 </fieldset>
               </div>
@@ -726,52 +730,8 @@ ${H('管理')}
         </div>
       </section>
 
-      <section id="m365-accounts" class="workspace-section" aria-labelledby="m365-accounts-title">
-        <div class="section-heading section-heading--admin">
-          <div><h2 id="m365-accounts-title">M365 账号池</h2><p>每个 M365 提供商可挂多个订阅账号（授权码/账密各连一次即入池）。网关按健康与并发自动轮询，限流/超限自动切换，避免单号封禁。新增账号请到「提供商 → 对应 M365 提供商 → 连接」。</p></div>
-          <div class="fc">
-            <select id="m365-acc-prov" class="select-sm" onchange="m365Render(this.value)">
-              ${providers.filter((p:any)=>p.oauth&&(p.oauth.flowType==='m365-pkce'||p.oauth.flowType==='m365-ropc')).map((p:any)=>'<option value="'+escapePageHtml(p.id)+'">'+escapePageHtml(p.name||p.id)+'</option>').join('')||'<option value="">无 M365 提供商</option>'}
-            </select>
-            <button class="btn btn-gh" onclick="m365Render(document.getElementById('m365-acc-prov').value)"><i class="fas fa-sync-alt"></i>刷新</button>
-          </div>
-        </div>
-        <div id="m365-accounts-root"><p class="mu">选择一个 M365 提供商以加载其账号池。</p></div>
-        <script>
-          function m365Esc(s) { return String(s == null ? '' : s).replace(/[&<>"']/g, function (c) { return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]; }); }
-          function m365Render(providerId) {
-            var root = document.getElementById('m365-accounts-root');
-            if (!providerId) { if (root) root.innerHTML = '<p class="mu">暂无 M365 提供商。</p>'; return; }
-            if (root) root.innerHTML = '<p class="mu">加载中…</p>';
-            fetch('/admin/api/m365/accounts/' + encodeURIComponent(providerId))
-              .then(function (r) { return r.json().then(function (j) { return { ok: r.ok, j: j }; }); })
-              .then(function (res) {
-                if (!res.ok || !res.j.success) { if (root) root.innerHTML = '<p class="c-d">加载失败：' + m365Esc(((res.j && res.j.message) || (res.j && res.j.error) || '未知错误')) + '</p>'; return; }
-                var accs = (res.j.data && res.j.data.accounts) || [];
-                if (!root) return;
-                if (accs.length === 0) { root.innerHTML = '<div class="empty-state"><i class="fas fa-users"></i><h3>暂无账号</h3><p>到「提供商 → ' + m365Esc(providerId) + '」用授权码或账密连接，第一个账号也会进入此池。</p></div>'; return; }
-                root.innerHTML = '<table class="tbl"><thead><tr><th>账号</th><th>OID</th><th>状态</th><th>操作</th></tr></thead><tbody>' +
-                  accs.map(function (a) {
-                    var status = a.connected ? (a.healthy ? '<span class="bd bd-on">健康</span>' : '<span class="bd bd-danger">不可用</span>') : '<span class="bd bd-off">未连接</span>';
-                    return '<tr><td>' + m365Esc(a.email || a.oid || '?') + '</td><td><code>' + m365Esc(a.oid || '') + '</code></td><td>' + status + '</td>' +
-                      '<td><button class="btn btn-d btn-xs" onclick="m365Remove(\\'' + m365Esc(providerId) + '\\',\\'' + m365Esc(a.oid || '') + '\\',this)"><i class="fas fa-trash"></i>移除</button></td></tr>';
-                  }).join('') + '</tbody></table>' +
-                  '<p class="mu" style="margin-top:8px">共 ' + accs.length + ' 个账号。每账号默认并发上限 8（可变 M365_ACCOUNT_DEFAULT_CONCURRENCY）。</p>';
-              })
-              .catch(function (e) { if (root) root.innerHTML = '<p class="c-d">请求异常：' + m365Esc(String(e && e.message || e)) + '</p>'; });
-          }
-          function m365Remove(providerId, oid, btn) {
-            if (!oid) return;
-            if (!window.confirm('确认移除账号 ' + oid + '？')) return;
-            if (btn) btn.disabled = true;
-            fetch('/admin/api/m365/accounts/' + encodeURIComponent(providerId) + '?oid=' + encodeURIComponent(oid), { method: 'DELETE' })
-              .then(function (r) { return r.json().then(function (j) { return { ok: r.ok, j: j }; }); })
-              .then(function (res) { if (btn) btn.disabled = false; if (res.ok) m365Render(providerId); else window.alert((res.j && res.j.message) || '移除失败'); })
-              .catch(function () { if (btn) btn.disabled = false; window.alert('请求异常'); });
-          }
-          setTimeout(function () { var s = document.getElementById('m365-acc-prov'); if (s && s.value) m365Render(s.value); }, 0);
-        </script>
-      </section>
+      <!-- P3：M365 账号池独立页已并入提供商详情（#m365-fs-<id>），此锚点仅为兼容旧链接保留重定向 -->
+      <span id="m365-accounts" class="hd" aria-hidden="true"></span>
 
       <section id="proxy-keys" class="workspace-section" aria-labelledby="proxy-keys-title">
         <div class="section-heading section-heading--admin"><div><h2 id="proxy-keys-title">转发 Key</h2><p>客户端使用这些 Key 访问统一的 <code>/v1</code> 接口。</p></div><button class="btn btn-p" onclick="genKey()"><i class="fas fa-plus" aria-hidden="true"></i>生成转发 Key</button></div>
@@ -1070,6 +1030,40 @@ function tog(id) {
   c.style.transform = d.classList.contains('open') ? 'rotate(90deg)' : ''
   // TRAE SOLO：展开时自动刷新账号池状态
   if (d.classList.contains('open') && document.getElementById('trae-acc-' + id)) traeStatus(id)
+  // P3：M365 提供商展开时自动加载账号池（账号池已内嵌提供商卡）
+  if (d.classList.contains('open') && document.getElementById('m365-acc-' + id)) m365Render(id)
+}
+
+// P3：M365 账号池渲染 —— 独立页并入提供商详情后按 providerId 定位容器
+function m365Esc(s) { return String(s == null ? '' : s).replace(/[&<>"']/g, function (c) { return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]; }); }
+function m365Render(providerId) {
+  var root = document.getElementById('m365-acc-' + providerId)
+  if (!root) return
+  root.innerHTML = '<p class="mu">加载中…</p>'
+  fetch('/admin/api/m365/accounts/' + encodeURIComponent(providerId))
+    .then(function (r) { return r.json().then(function (j) { return { ok: r.ok, j: j }; }); })
+    .then(function (res) {
+      if (!res.ok || !res.j.success) { root.innerHTML = '<p class="c-d">加载失败：' + m365Esc(((res.j && res.j.message) || (res.j && res.j.error) || '未知错误')) + '</p>'; return; }
+      var accs = (res.j.data && res.j.data.accounts) || []
+      if (accs.length === 0) { root.innerHTML = '<div class="empty-state"><i class="fas fa-users"></i><h3>暂无账号</h3><p>点上方「连接新账号」，用授权码或账密登录，第一个账号即进入此池。</p></div>'; return; }
+      root.innerHTML = '<table class="tbl"><thead><tr><th>账号</th><th>OID</th><th>状态</th><th>操作</th></tr></thead><tbody>' +
+        accs.map(function (a) {
+          var status = a.connected ? (a.healthy ? '<span class="bd bd-on">健康</span>' : '<span class="bd bd-danger">不可用</span>') : '<span class="bd bd-off">未连接</span>';
+          return '<tr><td>' + m365Esc(a.email || a.oid || '?') + '</td><td><code>' + m365Esc(a.oid || '') + '</code></td><td>' + status + '</td>' +
+            '<td><button class="btn btn-d btn-xs" onclick="m365Remove(\'' + m365Esc(providerId) + '\',\'' + m365Esc(a.oid || '') + '\',this)"><i class="fas fa-trash"></i>移除</button></td></tr>';
+        }).join('') + '</tbody></table>' +
+        '<p class="mu" style="margin-top:8px">共 ' + accs.length + ' 个账号。</p>';
+    })
+    .catch(function (e) { root.innerHTML = '<p class="c-d">请求异常：' + m365Esc(String(e && e.message || e)) + '</p>'; });
+}
+function m365Remove(providerId, oid, btn) {
+  if (!oid) return;
+  if (!window.confirm('确认移除账号 ' + oid + '？')) return;
+  if (btn) btn.disabled = true;
+  fetch('/admin/api/m365/accounts/' + encodeURIComponent(providerId) + '?oid=' + encodeURIComponent(oid), { method: 'DELETE' })
+    .then(function (r) { return r.json().then(function (j) { return { ok: r.ok, j: j }; }); })
+    .then(function (res) { if (btn) btn.disabled = false; if (res.ok) m365Render(providerId); else window.alert((res.j && res.j.message) || '移除失败'); })
+    .catch(function () { if (btn) btn.disabled = false; window.alert('请求异常'); });
 }
 
 // UX2：保存/删除等操作后 location.reload() 会把页面打回顶部、收起所有面板。
@@ -1107,6 +1101,9 @@ function restoreAdminState() {
         const d = document.getElementById(panelId)
         const c = document.getElementById('ch-' + String(panelId).replace(/^dt-/, ''))
         if (d && d.classList && !d.classList.contains('open')) { d.classList.add('open'); if (c) c.style.transform = 'rotate(90deg)' }
+        // P3：恢复展开态时同步加载内嵌账号池（TRAE / M365），与手动 tog 行为一致
+        const pid = String(panelId).replace(/^dt-/, '')
+        if (document.getElementById('m365-acc-' + pid)) m365Render(pid)
       })
       if (s.add) { const af = document.getElementById('af'); if (af) af.classList.remove('hd') }
       if (typeof s.y === 'number') uiScroll = s.y
@@ -2554,6 +2551,11 @@ adminNavLinks.forEach(function (link) {
 })
 window.addEventListener('hashchange', function () { setActiveAdminNav(location.hash) })
 setActiveAdminNav(location.hash)
+// P3：M365 账号池独立页已并入提供商详情，旧锚点重定向到提供商区
+if (location.hash === '#m365-accounts') location.replace('#providers')
+window.addEventListener('hashchange', function () {
+  if (location.hash === '#m365-accounts') location.replace('#providers')
+})
 
 // 签到状态：页面加载后总是加载一次（区块同屏展示，避免签到区默认停在静态占位）；进入 #checkin 时再刷新
 // 注意：仅读取状态，不触发签到（签到只能通过手动点击按钮或 cron 定时触发）
