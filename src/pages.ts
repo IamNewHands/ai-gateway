@@ -748,7 +748,7 @@ ${H('管理')}
                   accs.map(function (a) {
                     var status = a.connected ? (a.healthy ? '<span class="bd bd-on">健康</span>' : '<span class="bd bd-off">不可用</span>') : '<span class="bd bd-off">未连接</span>';
                     return '<tr><td>' + m365Esc(a.email || a.oid || '?') + '</td><td><code>' + m365Esc(a.oid || '') + '</code></td><td>' + status + '</td>' +
-                      '<td><button class="btn btn-d btn-xs" onclick="m365Remove(\'' + m365Esc(providerId) + '\',\'' + m365Esc(a.oid || '') + '\',this)"><i class="fas fa-trash"></i>移除</button></td></tr>';
+                      '<td><button class="btn btn-d btn-xs" onclick="m365Remove(\\'' + m365Esc(providerId) + '\\',\\'' + m365Esc(a.oid || '') + '\\',this)"><i class="fas fa-trash"></i>移除</button></td></tr>';
                   }).join('') + '</tbody></table>' +
                   '<p class="mu" style="margin-top:8px">共 ' + accs.length + ' 个账号。每账号默认并发上限 8（可变 M365_ACCOUNT_DEFAULT_CONCURRENCY）。</p>';
               })
