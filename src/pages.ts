@@ -519,73 +519,6 @@ ${H('管理')}
         <div id="overview-kpi" class="overview-kpi" aria-label="运营概况"></div>
       </section>
 
-      <!-- ===== Analytics Engine 使用统计 ===== -->
-      <section id="analytics" class="workspace-section" aria-labelledby="analytics-title">
-        <div class="section-heading section-heading--admin">
-          <div><h2 id="analytics-title">使用统计</h2><p>Analytics Engine 数据采集，基于 Cloudflare Workers Analytics Engine。</p></div>
-          <div class="admin-heading__actions">
-            <button class="btn btn-gh btn-xs" onclick="loadAnalytics()" id="analytics-refresh"><i class="fas fa-sync-alt" aria-hidden="true"></i>刷新</button>
-            <span class="range-group" id="analytics-range-group">
-              <button class="btn btn-gh btn-xs is-active" data-analytics-range="24h" onclick="setAnalyticsRange('24h',this)">24 小时</button>
-              <button class="btn btn-gh btn-xs" data-analytics-range="7d" onclick="setAnalyticsRange('7d',this)">7 天</button>
-              <button class="btn btn-gh btn-xs" data-analytics-range="30d" onclick="setAnalyticsRange('30d',this)">30 天</button>
-            </span>
-          </div>
-        </div>
-        <div id="analytics-error" class="al al-e hd" role="alert" aria-live="assertive"></div>
-        <div class="admin-metrics analytics-metrics" id="analytics-overview">
-          <div><span class="analytics-value" id="metric-requests">—</span><p>总请求数</p><small></small></div>
-          <div><span class="analytics-value" id="metric-success">—</span><p>成功率</p><small></small></div>
-          <div><span class="analytics-value" id="metric-input">—</span><p>输入 Token</p><small></small></div>
-          <div><span class="analytics-value" id="metric-output">—</span><p>输出 Token</p><small></small></div>
-          <div><span class="analytics-value" id="metric-latency">—</span><p>平均延迟</p><small></small></div>
-        </div>
-        <div class="analytics-charts">
-          <div class="analytics-chart-panel">
-            <div class="panel-heading"><div><span class="panel-heading__mark"><i class="fas fa-cube"></i></span><div><h3>模型调用排行</h3><p>按请求量 / Token 用量排序，点击切换</p></div></div></div>
-            <div class="ranking-tabs" role="tablist">
-              <button class="btn btn-gh btn-xs is-active" data-rank-tab="requests" onclick="switchModelRanking('requests',this)" role="tab" aria-selected="true">请求次数</button>
-              <button class="btn btn-gh btn-xs" data-rank-tab="tokens" onclick="switchModelRanking('tokens',this)" role="tab" aria-selected="false">Token 用量</button>
-            </div>
-            <div id="model-ranking"><div class="analytics-empty"><p>暂无数据</p></div></div>
-          </div>
-        </div>
-      </section>
-
-      <!-- ===== Usage Logs 详细日志 ===== -->
-      <section id="usage-logs" class="workspace-section" aria-labelledby="usage-logs-title">
-        <div class="section-heading section-heading--admin">
-          <div><h2 id="usage-logs-title">详细日志</h2><p>查询 Analytics Engine 事件明细，支持按时间/模型/渠道/结果筛选。</p></div>
-          <div class="admin-heading__actions">
-            <button class="btn btn-gh btn-xs" onclick="resetLogFilters()"><i class="fas fa-undo-alt" aria-hidden="true"></i>重置</button>
-            <button class="btn btn-gh btn-xs" onclick="loadUsageLogs(true)"><i class="fas fa-search" aria-hidden="true"></i>查询</button>
-          </div>
-        </div>
-        <div class="analytics-log-filters">
-          <div class="fg log-time-range"><label>时间范围</label><div class="fc"><input type="datetime-local" id="log-start" aria-label="开始时间"><span style="margin:0 4px;color:var(--color-muted)">至</span><input type="datetime-local" id="log-end" aria-label="结束时间"></div></div>
-          <div class="fg"><label>筛选维度</label><select id="log-dimension" class="select-sm"><option value="model">模型</option><option value="channel">渠道</option><option value="result">结果</option></select></div>
-          <div class="fg"><label>关键词</label><input type="text" id="log-keyword" placeholder="模型 ID / 渠道名称"></div>
-          <div class="fg"><label>结果</label><select id="log-result" class="select-sm"><option value="all">全部</option><option value="success">成功</option><option value="failure">失败</option></select></div>
-        </div>
-        <div id="usage-log-error" class="al al-e hd" role="alert" aria-live="assertive"></div>
-        <div class="usage-log-table-wrap">
-          <table class="usage-log-table" id="usage-log-table">
-            <thead><tr><th>时间</th><th>结果</th><th>模型</th><th>渠道</th><th>Token (入/出)</th><th>延迟</th><th>状态码</th><th>操作</th></tr></thead>
-            <tbody id="usage-log-body"></tbody>
-          </table>
-          <div class="usage-log-cards" id="usage-log-cards"></div>
-          <div id="usage-log-empty" class="empty-state"><i class="fas fa-clipboard-list" aria-hidden="true"></i><h3>暂无日志数据</h3><p>配置 Analytics Engine 并发送请求后，数据将自动采集并显示于此。</p></div>
-        </div>
-        <div class="analytics-log-pagination">
-          <button class="btn btn-gh btn-xs" id="log-prev" onclick="changeLogPage(-1)" disabled><i class="fas fa-chevron-left"></i>上一页</button>
-          <span class="mu" id="log-page-label">第 1 页</span>
-          <button class="btn btn-gh btn-xs" id="log-next" onclick="changeLogPage(1)">下一页<i class="fas fa-chevron-right"></i></button>
-          <label class="mu" style="font-size:12px;display:inline-flex;align-items:center;gap:4px">每页
-            <select id="log-page-size" class="select-sm" onchange="changeUsageLogPageSize(this.value)" aria-label="每页条数"><option value="5" selected>5</option><option value="10">10</option><option value="20">20</option><option value="50">50</option><option value="100">100</option></select>
-            条</label>
-        </div>
-      </section>
-
       <section id="providers" class="workspace-section" aria-labelledby="providers-title">
         <div class="section-heading section-heading--admin">
           <div><h2 id="providers-title">提供商</h2><p>管理上游地址、协议、API Key 和模型。</p></div>
@@ -754,6 +687,73 @@ ${H('管理')}
           ${proxyKeys.map(k=>`<article class="ki" data-id="${escapePageHtml(k.id)}"><div class="key-main"><span class="key-icon" aria-hidden="true"><i class="fas fa-key"></i></span><div><div class="kv"><span id="kv-${escapePageHtml(k.id)}" data-full="${escapePageHtml(k.key)}">${escapePageHtml(k.key.length>12?k.key.substring(0,8)+'••••'+k.key.substring(k.key.length-4):k.key)}</span><button class="icon-btn" onclick="toggleKeyVis('${escapePageJsx(k.id)}')" title="显示或隐藏" aria-label="显示或隐藏 Key"><i class="far fa-eye" aria-hidden="true"></i></button><button class="icon-btn" onclick='copyText("${escapePageJsx(k.key)}",this)' title="复制" aria-label="复制 Key"><i class="far fa-copy" aria-hidden="true"></i></button></div><h3>${escapePageHtml(k.name)}</h3><p>创建于 ${new Date(k.createdAt).toLocaleDateString()} · ${k.expiresAt?(new Date(k.expiresAt).getTime()>Date.now()?'有效至 '+new Date(k.expiresAt).toLocaleDateString():'<span class="c-d">已过期</span>'):'永久有效'} · <span class="bd ${k.allowedModels&&k.allowedModels.length>0?'bd-on':'bd-off'}">${k.allowedModels&&k.allowedModels.length>0?k.allowedModels.length+' 个模型':'全部模型'}</span></p></div></div><div class="key-actions"><label class="tg"><input type="checkbox" ${k.enabled?'checked':''} onchange="toggleProxyKey('${escapePageJsx(k.id)}',this.checked)" aria-label="启用 ${escapePageHtml(k.name)}"><span class="sl"></span></label><span class="bd ${k.enabled?'bd-on':'bd-off'}">${k.enabled?'已启用':'已禁用'}</span><button class="btn btn-gh btn-xs" onclick="editKeyExpiry('${escapePageJsx(k.id)}')" title="修改过期时间 / 续期"><i class="fas fa-clock" aria-hidden="true"></i>续期</button><button class="btn btn-gh btn-xs" onclick="editKeyModels('${escapePageJsx(k.id)}')" title="模型筛选"><i class="fas fa-filter" aria-hidden="true"></i>模型筛选</button><button class="btn btn-d btn-xs" onclick="rmKey('${escapePageJsx(k.id)}')"><i class="fas fa-trash" aria-hidden="true"></i>删除</button></div></article>`).join('')}
         </div>
       </section>
+
+      <!-- ===== Analytics Engine 使用统计 ===== -->
+      <section id="analytics" class="workspace-section" aria-labelledby="analytics-title">
+        <div class="section-heading section-heading--admin">
+          <div><h2 id="analytics-title">使用统计</h2><p>Analytics Engine 数据采集，基于 Cloudflare Workers Analytics Engine。</p></div>
+          <div class="admin-heading__actions">
+            <button class="btn btn-gh btn-xs" onclick="loadAnalytics()" id="analytics-refresh"><i class="fas fa-sync-alt" aria-hidden="true"></i>刷新</button>
+            <span class="range-group" id="analytics-range-group">
+              <button class="btn btn-gh btn-xs is-active" data-analytics-range="24h" onclick="setAnalyticsRange('24h',this)">24 小时</button>
+              <button class="btn btn-gh btn-xs" data-analytics-range="7d" onclick="setAnalyticsRange('7d',this)">7 天</button>
+              <button class="btn btn-gh btn-xs" data-analytics-range="30d" onclick="setAnalyticsRange('30d',this)">30 天</button>
+            </span>
+          </div>
+        </div>
+        <div id="analytics-error" class="al al-e hd" role="alert" aria-live="assertive"></div>
+        <div class="admin-metrics analytics-metrics" id="analytics-overview">
+          <div><span class="analytics-value" id="metric-requests">—</span><p>总请求数</p><small></small></div>
+          <div><span class="analytics-value" id="metric-success">—</span><p>成功率</p><small></small></div>
+          <div><span class="analytics-value" id="metric-input">—</span><p>输入 Token</p><small></small></div>
+          <div><span class="analytics-value" id="metric-output">—</span><p>输出 Token</p><small></small></div>
+          <div><span class="analytics-value" id="metric-latency">—</span><p>平均延迟</p><small></small></div>
+        </div>
+        <div class="analytics-charts">
+          <div class="analytics-chart-panel">
+            <div class="panel-heading"><div><span class="panel-heading__mark"><i class="fas fa-cube"></i></span><div><h3>模型调用排行</h3><p>按请求量 / Token 用量排序，点击切换</p></div></div></div>
+            <div class="ranking-tabs" role="tablist">
+              <button class="btn btn-gh btn-xs is-active" data-rank-tab="requests" onclick="switchModelRanking('requests',this)" role="tab" aria-selected="true">请求次数</button>
+              <button class="btn btn-gh btn-xs" data-rank-tab="tokens" onclick="switchModelRanking('tokens',this)" role="tab" aria-selected="false">Token 用量</button>
+            </div>
+            <div id="model-ranking"><div class="analytics-empty"><p>暂无数据</p></div></div>
+          </div>
+        </div>
+      </section>
+
+      <!-- ===== Usage Logs 详细日志 ===== -->
+      <section id="usage-logs" class="workspace-section" aria-labelledby="usage-logs-title">
+        <div class="section-heading section-heading--admin">
+          <div><h2 id="usage-logs-title">详细日志</h2><p>查询 Analytics Engine 事件明细，支持按时间/模型/渠道/结果筛选。</p></div>
+          <div class="admin-heading__actions">
+            <button class="btn btn-gh btn-xs" onclick="resetLogFilters()"><i class="fas fa-undo-alt" aria-hidden="true"></i>重置</button>
+            <button class="btn btn-gh btn-xs" onclick="loadUsageLogs(true)"><i class="fas fa-search" aria-hidden="true"></i>查询</button>
+          </div>
+        </div>
+        <div class="analytics-log-filters">
+          <div class="fg log-time-range"><label>时间范围</label><div class="fc"><input type="datetime-local" id="log-start" aria-label="开始时间"><span style="margin:0 4px;color:var(--color-muted)">至</span><input type="datetime-local" id="log-end" aria-label="结束时间"></div></div>
+          <div class="fg"><label>筛选维度</label><select id="log-dimension" class="select-sm"><option value="model">模型</option><option value="channel">渠道</option><option value="result">结果</option></select></div>
+          <div class="fg"><label>关键词</label><input type="text" id="log-keyword" placeholder="模型 ID / 渠道名称"></div>
+          <div class="fg"><label>结果</label><select id="log-result" class="select-sm"><option value="all">全部</option><option value="success">成功</option><option value="failure">失败</option></select></div>
+        </div>
+        <div id="usage-log-error" class="al al-e hd" role="alert" aria-live="assertive"></div>
+        <div class="usage-log-table-wrap">
+          <table class="usage-log-table" id="usage-log-table">
+            <thead><tr><th>时间</th><th>结果</th><th>模型</th><th>渠道</th><th>Token (入/出)</th><th>延迟</th><th>状态码</th><th>操作</th></tr></thead>
+            <tbody id="usage-log-body"></tbody>
+          </table>
+          <div class="usage-log-cards" id="usage-log-cards"></div>
+          <div id="usage-log-empty" class="empty-state"><i class="fas fa-clipboard-list" aria-hidden="true"></i><h3>暂无日志数据</h3><p>配置 Analytics Engine 并发送请求后，数据将自动采集并显示于此。</p></div>
+        </div>
+        <div class="analytics-log-pagination">
+          <button class="btn btn-gh btn-xs" id="log-prev" onclick="changeLogPage(-1)" disabled><i class="fas fa-chevron-left"></i>上一页</button>
+          <span class="mu" id="log-page-label">第 1 页</span>
+          <button class="btn btn-gh btn-xs" id="log-next" onclick="changeLogPage(1)">下一页<i class="fas fa-chevron-right"></i></button>
+          <label class="mu" style="font-size:12px;display:inline-flex;align-items:center;gap:4px">每页
+            <select id="log-page-size" class="select-sm" onchange="changeUsageLogPageSize(this.value)" aria-label="每页条数"><option value="5" selected>5</option><option value="10">10</option><option value="20">20</option><option value="50">50</option><option value="100">100</option></select>
+            条</label>
+        </div>
+      </section>
       <section id="logs" class="workspace-section" aria-labelledby="logs-title">
         <div class="section-heading section-heading--admin"><div><h2 id="logs-title">系统日志</h2><p>记录 API 请求、错误等关键信息。超过保留天数的日志会自动删除。</p></div><div><label class="tg"><input type="checkbox" id="log-switch" onchange="toggleLog(this.checked)"><span class="sl"></span></label><span id="log-status">已关闭</span><label class="tg" style="margin-left:8px" title="定时自动刷新日志，便于排查问题"><input type="checkbox" id="log-auto-on" onchange="logAutoToggle(this.checked)"><span class="sl"></span></label><input type="number" id="log-auto-sec" min="1" max="3600" value="5" style="width:58px;text-align:center;font-size:12px;padding:2px 4px;border-radius:6px;border:1px solid var(--border,#e2e8f0);background:var(--card,#fff);color:inherit;margin-left:6px" onchange="logAutoSecChange()"><span class="mu" style="font-size:12px;margin-left:4px">秒自动刷新</span><label class="mu" style="font-size:12px;margin-left:10px" title="日志保留天数，超过后自动删除">保留</label><input type="number" id="log-retention" min="1" max="365" value="7" style="width:50px;text-align:center;font-size:12px;padding:2px 4px;border-radius:6px;border:1px solid var(--border,#e2e8f0);background:var(--card,#fff);color:inherit;margin-left:4px" onchange="logRetentionChange(this.value)"><span class="mu" style="font-size:12px;margin-left:4px">天</span><button class="btn btn-gh btn-xs" onclick="logPageChange(1)" style="margin-left:10px" title="刷新（回到第一页）"><i class="fas fa-sync-alt"></i></button><button class="btn btn-d btn-xs" onclick="clearLogs()" style="margin-left:4px">清除</button></div></div>
         <div class="syslog-filters">
@@ -810,17 +810,6 @@ ${H('管理')}
           </article>`).join('')}
         </div>
       </section>
-      <!-- ===== 内存缓存管理（P4） ===== -->
-      <section id="cache" class="workspace-section" aria-labelledby="cache-title">
-        <div class="section-heading section-heading--admin">
-          <div><h2 id="cache-title">内存缓存</h2><p>热路径 KV 读的 10s 内存缓存（当前 isolate 实例）。外部直接改 KV 后，可在此手动清空让网关立即重读；也可点「清空全部」。</p></div>
-          <div><button class="btn btn-gh btn-xs" onclick="loadCache()" style="margin-left:8px"><i class="fas fa-sync-alt"></i></button><button class="btn btn-d btn-xs" onclick="cacheClear()"><i class="fas fa-trash" aria-hidden="true"></i>清空全部</button></div>
-        </div>
-        <div id="cache-list" class="key-list">
-          <div class="empty-state"><i class="fas fa-memory" aria-hidden="true"></i><h3>加载中…</h3></div>
-        </div>
-      </section>
-
       <!-- ===== 思维引导提示词设置 ===== -->
       <section id="thinking" class="workspace-section" aria-labelledby="thinking-title">
         <div class="section-heading section-heading--admin">
@@ -839,6 +828,17 @@ ${H('管理')}
           <span class="form-helper">提示词首行会被加上网关注入标记以做幂等，请勿手动移除或复制该标记行。</span>
         </div>
         <div id="thinking-result" class="mt-1" aria-live="polite"></div>
+      </section>
+
+      <!-- ===== 内存缓存管理（P4） ===== -->
+      <section id="cache" class="workspace-section" aria-labelledby="cache-title">
+        <div class="section-heading section-heading--admin">
+          <div><h2 id="cache-title">内存缓存</h2><p>热路径 KV 读的 10s 内存缓存（当前 isolate 实例）。外部直接改 KV 后，可在此手动清空让网关立即重读；也可点「清空全部」。</p></div>
+          <div><button class="btn btn-gh btn-xs" onclick="loadCache()" style="margin-left:8px"><i class="fas fa-sync-alt"></i></button><button class="btn btn-d btn-xs" onclick="cacheClear()"><i class="fas fa-trash" aria-hidden="true"></i>清空全部</button></div>
+        </div>
+        <div id="cache-list" class="key-list">
+          <div class="empty-state"><i class="fas fa-memory" aria-hidden="true"></i><h3>加载中…</h3></div>
+        </div>
       </section>
 
       <section id="cache-prefix" class="workspace-section" aria-labelledby="cache-prefix-title">
