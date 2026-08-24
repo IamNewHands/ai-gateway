@@ -33,8 +33,9 @@ export const CSS_CONTENT = `
   --shadow-panel: 0 18px 48px oklch(20% 0.020 258 / .10);
   --shadow-float: 0 8px 24px oklch(20% 0.020 258 / .12);
 
-  --font-display: 'Space Grotesk', 'SF Pro Display', sans-serif;
-  --font-body: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+  /* P0：中文优先字体链 —— Latin 交给 Space Grotesk/Inter，CJK 优先 MiSans/HarmonyOS Sans，逐级回退系统字体 */
+  --font-display: 'Space Grotesk', 'MiSans', 'HarmonyOS Sans SC', 'PingFang SC', 'Hiragino Sans GB', 'Microsoft YaHei', 'SF Pro Display', sans-serif;
+  --font-body: 'Inter', 'MiSans', 'HarmonyOS Sans SC', -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', 'Hiragino Sans GB', 'Microsoft YaHei', sans-serif;
   --font-mono: 'JetBrains Mono', 'SFMono-Regular', Consolas, monospace;
 
   --space-3xs: .25rem;
@@ -267,6 +268,8 @@ label, legend { color: var(--color-ink-2); font-size: var(--text-xs); font-weigh
 .status-badge--on, .bd-on, .status-dot--online { background: var(--color-success-soft); color: var(--color-success-ink); }
 .bd-off { background: var(--color-paper-3); color: var(--color-muted); }
 .bd-info, .protocol-chip { background: var(--color-accent-soft); color: var(--color-focus); }
+/* P0：状态徽章语义补齐 —— 失败/不可用用危险软底色，与成功/中性构成完整语义级 */
+.bd-danger { background: var(--color-danger-soft); color: var(--color-danger-ink); }
 .empty-inline { color: var(--color-muted); font-size: var(--text-xs); }
 .empty-state { padding: var(--space-xl) var(--space-sm); display: flex; flex-direction: column; align-items: center; gap: var(--space-xs); border: .0625rem dashed var(--color-rule-2); border-radius: var(--radius-panel); background: var(--color-paper-2); color: var(--color-muted); text-align: center; }
 .empty-state > i { font-size: var(--text-lg); color: var(--color-muted); }
@@ -331,7 +334,7 @@ label, legend { color: var(--color-ink-2); font-size: var(--text-xs); font-weigh
 .panel-actions > div, .detail-actions > div { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: var(--space-2xs); }
 .switch-label { min-height: var(--control-h); display: flex; align-items: center; justify-content: space-between; gap: var(--space-sm); }
 .gp, .provider-list, .key-list { display: grid; grid-template-columns: minmax(0, 1fr); gap: var(--space-xs); }
-.pi, .ki { min-width: 0; border: .0625rem solid var(--color-rule); border-radius: var(--radius-control); background: var(--color-paper); }
+.pi, .ki { min-width: 0; border: .0625rem solid var(--color-rule); border-radius: var(--radius-control); background: var(--color-paper); transition: border-color var(--dur-fast) ease; }
 .ps { min-height: 3.5rem; padding: var(--space-xs); display: flex; align-items: center; justify-content: space-between; gap: var(--space-sm); cursor: pointer; }
 .ps .l { min-width: 0; display: flex; align-items: center; gap: var(--space-xs); }
 .ps .l > div { min-width: 0; }
@@ -426,7 +429,8 @@ label, legend { color: var(--color-ink-2); font-size: var(--text-xs); font-weigh
   .btn-d:hover { border-color: var(--color-danger); background: var(--color-danger); color: var(--color-paper); }
   input:hover, textarea:hover, select:hover { background: var(--color-paper-2); }
   .model-token:hover { border-color: var(--color-accent); color: var(--color-focus); }
-  .provider-row:hover, .pi:hover, .ki:hover { border-color: var(--color-rule-2); }
+  /* P0：卡片悬浮态边框着色（accent 35% 混入边框色），替代单纯加深边框 */
+  .provider-row:hover, .pi:hover, .ki:hover { border-color: color-mix(in oklch, var(--color-accent) 35%, var(--color-rule)); }
   .ps:hover { background: var(--color-paper-2); }
   .admin-nav__link:hover { background: var(--color-paper-2); color: var(--color-ink); }
 }
@@ -467,6 +471,8 @@ label, legend { color: var(--color-ink-2); font-size: var(--text-xs); font-weigh
   .admin-rail__brand { padding-inline: var(--space-xs); }
   .admin-rail__brand > span:last-child { display: flex; flex-direction: column; line-height: 1.2; }
   .admin-nav { margin-block-start: var(--space-xl); display: grid; gap: var(--space-3xs); }
+  /* P1：导航分组标题 —— 只在侧栏（≥60rem）显示，移动端顶栏不需要 */
+  .admin-nav__group { margin: var(--space-sm) 0 var(--space-3xs); padding-inline: var(--space-xs); color: var(--color-muted); font-size: .6875rem; font-weight: 700; letter-spacing: .08em; }
   .admin-nav__link { min-height: var(--control-h); padding-inline: var(--space-xs); display: grid; grid-template-columns: 1.25rem minmax(0, 1fr) auto; align-items: center; gap: var(--space-2xs); color: var(--color-muted); font-weight: 600; }
   .admin-nav__link b { min-width: 1.5rem; padding-inline: var(--space-3xs); border-radius: var(--radius-round); background: var(--color-paper-3); color: var(--color-muted); font-family: var(--font-mono); font-size: .625rem; text-align: center; }
   .admin-nav__link.is-active { background: var(--color-accent-soft); color: var(--color-focus); }
@@ -528,10 +534,12 @@ label, legend { color: var(--color-ink-2); font-size: var(--text-xs); font-weigh
 .range-group .btn.is-active { background: var(--color-accent-soft); color: var(--color-focus); }
 .range-group .btn + .btn { border-inline-start: .0625rem solid var(--color-rule-2); }
 .usage-log-table-wrap { min-width: 0; overflow-x: auto; margin-block-start: var(--space-sm); }
-.usage-log-table { width: 100%; border-collapse: collapse; font-size: var(--text-xs); }
-.usage-log-table th, .usage-log-table td { min-width: 0; padding: var(--space-2xs) var(--space-xs); border-block-end: .0625rem solid var(--color-rule); text-align: left; white-space: nowrap; }
-.usage-log-table th { background: var(--color-paper-2); color: var(--color-muted); font-weight: 600; }
-.usage-log-table td.numeric { text-align: right; font-family: var(--font-mono); }
+/* P0：M365 账号池表格 .tbl 与 usage-log-table 统一外观 */
+.usage-log-table, .tbl { width: 100%; border-collapse: collapse; font-size: var(--text-xs); }
+/* P0：统一行高 44px、只保留横向分割线（无斑马纹），数字列等宽右对齐由 .numeric 承担 */
+.usage-log-table th, .usage-log-table td, .tbl th, .tbl td { min-width: 0; height: 2.75rem; padding: var(--space-2xs) var(--space-sm); border-block-end: .0625rem solid var(--color-rule); text-align: left; white-space: nowrap; }
+.usage-log-table th, .tbl th { background: var(--color-paper-2); color: var(--color-muted); font-weight: 600; }
+.usage-log-table td.numeric, .tbl td.numeric { text-align: right; font-family: var(--font-mono); }
 .usage-log-table code { font-size: var(--text-xs); }
 .usage-log-cards { display: none; }
 .analytics-log-filters, .syslog-filters { display: grid; grid-template-columns: minmax(0, 1fr); gap: var(--space-2xs); margin-block: var(--space-sm); padding: var(--space-sm); border: .0625rem solid var(--color-rule); border-radius: var(--radius-control); background: var(--color-paper-2); }

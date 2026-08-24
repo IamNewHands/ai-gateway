@@ -472,17 +472,21 @@ ${H('管理')}
     </a>
     <nav class="admin-nav">
       <a class="admin-nav__link is-active" href="#overview"><i class="fas fa-chart-pie" aria-hidden="true"></i><span>概览</span></a>
+      <p class="admin-nav__group" aria-hidden="true">接入资源</p>
       <a class="admin-nav__link" href="#providers"><i class="fas fa-server" aria-hidden="true"></i><span>提供商</span><b>${providers.length}</b></a>
       <a class="admin-nav__link" href="#m365-accounts"><i class="fas fa-users" aria-hidden="true"></i><span>M365 账号池</span></a>
       <a class="admin-nav__link" href="#proxy-keys"><i class="fas fa-key" aria-hidden="true"></i><span>转发 Key</span><b>${proxyKeys.length}</b></a>
+<a class="admin-nav__link" href="#checkin"><i class="fas fa-calendar-check" aria-hidden="true"></i><span>签到</span><b>${providers.filter((p:any)=>p.authType==='oauth-device'&&p.oauth&&p.oauth.flowType!=='m365-pkce'&&p.oauth.flowType!=='m365-ropc').length}</b></a>
+      <p class="admin-nav__group" aria-hidden="true">观测分析</p>
       <a class="admin-nav__link" href="#analytics"><i class="fas fa-chart-bar" aria-hidden="true"></i><span>使用统计</span></a>
       <a class="admin-nav__link" href="#usage-logs"><i class="fas fa-clipboard-list" aria-hidden="true"></i><span>详细日志</span></a>
       <a class="admin-nav__link" href="#logs"><i class="fas fa-list-alt" aria-hidden="true"></i><span>系统日志</span></a>
-<a class="admin-nav__link" href="#checkin"><i class="fas fa-calendar-check" aria-hidden="true"></i><span>签到</span><b>${providers.filter((p:any)=>p.authType==='oauth-device'&&p.oauth&&p.oauth.flowType!=='m365-pkce'&&p.oauth.flowType!=='m365-ropc').length}</b></a>
+      <p class="admin-nav__group" aria-hidden="true">模型能力</p>
       <a class="admin-nav__link" href="#mcps"><i class="fas fa-boxes" aria-hidden="true"></i><span>MCP 网关</span><b>${mcps.length}</b></a>
       <a class="admin-nav__link" href="#unimodels"><i class="fas fa-layer-group" aria-hidden="true"></i><span>联合模型</span><b>${unimodels.length}</b></a>
-      <a class="admin-nav__link" href="#cache"><i class="fas fa-memory" aria-hidden="true"></i><span>内存缓存</span></a>
       <a class="admin-nav__link" href="#thinking"><i class="fas fa-brain" aria-hidden="true"></i><span>思维引导</span></a>
+      <p class="admin-nav__group" aria-hidden="true">缓存与性能</p>
+      <a class="admin-nav__link" href="#cache"><i class="fas fa-memory" aria-hidden="true"></i><span>内存缓存</span></a>
       <a class="admin-nav__link" href="#cache-prefix"><i class="fas fa-database" aria-hidden="true"></i><span>缓存前缀</span></a>
       <a class="admin-nav__link" href="#perf"><i class="fas fa-tachometer-alt" aria-hidden="true"></i><span>性能设置</span></a>
     </nav>
@@ -495,7 +499,7 @@ ${H('管理')}
   <div class="admin-main">
     <header class="admin-topbar">
       <a class="brand" href="/"><span class="brand__mark" aria-hidden="true"><i class="fas fa-cloud"></i></span><span class="brand__name">${SITE_CONFIG.title}</span></a>
-      <nav aria-label="移动端控制台导航"><a href="#overview">概览</a><a href="#providers">提供商</a><a href="#proxy-keys">Key</a><a href="#analytics">统计</a><a href="#usage-logs">日志</a><a href="#checkin">签到</a><a href="#mcps">MCP</a><a href="#unimodels">联合</a><a href="#cache">缓存</a><a href="#thinking">思维引导</a><a href="#cache-prefix">缓存前缀</a><a href="#perf">性能</a><a href="#logs">系统日志</a></nav>
+      <nav aria-label="移动端控制台导航"><a href="#overview">概览</a><a href="#providers">提供商</a><a href="#m365-accounts">M365 池</a><a href="#proxy-keys">Key</a><a href="#checkin">签到</a><a href="#analytics">统计</a><a href="#usage-logs">日志</a><a href="#logs">系统日志</a><a href="#mcps">MCP</a><a href="#unimodels">联合</a><a href="#thinking">思维引导</a><a href="#cache">缓存</a><a href="#cache-prefix">缓存前缀</a><a href="#perf">性能</a></nav>
       <a class="icon-btn" href="javascript:void(0)" onclick="doLogout()" aria-label="退出登录"><i class="fas fa-sign-out-alt" aria-hidden="true"></i></a>
     </header>
 
@@ -746,7 +750,7 @@ ${H('管理')}
                 if (accs.length === 0) { root.innerHTML = '<div class="empty-state"><i class="fas fa-users"></i><h3>暂无账号</h3><p>到「提供商 → ' + m365Esc(providerId) + '」用授权码或账密连接，第一个账号也会进入此池。</p></div>'; return; }
                 root.innerHTML = '<table class="tbl"><thead><tr><th>账号</th><th>OID</th><th>状态</th><th>操作</th></tr></thead><tbody>' +
                   accs.map(function (a) {
-                    var status = a.connected ? (a.healthy ? '<span class="bd bd-on">健康</span>' : '<span class="bd bd-off">不可用</span>') : '<span class="bd bd-off">未连接</span>';
+                    var status = a.connected ? (a.healthy ? '<span class="bd bd-on">健康</span>' : '<span class="bd bd-danger">不可用</span>') : '<span class="bd bd-off">未连接</span>';
                     return '<tr><td>' + m365Esc(a.email || a.oid || '?') + '</td><td><code>' + m365Esc(a.oid || '') + '</code></td><td>' + status + '</td>' +
                       '<td><button class="btn btn-d btn-xs" onclick="m365Remove(\\'' + m365Esc(providerId) + '\\',\\'' + m365Esc(a.oid || '') + '\\',this)"><i class="fas fa-trash"></i>移除</button></td></tr>';
                   }).join('') + '</tbody></table>' +
@@ -1902,7 +1906,7 @@ function renderTraeCheckin(id, results) {
   if (!box) return
   if (!results || results.length === 0) { box.innerHTML = ''; return }
   box.innerHTML = '<div class="checkin-grid">' + results.map(function (r) {
-    const ok = r.success ? '<span class="bd bd-on">成功</span>' : '<span class="bd bd-off">失败</span>'
+    const ok = r.success ? '<span class="bd bd-on">成功</span>' : '<span class="bd bd-danger">失败</span>'
     return '<div class="ki" style="margin-bottom:6px"><div class="key-main"><span class="key-icon"><i class="fas fa-calendar-check"></i></span>' +
       '<div><h3>' + escapeHtml(r.nickname || r.uid) + ' ' + ok + (r.checkedIn ? ' <span class="bd bd-on">已签到</span>' : '') + '</h3>' +
       '<p>' + escapeHtml(r.message || '') + (r.credits !== undefined && r.credits !== null ? ' · 剩余积分 ' + r.credits : '') + '</p></div></div></div>'
@@ -2692,7 +2696,7 @@ async function refreshLogs(isAuto) {
           : log.type === 'request' ? '<i class="fas fa-check-circle c-g"></i>'
           : '<i class="fas fa-info-circle c-p"></i>'
         var time = new Date(log.time).toLocaleString()
-        html += '<article class="ki" style="font-size:12px;padding:6px 10px"><div><span style="margin-right:8px">' + icon + '</span><span class="mu" style="margin-right:8px">' + escapeHtml(time) + '</span><span class="bd bd-' + (log.type==='error'?'off':'on') + '">' + log.type + '</span></div><div style="margin-top:4px">' + escapeHtml(log.message) + '</div>' + (log.details ? '<details style="margin-top:4px"><summary>详情</summary><pre style="white-space:pre-wrap;font-size:11px;max-height:200px;overflow:auto">' + escapeHtml(log.details) + '</pre></details>' : '') + '</article>'
+        html += '<article class="ki" style="font-size:12px;padding:6px 10px"><div><span style="margin-right:8px">' + icon + '</span><span class="mu" style="margin-right:8px">' + escapeHtml(time) + '</span><span class="bd bd-' + (log.type==='error'?'danger':log.type==='warn'?'off':'on') + '">' + log.type + '</span></div><div style="margin-top:4px">' + escapeHtml(log.message) + '</div>' + (log.details ? '<details style="margin-top:4px"><summary>详情</summary><pre style="white-space:pre-wrap;font-size:11px;max-height:200px;overflow:auto">' + escapeHtml(log.details) + '</pre></details>' : '') + '</article>'
       })
       // 分页条
       var totalPages = Math.max(1, Math.ceil(d.data.total / logPageSize))
@@ -2835,7 +2839,7 @@ function renderWorkbuddyCards(list) {
       : reason === 'already' ? '<span class="bd bd-on">今日已签</span>'
       : reason === 'skipped_global' ? '<span class="bd bd-off">国际版跳过</span>'
       : reason === 'skipped_no_token' ? '<span class="bd bd-off">未签到</span>'
-      : '<span class="bd bd-off">失败</span>'
+      : '<span class="bd bd-danger">失败</span>'
     var lastTime = c.lastCheckinAt ? new Date(c.lastCheckinAt).toLocaleString() : '—'
     var streak = (c.streakDays !== undefined && c.streakDays !== null) ? c.streakDays + ' 天' : '—'
     var credits = (c.totalCredits !== undefined && c.totalCredits !== null) ? c.totalCredits : '—'
@@ -2871,7 +2875,7 @@ function renderWorkbuddyCards(list) {
     var accountsLine = ''
     if (c.accounts && c.accounts.length > 0) {
       accountsLine = '<div class="mu" style="margin-top:4px">' + c.accounts.map(function(a, ai) {
-        const ab = a.success ? '<span class="bd bd-on">' + (a.reason === 'already' ? '已签' : '成功') + '</span>' : '<span class="bd bd-off">失败</span>'
+        const ab = a.success ? '<span class="bd bd-on">' + (a.reason === 'already' ? '已签' : '成功') + '</span>' : '<span class="bd bd-danger">失败</span>'
         const nm = a.nickname ? escapeHtml(a.nickname) : escapeHtml(a.uid)
         const rem = (a.totalRemain !== undefined && a.totalRemain !== null) ? ' · 可用 ' + a.totalRemain : ''
         // 逐账号权益包明细（与单账号卡片一致，展示该账号额度由哪些包构成）
@@ -2913,7 +2917,7 @@ function renderTraeCheckinList(traeList) {
       html += '<p class="mu">尚未签到</p>'
     } else {
       html += t.results.map(function(r) {
-        const ok = r.success ? (r.checkedIn ? '<span class="bd bd-on">已签到</span>' : '<span class="bd bd-on">成功</span>') : '<span class="bd bd-off">失败</span>'
+        const ok = r.success ? (r.checkedIn ? '<span class="bd bd-on">已签到</span>' : '<span class="bd bd-on">成功</span>') : '<span class="bd bd-danger">失败</span>'
         return '<div style="margin-top:4px"><span class="bd bd-on">' + escapeHtml(r.nickname || r.uid) + '</span> ' + ok +
           ' <span style="color:var(--muted)">' + escapeHtml(r.message || '') + '</span>' +
           ((r.credits !== undefined && r.credits !== null) ? ' · 剩余积分 ' + r.credits : '') + '</div>'
