@@ -1,6 +1,7 @@
 # AI Gateway
 
 基于 Cloudflare Workers + Hono 的 AI API 代理网关，统一 `/v1` 接口转发，兼容 OpenAI / Anthropic 协议，支持多 Key 轮询、健康检查与自动故障转移。
+<img width="3164" height="1657" alt="image" src="https://github.com/user-attachments/assets/8e88a23a-19c1-4ba7-a392-ccdb224ea069" />
 
 ## 功能特性
 
