@@ -17,8 +17,8 @@
 
 本仓库基于 [yutian81/ai-gateway](https://github.com/yutian81/ai-gateway) 二次开发，在原有的多 Key 轮询 / 健康检查 / OpenCode 故障转移基础上新增了以下能力：
 
-- **WorkBuddy / CodeBuddy 接入** — OAuth 设备码登录、CN / Global 双域路由、Token 自动刷新、模型自动入库
-- **WorkBuddy 每日签到** — Cron 定时自动签到，多账号支持，后台签到面板
+- **WorkBuddy / CodeBuddy / TraeWork 接入** — OAuth 设备码登录、CN / Global 双域路由、Token 自动刷新、模型自动入库
+- **WorkBuddy / TraeWork 每日签到** — Cron 定时自动签到，多账号支持，后台签到面板
 - **对外管理 API** — Bearer Token 认证（`MANAGEMENT_TOKEN`），支持手机脚本远程管理提供商、触发签到
 - **协议格式双向转换** — Anthropic Messages / OpenAI Responses / Chat Completions 双向转换，含流式 SSE 实时转换
 - **Cline 接入** — 内置白嫖模型反代，多账号池轮询、一键授权获取 Token
