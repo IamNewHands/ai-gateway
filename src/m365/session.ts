@@ -22,6 +22,12 @@ export interface SessionBinding {
   userField?: string
   contextFinger?: string
   contextHistory?: OaiMsgLite[]
+  /**
+   * 会话归属租户（调用方 API Key 的不可逆哈希，由网关 auth 中间件计算并透传）。
+   * 所有读/匹配/复用/删除都按 tenant 作用域，杜绝跨 Key 读取/续聊/删除他人的云端对话。
+   * 旧记录（无此字段）视为无主，永不匹配任何带 key 的调用方。
+   */
+  tenant?: string
 }
 
 export interface ResolveResult {
@@ -119,6 +125,11 @@ export interface ContextLike {
   userAgent?: string
   user?: string
   explicitSessionId?: string
+  /**
+   * 租户标识：调用方 API Key 的不可逆哈希（由网关 auth 中间件计算并透传）。
+   * 传入后所有会话匹配都限制在该租户内；缺省为 ''（不匹配任何带 tenant 的记录）。
+   */
+  tenant?: string
 }
 
 /** 比较两个工具调用：name 与 arguments 一致即视为等价，忽略 id（客户端重放时 id 会重新生成） */
@@ -192,7 +203,7 @@ export async function resolveSession(env: Env, providerId: string, msgs: OaiMsgL
 
   const explicitID = ctx.explicitSessionId || ''
   if (explicitID) {
-    const s = list.find((x) => x.sessionId === explicitID)
+    const s = list.find((x) => x.sessionId === explicitID && x.tenant === ctx.tenant)
     if (s) {
       s.lastUsedAt = Date.now()
       await writeAll(env, providerId, list)
@@ -202,9 +213,10 @@ export async function resolveSession(env: Env, providerId: string, msgs: OaiMsgL
 
   if (msgs && msgs.length > 0) {
     const ipFinger = clientIPFingerprint(ctx)
-    // 内容前缀匹配
+    // 内容前缀匹配（仅限本租户）
     let best: { id: string; n: number; recent: number } | null = null
     for (const s of list) {
+      if (s.tenant !== ctx.tenant) continue
       if (!s.ipFingerprint || s.ipFingerprint !== ipFinger) continue
       if (Date.now() - s.lastUsedAt > contextTtlMs(env)) continue
       if (!s.contextHistory || s.contextHistory.length === 0) continue
@@ -219,9 +231,10 @@ export async function resolveSession(env: Env, providerId: string, msgs: OaiMsgL
       await writeAll(env, providerId, list)
       return { sessionId: s.sessionId, conversationId: s.conversationId, accountId: s.accountId, matchedBy: `context_prefix_${best.n}`, isNew: false, historyLen: best.n }
     }
-    // suffix 匹配（客户端本地截断历史时仍可复用）
+    // suffix 匹配（客户端本地截断历史时仍可复用；仅限本租户）
     let bestS: { id: string; n: number; recent: number } | null = null
     for (const s of list) {
+      if (s.tenant !== ctx.tenant) continue
       if (!s.ipFingerprint || s.ipFingerprint !== ipFinger) continue
       if (Date.now() - s.lastUsedAt > contextTtlMs(env)) continue
       if (!s.contextHistory || s.contextHistory.length < 2) continue
@@ -260,7 +273,10 @@ export async function bindSession(env: Env, providerId: string, sessionId: strin
   const explicitID = ctx.explicitSessionId || ''
   const persistId = explicitID || sessionId
 
-  const existing = list.find((s) => s.sessionId === persistId || (s.conversationId === conversationId && persistId === ''))
+  const existing = list.find((s) =>
+    (s.sessionId === persistId && s.tenant === ctx.tenant) ||
+    (s.conversationId === conversationId && persistId === '' && s.tenant === ctx.tenant)
+  )
   if (existing) {
     existing.conversationId = conversationId
     existing.accountId = accountId
@@ -269,6 +285,7 @@ export async function bindSession(env: Env, providerId: string, sessionId: strin
     existing.ipFingerprint = ipFinger
     existing.contextFinger = contextFingerprint(history)
     existing.contextHistory = history
+    existing.tenant = ctx.tenant
   } else {
     list.push({
       sessionId: persistId || crypto.randomUUID(),
@@ -280,6 +297,7 @@ export async function bindSession(env: Env, providerId: string, sessionId: strin
       ipFingerprint: ipFinger,
       contextFinger: contextFingerprint(history),
       contextHistory: history,
+      tenant: ctx.tenant,
     })
   }
   await writeAll(env, providerId, list)
@@ -290,11 +308,11 @@ export async function listSessions(env: Env, providerId: string): Promise<Sessio
   return evict(await readAll(env, providerId), sessionTtlMs(env))
 }
 
-/** 删除某 provider 的会话 */
-export async function deleteSession(env: Env, providerId: string, sessionId: string): Promise<boolean> {
+/** 删除某 provider 的会话（仅限本租户，防止跨 Key 删除他人会话） */
+export async function deleteSession(env: Env, providerId: string, sessionId: string, tenant?: string): Promise<boolean> {
   let list = await readAll(env, providerId)
   const before = list.length
-  list = list.filter((s) => s.sessionId !== sessionId)
+  list = list.filter((s) => s.sessionId !== sessionId || (tenant !== undefined && s.tenant !== tenant))
   if (list.length === before) return false
   await writeAll(env, providerId, list)
   return true

@@ -274,6 +274,26 @@ function bytesToBase64(bytes: Uint8Array): string {
   return btoa(binary)
 }
 
+/**
+ * 用最终消息对齐流式文本（原版 finalizeText 移植，导出以便单测）：
+ * - final 为空或 final 不高于 streamed → 直接用现有文本；
+ * - streamed 是 final 的前缀 → 流式漏了尾部，通过 emit 补发缺失片段后返回 final；
+ * - 否则流式文本已偏离 final → 无法撤回已发出的 delta，但以 final 作为返回值，
+ *   保证非流式调用与对话历史（会话绑定）使用完整正确的文本。
+ * emit 为可选的文本增量回调（流式透出时传入 onDelta）。
+ */
+export function finalizeText(streamed: string, final: string, emit?: (delta: string) => void): string {
+  if (final === '' || final.length <= streamed.length) {
+    return streamed === '' ? final : streamed
+  }
+  if (final.startsWith(streamed)) {
+    const tail = final.substring(streamed.length)
+    if (tail) emit?.(tail)
+    return final
+  }
+  return final
+}
+
 /** 组装 ChatHub chat 帧（type=4 target=chat） */
 function chatPayload(req: ChatHubRequest, requestID: string, firstTurn: boolean): string {
   const tools = req.tools || []
@@ -574,31 +594,6 @@ export async function chatWithHandlers(
       skippedSnapshots++
     }
 
-    /**
-     * 用最终消息对齐流式文本（原版 finalizeText 移植）：
-     * - final 不高于 streamed 或 streamed 为空 → 直接用现有文本；
-     * - streamed 是 final 的前缀 → 流式漏了尾部，立即补发缺失片段；
-     * - 否则流式文本已偏离 final → 无法撤回已发出的 delta，但以 final 作为
-     *   返回值，保证非流式调用与对话历史（会话绑定）使用完整正确的文本。
-     */
-    const finalizeText = (streamed: string, final: string): string => {
-      if (final === '' || final.length <= streamed.length) {
-        return streamed === '' ? final : streamed
-      }
-      if (final.startsWith(streamed)) {
-        const tail = final.substring(streamed.length)
-        if (tail) {
-          streamedText = final
-          onDelta?.(tail)
-        }
-        return final
-      }
-      if (skippedSnapshots > 0) {
-        console.warn(`[m365:chathub] streamed text diverged from final result (streamed=${streamed.length} final=${final.length} skipped=${skippedSnapshots}); using final`)
-      }
-      return final
-    }
-
     while (Date.now() < deadline) {
       const read = await withTimeout(next(), readTimeoutMs, 'ws message')
       if (read.err) throw read.err
@@ -678,7 +673,7 @@ export async function chatWithHandlers(
         if (frame.type === 3) {
           if (frame.error) throw new Error(`chathub completion error: ${JSON.stringify(frame.error)}`)
           // 以最终消息对齐流式文本：流式漏掉的尾部在这里补发（原版 finalizeText）
-          const text = finalizeText(streamedText, finalText || streamedText)
+          const text = finalizeText(streamedText, finalText || streamedText, onDelta)
           if (rateLimited(text)) throw new Error('upstream rate-limit notice')
           // 空返回：既无正文也无工具/推理事件 → 视为空完成（同原版 ErrEmptyCompletion）
           if (text.trim() === '' && reasoningBuf.trim() === '' && collectedEvents.length === 0) {

@@ -35,6 +35,11 @@ export interface M365ChatPayload {
   user?: string
   ip?: string
   userAgent?: string
+  /**
+   * 租户标识：调用方 API Key 的不可逆哈希（由网关 auth 中间件计算透传）。
+   * 用于会话绑定/复用的租户隔离，杜绝跨 Key 读取他人云端对话。
+   */
+  tenant?: string
 }
 
 interface ChatOutcome {
@@ -97,13 +102,13 @@ export class M365Session {
   }
 
   private async handleChat(payload: M365ChatPayload): Promise<Response> {
-    const { providerId, model, body, stream, explicitSessionId, explicitAccountId, user, ip, userAgent } = payload
+    const { providerId, model, body, stream, explicitSessionId, explicitAccountId, user, ip, userAgent, tenant } = payload
     const messages = (body['messages'] as Array<Record<string, unknown>>) || []
     const tools = (body['tools'] as unknown[]) || []
     const toolChoice = body['tool_choice']
 
-    // 1) 会话解析（显式 ID / 内容键）
-    const ctx = { explicitSessionId, user, ip, userAgent }
+    // 1) 会话解析（显式 ID / 内容键），按租户（API Key 哈希）隔离
+    const ctx = { explicitSessionId, user, ip, userAgent, tenant: payload.tenant }
     const resolved = await resolveSession(this.env, providerId, messages as never[], ctx)
 
     // 2) 构建 ChatHub 请求：messages 扁平化为单文本 prompt；复用命中只发增量
@@ -595,9 +600,13 @@ function buildSSE(id: string, model: string, o: ChatOutcome, payload: M365ChatPa
   return new Response(stream, { headers: { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', 'Connection': 'keep-alive', 'X-Accel-Buffering': 'no' } })
 }
 
-/** 计算会话路由键（DO instance 分片） */
-export function sessionKey(providerId: string, explicitSessionId: string | undefined, messages: Array<Record<string, unknown>> | undefined): string {
-  if (explicitSessionId) return `${providerId}:ex:${explicitSessionId}`
+/**
+ * 计算会话路由键（DO instance 分片）。
+ * tenant 参与分片：不同 API Key 永远落在不同的 DO 实例 / 绑定域，杜绝跨 Key 串号。
+ */
+export function sessionKey(providerId: string, explicitSessionId: string | undefined, messages: Array<Record<string, unknown>> | undefined, tenant?: string): string {
+  const t = tenant || ''
+  if (explicitSessionId) return `${providerId}:t:${t}:ex:${explicitSessionId}`
   if (messages && messages.length > 0) {
     const parts: string[] = []
     const limit = Math.min(messages.length, 3)
@@ -605,7 +614,7 @@ export function sessionKey(providerId: string, explicitSessionId: string | undef
       const m = messages[i]
       parts.push(`${m['role']}:${typeof m['content'] === 'string' ? String(m['content']).substring(0, 200) : JSON.stringify(m['content'] || '')}`)
     }
-    return `${providerId}:ctx:${sha256Hex(parts.join('||'))}`
+    return `${providerId}:t:${t}:ctx:${sha256Hex(parts.join('||'))}`
   }
-  return `${providerId}:ex:${crypto.randomUUID()}`
+  return `${providerId}:t:${t}:ex:${crypto.randomUUID()}`
 }

@@ -44,7 +44,15 @@ export interface M365ProxyContext {
   user?: string
   ip?: string
   userAgent?: string
+  /**
+   * 租户标识（调用方 API Key 的不可逆哈希，由网关 auth 中间件计算）。
+   * 参与会话隔离与 DO 分片；缺失时降级为无租户（''），不匹配任何带租户的绑定。
+   */
+  tenant?: string
 }
+
+/** 内部透传租户用的 body 字段（Anthropic/Responses 特殊路径没有 context 参数时使用） */
+const TENANT_BODY_FIELD = '__m365_tenant'
 
 /** 从请求体提取客户端指定的会话 ID（可选，X-M365-Session-Id 的 JSON 对应字段） */
 function extractExplicitSession(body: Record<string, unknown>): string | undefined {
@@ -66,7 +74,11 @@ export async function proxyM365ChatRequest(
   const messages = (body['messages'] as Array<Record<string, unknown>>) || []
   // 显式会话 ID 优先级：HTTP 头 X-M365-Session-Id > 请求体字段（m365_session_id / session_id）
   const explicitSessionId = context?.explicitSessionId || extractExplicitSession(body)
-  const sessionId = sessionKey(provider.id, explicitSessionId, messages)
+  // 租户隔离：优先 context 传入，其次特殊路径经 body 内部字段透传（读取后剥离，不进 DO）
+  const bodyTenant = typeof body[TENANT_BODY_FIELD] === 'string' ? (body[TENANT_BODY_FIELD] as string) : ''
+  delete body[TENANT_BODY_FIELD]
+  const tenant = context?.tenant || bodyTenant || ''
+  const sessionId = sessionKey(provider.id, explicitSessionId, messages, tenant)
 
   const payload: M365ChatPayload = {
     providerId: provider.id,
@@ -79,6 +91,7 @@ export async function proxyM365ChatRequest(
     user: context?.user,
     ip: context?.ip,
     userAgent: context?.userAgent,
+    tenant,
   }
 
   const stub = env.M365_SESSION.get(env.M365_SESSION.idFromName(sessionId))

@@ -1344,6 +1344,8 @@ export async function forwardProxy(
         explicitSessionId: c.req.header('X-M365-Session-Id') || '',
         ip: c.req.header('cf-connecting-ip') || c.req.header('x-real-ip') || '',
         userAgent: c.req.header('user-agent') || '',
+        // 租户隔离：调用方 API Key 的不可逆哈希（auth 中间件已计算）
+        tenant: c.get('proxyKeyHash') || '',
       })
       const logLevel = response.ok ? 'request' : (response.status >= 500 ? 'error' : 'warn')
       try {
@@ -3118,6 +3120,8 @@ async function handleAnthropicM365(
   // 透传 X-M365-Session-Id 请求头到 body（Anthropic 路径无 context 直传，靠 extractExplicitSession 识别）
   const sid = c.req.header('X-M365-Session-Id')
   if (sid) openaiBody['m365_session_id'] = sid
+  // 租户隔离：此路径无 context 参数，经 body 内部字段透传给 proxyM365ChatRequest
+  openaiBody['__m365_tenant'] = c.get('proxyKeyHash') || ''
   return handleAnthropicSpecial(c, provider, model, openaiBody, originalStream, proxyM365ChatRequest, 'M365')
 }
 
@@ -3954,6 +3958,8 @@ async function handleResponsesM365(
   // 透传 X-M365-Session-Id 请求头到 body（Responses 路径无 context 直传，靠 extractExplicitSession 识别）
   const sid = c.req.header('X-M365-Session-Id')
   if (sid) openaiBody['m365_session_id'] = sid
+  // 租户隔离：此路径无 context 参数，经 body 内部字段透传给 proxyM365ChatRequest
+  openaiBody['__m365_tenant'] = c.get('proxyKeyHash') || ''
   return handleResponsesSpecial(c, provider, model, openaiBody, originalStream, proxyM365ChatRequest, 'M365', g5Base, g5Save)
 }
 
