@@ -50,7 +50,10 @@ async function readHealth(env: Env, accountId: string): Promise<AccountHealthSta
 async function writeHealth(env: Env, accountId: string, state: AccountHealthState): Promise<void> {
   try {
     state.updatedAt = Date.now()
-    await env.KV.put(ACCOUNT_HEALTH_PREFIX + accountId, JSON.stringify(state), { expirationTtl: 3600 })
+    // TTL 必须覆盖最长的 imageLimitedUntil（24h），否则闲置 1 小时记录过期、封禁丢失
+    const maxUntil = Math.max(state.cooldownUntil, state.imageLimitedUntil)
+    const ttlMs = Math.max(maxUntil - Date.now(), 10 * 60 * 1000)
+    await env.KV.put(ACCOUNT_HEALTH_PREFIX + accountId, JSON.stringify(state), { expirationTtl: Math.ceil(ttlMs / 1000) })
   } catch { /* 写入失败不影响主流程 */ }
 }
 
@@ -130,9 +133,16 @@ export async function markAccountImageLimited(env: Env, accountId: string, hours
   console.log(`[account-health] ${accountId} marked image-limited until ${new Date(state.imageLimitedUntil).toISOString()}`)
 }
 
-/** 标记账户成功（清除所有失败状态） */
+/** 标记账户成功（清除失败状态；图片额度封禁保留至到期，同原版 MarkSuccess） */
 export async function markAccountSuccess(env: Env, accountId: string): Promise<void> {
-  await writeHealth(env, accountId, { cooldownUntil: 0, authFailed: false, imageLimitedUntil: 0, updatedAt: Date.now() })
+  const state = await readHealth(env, accountId)
+  await writeHealth(env, accountId, {
+    cooldownUntil: 0,
+    authFailed: false,
+    // 原版显式保留 imageLimited/imageLimitUntil 到自然到期，普通对话成功不解封图片额度
+    imageLimitedUntil: state.imageLimitedUntil > Date.now() ? state.imageLimitedUntil : 0,
+    updatedAt: Date.now(),
+  })
 }
 
 /** 账户是否可用 */

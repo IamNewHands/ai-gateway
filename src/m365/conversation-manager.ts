@@ -56,16 +56,17 @@ async function writePersist(env: Env, providerId: string, p: ConversationPersist
   } catch { /* 写入失败不影响主流程 */ }
 }
 
-/** 记录一条对话 */
+/** 记录一条对话（已存在时保留原 createdAt，同原版 conversation_manager.go） */
 export async function recordConversation(env: Env, providerId: string, conversationId: string, accountId: string, title?: string): Promise<void> {
   const p = await readPersist(env, providerId)
   const now = Date.now()
+  const existing = p.conversations[conversationId]
   p.conversations[conversationId] = {
     id: conversationId,
     accountId,
-    createdAt: now,
+    createdAt: existing?.createdAt || now,
     lastUsedAt: now,
-    title,
+    title: title || existing?.title,
   }
   await writePersist(env, providerId, p)
   console.log(`[conversation-manager] recorded conversation ${conversationId}`)

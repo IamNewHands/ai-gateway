@@ -309,7 +309,9 @@ export class M365Session {
     }
 
     // 6) 绑定会话（记录全量历史 + 助手回复），把实际使用的账号 oid 记为 accountId
-    await bindSession(this.env, providerId, outcome.sessionId, outcome.conversationId, usedAcc.oid || providerId, messages as never[], outcome.text + (outcome.reasoning ? '\n<reasoning>\n' + outcome.reasoning + '\n</reasoning>' : ''), ctx)
+    // 只绑定正文（同原版 Bind：Content 与 ReasoningContent 分离）——reasoning 拼进 content
+    // 会导致下一轮客户端回放的纯文本 assistant 消息前缀失配，会话复用退化为每轮新建
+    await bindSession(this.env, providerId, outcome.sessionId, outcome.conversationId, usedAcc.oid || providerId, messages as never[], outcome.text, ctx)
 
     // 标记账户健康：成功
     await markAccountSuccess(this.env, usedAcc.oid)

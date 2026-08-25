@@ -11,7 +11,7 @@
  */
 import type { Env, Provider } from '../types'
 import { isM365Provider } from './proxy'
-import { getM365Account } from './oauth'
+import { getM365Account, updateM365RefreshToken, M365_OAUTH } from './oauth'
 
 /** DALL-E 请求格式 */
 interface ImageGenRequest {
@@ -56,15 +56,14 @@ async function getDesignerToken(env: Env, providerId: string, _provider: Provide
     throw new Error('account has no refresh token for Designer image download')
   }
   // 用 refresh_token 换取 Designer app service scope 的 access token
-  // client_id 使用 M365 默认 client ID（同原版 auth.ClientID）
-  const clientId = 'abc06c5a-7202-4b42-9b8e-3473353e0700'
+  // client_id 必须与签发 refresh_token 的 client 一致（同原版 firstNonEmpty(acc.ClientID, auth.ClientID())）
   const resp = await fetch(
     `https://login.microsoftonline.com/${account.tid || 'common'}/oauth2/v2.0/token`,
     {
       method: 'POST',
       headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
       body: new URLSearchParams({
-        client_id: clientId,
+        client_id: M365_OAUTH.clientId,
         grant_type: 'refresh_token',
         refresh_token: account.refreshToken,
         scope: 'https://designerappservice.officeapps.live.com/.default',
@@ -79,6 +78,15 @@ async function getDesignerToken(env: Env, providerId: string, _provider: Provide
   const json = (await resp.json()) as Record<string, unknown>
   if (typeof json['access_token'] !== 'string') {
     throw new Error('Designer token response missing access_token')
+  }
+  // 同原版：微软可能轮换 refresh_token，必须回写账号池，否则旧 token 作废后刷新链断裂
+  const rotated = json['refresh_token']
+  if (typeof rotated === 'string' && rotated && rotated !== account.refreshToken) {
+    try {
+      await updateM365RefreshToken(env, providerId, account.oid, rotated)
+    } catch (err) {
+      console.error(`[image-gen] 轮换 refresh_token 持久化失败 provider=${providerId} account=${account.oid}: ${err instanceof Error ? err.message : String(err)}`)
+    }
   }
   return json['access_token'] as string
 }
@@ -148,10 +156,10 @@ function extractImageURLs(raw: string): string[] {
       } else if (typeof v === 'object' && v !== null) {
         for (const [k, e] of Object.entries(v as Record<string, unknown>)) {
           const lk = k.toLowerCase()
-          if (typeof e === 'string' && (lk === 'url' || lk === 'imageurl' || lk === 'thumbnailurl' || lk === 'downloadurl' || lk === 'src')) {
+          if (typeof e === 'string' && (lk === 'url' || lk === 'imageurl' || lk === 'thumbnailurl' || lk === 'downloadurl' || lk === 'src' || lk === 'value' || lk === 'data')) {
             if (e.startsWith('https://') && !seen.has(e)) {
               const le = e.toLowerCase()
-              if (le.includes('image') || le.endsWith('.png') || le.endsWith('.jpg') || le.endsWith('.jpeg') || le.endsWith('.webp')) {
+              if (le.includes('image') || /\.(png|jpe?g|gif|webp)(&|$)/.test(le)) {
                 seen.add(e)
                 urls.push(e)
               }
@@ -257,8 +265,9 @@ export async function handleImageGeneration(
   const rawResult = (result['rawResult'] as string) || ''
 
   if (images.length === 0) {
-    // 尝试从 rawResult 中提取
-    const extracted = extractImageURLs(rawResult) || extractImageURLs(resultText)
+    // 原版两级回退：先 rawResult，提取不到再从 resultText 提取
+    let extracted = extractImageURLs(rawResult)
+    if (extracted.length === 0) extracted = extractImageURLs(resultText)
     images.push(...extracted)
   }
 

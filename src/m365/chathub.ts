@@ -165,20 +165,29 @@ async function safeFetchImage(url: string, redirects = 0): Promise<Response | nu
 
 /** 上游内容策略 / 图片额度 / 限流 / 空返回 的语义分类（同原版 IsContentPolicyBlock 等） */
 export type ChatHubErrorClass = 'rate_limit' | 'content_policy' | 'image_quota' | 'empty' | null
+// 原版 contentPolicyPatterns 精确词表（避免长回答中普通词误判）
 const contentPolicyPatterns = [
-  'can\'t respond to this request', 'cannot respond to this request', '抱歉，我无法回答这个问题',
-  'i\'m sorry, but i cannot', "i'm sorry, i can't", 'as an ai, i cannot', '我不能提供', '无法提供该',
-  'inappropriate', 'harassment', 'self-harm', 'you may need to rephrase',
+  '很抱歉，我无法响应',
+  '我很抱歉，我无法响应',
+  '很抱歉，我无法',
+  '抱歉，我无法',
+  "i'm sorry, i can't respond",
+  "i'm sorry, i cannot respond",
+  'i apologize, i cannot',
 ]
 const imageLimitPatterns = [
+  '无法生成更多图像', 'unable to generate more images', 'cannot generate more images today',
   'image generation quota', 'daily image limit', 'generate any more images',
   '无法再生成图片', '请明天再试', '图片生成额度',
+  // chatWithHandlers 抛出的 ErrImageLimit 等价消息，需在错误消息归类时命中
+  'image generation daily limit',
 ]
 
-/** 判断错误是否与上游内容策略拦截相关 */
+/** 判断错误是否与上游内容策略拦截相关（同原版：>300 字符不判定，避免长回答误报） */
 function isContentPolicyBlock(text: string): boolean {
+  if (text.length > 300) return false
   const low = text.toLowerCase()
-  for (const p of contentPolicyPatterns) if (low.includes(p)) return true
+  for (const p of contentPolicyPatterns) if (low.includes(p.toLowerCase())) return true
   return false
 }
 
@@ -193,6 +202,8 @@ export function classifyChatHubNotice(text: string): ChatHubErrorClass {
     low.includes('too many requests') ||
     (low.includes('please retry') && low.includes('later'))
   ) return 'rate_limit'
+  // chatWithHandlers 抛出的 ErrOffensiveContent 等价消息
+  if (low.includes('content policy flagged as offensive')) return 'content_policy'
   if (isContentPolicyBlock(text)) return 'content_policy'
   for (const p of imageLimitPatterns) if (low.includes(p)) return 'image_quota'
   return null
@@ -461,6 +472,11 @@ export async function chatWithHandlers(
   const firstTurn = req.started === true || !req.sessionId || !req.conversationId
   const requestID = randomUUID()
 
+  // 同原版 client.go：把生成的 UUID 回填进 req，保证 payload 里的
+  // sessionId/conversationId 与 WS URL 一致（否则首轮 payload 两字段缺失）
+  req.sessionId = sessionId
+  req.conversationId = conversationId
+
   // 1) 上传图片附件
   if (req.attachments && req.attachments.length > 0) {
     await uploadAttachments(acc, conversationId, req.attachments, opts)
@@ -511,8 +527,9 @@ export async function chatWithHandlers(
     push({ msg: text })
   })
   socket.addEventListener('close', (e) => {
-    closed = true
+    // 先入队再置 closed（push 内部会丢弃 closed 之后的项，顺序反了会导致 close 错误永远送不到读循环）
     push({ err: new Error(`ws closed: code=${(e as CloseEvent).code} reason=${(e as CloseEvent).reason || ''}`) })
+    closed = true
   })
   socket.addEventListener('error', () => {
     // close 事件随后触发；这里只兜底
@@ -569,6 +586,22 @@ export async function chatWithHandlers(
       )
     }
 
+    // 图片额度耗尽检测（同原版 imageLimitDetected：仅在无已流式文本时判定）
+    const imageLimitDetected = (text: string): boolean => {
+      if (streamedText !== '') return false
+      const t = text.toLowerCase()
+      return (
+        t.includes('无法生成更多图像') ||
+        t.includes('unable to generate more images') ||
+        t.includes('cannot generate more images today')
+      )
+    }
+
+    const contentPolicyDetected = (text: string): boolean => {
+      if (streamedText !== '') return false
+      return isContentPolicyBlock(text)
+    }
+
     // 非前缀重写被 emitSnapshot 跳过的次数统计：这些片段可能让流式文本不完整
     // （甚至偏离最终答案），complete 时用 finalizeText 以最终消息兜底对齐。
     let skippedSnapshots = 0
@@ -578,7 +611,10 @@ export async function chatWithHandlers(
     // 非前缀的重写直接跳过，避免吐出重复/错乱片段。
     const emitSnapshot = (snapshot: string): void => {
       if (!snapshot) return
+      // 同原版顺序：图片额度 → 限流 → 内容策略
+      if (imageLimitDetected(snapshot)) throw new Error('upstream image generation daily limit reached')
       if (rateLimited(snapshot)) throw new Error('upstream rate-limit notice')
+      if (contentPolicyDetected(snapshot)) throw new Error('upstream content policy flagged as offensive')
       const cur = streamedText
       if (cur === '') {
         streamedText = snapshot
@@ -662,7 +698,10 @@ export async function chatWithHandlers(
               if (typeof res['value'] === 'string') rawResult = res['value']
               if (typeof res['message'] === 'string') {
                 finalText = res['message']
+                // 同原版 type=2 分支：final 消息三类检测（内容策略此处不带 streamed 守卫）
+                if (imageLimitDetected(finalText)) throw new Error('upstream image generation daily limit reached')
                 if (rateLimited(finalText)) throw new Error('upstream rate-limit notice')
+                if (isContentPolicyBlock(finalText)) throw new Error('upstream content policy flagged as offensive')
               }
             }
           }
@@ -672,9 +711,13 @@ export async function chatWithHandlers(
         // complete：结束
         if (frame.type === 3) {
           if (frame.error) throw new Error(`chathub completion error: ${JSON.stringify(frame.error)}`)
+          // 同原版：先检查 final 是否限流，避免限流提示经 finalizeText 泄漏给客户端
+          if (rateLimited(finalText)) throw new Error('upstream rate-limit notice')
           // 以最终消息对齐流式文本：流式漏掉的尾部在这里补发（原版 finalizeText）
           const text = finalizeText(streamedText, finalText || streamedText, onDelta)
+          if (imageLimitDetected(text)) throw new Error('upstream image generation daily limit reached')
           if (rateLimited(text)) throw new Error('upstream rate-limit notice')
+          if (isContentPolicyBlock(text)) throw new Error('upstream content policy flagged as offensive')
           // 空返回：既无正文也无工具/推理事件 → 视为空完成（同原版 ErrEmptyCompletion）
           if (text.trim() === '' && reasoningBuf.trim() === '' && collectedEvents.length === 0) {
             throw new Error('empty completion')

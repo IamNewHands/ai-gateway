@@ -326,7 +326,14 @@ app.post('/v1/images/edits', async (c) => {
       return c.json({ error: { message: 'image is required', type: 'invalid_request_error' } }, 400)
     }
     const buf = await file.arrayBuffer()
-    const b64 = btoa(String.fromCharCode(...new Uint8Array(buf)))
+    // 分块转 base64：展开运算符对真实图片（几十万字节）会超出参数上限直接 RangeError
+    const bytes = new Uint8Array(buf)
+    let binary = ''
+    const chunk = 0x8000
+    for (let i = 0; i < bytes.length; i += chunk) {
+      binary += String.fromCharCode.apply(null, bytes.subarray(i, i + chunk) as unknown as number[])
+    }
+    const b64 = btoa(binary)
     return handleImageGeneration(c.env, m365, {
       prompt: typeof form['prompt'] === 'string' ? form['prompt'] : '',
       model: typeof form['model'] === 'string' ? form['model'] : undefined,

@@ -193,8 +193,9 @@ export async function cleanupCloudConversations(
       // 活跃对话保护：正在使用中的云端对话不删除
       if (activeConversationIds.has(convId)) continue
 
-      // createTimeUtc 缺失视为 0 → age 为极大值 → 按最老处理直接删除（对齐原版 m365cloud.go 语义）
-      const createTime = typeof chat.createTimeUtc === 'number' ? chat.createTimeUtc : 0
+      // 时间戳缺失/类型不符时不视为旧会话直接跳过，避免误删刚创建的对话（对齐原版 auto_cleanup.go）
+      const createTime = chat.createTimeUtc
+      if (typeof createTime !== 'number') continue
 
       const age = now - createTime
       if (age > maxAgeMs) {

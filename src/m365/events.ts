@@ -111,13 +111,15 @@ export function extractToolEvents(value: unknown, seen: Set<string>): ChatHubStr
   return out
 }
 
-/** 判断是否像图片 URL（disk 扩展名 / data:image / 常见图片键名，同原版 chathub imageURLs 启发式） */
+/** 判断是否像图片 URL（同原版 chathub isImageURL 启发式） */
 function looksLikeImageURL(v: string): boolean {
   if (v.startsWith('data:image/')) return true
   const low = v.toLowerCase()
   if (!low.startsWith('https://')) return false
-  const path = low.split('?')[0]
-  if (/\.(png|jpe?g|gif|webp|bmp|svg)$/.test(path)) return true
+  // 原版用 path+query 整体匹配：Designer 生成 URL 的扩展名常在 query 里（?path=.../dalle-xxx.png&...）
+  const withQuery = low.split('#')[0]
+  if (/\.(png|jpe?g|gif|webp)(&|$)/.test(withQuery)) return true
+  if (withQuery.includes('image')) return true
   return false
 }
 
@@ -141,13 +143,15 @@ export function imageURLs(events: unknown[]): string[] {
         const lk = k.toLowerCase()
         if (typeof v === 'string') {
           if (lk === 'value' || lk === 'data') {
-            if (v.startsWith('data:image/')) pushImage(v)
+            // 原版对 value/data 键同样接受 https 图片 URL（不只 data:image）
+            pushImage(v)
           } else if (IMG_KEYS.has(lk)) {
             pushImage(v)
           } else {
             walk(v)
           }
-        } else if (Array.isArray(v) && (lk.endsWith('urls') || lk.endsWith('videourls'))) {
+        } else if (Array.isArray(v) && lk.includes('url')) {
+          // 原版：键名含 url 的字符串数组都提取（urlList/imageUrls/urls...）
           for (const item of v) {
             if (typeof item === 'string') pushImage(item)
           }

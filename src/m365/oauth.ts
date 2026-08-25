@@ -117,6 +117,21 @@ export async function removeM365Account(env: Env, providerId: string, oid: strin
   return true
 }
 
+/**
+ * 持久化轮换出的 refresh_token（同原版 cache.UpdateRefreshToken）。
+ * 用于跨 scope 换 token（Designer/cloud API）时微软轮换了 refresh_token 的场景，
+ * 避免旧 token 作废后账号刷新链断裂。
+ */
+export async function updateM365RefreshToken(env: Env, providerId: string, oid: string | undefined, refreshToken: string): Promise<void> {
+  if (!refreshToken) return
+  const list = await readAccounts(env, providerId)
+  const idx = oid ? list.findIndex((a) => a.oid === oid) : -1
+  const target = idx >= 0 ? list[idx] : list[0]
+  if (!target || target.refresh_token === refreshToken) return
+  target.refresh_token = refreshToken
+  await persistAccounts(env, providerId, list)
+}
+
 /** 列出账号池中的账号（管理后台用） */
 export async function listM365Accounts(env: Env, providerId: string): Promise<M365Account[]> {
   const list = await readAccounts(env, providerId)

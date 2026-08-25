@@ -293,8 +293,8 @@ export function parseModelToolDecision(text: string, tools: ToolDef[], choice: u
         const args = JSON.parse(argsStr) as Record<string, unknown>
         if (args !== null && typeof args === 'object') {
           const fn = toolFunction(name, tools)
-          // 同原版 model_tool_router：必须通过 schema 校验才采用，避免不合 schema 的调用
-          if (fn && schemaValid(args, fn) && toolChoiceAllows(choice, name)) {
+          // 同原版 model_tool_router：必须通过 schema 校验才采用（schemaValid 返回 null 表示合法）
+          if (fn && schemaValid(args, fn) === null && toolChoiceAllows(choice, name)) {
             return {
               calls: [{ id: `call_${crypto.randomUUID()}`, type: toolTypeOf(name, tools), name, arguments: JSON.stringify(args) }],
               parsed: true,
