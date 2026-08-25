@@ -1,6 +1,6 @@
 import { KV_KEYS, OAUTH_TOKEN_REFRESH_MARGIN_MS } from './config'
 import type { Env, OAuthDeviceConfig, OAuthTokenState, DeviceFlowState } from './types'
-import { startM365PKCE, submitM365PKCECallback, m365ROPC, refreshM365Token } from './m365/oauth'
+import { startM365PKCE, submitM365PKCECallback, m365ROPC, refreshM365Token, getM365AccountInfos } from './m365/oauth'
 
 // ===== KV 读写 =====
 
@@ -1272,12 +1272,46 @@ export async function refreshAllOauthTokens(env: Env, providers: ProviderLike[])
   let fail = 0
   for (const p of providers) {
     if (p.authType !== 'oauth-device' || !p.oauth) continue
+    const flow = p.oauth.flowType
+    // M365：token 存于账号池（oauth:token:{id}:pool）。旧实现只读单 token key，
+    // 从不刷新账号池，导致闲置账号 access_token 过期后 refresh_token 被上游撤销。
+    // 这里遍历池内每个账号逐个刷新（写回池会重置 30 天 KV TTL，隐藏保活），
+    // 刷新失败记录日志告警，便于发现需重新登录的账号。
+    if (flow === 'm365-pkce' || flow === 'm365-ropc') {
+      const r = await refreshAllM365PoolTokens(env, p)
+      ok += r.ok
+      fail += r.fail
+      continue
+    }
     const state = await readOauthToken(env, p.id)
     if (!state?.refresh_token) continue
     if (state.expires_at - Date.now() > 5 * 60 * 1000) continue // 未临近过期，跳过
     const success = await refreshOauthToken(env, p.id, p.oauth)
     if (success) ok++
     else fail++
+  }
+  return { ok, fail }
+}
+
+/** 刷新某 M365 provider 账号池内所有账号（Cron 专用）。 */
+async function refreshAllM365PoolTokens(env: Env, p: ProviderLike): Promise<{ ok: number; fail: number }> {
+  let ok = 0
+  let fail = 0
+  let infos
+  try {
+    infos = await getM365AccountInfos(env, p.id)
+  } catch {
+    return { ok: 0, fail: 0 }
+  }
+  for (const info of infos) {
+    if (!info.connected || !info.oid) continue
+    const success = await refreshM365Token(env, p.id, p.oauth!, info.oid)
+    if (success) {
+      ok++
+    } else {
+      fail++
+      console.error(`[oauth] M365 账号刷新失败，可能需要重新登录 provider=${p.id} oid=${info.oid} email=${info.email || '无'} ${new Date().toISOString()}`)
+    }
   }
   return { ok, fail }
 }

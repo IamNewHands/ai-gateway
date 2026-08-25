@@ -1074,9 +1074,26 @@ export async function handleOAuthStatus(c: Context<AppEnv>) {
     oid: token?.oid ?? null,
     tid: token?.tid ?? null,
   }
-  // M365：token 存于账号池（oauth:token:{id}:pool），从池读首个账号，避免 status 误报"未连接"
+  // M365：token 存于账号池（oauth:token:{id}:pool）。旧实现只取最久未用的首个账号，
+  // 易误导（最久未用的账号往往已失效）。改为列出全部账号及其健康状态。
   if (isM365Provider(provider)) {
     const infos = await getM365AccountInfos(c.env, id)
+    const accounts = []
+    for (const info of infos) {
+      const oid = info.oid || ''
+      const available = info.connected ? (oid ? await isAccountAvailable(c.env, oid) : false) : false
+      const cooldownSeconds = info.connected ? (oid ? await accountCooldownSeconds(c.env, oid) : 0) : 0
+      accounts.push({
+        connected: info.connected ?? false,
+        email: info.email ?? null,
+        oid: oid || null,
+        tid: info.tid ?? null,
+        tokenExpiresAt: info.expiresAt ?? null,
+        available,
+        cooldownSeconds,
+        healthy: available && cooldownSeconds === 0,
+      })
+    }
     const first = infos[0] || null
     data.connected = first ? first.connected : false
     data.expiresAt = first?.expiresAt ?? null
@@ -1086,6 +1103,7 @@ export async function handleOAuthStatus(c: Context<AppEnv>) {
     data.updatedAt = null
     data.hasCookies = false
     data.accountCount = infos.length
+    data.accounts = accounts
   }
   // WorkBuddy 多账号池：返回池账号状态（脱敏）供面板展示
   if (isOAuthPoolProvider(provider)) {
