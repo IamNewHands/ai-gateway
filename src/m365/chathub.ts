@@ -121,10 +121,46 @@ function isSafeDownloadURL(url: string): boolean {
     if (host === 'localhost' || host.endsWith('.local')) return false
     if (/^(10\.|127\.|172\.(1[6-9]|2\d|3[01])\.|192\.168\.)/.test(host)) return false
     if (host === '169.254.169.254') return false
+    // 拒绝带用户名/密码（userinfo）的 URL，避免凭证被带到重定向目标
+    if (u.username !== '' || u.password !== '') return false
     return true
   } catch {
     return false
   }
+}
+
+/** 附件下载重定向跳数上限（同原版 downloadClient 的 CheckRedirect 上限） */
+const MAX_DOWNLOAD_REDIRECTS = 5
+
+/**
+ * 安全下载远程图片附件：手动跟随重定向，每一跳都用 isSafeDownloadURL 重新校验，
+ * 防止公共 URL 302 到云元数据地址 / 内网主机而绕过 SSRF 检查（原版 6654ada 修复）。
+ * 仅返回 2xx 的最终响应；任何一跳不合法或跳数超限都返回 null（上层按失败跳过该附件）。
+ */
+async function safeFetchImage(url: string, redirects = 0): Promise<Response | null> {
+  if (redirects > MAX_DOWNLOAD_REDIRECTS) return null
+  if (!isSafeDownloadURL(url)) return null
+  let resp: Response
+  try {
+    resp = await fetch(url, { redirect: 'manual' })
+  } catch {
+    return null
+  }
+  const status = resp.status
+  // 3xx：校验 Location 后继续跟随（仅 302/303/307/308 这类显式重定向）
+  if (status >= 300 && status < 400) {
+    const loc = resp.headers.get('location')
+    if (!loc) return null
+    let next: string
+    try {
+      next = new URL(loc, url).toString()
+    } catch {
+      return null
+    }
+    return safeFetchImage(next, redirects + 1)
+  }
+  if (status < 200 || status >= 300) return null
+  return resp
 }
 
 /** 上游内容策略 / 图片额度 / 限流 / 空返回 的语义分类（同原版 IsContentPolicyBlock 等） */
@@ -176,14 +212,9 @@ async function uploadAttachments(acc: ChatHubAccount, conversationID: string, at
 
     let imageData = a.url
     if (!imageData.startsWith('data:')) {
-      if (!isSafeDownloadURL(imageData)) throw new Error('attachment URL is not a safe public https URL')
-      let resp: Response
-      try {
-        resp = await fetch(imageData)
-      } catch {
-        continue
-      }
-      if (!resp.ok) continue
+      // 安全下载：手动跟随重定向且每一跳重新校验 SSRF（见 safeFetchImage）
+      const resp = await safeFetchImage(imageData)
+      if (!resp) continue
       const buf = await resp.arrayBuffer()
       if (buf.byteLength > MAX_ATTACHMENT_MIB << 20) continue
       const mimeType = resp.headers.get('Content-Type') || 'image/png'
@@ -518,6 +549,10 @@ export async function chatWithHandlers(
       )
     }
 
+    // 非前缀重写被 emitSnapshot 跳过的次数统计：这些片段可能让流式文本不完整
+    // （甚至偏离最终答案），complete 时用 finalizeText 以最终消息兜底对齐。
+    let skippedSnapshots = 0
+
     // ChatHub 以"全量快照 + 光标重写"方式送文本，只输出未见过的后缀。
     // 对齐原版 client.go emitSnapshot：仅当新快照以前缀命中当前文本时才补发尾部，
     // 非前缀的重写直接跳过，避免吐出重复/错乱片段。
@@ -536,6 +571,32 @@ export async function chatWithHandlers(
         return
       }
       // 非前缀重写：原版跳过（仅记录），这里不做任何透出
+      skippedSnapshots++
+    }
+
+    /**
+     * 用最终消息对齐流式文本（原版 finalizeText 移植）：
+     * - final 不高于 streamed 或 streamed 为空 → 直接用现有文本；
+     * - streamed 是 final 的前缀 → 流式漏了尾部，立即补发缺失片段；
+     * - 否则流式文本已偏离 final → 无法撤回已发出的 delta，但以 final 作为
+     *   返回值，保证非流式调用与对话历史（会话绑定）使用完整正确的文本。
+     */
+    const finalizeText = (streamed: string, final: string): string => {
+      if (final === '' || final.length <= streamed.length) {
+        return streamed === '' ? final : streamed
+      }
+      if (final.startsWith(streamed)) {
+        const tail = final.substring(streamed.length)
+        if (tail) {
+          streamedText = final
+          onDelta?.(tail)
+        }
+        return final
+      }
+      if (skippedSnapshots > 0) {
+        console.warn(`[m365:chathub] streamed text diverged from final result (streamed=${streamed.length} final=${final.length} skipped=${skippedSnapshots}); using final`)
+      }
+      return final
     }
 
     while (Date.now() < deadline) {
@@ -616,7 +677,8 @@ export async function chatWithHandlers(
         // complete：结束
         if (frame.type === 3) {
           if (frame.error) throw new Error(`chathub completion error: ${JSON.stringify(frame.error)}`)
-          const text = finalText || streamedText
+          // 以最终消息对齐流式文本：流式漏掉的尾部在这里补发（原版 finalizeText）
+          const text = finalizeText(streamedText, finalText || streamedText)
           if (rateLimited(text)) throw new Error('upstream rate-limit notice')
           // 空返回：既无正文也无工具/推理事件 → 视为空完成（同原版 ErrEmptyCompletion）
           if (text.trim() === '' && reasoningBuf.trim() === '' && collectedEvents.length === 0) {
