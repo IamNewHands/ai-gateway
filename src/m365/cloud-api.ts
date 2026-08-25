@@ -4,10 +4,11 @@
  * 调用 https://m365.cloud.microsoft/chat 的 RefreshNavPane / DeleteConversation
  * 等管理面 API，用于云端对话列表查询与自动清理。
  *
- * 鉴权：从 KV 读取该 provider 的 OAuth token（accessToken），过期自动刷新。
+ * 鉴权：用账号 refresh_token 换取 audience 为 https://m365.cloud.microsoft/v2/.default
+ * 的专用 token（与 ChatHub 的 substrate token 不同），isolate 内存缓存并临期自动重换。
  */
 import type { Env } from '../types'
-import { getM365Account } from './oauth'
+import { getM365Account, M365_OAUTH } from './oauth'
 import { unbindByConversation } from './session'
 
 interface CloudChat {
@@ -16,12 +17,53 @@ interface CloudChat {
   [key: string]: unknown
 }
 
-/** 调用 m365.cloud.microsoft/chat API；oid 指定账号，缺省取账号池第一个 */
-async function doCloudAPI(env: Env, providerId: string, action: string, payload: Record<string, unknown>, oid?: string): Promise<Record<string, unknown>> {
+/**
+ * 换取 m365.cloud.microsoft 管理 API 专用 token。
+ * 原版（M365-Copilot2API m365cloud.go）的关键细节：chat 管理面 API 的 audience 是
+ * https://m365.cloud.microsoft/v2/.default，不能直接复用 ChatHub 的 substrate token，
+ * 需用 refresh_token 向租户端点换取。isolate 内存缓存，临期 2 分钟自动重换。
+ */
+const cloudTokenCache = new Map<string, { token: string; expiresAt: number }>()
+
+async function getCloudAccessToken(env: Env, providerId: string, oid?: string): Promise<string> {
   const account = await getM365Account(env, providerId, oid)
   if (!account || !account.accessToken) {
     throw new Error(oid ? `M365 账号 ${oid} 未授权或 token 失效` : 'M365 账号未授权或 token 失效')
   }
+  if (!account.refreshToken || !account.tid) {
+    throw new Error('账号缺少 refresh_token/tid，无法换取 cloud API token')
+  }
+  const cacheKey = account.oid || providerId
+  const cached = cloudTokenCache.get(cacheKey)
+  if (cached && cached.expiresAt - Date.now() > 2 * 60 * 1000) return cached.token
+
+  const params = new URLSearchParams({
+    client_id: M365_OAUTH.clientId,
+    refresh_token: account.refreshToken,
+    grant_type: 'refresh_token',
+    scope: 'https://m365.cloud.microsoft/v2/.default',
+  })
+  const res = await fetch(`https://login.microsoftonline.com/${account.tid}/oauth2/v2.0/token`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded', Accept: 'application/json' },
+    body: params.toString(),
+    signal: AbortSignal.timeout(20000),
+  })
+  if (!res.ok) {
+    const body = await res.text().catch(() => '')
+    throw new Error(`cloud token exchange HTTP ${res.status}: ${body.substring(0, 200)}`)
+  }
+  const data = (await res.json()) as { access_token?: string; expires_in?: number }
+  if (!data.access_token) throw new Error('cloud token exchange 响应缺少 access_token')
+  const expiresIn = (data.expires_in || 3600) * 1000
+  cloudTokenCache.set(cacheKey, { token: data.access_token, expiresAt: Date.now() + expiresIn })
+  return data.access_token
+}
+
+/** 调用 m365.cloud.microsoft/chat API；oid 指定账号，缺省取账号池第一个 */
+async function doCloudAPI(env: Env, providerId: string, action: string, payload: Record<string, unknown>, oid?: string): Promise<Record<string, unknown>> {
+  // chat 管理面 API 需 audience=m365.cloud.microsoft 的专用 token（非 ChatHub 的 substrate token）
+  const token = await getCloudAccessToken(env, providerId, oid)
 
   const reqBody: Record<string, unknown> = {
     action,
@@ -31,7 +73,7 @@ async function doCloudAPI(env: Env, providerId: string, action: string, payload:
   const resp = await fetch('https://m365.cloud.microsoft/chat', {
     method: 'POST',
     headers: {
-      'Authorization': `Bearer ${account.accessToken}`,
+      'Authorization': `Bearer ${token}`,
       'Content-Type': 'application/json',
       'Accept': 'application/json, text/plain, */*',
       'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:148.0) Gecko/20100101 Firefox/148.0',
@@ -151,8 +193,8 @@ export async function cleanupCloudConversations(
       // 活跃对话保护：正在使用中的云端对话不删除
       if (activeConversationIds.has(convId)) continue
 
+      // createTimeUtc 缺失视为 0 → age 为极大值 → 按最老处理直接删除（对齐原版 m365cloud.go 语义）
       const createTime = typeof chat.createTimeUtc === 'number' ? chat.createTimeUtc : 0
-      if (createTime === 0) continue
 
       const age = now - createTime
       if (age > maxAgeMs) {
