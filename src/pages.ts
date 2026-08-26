@@ -401,7 +401,6 @@ ${H('管理')}
       <section id="overview" class="admin-overview" aria-labelledby="admin-title">
         <div class="admin-heading">
           <div><p class="eyebrow"><span aria-hidden="true"></span>GATEWAY STATUS</p><h1 id="admin-title">管理控制台</h1><p>配置提供商、模型与客户端访问凭据。变更将写入 Cloudflare KV。</p></div>
-          <div class="admin-heading__actions"><a href="/" class="btn btn-s"><i class="fas fa-external-link-alt" aria-hidden="true"></i>查看模型目录</a><button class="btn btn-p" onclick="showAdd();location.hash='providers'"><i class="fas fa-plus" aria-hidden="true"></i>添加提供商</button></div>
         </div>
         <div class="admin-metrics" aria-label="配置统计">
           <div><span>${providers.length}</span><p>提供商</p><small>${enabledProvidersCount} 个已启用</small></div>
