@@ -99,6 +99,7 @@ function buildWSURL(acc: ChatHubAccount, sessionID: string, conversationID: stri
   const q = new URLSearchParams()
   q.set('chatsessionid', requestID)
   q.set('clientrequestid', requestID)
+  q.set('XRoutingParameterSessionKey', requestID)
   q.set('X-SessionId', sessionID)
   q.set('ConversationId', conversationID)
   q.set('access_token', acc.accessToken)
@@ -109,6 +110,7 @@ function buildWSURL(acc: ChatHubAccount, sessionID: string, conversationID: stri
   q.set('licenseType', 'Starter')
   q.set('agent', 'web')
   q.set('scenario', 'OfficeWebIncludedCopilot')
+  q.set('isEdu', 'false')
   return `${WS_BASE}/${encodeURIComponent(acc.oid)}@${encodeURIComponent(acc.tid)}?${q.toString()}`
 }
 
