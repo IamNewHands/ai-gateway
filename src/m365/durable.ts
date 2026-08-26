@@ -22,6 +22,7 @@ import { markAccountSuccess, markAccountFailure, markAccountImageLimited, accoun
 import type { RateLimitProbeFn } from './account-health'
 import { writeLog } from '../admin'
 import { acquireSlot, releaseSlot, fluxSnapshot } from './account-flux'
+import { computeContextBudget, slidingWindow } from './context-budget'
 
 export interface M365ChatPayload {
   providerId: string
@@ -111,8 +112,14 @@ export class M365Session {
     const ctx = { explicitSessionId, user, ip, userAgent, tenant: payload.tenant }
     let resolved = await resolveSession(this.env, providerId, messages as never[], ctx)
 
-    // 2) 构建 ChatHub 请求：messages 扁平化为单文本 prompt；复用命中只发增量
-    const { prompt, attachments } = flattenPromptMessages(messages as never[])
+    // 2) 构建 ChatHub 请求：先按上下文预算裁剪，再扁平化为单文本 prompt；复用命中只发增量
+    const budget = computeContextBudget(this.env, body)
+    const windowed = slidingWindow(messages as OaiMsgLite[], budget)
+    if (windowed.error) {
+      try { await writeLog(this.env, 'warn', `[m365-chat] provider=${providerId} → ${windowed.error}`) } catch { /* ignore */ }
+      return cjson({ error: { message: windowed.error, type: 'context_length_exceeded' } }, 400)
+    }
+    const { prompt, attachments } = flattenPromptMessages(windowed.messages)
     let answerPrompt = prompt
     if (!resolved.isNew && resolved.historyLen > 0 && resolved.historyLen < messages.length) {
       const inc = flattenPromptMessages(messages.slice(resolved.historyLen) as never[])
@@ -155,11 +162,11 @@ export class M365Session {
     }
     const acc = ordered[0]
 
-    // convCache 复用层：新会话且无工具时，命中 account+model+systemPromptHash 则沿用云端对话（同原版第三层复用）
+    // convCache 复用层：新会话且无工具时，命中 account+model+systemPromptHash+tenant 则沿用云端对话（同原版第三层复用，租户隔离对齐 #57）
     const sysHash = model ? systemPromptHash(messages as never[]) : ''
     if (resolved.isNew && model && sysHash) {
       try {
-        const reuse = await convCacheLookup(this.env, providerId, acc.oid, model, sysHash)
+        const reuse = await convCacheLookup(this.env, providerId, acc.oid, model, sysHash, payload.tenant)
         if (reuse) {
           resolved = { ...resolved, sessionId: reuse.sessionId, conversationId: reuse.conversationId, accountId: acc.oid, isNew: false, historyLen: 0, matchedBy: 'convCache' }
           // 沿用云端对话：只发最新一条用户消息作为增量，避免重复注入 system/历史
@@ -368,7 +375,7 @@ export class M365Session {
     await markAccountSuccess(this.env, usedAcc.oid)
     // 写入 convCache（account+model+systemPromptHash），供后续复用
     if (sysHash) {
-      try { await convCacheStore(this.env, providerId, usedAcc.oid || providerId, model, sysHash, outcome.sessionId, outcome.conversationId) } catch { /* ignore */ }
+      try { await convCacheStore(this.env, providerId, usedAcc.oid || providerId, model, sysHash, outcome.sessionId, outcome.conversationId, payload.tenant) } catch { /* ignore */ }
     }
 
     // 7) 对话管理器：记录云端对话 + 按模式清理
@@ -534,7 +541,7 @@ export class M365Session {
             await bindSession(this.env, providerId, result.sessionId, result.conversationId, usedAcc.oid || providerId, messages as never[], finalText, ctx)
             await markAccountSuccess(this.env, usedAcc.oid)
             if (sysHash) {
-              try { await convCacheStore(this.env, providerId, usedAcc.oid || providerId, model, sysHash, result.sessionId, result.conversationId) } catch { /* ignore */ }
+              try { await convCacheStore(this.env, providerId, usedAcc.oid || providerId, model, sysHash, result.sessionId, result.conversationId, ctx.tenant) } catch { /* ignore */ }
             }
             const promptText = typeof messages[messages.length - 1]?.['content'] === 'string'
               ? String(messages[messages.length - 1]['content']).substring(0, 100)

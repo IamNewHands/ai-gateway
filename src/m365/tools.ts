@@ -424,6 +424,7 @@ export interface OaiMsgLite {
   content?: unknown
   tool_calls?: unknown[]
   tool_call_id?: string
+  name?: string
 }
 
 export function contentToString(content: unknown): string {

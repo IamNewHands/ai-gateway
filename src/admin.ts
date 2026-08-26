@@ -1927,7 +1927,9 @@ export async function handleM365Sessions(c: Context<AppEnv>) {
   }
   const providerIdResolved = resolved
   try {
-    const sessions = await listM365Sessions(c.env, providerIdResolved)
+    // 租户隔离（#57）：只返回调用方 API Key 自己的会话绑定
+    const tenant = c.get('proxyKeyHash') || ''
+    const sessions = await listM365Sessions(c.env, providerIdResolved, tenant)
     if (c.req.method === 'POST') {
       const body = await c.req.json().catch(() => ({}))
       const sid = typeof body['session_id'] === 'string' ? body['session_id'] : ''
@@ -1976,7 +1978,9 @@ export async function handleM365SessionDelete(c: Context<AppEnv>) {
     return c.json({ error: { message: '缺少 session id 参数', type: 'invalid_request_error' } }, 400)
   }
   try {
-    const ok = await deleteM365Session(c.env, providerId, id)
+    // 租户隔离（#57）：仅当该 sessionId 属于调用方 API Key 时才解除，防止跨 Key 删除他人会话
+    const tenant = c.get('proxyKeyHash') || ''
+    const ok = await deleteM365Session(c.env, providerId, id, tenant)
     if (!ok) {
       return c.json({ error: { message: 'session not found', type: 'not_found' } }, 404)
     }

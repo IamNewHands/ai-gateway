@@ -348,18 +348,27 @@ export async function bindSession(env: Env, providerId: string, sessionId: strin
   await writeAll(env, providerId, list)
 }
 
-/** 列出某 provider 的所有会话（管理后台用） */
-export async function listSessions(env: Env, providerId: string): Promise<SessionBinding[]> {
-  return evict(await readAll(env, providerId), sessionTtlMs(env))
+/**
+ * 列出某 provider 的会话。
+ * 传入 tenant 时仅返回该租户（调用方 API Key）的会话（对齐 #57：GET /v1/sessions 只返回调用方自己的会话）；
+ * 不传则列出全部（供管理端/自动清理使用）。
+ */
+export async function listSessions(env: Env, providerId: string, tenant?: string): Promise<SessionBinding[]> {
+  const list = evict(await readAll(env, providerId), sessionTtlMs(env))
+  if (tenant) return list.filter((s) => s.tenant === tenant)
+  return list
 }
 
-/** 删除某 provider 的会话（仅限本租户，防止跨 Key 删除他人会话） */
-export async function deleteSession(env: Env, providerId: string, sessionId: string, tenant?: string): Promise<boolean> {
-  let list = await readAll(env, providerId)
-  const before = list.length
-  list = list.filter((s) => s.sessionId !== sessionId || (tenant !== undefined && s.tenant !== tenant))
-  if (list.length === before) return false
-  await writeAll(env, providerId, list)
+/**
+ * 删除某 provider 的会话。tenant 必传，且仅当 sessionId 属于该租户时才删除，
+ * 防止跨 Key（跨调用方）删除他人会话（对齐 #57）。
+ */
+export async function deleteSession(env: Env, providerId: string, sessionId: string, tenant: string): Promise<boolean> {
+  const list = await readAll(env, providerId)
+  const target = list.find((s) => s.sessionId === sessionId && s.tenant === tenant)
+  if (!target) return false
+  const remaining = list.filter((s) => !(s.sessionId === sessionId && s.tenant === tenant))
+  await writeAll(env, providerId, remaining)
   return true
 }
 
@@ -406,6 +415,8 @@ export interface ConvCacheEntry {
   accountId: string
   systemHash: string
   model: string
+  /** 所属租户（调用方 API Key 的不可逆哈希），复用只在同 Key 内（对齐 #57） */
+  tenant?: string
   lastUsedAt: number
 }
 
@@ -424,23 +435,27 @@ async function writeConvCache(env: Env, providerId: string, list: ConvCacheEntry
   } catch { /* 写入失败不影响主流程 */ }
 }
 
-/** 按 account+model+systemPromptHash 查找可复用的云端对话（同原版 convCache） */
+/**
+ * 按 account+model+systemPromptHash+tenant 查找可复用的云端对话（同原版 convCache，追加租户隔离）
+ * 复用仅限同一调用方 API Key，杜绝跨 Key 命中他人云端对话。
+ */
 export async function convCacheLookup(
   env: Env,
   providerId: string,
   accountId: string,
   model: string,
   sysHash: string,
+  tenant?: string,
 ): Promise<{ sessionId: string; conversationId: string } | null> {
   const list = await readConvCache(env, providerId)
   const hit = list
-    .filter((e) => e.accountId === accountId && e.model === model && e.systemHash === sysHash)
+    .filter((e) => e.accountId === accountId && e.model === model && e.systemHash === sysHash && e.tenant === tenant)
     .sort((a, b) => b.lastUsedAt - a.lastUsedAt)[0]
   if (!hit) return null
   return { sessionId: hit.sessionId, conversationId: hit.conversationId }
 }
 
-/** 会话成功后写入 convCache（按 account+model+systemPromptHash upsert） */
+/** 会话成功后写入 convCache（按 account+model+systemPromptHash+tenant upsert） */
 export async function convCacheStore(
   env: Env,
   providerId: string,
@@ -449,10 +464,11 @@ export async function convCacheStore(
   sysHash: string,
   sessionId: string,
   conversationId: string,
+  tenant?: string,
 ): Promise<void> {
   if (!sessionId || !conversationId || !sysHash) return
   let list = await readConvCache(env, providerId)
-  list = list.filter((e) => !(e.accountId === accountId && e.model === model && e.systemHash === sysHash))
-  list.push({ sessionId, conversationId, accountId, systemHash: sysHash, model, lastUsedAt: Date.now() })
+  list = list.filter((e) => !(e.accountId === accountId && e.model === model && e.systemHash === sysHash && e.tenant === tenant))
+  list.push({ sessionId, conversationId, accountId, systemHash: sysHash, model, tenant, lastUsedAt: Date.now() })
   await writeConvCache(env, providerId, list)
 }

@@ -472,6 +472,11 @@ export interface Env {
   M365_SESSION_TTL_HOURS?: string
   /** M365 上下文内容复用 TTL（小时，默认 2） */
   M365_CONTEXT_TTL_HOURS?: string
+  /**
+   * M365 上下文预算所用的模型上下文窗口（token，默认 200000）。
+   * 预算 B = 该值 - maxOutput - 512（同原版 B = ContextWindow - MaxOutput - 512）。
+   */
+  M365_CONTEXT_WINDOW_TOKENS?: string
 }
 
 export interface AnalyticsEngineDatasetBinding {
