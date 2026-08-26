@@ -225,9 +225,9 @@ async function uploadAttachments(acc: ChatHubAccount, conversationID: string, at
     if (!imageData.startsWith('data:')) {
       // 安全下载：手动跟随重定向且每一跳重新校验 SSRF（见 safeFetchImage）
       const resp = await safeFetchImage(imageData)
-      if (!resp) continue
+      if (!resp) throw new Error('download image attachment failed (unsafe URL, redirect limit, or non-2xx)')
       const buf = await resp.arrayBuffer()
-      if (buf.byteLength > MAX_ATTACHMENT_MIB << 20) continue
+      if (buf.byteLength > MAX_ATTACHMENT_MIB << 20) throw new Error(`image attachment exceeds ${MAX_ATTACHMENT_MIB}MiB`)
       const mimeType = resp.headers.get('Content-Type') || 'image/png'
       imageData = `data:${mimeType};base64,${bytesToBase64(new Uint8Array(buf))}`
     }
@@ -258,17 +258,17 @@ async function uploadAttachments(acc: ChatHubAccount, conversationID: string, at
         },
         body: form.toString(),
       })
-    } catch {
-      continue
+    } catch (e) {
+      throw new Error(`image attachment upload failed: ${e instanceof Error ? e.message : String(e)}`)
     }
-    if (!resp.ok) continue
+    if (!resp.ok) throw new Error(`image attachment upload HTTP ${resp.status}`)
     let out: { docId?: string; fileName?: string; fileType?: string; result?: { value?: string } }
     try {
       out = await resp.json()
     } catch {
-      continue
+      throw new Error('image attachment upload returned invalid JSON')
     }
-    if (out.result?.value !== 'Success' || !out.docId) continue
+    if (out.result?.value !== 'Success' || !out.docId) throw new Error(`image attachment upload rejected: ${out.result?.value || 'unknown'}`)
     a.docId = out.docId
     a.fileType = (out.fileType || '').toLowerCase().replace(/^\./, '')
     if (a.fileType === 'jpeg') a.fileType = 'jpg'

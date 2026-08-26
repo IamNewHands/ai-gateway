@@ -162,11 +162,35 @@ function messagesEqual(a: OaiMsgLite, b: OaiMsgLite): boolean {
   return true
 }
 
+/**
+ * 校验历史是否结束在"消息原子边界"（同原版 buildAtoms 约束）：
+ * 带 tool_calls 的 assistant 与其后的 tool 结果是一个不可分割的原子往返，
+ * 不能从中间切开续传。若历史结束在未闭合的 tool_calls 之后，返回 false。
+ */
+function atomicBoundaryOk(hist: OaiMsgLite[]): boolean {
+  const n = hist.length
+  if (n === 0) return true
+  // 最后一条为带 tool_calls 的 assistant：其后还需 tool 结果才能闭合，
+  // 在此结束说明切在往返中间 → 非原子边界
+  const last = hist[n - 1]
+  if (last.role === 'assistant' && last.tool_calls && last.tool_calls.length > 0) return false
+  // 其余位置：tool_calls 之后必须紧跟 role=tool，保证往返不被切断
+  for (let i = 0; i < n - 1; i++) {
+    const a = hist[i]
+    if (a.role === 'assistant' && a.tool_calls && a.tool_calls.length > 0) {
+      if (hist[i + 1].role !== 'tool') return false
+    }
+  }
+  return true
+}
+
 function contextPrefixLen(hist: OaiMsgLite[], msgs: OaiMsgLite[]): number {
   if (hist.length === 0 || msgs.length < hist.length) return 0
   for (let i = 0; i < hist.length; i++) {
     if (!messagesEqual(hist[i], msgs[i])) return 0
   }
+  // 前缀虽匹配，但若切在工具往返中间，则不视为可复用前缀，避免云端状态错乱
+  if (!atomicBoundaryOk(hist)) return 0
   return hist.length
 }
 
