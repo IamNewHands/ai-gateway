@@ -12,7 +12,7 @@
 import type { Env } from '../types'
 import { chatWithHandlers, classifyChatHubNotice } from './chathub'
 import type { ChatHubAccount, ChatHubTool, ChatHubResult } from './chathub'
-import { flattenPromptMessages, modelToolRouterPrompt, parseModelToolDecision, fencedToolCalls, nativeToolCalls, compactToolResult, buildAgentLedger, ledgerRouterContext, filterCompletedCalls, validateDetectedToolCalls, completionEvidenceAllows, isToolRefusal } from './tools'
+import { flattenPromptMessages, modelToolRouterPrompt, parseModelToolDecision, fencedToolCalls, nativeToolCalls, compactToolResult, buildAgentLedger, canContinue, MAX_TOOL_ROUNDS_DEFAULT, ledgerRouterContext, filterCompletedCalls, validateDetectedToolCalls, completionEvidenceAllows, isToolRefusal } from './tools'
 import type { DetectedToolCall, AgentLedger, OaiMsgLite } from './tools'
 import { resolveSession, bindSession } from './session'
 import type { ResolveResult } from './session'
@@ -131,6 +131,14 @@ export class M365Session {
 
     // 多轮工具证据 ledger：从 messages 历史解析已完成/待处理的工具调用，去重并注入上下文
     const ledger: AgentLedger = buildAgentLedger(messages as OaiMsgLite[])
+    if (!canContinue(ledger, MAX_TOOL_ROUNDS_DEFAULT)) {
+      return cjson({
+        error: {
+          message: ledger.stuckLoop ? 'tool loop detected' : 'tool round limit exceeded',
+          type: 'tool_round_limit_error',
+        },
+      }, 409)
+    }
     const ledgerCtx = ledger.toolRounds > 0 ? ledgerRouterContext(ledger) : ''
 
     // 3) 账号池选择：见 selectAccounts 注释。返回按尝试顺序排好的候选账号。
