@@ -139,7 +139,8 @@ export class M365Session {
       if (explicitAccountId) {
         return cjson({ error: { message: '指定的 M365 账号（m365_account_id）不存在或不可用', type: 'account_error' } }, 404)
       }
-      return cjson({ error: { message: 'M365 账号未授权、token 失效或全部处于冷却，请在后台添加/授权账号', type: 'auth_error' } }, 401)
+      // 全部账号处于冷却/不可用：对齐原版返回 429 + Retry-After（戴避账号被打爆），而非 401
+      return cjson({ error: { message: 'M365 所有账号繁忙或冷却中，请稍后重试或先在后台添加/授权账号', type: 'rate_limit_error' } }, 429, { 'Retry-After': '60' })
     }
     const acc = ordered[0]
 
@@ -413,7 +414,9 @@ export class M365Session {
     if (isAuthFailure(msg)) {
       return cjson({ error: { message: 'M365 account authentication failed; re-authorize required', type: 'auth_error' } }, 401)
     }
-    return cjson({ error: { message: msg, type: 'internal_error' } }, 500)
+    // 兜底：不再把原始上游错误透给客户端（对齐原版统一 502、不泄漏内部细节）。
+    // 详细原因写日志便于排查，端侧只给通用提示。
+    return cjson({ error: { message: 'upstream M365 ChatHub error; please retry later', type: 'upstream_error' } }, 502)
   }
 
   /**

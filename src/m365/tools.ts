@@ -451,16 +451,17 @@ export function extractAttachments(content: unknown): { type: 'image'; url: stri
 }
 
 export function compactToolResult(text: string, max = 4000): string {
-  const s = String(text || '')
-  if (s.length <= max) return s
-  // 保留头部前 1/3 与尾部 80 字符，中间标注截断（同原版 agent_ledger.go compactResult）
-  const tail = 80
-  const head = Math.floor(max * 0.6) - Math.floor(tail / 2)
-  const keepHead = Math.max(0, Math.min(head, s.length))
-  const trimmed = s.length - max
-  const headPart = s.substring(0, keepHead)
-  const tailPart = s.substring(s.length - Math.min(tail, max - keepHead))
-  return headPart + `\n...[truncated ${trimmed} chars]...\n` + tailPart
+  const s = String(text || '').trim()
+  // 与原版 agent_ledger.go compactResult 一致：Limit 小于 200 时按其上限；
+  // 否则 head=Limit/3、tail=Limit-head-80，保留约 Limit 字符
+  const limit = Math.max(1, max)
+  if (s.length <= limit) return s
+  const head = Math.floor(limit / 3)
+  const tail = Math.min(Math.max(limit - head - 80, 0), s.length)
+  const keepHead = Math.min(head, s.length - tail)
+  const trimmed = s.length - head - tail
+  if (keepHead <= 0) return `[truncated ${s.length} chars]`
+  return s.substring(0, keepHead) + `\n...[truncated ${trimmed} chars]...\n` + s.substring(s.length - tail)
 }
 
 export function flattenPromptMessages(messages: OaiMsgLite[], attachments?: { type: 'image'; url: string }[]): { prompt: string; attachments: { type: 'image'; url: string }[] } {
