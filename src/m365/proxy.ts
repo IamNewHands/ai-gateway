@@ -49,6 +49,8 @@ export interface M365ProxyContext {
    * 参与会话隔离与 DO 分片；缺失时降级为无租户（''），不匹配任何带租户的绑定。
    */
   tenant?: string
+  /** 客户端请求取消信号：断连时透传给 DO，中止上游 ChatHub 对话（同原版 r.Context().Done()） */
+  signal?: AbortSignal
 }
 
 /** 内部透传租户用的 body 字段（Anthropic/Responses 特殊路径没有 context 参数时使用） */
@@ -99,6 +101,7 @@ export async function proxyM365ChatRequest(
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(payload),
+    signal: context?.signal,
   })
 }
 

@@ -27,6 +27,8 @@ interface ImageGenRequest {
   image?: string
   /** 图片 MIME 类型 */
   imageType?: string
+  /** 网关公网 origin（用于把本地图片文件 URL 拼成绝对地址，同原版） */
+  baseUrl?: string
 }
 
 /** 判断 URL 是否是 Designer 图片 */
@@ -49,9 +51,9 @@ function bytesToBase64(bytes: Uint8Array): string {
   return btoa(binary)
 }
 
-/** 获取 Designer 下载 token（通过 refresh_token 换取 Designer scope） */
-async function getDesignerToken(env: Env, providerId: string, _provider: Provider): Promise<string> {
-  const account = await getM365Account(env, providerId)
+/** 获取 Designer 下载 token（通过 refresh_token 换取 Designer scope）。oid 指定时用同账号，保证下载与生成归属一致 */
+async function getDesignerToken(env: Env, providerId: string, _provider: Provider, oid?: string): Promise<string> {
+  const account = await getM365Account(env, providerId, oid)
   if (!account || !account.refreshToken) {
     throw new Error('account has no refresh token for Designer image download')
   }
@@ -200,14 +202,22 @@ export async function handleImageGeneration(
   provider: Provider,
   body: ImageGenRequest,
 ): Promise<Response> {
-  const account = await getM365Account(env, provider.id)
+  const account = await getM365Account(env, provider.id, body.accountId)
   if (!account || !account.accessToken) {
     return new Response(JSON.stringify({ error: { message: 'M365 account not authorized', type: 'auth_error' } }), { status: 401, headers: { 'Content-Type': 'application/json' } })
   }
 
-  const n = Math.max(1, Math.min(body.n || 1, 10))
+  // 参数校验（同原版）：n>10 → 400；response_format 非 url/b64_json → 400
+  const n = body.n ?? 1
+  if (!Number.isInteger(n) || n < 1 || n > 10) {
+    return new Response(JSON.stringify({ error: { message: '"n" must be an integer between 1 and 10', type: 'invalid_request_error' } }), { status: 400, headers: { 'Content-Type': 'application/json' } })
+  }
+  const rawFormat = body.response_format || 'url'
+  if (rawFormat !== 'url' && rawFormat !== 'b64_json') {
+    return new Response(JSON.stringify({ error: { message: '"response_format" must be "url" or "b64_json"', type: 'invalid_request_error' } }), { status: 400, headers: { 'Content-Type': 'application/json' } })
+  }
+  const format = rawFormat
   const size = body.size || '1024x1024'
-  const format = body.response_format || 'url'
   const isEdit = body.operation === 'edit'
 
   if (isEdit && !body.image) {
@@ -240,6 +250,8 @@ export async function handleImageGeneration(
       } : {}),
       // 标记为图片模式，DO 内部不走工具路由
       _m365_image_mode: true,
+      // 指定账号时透传给 DO，保证生成账号与下载账号一致
+      m365_account_id: body.accountId,
     },
     stream: false,
     _image_mode: true,
@@ -287,8 +299,12 @@ export async function handleImageGeneration(
   for (const imgUrl of selected) {
     if (imgUrl.startsWith('data:image/')) {
       if (format === 'b64_json') {
+        // data:image/...;base64,<data> —— 缺少逗号视为非法数据（同原版）
         const parts = imgUrl.split(',', 2)
-        data.push({ b64_json: parts[1] || parts[0] })
+        if (parts.length < 2 || parts[1] === '') {
+          return new Response(JSON.stringify({ error: { message: 'invalid image data url', type: 'invalid_request_error' } }), { status: 400, headers: { 'Content-Type': 'application/json' } })
+        }
+        data.push({ b64_json: parts[1] })
       } else {
         data.push({ url: imgUrl })
       }
@@ -303,10 +319,10 @@ export async function handleImageGeneration(
       continue
     }
 
-    // Designer 图片需要专用 token 下载
+    // Designer 图片需要专用 token 下载（用同一账号 oid，保证 token 归属与生成账号一致）
     if (!designerToken) {
       try {
-        designerToken = await getDesignerToken(env, provider.id, provider)
+        designerToken = await getDesignerToken(env, provider.id, provider, body.accountId)
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err)
         return new Response(JSON.stringify({ error: { message: `Designer token: ${msg}`, type: 'upstream_error' } }), { status: 502, headers: { 'Content-Type': 'application/json' } })
@@ -318,11 +334,11 @@ export async function handleImageGeneration(
       if (format === 'b64_json') {
         data.push({ b64_json: bytesToBase64(imgData) })
       } else {
-        // 存储到 KV 并返回本地 URL（记录实际 Content-Type）
+        // 存储到 KV 并返回本地 URL：可取得 origin 时返回绝对地址（同原版），否则退回相对路径
         const id = crypto.randomUUID()
         const kvKey = `image:${id}`
         await env.KV.put(kvKey, JSON.stringify({ d: bytesToBase64(imgData), c: contentType }), { expirationTtl: 900 })
-        data.push({ url: `/v1/images/files/${id}` })
+        data.push({ url: body.baseUrl ? `${body.baseUrl}/v1/images/files/${id}` : `/v1/images/files/${id}` })
       }
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err)
@@ -334,6 +350,11 @@ export async function handleImageGeneration(
   return new Response(JSON.stringify({
     created: Math.floor(Date.now() / 1000),
     data,
+    // 附加 m365 元数据块（同原版响应携带 m365:{...}）
+    m365: {
+      accountId: account.oid,
+      providerId: provider.id,
+    },
   }), { status: 200, headers: { 'Content-Type': 'application/json' } })
 }
 

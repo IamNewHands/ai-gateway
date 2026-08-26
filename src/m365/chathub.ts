@@ -30,9 +30,9 @@ const WS_BASE = 'wss://substrate.office.com/m365Copilot/Chathub'
 const MAX_ATTACHMENTS = 10
 const MAX_ATTACHMENT_MIB = 10
 
-/** 与浏览器探针一致的 variants 字符串 */
+/** 与浏览器探针一致的 variants 字符串（含静态补全缺失 flag） */
 const VARIANTS =
-  'EnableMcpServerWidgets,feature.EnableMcpServerWidgets,feature.EnableLuForChatCIQ,feature.enableChatCIQPlugin,EnableRequestPlugins,feature.EnableSensitivityLabels,EnableUnsupportedUrlDetector,feature.IsCustomEngineCopilotEnabled,feature.bizchatfluxv3,feature.enablechatpages,feature.enableCodeCanvas,feature.turnOnWorkTabRecommendation,turnOffWorkTabUpsellFromClient,feature.turnOnDARecommendation,feature.IsStreamingModeInChatRequestEnabled,IncludeSourceAttributionsConcise,SkipPublishEmptyMessage,feature.EnableDeduplicatingSourceAttributions,Enable3PActionProgressMessages,feature.enableClientWebRtc,feature.EnableMeetingRecapOfSeriesMeetingWithCiq,feature.EnableReferencesListCompleteSignal,feature.StorageMessageSplitDisabled,feature.EnableCuaTakeControlApi,feature.cwcallowedos,feature.disabledisallowedmsgs,feature.enableCitationsForSynthesisData,feature.enableGenerateGraphicArtOptionsSet,cdximagen,feature.EnableUpdatedUXForConfirmationDialog,feature.EnableClientFileURLSupportForOfficeWebPaidCopilot,feature.EnableDesignEditorImageGrounding,feature.EnableDesignerEditor,feature.OfficeWebToHelix,feature.OfficeDesktopToHelix,feature.M365TeamsHubToHelix,feature.OwaHubToHelix,feature.MonarchHubToHelix,feature.Win32OutlookHubToHelix,feature.MacOutlookHubToHelix,Agt_bizchat_enableGpt5ForHelix'
+  'EnableMcpServerWidgets,feature.EnableMcpServerWidgets,feature.EnableLuForChatCIQ,feature.enableChatCIQPlugin,EnableRequestPlugins,feature.EnableSensitivityLabels,EnableUnsupportedUrlDetector,feature.IsCustomEngineCopilotEnabled,feature.bizchatfluxv3,feature.enablechatpages,feature.enableCodeCanvas,feature.turnOnWorkTabRecommendation,turnOffWorkTabUpsellFromClient,feature.turnOnDARecommendation,feature.IsStreamingModeInChatRequestEnabled,IncludeSourceAttributionsConcise,SkipPublishEmptyMessage,feature.EnableDeduplicatingSourceAttributions,Enable3PActionProgressMessages,feature.enableClientWebRtc,feature.EnableMeetingRecapOfSeriesMeetingWithCiq,feature.EnableReferencesListCompleteSignal,feature.StorageMessageSplitDisabled,feature.EnableCuaTakeControlApi,feature.cwcallowedos,feature.disabledisallowedmsgs,feature.enableCitationsForSynthesisData,feature.enableGenerateGraphicArtOptionsSet,cdximagen,feature.EnableUpdatedUXForConfirmationDialog,feature.EnableClientFileURLSupportForOfficeWebPaidCopilot,feature.EnableDesignEditorImageGrounding,feature.EnableDesignerEditor,feature.OfficeWebToHelix,feature.OfficeDesktopToHelix,feature.M365TeamsHubToHelix,feature.OwaHubToHelix,feature.MonarchHubToHelix,feature.Win32OutlookHubToHelix,feature.MacOutlookHubToHelix,Agt_bizchat_enableGpt5ForHelix,EnableMergingPureDeltas,EnableRemoveStreamingMode,EnableConversationShareApisClient,EnableConversationShareApis,feature.EnableConversationShareApis,feature.EnableImageGenThrottled,feature.EnableImageGen2Throttled'
 
 export interface ChatHubAccount {
   accessToken: string
@@ -64,6 +64,8 @@ export interface ChatHubRequest {
   toolChoice?: unknown
   /** 首轮标记：会话/对话 ID 为空或首次使用时为 true */
   started?: boolean
+  /** MCP 网关 URL：非空时向 plugins 注入 {Id:'mcp-gateway', Source:'MCPServer'}（同原版） */
+  mcpServerUrl?: string
 }
 
 export interface ChatHubResult {
@@ -89,6 +91,8 @@ export interface ChatHubOptions {
   readTimeoutMs?: number
   /** 附件元数据追踪回调（可选） */
   trace?: (meta: Record<string, unknown>) => void
+  /** 取消信号：客户端断连时中止上游对话（同原版 r.Context().Done()） */
+  signal?: AbortSignal
 }
 
 function randomUUID(): string {
@@ -392,6 +396,11 @@ function chatPayload(req: ChatHubRequest, requestID: string, firstTurn: boolean)
     'enable_gg_gpt',
     'cwc_code_interpreter_v3',
     'rich_responses',
+    // 静态补全缺失项（同原版 optionsSets 静态部分；不引入 FeatureFlags 条件项）
+    'code-interpreter',
+    'flux_v3_references',
+    'image-gen-dimensions-1024x1024',
+    'image-gen-dimensions-1792x1792',
   ]
 
   const chat = {
@@ -402,18 +411,18 @@ function chatPayload(req: ChatHubRequest, requestID: string, firstTurn: boolean)
         sessionId: req.sessionId,
         optionsSets,
         options: {},
-        allowedMessageTypes: ['Chat', 'Suggestion', 'Disengaged', 'Progress', 'EndOfRequest', 'InternalLoaderMessage', 'GeneratedCode', 'SearchQuery', 'TriggerPlugin', 'MemoryUpdate', 'SideBySide', 'ReferencesListComplete', 'RichResponse'],
+        allowedMessageTypes: ['Chat', 'Suggestion', 'Disengaged', 'Progress', 'EndOfRequest', 'InternalLoaderMessage', 'GeneratedCode', 'SearchQuery', 'TriggerPlugin', 'MemoryUpdate', 'SideBySide', 'ReferencesListComplete', 'RichResponse', 'GenerateGraphicArt', 'GenerateContentQuery', 'RenderCardRequest', 'PromptSuggestion', 'CodeInterpreterResult', 'AudioResult', 'ImageResult', 'MeetingInsights', 'TranscriptSearch', 'DraftWithCopilot', 'MeetingTranscript', 'TranslationSuggestion', 'Citation', 'ActionCard', 'UserPromptSuggestion', 'GeneratedQuestions', 'SummaryInsights', 'SubTopicSuggestion'],
         sliceIds: [],
         threadLevelGptId: {},
         conversationId: req.conversationId,
         traceId: randomUUID(),
         isStartOfSession: firstTurn,
         productThreadType: 'Office',
-        clientInfo: { clientPlatform: 'mcmcopilot-web', clientAppName: 'Office' },
+        clientInfo: { clientPlatform: 'mcmcopilot-web', clientAppName: 'Office', clientEntrypoint: 'Web.LegacyEntrypoint', clientSessionId: randomUUID(), ProductCategory: 'OfficeWebIncludedCopilot' },
         tone: req.tone || DEFAULT_TONE,
         streamingMode: 'ConciseWithPadding',
         message,
-        plugins: clientPlugins(tools),
+        plugins: buildPlugins(tools, req.mcpServerUrl),
         toolChoice: req.toolChoice,
       },
     ],
@@ -438,7 +447,8 @@ function chatPayload(req: ChatHubRequest, requestID: string, firstTurn: boolean)
   return JSON.stringify(chat) + RS + JSON.stringify(metrics) + RS
 }
 
-/** M365 原生插件列表（与原版 clientPlugins 一致的官方插件结构，字段名须大写） */
+/** M365 原生插件列表（与原版 clientPlugins 一致的官方插件结构，字段名须大写）。
+ * mcpServerUrl 非空时附加 mcp-gateway 插件条目（同原版：Source:'MCPServer'）。 */
 function clientPlugins(tools: ChatHubTool[]): Record<string, unknown>[] {
   if (!tools || tools.length === 0) return []
   const plugins: Record<string, unknown>[] = []
@@ -451,6 +461,14 @@ function clientPlugins(tools: ChatHubTool[]): Record<string, unknown>[] {
       Description: f.description || '',
       Parameters: f.parameters ?? null,
     })
+  }
+  return plugins
+}
+
+function buildPlugins(tools: ChatHubTool[], mcpServerUrl?: string): Record<string, unknown>[] {
+  const plugins = clientPlugins(tools)
+  if (mcpServerUrl && mcpServerUrl.trim() !== '') {
+    plugins.push({ Id: 'mcp-gateway', Source: 'MCPServer', ServerUrl: mcpServerUrl.trim() })
   }
   return plugins
 }
@@ -502,12 +520,23 @@ export async function chatWithHandlers(
     })
     if (resp.status !== 101 || !resp.webSocket) {
       const text = await resp.text().catch(() => '')
-      throw new Error(`ws dial failed: HTTP ${resp.status} ${text.substring(0, 200)}`)
+      // 读取 Retry-After 并挂到错误上，供 account-health 冷却使用（同原版 DialError.RetryAfter）
+      const retryAfterRaw = resp.headers.get('retry-after')
+      const err = new Error(`ws dial failed: HTTP ${resp.status} ${text.substring(0, 200)}`) as Error & { retryAfterSeconds?: number }
+      if (retryAfterRaw && /^\d+$/.test(retryAfterRaw.trim())) {
+        err.retryAfterSeconds = parseInt(retryAfterRaw.trim(), 10)
+      }
+      throw err
     }
     socket = resp.webSocket as unknown as OutboundWebSocket
     socket.accept()
   } catch (err) {
-    throw new Error(`ws dial: ${err instanceof Error ? err.message : String(err)}`)
+    const wrapped = new Error(`ws dial: ${err instanceof Error ? err.message : String(err)}`) as Error & { retryAfterSeconds?: number }
+    // 保留上游 Retry-After（供 account-health 冷却）
+    if ((err as Error & { retryAfterSeconds?: number }).retryAfterSeconds) {
+      wrapped.retryAfterSeconds = (err as Error & { retryAfterSeconds?: number }).retryAfterSeconds
+    }
+    throw wrapped
   }
 
   // 消息队列：事件驱动 → 同步式读取
@@ -554,6 +583,8 @@ export async function chatWithHandlers(
   const timeoutMs = opts.timeoutMs || 300_000
   const readTimeoutMs = opts.readTimeoutMs || 90_000
   const deadline = Date.now() + timeoutMs
+  // 客户端断连时中止（同原版 r.Context().Done() → 取消上游对话）
+  const aborted = () => opts.signal?.aborted === true
 
   try {
     // 3) 握手
@@ -573,7 +604,7 @@ export async function chatWithHandlers(
     let throttling: unknown
     /** 收集原生工具事件（含 messages[] 之外的插件调用），供上层 nativeToolCalls 提取 */
     const collectedEvents: unknown[] = []
-    /** 收集所有 update 帧的 arguments，供 complete 时提取图片 URL */
+    /** 收集图片 URL 的帧内容：update 帧 arguments + result 帧 item（同原版 events 全量收集） */
     const rawFrames: unknown[] = []
 
     const rateLimited = (text: string): boolean => {
@@ -633,6 +664,7 @@ export async function chatWithHandlers(
     }
 
     while (Date.now() < deadline) {
+      if (aborted()) throw new Error('request aborted by client')
       const read = await withTimeout(next(), readTimeoutMs, 'ws message')
       if (read.err) throw read.err
       if (!read.msg) continue
@@ -694,6 +726,8 @@ export async function chatWithHandlers(
         if (frame.type === 2) {
           const item = frame.item as Record<string, unknown> | undefined
           if (item) {
+            // 图片 URL 也可能只出现在 result 帧（item/result 元数据）：一并纳入收集
+            rawFrames.push(item)
             if (item['throttling'] !== undefined) throttling = item['throttling']
             const res = item['result'] as Record<string, unknown> | undefined
             if (res) {

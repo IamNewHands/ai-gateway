@@ -12,10 +12,10 @@
 import type { Env } from '../types'
 import { chatWithHandlers, classifyChatHubNotice } from './chathub'
 import type { ChatHubAccount, ChatHubTool, ChatHubResult } from './chathub'
-import { flattenPromptMessages, modelToolRouterPrompt, parseModelToolDecision, fencedToolCalls, nativeToolCalls, compactToolResult, buildAgentLedger, canContinue, MAX_TOOL_ROUNDS_DEFAULT, ledgerRouterContext, filterCompletedCalls, validateDetectedToolCalls, completionEvidenceAllows, isToolRefusal } from './tools'
+import { flattenPromptMessages, modelToolRouterPrompt, parseModelToolDecision, fencedToolCalls, nativeToolCalls, compactToolResult, buildAgentLedger, canContinue, MAX_TOOL_ROUNDS_DEFAULT, ledgerRouterContext, filterCompletedCalls, validateDetectedToolCalls, completionEvidenceAllows, isToolRefusal, isSandboxHallucination } from './tools'
 import type { DetectedToolCall, AgentLedger, OaiMsgLite } from './tools'
-import { resolveSession, bindSession } from './session'
-import type { ResolveResult } from './session'
+import { resolveSession, bindSession, systemPromptHash, convCacheLookup, convCacheStore } from './session'
+import type { ResolveResult, ContextLike } from './session'
 import { listM365Accounts } from './oauth'
 import { recordConversation, shouldCleanup, cleanupConversations, getCleanupMode, getCleanupConfig } from './conversation-manager'
 import { markAccountSuccess, markAccountFailure, markAccountImageLimited, accountCooldownSeconds, isAccountAvailable, isRateLimited, isAuthFailure, isEmptyCompletion, confirmAndMarkRateLimit } from './account-health'
@@ -96,12 +96,12 @@ export class M365Session {
       } catch {
         return cjson({ error: { message: 'bad json', type: 'invalid_request_error' } }, 400)
       }
-      return this.enqueue(() => this.handleChat(payload))
+      return this.enqueue(() => this.handleChat(payload, request.signal))
     }
     return cjson({ error: { message: 'not found', type: 'not_found' } }, 404)
   }
 
-  private async handleChat(payload: M365ChatPayload): Promise<Response> {
+  private async handleChat(payload: M365ChatPayload, requestSignal?: AbortSignal): Promise<Response> {
     const { providerId, model, body, stream, explicitSessionId, explicitAccountId, user, ip, userAgent, tenant } = payload
     const messages = (body['messages'] as Array<Record<string, unknown>>) || []
     const tools = (body['tools'] as unknown[]) || []
@@ -109,7 +109,7 @@ export class M365Session {
 
     // 1) 会话解析（显式 ID / 内容键），按租户（API Key 哈希）隔离
     const ctx = { explicitSessionId, user, ip, userAgent, tenant: payload.tenant }
-    const resolved = await resolveSession(this.env, providerId, messages as never[], ctx)
+    let resolved = await resolveSession(this.env, providerId, messages as never[], ctx)
 
     // 2) 构建 ChatHub 请求：messages 扁平化为单文本 prompt；复用命中只发增量
     const { prompt, attachments } = flattenPromptMessages(messages as never[])
@@ -128,14 +128,17 @@ export class M365Session {
       const f = (obj['function'] || {}) as Record<string, unknown>
       return { type: typeof obj['type'] === 'string' ? obj['type'] : 'function', function: { name: String(f['name'] || ''), description: typeof f['description'] === 'string' ? f['description'] : undefined, parameters: f['parameters'] } }
     })
+    // MCP 网关 URL（可选，默认关闭）：非空时注入 mcp-gateway 插件（同原版）
+    const mcpServerUrl = typeof body['m365_mcp_server_url'] === 'string' && body['m365_mcp_server_url'].trim() !== '' ? body['m365_mcp_server_url'].trim() : undefined
 
     // 多轮工具证据 ledger：从 messages 历史解析已完成/待处理的工具调用，去重并注入上下文
     const ledger: AgentLedger = buildAgentLedger(messages as OaiMsgLite[])
     if (!canContinue(ledger, MAX_TOOL_ROUNDS_DEFAULT)) {
+      try { await writeLog(this.env, 'warn', `[m365-chat] provider=${providerId} → tool loop gate blocked`, `stuckLoop=${ledger.stuckLoop} repeatedFailure=${ledger.repeatedFailure} toolRounds=${ledger.toolRounds} sig=${ledger.repetitionSignature || ''}`) } catch { /* ignore */ }
       return cjson({
         error: {
-          message: ledger.stuckLoop ? 'tool loop detected' : 'tool round limit exceeded',
-          type: 'tool_round_limit_error',
+          message: ledger.stuckLoop || ledger.repeatedFailure ? 'tool loop detected' : 'tool round limit exceeded',
+          type: 'tool_round_limit',
         },
       }, 409)
     }
@@ -151,6 +154,27 @@ export class M365Session {
       return cjson({ error: { message: 'M365 所有账号繁忙或冷却中，请稍后重试或先在后台添加/授权账号', type: 'rate_limit_error' } }, 429, { 'Retry-After': '60' })
     }
     const acc = ordered[0]
+
+    // convCache 复用层：新会话且无工具时，命中 account+model+systemPromptHash 则沿用云端对话（同原版第三层复用）
+    const sysHash = model ? systemPromptHash(messages as never[]) : ''
+    if (resolved.isNew && model && sysHash) {
+      try {
+        const reuse = await convCacheLookup(this.env, providerId, acc.oid, model, sysHash)
+        if (reuse) {
+          resolved = { ...resolved, sessionId: reuse.sessionId, conversationId: reuse.conversationId, accountId: acc.oid, isNew: false, historyLen: 0, matchedBy: 'convCache' }
+          // 沿用云端对话：只发最新一条用户消息作为增量，避免重复注入 system/历史
+          const lu = [...messages].reverse().find((m) => String(m['role']).toLowerCase() === 'user')
+          if (lu) {
+            const inc = flattenPromptMessages([lu] as never[])
+            if (inc.prompt.trim() !== '') {
+              answerPrompt = inc.prompt
+              attachments.length = 0
+              attachments.push(...inc.attachments)
+            }
+          }
+        }
+      } catch { /* 复用失败不影响主流程 */ }
+    }
 
     // 4) 工具路由：带 tools 且 toolChoice != none 时，先发起一次独立的路由对话，
     //    注入完整工具定义 + ledger 证据让模型显式决策是否调用工具（同原版 planningMode="router"）。
@@ -199,6 +223,15 @@ export class M365Session {
     const mainTools = toolRouterFailed ? [] : toolDefs
     const mainChoice = toolRouterFailed ? 'none' : toolChoice
 
+    // 流式：增量透传主回答文本/推理，随事件实时推送，客户端断连可中止上游（同原版真实流式）
+    if (stream) {
+      return await this.streamMainAnswer({
+        providerId, model, ordered, resolved,
+        mainPrompt, attachments, mainTools, mainChoice,
+        toolDefs, toolChoice, ledger, messages, ctx, requestSignal, mcpServerUrl, sysHash,
+      })
+    }
+
     let streamedText = ''
     let reasoning = ''
     let result: Awaited<ReturnType<typeof chatWithHandlers>> | undefined
@@ -224,6 +257,7 @@ export class M365Session {
             attachments,
             tools: mainTools,
             toolChoice: mainChoice,
+            mcpServerUrl,
           },
           { timeoutMs: 300_000 },
           (delta) => { streamedText += delta },
@@ -234,11 +268,13 @@ export class M365Session {
         // 记录完整 ChatHub 错误（含微软服务端返回的 detail）便于排查真实对话 500
         const msg = err instanceof Error ? err.message : String(err)
         const errObj = err instanceof Error ? err : new Error(msg)
+        // 携带上游 Retry-After（WS dial 失败等场景已挂到错误上）
+        const ra = (errObj as Error & { retryAfterSeconds?: number }).retryAfterSeconds
         // 限流先做二次确认探测（误报不冷却），鉴权/其他失败直接标记
         if (isRateLimited(errObj)) {
-          await confirmAndMarkRateLimit(this.env, usedAcc.oid, errObj, this.createRateLimitProbe(usedAcc))
+          await confirmAndMarkRateLimit(this.env, usedAcc.oid, errObj, this.createRateLimitProbe(usedAcc), ra)
         } else {
-          await markAccountFailure(this.env, usedAcc.oid, errObj)
+          await markAccountFailure(this.env, usedAcc.oid, errObj, ra)
         }
         const cls = classifyChatHubNotice(msg)
         const detail =
@@ -271,14 +307,20 @@ export class M365Session {
     }
     streamedText = streamedText || result.text
 
-    // 主回答兜底 1：模型错误拒绝使用工具时，发起纠正对话重试（同原版 isToolRefusal）
-    if (toolDefs.length > 0 && isToolRefusal(result.text || streamedText)) {
-      const correction =
-        'Your previous response incorrectly denied that caller tools are available. They are real, active, and callable on the caller\'s Windows machine. Call the appropriate tool now. Do not explain tool availability.\n\nUser request:\n' + mainPrompt
+    // 主回答兜底 1：模型错误拒绝使用工具 或 产生沙箱幻觉时，发起纠正对话重试。
+    // 两类独立检测：isToolRefusal 带长度守卫；isSandboxHallucination 无长度限制、用专门纠正词（同原版 toolloop.go）。
+    const answerText = result.text || streamedText
+    const refusalDetected = toolDefs.length > 0 && isToolRefusal(answerText)
+    const sandboxDetected = toolDefs.length > 0 && isSandboxHallucination(answerText)
+    if (refusalDetected || sandboxDetected) {
+      const correction = sandboxDetected
+        ? "Your previous response was wrong: you are running on the caller's Windows machine with full local execution, not in a sandbox or container, and no built-in code interpreter exists. Only the caller tools are available and they are real and callable. Call the appropriate tool now.\n\nUser request:\n" + mainPrompt
+        : 'Your previous response incorrectly denied that caller tools are available. They are real, active, and callable on the caller\'s Windows machine. Call the appropriate tool now. Do not explain tool availability.\n\nUser request:\n' + mainPrompt
       const corrAcquired = await acquireSlot(this.env, providerId, usedAcc.oid)
       try {
         const corrRes = await chatWithHandlers(usedAcc, { text: correction, conversationId: resolved.isNew ? undefined : resolved.conversationId, sessionId: resolved.isNew ? undefined : resolved.sessionId, started: resolved.isNew, attachments }, { timeoutMs: 300_000 })
-        if (!isToolRefusal(corrRes.text)) {
+        const stillBad = sandboxDetected ? isSandboxHallucination(corrRes.text) : isToolRefusal(corrRes.text)
+        if (!stillBad) {
           result = { ...corrRes, events: result.events }
           streamedText = corrRes.text
         }
@@ -291,8 +333,8 @@ export class M365Session {
     const rawCalls: DetectedToolCall[] =
       fencedToolCalls(result.text || streamedText, toolDefs, toolChoice)
     const allCalls = rawCalls.length > 0 ? rawCalls : nativeToolCalls(result.events, toolDefs)
-    // 信任边界：模型输出不可信，二次校验（未知工具/参数不合 schema 一律剔除）
-    const validated = validateDetectedToolCalls(allCalls, toolDefs)
+    // 信任边界：模型输出不可信，二次校验（未知工具/参数不合 schema/tool_choice 约束一律剔除）
+    const validated = validateDetectedToolCalls(allCalls, toolDefs, toolChoice)
     if (validated.dropped > 0) {
       console.warn(`[m365:${providerId}] 剔除 ${validated.dropped} 个不合规工具调用（信任边界校验）`)
     }
@@ -324,6 +366,10 @@ export class M365Session {
 
     // 标记账户健康：成功
     await markAccountSuccess(this.env, usedAcc.oid)
+    // 写入 convCache（account+model+systemPromptHash），供后续复用
+    if (sysHash) {
+      try { await convCacheStore(this.env, providerId, usedAcc.oid || providerId, model, sysHash, outcome.sessionId, outcome.conversationId) } catch { /* ignore */ }
+    }
 
     // 7) 对话管理器：记录云端对话 + 按模式清理
     const promptText = typeof messages[messages.length - 1]?.['content'] === 'string'
@@ -344,10 +390,190 @@ export class M365Session {
     }
 
     const id = 'chatcmpl-' + crypto.randomUUID()
-    if (stream) {
-      return buildSSE(id, model, outcome, payload)
-    }
     return buildJSON(id, model, outcome)
+  }
+
+  /**
+   * 流式主回答：增量透传 ChatHub delta → OpenAI SSE，客户端断连时中止上游对话。
+   * 与聚合路径差异：文本/推理随事件实时推送（非等整个对话完成）；拒绝/沙盒/完成证据
+   * 等需要"先看到全文再改写"的校正，在流式下无法撤回已发送的文本，仅用于会话绑定一致。
+   */
+  private async streamMainAnswer(a: {
+    providerId: string
+    model: string
+    ordered: ChatHubAccount[]
+    resolved: ResolveResult
+    mainPrompt: string
+    attachments: { type: 'image'; url: string }[]
+    mainTools: ChatHubTool[]
+    mainChoice: unknown
+    toolDefs: ChatHubTool[]
+    toolChoice: unknown
+    ledger: AgentLedger
+    messages: Array<Record<string, unknown>>
+    ctx: ContextLike
+    requestSignal?: AbortSignal
+    mcpServerUrl?: string
+    sysHash?: string
+  }): Promise<Response> {
+    const { providerId, model, ordered, resolved, mainPrompt, attachments, mainTools, mainChoice, toolDefs, toolChoice, ledger, messages, ctx, requestSignal, mcpServerUrl, sysHash } = a
+    const encoder = new TextEncoder()
+    const aborter = new AbortController()
+    // 客户端断连（requestSignal）或响应体被取消（cancel）都中止上游 ChatHub
+    if (requestSignal?.aborted) aborter.abort()
+    else requestSignal?.addEventListener('abort', () => aborter.abort(), { once: true })
+    const created = Math.floor(Date.now() / 1000)
+    const id = 'chatcmpl-' + crypto.randomUUID()
+    const usedAcc = ordered[0]
+    if (!usedAcc || !usedAcc.oid) {
+      return cjson({ error: { message: 'no available M365 account', type: 'rate_limit_error' } }, 429, { 'Retry-After': '5' })
+    }
+
+    const stream = new ReadableStream<Uint8Array>({
+      start: async (controller) => {
+        const push = (s: string) => { try { controller.enqueue(encoder.encode(s)) } catch { /* 客户端已断开 */ } }
+        const chunk = (delta: Record<string, unknown>, finish: unknown, extra: Record<string, unknown> = {}) => {
+          const c: Record<string, unknown> = { id, object: 'chat.completion.chunk', created, model, choices: [{ index: 0, delta, finish_reason: finish }] }
+          for (const [k, v] of Object.entries(extra)) c[k] = v
+          return 'data: ' + JSON.stringify(c) + '\n\n'
+        }
+        const usageSSE = (pt: number, ct: number, finish: string, conv: string) =>
+          'data: ' + JSON.stringify({
+            id, object: 'chat.completion.chunk', created, model,
+            choices: [{ index: 0, delta: {}, finish_reason: finish }],
+            usage: { prompt_tokens: pt, completion_tokens: ct, total_tokens: pt + ct, m365_conversation: conv },
+          }) + '\n\n'
+
+        // 打开：role assistant
+        push(chunk({ role: 'assistant', content: '' }, null))
+
+        const acquired = await acquireSlot(this.env, providerId, usedAcc.oid)
+        if (!acquired) {
+          push(usageSSE(0, 0, 'stop', ''))
+          push('data: [DONE]\n\n')
+          return
+        }
+
+        let streamedText = ''
+        let reasoningBuf = ''
+        let result: Awaited<ReturnType<typeof chatWithHandlers>> | undefined
+        try {
+          result = await chatWithHandlers(
+            usedAcc,
+            {
+              text: mainPrompt,
+              conversationId: resolved.isNew ? undefined : resolved.conversationId,
+              sessionId: resolved.isNew ? undefined : resolved.sessionId,
+              started: resolved.isNew,
+              attachments,
+              tools: mainTools,
+              toolChoice: mainChoice,
+              mcpServerUrl,
+            },
+            { timeoutMs: 300_000, signal: aborter.signal },
+            (delta) => {
+              if (!delta) return
+              streamedText += delta
+              push(chunk({ content: delta }, null))
+            },
+            (ev) => {
+              if (ev.kind === 'reasoning' && ev.text) {
+                reasoningBuf += ev.text
+                push(chunk({ reasoning_content: ev.text }, null))
+              }
+            },
+          )
+
+          // 流式结尾：如文本答案里带了 fenced 工具调用，同样透出（与聚合路径一致）
+          const rawCalls = fencedToolCalls(result.text || streamedText, toolDefs, toolChoice)
+          const allCalls = rawCalls.length > 0 ? rawCalls : nativeToolCalls(result.events, toolDefs)
+          const validated = validateDetectedToolCalls(allCalls, toolDefs, toolChoice)
+          const calls = filterCompletedCalls(validated.calls, ledger)
+          if (calls.length > 0) {
+            push(chunk({ content: result.text || streamedText }, null))
+            calls.forEach((tc, i) => {
+              const args = tc.arguments || ''
+              if (args.length <= 512) {
+                push(chunk({ tool_calls: [{ index: i, id: tc.id, type: tc.type, function: { name: tc.name, arguments: args } }] }, null))
+                return
+              }
+              let offset = 0
+              let first = true
+              while (offset < args.length) {
+                let end = Math.min(offset + 512, args.length)
+                if (end < args.length) {
+                  while (end > offset) {
+                    const prev = args.charCodeAt(end - 1)
+                    const cur = args.charCodeAt(end)
+                    if (prev >= 0xd800 && prev <= 0xdbff && cur >= 0xdc00 && cur <= 0xdfff) end--
+                    else break
+                  }
+                  if (end === offset) end = Math.min(offset + 512, args.length)
+                }
+                const frag = args.substring(offset, end)
+                if (first) { push(chunk({ tool_calls: [{ index: i, id: tc.id, type: tc.type, function: { name: tc.name, arguments: frag } }] }, null)); first = false }
+                else push(chunk({ tool_calls: [{ index: i, function: { arguments: frag } }] }, null))
+                offset = end
+              }
+            })
+          }
+
+          // 完成证据校正（流式不可撤回，仅影响会话绑定文本）
+          let finalText = result.text || streamedText
+          if (toolDefs.length > 0 && !completionEvidenceAllows(finalText, ledger)) {
+            finalText = 'I cannot confirm completion because no matching tool results were returned. No external action has been verified.'
+          }
+          const conv = result.conversationId
+          const pt = estimateTokens(finalText) + (result.reasoning || reasoningBuf ? estimateTokens(result.reasoning || reasoningBuf) : 0)
+          const ct = pt
+          push(usageSSE(pt, ct, calls.length > 0 ? 'tool_calls' : 'stop', conv))
+          push('data: [DONE]\n\n')
+
+          // 持久化：绑定会话 + 记健康 + 记对话
+          try {
+            await bindSession(this.env, providerId, result.sessionId, result.conversationId, usedAcc.oid || providerId, messages as never[], finalText, ctx)
+            await markAccountSuccess(this.env, usedAcc.oid)
+            if (sysHash) {
+              try { await convCacheStore(this.env, providerId, usedAcc.oid || providerId, model, sysHash, result.sessionId, result.conversationId) } catch { /* ignore */ }
+            }
+            const promptText = typeof messages[messages.length - 1]?.['content'] === 'string'
+              ? String(messages[messages.length - 1]['content']).substring(0, 100)
+              : ''
+            await recordConversation(this.env, providerId, result.conversationId, usedAcc.oid || providerId, promptText)
+          } catch (persistErr) {
+            try { await writeLog(this.env, 'warn', `[m365-chat] provider=${providerId} → stream persist failed`, persistErr instanceof Error ? persistErr.message : String(persistErr)) } catch { /* ignore */ }
+          }
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err)
+          const errObj = err instanceof Error ? err : new Error(msg)
+          const ra = (errObj as Error & { retryAfterSeconds?: number }).retryAfterSeconds
+          if (isRateLimited(errObj)) {
+            await confirmAndMarkRateLimit(this.env, usedAcc.oid, errObj, this.createRateLimitProbe(usedAcc), ra)
+          } else {
+            await markAccountFailure(this.env, usedAcc.oid, errObj, ra)
+          }
+          try {
+            const detail = `model=${model} account=${usedAcc.oid} stream=${true} err=${msg} retryAfter=${ra ?? '-'}`
+            await writeLog(this.env, 'error', `[m365-chat] provider=${providerId} → stream ${msg}`, detail)
+          } catch { /* ignore */ }
+          // 已输出过内容则正常收尾，否则仍补一个 DONE 避免客户端挂起
+          if (streamedText === '') push(chunk({ content: '' }, null))
+          push(usageSSE(0, 0, 'stop', ''))
+          push('data: [DONE]\n\n')
+        } finally {
+          try { await releaseSlot(this.env, providerId, usedAcc.oid) } catch { /* ignore */ }
+          try { controller.close() } catch { /* 已关闭 */ }
+        }
+      },
+      cancel() {
+        // 客户端断连 / 响应体被取消：中止上游 ChatHub 对话（同原版 r.Context().Done()）
+        aborter.abort()
+      },
+    })
+
+    return new Response(stream, {
+      headers: { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', 'Connection': 'keep-alive', 'X-Accel-Buffering': 'no' },
+    })
   }
 
   /**

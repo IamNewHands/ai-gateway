@@ -310,6 +310,7 @@ app.post('/v1/images/generations', async (c) => {
     response_format: body['response_format'],
     user: body['user'],
     operation: 'generation',
+    baseUrl: new URL(c.req.url).origin,
   })
 })
 app.post('/v1/images/edits', async (c) => {
@@ -343,6 +344,7 @@ app.post('/v1/images/edits', async (c) => {
       operation: 'edit',
       image: b64,
       imageType: file.type,
+      baseUrl: new URL(c.req.url).origin,
     })
   }
   // JSON body
@@ -356,6 +358,7 @@ app.post('/v1/images/edits', async (c) => {
     operation: 'edit',
     image: body['image'],
     imageType: body['image_type'],
+    baseUrl: new URL(c.req.url).origin,
   })
 })
 app.get('/v1/images/files/:id', async (c) => {

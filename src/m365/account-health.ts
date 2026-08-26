@@ -15,10 +15,19 @@
 import type { Env } from '../types'
 
 const ACCOUNT_HEALTH_PREFIX = 'm365:health:'
-const RATE_LIMIT_COOLDOWN_MS = 60 * 1000 // 1 分钟（对齐原版 ~30-60s）
+const RATE_LIMIT_BACKOFF_BASE_MS = 30 * 1000 // 指数退避基数：30s·2^(n-1)（同原版）
 const MAX_COOLDOWN_MS = 30 * 60 * 1000 // 最大冷却 30 分钟
-const AUTH_FAIL_COOLDOWN_MS = 2 * 60 * 1000 // 鉴权失败冷却 2 分钟
+const AUTH_FAIL_COOLDOWN_MS = 24 * 60 * 60 * 1000 // 鉴权/403 冷却 24h（同原版）
+const SERVICE_UNAVAILABLE_COOLDOWN_MS = 15 * 1000 // 503 冷却 15s（同原版）
+const EMPTY_COOLDOWN_MS = 10 * 1000 // 空响应冷却 10s（原版 10–30s）
+const UNKNOWN_COOLDOWN_MS = 30 * 1000 // 未知错误冷却 30s（原版 10–30s）
 const IMAGE_LIMIT_COOLDOWN_MS = 24 * 60 * 60 * 1000 // 图片额度耗尽冷却 24h（同原版 MarkImageLimited）
+// 全局熔断器参数（同原版：30s 窗口内失败 ≥10 次且失败率 ≥50% → 熔断 30s）。
+// KV 落盘使其在跨实例/跨 DO 间共享，达到"全局"熔断语义。
+const BREAKER_WINDOW_MS = 30 * 1000
+const BREAKER_MIN_FAILURES = 10
+const BREAKER_FAIL_RATE = 0.5
+const BREAKER_TRIP_MS = 30 * 1000
 
 export interface AccountHealthState {
   /** 冷却到期时间（Unix ms），0 表示未冷却 */
@@ -27,6 +36,16 @@ export interface AccountHealthState {
   authFailed: boolean
   /** 图片额度耗尽到期时间（Unix ms），0 表示正常 */
   imageLimitedUntil: number
+  /** 连续限流次数（供指数退避） */
+  rlFailures?: number
+  /** 熔断器滑动窗口起点（Unix ms） */
+  breakerStart?: number
+  /** 窗口内失败次数 */
+  breakerFailures?: number
+  /** 窗口内总请求数 */
+  breakerTotal?: number
+  /** 熔断到期时间（Unix ms），0 表示未熔断 */
+  trippedUntil?: number
   /** 最后更新时间 */
   updatedAt: number
 }
@@ -34,16 +53,39 @@ export interface AccountHealthState {
 async function readHealth(env: Env, accountId: string): Promise<AccountHealthState> {
   try {
     const raw = await env.KV.get(ACCOUNT_HEALTH_PREFIX + accountId)
-    if (!raw) return { cooldownUntil: 0, authFailed: false, imageLimitedUntil: 0, updatedAt: 0 }
+    if (!raw) return { cooldownUntil: 0, authFailed: false, imageLimitedUntil: 0, rlFailures: 0, updatedAt: 0 }
     const s = JSON.parse(raw) as Partial<AccountHealthState>
     return {
       cooldownUntil: s.cooldownUntil || 0,
       authFailed: !!s.authFailed,
       imageLimitedUntil: s.imageLimitedUntil || 0,
+      rlFailures: s.rlFailures || 0,
+      breakerStart: s.breakerStart || 0,
+      breakerFailures: s.breakerFailures || 0,
+      breakerTotal: s.breakerTotal || 0,
+      trippedUntil: s.trippedUntil || 0,
       updatedAt: s.updatedAt || 0,
     }
   } catch {
-    return { cooldownUntil: 0, authFailed: false, imageLimitedUntil: 0, updatedAt: 0 }
+    return { cooldownUntil: 0, authFailed: false, imageLimitedUntil: 0, rlFailures: 0, updatedAt: 0 }
+  }
+}
+
+/** 熔断器事件：维护 30s 滑动窗口计数，达阈值则熔断 30s（同原版断路器） */
+function updateBreaker(state: AccountHealthState, now: number, ok: boolean): void {
+  if (!state.breakerStart || now - state.breakerStart > BREAKER_WINDOW_MS) {
+    state.breakerStart = now
+    state.breakerFailures = 0
+    state.breakerTotal = 0
+  }
+  state.breakerTotal = (state.breakerTotal || 0) + 1
+  if (!ok) state.breakerFailures = (state.breakerFailures || 0) + 1
+  // 仅当未处于熔断中才触发（一旦熔断，isAccountAvailable 会暂时跳过该账号，窗口自然冷却）
+  if (!state.trippedUntil || now >= state.trippedUntil) {
+    if ((state.breakerFailures || 0) >= BREAKER_MIN_FAILURES && (state.breakerTotal || 0) > 0
+      && (state.breakerFailures || 0) / (state.breakerTotal || 1) >= BREAKER_FAIL_RATE) {
+      state.trippedUntil = now + BREAKER_TRIP_MS
+    }
   }
 }
 
@@ -57,7 +99,7 @@ async function writeHealth(env: Env, accountId: string, state: AccountHealthStat
   } catch { /* 写入失败不影响主流程 */ }
 }
 
-/** 判断错误是否是限流相关 */
+/** 判断错误是否是限流相关（429 / 503 / 上游限流提示） */
 export function isRateLimited(err: Error | string): boolean {
   const msg = typeof err === 'string' ? err : err.message || ''
   const low = msg.toLowerCase()
@@ -66,8 +108,17 @@ export function isRateLimited(err: Error | string): boolean {
     low.includes('rate limit') ||
     low.includes('too many requests') ||
     low.includes('429') ||
+    low.includes('503') ||
+    low.includes('service unavailable') ||
     low.includes('throttl')
   )
+}
+
+/** 判断错误是否是 503 服务不可用（同原版 IsRateLimited 含 503，但冷却更短） */
+export function isServiceUnavailable(err: Error | string): boolean {
+  const msg = typeof err === 'string' ? err : err.message || ''
+  const low = msg.toLowerCase()
+  return low.includes('503') || low.includes('service unavailable')
 }
 
 /** 判断错误是否是鉴权失败（对齐原版：仅明确鉴权信号，避免把普通错误误判为鉴权失败） */
@@ -92,9 +143,11 @@ export function isEmptyCompletion(err: Error | string): boolean {
 }
 
 /**
- * 标记账户失败。
- * - 鉴权失败：冷却 2 分钟
- * - 限流：冷却 window（默认 3 分钟，上游 Retry-After 优先）
+ * 标记账户失败（分类冷却）。
+ * - 鉴权失败（401/403）：冷却 24h（同原版）
+ * - 限流（429/503）：指数退避 30s·2^(n-1) 封顶 30min；503 用 15s；上游 Retry-After 优先
+ * - 空响应：冷却 10s
+ * - 未知错误：短冷却 30s（原版 10–30s）
  * @param retryAfterSeconds 上游给出的 Retry-After 秒数（可选）
  */
 export async function markAccountFailure(
@@ -105,18 +158,36 @@ export async function markAccountFailure(
 ): Promise<void> {
   const state = await readHealth(env, accountId)
   const now = Date.now()
+  const msg = typeof err === 'string' ? err : err.message || ''
+
+  updateBreaker(state, now, false)
 
   if (isAuthFailure(err)) {
     state.authFailed = true
+    state.rlFailures = 0
     state.cooldownUntil = now + AUTH_FAIL_COOLDOWN_MS
   } else if (isRateLimited(err)) {
     state.authFailed = false
-    let cd = RATE_LIMIT_COOLDOWN_MS
+    let cd: number
     if (retryAfterSeconds && retryAfterSeconds > 0) {
       cd = retryAfterSeconds * 1000
-      if (cd > MAX_COOLDOWN_MS) cd = MAX_COOLDOWN_MS
+    } else if (isServiceUnavailable(msg)) {
+      cd = SERVICE_UNAVAILABLE_COOLDOWN_MS
+    } else {
+      // 指数退避：连续限流越多次冷却越久
+      const n = (state.rlFailures || 0) + 1
+      state.rlFailures = n
+      cd = Math.min(RATE_LIMIT_BACKOFF_BASE_MS * Math.pow(2, n - 1), MAX_COOLDOWN_MS)
     }
+    if (cd > MAX_COOLDOWN_MS) cd = MAX_COOLDOWN_MS
     state.cooldownUntil = now + cd
+  } else if (isEmptyCompletion(err)) {
+    state.authFailed = false
+    state.cooldownUntil = now + EMPTY_COOLDOWN_MS
+  } else {
+    // 未知错误：短冷却（原版 10–30s）
+    state.authFailed = false
+    state.cooldownUntil = now + UNKNOWN_COOLDOWN_MS
   }
 
   await writeHealth(env, accountId, state)
@@ -129,16 +200,25 @@ export async function markAccountImageLimited(env: Env, accountId: string, hours
   state.imageLimitedUntil = Date.now() + Math.min(hours, 48) * 60 * 60 * 1000
   state.cooldownUntil = 0
   state.authFailed = false
+  state.rlFailures = 0
   await writeHealth(env, accountId, state)
   console.log(`[account-health] ${accountId} marked image-limited until ${new Date(state.imageLimitedUntil).toISOString()}`)
 }
 
-/** 标记账户成功（清除失败状态；图片额度封禁保留至到期，同原版 MarkSuccess） */
+/** 标记账户成功（清除失败状态与限流退避计数；图片额度封禁保留至到期，同原版 MarkSuccess） */
 export async function markAccountSuccess(env: Env, accountId: string): Promise<void> {
   const state = await readHealth(env, accountId)
+  // 成功计入熔断窗口（用于失败率分母），并复位限流退避计数
+  updateBreaker(state, Date.now(), true)
   await writeHealth(env, accountId, {
     cooldownUntil: 0,
     authFailed: false,
+    rlFailures: 0,
+    // 熔断窗口延续（updateBreaker 已更新 state）
+    breakerStart: state.breakerStart,
+    breakerFailures: state.breakerFailures,
+    breakerTotal: state.breakerTotal,
+    trippedUntil: state.trippedUntil,
     // 原版显式保留 imageLimited/imageLimitUntil 到自然到期，普通对话成功不解封图片额度
     imageLimitedUntil: state.imageLimitedUntil > Date.now() ? state.imageLimitedUntil : 0,
     updatedAt: Date.now(),
@@ -151,6 +231,8 @@ export async function isAccountAvailable(env: Env, accountId: string): Promise<b
   if (state.authFailed) return false
   if (state.imageLimitedUntil > 0 && Date.now() < state.imageLimitedUntil) return false
   if (state.cooldownUntil > 0 && Date.now() < state.cooldownUntil) return false
+  // 全局熔断器：命中时跳过该账号（跨实例/跨 DO 共享）
+  if (state.trippedUntil && Date.now() < state.trippedUntil) return false
   return true
 }
 
@@ -196,6 +278,7 @@ export async function confirmAndMarkRateLimit(
   accountId: string,
   originalErr: Error | string,
   probe: RateLimitProbeFn,
+  retryAfterSeconds?: number,
 ): Promise<boolean> {
   if (!isRateLimited(originalErr)) return false
 
@@ -210,6 +293,6 @@ export async function confirmAndMarkRateLimit(
     console.log(`[account-health] ${accountId} rate-limit probe failed, marking as rate-limited`)
   }
 
-  await markAccountFailure(env, accountId, originalErr)
+  await markAccountFailure(env, accountId, originalErr, retryAfterSeconds)
   return true
 }

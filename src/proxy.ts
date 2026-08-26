@@ -11,6 +11,7 @@ import {
   resolveOpenCodeUrls,
   streamFetchWithTimeout,
   withSSEKeepAlive,
+  isEventStreamResponse,
   OPENCODE_STREAM_IDLE_TIMEOUT_MS,
 } from './opencode'
 import { isQoderProvider, proxyQoderChatRequest } from './qoder/proxy'
@@ -1346,6 +1347,8 @@ export async function forwardProxy(
         userAgent: c.req.header('user-agent') || '',
         // 租户隔离：调用方 API Key 的不可逆哈希（auth 中间件已计算）
         tenant: c.get('proxyKeyHash') || '',
+        // 断连取消：客户端断开时中止上游（同原版 r.Context().Done()）
+        signal: c.req.raw.signal,
       })
       const logLevel = response.ok ? 'request' : (response.status >= 500 ? 'error' : 'warn')
       try {
@@ -1355,6 +1358,17 @@ export async function forwardProxy(
           JSON.stringify({ providerId, subPath, body: bodySummary }).substring(0, 4000)
         ))
       } catch { /* log failure must not break */ }
+      // 流式透传：包 keepalive（心跳 + idle 兜底），避免长时间无字节被中间层/客户端超时掐断
+      if (isEventStreamResponse(response) && body && (body as Record<string, unknown>)['stream'] === true) {
+        return new Response(withSSEKeepAlive(response.body as ReadableStream, SSE_KEEPALIVE_MS, SSE_IDLE_TIMEOUT_MS), {
+          status: response.status,
+          headers: {
+            'Content-Type': 'text/event-stream',
+            'Cache-Control': 'no-store',
+            'X-Accel-Buffering': 'no',
+          },
+        })
+      }
       return response
     }
 

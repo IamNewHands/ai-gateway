@@ -88,18 +88,26 @@ async function persistAccounts(env: Env, providerId: string, list: PooledAccount
   } catch { /* 写入失败不影响主流程 */ }
 }
 
-/** 把 account 状态写回账号池（按 oid upsert） */
+/** 把 account 状态写回账号池（按 oid 或 email 合并，同原版 upsert——同邮箱重登不分裂） */
 async function writeToken(env: Env, providerId: string, state: OAuthTokenState): Promise<void> {
   const list = await readAccounts(env, providerId)
   const rec: PooledAccount = { ...state, lastUsedAt: Date.now() }
   const oid = state.oid || ''
-  if (oid) {
-    const idx = list.findIndex((a) => a.oid === oid)
-    if (idx >= 0) list[idx] = rec
-    else list.push(rec)
-  } else {
-    list.push(rec)
+  const email = state.email ? String(state.email).toLowerCase().trim() : ''
+  const matchIdx = (): number => {
+    if (oid) {
+      const i = list.findIndex((a) => a.oid === oid)
+      if (i >= 0) return i
+    }
+    if (email) {
+      const i = list.findIndex((a) => a.email && String(a.email).toLowerCase().trim() === email)
+      if (i >= 0) return i
+    }
+    return -1
   }
+  const idx = matchIdx()
+  if (idx >= 0) list[idx] = rec
+  else list.push(rec)
   await persistAccounts(env, providerId, list)
 }
 
@@ -207,6 +215,14 @@ function m365ClientConfig(cfg: OAuthDeviceConfig): { clientId: string; authority
   }
 }
 
+/** 由可配置 authority（authorize 端点）派生 token 端点：.../oauth2/v2.0/authorize → .../oauth2/v2.0/token；无法派生时退回默认 */
+function tokenEndpointUrl(authority: string | undefined): string {
+  if (!authority) return M365_OAUTH.tokenUrl
+  const t = authority.replace(/\/authorize$/i, '')
+  if (t !== authority) return t + '/token'
+  return M365_OAUTH.tokenUrl
+}
+
 async function makePKCE(): Promise<{ verifier: string; challenge: string }> {
   const alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~'
   const raw = crypto.getRandomValues(new Uint8Array(64))
@@ -308,7 +324,7 @@ export async function submitM365PKCECallback(env: Env, providerId: string, cfg: 
       redirect_uri: conf.redirectUri,
       code_verifier: device.verifier || '',
     })
-    const res = await fetch(conf.authority ? M365_OAUTH.tokenUrl : M365_OAUTH.tokenUrl, {
+    const res = await fetch(tokenEndpointUrl(conf.authority), {
       method: 'POST',
       headers: { 'Content-Type': 'application/x-www-form-urlencoded', Accept: 'application/json' },
       body: params.toString(),
@@ -450,7 +466,7 @@ async function doRefreshM365Token(env: Env, providerId: string, cfg: OAuthDevice
       grant_type: 'refresh_token',
       scope: conf.scope,
     })
-    const res = await fetch(M365_OAUTH.tokenUrl, {
+    const res = await fetch(tokenEndpointUrl(conf.authority), {
       method: 'POST',
       headers: { 'Content-Type': 'application/x-www-form-urlencoded', Accept: 'application/json' },
       body: params.toString(),
@@ -497,11 +513,11 @@ function toM365Account(state: PooledAccount, accessToken: string, expiresAt: num
  */
 export async function getM365Account(env: Env, providerId: string, oid?: string): Promise<M365Account | null> {
   let list = await readAccounts(env, providerId)
-  let state = oid && oid !== '' ? list.find((a) => a.oid === oid) || null : list[0] || null
+  let state = (oid && oid !== '') ? list.find((a) => a.oid === oid) || null : list[0] || null
   if (!state || !state.access_token) {
-    // oid 指定但不在池中：可能是旧绑定，回退首个可用账号
-    if (oid && oid !== '' && list.length > 0) state = list[0]
-    if (!state || !state.access_token) return null
+    // oid 指定但不在池中：明确返回不存在（同原版），不再静默回退池内首个账号
+    if (oid && oid !== '') return null
+    return null
   }
 
   let accessToken = state.access_token
@@ -537,7 +553,7 @@ export async function getM365Account(env: Env, providerId: string, oid?: string)
 }
 
 /** 管理后台展示用：账号池概要列表 */
-export async function getM365AccountInfos(env: Env, providerId: string): Promise<Array<{ connected: boolean; email?: string; oid?: string; tid?: string; expiresAt?: number }>> {
+export async function getM365AccountInfos(env: Env, providerId: string): Promise<Array<{ connected: boolean; email?: string; oid?: string; tid?: string; expiresAt?: number; lastUsedAt?: number }>> {
   const list = await readAccounts(env, providerId)
   return list.map((s) => ({
     connected: !!s.access_token,
@@ -545,6 +561,7 @@ export async function getM365AccountInfos(env: Env, providerId: string): Promise
     oid: s.oid,
     tid: s.tid,
     expiresAt: s.expires_at,
+    lastUsedAt: s.lastUsedAt,
   }))
 }
 

@@ -1293,7 +1293,11 @@ export async function refreshAllOauthTokens(env: Env, providers: ProviderLike[])
   return { ok, fail }
 }
 
-/** 刷新某 M365 provider 账号池内所有账号（Cron 专用）。 */
+/**
+ * 刷新某 M365 provider 账号池内的账号（Cron 专用，对上游请求更少）：
+ * 只刷「临期（expiresAt 临近，需换新 access_token）」或「闲置过久（30 天池 TTL 将到期，需保活重置）」的账号，
+ * 避免像原实现那样遍历池内每个账号无条件刷新、对上游请求过多。
+ */
 async function refreshAllM365PoolTokens(env: Env, p: ProviderLike): Promise<{ ok: number; fail: number }> {
   let ok = 0
   let fail = 0
@@ -1303,8 +1307,16 @@ async function refreshAllM365PoolTokens(env: Env, p: ProviderLike): Promise<{ ok
   } catch {
     return { ok: 0, fail: 0 }
   }
+  const now = Date.now()
+  // 临期阈值：access_token 过期前 10 分钟刷新（同原版临期刷新语义）
+  const NEAR_EXPIRY_MS = 10 * 60 * 1000
+  // 闲置阈值：账号超过 20 天未被使用则刷新一次，重置 30 天池 KV TTL 保活
+  const IDLE_MS = 20 * 24 * 60 * 60 * 1000
   for (const info of infos) {
     if (!info.connected || !info.oid) continue
+    const nearExpiry = typeof info.expiresAt === 'number' && info.expiresAt - now <= NEAR_EXPIRY_MS
+    const idle = typeof info.lastUsedAt === 'number' && now - info.lastUsedAt >= IDLE_MS
+    if (!nearExpiry && !idle) continue
     const success = await refreshM365Token(env, p.id, p.oauth!, info.oid)
     if (success) {
       ok++

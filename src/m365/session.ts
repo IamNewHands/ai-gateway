@@ -204,8 +204,29 @@ function suffixMatchLen(hist: OaiMsgLite[], msgs: OaiMsgLite[]): number {
   return n
 }
 
+const MAX_CONTEXT_MESSAGES = 512
+
+/** 克隆并截取消息：超出 512 条时按"消息原子边界"截最后 MAX_CONTEXT_MESSAGES 条（同原版裁剪，防 KV value 无限增长） */
 function cloneMessages(msgs: OaiMsgLite[]): OaiMsgLite[] {
-  return msgs.map((m) => ({ ...m, content: Array.isArray(m.content) ? [...m.content] : m.content, tool_calls: m.tool_calls ? [...m.tool_calls] : m.tool_calls }))
+  let slice = msgs
+  if (msgs.length > MAX_CONTEXT_MESSAGES) {
+    let start = msgs.length - MAX_CONTEXT_MESSAGES
+    // 回退到原子边界：不能从 tool_calls→tool 往返中间截断
+    for (let i = start; i < msgs.length - 1; i++) {
+      const a = msgs[i]
+      if (a.role === 'assistant' && a.tool_calls && a.tool_calls.length > 0) {
+        // a 后应有紧接着的 tool 结果；若截断点在 a 与 tool 之间，则把起点退到 a
+        if (msgs[i + 1].role !== 'tool') { start = i; break }
+      }
+    }
+    // 若起点本身落在"assistant 带 tool_calls"且其后需要 tool 才能闭合，则不能以它为界
+    const startMsg = msgs[start]
+    if (startMsg && startMsg.role === 'assistant' && startMsg.tool_calls && startMsg.tool_calls.length > 0) {
+      start = Math.max(0, start - 1)
+    }
+    slice = msgs.slice(start)
+  }
+  return slice.map((m) => ({ ...m, content: Array.isArray(m.content) ? [...m.content] : m.content, tool_calls: m.tool_calls ? [...m.tool_calls] : m.tool_calls }))
 }
 
 function evict(list: SessionBinding[], ttlMs: number): SessionBinding[] {
@@ -361,4 +382,77 @@ export async function cleanupSessions(env: Env, providerId: string): Promise<num
   list = evict(list, sessionTtlMs(env))
   if (list.length !== before) await writeAll(env, providerId, list)
   return before - list.length
+}
+
+/* ==================== convCache 会话复用层（同原版 account+model+systemPromptHash） ==================== */
+
+const CONV_CACHE_PREFIX = 'm365:convcache:'
+
+/** 计算 system/developer 消息的哈希（同原版 systemPromptHash） */
+export function systemPromptHash(messages: Array<Record<string, unknown>>): string {
+  const parts: string[] = []
+  for (const m of messages) {
+    const role = String(m['role'] || '').toLowerCase().trim()
+    if (role === 'system' || role === 'developer') {
+      parts.push(contentToString(m['content']))
+    }
+  }
+  return sha256Hex(parts.join('\n'))
+}
+
+export interface ConvCacheEntry {
+  sessionId: string
+  conversationId: string
+  accountId: string
+  systemHash: string
+  model: string
+  lastUsedAt: number
+}
+
+async function readConvCache(env: Env, providerId: string): Promise<ConvCacheEntry[]> {
+  try {
+    const raw = await env.KV.get(CONV_CACHE_PREFIX + providerId)
+    const arr = raw ? JSON.parse(raw) : null
+    return Array.isArray(arr) ? (arr as ConvCacheEntry[]) : []
+  } catch { return [] }
+}
+
+async function writeConvCache(env: Env, providerId: string, list: ConvCacheEntry[]): Promise<void> {
+  try {
+    const trimmed = [...list].sort((a, b) => b.lastUsedAt - a.lastUsedAt).slice(0, 200)
+    await env.KV.put(CONV_CACHE_PREFIX + providerId, JSON.stringify(trimmed), { expirationTtl: 24 * 60 * 60 })
+  } catch { /* 写入失败不影响主流程 */ }
+}
+
+/** 按 account+model+systemPromptHash 查找可复用的云端对话（同原版 convCache） */
+export async function convCacheLookup(
+  env: Env,
+  providerId: string,
+  accountId: string,
+  model: string,
+  sysHash: string,
+): Promise<{ sessionId: string; conversationId: string } | null> {
+  const list = await readConvCache(env, providerId)
+  const hit = list
+    .filter((e) => e.accountId === accountId && e.model === model && e.systemHash === sysHash)
+    .sort((a, b) => b.lastUsedAt - a.lastUsedAt)[0]
+  if (!hit) return null
+  return { sessionId: hit.sessionId, conversationId: hit.conversationId }
+}
+
+/** 会话成功后写入 convCache（按 account+model+systemPromptHash upsert） */
+export async function convCacheStore(
+  env: Env,
+  providerId: string,
+  accountId: string,
+  model: string,
+  sysHash: string,
+  sessionId: string,
+  conversationId: string,
+): Promise<void> {
+  if (!sessionId || !conversationId || !sysHash) return
+  let list = await readConvCache(env, providerId)
+  list = list.filter((e) => !(e.accountId === accountId && e.model === model && e.systemHash === sysHash))
+  list.push({ sessionId, conversationId, accountId, systemHash: sysHash, model, lastUsedAt: Date.now() })
+  await writeConvCache(env, providerId, list)
 }
