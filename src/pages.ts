@@ -211,110 +211,6 @@ const H = (title: string) => `
   <style>${CSS_CONTENT}</style>
 </head>`
 
-// ===== 首页 =====
-
-export async function renderHomePage(c: Context<AppEnv>, isLoggedIn: boolean) {
-  // 首页仅展示占位示例，不暴露真实部署域名，避免泄露隐私链接
-  const apiBase = 'https://自定义的域名/v1'
-
-  return c.html(`<!DOCTYPE html><html lang="zh-CN">
-${H('首页')}
-<body class="site-page home-page">
-<header class="topbar">
-  <div class="shell topbar__inner">
-    <a class="brand" href="/" aria-label="AI Gateway 首页">
-      <span class="brand__mark" aria-hidden="true"><i class="fas fa-cloud"></i></span>
-      <span class="brand__name">${SITE_CONFIG.title}</span>
-      <span class="brand__descriptor">API CONTROL PLANE</span>
-    </a>
-    <nav class="topbar__actions" aria-label="主导航">
-      ${isLoggedIn
-        ? `<a href="/admin" class="btn btn-p"><i class="fas fa-sliders-h" aria-hidden="true"></i>管理控制台</a><a href="javascript:void(0)" onclick="doLogout()" class="btn btn-gh"><i class="fas fa-sign-out-alt" aria-hidden="true"></i>退出</a>`
-        : `<a href="/admin/login" class="btn btn-p"><i class="fas fa-sign-in-alt" aria-hidden="true"></i>管理员登录</a>`
-      }
-    </nav>
-  </div>
-</header>
-
-<main>
-  <section class="shell home-hero" aria-labelledby="home-title">
-    <div class="home-hero__copy">
-      <p class="eyebrow"><span aria-hidden="true"></span>UNIFIED AI GATEWAY</p>
-      <h1 id="home-title">一个 API，调用已配置的所有模型。</h1>
-      <p class="home-hero__lede">统一的 OpenAI / Anthropic 兼容入口。模型按提供商归档，转发 Key、启用状态和故障转移集中管理。</p>
-      <div class="endpoint-box" aria-label="API 接入地址">
-        <span class="endpoint-box__label">BASE URL</span>
-        <code>${escapePageHtml(apiBase)}</code>
-        <button class="icon-btn copy-control" type="button" data-copy="${escapePageHtml(apiBase)}" aria-label="复制 API 地址">
-          <i class="far fa-copy" aria-hidden="true"></i><span>复制</span>
-        </button>
-      </div>
-      <p id="copy-status" class="sr-status" aria-live="polite"></p>
-    </div>
-
-    <figure class="request-panel" aria-labelledby="request-caption">
-      <figcaption id="request-caption">
-        <span>POST /chat/completions</span>
-        <span class="protocol-state"><i aria-hidden="true"></i>OPENAI COMPATIBLE</span>
-      </figcaption>
-      <pre><code><span class="syntax-command">curl</span> ${escapePageHtml(apiBase)}/chat/completions \\
-  <span class="syntax-key">-H</span> <span class="syntax-string">"Authorization: Bearer sk_cf_••••"</span> \\
-  <span class="syntax-key">-H</span> <span class="syntax-string">"Content-Type: application/json"</span> \\
-  <span class="syntax-key">-d</span> <span class="syntax-string">'{
-    "model": "opencode/deepseek-v4-flash-free",
-    "messages": [{ "role": "user", "content": "Hello" }]
-  }'</span></code></pre>
-      <div class="request-panel__foot">
-        <span>模型格式</span>
-        <code>provider/model</code>
-      </div>
-    </figure>
-  </section>
-</main>
-
-<footer class="site-footer">
-  <div class="shell site-footer__inner">
-    <span>© ${new Date().getFullYear()} ${SITE_CONFIG.title}</span>
-    <span>Cloudflare Workers · Hono · KV</span>
-  </div>
-</footer>
-
-<script>
-(function () {
-  var status = document.getElementById('copy-status')
-  document.querySelectorAll('.copy-control').forEach(function (button) {
-    button.addEventListener('click', async function () {
-      var text = button.getAttribute('data-copy') || ''
-      var icon = button.querySelector('i')
-      var label = button.querySelector('span')
-      try {
-        await navigator.clipboard.writeText(text)
-        button.setAttribute('data-state', 'success')
-        if (icon) icon.className = 'fas fa-check'
-        if (label) label.textContent = '已复制'
-        if (status) status.textContent = '已复制 ' + text
-        window.setTimeout(function () {
-          button.removeAttribute('data-state')
-          if (icon) icon.className = 'far fa-copy'
-          if (label) label.textContent = '复制'
-        }, 1800)
-      } catch (error) {
-        button.setAttribute('data-state', 'error')
-        if (status) status.textContent = '复制失败，请手动选择文本。'
-      }
-    })
-  })
-})()
-// S5：logout 已改 POST-only（GET 易被链接型 CSRF 触发），退出统一走这里
-function doLogout() {
-  fetch('/admin/logout', { method: 'POST', credentials: 'same-origin' })
-    .catch(function () { /* 忽略网络错误 */ })
-    .then(function () { location.href = '/admin/login' })
-}
-</script>
-</body></html>`)
-}
-
 // ===== 登录页 =====
 
 export async function renderLoginPage(c: Context<AppEnv>) {
@@ -323,11 +219,10 @@ ${H('登录')}
 <body class="site-page auth-page">
 <header class="topbar topbar--auth">
   <div class="shell topbar__inner">
-    <a class="brand" href="/" aria-label="AI Gateway 首页">
+    <a class="brand" href="/admin" aria-label="管理控制台">
       <span class="brand__mark" aria-hidden="true"><i class="fas fa-cloud"></i></span>
       <span class="brand__name">${SITE_CONFIG.title}</span>
     </a>
-    <a href="/" class="btn btn-gh"><i class="fas fa-arrow-left" aria-hidden="true"></i>返回首页</a>
   </div>
 </header>
 
@@ -489,14 +384,13 @@ ${H('管理')}
       <a class="admin-nav__link" href="#perf"><i class="fas fa-tachometer-alt" aria-hidden="true"></i><span>性能设置</span></a>
     </nav>
     <div class="admin-rail__foot">
-      <a href="/" class="admin-nav__link"><i class="fas fa-arrow-left" aria-hidden="true"></i><span>返回首页</span></a>
       <a href="javascript:void(0)" onclick="doLogout()" class="admin-nav__link"><i class="fas fa-sign-out-alt" aria-hidden="true"></i><span>退出登录</span></a>
     </div>
   </aside>
 
   <div class="admin-main">
     <header class="admin-topbar">
-      <a class="brand" href="/"><span class="brand__mark" aria-hidden="true"><i class="fas fa-cloud"></i></span><span class="brand__name">${SITE_CONFIG.title}</span></a>
+      <a class="brand" href="/admin"><span class="brand__mark" aria-hidden="true"><i class="fas fa-cloud"></i></span><span class="brand__name">${SITE_CONFIG.title}</span></a>
       <nav aria-label="移动端控制台导航"><a href="#overview">概览</a><a href="#providers">提供商</a><a href="#proxy-keys">Key</a><a href="#analytics">统计</a><a href="#usage-logs">日志</a><a href="#logs">系统日志</a><a href="#mcps">MCP</a><a href="#unimodels">联合</a><a href="#thinking">思维引导</a><a href="#cache">缓存</a><a href="#cache-prefix">缓存前缀</a><a href="#perf">性能</a></nav>
       <a class="icon-btn" href="javascript:void(0)" onclick="doLogout()" aria-label="退出登录"><i class="fas fa-sign-out-alt" aria-hidden="true"></i></a>
     </header>

@@ -217,28 +217,9 @@ label, legend { color: var(--color-ink-2); font-size: var(--text-xs); font-weigh
 .mdl-list { display: grid; gap: .125rem; }
 .mdl-list > div { margin-block-end: var(--space-2xs); }
 
-/* home workbench */
-.home-page { background: var(--color-paper); }
-.home-hero { display: grid; grid-template-columns: minmax(0, 1fr); gap: var(--space-xl); padding-block: var(--space-2xl); }
-.home-hero__copy { align-self: center; min-width: 0; }
+/* eyebrow（登录/管理页共用） */
 .eyebrow { margin-block-end: var(--space-sm); display: flex; align-items: center; gap: var(--space-2xs); color: var(--color-muted); font-family: var(--font-mono); font-size: .6875rem; font-weight: 600; letter-spacing: .08em; }
 .eyebrow > span { width: .75rem; height: .125rem; background: var(--color-accent); }
-.home-hero h1 { max-width: 12ch; font-size: var(--text-2xl); }
-.home-hero__lede { max-width: 60ch; margin-block-start: var(--space-md); color: var(--color-muted); font-size: var(--text-md); }
-.endpoint-box { max-width: 40rem; margin-block-start: var(--space-lg); display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; border: .0625rem solid var(--color-rule-2); border-radius: var(--radius-control); background: var(--color-paper-2); }
-.endpoint-box__label { grid-column: 1 / -1; padding: var(--space-2xs) var(--space-xs) 0; color: var(--color-muted); font-family: var(--font-mono); font-size: .625rem; font-weight: 600; letter-spacing: .08em; }
-.endpoint-box code { min-width: 0; padding: var(--space-2xs) var(--space-xs) var(--space-xs); overflow: hidden; color: var(--color-ink); font-size: var(--text-xs); text-overflow: ellipsis; white-space: nowrap; }
-.endpoint-box .icon-btn { width: auto; padding-inline: var(--space-sm); display: flex; gap: var(--space-2xs); border-inline-start-color: var(--color-rule); border-radius: 0; }
-.request-panel { min-width: 0; overflow: clip; border: .0625rem solid var(--color-graphite-rule); border-radius: var(--radius-panel); background: var(--color-graphite); color: var(--color-graphite-ink); box-shadow: var(--shadow-panel); }
-.request-panel figcaption, .request-panel__foot { min-height: 3rem; padding-inline: var(--space-sm); display: flex; align-items: center; justify-content: space-between; gap: var(--space-sm); border-block-end: .0625rem solid var(--color-graphite-rule); color: var(--color-graphite-ink); font-family: var(--font-mono); font-size: .625rem; letter-spacing: .04em; }
-.protocol-state { display: inline-flex; align-items: center; gap: var(--space-2xs); color: var(--color-graphite-ink); white-space: nowrap; }
-.protocol-state i { width: .4375rem; height: .4375rem; border-radius: 50%; background: var(--color-success); }
-.request-panel pre { margin: 0; min-height: 18rem; padding: var(--space-md); overflow: auto; background: var(--color-graphite); color: var(--color-graphite-ink); font-size: clamp(.6875rem, 2vw, .8125rem); line-height: 1.8; }
-.request-panel pre code { white-space: pre; }
-.syntax-command, .syntax-key { color: oklch(75% 0.130 256); }
-.syntax-string { color: oklch(83% 0.060 154); }
-.request-panel__foot { border-block-start: .0625rem solid var(--color-graphite-rule); border-block-end: 0; color: oklch(72% 0.012 250); }
-.request-panel__foot code { color: var(--color-graphite-ink); }
 .metrics-strip { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); border-block: .0625rem solid var(--color-rule); }
 .metric { min-width: 0; padding-block: var(--space-md); display: flex; flex-direction: column; gap: var(--space-3xs); border-inline-end: .0625rem solid var(--color-rule); }
 .metric:nth-child(even) { border-inline-end: 0; }
@@ -445,7 +426,6 @@ label, legend { color: var(--color-ink-2); font-size: var(--text-xs); font-weigh
 
 @media (min-width: 40rem) {
   .shell { width: min(100% - calc(var(--space-lg) * 2), var(--shell)); }
-  .home-hero { padding-block: var(--space-3xl); }
   .metrics-strip { grid-template-columns: repeat(4, minmax(0, 1fr)); }
   .metric { padding-inline: var(--space-md); }
   .metric:first-child { padding-inline-start: 0; }
@@ -472,7 +452,6 @@ label, legend { color: var(--color-ink-2); font-size: var(--text-xs); font-weigh
 }
 
 @media (min-width: 60rem) {
-  .home-hero { grid-template-columns: minmax(0, .9fr) minmax(28rem, 1.1fr); align-items: center; gap: var(--space-2xl); }
   .auth-shell { grid-template-columns: minmax(0, 1.05fr) minmax(25rem, .95fr); }
   .auth-context { border-block-end: 0; border-inline-end: .0625rem solid var(--color-rule); }
   .admin-shell { display: grid; grid-template-columns: 15rem minmax(0, 1fr); }

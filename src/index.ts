@@ -64,8 +64,8 @@ import {
   handleSetPerfSettings,
 } from './admin'
 import { handleMcpJsonRpc } from './mcp-gateway'
-import { renderHomePage, renderLoginPage, renderAdminPage } from './pages'
-import { seedInitialData, getSession, getProviders } from './storage'
+import { renderLoginPage, renderAdminPage } from './pages'
+import { seedInitialData, getProviders } from './storage'
 import {
   handleAnalyticsOverview,
   handleAnalyticsTrend,
@@ -113,17 +113,9 @@ app.get('/health', async (c) =>
   c.json({ status: 'ok', ts: Date.now(), uptime: (globalThis as any).__startAt ? Date.now() - (globalThis as any).__startAt : 0 })
 )
 
-// ===== 首页 =====
-app.get('/', async (c) => {
-  const { getCookie } = await import('hono/cookie')
-  const sessionId = getCookie(c, 'session_id')
-  let isLoggedIn = false
-  if (sessionId) {
-const session = await getSession(c.env, sessionId)
-    isLoggedIn = session !== null
-  }
-  return renderHomePage(c, isLoggedIn)
-})
+// ===== 根路径：直达管理控制台（无独立前台首页） =====
+// 未登录时 adminAuthMiddleware 会自动 302 到 /admin/login，已登录则直接进入控制台
+app.get('/', async (c) => c.redirect('/admin'))
 
 // ===== 登录/退出 =====
 app.get('/admin/login', async (c) => renderLoginPage(c))
