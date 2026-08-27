@@ -498,6 +498,9 @@ function chatCompletionFromAgg(a: AggregatedChat): Record<string, unknown> {
  * 最后仍空则把 reasoning 兜底拼进 content，避免"静默不回复"（item5）。
  */
 async function proxyNonStreamChat(pool: Pool, body: Record<string, unknown>, sessionId: string): Promise<Response> {
+  // 恒流式前置：无论调用方 body 是否带 stream，一律强制 stream:true，
+  // 否则免费通道非流式返回 500 "empty response content"（item4 修复测试/直连等手工 body 场景）。
+  body['stream'] = true
   let last: AggregatedChat | null = null
   for (let attempt = 0; attempt < 3; attempt++) {
     const resp = await clineFetchWithRetry(pool, '/chat/completions', body, sessionId, true)
