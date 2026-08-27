@@ -457,6 +457,7 @@ async function aggregateStream(upstream: Response): Promise<AggregatedChat> {
         if (!delta) continue
         if (delta.content) acc.content += String(delta.content)
         if (delta.reasoning_content) acc.reasoning += String(delta.reasoning_content)
+        else if (delta.reasoning) acc.reasoning += String(delta.reasoning)
         const tcs = delta.tool_calls as Array<Record<string, unknown>> | undefined
         if (Array.isArray(tcs)) {
           for (const tc of tcs) {
@@ -714,9 +715,11 @@ export async function testClineChat(
   try {
     const body: Record<string, unknown> = {
       model: modelId || DEFAULT_MODEL,
-      max_tokens: 1,
+      // 推理模型思考阶段也要消耗 token：max_tokens 太小会一进 reasoning 就 length 截断，
+      // 导致"空内容"。给足量让模型能走完思考并产出正文。
+      max_tokens: 600,
       session_id: sessionId,
-      reasoning_effort: 'high',
+      reasoning_effort: 'medium',
       messages: [{ role: 'user', content: 'hi' }],
     }
     // 走非流式聚合通道：规避免费通道非流式 500，并能在聚合结果里判断模型是否真实回复
@@ -727,14 +730,12 @@ export async function testClineChat(
       } | null
       const message = data?.choices?.[0]?.message || {}
       const content = String(message.content || '')
-      if (content) return { success: true, statusCode: 200, message: `模型可回复（${content.slice(0, 50)}）` }
-      // 空内容：给出可诊断信息，区分"额度耗尽"与"模型无输出/已停用"
       const reasoning = String(message.reasoning_content || '')
       const finishReason = String(data?.choices?.[0]?.finish_reason || '')
-      const parts: string[] = []
-      if (reasoning) parts.push(`有思考内容:${reasoning.slice(0, 60)}`)
-      if (finishReason) parts.push(`finish_reason=${finishReason}`)
-      const detail = parts.length ? `（${parts.join('；')}）` : ''
+      if (content) return { success: true, statusCode: 200, message: `模型可回复（${content.slice(0, 50)}）` }
+      // 有思考但没正文：模型是通的（推理模型），只是本次没吐文本
+      if (reasoning) return { success: true, statusCode: 200, message: `模型已连通（${reasoning.slice(0, 50)}…）` }
+      const detail = finishReason ? `（finish_reason=${finishReason}）` : ''
       return { success: false, statusCode: 200, message: `模型返回空内容${detail}，免费额度可能已耗尽或该模型暂无可输出，请换号或改用 poolside/laguna-s-2.1:free` }
     }
     const t = await resp.text().catch(() => '').then((s) => s.slice(0, 300))
