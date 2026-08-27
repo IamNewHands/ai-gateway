@@ -23,6 +23,8 @@ import type { RateLimitProbeFn } from './account-health'
 import { writeLog } from '../admin'
 import { acquireSlot, releaseSlot, fluxSnapshot } from './account-flux'
 import { computeContextBudget, slidingWindow } from './context-budget'
+import { extractChatTaskAnchors, mergeTaskAnchors, decodeTaskAnchors, encodeTaskAnchors, reserveTaskAnchorContext } from './task-anchors'
+import type { TaskAnchor } from './task-anchors'
 
 export interface M365ChatPayload {
   providerId: string
@@ -222,7 +224,11 @@ export class M365Session {
 
     // 5) 执行主回答对话（持久会话），带账号级 failover：
     //    限流/鉴权失败且为"新会话"时自动切换到下一个健康账号重试；已绑定会话不切号（云端对话归属该账号）。
-    let mainPrompt = answerPrompt
+    // 任务锚点：先合并本租户持久化锚点 + 新观测引用（写回 KV），再以受限预算注入主 prompt 前缀，
+    //    防止上下文裁剪后模型丢失跨轮任务目标（data-only 块，永不当作指令执行）。
+    const mergedAnchors = await this.reconcileTaskAnchors(providerId, messages, payload.tenant)
+    const anchorRes = reserveTaskAnchorContext(mergedAnchors, answerPrompt.length, estimateTokens(answerPrompt))
+    let mainPrompt = anchorRes.context ? anchorRes.context + '\n\n' + answerPrompt : answerPrompt
     if (ledger.completed.length > 0 || ledger.pending.length > 0) mainPrompt += '\n' + ledgerCtx
     if (ledger.completed.length > 0) mainPrompt += '\nFINAL ANSWER RULE: Report only actions supported by completed tool results. If the goal is not fully verified, state exactly what remains unconfirmed.'
 
@@ -436,6 +442,14 @@ export class M365Session {
       return cjson({ error: { message: 'no available M365 account', type: 'rate_limit_error' } }, 429, { 'Retry-After': '5' })
     }
 
+    // 流式终态三分（同对方 request-metrics.ts 的 trackStreamingResponse 判定）：
+    // complete=自然 EOF 正常收尾 / error=上游失败走了错误收尾 / canceled=客户端取消 ReadableStream。
+    // 由 start 与 cancel 共享，用于 exactly-once 收尾与诊断日志，避免重复 close/挂起。
+    let streamState: 'complete' | 'error' | 'canceled' = 'complete'
+    let closed = false
+    // 恰到一次收尾：心跳 interval 与 controller.close() 只执行一次
+    let heartbeat: ReturnType<typeof setInterval> | undefined
+
     const stream = new ReadableStream<Uint8Array>({
       start: async (controller) => {
         const push = (s: string) => { try { controller.enqueue(encoder.encode(s)) } catch { /* 客户端已断开 */ } }
@@ -464,6 +478,18 @@ export class M365Session {
         let streamedText = ''
         let reasoningBuf = ''
         let result: Awaited<ReturnType<typeof chatWithHandlers>> | undefined
+        // 客户端 SSE 心跳保活（同对方 openai.ts STREAM_HEARTBEAT_MS=5s）：
+        // M365 长思考（reasoning）阶段可能长时间无文本增量，客户端/中间代理可能误判为超时
+        // 而掐断连接。每 5s 发送一条 SSE 注释行（以 ":" 开头），OpenAI 解析器会忽略，仅用于保活。
+        const closeStream = () => {
+          if (closed) return
+          closed = true
+          if (heartbeat) { clearInterval(heartbeat); heartbeat = undefined }
+          try { controller.close() } catch { /* 已关闭 */ }
+        }
+        heartbeat = setInterval(() => {
+          try { controller.enqueue(encoder.encode(': keep-alive\n\n')) } catch { /* 客户端已断开，交由 finally 收尾 */ }
+        }, 5000)
         try {
           result = await chatWithHandlers(
             usedAcc,
@@ -550,7 +576,9 @@ export class M365Session {
           } catch (persistErr) {
             try { await writeLog(this.env, 'warn', `[m365-chat] provider=${providerId} → stream persist failed`, persistErr instanceof Error ? persistErr.message : String(persistErr)) } catch { /* ignore */ }
           }
+          streamState = 'complete'
         } catch (err) {
+          streamState = 'error'
           const msg = err instanceof Error ? err.message : String(err)
           const errObj = err instanceof Error ? err : new Error(msg)
           const ra = (errObj as Error & { retryAfterSeconds?: number }).retryAfterSeconds
@@ -569,11 +597,19 @@ export class M365Session {
           push('data: [DONE]\n\n')
         } finally {
           try { await releaseSlot(this.env, providerId, usedAcc.oid) } catch { /* ignore */ }
-          try { controller.close() } catch { /* 已关闭 */ }
+          // 流式终态三分诊断：canceled 说明客户端主动掐断（中止上游成功），其余为自然 EOF / 上游失败
+          if (streamState !== 'complete') {
+            const reason = streamState === 'canceled'
+              ? 'client canceled stream, upstream aborted'
+              : streamState === 'error' ? 'upstream error after partial output' : 'unknown'
+            try { await writeLog(this.env, 'info', `[m365-chat] provider=${providerId} → stream terminal state=${streamState} (${reason}) account=${usedAcc.oid}`) } catch { /* ignore */ }
+          }
+          closeStream()
         }
       },
       cancel() {
-        // 客户端断连 / 响应体被取消：中止上游 ChatHub 对话（同原版 r.Context().Done()）
+        // 客户端断连 / 响应体被取消：即刻标记 canceled（终态三分），并中止上游 ChatHub 对话（同原版 r.Context().Done()）
+        streamState = 'canceled'
         aborter.abort()
       },
     })
@@ -619,6 +655,29 @@ export class M365Session {
       if (pref) return [pref, ...healthy.filter((a) => a.oid !== resolved.accountId)]
     }
     return healthy
+  }
+
+  /**
+   * 任务锚点对账：读本 provider 的 KV 持久化锚点（tenant 作用域），合并本条消息新观测到的
+   * 用户任务引用，写回 KV，并返回合并结果供本次请求注入。读取/写回失败都不阻断主流程。
+   */
+  private async reconcileTaskAnchors(providerId: string, messages: Array<Record<string, unknown>>, tenant?: string): Promise<TaskAnchor[]> {
+    const key = 'm365:taskanchors:' + providerId
+    const t = tenant || 'default'
+    let map: Record<string, string> = {}
+    try {
+      const raw = await this.env.KV.get(key)
+      if (raw) {
+        const parsed = JSON.parse(raw) as unknown
+        if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) map = parsed as Record<string, string>
+      }
+    } catch { /* 读取失败按空锚点处理 */ }
+    const persisted = decodeTaskAnchors(map[t])
+    const fresh = extractChatTaskAnchors(messages as never[])
+    const merged = mergeTaskAnchors(persisted, fresh)
+    map[t] = encodeTaskAnchors(merged)
+    try { await this.env.KV.put(key, JSON.stringify(map)) } catch { /* 写回失败不影响本次注入 */ }
+    return merged
   }
 
   /** 限流二次确认探测：用最小消息发全新 ChatHub 对话，30s 内成功即判定上次限流为误报（不冷却） */

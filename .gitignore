@@ -7,3 +7,5 @@ worker-configuration.d.ts
 .zcode/
 docs/
 .testout/
+# 对比分析的第三方仓库克隆（含对方 .dev.vars 等潜在敏感文件），绝不提交
+.comparison/

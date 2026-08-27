@@ -57,6 +57,8 @@ export const writeAnalyticsEvent = (
         (options.errorSummary || '')
           .replace(/Bearer\s+[A-Za-z0-9._~+\/-]+/gi, 'Bearer ***')
           .replace(/sk[-_][A-Za-z0-9_-]{8,}/gi, 'sk_***')
+          .replace(/\b(?:m365|cfk|ghp|github_pat|gho)[_-][A-Za-z0-9_-]{12,}/gi, '$1_***')
+          .replace(/\b(?:refresh_token|access_token|copilot_token)\b[^,;{}\n]*/gi, '$1 ***')
           .replace(/\s+/g, ' ')
           .slice(0, 200),
       ],

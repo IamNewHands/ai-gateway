@@ -119,8 +119,16 @@ export function toolFunction(name: string, tools: ToolDef[]): Record<string, unk
   return null
 }
 
-/** JSON Schema 校验（同原版 validateJSONSchema）。返回错误信息或 null。 */
-export function validateJSONSchema(value: unknown, schema: Record<string, unknown>, path: string): string | null {
+/** JSON Schema 校验（同原版 validateJSONSchema）。返回错误信息或 null。
+ *  安全护栏（同对方 tool-schema.ts）：MAX_SCHEMA_DEPTH=64 限制递归深度、
+ *  MAX_VALIDATION_NODES=50000 限制单次校验遍历节点数，防止调用方 schema 引发远程引用/无限递归。 */
+const MAX_SCHEMA_DEPTH = 64
+const MAX_VALIDATION_NODES = 50000
+export function validateJSONSchema(value: unknown, schema: Record<string, unknown>, path: string, depth = 0, state?: { nodes: number }): string | null {
+  const st = state ?? { nodes: 0 }
+  st.nodes++
+  if (st.nodes > MAX_VALIDATION_NODES) return `${path} validation nodes exceeded safe limit`
+  if (depth > MAX_SCHEMA_DEPTH) return `${path} schema exceeds max depth`
   const enums = schema['enum']
   if (Array.isArray(enums)) {
     const a = JSON.stringify(value)
@@ -152,7 +160,7 @@ export function validateJSONSchema(value: unknown, schema: Record<string, unknow
       for (const n of Object.keys(m)) {
         const ps = props[n] as Record<string, unknown> | undefined
         if (ps) {
-          const err = validateJSONSchema(m[n], ps, `${path}.${n}`)
+          const err = validateJSONSchema(m[n], ps, `${path}.${n}`, depth + 1, st)
           if (err) return err
         }
       }
@@ -163,7 +171,7 @@ export function validateJSONSchema(value: unknown, schema: Record<string, unknow
       const item = schema['items'] as Record<string, unknown> | undefined
       if (item) {
         for (let i = 0; i < value.length; i++) {
-          const err = validateJSONSchema(value[i], item, `${path}[${i}]`)
+          const err = validateJSONSchema(value[i], item, `${path}[${i}]`, depth + 1, st)
           if (err) return err
         }
       }
