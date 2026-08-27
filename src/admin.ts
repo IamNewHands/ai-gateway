@@ -27,7 +27,7 @@ import { testModelConnection } from './proxy'
 import { isTraeProvider, testTraeModel } from './trae/proxy'
 import { fetchOpenCodeModels, isOpenCodeProvider, resolveOpenCodeUrls, testOpenCodeModel } from './opencode'
 import { isQoderProvider, fetchQoderModels } from './qoder/proxy'
-import { isClineProvider, fetchClineModels, syncClineModels, testClineChat, testClineRefreshToken, startClineOAuth, pollClineOAuth } from './cline/proxy'
+import { isClineProvider, fetchClineModels, fetchClineRecommendedModels, testClineChat, testClineRefreshToken, startClineOAuth, pollClineOAuth } from './cline/proxy'
 import { isGeminiProvider, testGeminiModel, GEMINI_MODELS } from './gemini/proxy'
 import { isCnbProvider, testCnbConnection, CNB_MODELS } from './cnb/proxy'
 import { PROXY_KEY_PREFIX, EXPIRY_OPTIONS, OPENCODE_DEFAULT_URL } from './config'
@@ -1370,8 +1370,8 @@ function parseModelList(json: any): Array<{ id: string }> {
 }
 
 /**
- * Cline 动态模型同步（item6）：从官方 recommended-models 拉最新模型并合并进 provider.models。
- * 返回新增/总数，供管理面板展示。
+ * Cline 「获取模型」：从官方 recommended-models 拉最新模型清单，仅返回给管理面板预览，
+ * 不写入 provider.models —— 由用户在面板里手工「+ / 一键全部添加」确认后再保存入库。
  */
 export async function handleClineModelSync(c: Context<AppEnv>) {
   const id = c.req.param('id')
@@ -1381,13 +1381,17 @@ export async function handleClineModelSync(c: Context<AppEnv>) {
   if (!isClineProvider(provider.id)) {
     return c.json<ApiResponse>({ success: false, message: '该提供商不是 Cline' }, 400)
   }
-  const result = await syncClineModels(c.env, provider)
-  const entries = (result.error ? [] : result.remote).map((m) => ({ id: m.id }))
-  return c.json<ApiResponse>({
-    success: !result.error,
-    data: { data: entries, sync: result },
-    message: result.error || (result.changed ? `同步完成，新增 ${result.added.length} 个模型` : '已是最新，无新增模型'),
-  })
+  try {
+    const remote = await fetchClineRecommendedModels()
+    const entries = remote.map((m) => ({ id: m.id }))
+    return c.json<ApiResponse>({
+      success: true,
+      data: { data: entries, sync: { changed: false } },
+      message: `已获取 ${entries.length} 个候选模型，请勾选后点「+」或「一键全部添加」保存`,
+    })
+  } catch (err) {
+    return c.json<ApiResponse>({ success: false, message: `拉取模型失败：${(err as Error).message || '未知错误'}` }, 502)
+  }
 }
 
 /**

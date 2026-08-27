@@ -610,47 +610,6 @@ export async function fetchClineRecommendedModels(): Promise<RemoteClineModel[]>
   return out
 }
 
-/** normalize provider.models（可能为 [{id,enabled}] 或 string[]）。 */
-function normalizeModels(models: unknown): Array<{ id: string; enabled: boolean }> {
-  if (!Array.isArray(models)) return []
-  return models
-    .map((m) => (typeof m === 'string' ? { id: m, enabled: true } : { id: (m as { id?: string })?.id ?? '', enabled: (m as { enabled?: boolean })?.enabled !== false }))
-    .filter((m) => !!m.id)
-}
-
-export interface ClapClineSyncResult {
-  changed: boolean
-  added: Array<{ id: string; cost: string }>
-  /** 本次从官方拉到的完整模型列表（含已存在的），供管理面板渲染。 */
-  remote: RemoteClineModel[]
-  total: number
-  syncedAt: number
-  error?: string
-}
-
-/** 拉取官方模型并入 provider.models（新增 model 自动启用，保留已有项）。 */
-export async function syncClineModels(env: Env, provider: Provider): Promise<ClapClineSyncResult> {
-  const syncedAt = Date.now()
-  try {
-    const remote = await fetchClineRecommendedModels()
-    const existing = normalizeModels(provider.models)
-    const existingIds = new Set(existing.map((m) => m.id))
-    const added: Array<{ id: string; cost: string }> = []
-    const merged = [...existing]
-    for (const m of remote) {
-      if (!existingIds.has(m.id)) {
-        merged.push({ id: m.id, enabled: true })
-        existingIds.add(m.id)
-        added.push({ id: m.id, cost: m.cost })
-      }
-    }
-    if (added.length) await updateProvider(env, provider.id, { models: merged })
-    return { changed: added.length > 0, added, remote, total: remote.length, syncedAt }
-  } catch (err) {
-    return { changed: false, added: [], remote: [], total: 0, syncedAt, error: (err as Error).message || '同步失败' }
-  }
-}
-
 // ===== 每日健康检查（item10，移植自 Go 版冷却自愈：探活并刷新过期 token） =====
 
 export interface ClineHealthSummary {
