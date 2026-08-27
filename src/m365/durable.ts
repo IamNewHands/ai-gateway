@@ -12,7 +12,7 @@
 import type { Env } from '../types'
 import { chatWithHandlers, classifyChatHubNotice } from './chathub'
 import type { ChatHubAccount, ChatHubTool, ChatHubResult } from './chathub'
-import { flattenPromptMessages, modelToolRouterPrompt, parseModelToolDecision, fencedToolCalls, nativeToolCalls, compactToolResult, buildAgentLedger, canContinue, MAX_TOOL_ROUNDS_DEFAULT, ledgerRouterContext, filterCompletedCalls, validateDetectedToolCalls, completionEvidenceAllows, isToolRefusal, isSandboxHallucination } from './tools'
+import { flattenPromptMessages, modelToolRouterPrompt, parseModelToolDecision, fencedToolCalls, nativeToolCalls, compactToolResult, buildAgentLedger, canContinue, resolveMaxToolRounds, activeMessages, ledgerRouterContext, filterCompletedCalls, validateDetectedToolCalls, completionEvidenceAllows, isToolRefusal, isSandboxHallucination } from './tools'
 import type { DetectedToolCall, AgentLedger, OaiMsgLite } from './tools'
 import { resolveSession, bindSession, systemPromptHash, convCacheLookup, convCacheStore } from './session'
 import type { ResolveResult, ContextLike } from './session'
@@ -140,10 +140,13 @@ export class M365Session {
     // MCP 网关 URL（可选，默认关闭）：非空时注入 mcp-gateway 插件（同原版）
     const mcpServerUrl = typeof body['m365_mcp_server_url'] === 'string' && body['m365_mcp_server_url'].trim() !== '' ? body['m365_mcp_server_url'].trim() : undefined
 
-    // 多轮工具证据 ledger：从 messages 历史解析已完成/待处理的工具调用，去重并注入上下文
-    const ledger: AgentLedger = buildAgentLedger(messages as OaiMsgLite[])
-    if (!canContinue(ledger, MAX_TOOL_ROUNDS_DEFAULT)) {
-      try { await writeLog(this.env, 'warn', `[m365-chat] provider=${providerId} → tool loop gate blocked`, `stuckLoop=${ledger.stuckLoop} repeatedFailure=${ledger.repeatedFailure} toolRounds=${ledger.toolRounds} sig=${ledger.repetitionSignature || ''}`) } catch { /* ignore */ }
+    // 多轮工具证据 ledger：从"最近一条 user 之后的连续窗口"解析已完成/待处理的工具调用
+    // （activeMessages 同原版），去重并注入上下文。只用最近窗口统计 toolRounds，
+    // 避免历史已完成工具调用累计而误触发上限（长会话第 N 轮被 409 的根因）。
+    const ledger: AgentLedger = buildAgentLedger(activeMessages(messages as OaiMsgLite[]))
+    const maxToolRounds = resolveMaxToolRounds(this.env.M365_MAX_TOOL_ROUNDS)
+    if (!canContinue(ledger, maxToolRounds)) {
+      try { await writeLog(this.env, 'warn', `[m365-chat] provider=${providerId} → tool loop gate blocked`, `stuckLoop=${ledger.stuckLoop} repeatedFailure=${ledger.repeatedFailure} toolRounds=${ledger.toolRounds}/${maxToolRounds} sig=${ledger.repetitionSignature || ''}`) } catch { /* ignore */ }
       return cjson({
         error: {
           message: ledger.stuckLoop || ledger.repeatedFailure ? 'tool loop detected' : 'tool round limit exceeded',

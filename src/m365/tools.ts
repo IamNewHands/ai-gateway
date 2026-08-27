@@ -554,8 +554,32 @@ export interface AgentLedger {
   repetitionSignature?: string
 }
 
-/** 单次对话允许的最大工具轮数（同原版 maxToolRounds / M365_MAX_TOOL_ROUNDS 默认） */
-export const MAX_TOOL_ROUNDS_DEFAULT = 8
+/** 单次对话允许的最大工具轮数（对齐原版 maxToolRounds 默认 32；可用 M365_MAX_TOOL_ROUNDS 覆盖，上限 512） */
+export const MAX_TOOL_ROUNDS_DEFAULT = 32
+
+/** 解析最大工具轮数：env 合法（1..512）用 env，否则默认 32（同原版 maxToolRounds()） */
+export function resolveMaxToolRounds(raw?: string): number {
+  if (raw != null && raw.trim() !== '') {
+    const n = parseInt(raw.trim(), 10)
+    if (Number.isFinite(n) && n > 0 && n <= 512) return n
+  }
+  return MAX_TOOL_ROUNDS_DEFAULT
+}
+
+/**
+ * 只取"最近一条 user 消息之后"的连续窗口（同原版 activeMessages）。
+ * 构建 ledger 时用它，使 toolRounds 只统计当前用户请求开启的工具链，
+ * 避免把历史已完成工具调用累计而上限误拦（长会话第 N 轮被 409 的根因）。
+ * 无 user 消息或 user 在首条时返回全量。
+ */
+export function activeMessages(messages: OaiMsgLite[]): OaiMsgLite[] {
+  let last = -1
+  for (let i = 0; i < messages.length; i++) {
+    if (String(messages[i].role || '').toLowerCase() === 'user') last = i
+  }
+  if (last <= 0) return messages
+  return messages.slice(last)
+}
 
 /** 是否允许继续发起工具轮：死循环 / 反复失败 / 超轮数则停止（同原版 CanContinue） */
 export function canContinue(l: AgentLedger, maxRounds = MAX_TOOL_ROUNDS_DEFAULT): boolean {
