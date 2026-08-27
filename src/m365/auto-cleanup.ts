@@ -17,7 +17,8 @@ import { isM365Provider } from './proxy'
 import { cleanupCloudConversations } from './cloud-api'
 import { listConversations, whitelistedIDs, getCleanupConfig } from './conversation-manager'
 import { listSessions, cleanupSessions } from './session'
-import { listM365Accounts } from './oauth'
+import { listM365Accounts, refreshM365AccountIfNeeded } from './oauth'
+import { isAccountAvailable } from './account-health'
 
 /**
  * 收集活跃对话 ID 集合（受保护的对话，不会被清理）。
@@ -124,4 +125,79 @@ export async function autoCleanupAll(env: Env): Promise<{ total: number; provide
 
   console.log(`[auto-cleanup] done: total=${totalDeleted} providers=${m365Providers.length} errors=${errorCount}`)
   return { total: totalDeleted, providers: m365Providers.length, errors: errorCount }
+}
+
+/**
+ * M365 账号每日健康检查（Cron 入口，与每 2 小时的 token 刷新互补）。
+ *
+ * 目的：解决闲置/临期账号长期不用后，access_token 过期被 401 误判为"账号禁用"而长期不可用的问题。
+ * 对每个 M365 账号逐个调用 refreshM365AccountIfNeeded：
+ * - access_token 已过期或临期（< 刷新余量）且存在 refresh_token → 自动刷新换新 token；
+ * - 刷新成功会自动清除该账号此前被误标记的鉴权失败/冷却健康状态（markAccountSuccess），实现"复活"；
+ * - 限定条件的刷新不会对仍然新鲜的 token 无意义刷线上游，限流/图片额度类冷却不受影响。
+ */
+export interface M365HealthCheckResult {
+  providers: number
+  accounts: number
+  ok: number
+  /** 此前不可用（鉴权失败/冷却）经刷新后恢复可用的账号数 */
+  recovered: number
+  /** 无法刷新/拿不到可用 token 的账号数（需重新登录） */
+  failed: number
+  errors: number
+}
+
+/** 对单个 M365 提供商执行账号健康检查，返回该池健康检查结果 */
+export async function healthCheckM365Provider(env: Env, provider: Provider): Promise<Omit<M365HealthCheckResult, 'providers'>> {
+  const result: Omit<M365HealthCheckResult, 'providers'> = { accounts: 0, ok: 0, recovered: 0, failed: 0, errors: 0 }
+  const accounts = await listM365Accounts(env, provider.id)
+  if (accounts.length === 0) {
+    console.log(`[m365-health] provider=${provider.id} has no authorized accounts`)
+    return result
+  }
+  for (const acc of accounts) {
+    if (!acc.oid) continue
+    result.accounts++
+    const wasUnavailable = !(await isAccountAvailable(env, acc.oid))
+    const fresh = await refreshM365AccountIfNeeded(env, provider.id, acc.oid)
+    if (fresh) {
+      result.ok++
+      // 此前不可用但刷新后拿到了可用 token → 恢复（清除误判的鉴权失败/冷却）
+      if (wasUnavailable && (await isAccountAvailable(env, acc.oid))) {
+        result.recovered++
+        console.log(`[m365-health] provider=${provider.id} account=${acc.oid} RECOVERED email=${acc.email || '无'}`)
+      }
+    } else {
+      result.failed++
+      console.error(`[m365-health] provider=${provider.id} account=${acc.oid} refresh failed, may need re-auth email=${acc.email || '无'}`)
+    }
+  }
+  console.log(`[m365-health] provider=${provider.id} accounts=${result.accounts} ok=${result.ok} recovered=${result.recovered} failed=${result.failed}`)
+  return result
+}
+
+/** 对所有 M365 提供商执行每日健康检查（Cron 入口） */
+export async function healthCheckM365All(env: Env): Promise<M365HealthCheckResult> {
+  const providers = (await getProviders(env)) as Provider[]
+  const m365Providers = providers.filter((p) => isM365Provider(p))
+  const result: M365HealthCheckResult = { providers: m365Providers.length, accounts: 0, ok: 0, recovered: 0, failed: 0, errors: 0 }
+  if (m365Providers.length === 0) {
+    console.log('[m365-health] no M365 providers found')
+    return result
+  }
+  for (const provider of m365Providers) {
+    try {
+      const r = await healthCheckM365Provider(env, provider)
+      result.accounts += r.accounts
+      result.ok += r.ok
+      result.recovered += r.recovered
+      result.failed += r.failed
+    } catch (err) {
+      result.errors++
+      const msg = err instanceof Error ? err.message : String(err)
+      console.log(`[m365-health] provider=${provider.id} error: ${msg}`)
+    }
+  }
+  console.log(`[m365-health] done: providers=${result.providers} accounts=${result.accounts} ok=${result.ok} recovered=${result.recovered} failed=${result.failed} errors=${result.errors}`)
+  return result
 }

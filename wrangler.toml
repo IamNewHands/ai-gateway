@@ -48,9 +48,9 @@ USAGE_ANALYTICS_DATASET = "ai_gateway_usage"
 binding = "USAGE_ANALYTICS"
 dataset = "ai_gateway_usage"
 
-# 定时任务：OAuth token 刷新（每 2 小时）+ WorkBuddy 签到（每日 09:00/21:00 北京时间 = 01:00/13:00 UTC）+ M365 对话清理（每小时）
+# 定时任务：OAuth token 刷新（每 2 小时）+ WorkBuddy 签到（每日 09:00/21:00 北京时间 = 01:00/13:00 UTC）+ M365 对话清理（每小时）+ M365 账号健康检查（每日 04:00 北京时间 = 20:00 UTC）
 [triggers]
-crons = ["0 */2 * * *", "0 1,13 * * *", "0 * * * *"]
+crons = ["0 */2 * * *", "0 1,13 * * *", "0 * * * *", "0 20 * * *"]
 
 # Admin credentials (set these in Cloudflare Dashboard > Workers > Variables)
 # [vars]

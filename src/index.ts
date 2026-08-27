@@ -75,7 +75,7 @@ import {
 } from './analytics/admin-api'
 import { refreshAllOauthTokens } from './oauth'
 import { runAllCheckins, handleCheckinTrigger, handleCheckinStatus, handleAdminOverview } from './checkin'
-import { autoCleanupAll } from './m365/auto-cleanup'
+import { autoCleanupAll, healthCheckM365All } from './m365/auto-cleanup'
 import {
   handleTraeLoginConnect,
   handleTraeLoginCallback,
@@ -401,6 +401,7 @@ app.onError((err, c) => {
 //   "0 */2 * * *"   —— 每 2 小时刷新 OAuth token
 //   "0 1,13 * * *"  —— 每日 09:00/21:00（北京时间）WorkBuddy 签到
 //   "0 * * * *"     —— 每小时 M365 对话自动清理
+//   "0 20 * * *"    —— 每日 04:00（北京时间）M365 账号健康检查（临期刷新 + 复活误判不可用账号）
 // ⚠️ Cloudflare ES Module Workers 只认 default export 上的 handler：
 //    scheduled 若写成 named export（export async function scheduled），运行时找不到
 //    default.scheduled，cron 触发后会被静默丢弃 → 定时签到/token 刷新均不执行。
@@ -417,6 +418,12 @@ async function scheduled(event: ScheduledEvent, env: Env, ctx: ExecutionContext)
     // M365 对话自动清理
     const result = await autoCleanupAll(env)
     console.log(`[auto-cleanup] cron done: total=${result.total} providers=${result.providers} errors=${result.errors}`)
+    return
+  }
+  if (event.cron === '0 20 * * *') {
+    // M365 账号每日健康检查（04:00 北京时间）：临期/过期 token 自动刷新 + 复活被误判不可用的账号
+    const result = await healthCheckM365All(env)
+    console.log(`[m365-health] cron done: providers=${result.providers} accounts=${result.accounts} ok=${result.ok} recovered=${result.recovered} failed=${result.failed} errors=${result.errors}`)
     return
   }
   // token 刷新（默认 / "0 */2 * * *"）——OAuth 提供商 + TRAE SOLO 预刷新
