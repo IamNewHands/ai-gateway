@@ -27,7 +27,7 @@ import { testModelConnection } from './proxy'
 import { isTraeProvider, testTraeModel } from './trae/proxy'
 import { fetchOpenCodeModels, isOpenCodeProvider, resolveOpenCodeUrls, testOpenCodeModel } from './opencode'
 import { isQoderProvider, fetchQoderModels } from './qoder/proxy'
-import { isClineProvider, fetchClineModels, testClineChat, testClineRefreshToken, startClineOAuth, pollClineOAuth } from './cline/proxy'
+import { isClineProvider, fetchClineModels, syncClineModels, testClineChat, testClineRefreshToken, startClineOAuth, pollClineOAuth } from './cline/proxy'
 import { isGeminiProvider, testGeminiModel, GEMINI_MODELS } from './gemini/proxy'
 import { isCnbProvider, testCnbConnection, CNB_MODELS } from './cnb/proxy'
 import { PROXY_KEY_PREFIX, EXPIRY_OPTIONS, OPENCODE_DEFAULT_URL } from './config'
@@ -1367,6 +1367,26 @@ function parseModelList(json: any): Array<{ id: string }> {
     models.push(...json.models.filter((m: any) => m && m.id).map((m: any) => ({ id: m.id })))
   }
   return models
+}
+
+/**
+ * Cline 动态模型同步（item6）：从官方 recommended-models 拉最新模型并合并进 provider.models。
+ * 返回新增/总数，供管理面板展示。
+ */
+export async function handleClineModelSync(c: Context<AppEnv>) {
+  const id = c.req.param('id')
+  if (!id) return c.json<ApiResponse>({ success: false, message: '缺少 id 参数' }, 400)
+  const provider = await getProvider(c.env, id)
+  if (!provider) return c.json<ApiResponse>({ success: false, message: '提供商不存在' }, 404)
+  if (!isClineProvider(provider.id)) {
+    return c.json<ApiResponse>({ success: false, message: '该提供商不是 Cline' }, 400)
+  }
+  const result = await syncClineModels(c.env, provider)
+  return c.json<ApiResponse>({
+    success: !result.error,
+    data: result,
+    message: result.error || (result.changed ? `同步完成，新增 ${result.added.length} 个模型` : '已是最新，无新增模型'),
+  })
 }
 
 /**

@@ -16,7 +16,7 @@
  */
 
 import type { Env, Provider } from '../types'
-import { updateProvider } from '../storage'
+import { updateProvider, getProviders } from '../storage'
 import { streamFetchWithTimeout } from '../opencode'
 
 export const CLINE_PROVIDER_ID = 'cline'
@@ -40,17 +40,41 @@ export function isClineProvider(providerId: string): boolean {
 
 // ===== 账号池状态（per isolate，按 provider.id 隔离） =====
 
+// Cline 客户端指纹头：模拟官方 Cline 客户端，规避 "only available via Cline product surfaces"
+// 这类对非官方客户端的 403 锁定（移植自 cline2api-workers worker.js 的 clineHeaders）。
+const CLINE_SDK_VERSION = '3.0.47'
+const CLINE_FINGERPRINT_HEADERS: Record<string, string> = {
+  'User-Agent': `Cline/${CLINE_SDK_VERSION}`,
+  'HTTP-Referer': 'https://cline.bot',
+  'X-Title': 'Cline',
+  'X-IS-MULTIROOT': 'false',
+  'X-CLIENT-TYPE': 'cline-sdk',
+  'X-CLIENT-VERSION': CLINE_SDK_VERSION,
+  'X-PLATFORM': 'terminal',
+  'X-CORE-VERSION': '0.0.66',
+}
+
+// 冷却时长（解析上游 Retry-After / "Try again in 2h 51m"，封顶 6h 防止账号被过久冻结）
+const CLINE_COOLDOWN_MAX_MS = 6 * 3600 * 1000
+const CLINE_COOLDOWN_LIMIT_MS = 5 * 60 * 1000   // 429 默认冷却
+const CLINE_COOLDOWN_EMPTY_MS = 60 * 1000       // 空响应（免费额度耗尽）默认冷却
+const CLINE_COOLDOWN_401_MS = 60 * 1000         // token 失效默认冷却
+
 interface Account {
   refreshToken: string
   accessToken: string | null
   expiry: number
   cooldownUntil: number
+  /** 模型级冷却：modelId → 冷却截止时间戳。仅该模型暂停，账号其它模型仍可用。 */
+  modelCooldowns: Map<string, number>
 }
 
 interface Pool {
   accounts: Account[]
   accountIndex: number
   current: Account | null
+  /** refreshToken 轮换回调：上游换发新 refreshToken 时触发，用于持久化到 KV，避免下次 invalid_grant。 */
+  onRotate?: (oldRt: string, newRt: string) => void
 }
 
 const pools = new Map<string, Pool>()
@@ -66,7 +90,7 @@ function getPool(providerId: string, refreshTokens: string[]): Pool {
     pool.accounts.some((a, i) => a.refreshToken !== tokens[i])
   if (changed) {
     pool = {
-      accounts: tokens.map((rt) => ({ refreshToken: rt, accessToken: null, expiry: 0, cooldownUntil: 0 })),
+      accounts: tokens.map((rt) => ({ refreshToken: rt, accessToken: null, expiry: 0, cooldownUntil: 0, modelCooldowns: new Map() })),
       accountIndex: 0,
       current: null,
     }
@@ -76,12 +100,62 @@ function getPool(providerId: string, refreshTokens: string[]): Pool {
 }
 
 /** 由 provider 的启用 apiKeys（即各账号 refreshToken）构造账号池。 */
-function poolFromProvider(provider: Provider): Pool {
+function poolFromProvider(provider: Provider, env?: Env): Pool {
   const tokens = (provider.apiKeys || []).filter((k) => k.enabled).map((k) => k.key)
-  return getPool(provider.id, tokens)
+  const pool = getPool(provider.id, tokens)
+  // refreshToken 轮换时回写 KV，避免下次 invalid_grant（永久 key 更新持久）。
+  if (env) pool.onRotate = (oldRt, newRt) => { void persistClineRotation(env, provider, oldRt, newRt) }
+  return pool
 }
 
-async function getAccountToken(account: Account): Promise<string> {
+async function persistClineRotation(env: Env, provider: Provider, oldRt: string, newRt: string): Promise<void> {
+  try {
+    const apiKeys = (provider.apiKeys || []).map((k) => (k.key === oldRt ? { ...k, key: newRt } : k))
+    if (!apiKeys.some((k) => k.key === oldRt)) return
+    await updateProvider(env, provider.id, { apiKeys })
+    provider.apiKeys = apiKeys
+  } catch { /* 持久化失败不阻断请求，下一轮会重新刷新 */ }
+}
+
+// ===== 冷却时长计算（移植 cline2api-workers 的 parseCooldown / Retry-After 支持） =====
+
+/** 解析 "Try again in 2h 51m / 30m / 15s" 这类文本为毫秒；仍封顶 6h。 */
+export function parseCooldownMs(text: string): number | null {
+  if (!text) return null
+  let totalSec = 0
+  let found = false
+  const re = /(\d+)\s*(h(?:our)?s?|m(?:in(?:ute)?)?s?|s(?:ec(?:ond)?)?s?)/gi
+  let m: RegExpExecArray | null
+  while ((m = re.exec(text))) {
+    const n = parseInt(m[1], 10)
+    const unit = m[2][0]
+    totalSec += unit === 'h' ? n * 3600 : unit === 'm' ? n * 60 : n
+    found = true
+  }
+  if (!found) return null
+  return Math.min(totalSec * 1000, CLINE_COOLDOWN_MAX_MS)
+}
+
+/** 从响应取冷却时长：优先 Retry-After 头，其次响应体 "Try again in..."，否则用 fallbackMs。 */
+function cooldownFromResponse(resp: Response, text: string, fallbackMs: number): number {
+  const retryAfter = resp?.headers?.get?.('Retry-After')
+  if (retryAfter) {
+    const sec = parseInt(retryAfter, 10)
+    if (!isNaN(sec) && sec > 0) return Math.min(sec * 1000, CLINE_COOLDOWN_MAX_MS)
+  }
+  const parsed = parseCooldownMs(text)
+  if (parsed !== null) return parsed
+  return fallbackMs
+}
+
+/** 冷却一个账号（整体冷却）。 */
+function cooldownAccount(acc: Account, ms: number) {
+  acc.cooldownUntil = Date.now() + ms
+  acc.accessToken = null
+  acc.expiry = 0
+}
+
+async function getAccountToken(account: Account, pool?: Pool): Promise<string> {
   const now = Date.now()
   if (account.cooldownUntil > now) throw new Error('account_cooldown')
   if (account.accessToken && now < account.expiry) return account.accessToken
@@ -92,16 +166,23 @@ async function getAccountToken(account: Account): Promise<string> {
     body: JSON.stringify({ refreshToken: account.refreshToken, grantType: 'refresh_token' }),
   })
   if (!resp.ok) {
-    account.cooldownUntil = now + 60 * 1000
+    account.cooldownUntil = now + CLINE_COOLDOWN_401_MS
     throw new Error('refresh_failed')
   }
-  const data = (await resp.json()) as { data?: { accessToken?: string; expiresAt?: number | string } }
+  const data = (await resp.json()) as { data?: { accessToken?: string; refreshToken?: string; expiresAt?: number | string } }
   const accessToken = data?.data?.accessToken
   if (!accessToken) {
-    account.cooldownUntil = now + 60 * 1000
+    account.cooldownUntil = now + CLINE_COOLDOWN_401_MS
     throw new Error('refresh_no_token')
   }
   account.accessToken = accessToken
+  // 轮换的新 refreshToken：更新内存并异步持久化到 KV（item2）
+  const rotated = data?.data?.refreshToken
+  if (rotated && rotated.length > 8 && rotated !== account.refreshToken) {
+    const oldRt = account.refreshToken
+    account.refreshToken = rotated
+    try { pool?.onRotate?.(oldRt, rotated) } catch { /* onRotate 失败不影响 */ }
+  }
   // 过期时间：优先服务端，兜底 10 分钟，留 60 秒余量
   const expiresAt = data?.data?.expiresAt
   let expiry = now + 10 * 60 * 1000
@@ -114,15 +195,16 @@ async function getAccountToken(account: Account): Promise<string> {
   return accessToken
 }
 
-/** 轮询选一个可用账号，取到 accessToken。全失败则清冷却重试一次最早的。 */
-async function getAccessToken(pool: Pool): Promise<string> {
+/** 轮询选一个可用账号，取到 accessToken。全失败则清冷却重试一次最早的。（item7 支持模型级冷却） */
+async function getAccessToken(pool: Pool, model?: string): Promise<string> {
   if (pool.accounts.length === 0) throw new Error('未配置 Cline RefreshToken')
   for (let attempt = 0; attempt < pool.accounts.length; attempt++) {
     const acc = pool.accounts[attempt % pool.accounts.length]
     if (acc.cooldownUntil && acc.cooldownUntil > Date.now()) continue
+    if (model && acc.modelCooldowns.get(model) && (acc.modelCooldowns.get(model) as number) > Date.now()) continue
     pool.current = acc
     try {
-      return await getAccountToken(acc)
+      return await getAccountToken(acc, pool)
     } catch {
       continue // 刷新失败也切下个号
     }
@@ -131,7 +213,7 @@ async function getAccessToken(pool: Pool): Promise<string> {
   pool.current = acc
   acc.cooldownUntil = 0
   try {
-    return await getAccountToken(acc)
+    return await getAccountToken(acc, pool)
   } catch {
     throw new Error('所有账号刷新 token 均失败')
   }
@@ -144,11 +226,14 @@ async function clineFetch(
   sessionId: string,
   retried = false
 ): Promise<Response> {
-  const token = await getAccessToken(pool)
+  const model = String((bodyObj as Record<string, unknown>).model || '')
+  const token = await getAccessToken(pool, model || undefined)
   const headers = {
     Authorization: 'Bearer workos:' + token,
     'Content-Type': 'application/json',
     'X-Task-ID': sessionId,
+    // item1：Cline 客户端指纹头，规避非官方客户端 403
+    ...CLINE_FINGERPRINT_HEADERS,
   }
   const resp = await streamFetchWithTimeout(CLINE_API_BASE + path, {
     method: 'POST',
@@ -157,11 +242,7 @@ async function clineFetch(
   })
   // token 失效：标记当前账号冷却，强制重试（会用别的账号/刷新）
   if (resp.status === 401 && !retried) {
-    if (pool.current) {
-      pool.current.cooldownUntil = Date.now() + 60 * 1000
-      pool.current.accessToken = null
-      pool.current.expiry = 0
-    }
+    if (pool.current) cooldownAccount(pool.current, CLINE_COOLDOWN_401_MS)
     return clineFetch(pool, path, bodyObj, sessionId, true)
   }
   return resp
@@ -182,7 +263,7 @@ function sleep(ms: number): Promise<void> {
   return new Promise((r) => setTimeout(r, ms))
 }
 
-/** 带重试的上游转发：空响应/5xx 自动切换账号 + 指数退避。 */
+/** 带重试的上游转发：429/空响应自动冷却并切换账号 + 指数退避。item7 优先记模型级冷却。 */
 async function clineFetchWithRetry(
   pool: Pool,
   path: string,
@@ -191,38 +272,46 @@ async function clineFetchWithRetry(
   isStream: boolean,
   maxRetries = 4
 ): Promise<Response> {
+  const model = String((bodyObj as Record<string, unknown>).model || '')
+  // 冷却当前账号：优先模型级（该账号还能跑其它模型），无模型上下文则整体冷却。
+  const applyCooldown = (ms: number) => {
+    if (!pool.current) return
+    if (model) pool.current.modelCooldowns.set(model, Date.now() + Math.max(ms, 60 * 1000))
+    else cooldownAccount(pool.current, ms)
+  }
   for (let attempt = 0; attempt <= maxRetries; attempt++) {
     const resp = await enqueue(() => clineFetch(pool, path, bodyObj, sessionId))
-    let hitEmpty = false
-    if (resp.ok && !isStream) {
-      const text = await resp.clone().text()
-      if (!text.includes('empty response content')) return resp
-      hitEmpty = true
-    } else if (isStream) {
-      // 流式：HTTP 200 直接转发，空流/错误由流式处理器判断
-      return resp
-    } else if (!(resp.status === 500 || resp.status === 502 || resp.status === 503 || resp.status === 504)) {
-      // 非 5xx 错误（403/400 等）不重试，直接返回
-      return resp
-    } else {
-      const errText = await resp.clone().text()
-      if (!errText.includes('empty response content')) return resp
-      hitEmpty = true
-    }
-    if (hitEmpty) {
-      // 额度用完：冷却当前账号，切到下个号
-      if (pool.current) {
-        pool.current.cooldownUntil = Date.now() + 60 * 1000
-        pool.current.accessToken = null
-        pool.current.expiry = 0
-      }
+    // 明确限流：冷却 + 切号重试
+    if (resp.status === 429) {
+      const text = await resp.clone().text().catch(() => '')
+      applyCooldown(cooldownFromResponse(resp, text, CLINE_COOLDOWN_LIMIT_MS))
       const short = 500 + Math.floor(Math.random() * 500)
       await sleep(short)
       continue
     }
-    // 指数退避：约 1.5s, 3s, 6s, 12s
-    const backoff = Math.min(1500 * Math.pow(2, attempt), 12000)
-    await sleep(backoff)
+    if (resp.ok) {
+      if (!isStream) {
+        const text = await resp.clone().text()
+        if (!text.includes('empty response content')) return resp
+        // 免费额度耗尽空响应：冷却 + 切号
+        applyCooldown(cooldownFromResponse(resp, text, CLINE_COOLDOWN_EMPTY_MS))
+        await sleep(500 + Math.random() * 500)
+        continue
+      }
+      // 流式：HTTP 200 直接转发，空流/错误由流式/聚合处理器判断
+      return resp
+    }
+    // 非 2xx 且非 429：仅 5xx 这类可重试；403/400 直接返回（模型锁定 / 参数错误）
+    const limitable = resp.status === 500 || resp.status === 502 || resp.status === 503 || resp.status === 504
+    if (!limitable) return resp
+    const errText = await resp.clone().text().catch(() => '')
+    if (errText.includes('empty response content')) {
+      // 5xx + 空响应：额度耗尽，冷却 + 切号
+      applyCooldown(cooldownFromResponse(resp, errText, CLINE_COOLDOWN_EMPTY_MS))
+      await sleep(500 + Math.random() * 500)
+      continue
+    }
+    return resp
   }
   return enqueue(() => clineFetch(pool, path, bodyObj, sessionId))
 }
@@ -322,6 +411,115 @@ function jsonResponse(obj: unknown, status: number): Response {
   })
 }
 
+// ===== 非流式聚合（item4/5）：上游恒定流式，客户端要非流式时把 SSE 聚合成 chat.completion =====
+
+interface AggregatedChat {
+  id: string
+  model: string
+  created: number
+  content: string
+  reasoning: string
+  toolCalls: Array<{ id: string; name: string; arguments: string }>
+  usage: Record<string, unknown> | null
+  finishReason: string
+}
+
+/** 读取整段上游 SSE，累积 content / reasoning / tool_calls / usage，返回聚合后的 chat 状态。 */
+async function aggregateStream(upstream: Response): Promise<AggregatedChat> {
+  const reader = upstream.body!.getReader()
+  const decoder = new TextDecoder()
+  const toolIndex = new Map<number, number>()
+  const acc: AggregatedChat = { id: '', model: '', created: 0, content: '', reasoning: '', toolCalls: [], usage: null, finishReason: '' }
+  let buf = ''
+  while (true) {
+    const { done, value } = await reader.read()
+    if (done) break
+    buf += decoder.decode(value, { stream: true })
+    let idx
+    while ((idx = buf.indexOf('\n')) >= 0) {
+      const line = buf.slice(0, idx)
+      buf = buf.slice(idx + 1)
+      if (!line.startsWith('data:')) continue
+      const payload = line.slice(5).trim()
+      if (payload === '' || payload === '[DONE]') continue
+      try {
+        const obj = JSON.parse(payload) as Record<string, unknown>
+        const o = unwrapData(obj) as Record<string, unknown>
+        if (o.id) acc.id = String(o.id)
+        if (o.model) acc.model = String(o.model)
+        if (o.created) acc.created = Number(o.created)
+        if (o.usage) acc.usage = o.usage as Record<string, unknown>
+        const choice = (((o.choices as Array<Record<string, unknown>>) || [])[0]) as Record<string, unknown> | undefined
+        if (!choice) continue
+        if (choice.finish_reason) acc.finishReason = String(choice.finish_reason)
+        const delta = (choice.delta || choice.message) as Record<string, unknown> | undefined
+        if (!delta) continue
+        if (delta.content) acc.content += String(delta.content)
+        if (delta.reasoning_content) acc.reasoning += String(delta.reasoning_content)
+        const tcs = delta.tool_calls as Array<Record<string, unknown>> | undefined
+        if (Array.isArray(tcs)) {
+          for (const tc of tcs) {
+            const i = Number(tc.index ?? 0)
+            const fn = tc.function as Record<string, unknown> | undefined
+            if (tc.id && fn) {
+              toolIndex.set(i, acc.toolCalls.length)
+              acc.toolCalls.push({ id: String(tc.id), name: String(fn.name || ''), arguments: String(fn.arguments || '') })
+            } else if (fn?.arguments) {
+              const ti = toolIndex.get(i)
+              if (ti !== undefined) acc.toolCalls[ti].arguments += String(fn.arguments)
+            }
+          }
+        }
+      } catch { /* 解析失败忽略 */ }
+    }
+  }
+  return acc
+}
+
+/** 聚合结果 → OpenAI 非流式 chat.completion JSON。 */
+function chatCompletionFromAgg(a: AggregatedChat): Record<string, unknown> {
+  const message: Record<string, unknown> = { role: 'assistant', content: a.content }
+  if (a.reasoning) message['reasoning_content'] = a.reasoning
+  if (a.toolCalls.length) {
+    message['tool_calls'] = a.toolCalls.map((tc) => ({ id: tc.id, type: 'function', function: { name: tc.name, arguments: tc.arguments } }))
+  }
+  return {
+    id: a.id || 'chatcmpl-' + Date.now(),
+    object: 'chat.completion',
+    created: a.created || Math.floor(Date.now() / 1000),
+    model: a.model,
+    choices: [{ index: 0, message, finish_reason: a.finishReason || 'stop' }],
+    usage: a.usage || { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
+  }
+}
+
+/**
+ * 非流式转发：上游已是 SSE，聚合成非流式。content 为空时冷却当前账号切号重试（最多 3 次），
+ * 最后仍空则把 reasoning 兜底拼进 content，避免"静默不回复"（item5）。
+ */
+async function proxyNonStreamChat(pool: Pool, body: Record<string, unknown>, sessionId: string): Promise<Response> {
+  let last: AggregatedChat | null = null
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const resp = await clineFetchWithRetry(pool, '/chat/completions', body, sessionId, true)
+    if (!resp.ok) {
+      const errText = await resp.text().catch(() => '')
+      return jsonResponse(
+        { error: { message: `Cline 上游 HTTP ${resp.status}: ${errText.slice(0, 300)}`, type: 'upstream_error' } },
+        resp.status || 502
+      )
+    }
+    const agg = await aggregateStream(resp)
+    last = agg
+    if (agg.content) return jsonResponse(chatCompletionFromAgg(agg), 200)
+    // 有正常结束原因但无文本：不空转重试
+    if (agg.finishReason) break
+    if (pool.current) cooldownAccount(pool.current, CLINE_COOLDOWN_EMPTY_MS)
+    await sleep(500 + Math.random() * 500)
+  }
+  if (last && last.content === '' && last.reasoning) last.content = last.reasoning
+  return jsonResponse(chatCompletionFromAgg(last as AggregatedChat), 200)
+}
+
 // ===== 对外接口 =====
 
 export interface ClineProxyOptions {
@@ -341,22 +539,25 @@ export async function proxyClineChatRequest(
   forwardBody: Record<string, unknown>,
   opts?: ClineProxyOptions
 ): Promise<Response> {
-  const pool = poolFromProvider(provider)
+  const pool = poolFromProvider(provider, _env as Env)
   const wantStream = opts ? !!opts.stream : forwardBody.stream === true
   const sessionId = 'sess_' + Date.now()
-  const body = buildUpstreamBody(forwardBody, wantStream, sessionId)
+  // 上游恒定强制流式（item4）：免费通道非流式返回 500 "empty response content"，
+  // 统一以流式取数，客户端要非流式时再聚合成 chat.completion。
+  const body = buildUpstreamBody(forwardBody, true, sessionId)
   try {
-    const resp = await clineFetchWithRetry(pool, '/chat/completions', body, sessionId, wantStream)
-    if (!resp.ok) {
-      const errText = await resp.text().catch(() => '')
-      return jsonResponse(
-        { error: { message: `Cline 上游 HTTP ${resp.status}: ${errText.slice(0, 300)}`, type: 'upstream_error' } },
-        resp.status || 502
-      )
+    if (wantStream) {
+      const resp = await clineFetchWithRetry(pool, '/chat/completions', body, sessionId, true)
+      if (!resp.ok) {
+        const errText = await resp.text().catch(() => '')
+        return jsonResponse(
+          { error: { message: `Cline 上游 HTTP ${resp.status}: ${errText.slice(0, 300)}`, type: 'upstream_error' } },
+          resp.status || 502
+        )
+      }
+      return streamSSE(resp)
     }
-    if (wantStream) return streamSSE(resp)
-    const raw = await resp.json().catch(() => ({}))
-    return jsonResponse(unwrapData(raw), 200)
+    return await proxyNonStreamChat(pool, body, sessionId)
   } catch (err) {
     return jsonResponse({ error: { message: (err as Error).message || 'Cline 转发失败', type: 'api_error' } }, 500)
   }
@@ -371,9 +572,124 @@ export function fetchClineModels(): { ok: true; message: string; models: Array<{
   }
 }
 
+// ===== 动态模型同步（item6，移植自 luawei1/cline2api models_sync.go） =====
+
+const CLINE_RECOMMENDED_URL = 'https://api.cline.bot/api/v1/ai/cline/recommended-models'
+
+export interface RemoteClineModel { id: string; cost: 'free' | 'pass' }
+
+/** 拉取 Cline 官方推荐/免费/订阅模型清单（免认证），按 free 优先去重。 */
+export async function fetchClineRecommendedModels(): Promise<RemoteClineModel[]> {
+  const resp = await fetch(CLINE_RECOMMENDED_URL, { signal: AbortSignal.timeout(10000) })
+  if (!resp.ok) throw new Error(`recommended-models HTTP ${resp.status}`)
+  const data = (await resp.json()) as {
+    recommended?: Array<{ id?: string; tags?: string[] }>
+    free?: Array<{ id?: string }>
+    clinePass?: Array<{ id?: string }>
+  }
+  const out: RemoteClineModel[] = []
+  const seen = new Set<string>()
+  const add = (list: Array<{ id?: string; tags?: string[] }> | undefined, cost: 'free' | 'pass') => {
+    for (const m of list || []) {
+      const id = m?.id
+      if (!id || seen.has(id)) continue
+      // recommended 组按 tags 是否含 FREE 判定，否则 pass
+      const c = cost !== 'free' && Array.isArray(m?.tags) && m.tags.some((t) => (t || '').toUpperCase() === 'FREE') ? 'free' : cost
+      seen.add(id)
+      out.push({ id, cost: c })
+    }
+  }
+  add(data.free, 'free')
+  add(data.recommended, 'pass')
+  add(data.clinePass, 'pass')
+  return out
+}
+
+/** normalize provider.models（可能为 [{id,enabled}] 或 string[]）。 */
+function normalizeModels(models: unknown): Array<{ id: string; enabled: boolean }> {
+  if (!Array.isArray(models)) return []
+  return models
+    .map((m) => (typeof m === 'string' ? { id: m, enabled: true } : { id: (m as { id?: string })?.id ?? '', enabled: (m as { enabled?: boolean })?.enabled !== false }))
+    .filter((m) => !!m.id)
+}
+
+export interface ClapClineSyncResult {
+  changed: boolean
+  added: Array<{ id: string; cost: string }>
+  total: number
+  syncedAt: number
+  error?: string
+}
+
+/** 拉取官方模型并入 provider.models（新增 model 自动启用，保留已有项）。 */
+export async function syncClineModels(env: Env, provider: Provider): Promise<ClapClineSyncResult> {
+  const syncedAt = Date.now()
+  try {
+    const remote = await fetchClineRecommendedModels()
+    const existing = normalizeModels(provider.models)
+    const existingIds = new Set(existing.map((m) => m.id))
+    const added: Array<{ id: string; cost: string }> = []
+    const merged = [...existing]
+    for (const m of remote) {
+      if (!existingIds.has(m.id)) {
+        merged.push({ id: m.id, enabled: true })
+        existingIds.add(m.id)
+        added.push({ id: m.id, cost: m.cost })
+      }
+    }
+    if (added.length) await updateProvider(env, provider.id, { models: merged })
+    return { changed: added.length > 0, added, total: remote.length, syncedAt }
+  } catch (err) {
+    return { changed: false, added: [], total: 0, syncedAt, error: (err as Error).message || '同步失败' }
+  }
+}
+
+// ===== 每日健康检查（item10，移植自 Go 版冷却自愈：探活并刷新过期 token） =====
+
+export interface ClineHealthSummary {
+  providers: number
+  accounts: number
+  ok: number
+  failed: number
+  errors: number
+}
+
+/** 遍历 Cline 提供商，逐个账号刷新 accessToken（临期/过期自动刷新，失败标记冷却），并持久化轮换的新 refreshToken。 */
+export async function healthCheckClineAll(env: Env): Promise<ClineHealthSummary> {
+  let providers = 0
+  let accounts = 0
+  let ok = 0
+  let failed = 0
+  let errors = 0
+  try {
+    const list = await getProviders(env)
+    for (const p of list) {
+      if (!isClineProvider(p.id)) continue
+      providers++
+      const enabled = (p.apiKeys || []).filter((k) => k.enabled)
+      if (enabled.length === 0) continue
+      const pool = getPool(p.id, enabled.map((k) => k.key))
+      pool.onRotate = (oldRt, newRt) => { void persistClineRotation(env, p, oldRt, newRt) }
+      for (const acc of pool.accounts) {
+        accounts++
+        acc.cooldownUntil = 0 // 探活忽略既有冷却，尝试复活
+        try {
+          await getAccountToken(acc, pool)
+          ok++
+        } catch {
+          failed++ // getAccountToken 失败时已标记冷却
+        }
+      }
+    }
+  } catch {
+    errors++
+  }
+  return { providers, accounts, ok, failed, errors }
+}
+
 /** 校验单个 refreshToken 是否能换取 accessToken（管理面板"测试"用）。 */
 export async function testClineRefreshToken(refreshToken: string): Promise<{ success: boolean; message: string; statusCode?: number }> {
-  const acc: Account = { refreshToken: refreshToken.trim(), accessToken: null, expiry: 0, cooldownUntil: 0 }
+  const acc: Account = { refreshToken: refreshToken.trim(), accessToken: null, expiry: 0, cooldownUntil: 0, modelCooldowns: new Map() }
   try {
     await getAccountToken(acc)
     return { success: true, message: 'RefreshToken 有效' }
@@ -390,15 +706,22 @@ export async function testClineChat(
   const pool = getPool('__cline_test__', refreshTokens)
   const sessionId = 'sess_test_' + Date.now()
   try {
-    const resp = await clineFetchWithRetry(
-      pool,
-      '/chat/completions',
-      { model: modelId || DEFAULT_MODEL, max_tokens: 1, session_id: sessionId, reasoning_effort: 'high', messages: [{ role: 'user', content: 'hi' }], stream: false },
-      sessionId,
-      false,
-      1
-    )
-    if (resp.ok) return { success: true, statusCode: resp.status, message: '' }
+    const body: Record<string, unknown> = {
+      model: modelId || DEFAULT_MODEL,
+      max_tokens: 1,
+      session_id: sessionId,
+      reasoning_effort: 'high',
+      messages: [{ role: 'user', content: 'hi' }],
+    }
+    // 走非流式聚合通道：规避免费通道非流式 500，并能在聚合结果里判断模型是否真实回复
+    const resp = await proxyNonStreamChat(pool, body, sessionId)
+    if (resp.status === 200) {
+      const data = (await resp.json().catch(() => null)) as { choices?: Array<{ message?: { content?: string } }> } | null
+      const content = String(data?.choices?.[0]?.message?.content || '')
+      return content
+        ? { success: true, statusCode: 200, message: `模型可回复（${content.slice(0, 50)}）` }
+        : { success: false, statusCode: 200, message: '模型返回空内容' }
+    }
     const t = await resp.text().catch(() => '').then((s) => s.slice(0, 300))
     // 官方锁定模型（仅 Cline 产品界面可用）与需订阅模型的 403，给出更明确的提示
     if (resp.status === 403 && /only available via Cline product surfaces|not available/i.test(t)) {

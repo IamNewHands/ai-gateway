@@ -1044,6 +1044,9 @@ export function openAIChunkToResponsesSSE(
     outputTokens: number
     hasStarted: boolean
     completed: boolean
+    /** item8：推理内容（reasoning_content → reasoning_summary_text.delta）。可选，未提供则跳过。 */
+    reasoningContent?: string
+    reasoningItemId?: string | null
   }
 ): string {
   const events: string[] = []
@@ -1091,6 +1094,38 @@ export function openAIChunkToResponsesSSE(
       })}`)
     }
     return formatAnthropicSSE(events)
+  }
+
+  // item8：推理内容 delta → response.reasoning_summary_text.delta（含摘要结构），
+  // 与 anthropic 的 thinking / 直连客户端的 reasoning 事件对齐（移植自 luawei1/cline2api responses.go）。
+  if (delta.reasoning_content) {
+    if (!acc.reasoningContent) {
+      acc.reasoningContent = ''
+      acc.reasoningItemId = acc.reasoningItemId || `reasoning_${Date.now()}`
+      events.push(`event: response.output_item.added`)
+      events.push(`data: ${JSON.stringify({
+        type: 'response.output_item.added',
+        output_index: acc.itemId ? 2 : 1,
+        item: { id: acc.reasoningItemId, type: 'reasoning', summary: [], status: 'in_progress' },
+      })}`)
+      events.push(`event: response.reasoning_summary_part.added`)
+      events.push(`data: ${JSON.stringify({
+        type: 'response.reasoning_summary_part.added',
+        item_id: acc.reasoningItemId,
+        output_index: acc.itemId ? 2 : 1,
+        summary_index: 0,
+        part: { type: 'summary_text', text: '' },
+      })}`)
+    }
+    acc.reasoningContent += delta.reasoning_content
+    events.push(`event: response.reasoning_summary_text.delta`)
+    events.push(`data: ${JSON.stringify({
+      type: 'response.reasoning_summary_text.delta',
+      item_id: acc.reasoningItemId,
+      output_index: acc.itemId ? 2 : 1,
+      summary_index: 0,
+      delta: delta.reasoning_content,
+    })}`)
   }
 
   // text delta

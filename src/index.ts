@@ -26,6 +26,7 @@ import {
   handleOAuthDisconnect,
   handleOAuthPoolRemove,
   handleOAuthModels,
+  handleClineModelSync,
   handleOAuthGeminiCallback,
   handleOAuthM365Callback,
   handleOAuthM365ROPC,
@@ -76,6 +77,7 @@ import {
 import { refreshAllOauthTokens } from './oauth'
 import { runAllCheckins, handleCheckinTrigger, handleCheckinStatus, handleAdminOverview } from './checkin'
 import { autoCleanupAll, healthCheckM365All } from './m365/auto-cleanup'
+import { healthCheckClineAll } from './cline/proxy'
 import {
   handleTraeLoginConnect,
   handleTraeLoginCallback,
@@ -176,6 +178,8 @@ app.post('/admin/api/oauth/:id/disconnect', handleOAuthDisconnect)
 app.post('/admin/api/oauth/:id/pool/remove', handleOAuthPoolRemove)
 // S5：模型拉取有副作用（请求上游并自动合并保存到 provider.models），改 POST 防链接型 CSRF
 app.post('/admin/api/oauth/:id/models', handleOAuthModels)
+// Cline 动态模型同步（item6）
+app.post('/admin/api/providers/:id/cline-models/sync', handleClineModelSync)
 // Gemini 授权回调：浏览器授权后把地址栏 URL 粘贴回后台提交（POST { callbackUrl }）
 app.post('/admin/api/oauth/:id/callback', handleOAuthGeminiCallback)
 // M365 PKCE 授权回调（POST { callbackUrl }）与 M365 ROPC 账号密码登录（POST { username, password }）
@@ -424,6 +428,12 @@ async function scheduled(event: ScheduledEvent, env: Env, ctx: ExecutionContext)
     // M365 账号每日健康检查（04:00 北京时间）：临期/过期 token 自动刷新 + 复活被误判不可用的账号
     const result = await healthCheckM365All(env)
     console.log(`[m365-health] cron done: providers=${result.providers} accounts=${result.accounts} ok=${result.ok} recovered=${result.recovered} failed=${result.failed} errors=${result.errors}`)
+    return
+  }
+  if (event.cron === '0 30 * * *') {
+    // Cline 账号健康检查（item10，08:30 北京时间）：逐个账号探活刷新 accessToken + 复活冷却账号 + 持久化轮换 refreshToken
+    const result = await healthCheckClineAll(env)
+    console.log(`[cline-health] cron done: providers=${result.providers} accounts=${result.accounts} ok=${result.ok} failed=${result.failed} errors=${result.errors}`)
     return
   }
   // token 刷新（默认 / "0 */2 * * *"）——OAuth 提供商 + TRAE SOLO 预刷新
