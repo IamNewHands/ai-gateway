@@ -1875,7 +1875,8 @@ function traeModels(id) {
   }).catch(() => { if (st) showResult(st, false, '网络错误，请重试') })
 }
 function clineModels(id) {
-  const st = document.getElementById('cline-st-' + id)
+  // 反馈写到按钮所在结果区（detail-actions 的 tr-<id>），不存在则用网格内的状态点
+  const st = document.getElementById('tr-' + id) || document.getElementById('cline-st-' + id)
   if (st) { st.textContent = '同步中…'; showSpinner(st) }
   fetch('/admin/api/providers/' + encodeURIComponent(id) + '/cline-models/sync', { method: 'POST' }).then(r => r.json()).then(d => {
     if (!d.success) { if (st) showResult(st, false, d.message || '同步失败'); return }
@@ -2175,8 +2176,10 @@ async function testKeyRow(id, idx) {
   }
 }
 
-// opencode 编辑表单 — 获取模型（复用 testKeyConnection 逻辑）
+// opencode / 通用 编辑表单 — 获取模型（复用 testKeyConnection 逻辑）
 async function fetchEditModels(id) {
+  // Cline：仅保留一个「获取模型」按钮，改为动态拉官方 recommended-models（并入 provider.models）
+  if (id === 'cline') { clineModels(id); return }
   const url = document.getElementById('url-' + id).value.trim()
   const keys = getKeys(id)
   const apiKey = keys.length > 0 ? keys[0].key : ''
@@ -2216,7 +2219,7 @@ function showEditModelsList(id, models) {
       pd.appendChild(el)
     }
   }
-  el.innerHTML = (id==='cline' ? '<div class="fc mb-1"><button class="btn btn-s btn-xs" onclick="clineModels(\\'' + escapeJsAttr(id) + '\\')"><i class="fas fa-cloud-download-alt" aria-hidden="true"></i> 拉取官方模型（recommended-models 动态同步）</button><span id="cline-st-' + id + '" class="trt" aria-live="polite" style="flex-basis:100%"></span></div>' : '') + '<label>可用模型 <span class="mu">（点击 + 添加单个，或 <a href="javascript:void(0)" onclick="addAllModels(\\'' + escapeJsAttr(id) + '\\')">一键全部添加</a>）</span></label>' + renderModelGrid(models, id, id)
+  el.innerHTML = '<label>可用模型 <span class="mu">（点击 + 添加单个，或 <a href="javascript:void(0)" onclick="addAllModels(\\'' + escapeJsAttr(id) + '\\')">一键全部添加</a>；Cline 点上方「获取模型」可动态拉官方 recommended-models）</span></label>' + renderModelGrid(models, id, id)
 }
 
 // 一键添加所有拉取的模型
