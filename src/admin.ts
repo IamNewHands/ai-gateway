@@ -502,6 +502,12 @@ export async function handleTestModel(c: Context<AppEnv>) {
     return c.json<ApiResponse>({ success: true, data: result })
   }
 
+  // CNB：免 Key（CSRF 凭证池），由凭证池 + 最小 chat 请求验证完整链路，不走通用 API Key
+  if (isCnbProvider(provider)) {
+    const result = await testCnbConnection(c.env, provider, modelId)
+    return c.json<ApiResponse>({ success: true, data: result })
+  }
+
   const enabledKeys = provider.apiKeys.filter(k => k.enabled)
   if (!isOpenCodeProvider(provider.id) && enabledKeys.length === 0) {
     return c.json<ApiResponse>({ success: false, message: '该提供商未配置可用的 API Key' }, 400)
