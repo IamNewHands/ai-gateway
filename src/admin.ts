@@ -1896,6 +1896,33 @@ export async function handleLogConfig(c: Context<AppEnv>) {
   return c.json<ApiResponse>({ success: true, data: { enabled: enabled !== 'false', retentionDays: retention } })
 }
 
+// ===== M365 SSE 调试日志开关（界面可配置，存储 KV，5s 内存缓存） =====
+// KV config:m365_debug_sse：'true'/'false'。未设置时回退环境变量 M365_DEBUG_SSE。
+let m365DebugCache = { at: 0, value: false }
+const M365_DEBUG_CACHE_TTL_MS = 5_000
+
+/** 读取 M365 SSE 调试日志开关（durable 侧亦复用，避免每 delta 一次 KV.get） */
+export async function isM365DebugSseEnabled(env: Env): Promise<boolean> {
+  if (Date.now() - m365DebugCache.at < M365_DEBUG_CACHE_TTL_MS) return m365DebugCache.value
+  const raw = await env.KV.get('config:m365_debug_sse').catch(() => null)
+  const value = raw === 'true' || (raw === null && env.M365_DEBUG_SSE === 'true')
+  m365DebugCache = { at: Date.now(), value }
+  return value
+}
+
+/** GET/POST /admin/api/m365/debug-sse —— 获取/设置 M365 SSE 调试日志开关 */
+export async function handleM365DebugConfig(c: Context<AppEnv>) {
+  if (c.req.method === 'POST') {
+    const body = await c.req.json().catch(() => ({}))
+    const enabled = !!body.enabled
+    await c.env.KV.put('config:m365_debug_sse', enabled ? 'true' : 'false')
+    m365DebugCache = { at: Date.now(), value: enabled }  // 立即刷新缓存
+    return c.json<ApiResponse>({ success: true, data: { enabled } })
+  }
+  const enabled = await isM365DebugSseEnabled(c.env)
+  return c.json<ApiResponse>({ success: true, data: { enabled } })
+}
+
 // ============================================================
 //  M365 会话绑定管理  /v1/sessions
 //  （对标原版会话管理：查询 / 按 session_id 查询 / 解除绑定）

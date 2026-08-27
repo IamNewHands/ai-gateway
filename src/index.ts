@@ -34,6 +34,7 @@ import {
   handleLogs,
   handleLogsClear,
   handleLogConfig,
+  handleM365DebugConfig,
   writeLog,
   handleGetMcps,
   handleCreateMcp,
@@ -205,6 +206,10 @@ app.get('/admin/api/logs', handleLogs)
 app.delete('/admin/api/logs', handleLogsClear)
 app.get('/admin/api/logs/config', handleLogConfig)
 app.post('/admin/api/logs/config', handleLogConfig)
+
+// M365 SSE 调试日志开关
+app.get('/admin/api/m365/debug-sse', handleM365DebugConfig)
+app.post('/admin/api/m365/debug-sse', handleM365DebugConfig)
 
 // MCP Server 管理（MCP 聚合网关）
 app.get('/admin/api/mcps', handleGetMcps)

@@ -648,7 +648,7 @@ ${H('管理')}
         </div>
       </section>
       <section id="logs" class="workspace-section" aria-labelledby="logs-title">
-        <div class="section-heading section-heading--admin"><div><h2 id="logs-title">系统日志</h2><p>记录 API 请求、错误等关键信息。超过保留天数的日志会自动删除。</p></div><div><label class="tg"><input type="checkbox" id="log-switch" onchange="toggleLog(this.checked)"><span class="sl"></span></label><span id="log-status">已关闭</span><label class="tg" style="margin-left:8px" title="定时自动刷新日志，便于排查问题"><input type="checkbox" id="log-auto-on" onchange="logAutoToggle(this.checked)"><span class="sl"></span></label><input type="number" id="log-auto-sec" min="1" max="3600" value="5" style="width:58px;text-align:center;font-size:12px;padding:2px 4px;border-radius:6px;border:1px solid var(--border,#e2e8f0);background:var(--card,#fff);color:inherit;margin-left:6px" onchange="logAutoSecChange()"><span class="mu" style="font-size:12px;margin-left:4px">秒自动刷新</span><label class="mu" style="font-size:12px;margin-left:10px" title="日志保留天数，超过后自动删除">保留</label><input type="number" id="log-retention" min="1" max="365" value="7" style="width:50px;text-align:center;font-size:12px;padding:2px 4px;border-radius:6px;border:1px solid var(--border,#e2e8f0);background:var(--card,#fff);color:inherit;margin-left:4px" onchange="logRetentionChange(this.value)"><span class="mu" style="font-size:12px;margin-left:4px">天</span><button class="btn btn-gh btn-xs" onclick="logPageChange(1)" style="margin-left:10px" title="刷新（回到第一页）"><i class="fas fa-sync-alt"></i></button><button class="btn btn-d btn-xs" onclick="clearLogs()" style="margin-left:4px">清除</button></div></div>
+        <div class="section-heading section-heading--admin"><div><h2 id="logs-title">系统日志</h2><p>记录 API 请求、错误等关键信息。超过保留天数的日志会自动删除。</p></div><div><label class="tg"><input type="checkbox" id="log-switch" onchange="toggleLog(this.checked)"><span class="sl"></span></label><span id="log-status">已关闭</span><label class="tg" style="margin-left:12px" title="M365 SSE 调试日志：记录 ChatHub 原始 / OpenAI delta / 最终聚合三层，排查换行与格式来源"><input type="checkbox" id="m365-sse-switch" onchange="toggleM365Debug(this.checked)"><span class="sl"></span></label><span id="m365-sse-status" style="font-size:12px;margin-left:4px">M365调试</span><label class="tg" style="margin-left:8px" title="定时自动刷新日志，便于排查问题"><input type="checkbox" id="log-auto-on" onchange="logAutoToggle(this.checked)"><span class="sl"></span></label><input type="number" id="log-auto-sec" min="1" max="3600" value="5" style="width:58px;text-align:center;font-size:12px;padding:2px 4px;border-radius:6px;border:1px solid var(--border,#e2e8f0);background:var(--card,#fff);color:inherit;margin-left:6px" onchange="logAutoSecChange()"><span class="mu" style="font-size:12px;margin-left:4px">秒自动刷新</span><label class="mu" style="font-size:12px;margin-left:10px" title="日志保留天数，超过后自动删除">保留</label><input type="number" id="log-retention" min="1" max="365" value="7" style="width:50px;text-align:center;font-size:12px;padding:2px 4px;border-radius:6px;border:1px solid var(--border,#e2e8f0);background:var(--card,#fff);color:inherit;margin-left:4px" onchange="logRetentionChange(this.value)"><span class="mu" style="font-size:12px;margin-left:4px">天</span><button class="btn btn-gh btn-xs" onclick="logPageChange(1)" style="margin-left:10px" title="刷新（回到第一页）"><i class="fas fa-sync-alt"></i></button><button class="btn btn-d btn-xs" onclick="clearLogs()" style="margin-left:4px">清除</button></div></div>
         <div class="syslog-filters">
           <div class="fg log-time-range"><label>时间范围</label><div class="fc"><input type="datetime-local" id="syslog-start" aria-label="开始时间"><span style="margin:0 4px;color:var(--color-muted)">至</span><input type="datetime-local" id="syslog-end" aria-label="结束时间"></div></div>
           <div class="fg"><label>类型</label><select id="syslog-type" aria-label="日志类型"><option value="">全部</option><option value="error">error</option><option value="warn">warn</option><option value="info">info</option><option value="request">request</option><option value="response">response</option></select></div>
@@ -2682,6 +2682,13 @@ function logAutoSecChange() {
       if (d.data.enabled) refreshLogs()
     }
   })
+  // M365 SSE 调试日志开关状态
+  fetch('/admin/api/m365/debug-sse').then(r => r.json()).then(d => {
+    if (d.success) {
+      document.getElementById('m365-sse-switch').checked = d.data.enabled
+      document.getElementById('m365-sse-status').textContent = d.data.enabled ? 'M365调试:开' : 'M365调试:关'
+    }
+  })
   // 恢复上次的自动刷新设置
   try {
     const cfg = JSON.parse(localStorage.getItem('kv-log-auto') || 'null')
@@ -2700,6 +2707,12 @@ async function toggleLog(on) {
     if (on) { logPage = 1; refreshLogs() }
     else document.getElementById('log-list').innerHTML = '<div class="empty-state"><i class="fas fa-list-alt" aria-hidden="true"></i><h3>日志已关闭</h3><p>开启开关后开始记录。</p></div>'
   }
+}
+
+async function toggleM365Debug(on) {
+  const r = await fetch('/admin/api/m365/debug-sse', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({enabled:on}) })
+  const d = await r.json()
+  if (d.success) document.getElementById('m365-sse-status').textContent = on ? 'M365调试:开' : 'M365调试:关'
 }
 
 async function refreshLogs(isAuto) {

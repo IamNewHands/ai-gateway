@@ -20,7 +20,7 @@ import { listM365Accounts, refreshM365AccountIfNeeded } from './oauth'
 import { recordConversation, shouldCleanup, cleanupConversations, getCleanupMode, getCleanupConfig } from './conversation-manager'
 import { markAccountSuccess, markAccountFailure, markAccountImageLimited, accountCooldownSeconds, isAccountAvailable, isRateLimited, isAuthFailure, isEmptyCompletion, isRetryable, confirmAndMarkRateLimit } from './account-health'
 import type { RateLimitProbeFn } from './account-health'
-import { writeLog } from '../admin'
+import { writeLog, isM365DebugSseEnabled } from '../admin'
 import { acquireSlot, releaseSlot, fluxSnapshot } from './account-flux'
 import { computeContextBudget, slidingWindow } from './context-budget'
 import { extractChatTaskAnchors, mergeTaskAnchors, decodeTaskAnchors, encodeTaskAnchors, reserveTaskAnchorContext } from './task-anchors'
@@ -256,9 +256,9 @@ export class M365Session {
     let allBusy = false
     /** 本轮是否发生过"401 但 token 刷新成功"（账号实为可恢复的过期 token） */
     let refreshedAccount = false
-    // 非流式三层 SSE 调试日志（M365_DEBUG_SSE=true 开启）：
+    // 非流式三层 SSE 调试日志（界面开关 或 M365_DEBUG_SSE=true 开启）：
     // 第一层 chathub-*（原始）+ 第三层 final（聚合）；流式的 delta 层在 streamMainAnswer 内
-    const debugSse = this.env.M365_DEBUG_SSE === 'true'
+    const debugSse = await isM365DebugSseEnabled(this.env)
     const sampleN = (() => { const n = parseInt(this.env.M365_DEBUG_SSE_SAMPLE || '', 10); return Number.isInteger(n) && n > 0 ? n : 2000 })()
     const sseLog = (tag: string, text: string): void => {
       if (!debugSse || !text) return
@@ -483,12 +483,12 @@ export class M365Session {
       start: async (controller) => {
         const push = (s: string) => { try { controller.enqueue(encoder.encode(s)) } catch { /* 客户端已断开 */ } }
 
-        // 三层 SSE 调试日志（M365_DEBUG_SSE=true 开启）：
+        // 三层 SSE 调试日志（界面开关 或 M365_DEBUG_SSE=true 开启）：
         // 1) chathub-*：ChatHub 原始文本（delta/snapshot/result/final）
         // 2) delta：网关透出的 OpenAI delta.content
         // 3) final：最终聚合文本
         // 对比三层可定位换行/格式是源头、网关加工还是客户端渲染引入。
-        const debugSse = this.env.M365_DEBUG_SSE === 'true'
+        const debugSse = await isM365DebugSseEnabled(this.env)
         const sampleN = (() => { const n = parseInt(this.env.M365_DEBUG_SSE_SAMPLE || '', 10); return Number.isInteger(n) && n > 0 ? n : 2000 })()
         const sseLog = (tag: string, text: string): void => {
           if (!debugSse || !text) return
