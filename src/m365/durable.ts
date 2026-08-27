@@ -16,7 +16,7 @@ import { flattenPromptMessages, modelToolRouterPrompt, parseModelToolDecision, f
 import type { DetectedToolCall, AgentLedger, OaiMsgLite } from './tools'
 import { resolveSession, bindSession, systemPromptHash, convCacheLookup, convCacheStore } from './session'
 import type { ResolveResult, ContextLike } from './session'
-import { listM365Accounts } from './oauth'
+import { listM365Accounts, refreshM365AccountIfNeeded } from './oauth'
 import { recordConversation, shouldCleanup, cleanupConversations, getCleanupMode, getCleanupConfig } from './conversation-manager'
 import { markAccountSuccess, markAccountFailure, markAccountImageLimited, accountCooldownSeconds, isAccountAvailable, isRateLimited, isAuthFailure, isEmptyCompletion, isRetryable, confirmAndMarkRateLimit } from './account-health'
 import type { RateLimitProbeFn } from './account-health'
@@ -254,6 +254,17 @@ export class M365Session {
     let usedAcc = acc
     let failoverLastResp: Response | null = null
     let allBusy = false
+    /** 本轮是否发生过"401 但 token 刷新成功"（账号实为可恢复的过期 token） */
+    let refreshedAccount = false
+    // 非流式三层 SSE 调试日志（M365_DEBUG_SSE=true 开启）：
+    // 第一层 chathub-*（原始）+ 第三层 final（聚合）；流式的 delta 层在 streamMainAnswer 内
+    const debugSse = this.env.M365_DEBUG_SSE === 'true'
+    const sampleN = (() => { const n = parseInt(this.env.M365_DEBUG_SSE_SAMPLE || '', 10); return Number.isInteger(n) && n > 0 ? n : 2000 })()
+    const sseLog = (tag: string, text: string): void => {
+      if (!debugSse || !text) return
+      const t = text.length > sampleN ? text.slice(0, sampleN) + '…(truncated)' : text
+      try { void writeLog(this.env, 'info', `[m365-sse] ${tag} account=${usedAcc.oid}`, t) } catch { /* ignore */ }
+    }
     for (let i = 0; i < ordered.length; i++) {
       usedAcc = ordered[i]
       // 并发闸门：占用该账号一个并发位；满则轮询等待，超时后该账号视为"忙"试下一个
@@ -275,7 +286,7 @@ export class M365Session {
             toolChoice: mainChoice,
             mcpServerUrl,
           },
-          { timeoutMs: 300_000 },
+          { timeoutMs: 300_000, debug: debugSse, onDebug: (tag, text) => sseLog(tag, text) },
           (delta) => { streamedText += delta },
           (ev) => { if (ev.kind === 'reasoning') reasoning += ev.text || '' },
         )
@@ -286,6 +297,16 @@ export class M365Session {
         const errObj = err instanceof Error ? err : new Error(msg)
         // 携带上游 Retry-After（WS dial 失败等场景已挂到错误上）
         const ra = (errObj as Error & { retryAfterSeconds?: number }).retryAfterSeconds
+        // 鉴权失败（401/403）但账号有 refresh_token：先刷新再定责。
+        // access_token 过期导致的 401 属可恢复（可自动续期），不应触发 24h 账号禁用冷却。
+        if (isAuthFailure(errObj) && usedAcc.refreshToken) {
+          const recovered = await refreshM365AccountIfNeeded(this.env, providerId, usedAcc.oid)
+          if (recovered) {
+            refreshedAccount = true
+            try { await writeLog(this.env, 'info', `[m365-chat] provider=${providerId} → auth failure but token refreshed, account kept alive account=${usedAcc.oid}`) } catch { /* ignore */ }
+            continue
+          }
+        }
         // 限流先做二次确认探测（误报不冷却），鉴权/其他失败直接标记
         if (isRateLimited(errObj)) {
           await confirmAndMarkRateLimit(this.env, usedAcc.oid, errObj, this.createRateLimitProbe(usedAcc), ra)
@@ -316,12 +337,17 @@ export class M365Session {
     if (!result) {
       // 全部候选忙（并发闸门打满）或全部失败
       if (failoverLastResp) return failoverLastResp
+      // 曾因过期 token 触发 401 但刷新成功：账号已恢复，让客户端立刻重试（短退避，不误判禁用）
+      if (refreshedAccount) {
+        return cjson({ error: { message: 'M365 account token refreshed; retry now', type: 'retryable_error' } }, 429, { 'Retry-After': '2' })
+      }
       if (allBusy) {
         return cjson({ error: { message: 'all M365 accounts are busy or rate-limited; try again shortly', type: 'rate_limit_error' } }, 429, { 'Retry-After': '5' })
       }
       return cjson({ error: { message: 'upstream failed on all accounts', type: 'upstream_error' } }, 502)
     }
     streamedText = streamedText || result.text
+    sseLog('final', result.text || streamedText)
 
     // 主回答兜底 1：模型错误拒绝使用工具 或 产生沙箱幻觉时，发起纠正对话重试。
     // 两类独立检测：isToolRefusal 带长度守卫；isSandboxHallucination 无长度限制、用专门纠正词（同原版 toolloop.go）。
@@ -456,6 +482,21 @@ export class M365Session {
     const stream = new ReadableStream<Uint8Array>({
       start: async (controller) => {
         const push = (s: string) => { try { controller.enqueue(encoder.encode(s)) } catch { /* 客户端已断开 */ } }
+
+        // 三层 SSE 调试日志（M365_DEBUG_SSE=true 开启）：
+        // 1) chathub-*：ChatHub 原始文本（delta/snapshot/result/final）
+        // 2) delta：网关透出的 OpenAI delta.content
+        // 3) final：最终聚合文本
+        // 对比三层可定位换行/格式是源头、网关加工还是客户端渲染引入。
+        const debugSse = this.env.M365_DEBUG_SSE === 'true'
+        const sampleN = (() => { const n = parseInt(this.env.M365_DEBUG_SSE_SAMPLE || '', 10); return Number.isInteger(n) && n > 0 ? n : 2000 })()
+        const sseLog = (tag: string, text: string): void => {
+          if (!debugSse || !text) return
+          const t = text.length > sampleN ? text.slice(0, sampleN) + '…(truncated)' : text
+          try { void writeLog(this.env, 'info', `[m365-sse] ${tag} account=${usedAcc.oid}`, t) } catch { /* ignore */ }
+        }
+        sseLog('start', `model=${model}`)
+
         const chunk = (delta: Record<string, unknown>, finish: unknown, extra: Record<string, unknown> = {}) => {
           const c: Record<string, unknown> = { id, object: 'chat.completion.chunk', created, model, choices: [{ index: 0, delta, finish_reason: finish }] }
           for (const [k, v] of Object.entries(extra)) c[k] = v
@@ -506,10 +547,11 @@ export class M365Session {
               toolChoice: mainChoice,
               mcpServerUrl,
             },
-            { timeoutMs: 300_000, signal: aborter.signal },
+            { timeoutMs: 300_000, signal: aborter.signal, debug: debugSse, onDebug: (tag, text) => sseLog(tag, text) },
             (delta) => {
               if (!delta) return
               streamedText += delta
+              sseLog('delta', delta)
               push(chunk({ content: delta }, null))
             },
             (ev) => {
@@ -559,6 +601,7 @@ export class M365Session {
           if (toolDefs.length > 0 && !completionEvidenceAllows(finalText, ledger)) {
             finalText = 'I cannot confirm completion because no matching tool results were returned. No external action has been verified.'
           }
+          sseLog('final', finalText)
           const conv = result.conversationId
           const pt = estimateTokens(finalText) + (result.reasoning || reasoningBuf ? estimateTokens(result.reasoning || reasoningBuf) : 0)
           const ct = pt
@@ -585,7 +628,17 @@ export class M365Session {
           const msg = err instanceof Error ? err.message : String(err)
           const errObj = err instanceof Error ? err : new Error(msg)
           const ra = (errObj as Error & { retryAfterSeconds?: number }).retryAfterSeconds
-          if (isRateLimited(errObj)) {
+          // 鉴权失败（401/403）但账号有 refresh_token：先刷新再定责，
+          // 避免过期 token 触发的 401 被误判为账号禁用（24h 冷却）；刷新成功则账号保持存活
+          if (isAuthFailure(errObj) && usedAcc.refreshToken) {
+            const recovered = await refreshM365AccountIfNeeded(this.env, providerId, usedAcc.oid)
+            if (recovered) {
+              sseLog('error', `auth failure but token refreshed, account kept alive`)
+              try { await writeLog(this.env, 'info', `[m365-chat] provider=${providerId} → stream auth failure but token refreshed, account kept alive account=${usedAcc.oid}`) } catch { /* ignore */ }
+            } else {
+              await markAccountFailure(this.env, usedAcc.oid, errObj, ra)
+            }
+          } else if (isRateLimited(errObj)) {
             await confirmAndMarkRateLimit(this.env, usedAcc.oid, errObj, this.createRateLimitProbe(usedAcc), ra)
           } else {
             await markAccountFailure(this.env, usedAcc.oid, errObj, ra)
@@ -636,11 +689,15 @@ export class M365Session {
     const healthy: ChatHubAccount[] = []
     for (const a of accounts) {
       if (!a.accessToken || !a.oid) continue
-      if (!(await isAccountAvailable(this.env, a.oid))) continue
+      // 惰性刷新：access_token 临近过期/已过期时自动刷新（刷新成功会恢复健康标记），
+      // 避免用过期 token 触发 ws dial 401 后被误判为账号禁用（authFailed 24h 冷却）
+      const fresh = await refreshM365AccountIfNeeded(this.env, providerId, a.oid)
+      if (!fresh || Date.now() >= fresh.expiresAt) continue
+      if (!(await isAccountAvailable(this.env, fresh.oid))) continue
       // 并发闸门：已打满（inflight >= limit）的账号视为不可用，避免选到忙号
-      const inflight = snapshot.inflight[a.oid] || 0
+      const inflight = snapshot.inflight[fresh.oid] || 0
       if (inflight >= snapshot.limit) continue
-      healthy.push({ accessToken: a.accessToken, oid: a.oid, tid: a.tid })
+      healthy.push({ accessToken: fresh.accessToken, oid: fresh.oid, tid: fresh.tid, refreshToken: fresh.refreshToken })
     }
     // 客户端显式指定账号：仅用该账号（须在池中且健康）
     if (explicitAccountId && explicitAccountId !== '') {

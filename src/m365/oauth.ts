@@ -11,6 +11,7 @@
  */
 import { KV_KEYS, OAUTH_TOKEN_REFRESH_MARGIN_MS } from '../config'
 import type { Env, OAuthDeviceConfig, OAuthTokenState, DeviceFlowState } from '../types'
+import { markAccountSuccess } from './account-health'
 
 /** M365 Copilot 商业版 OAuth 端点（与官方桌面客户端一致） */
 export const M365_OAUTH = {
@@ -529,6 +530,36 @@ function toM365Account(state: PooledAccount, accessToken: string, expiresAt: num
     displayName: state.nickname,
     expiresAt,
   }
+}
+
+/**
+ * 账号 access_token 惰性刷新（供账号池选号 / 401 归因前调用）：
+ * - access_token 临近过期（< MARGIN）且存在 refresh_token → 刷新并写回池；
+ * - 刷新成功 → 清除该账号此前因"过期 token 触发 401"被误标记的鉴权失败/冷却健康状态，
+ *   并返回带新 token 的最新账号（避免过期 token 被 401 后误判为账号禁用 24h）；
+ * - 无需刷新 → 返回原账号；无 refresh_token 或刷新失败且已过期 → 返回 null（调用方剔除）。
+ */
+export async function refreshM365AccountIfNeeded(env: Env, providerId: string, oid?: string): Promise<M365Account | null> {
+  const list = await readAccounts(env, providerId)
+  const state = (oid && oid !== '') ? list.find((a) => a.oid === oid) || null : list[0] || null
+  if (!state || !state.access_token) return null
+
+  let accessToken = state.access_token
+  let expiresAt = state.expires_at
+  if (state.refresh_token && state.expires_at - Date.now() < OAUTH_TOKEN_REFRESH_MARGIN_MS) {
+    const ok = await refreshM365Token(env, providerId, {} as OAuthDeviceConfig, state.oid)
+    if (ok) {
+      const refreshed = (await readAccounts(env, providerId)).find((a) => a.oid === state!.oid)
+      if (refreshed?.access_token) {
+        accessToken = refreshed.access_token
+        expiresAt = refreshed.expires_at
+        // 刷新成功说明账号仍可用：恢复此前被误标记的健康状态（过期 token 触发的 401 不应造成 24h 封禁）
+        if (state.oid) { try { await markAccountSuccess(env, state.oid) } catch { /* ignore */ } }
+      }
+    }
+  }
+  if (Date.now() >= expiresAt) return null
+  return toM365Account(state, accessToken, expiresAt)
 }
 
 /**

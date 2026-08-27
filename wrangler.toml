@@ -40,6 +40,9 @@ USAGE_ANALYTICS_DATASET = "ai_gateway_usage"
 # M365：会话/上下文 TTL（小时，可选；缺省 2）
 # M365_SESSION_TTL_HOURS = "2"
 # M365_CONTEXT_TTL_HOURS = "2"
+# M365：SSE 调试日志开关（"true" 开启三层：ChatHub 原始 / OpenAI delta / 最终聚合；M365_DEBUG_SSE_SAMPLE 控制单条采样字符数）
+# M365_DEBUG_SSE = "true"
+# M365_DEBUG_SSE_SAMPLE = "2000"
 
 [[analytics_engine_datasets]]
 binding = "USAGE_ANALYTICS"

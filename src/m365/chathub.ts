@@ -38,6 +38,8 @@ export interface ChatHubAccount {
   accessToken: string
   oid: string
   tid: string
+  /** 可选：refresh_token 存在时，上层可在 401 时先刷新再定责（避免过期 token 被误判账号禁用） */
+  refreshToken?: string
 }
 
 export interface ChatHubAttachment {
@@ -93,6 +95,10 @@ export interface ChatHubOptions {
   trace?: (meta: Record<string, unknown>) => void
   /** 取消信号：客户端断连时中止上游对话（同原版 r.Context().Done()） */
   signal?: AbortSignal
+  /** 调试：true 时通过 onDebug 上报原始文本增量/快照/最终消息（供排查换行/格式来源） */
+  debug?: boolean
+  /** 调试回调：tag ∈ chathub-delta / chathub-snapshot / chathub-result / chathub-final */
+  onDebug?: (tag: string, text: string) => void
 }
 
 function randomUUID(): string {
@@ -631,6 +637,12 @@ export async function chatWithHandlers(
     /** 收集图片 URL 的帧内容：update 帧 arguments + result 帧 item（同原版 events 全量收集） */
     const rawFrames: unknown[] = []
 
+    /** 调试：上报 ChatHub 原始文本（增量/快照/最终消息），供上层排查换行与格式来源 */
+    const debugEmit = (tag: string, text: string): void => {
+      if (!opts.debug || !opts.onDebug || !text) return
+      try { opts.onDebug(tag, text) } catch { /* ignore */ }
+    }
+
     const rateLimited = (text: string): boolean => {
       if (streamedText !== '') return false
       const t = text.toLowerCase()
@@ -668,6 +680,7 @@ export async function chatWithHandlers(
     // 非前缀的重写直接跳过，避免吐出重复/错乱片段。
     const emitSnapshot = (snapshot: string): void => {
       if (!snapshot) return
+      debugEmit('chathub-snapshot', snapshot)
       // 同原版顺序：图片额度 → 限流 → 内容策略
       if (imageLimitDetected(snapshot)) throw new Error('upstream image generation daily limit reached')
       if (rateLimited(snapshot)) throw new Error('upstream rate-limit notice')
@@ -735,6 +748,7 @@ export async function chatWithHandlers(
             if (a['throttling'] !== undefined) throttling = a['throttling']
             const wac = a['writeAtCursor']
             if (typeof wac === 'string' && wac !== '' && !toolFrame) {
+              debugEmit('chathub-delta', wac)
               // HAR 05：writeAtCursor 是纯 append 增量。一旦存在文本基线就把它直接作 delta 透出，
               // 避免把 33-47 个 cursor 帧折叠成 2-3 个巨大快照（同原项目 client.go：streamed 非空走 emitDelta）。
               if (streamedText !== '') { streamedText += wac; onDelta?.(wac) }
@@ -760,9 +774,13 @@ export async function chatWithHandlers(
             if (item['throttling'] !== undefined) throttling = item['throttling']
             const res = item['result'] as Record<string, unknown> | undefined
             if (res) {
-              if (typeof res['value'] === 'string') rawResult = res['value']
+              if (typeof res['value'] === 'string') {
+                rawResult = res['value']
+                debugEmit('chathub-result', rawResult)
+              }
               if (typeof res['message'] === 'string') {
                 finalText = res['message']
+                debugEmit('chathub-result', finalText)
                 // 同原版 type=2 分支：final 消息三类检测（内容策略此处不带 streamed 守卫）
                 if (imageLimitDetected(finalText)) throw new Error('upstream image generation daily limit reached')
                 if (rateLimited(finalText)) throw new Error('upstream rate-limit notice')
@@ -780,6 +798,7 @@ export async function chatWithHandlers(
           if (rateLimited(finalText)) throw new Error('upstream rate-limit notice')
           // 以最终消息对齐流式文本：流式漏掉的尾部在这里补发（原版 finalizeText）
           const text = finalizeText(streamedText, finalText || streamedText, onDelta)
+          debugEmit('chathub-final', text)
           if (imageLimitDetected(text)) throw new Error('upstream image generation daily limit reached')
           if (rateLimited(text)) throw new Error('upstream rate-limit notice')
           if (isContentPolicyBlock(text)) throw new Error('upstream content policy flagged as offensive')

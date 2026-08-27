@@ -479,6 +479,10 @@ export interface Env {
   M365_CONTEXT_WINDOW_TOKENS?: string
   /** M365 单次对话最大工具轮数（默认 32，可用 M365_MAX_TOOL_ROUNDS 覆盖，上限 512） */
   M365_MAX_TOOL_ROUNDS?: string
+  /** M365 SSE 调试日志开关（'true' 开启）：记录 ChatHub 原始文本 / OpenAI delta / 最终聚合三层，排查换行与格式来源 */
+  M365_DEBUG_SSE?: string
+  /** M365 SSE 调试日志单条采样字符数（默认 2000），防止长文档/长回答写爆日志 */
+  M365_DEBUG_SSE_SAMPLE?: string
 }
 
 export interface AnalyticsEngineDatasetBinding {
