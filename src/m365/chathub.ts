@@ -317,6 +317,33 @@ export function finalizeText(streamed: string, final: string, emit?: (delta: str
   return final
 }
 
+/**
+ * 折叠"无意义的空行"（仅最终完整文本专用，SSE 流式增量不做）。
+ *
+ * 上游 M365 常返回大量连续空行，让长回答看起来碎成一段一断。这里做 markdown 感知的紧凑化：
+ * - 普通文字区域：连续的多个空行压缩为最多 maxConsecutive 个 `\n`（段落留白保留）；
+ * - 代码块（```  /  ~~~ 围栏）：内部所有空行原样保留，避免压缩破坏代码/文字排版缩进；
+ * - 末尾多余空行清掉。
+ * 不动单个换行（列表项/标题/引用的行内结构保持），因此不会破坏有意的 markdown 排版。
+ */
+export function collapseExcessBlankLines(text: string, maxConsecutive = 1): string {
+  if (!text) return text
+  const lines = text.split('\n')
+  const out: string[] = []
+  let inFence = false
+  let blankRun = 0
+  for (const line of lines) {
+    // 围栏行（``` / ~~~）翻转代码块状态；围栏内的空行一律保留
+    if (/^(\s*)(```|~~~)/.test(line)) inFence = !inFence
+    if (inFence) { out.push(line); blankRun = 0; continue }
+    if (line.trim() === '') { blankRun++; if (blankRun <= maxConsecutive) out.push(''); continue }
+    blankRun = 0
+    out.push(line)
+  }
+  while (out.length > 0 && out[out.length - 1] === '') out.pop()
+  return out.join('\n')
+}
+
 /** 组装 ChatHub chat 帧（type=4 target=chat） */
 function chatPayload(req: ChatHubRequest, requestID: string, firstTurn: boolean): string {
   const tools = req.tools || []

@@ -10,7 +10,7 @@
  * 其中 sessionKey = providerId + ':' + explicitSessionId | contextFingerprint
  */
 import type { Env } from '../types'
-import { chatWithHandlers, classifyChatHubNotice } from './chathub'
+import { chatWithHandlers, classifyChatHubNotice, collapseExcessBlankLines } from './chathub'
 import type { ChatHubAccount, ChatHubTool, ChatHubResult } from './chathub'
 import { flattenPromptMessages, modelToolRouterPrompt, parseModelToolDecision, fencedToolCalls, nativeToolCalls, compactToolResult, buildAgentLedger, canContinue, resolveMaxToolRounds, activeMessages, ledgerRouterContext, filterCompletedCalls, validateDetectedToolCalls, completionEvidenceAllows, isToolRefusal, isSandboxHallucination } from './tools'
 import type { DetectedToolCall, AgentLedger, OaiMsgLite } from './tools'
@@ -389,7 +389,7 @@ export class M365Session {
     }
 
     const outcome: ChatOutcome = {
-      text: finalText,
+      text: collapseExcessBlankLines(finalText),
       reasoning: result.reasoning || reasoning,
       conversationId: result.conversationId,
       sessionId: result.sessionId,
@@ -597,7 +597,7 @@ export class M365Session {
           }
 
           // 完成证据校正（流式不可撤回，仅影响会话绑定文本）
-          let finalText = result.text || streamedText
+          let finalText = collapseExcessBlankLines(result.text || streamedText)
           if (toolDefs.length > 0 && !completionEvidenceAllows(finalText, ledger)) {
             finalText = 'I cannot confirm completion because no matching tool results were returned. No external action has been verified.'
           }

@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from 'vitest'
-import { finalizeText } from './chathub'
+import { finalizeText, collapseExcessBlankLines } from './chathub'
 
 describe('finalizeText', () => {
   it('final 为空时返回 streamed（或空串）', () => {
@@ -33,5 +33,35 @@ describe('finalizeText', () => {
 
   it('streamed 为空且 final 非空时直接返回 final', () => {
     expect(finalizeText('', 'final answer')).toBe('final answer')
+  })
+})
+
+describe('collapseExcessBlankLines', () => {
+  it('连续 3+ 空行压缩为 1 个空行，保留单个空行段落留白', () => {
+    const input = '第一段\n\n\n\n第二段'
+    expect(collapseExcessBlankLines(input)).toBe('第一段\n\n第二段')
+  })
+
+  it('多段之间的单个空行（2 个换行）保持不变', () => {
+    const input = '第一段\n\n第二段\n\n第三段'
+    expect(collapseExcessBlankLines(input)).toBe(input)
+  })
+
+  it('代码块内部空行全部保留', () => {
+    const input = '说明\n\n```\na\n\n\nb\n```\n\n结尾'
+    expect(collapseExcessBlankLines(input)).toBe('说明\n\n```\na\n\n\nb\n```\n\n结尾')
+  })
+
+  it('代码块外连续空行仍被折叠', () => {
+    const input = '```\na\n\n\nb\n```\n\n\n\n结尾'
+    expect(collapseExcessBlankLines(input)).toBe('```\na\n\n\nb\n```\n\n结尾')
+  })
+
+  it('清掉末尾多余空行', () => {
+    expect(collapseExcessBlankLines('内容\n\n\n\n')).toBe('内容')
+  })
+
+  it('空串安全返回', () => {
+    expect(collapseExcessBlankLines('')).toBe('')
   })
 })
