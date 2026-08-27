@@ -318,14 +318,14 @@ function renderMarkupValue(value: unknown): string {
 function protocolOpenTagRe(protocol: ProtocolSpec, tag: string): RegExp {
   const name = protocol.name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
   const tg = tag.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
-  return new RegExp(`<\\s*\\|\\s*${name}\\s*\\|\\s*${tg}\\b[^>]*>`, 'gi')
+  return new RegExp(`<\\s*(?:[:|]?\\s*${name}\\s*[:|]|${name}:)\\s*${tg}\\b[^>]*>`, 'gi')
 }
 
 function protocolTagBlockRe(protocol: ProtocolSpec, tag: string): RegExp {
   const name = protocol.name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
   const tg = tag.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
   return new RegExp(
-    `<\\s*\\|\\s*${name}\\s*\\|\\s*${tg}\\b([^>]*)>([\\s\\S]*?)<\\s*/\\s*\\|\\s*${name}\\s*\\|\\s*${tg}\\s*>`,
+    `<\\s*(?:[:|]?\\s*${name}\\s*[:|]|${name}:)\\s*${tg}\\b([^>]*)>([\\s\\S]*?)<\\s*/\\s*(?:[:|]?\\s*${name}\\s*[:|]|${name}:)\\s*${tg}\\s*>`,
     'gis',
   )
 }
@@ -573,7 +573,7 @@ function canonicalToolName(name: unknown, allowed: Record<string, string>, confi
 }
 
 function extractNameAttr(attributes: unknown): string {
-  const m = String(attributes ?? '').match(/(?:^|[\s|])name\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s|/>]+))/i)
+  const m = String(attributes ?? '').match(/(?:^|[\s|:])name\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s|/>]+))/i)
   if (!m) return ''
   const v = m[1] ?? m[2] ?? m[3] ?? ''
   return htmlUnescape(v.trim())
@@ -1137,7 +1137,7 @@ function looksStructurallyClosed(text: string, config: ToolCallConfig): boolean 
   for (const protocol of config.parseProtocols) {
     const name = protocol.name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
     const tag = protocol.tags.root.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
-    if (new RegExp(`<\\s*/\\s*\\|\\s*${name}\\s*\\|\\s*${tag}\\s*>`, 'i').test(text)) return true
+    if (new RegExp(`<\\s*/\\s*(?:[:|]?\\s*${name}\\s*[:|]|${name}:)\\s*${tag}\\s*>`, 'i').test(text)) return true
   }
   return false
 }
@@ -1151,11 +1151,11 @@ function looksStructurallyClosed(text: string, config: ToolCallConfig): boolean 
  */
 function firstClosedBlockEnd(text: string, config: ToolCallConfig): number {
   let best = -1
-  // 协议根闭合标签：</|XYML|tool_calls> / </|QNML|tool_calls>
+  // 协议根闭合标签：</|XYML|tool_calls> / </:XYML:tool_calls> / </|QNML|tool_calls> 等
   for (const protocol of config.parseProtocols) {
     const name = protocol.name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
     const tag = protocol.tags.root.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
-    const re = new RegExp(`<\\s*/\\s*\\|\\s*${name}\\s*\\|\\s*${tag}\\s*>`, 'i')
+    const re = new RegExp(`<\\s*/\\s*(?:[:|]?\\s*${name}\\s*[:|]|${name}:)\\s*${tag}\\s*>`, 'i')
     const m = re.exec(text)
     if (m) {
       const end = m.index + m[0].length
@@ -1182,14 +1182,16 @@ export function scrubToolFragments(text: unknown): string {
   let t = String(text ?? '')
   t = t.replace(/<!\[CDATA\[/g, '')
   t = t.replace(/\]\]>/g, '')
-  // 完整协议标签（开/闭，单/双 tag，含属性）：<|XYML|tool_calls> </|XYML|parameter name="..."> <|XYML|tool_calls>
-  t = t.replace(/<\s*\/?\s*\|\s*[A-Za-z][A-Za-z0-9_]*\s*\|\s*[A-Za-z_][A-Za-z0-9_.:-]*(\s[^>]*)?>/gi, '')
-  t = t.replace(/<\s*\/?\s*\|\s*[A-Za-z][A-Za-z0-9_]*\s*\|?>/gi, '')
-  // 截断残片（无 >）：</|XYML|、<|XYML|、</|XYML —— 精确匹配标签本身，不吞后续正文（如路径/行号）
+  // 完整协议标签（开/闭，含竖线、冒号、命名空间变体，含属性）：
+  // <|XYML|tool_calls>, </|XYML|invoke>, <:XYML:tool_calls>, </:XYML:invoke>, <XYML:parameter name="..."> 等
+  t = t.replace(/<\s*\/?\s*(?:[:|]?\s*[A-Za-z][A-Za-z0-9_]*\s*[:|]|[A-Za-z][A-Za-z0-9_]*:)\s*[A-Za-z_][A-Za-z0-9_.:-]*(\s[^>]*)?>/gi, '')
+  t = t.replace(/<\s*\/?\s*[:|]\s*[A-Za-z][A-Za-z0-9_]*\s*[:|]?>/gi, '')
+  t = t.replace(/<\s*\/?\s*[A-Za-z][A-Za-z0-9_]*\s*[:|]>/gi, '')
+  // 截断残片（无 >）：</:XYML:、<:XYML:、</|XYML|、<|XYML|、</|XYML —— 精确匹配标签本身，不吞后续正文（如路径/行号）
+  t = t.replace(/<\s*\/?\s*[:|]\s*[A-Za-z][A-Za-z0-9_]*\s*[:|]?/gi, '')
   t = t.replace(/<\s*\/?\s*\|\s*[A-Za-z][A-Za-z0-9_]*\s*\|?/gi, '')
-  // 缺 <|X 前缀的协议标签残片（XYML→YML / QNML→NML，开头被截断，如 YML|parameter name="...">）。
-  // 只认协议名残片 + parameter/invoke/tool_calls 关键字，避免误伤正常竖线分隔正文（如 HTML|CSS、a|b）。
-  t = t.replace(/\b(?:YML|NML)\s*\|\s*(?:parameter|invoke|tool_calls)\b[^>]*>/gi, '')
+  // 缺 <|X 或 <:X 前缀的协议标签残片（XYML→YML / QNML→NML，开头被截断，如 YML:parameter name="..."> 或 YML|...）
+  t = t.replace(/\b(?:YML|NML)\s*[:|]\s*(?:parameter|invoke|tool_calls)\b[^>]*>/gi, '')
   t = t.replace(/<\/?(?:tool_call|tool_use|function|invoke|parameter)\b[^>]*>/gi, '')
   t = t.replace(/^=+\s*(?:XYML|QNML)\s+TOOL CALL PROTOCOL\s*=+$/gim, '')
   t = t.replace(/^Default protocol for new tool calls:.*$/gim, '')
