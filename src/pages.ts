@@ -1120,8 +1120,8 @@ function testNewAKey(btn) {
   const tr = btn.parentElement.querySelector('.trt') || document.getElementById('atestR')
   showSpinner(tr)
   testKeyConnection(url, apiType, k, providerId).then(function(result) {
-    if (result.success && result.data) {
-      document.getElementById('amcl').innerHTML = renderModelGrid(result.data.data || [], null, providerId)
+    if (result.success) {
+      document.getElementById('amcl').innerHTML = renderModelGrid(extractModels(result.data), null, providerId)
       document.getElementById('amc').classList.remove('hd')
     } else {
       document.getElementById('amc').classList.add('hd')
@@ -2153,6 +2153,13 @@ function rmKeyRow(id, idx) {
   })
 }
 
+// 兼容不同 test-key / sync 端点的模型返回：可能是裸数组，也可能是 {data:[...]}（Cloudflare AI 等）
+function extractModels(v) {
+  if (Array.isArray(v)) return v
+  if (v && Array.isArray(v.data)) return v.data
+  return []
+}
+
 async function testKeyRow(id, idx) {
   const k = document.getElementById('k-' + id + '-' + idx).value.trim()
   const url = document.getElementById('url-' + id).value.trim()
@@ -2163,8 +2170,8 @@ async function testKeyRow(id, idx) {
   showSpinner(tr)
   const result = await testKeyConnection(url, apiType, k, id)
   showResult(tr, result.success, result.success ? '' : (result.message && result.message.indexOf('HTTP') !== -1 ? result.message : 'HTTP ' + result.status + (result.message ? ': ' + result.message : '')))
-  if (result.success && result.data) {
-    showEditModelsList(id, result.data.data || [])
+  if (result.success) {
+    showEditModelsList(id, extractModels(result.data))
   }
 }
 
@@ -2179,8 +2186,8 @@ async function fetchEditModels(id) {
   const result = await testKeyConnection(url, apiType, apiKey, id)
   // UX7：showResult 内部已转义，不再二次转义
   showResult(tr, result.success, result.success ? '' : (result.message || '获取模型失败'))
-  if (result.success && result.data) {
-    showEditModelsList(id, result.data.data || [])
+  if (result.success) {
+    showEditModelsList(id, extractModels(result.data))
   }
 }
 
