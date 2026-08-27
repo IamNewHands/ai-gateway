@@ -18,7 +18,7 @@ import { resolveSession, bindSession, systemPromptHash, convCacheLookup, convCac
 import type { ResolveResult, ContextLike } from './session'
 import { listM365Accounts } from './oauth'
 import { recordConversation, shouldCleanup, cleanupConversations, getCleanupMode, getCleanupConfig } from './conversation-manager'
-import { markAccountSuccess, markAccountFailure, markAccountImageLimited, accountCooldownSeconds, isAccountAvailable, isRateLimited, isAuthFailure, isEmptyCompletion, confirmAndMarkRateLimit } from './account-health'
+import { markAccountSuccess, markAccountFailure, markAccountImageLimited, accountCooldownSeconds, isAccountAvailable, isRateLimited, isAuthFailure, isEmptyCompletion, isRetryable, confirmAndMarkRateLimit } from './account-health'
 import type { RateLimitProbeFn } from './account-health'
 import { writeLog } from '../admin'
 import { acquireSlot, releaseSlot, fluxSnapshot } from './account-flux'
@@ -302,8 +302,8 @@ export class M365Session {
           return cjson({ error: { message: 'M365 image generation quota is exhausted; try again later or use another account', type: 'rate_limit_error' } }, 429, { 'Retry-After': '86400' })
         }
         failoverLastResp = this.mapChatError(msg)
-        const canFailover = isRateLimited(errObj) || isAuthFailure(errObj)
-        // 上游限流/鉴权失败且为全新会话时允许切号；已绑定会话直接返回退避响应
+        // 上游限流/鉴权失败/可重试临时错误 且 为全新会话时允许切号；已绑定会话直接返回退避响应
+        const canFailover = isRateLimited(errObj) || isAuthFailure(errObj) || isRetryable(errObj)
         if (!canFailover || !resolved.isNew) return failoverLastResp
         if (i === ordered.length - 1) return failoverLastResp
       } finally {
@@ -699,7 +699,7 @@ export class M365Session {
     }
   }
 
-  /** 把主回答的 ChatHub 错误归类为合适的 HTTP 响应（429/401/502/500） */
+  /** 把主回答的 ChatHub 错误归类为合适的 HTTP 响应（429/401/422/502/500） */
   private mapChatError(msg: string): Response {
     const cls = classifyChatHubNotice(msg)
     if (cls === 'rate_limit') {
@@ -707,6 +707,10 @@ export class M365Session {
     }
     if (cls === 'content_policy') {
       return cjson({ error: { message: 'M365 upstream declined the request due to content policy; try rephrasing', type: 'content_policy' } }, 502)
+    }
+    // 422 retryable：上游拒绝了请求但可重试（同原版 CategoryRetryable422 → 422）
+    if (isRetryable(msg) && /(?:422|unprocessable)/i.test(msg)) {
+      return cjson({ error: { message: 'upstream M365 rejected the request (422); retry separately', type: 'retryable_error' } }, 422)
     }
     if (isRateLimited(msg)) {
       return cjson({ error: { message: 'upstream is rate limiting; try again shortly', type: 'rate_limit_error' } }, 429, { 'Retry-After': '60' })

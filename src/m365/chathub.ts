@@ -327,6 +327,20 @@ function chatPayload(req: ChatHubRequest, requestID: string, firstTurn: boolean)
     return w
   })
 
+  // clientInfo 与真实浏览器一致（HAR 逆向），在 argument 层与 message 层各嵌一份副本
+  const clientInfo: Record<string, unknown> = {
+    clientPlatform: 'mcmcopilot-web',
+    clientAppName: 'Office',
+    clientEntrypoint: 'mcmcopilot-officeweb',
+    clientSessionId: req.sessionId,
+    ProductCategory: 'Chat',
+    clientAppType: 'Web',
+    productEntryPoint: 'ChatPanel',
+    deviceOS: 'Windows',
+    deviceType: 'Desktop',
+    clientPlatformVersion: '10',
+  }
+
   const message: Record<string, unknown> = {
     author: 'user',
     attachments: wireAttachments,
@@ -340,6 +354,8 @@ function chatPayload(req: ChatHubRequest, requestID: string, firstTurn: boolean)
     experienceType: 'Default',
     adaptiveCards: [],
     clientPreferences: {},
+    connectedFederatedConnections: ['dummyId'],
+    clientInfo,
   }
 
   // 图片上传后注入文件注解（messageAnnotations）
@@ -414,30 +430,37 @@ function chatPayload(req: ChatHubRequest, requestID: string, firstTurn: boolean)
         allowedMessageTypes: ['Chat', 'Suggestion', 'Disengaged', 'Progress', 'EndOfRequest', 'InternalLoaderMessage', 'GeneratedCode', 'SearchQuery', 'TriggerPlugin', 'MemoryUpdate', 'SideBySide', 'ReferencesListComplete', 'RichResponse', 'GenerateGraphicArt', 'GenerateContentQuery', 'RenderCardRequest', 'PromptSuggestion', 'CodeInterpreterResult', 'AudioResult', 'ImageResult', 'MeetingInsights', 'TranscriptSearch', 'DraftWithCopilot', 'MeetingTranscript', 'TranslationSuggestion', 'Citation', 'ActionCard', 'UserPromptSuggestion', 'GeneratedQuestions', 'SummaryInsights', 'SubTopicSuggestion'],
         sliceIds: [],
         threadLevelGptId: {},
-        conversationId: req.conversationId,
+        // HAR 逆向：参数层不再下发 conversationId/productThreadType/toolChoice，
+        // isStartOfSession 恒为 false（WS URL 已绑定会话/对话身份，同原项目 chatPayload）
+        isStartOfSession: false,
         traceId: randomUUID(),
-        isStartOfSession: firstTurn,
-        productThreadType: 'Office',
-        clientInfo: { clientPlatform: 'mcmcopilot-web', clientAppName: 'Office', clientEntrypoint: 'Web.LegacyEntrypoint', clientSessionId: randomUUID(), ProductCategory: 'OfficeWebIncludedCopilot' },
+        clientInfo,
         tone: req.tone || DEFAULT_TONE,
         streamingMode: 'ConciseWithPadding',
         message,
         plugins: buildPlugins(tools, req.mcpServerUrl),
-        toolChoice: req.toolChoice,
+        extraExtensionParameters: {},
+        isSbsSupported: true,
+        renderReferencesBehindEOS: true,
+        disconnectBehavior: 'continue',
       },
     ],
     invocationId: '0',
     target: 'chat',
     type: 4,
   }
+  // Metrics 帧带真实 ISO 时间戳 + RequestSent（同原项目），供 M365 侧计费/统计识别
+  const nowMs = Date.now()
+  const iso = (d: number) => new Date(nowMs + d).toISOString()
   const metrics = {
     arguments: [
       {
         Timestamps: {
-          ConnectionStart: '',
-          UserInputStart: '',
-          ConnectionEstablished: '',
-          UserInputSubmit: '',
+          ConnectionStart: iso(-2000),
+          UserInputStart: iso(-2000),
+          ConnectionEstablished: iso(-500),
+          UserInputSubmit: iso(0),
+          RequestSent: iso(1),
         },
       },
     ],
@@ -515,7 +538,8 @@ export async function chatWithHandlers(
         Upgrade: 'websocket',
         Connection: 'Upgrade',
         Origin: 'https://m365.cloud.microsoft',
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:148.0) Gecko/20100101 Firefox/148.0',
+        // UA 与真实浏览器统一为 Chrome（同原项目 NewClient）——M365 按会话指纹的 UA 识别，避免被当作异常客户端
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
       },
     })
     if (resp.status !== 101 || !resp.webSocket) {
@@ -710,7 +734,12 @@ export async function chatWithHandlers(
             }
             if (a['throttling'] !== undefined) throttling = a['throttling']
             const wac = a['writeAtCursor']
-            if (typeof wac === 'string' && wac !== '' && !toolFrame) emitSnapshot(wac)
+            if (typeof wac === 'string' && wac !== '' && !toolFrame) {
+              // HAR 05：writeAtCursor 是纯 append 增量。一旦存在文本基线就把它直接作 delta 透出，
+              // 避免把 33-47 个 cursor 帧折叠成 2-3 个巨大快照（同原项目 client.go：streamed 非空走 emitDelta）。
+              if (streamedText !== '') { streamedText += wac; onDelta?.(wac) }
+              else emitSnapshot(wac)
+            }
             for (const mraw of msgs) {
               if (!mraw || typeof mraw !== 'object') continue
               const m = mraw as Record<string, unknown>

@@ -143,6 +143,30 @@ export function isEmptyCompletion(err: Error | string): boolean {
 }
 
 /**
+ * 判断错误是否"可重试"（同原版 IsRetryable：CategoryRetryable422 / 传输类临时错误）。
+ * 用于新会话 failover 时决定是否切下一健康账号，而非直接返回 502。
+ * - 422（Unprocessable Entity）：可重试，客户端/网关换参数或账号再试
+ * - 传输类（TLS/DNS/连接/握手/读超时/EOF/SOCKS）：临时网络故障，可换号重试
+ * - 鉴权类（401/403/令牌失效）除外（属永久/需重新授权的失败）
+ */
+export function isRetryable(err: Error | string): boolean {
+  const msg = typeof err === 'string' ? err : err.message || ''
+  const low = msg.toLowerCase()
+  if (isAuthFailure(err)) return false
+  // 内容策略 / 空完成 属"永久/需改词"失败，不参与切号重试
+  if (low.includes('content policy') || low.includes('offensive') || low.includes('empty completion') || low.includes('empty response')) return false
+  if (low.includes('422') || low.includes('unprocessable')) return true
+  if (
+    low.includes('connection ') || low.includes('connection refused') ||
+    low.includes('tls') || low.includes('dns') || low.includes('no such host') ||
+    low.includes('handshake') || low.includes('read timeout') || low.includes('i/o timeout') ||
+    low.includes('eof') || low.includes('timeout') || low.includes('reset') ||
+    low.includes('socket') || low.includes('socks') || low.includes('upstream')
+  ) return true
+  return false
+}
+
+/**
  * 标记账户失败（分类冷却）。
  * - 鉴权失败（401/403）：冷却 24h（同原版）
  * - 限流（429/503）：指数退避 30s·2^(n-1) 封顶 30min；503 用 15s；上游 Retry-After 优先

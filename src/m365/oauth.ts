@@ -18,7 +18,7 @@ export const M365_OAUTH = {
   authorizeUrl: 'https://login.microsoftonline.com/common/oauth2/v2.0/authorize',
   tokenUrl: 'https://login.microsoftonline.com/common/oauth2/v2.0/token',
   redirectUri: 'https://login.microsoftonline.com/common/oauth2/nativeclient',
-  scope: 'openid profile offline_access https://substrate.office.com/sydney/M365Chat.Read https://substrate.office.com/sydney/sydney.readwrite',
+  scope: 'openid profile offline_access https://substrate.office.com/sydney/.default',
 }
 
 export interface M365Account {
@@ -172,10 +172,28 @@ function decodeJWTClaims(token: string): Record<string, string> {
   return out
 }
 
+/** 解析数字型 JWT claim（如 exp）；非数字/缺失返回 NaN（同原 token.go jwtNumericClaim，独立解析以保留数字） */
+function jwtNumericClaim(token: string, key: string): number {
+  try {
+    const parts = token.split('.')
+    if (parts.length < 2) return NaN
+    let b64 = parts[1].replace(/-/g, '+').replace(/_/g, '/')
+    while (b64.length % 4) b64 += '='
+    const payload = JSON.parse(atob(b64)) as Record<string, unknown>
+    const v = payload[key]
+    return typeof v === 'number' && Number.isFinite(v) ? v : NaN
+  } catch { return NaN }
+}
+
 function buildTokenState(data: { access_token: string; refresh_token?: string; expires_in?: number; id_token?: string }): OAuthTokenState {
   const claims = decodeJWTClaims(data.access_token)
   // 优先用 id_token 解析账号标识（原版 token.go 同时解 access_token 与 id_token）
   const idClaims = data.id_token ? decodeJWTClaims(data.id_token) : {}
+  // JWT exp 交叉校准（同原 token.go）：now+expires_in 与 access_token 的 exp 漂移 >60s 时以 JWT exp 为准，
+  // 防止客户端时钟偏差导致 token 出现过早/过晚失效
+  const baseExp = Date.now() + (data.expires_in || 3600) * 1000
+  const jwtExp = jwtNumericClaim(data.access_token, 'exp')
+  const expiresAt = Number.isFinite(jwtExp) && Math.abs(jwtExp * 1000 - baseExp) > 60_000 ? jwtExp * 1000 : baseExp
   const email = firstNonEmpty(
     idClaims['email'],
     idClaims['unique_name'],
@@ -189,7 +207,7 @@ function buildTokenState(data: { access_token: string; refresh_token?: string; e
   return {
     access_token: data.access_token,
     refresh_token: data.refresh_token,
-    expires_at: Date.now() + (data.expires_in || 3600) * 1000,
+    expires_at: expiresAt,
     updated_at: Date.now(),
     email: email || undefined,
     // M365 特有：ChatHub WS 需要 oid/tid
@@ -468,7 +486,13 @@ async function doRefreshM365Token(env: Env, providerId: string, cfg: OAuthDevice
     })
     const res = await fetch(tokenEndpointUrl(conf.authority), {
       method: 'POST',
-      headers: { 'Content-Type': 'application/x-www-form-urlencoded', Accept: 'application/json' },
+      headers: (() => {
+        const h: Record<string, string> = { 'Content-Type': 'application/x-www-form-urlencoded', Accept: 'application/json' }
+        // refresh 携带 X-AnchorMailbox 绑定账号身份（同原 token.go requestTokenTenant），
+        // 帮助 AAD 命中正确租户/账号令牌缓存，降低多账号刷新串号风险
+        if (state?.oid && state?.tid) h['X-AnchorMailbox'] = `Oid:${state.oid}@${state.tid}`
+        return h
+      })(),
       body: params.toString(),
       signal: AbortSignal.timeout(20000),
     })
