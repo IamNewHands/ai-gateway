@@ -164,6 +164,7 @@ async function getAccountToken(account: Account, pool?: Pool): Promise<string> {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ refreshToken: account.refreshToken, grantType: 'refresh_token' }),
+    signal: AbortSignal.timeout(15000),
   })
   if (!resp.ok) {
     account.cooldownUntil = now + CLINE_COOLDOWN_401_MS
@@ -619,6 +620,8 @@ function normalizeModels(models: unknown): Array<{ id: string; enabled: boolean 
 export interface ClapClineSyncResult {
   changed: boolean
   added: Array<{ id: string; cost: string }>
+  /** 本次从官方拉到的完整模型列表（含已存在的），供管理面板渲染。 */
+  remote: RemoteClineModel[]
   total: number
   syncedAt: number
   error?: string
@@ -641,9 +644,9 @@ export async function syncClineModels(env: Env, provider: Provider): Promise<Cla
       }
     }
     if (added.length) await updateProvider(env, provider.id, { models: merged })
-    return { changed: added.length > 0, added, total: remote.length, syncedAt }
+    return { changed: added.length > 0, added, remote, total: remote.length, syncedAt }
   } catch (err) {
-    return { changed: false, added: [], total: 0, syncedAt, error: (err as Error).message || '同步失败' }
+    return { changed: false, added: [], remote: [], total: 0, syncedAt, error: (err as Error).message || '同步失败' }
   }
 }
 
@@ -719,11 +722,20 @@ export async function testClineChat(
     // 走非流式聚合通道：规避免费通道非流式 500，并能在聚合结果里判断模型是否真实回复
     const resp = await proxyNonStreamChat(pool, body, sessionId)
     if (resp.status === 200) {
-      const data = (await resp.json().catch(() => null)) as { choices?: Array<{ message?: { content?: string } }> } | null
-      const content = String(data?.choices?.[0]?.message?.content || '')
-      return content
-        ? { success: true, statusCode: 200, message: `模型可回复（${content.slice(0, 50)}）` }
-        : { success: false, statusCode: 200, message: '模型返回空内容' }
+      const data = (await resp.json().catch(() => null)) as {
+        choices?: Array<{ message?: { content?: string; reasoning_content?: string; tool_calls?: unknown[] }; finish_reason?: string }>
+      } | null
+      const message = data?.choices?.[0]?.message || {}
+      const content = String(message.content || '')
+      if (content) return { success: true, statusCode: 200, message: `模型可回复（${content.slice(0, 50)}）` }
+      // 空内容：给出可诊断信息，区分"额度耗尽"与"模型无输出/已停用"
+      const reasoning = String(message.reasoning_content || '')
+      const finishReason = String(data?.choices?.[0]?.finish_reason || '')
+      const parts: string[] = []
+      if (reasoning) parts.push(`有思考内容:${reasoning.slice(0, 60)}`)
+      if (finishReason) parts.push(`finish_reason=${finishReason}`)
+      const detail = parts.length ? `（${parts.join('；')}）` : ''
+      return { success: false, statusCode: 200, message: `模型返回空内容${detail}，免费额度可能已耗尽或该模型暂无可输出，请换号或改用 poolside/laguna-s-2.1:free` }
     }
     const t = await resp.text().catch(() => '').then((s) => s.slice(0, 300))
     // 官方锁定模型（仅 Cline 产品界面可用）与需订阅模型的 403，给出更明确的提示

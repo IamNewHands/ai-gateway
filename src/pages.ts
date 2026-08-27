@@ -1874,6 +1874,17 @@ function traeModels(id) {
     if (st) showResult(st, true, '已拉取 ' + entries.length + ' 个模型（' + (from === 'dynamic' ? '动态' : '静态回退') + '），点击 + 添加或直接保存')
   }).catch(() => { if (st) showResult(st, false, '网络错误，请重试') })
 }
+function clineModels(id) {
+  const st = document.getElementById('cline-st-' + id)
+  if (st) { st.textContent = '同步中…'; showSpinner(st) }
+  fetch('/admin/api/providers/' + encodeURIComponent(id) + '/cline-models/sync', { method: 'POST' }).then(r => r.json()).then(d => {
+    if (!d.success) { if (st) showResult(st, false, d.message || '同步失败'); return }
+    const entries = (d.data && d.data.data) || []
+    showEditModelsList(id, entries)
+    const sync = d.data && d.data.sync
+    if (st) showResult(st, true, '已同步 ' + entries.length + ' 个模型' + (sync && sync.changed ? '，新增 ' + sync.added.length + ' 个' : '（无新增）'))
+  }).catch(() => { if (st) showResult(st, false, '网络错误，请重试') })
+}
 function traeStatus(id) {
   const st = document.getElementById('trae-st-' + id)
   const box = document.getElementById('trae-acc-' + id)
@@ -2198,7 +2209,7 @@ function showEditModelsList(id, models) {
       pd.appendChild(el)
     }
   }
-  el.innerHTML = '<label>可用模型 <span class="mu">（点击 + 添加单个，或 <a href="javascript:void(0)" onclick="addAllModels(\\'' + escapeJsAttr(id) + '\\')">一键全部添加</a>）</span></label>' + renderModelGrid(models, id, id)
+  el.innerHTML = (id==='cline' ? '<div class="fc mb-1"><button class="btn btn-s btn-xs" onclick="clineModels(\\'' + escapeJsAttr(id) + '\\')"><i class="fas fa-cloud-download-alt" aria-hidden="true"></i> 拉取官方模型（recommended-models 动态同步）</button><span id="cline-st-' + id + '" class="trt" aria-live="polite" style="flex-basis:100%"></span></div>' : '') + '<label>可用模型 <span class="mu">（点击 + 添加单个，或 <a href="javascript:void(0)" onclick="addAllModels(\\'' + escapeJsAttr(id) + '\\')">一键全部添加</a>）</span></label>' + renderModelGrid(models, id, id)
 }
 
 // 一键添加所有拉取的模型

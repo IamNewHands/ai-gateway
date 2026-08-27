@@ -1382,9 +1382,10 @@ export async function handleClineModelSync(c: Context<AppEnv>) {
     return c.json<ApiResponse>({ success: false, message: '该提供商不是 Cline' }, 400)
   }
   const result = await syncClineModels(c.env, provider)
+  const entries = (result.error ? [] : result.remote).map((m) => ({ id: m.id }))
   return c.json<ApiResponse>({
     success: !result.error,
-    data: result,
+    data: { data: entries, sync: result },
     message: result.error || (result.changed ? `同步完成，新增 ${result.added.length} 个模型` : '已是最新，无新增模型'),
   })
 }
