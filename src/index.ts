@@ -430,19 +430,20 @@ async function scheduled(event: ScheduledEvent, env: Env, ctx: ExecutionContext)
     console.log(`[m365-health] cron done: providers=${result.providers} accounts=${result.accounts} ok=${result.ok} recovered=${result.recovered} failed=${result.failed} errors=${result.errors}`)
     return
   }
-  if (event.cron === '0 30 * * *') {
-    // Cline 账号健康检查（item10，08:30 北京时间）：逐个账号探活刷新 accessToken + 复活冷却账号 + 持久化轮换 refreshToken
-    const result = await healthCheckClineAll(env)
-    console.log(`[cline-health] cron done: providers=${result.providers} accounts=${result.accounts} ok=${result.ok} failed=${result.failed} errors=${result.errors}`)
-    return
-  }
-  // token 刷新（默认 / "0 */2 * * *"）——OAuth 提供商 + TRAE SOLO 预刷新
+  // token 刷新（默认 / "0 */2 * * *"）——OAuth 提供商 + TRAE SOLO 预刷新 + Cline 账号探活
   const providers = (await getProviders(env)) as Provider[]
   const oauthProviders = providers.filter((p) => p.authType === 'oauth-device' && p.oauth)
   const result = await refreshAllOauthTokens(env, oauthProviders)
   console.log(`[oauth] cron refresh done: ${result.ok} ok, ${result.fail} fail`)
   const traeRefresh = await refreshTraeTokens(env)
   console.log(`[trae] cron refresh done: ${traeRefresh.ok} ok, ${traeRefresh.fail} fail`)
+  // Cline 账号健康检查（item10）：并发独立执行，失败不影响 OAuth/TRAE 刷新；每 2 小时随本 cron 一起跑
+  try {
+    const clineHealth = await healthCheckClineAll(env)
+    console.log(`[cline-health] cron done: providers=${clineHealth.providers} accounts=${clineHealth.accounts} ok=${clineHealth.ok} failed=${clineHealth.failed} errors=${clineHealth.errors}`)
+  } catch (err) {
+    console.error(`[cline-health] cron error: ${(err as Error).message}`)
+  }
 }
 
 // fetch 与 scheduled 必须都挂在 default export 上，Cloudflare 才会注册并调用。
