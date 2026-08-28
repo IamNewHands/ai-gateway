@@ -630,31 +630,38 @@ export function buildAgentLedger(messages: OaiMsgLite[]): AgentLedger {
   const l: AgentLedger = { completed: [], pending: [], toolRounds: 0, repeatedCall: false, repeatedFailure: false }
   const seenCall: Record<string, number> = {}
   const seenFailure: Record<string, number> = {}
-  const seenAny: Record<string, number> = {}
+  /** 成功调用的重复计数（区别于失败，见下：不对合法重复成功调用误判死循环） */
+  const seenSuccess: Record<string, number> = {}
   for (const id of order) {
     const e = calls[id]
     l.toolRounds++
     const sig = e.name + '\x00' + e.arguments
     seenCall[sig] = (seenCall[sig] || 0) + 1
-    seenAny[sig] = (seenAny[sig] || 0) + 1
     if (seenCall[sig] >= 2) {
       l.repeatedCall = true
       l.repetitionSignature = sig
-    }
-    // 同一调用被执行 >=3 次 → 死循环（同原版 StuckLoop），提示模型停止重复
-    if (seenAny[sig] >= 3) {
-      l.stuckLoop = true
     }
     if (e.result === '') {
       l.pending.push(e)
     } else {
       l.completed.push(e)
       if (e.failed) {
+        // 失败重试无进展才是真正的死循环：重复失败 >=3 次切断（同原版，阈值保持 3）
         const fs = e.name + '\x00' + e.arguments + '\x00' + normalizeFailure(e.result)
         seenFailure[fs] = (seenFailure[fs] || 0) + 1
         if (seenFailure[fs] >= 2) {
           l.repeatedFailure = true
           l.repetitionSignature = fs
+          if (seenFailure[fs] >= 3) {
+            l.stuckLoop = true
+          }
+        }
+      } else {
+        // 合法的重复成功调用（反复读同一文件 / 轮询状态）不应被误判死循环，
+        // 阈值放宽到 >=5（同原版 #68）；上限仍受 repeatedFailure 与轮数熔断兜底。
+        seenSuccess[sig] = (seenSuccess[sig] || 0) + 1
+        if (seenSuccess[sig] >= 5) {
+          l.stuckLoop = true
         }
       }
     }

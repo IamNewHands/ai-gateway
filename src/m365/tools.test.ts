@@ -8,8 +8,15 @@ describe('buildAgentLedger + canContinue 熔断门禁', () => {
     expect(canContinue(l)).toBe(true)
   })
 
-  it('同一调用重复 3 次（StuckLoop）时熔断', () => {
+  it('同一成功调用重复 3 次（合法轮询）不熔断', () => {
     const msgs = repeatedCalls(3)
+    const l = buildAgentLedger(msgs)
+    expect(l.stuckLoop).toBeFalsy()
+    expect(canContinue(l)).toBe(true)
+  })
+
+  it('同一成功调用重复 5 次（StuckLoop）时熔断', () => {
+    const msgs = repeatedCalls(5)
     const l = buildAgentLedger(msgs)
     expect(l.stuckLoop).toBe(true)
     expect(canContinue(l)).toBe(false)
