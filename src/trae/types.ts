@@ -11,6 +11,7 @@ export type TraeErrKind =
   | 'not_found'   // 404 → 短冷却 60s 不累计 errCount
   | 'server'      // 5xx
   | 'client'      // 其他 4xx
+  | 'transport'   // 网络/连接中断（建连超时、客户端掐断等），与账号健康无关，不惩罚账号
 
 /** 归一化后的账号凭证（持久化为 JSON 存在 provider.apiKeys 中，每个 key 一行一个账号） */
 export interface TraeAccount {

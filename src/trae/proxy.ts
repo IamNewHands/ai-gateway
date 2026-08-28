@@ -179,6 +179,10 @@ async function applyChatError(env: Env, providerId: string, uid: string, kind: s
       // 404 短冷却不累计 errCount（防雪崩）
       await cooldownTraeAccount(env, providerId, uid, cd.softMs, 'upstream 404')
       break
+    case 'transport':
+      // 网络/连接中断（建连超时、客户端掐断等）与账号健康无关：
+      // 不冷却、不累计 errCount，避免一次网络抖动把整个账号池刷成 no_healthy_account。
+      break
     default:
       await noteTraeError(env, providerId, uid, cd.errThreshold, cd.errMs)
   }

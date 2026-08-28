@@ -486,7 +486,12 @@ export async function chatStream(account: TraeAccount, bodyObj: Record<string, a
     })
   } catch (e) {
     clearTimeout(connectTimer)
-    throw new Error(`chat transport error: ${(e as Error).message || String(e)}`)
+    // 网络/连接中断（建立连接超时、客户端掐断、DNS/网络异常等）→ 标记为 transport。
+    // 这类错误与账号健康无关（token/权益没问题），不能计入账号错误冷却，否则
+    // 一次网络抖动会把整个账号池刷成 no_healthy_account。
+    const err = new Error(`chat transport error: ${(e as Error).message || String(e)}`) as Error & { kind?: TraeErrKind }
+    ;(err as any).kind = 'transport'
+    throw err
   }
   clearTimeout(connectTimer)
   if (response.status >= 400) {
