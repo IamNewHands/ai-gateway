@@ -640,6 +640,11 @@ export async function chatWithHandlers(
   const timeoutMs = opts.timeoutMs || 300_000
   const readTimeoutMs = opts.readTimeoutMs || 90_000
   const deadline = Date.now() + timeoutMs
+  // 无语义进展超时（同原版 04f5481）：微软会保持连接却长时间不发 update/result 帧。
+  // 此时不应挂满整个 timeoutMs；收到语义帧才续期 progressDeadline，否则到达截止即失败，
+  // 让客户端快速感知冻结并及时重试（而非看起来卡死）。
+  const progressIdleMs = 90_000
+  let progressDeadline = Math.min(deadline, Date.now() + progressIdleMs)
   // 客户端断连时中止（同原版 r.Context().Done() → 取消上游对话）
   const aborted = () => opts.signal?.aborted === true
 
@@ -729,9 +734,16 @@ export async function chatWithHandlers(
 
     while (Date.now() < deadline) {
       if (aborted()) throw new Error('request aborted by client')
-      const read = await withTimeout(next(), readTimeoutMs, 'ws message')
-      if (read.err) throw read.err
+      // 无语义进展超时检查：本次读帧前若已越过进度截止，说明期间无任何语义帧 → 抛错
+      if (Date.now() >= progressDeadline) throw new Error('CHAT_PROGRESS_TIMEOUT')
+      const read = await withTimeout(next(), Math.min(readTimeoutMs, Math.max(0, progressDeadline - Date.now())), 'ws message')
+      if (read.err) {
+        // 读等待本身跨过了进度截止：同样按无语义进展超时处理
+        if (Date.now() >= progressDeadline) throw new Error('CHAT_PROGRESS_TIMEOUT')
+        throw read.err
+      }
       if (!read.msg) continue
+      let semanticProgress = false
 
       const parts = read.msg.split(RS)
       for (const partRaw of parts) {
@@ -748,6 +760,8 @@ export async function chatWithHandlers(
 
         // update：流式文本 / 推理 / 工具 / 进度
         if (frame.type === 1 && frame.target === 'update') {
+          // update 帧即视为存在语义进展（同原版 04f5481：语义帧才续期进度截止）
+          semanticProgress = true
           if (frame.arguments && Array.isArray(frame.arguments)) rawFrames.push(...frame.arguments)
           for (const arg of frame.arguments || []) {
             if (!arg || typeof arg !== 'object' || Array.isArray(arg)) continue
@@ -794,6 +808,8 @@ export async function chatWithHandlers(
 
         // result：最终结果帧
         if (frame.type === 2) {
+          // 收到 result 帧即视为语义进展（同原版 04f5481）
+          semanticProgress = true
           const item = frame.item as Record<string, unknown> | undefined
           if (item) {
             // 图片 URL 也可能只出现在 result 帧（item/result 元数据）：一并纳入收集
@@ -845,6 +861,10 @@ export async function chatWithHandlers(
             images: imageURLs(rawFrames),
           }
         }
+      }
+      // 本次读到的消息中存在语义帧 → 续期进度截止
+      if (semanticProgress) {
+        progressDeadline = Math.min(deadline, Date.now() + progressIdleMs)
       }
     }
     throw new Error('chathub response deadline exceeded before completion')

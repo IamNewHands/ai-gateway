@@ -155,6 +155,8 @@ export function isRetryable(err: Error | string): boolean {
   if (isAuthFailure(err)) return false
   // 内容策略 / 空完成 属"永久/需改词"失败，不参与切号重试
   if (low.includes('content policy') || low.includes('offensive') || low.includes('empty completion') || low.includes('empty response')) return false
+  // 无语义进展超时是微软长时间不吐内容、属于"卡住"，切号重试只会放大账号负载（同原版 mayFailOverChatHubFailure=false）
+  if (low.includes('chat_progress_timeout')) return false
   if (low.includes('422') || low.includes('unprocessable')) return true
   if (
     low.includes('connection ') || low.includes('connection refused') ||
