@@ -41,11 +41,37 @@ describe('XYML tool call parsing & scrubbing', () => {
     expect(calls[0].input).toEqual({ command: 'echo hello' })
   })
 
+  it('parses full-width-pipe XYML tags <｜XYML｜...>', () => {
+    const input = `<｜XYML｜tool_calls><｜XYML｜invoke name="shell_execute"><｜XYML｜parameter name="command"><![CDATA[echo hello]]></｜XYML｜parameter></｜XYML｜invoke></｜XYML｜tool_calls>`
+    const calls = parseToolCalls(input, tools)
+    expect(calls).toHaveLength(1)
+    expect(calls[0].name).toBe('shell_execute')
+    expect(calls[0].input).toEqual({ command: 'echo hello' })
+  })
+
+  it('parses mixed-width XYML tags <｜XYML|...>', () => {
+    const input = `<｜XYML|tool_calls><｜XYML|invoke name="shell_execute"><｜XYML|parameter name="command"><![CDATA[echo hello]]></｜XYML|parameter></｜XYML|invoke></｜XYML|tool_calls>`
+    const calls = parseToolCalls(input, tools)
+    expect(calls).toHaveLength(1)
+    expect(calls[0].name).toBe('shell_execute')
+    expect(calls[0].input).toEqual({ command: 'echo hello' })
+  })
+
   it('scrubs colon-style and pipe-style XYML tags from text', () => {
     const text = `普通正文 <:XYML:tool_calls> <:XYML:invoke name="shell_execute"> </:XYML:invoke> </:XYML:tool_calls> 结束正文`
     const scrubbed = scrubToolFragments(text)
     expect(scrubbed).not.toContain(':XYML:')
     expect(scrubbed).not.toContain('invoke')
+    expect(scrubbed).toContain('普通正文')
+    expect(scrubbed).toContain('结束正文')
+  })
+
+  it('scrubs full-width-pipe XYML tags from text', () => {
+    const text = `普通正文 <｜XYML｜tool_calls> <｜XYML｜invoke name="shell_execute"> </｜XYML｜invoke> </｜XYML｜tool_calls> 结束正文`
+    const scrubbed = scrubToolFragments(text)
+    expect(scrubbed).not.toContain('XYML')
+    expect(scrubbed).not.toContain('invoke')
+    expect(scrubbed).not.toContain('tool_calls')
     expect(scrubbed).toContain('普通正文')
     expect(scrubbed).toContain('结束正文')
   })
@@ -70,5 +96,30 @@ describe('XYML tool call parsing & scrubbing', () => {
     const fullContent = contentEvents.map((e) => e.text).join('')
     expect(fullContent).not.toContain(':XYML:')
     expect(fullContent).not.toContain('invoke')
+  })
+
+  it('handles ToolSieve streaming with full-width-pipe tags and no leak', () => {
+    const sieve = new ToolSieve(tools)
+    const chunk1 = '正在执行检查。\n<｜XYML｜tool_calls><｜XYML｜invoke name="shell_execute"><｜XYML｜parameter name="command"><![CDATA[cat token.json]]></｜XYML｜parameter>'
+    const chunk2 = '</｜XYML｜invoke></｜XYML｜tool_calls> 检查完成'
+
+    const events1 = sieve.processChunk(chunk1)
+    const events2 = sieve.processChunk(chunk2)
+    const eventsFlush = sieve.flush()
+
+    const allEvents = [...events1, ...events2, ...eventsFlush]
+    const contentEvents = allEvents.filter((e) => e.type === 'content')
+    const toolEvents = allEvents.filter((e) => e.type === 'tool_calls')
+
+    expect(toolEvents).toHaveLength(1)
+    expect(toolEvents[0].calls?.[0].name).toBe('shell_execute')
+    expect(toolEvents[0].calls?.[0].input).toEqual({ command: 'cat token.json' })
+
+    const fullContent = contentEvents.map((e) => e.text).join('')
+    expect(fullContent).not.toContain('XYML')
+    expect(fullContent).not.toContain('invoke')
+    expect(fullContent).not.toContain('tool_calls')
+    expect(fullContent).toContain('正在执行检查。')
+    expect(fullContent).toContain('检查完成')
   })
 })

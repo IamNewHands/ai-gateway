@@ -22,6 +22,11 @@
 const MAX_CAPTURE_MS = 2_000
 const MAX_CAPTURE_LEN = 50_000
 
+// 协议标签定界符字符类（ASCII 竖线/冒号 + 常见的全角竖线变体）。
+// 模型（或客户端工具解析）可能把 <|XYML|...> 输出成 <｜XYML｜...>/<｜XYML|...> 等全角竖线变体，
+// 流式检测/清洗都必须覆盖到，否则这类畸形工具块会被当成正文裸漏给客户端。
+const PROTOCOL_DELIMS = '[:|｜│┃▏▕]'
+
 const DEFAULT_RAW_STRING_PARAMS = new Set([
   'content', 'command', 'cmd', 'script', 'code', 'prompt', 'file_content',
   'old_string', 'new_string', 'insert_text', 'patch', 'pattern', 'text',
@@ -318,14 +323,16 @@ function renderMarkupValue(value: unknown): string {
 function protocolOpenTagRe(protocol: ProtocolSpec, tag: string): RegExp {
   const name = protocol.name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
   const tg = tag.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
-  return new RegExp(`<\\s*(?:[:|]?\\s*${name}\\s*[:|]|${name}:)\\s*${tg}\\b[^>]*>`, 'gi')
+  // 构造同时匹配 ASCII（: |）与全角竖线（｜│┃▏▕）定界符的协议标签模式，
+  // 覆盖模型输出 <｜XYML｜...>/<｜XYML|...> 等全角竖线变体，确保流式检测能捕获。
+  return new RegExp(`<\\s*(?:${PROTOCOL_DELIMS}?\\s*${name}\\s*${PROTOCOL_DELIMS}|${name}:)\\s*${tg}\\b[^>]*>`, 'gi')
 }
 
 function protocolTagBlockRe(protocol: ProtocolSpec, tag: string): RegExp {
   const name = protocol.name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
   const tg = tag.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
   return new RegExp(
-    `<\\s*(?:[:|]?\\s*${name}\\s*[:|]|${name}:)\\s*${tg}\\b([^>]*)>([\\s\\S]*?)<\\s*/\\s*(?:[:|]?\\s*${name}\\s*[:|]|${name}:)\\s*${tg}\\s*>`,
+    `<\\s*(?:${PROTOCOL_DELIMS}?\\s*${name}\\s*${PROTOCOL_DELIMS}|${name}:)\\s*${tg}\\b([^>]*)>([\\s\\S]*?)<\\s*/\\s*(?:${PROTOCOL_DELIMS}?\\s*${name}\\s*${PROTOCOL_DELIMS}|${name}:)\\s*${tg}\\s*>`,
     'gis',
   )
 }
@@ -1137,7 +1144,7 @@ function looksStructurallyClosed(text: string, config: ToolCallConfig): boolean 
   for (const protocol of config.parseProtocols) {
     const name = protocol.name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
     const tag = protocol.tags.root.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
-    if (new RegExp(`<\\s*/\\s*(?:[:|]?\\s*${name}\\s*[:|]|${name}:)\\s*${tag}\\s*>`, 'i').test(text)) return true
+    if (new RegExp(`<\\s*/\\s*(?:${PROTOCOL_DELIMS}?\\s*${name}\\s*${PROTOCOL_DELIMS}|${name}:)\\s*${tag}\\s*>`, 'i').test(text)) return true
   }
   return false
 }
@@ -1155,7 +1162,7 @@ function firstClosedBlockEnd(text: string, config: ToolCallConfig): number {
   for (const protocol of config.parseProtocols) {
     const name = protocol.name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
     const tag = protocol.tags.root.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
-    const re = new RegExp(`<\\s*/\\s*(?:[:|]?\\s*${name}\\s*[:|]|${name}:)\\s*${tag}\\s*>`, 'i')
+    const re = new RegExp(`<\\s*/\\s*(?:${PROTOCOL_DELIMS}?\\s*${name}\\s*${PROTOCOL_DELIMS}|${name}:)\\s*${tag}\\s*>`, 'i')
     const m = re.exec(text)
     if (m) {
       const end = m.index + m[0].length
@@ -1179,7 +1186,7 @@ function firstClosedBlockEnd(text: string, config: ToolCallConfig): number {
  * 仅作兜底：正常情况下工具块都已被 ToolSieve 捕获解析，此处只处理截断/残缺块。
  */
 export function scrubToolFragments(text: unknown): string {
-  let t = String(text ?? '')
+  let t = canonicalizeMarkup(String(text ?? ''))
   t = t.replace(/<!\[CDATA\[/g, '')
   t = t.replace(/\]\]>/g, '')
   // 完整协议标签（开/闭，含竖线、冒号、命名空间变体，含属性）：
