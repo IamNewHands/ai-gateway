@@ -896,7 +896,18 @@ export function responsesOutputToAssistantMessage(output: Array<Record<string, u
 
 interface ResponsesRequest {
   model: string
-  input: string | Array<{ role: string; content: string | Array<{ type: string; text?: string; image_url?: { url: string } }> }>
+  input: string | Array<{
+    role?: string
+    type?: string
+    content?: string | Array<{ type: string; text?: string; image_url?: { url: string } }>
+    /** Codex 等客户端把工具声明放进 input 项的 additional_tools，而非顶层 tools */
+    tools?: Array<{
+      type: string
+      name?: string
+      description?: string
+      parameters?: Record<string, unknown>
+    }>
+  }>
   instructions?: string
   tools?: Array<{
     type: string
@@ -917,6 +928,9 @@ interface ResponsesRequest {
  */
 export function responsesToOpenAI(responsesReq: ResponsesRequest): Record<string, unknown> {
   const messages: Record<string, unknown>[] = []
+  // Codex 等客户端把工具声明放在 input 数组的 additional_tools 项里（而非顶层 tools），
+  // 这里单独收集，末尾与顶层 tools 合并后统一注入（同原版 #71）。
+  const additionalTools: Array<{ type: string; name?: string; description?: string; parameters?: Record<string, unknown> }> = []
 
   // instructions → system message
   if (responsesReq.instructions) {
@@ -928,6 +942,16 @@ export function responsesToOpenAI(responsesReq: ResponsesRequest): Record<string
     messages.push({ role: 'user', content: responsesReq.input })
   } else if (Array.isArray(responsesReq.input)) {
     for (const item of responsesReq.input) {
+      // additional_tools：非消息项，提取其工具声明，不进入 messages
+      if (item.type === 'additional_tools' && Array.isArray(item.tools)) {
+        for (const t of item.tools) {
+          // 过滤 Codex 内部工具（wait / request_user_input），仅保留可投递给上游的声明
+          const name = t.name || ''
+          if (name === 'wait' || name === 'request_user_input') continue
+          additionalTools.push(t)
+        }
+        continue
+      }
       if (typeof item.content === 'string') {
         messages.push({ role: item.role, content: item.content })
       } else if (Array.isArray(item.content)) {
@@ -952,9 +976,13 @@ export function responsesToOpenAI(responsesReq: ResponsesRequest): Record<string
   if (responsesReq.temperature !== undefined) body['temperature'] = responsesReq.temperature
   if (responsesReq.top_p !== undefined) body['top_p'] = responsesReq.top_p
 
-  // tools
-  if (responsesReq.tools?.length) {
-    body['tools'] = responsesReq.tools.map((t) => ({
+  // tools（合并顶层 tools 与 input 内 additional_tools 声明）
+  const toolDecls = [
+    ...(responsesReq.tools || []),
+    ...additionalTools,
+  ]
+  if (toolDecls.length) {
+    body['tools'] = toolDecls.map((t) => ({
       type: 'function',
       function: {
         name: t.name || t.type,
