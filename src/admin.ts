@@ -24,7 +24,7 @@ import {
   type CacheEntryView,
 } from './storage'
 import { testModelConnection } from './proxy'
-import { isTraeProvider, testTraeModel } from './trae/proxy'
+import { isTraeProvider, testTraeCredential, testTraeModel } from './trae/proxy'
 import { fetchOpenCodeModels, isOpenCodeProvider, resolveOpenCodeUrls, testOpenCodeModel } from './opencode'
 import { isQoderProvider, fetchQoderModels } from './qoder/proxy'
 import { isClineProvider, fetchClineModels, fetchClineRecommendedModels, testClineChat, testClineRefreshToken, startClineOAuth, pollClineOAuth } from './cline/proxy'
@@ -547,6 +547,16 @@ export async function handleTestKeyNew(c: Context<AppEnv>) {
   }
   if (!isSafeHttpUrl(url)) {
     return c.json<ApiResponse>({ success: false, message: 'url 必须是合法的 http/https 公网地址' }, 400)
+  }
+
+  // TRAE SOLO：账号凭证是 JSON，不能像普通 OpenAI Key 一样 GET /models（会 404）。
+  // 「测试」按钮走账号凭证连通性验证：解析 JSON → 该账号发最小 llm_utils_chat 请求。
+  if (providerId && isTraeProvider({ id: providerId, baseUrl: url } as Provider)) {
+    const result = await testTraeCredential(apiKey)
+    return c.json<ApiResponse>({
+      success: true,
+      data: { success: result.success, statusCode: result.statusCode || 0, message: result.message },
+    })
   }
 
   if (providerId && isOpenCodeProvider(providerId)) {
@@ -1439,6 +1449,21 @@ export async function handleClineModelSync(c: Context<AppEnv>) {
  *   当 JWT 域判断不确定或配置缺失时，自动尝试另一个域。
  * - 参考 cpa-plugin/models.go 的 callModelsAPI 实现。
  */
+
+/** WorkBuddy/CodeBuddy 静态候选模型（上游无公开 models 端点，实测 /models 类路径均 404，与 cnb/gemini/m365 一致用静态清单）。 */
+const WORKBUDDY_MODELS: string[] = [
+  'glm-4.5',
+  'glm-4.6',
+  'glm-4.7',
+  'deepseek-v3',
+  'deepseek-r1',
+  'hunyuan-lite',
+  'hunyuan-turbo',
+  'kimi-k2',
+  'qwen-3',
+  'doubao-1.5-pro',
+]
+
 export async function handleOAuthModels(c: Context<AppEnv>) {
   const id = c.req.param('id')
   if (!id) return c.json<ApiResponse>({ success: false, message: '缺少 id 参数' }, 400)
@@ -1559,6 +1584,29 @@ export async function handleOAuthModels(c: Context<AppEnv>) {
       }
     } catch (e) {
       console.warn(`[oauth-models] m365 auto-save failed: ${(e as Error).message}`)
+    }
+    return c.json<ApiResponse>({ success: true, data: { data: models } })
+  }
+
+  // WorkBuddy/CodeBuddy：无公开模型列表端点（实测 /console/…/models 等均返回 404），
+  // 与 gemini/cnb/m365 一致用内置静态清单，登录成功后一键拉取自动合并保存。
+  if ((provider.authType === 'oauth-device' && provider.oauth?.flowType === 'browser') || provider.id.startsWith('workbuddy')) {
+    const models = WORKBUDDY_MODELS.map((m) => ({ id: m }))
+    try {
+      const existing = provider.models || []
+      const existingIds = new Set(existing.map((m) => m.id))
+      const merged = [...existing]
+      for (const m of models) {
+        if (!existingIds.has(m.id)) {
+          merged.push({ id: m.id, enabled: true })
+          existingIds.add(m.id)
+        }
+      }
+      if (merged.length !== existing.length) {
+        await updateProvider(c.env, id, { models: merged })
+      }
+    } catch (e) {
+      console.warn(`[oauth-models] workbuddy auto-save failed: ${(e as Error).message}`)
     }
     return c.json<ApiResponse>({ success: true, data: { data: models } })
   }

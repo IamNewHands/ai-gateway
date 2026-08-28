@@ -12,8 +12,9 @@
  */
 import type { Env, Provider } from '../types'
 import { withSSEKeepAlive } from '../opencode'
+import { getPerfSettings } from '../perf'
 import { TRAE_DEFAULT_MODEL, TRAE_KEEPALIVE_MS, TRAE_STATIC_MODEL_IDS, TRAE_STREAM_IDLE_TIMEOUT_MS, normalizeTraeModelName } from './constants'
-import { chatStream, exchangeToken, needsTraeRefresh } from './upstream'
+import { chatStream, exchangeToken, needsTraeRefresh, parseAuth } from './upstream'
 import { aggregateSoloSse, soloStreamToOpenAIStream } from './sse'
 import type { SOLOStreamError } from './types'
 import {
@@ -95,6 +96,45 @@ export async function testTraeModel(
     })
     if (!resp.body) return { success: false, message: '上游返回空响应体' }
     // 读到首个字节即视为连接成功（minimal 请求，不校验内容）
+    const reader = resp.body.getReader()
+    const { value } = await reader.read()
+    await reader.cancel().catch(() => {})
+    if (!value || value.length === 0) {
+      return { success: false, message: '上游无输出（可能被限流或 plan 权益不足）' }
+    }
+    return { success: true, message: '连接成功', statusCode: resp.status }
+  } catch (e) {
+    const err = e as Error & { kind?: string; status?: number }
+    return {
+      success: false,
+      message: `连接失败: ${(err.message || '未知错误').substring(0, 200)}`,
+      statusCode: err.status,
+    }
+  }
+}
+
+/**
+ * 管理后台"测试账号凭证"（handleTestKey 的 TRAE 分支）。
+ * 针对单个粘贴进去的账号 JSON 做连通性验证：parseAuth 解析 → 用该账号发最小
+ * llm_utils_chat 请求 → 读到首字节即成功。不触碰账号池，避免测试副作用冷却真实账号。
+ */
+export async function testTraeCredential(
+  jsonText: string
+): Promise<{ success: boolean; message: string; statusCode?: number }> {
+  let account
+  try {
+    account = parseAuth(jsonText)
+  } catch (e) {
+    return { success: false, message: `凭证解析失败: ${(e as Error).message || '未知错误'}` }
+  }
+  try {
+    const resp = await chatStream(account, {
+      model: TRAE_DEFAULT_MODEL,
+      messages: [{ role: 'user', content: 'hi' }],
+      max_tokens: 1,
+      stream: true,
+    })
+    if (!resp.body) return { success: false, message: '上游返回空响应体' }
     const reader = resp.body.getReader()
     const { value } = await reader.read()
     await reader.cancel().catch(() => {})
@@ -225,11 +265,16 @@ export async function proxyTraeChatRequest(
       const onErr = (se: SOLOStreamError) => { void applyStreamError(env, provider.id, account.uid, se, cd) }
       // 包 SSE 心跳 + idle 兜底：思考模型静默期客户端会因无事件 idle 超时判定流结束
       //（实测 ~15-20s 自动截断），`: keep-alive\n\n` 注释行重置客户端计时器；上游
-      // 超过 TRAE_STREAM_IDLE_TIMEOUT_MS 完全无数据则主动结束流防挂起。
+      // 超过 idle 超时完全无数据则主动结束流防挂起。
+      // 心跳/idle 阈值与 workbuddy 等 OAuth/通用路径一致，读「性能设置」（KV 可编辑，
+      // src/perf.ts），未自定义时回退 TRAE 内置常量（8s 心跳 / 180s idle）。
+      const perf = await getPerfSettings(env)
+      const keepAliveMs = perf.keepAliveMs > 0 ? perf.keepAliveMs : TRAE_KEEPALIVE_MS
+      const idleTimeoutMs = perf.idleTimeoutMs || TRAE_STREAM_IDLE_TIMEOUT_MS
       const sseBody = withSSEKeepAlive(
         soloStreamToOpenAIStream(resp.body, configName, onErr),
-        TRAE_KEEPALIVE_MS,
-        TRAE_STREAM_IDLE_TIMEOUT_MS
+        keepAliveMs,
+        idleTimeoutMs
       )
       return new Response(sseBody, {
         status: resp.status,
