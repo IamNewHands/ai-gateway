@@ -328,15 +328,6 @@ function protocolOpenTagRe(protocol: ProtocolSpec, tag: string): RegExp {
   return new RegExp(`<\\s*(?:${PROTOCOL_DELIMS}?\\s*${name}\\s*${PROTOCOL_DELIMS}|${name}:)\\s*${tg}\\b[^>]*>`, 'gi')
 }
 
-function protocolTagBlockRe(protocol: ProtocolSpec, tag: string): RegExp {
-  const name = protocol.name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
-  const tg = tag.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
-  return new RegExp(
-    `<\\s*(?:${PROTOCOL_DELIMS}?\\s*${name}\\s*${PROTOCOL_DELIMS}|${name}:)\\s*${tg}\\b([^>]*)>([\\s\\S]*?)<\\s*/\\s*(?:${PROTOCOL_DELIMS}?\\s*${name}\\s*${PROTOCOL_DELIMS}|${name}:)\\s*${tg}\\s*>`,
-    'gis',
-  )
-}
-
 export function renderToolCall(
   name: unknown,
   input?: unknown,
@@ -679,16 +670,126 @@ function decodeMarkupValue(raw: unknown, parameterName: unknown, config: ToolCal
   return coerceMarkupScalar(raw, rawString)
 }
 
-function parseProtocolParameters(body: string, protocol: ProtocolSpec, config: ToolCallConfig): Record<string, unknown> {
-  const out: Record<string, unknown> = {}
-  const re = protocolTagBlockRe(protocol, protocol.tags.parameter)
+// ===== 容错树解析（方案C） =====
+// 以「标签扫描 + 栈结构 + 未闭合自动闭合」替代手工正则的逐层拼接。
+// 正则方式对「参数未闭合」这类结构损坏无计可施——regex 要求标签严格配对，
+// 一旦 </parameter> 缺失，整块 invoke 被丢弃，参数值（工具入参）随之丢失。
+// 树解析维护标签嵌套：遇到不匹配的闭合（如 </invoke> 直接闭合了一个未闭合的 parameter）
+// 时自动闭合顶层节点，从而在 invoke 整体闭合的前提下恢复出参数。
+
+interface MarkupToken {
+  kind: 'open' | 'close'
+  tag: string
+  attrs: string
+  openAt: number
+  closeAt: number
+}
+
+// 协议标签 scanner：一条正则兼容开/闭（<|XYML|...> / </|XYML|...>）、
+// 定界符（: 与 |）及标签名与定界符间空白。内容（含 CDATA）不会被误识别为标签。
+function markupTagRegex(protocol: ProtocolSpec): RegExp {
+  const name = protocol.name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+  const tagGroup = [protocol.tags.root, protocol.tags.invoke, protocol.tags.parameter]
+    .map((t) => t.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'))
+    .join('|')
+  return new RegExp(
+    `<\\s*(/?)\\s*(?:[:|]\\s*${name}\\s*[:|]|${name}\\s*[:|])\\s*(${tagGroup})\\b([^>]*)>`,
+    'gi',
+  )
+}
+
+function tokenizeMarkup(text: string, protocol: ProtocolSpec): MarkupToken[] {
+  const tokens: MarkupToken[] = []
+  const re = markupTagRegex(protocol)
   let m: RegExpExecArray | null
-  while ((m = re.exec(body)) !== null) {
-    const name = extractNameAttr(m[1])
-    if (name) out[name] = decodeMarkupValue(m[2], name, config)
+  while ((m = re.exec(text)) !== null) {
+    tokens.push({
+      kind: m[1] ? 'close' : 'open',
+      tag: (m[2] || '').toLowerCase(),
+      attrs: m[3] || '',
+      openAt: m.index,
+      closeAt: m.index + m[0].length,
+    })
   }
-  if (Object.keys(out).length) return out
-  return parseTextKVInput(body)
+  return tokens
+}
+
+interface MarkupNode {
+  tag: string
+  attrs: string
+  text: string
+  children: MarkupNode[]
+}
+
+// 栈式构建协议树；遇到闭合不匹配时自动闭合顶层，实现未闭合标签的容错恢复。
+function parseFaultTolerantTree(canonical: string, protocol: ProtocolSpec): MarkupNode[] {
+  const roots: MarkupNode[] = []
+  const stack: MarkupNode[] = []
+  let cursor = 0
+  for (const tk of tokenizeMarkup(canonical, protocol)) {
+    if (tk.kind === 'open') {
+      if (stack.length) stack[stack.length - 1].text += canonical.slice(cursor, tk.openAt)
+      stack.push({ tag: tk.tag, attrs: tk.attrs, text: '', children: [] })
+      cursor = tk.closeAt
+      continue
+    }
+    // 闭合：先补栈顶文本，随后用闭合标签兜住栈里最近的同类型节点。
+    if (stack.length) stack[stack.length - 1].text += canonical.slice(cursor, tk.openAt)
+    cursor = tk.closeAt
+    let remain = true
+    while (remain && stack.length) {
+      const top = stack[stack.length - 1]
+      stack.pop()
+      if (stack.length) stack[stack.length - 1].children.push(top)
+      else roots.push(top)
+      if (top.tag === tk.tag) remain = false
+    }
+  }
+  // 残余未闭合节点（到文本末尾也没闭合）：逐个闭合并入父级/根。
+  while (stack.length) {
+    const top = stack.pop()!
+    if (stack.length) stack[stack.length - 1].children.push(top)
+    else roots.push(top)
+  }
+  return roots
+}
+
+// 递归收集某节点为根时的所有 invoke 调用（无论是否被 tool_calls 根包裹）。
+function collectInvokes(node: MarkupNode, protocol: ProtocolSpec, allowed: Record<string, string>, config: ToolCallConfig, out: ParsedToolCall[]): void {
+  if (node.tag === protocol.tags.invoke) {
+    const name = canonicalToolName(extractNameAttr(node.attrs), allowed, config)
+    if (name) {
+      const input = collectParams(node, protocol, config)
+      out.push(newParsedToolCall(name, input))
+    }
+  }
+  for (const child of node.children) collectInvokes(child, protocol, allowed, config, out)
+}
+
+// 收集 invoke 节点的参数：parameter 子节点取其 name/text；
+// 参数标签未闭合（被自动闭合）时不在这层取——其值已成为参数子节点的 text，同样可恢复。
+function collectParams(node: MarkupNode, protocol: ProtocolSpec, config: ToolCallConfig): Record<string, unknown> {
+  const out: Record<string, unknown> = {}
+  for (const child of node.children) {
+    if (child.tag !== protocol.tags.parameter) continue
+    const name = extractNameAttr(child.attrs)
+    if (!name) continue
+    if (out[name] === undefined) out[name] = decodeMarkupValue(child.text, name, config)
+  }
+  if (!Object.keys(out).length) return parseTextKVInput(node.text)
+  return out
+}
+
+function parseFaultTolerantMarkup(
+  canonical: string,
+  protocol: ProtocolSpec,
+  allowed: Record<string, string>,
+  config: ToolCallConfig,
+): ParsedToolCall[] {
+  const roots = parseFaultTolerantTree(canonical, protocol)
+  const calls: ParsedToolCall[] = []
+  for (const root of roots) collectInvokes(root, protocol, allowed, config, calls)
+  return calls
 }
 
 function filterInputForTool(name: string, input: Record<string, unknown>, tools: Array<Record<string, unknown>>): Record<string, unknown> {
@@ -773,21 +874,11 @@ function parseProtocolMarkup(
   config: ToolCallConfig,
 ): ParsedToolCall[] {
   const canonical = canonicalizeMarkup(stripMarkdownFences(String(text ?? '')))
-  const calls: ParsedToolCall[] = []
-  const rootRe = protocolTagBlockRe(protocol, protocol.tags.root)
-  let m: RegExpExecArray | null
-  while ((m = rootRe.exec(canonical)) !== null) {
-    const invokeRe = protocolTagBlockRe(protocol, protocol.tags.invoke)
-    let im: RegExpExecArray | null
-    while ((im = invokeRe.exec(m[2])) !== null) {
-      const name = canonicalToolName(extractNameAttr(im[1]), allowed, config)
-      if (!name) continue
-      const input = parseProtocolParameters(im[2], protocol, config)
-      calls.push(newParsedToolCall(name, input))
-    }
-  }
-  if (!calls.length) calls.push(...parseLooseProtocolCalls(canonical, protocol, allowed, tools, config))
-  return calls
+  // 容错树解析优先（方案C）：能处理</parameter>缺失、参数被</invoke>提前闭合等结构损坏。
+  const treeCalls = parseFaultTolerantMarkup(canonical, protocol, allowed, config)
+  if (treeCalls.length) return treeCalls
+  // 树解析未命中时回退到宽松调用解析（裸属性/CDATA 残片）与旧正则路径。
+  return parseLooseProtocolCalls(canonical, protocol, allowed, tools, config)
 }
 
 function parseXmlToolCalls(text: unknown, allowed: Record<string, string>, config: ToolCallConfig): ParsedToolCall[] {
@@ -1232,7 +1323,10 @@ export class ToolSieve {
 
   processChunk(chunk: unknown): SieveEvent[] {
     if (!chunk) return []
-    this.pending += String(chunk)
+    // 捕获层入口统一规范化：把全角尖括号/竖线/引号归一为 ASCII，使检测层
+    // （firstToolMarkerIndex 用 ASCII '<' 扫描）也能命中 <｜XYML｜...> 这类全角包裹形态，
+    // 避免工具块被漏检、参数值经 scrub 兜底泄漏进正文。
+    this.pending += canonicalizeMarkup(String(chunk))
     const events: SieveEvent[] = []
     // 循环处理：一个 chunk 可能包含多个连续工具块（前一块闭合后紧跟着下一块的开标签）。
     // consumeCapture 只消费第一个完整闭合块并返回 remainder，这里把 remainder 重新喂回，
@@ -1306,12 +1400,18 @@ export class ToolSieve {
     this.captureStart = 0
     // 只消费第一个完整闭合块；块之后的剩余内容（后续工具块 / 正文）由 processChunk 继续处理
     const end = firstClosedBlockEnd(this.capture, this.config)
-    const blockText = end > 0 ? this.capture.slice(0, end) : this.capture
-    const remainder = end > 0 ? this.capture.slice(end) : ''
+    const whole = this.capture
+    const blockText = end > 0 ? whole.slice(0, end) : whole
+    const remainder = end > 0 ? whole.slice(end) : ''
     this.capture = ''
+    // 截断/未闭合协议块：开标签（甚至整个工具块内容）已进入捕获区，但到流结束都找不到闭合标签。
+    // 这种情况下 payload 是工具入参残片而非用户看的正文，绝不能 scrub 后透进 content——
+    // 否则就造成"工具参数泄漏进正文"。方案C：未闭合的协议块整体丢弃（remainder 里的纯正文照常处理）。
+    const unclosed = end < 0 && hasOpenProtocolBlock(whole, this.config) && !looksStructurallyClosed(whole, this.config)
+    if (unclosed) return { events: [], remainder }
     const calls = parseToolCalls(blockText, this.tools, { config: this.config })
     // 解析不出工具调用（无可用工具 / 块残缺 / 畸形未闭合块 / 非工具块）时降级为正文透传，
-    // 清洗协议标记后输出原文——绝不静默丢弃，否则该轮内容被吞、客户端"停止返回"。
+    // 清洗协议标记后输出原文。
     if (calls.length) return { events: [{ type: 'tool_calls', calls }], remainder }
     const text = scrubToolFragments(blockText)
     return { events: text ? [{ type: 'content', text }] : [], remainder }
