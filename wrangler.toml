@@ -4,6 +4,12 @@ compatibility_date = "2025-07-01"
 compatibility_flags = ["nodejs_compat"]
 keep_vars = true
 
+# Workers Paid：把单请求活跃 CPU 上限从默认 30s 提到 5 分钟（300000ms）。
+# 主动计算时间（SSE 解析/序列化等）才算 CPU，等网络 I/O 不计入；墙钟本来就无限。
+# 仅 Paid 生效，Free 固定 10ms 无法提高。
+[limits]
+cpu_ms = 300_000
+
 # Smart Placement：将 Worker 执行点自动调度到距离上游（如 Google Gemini）更近的 Cloudflare 节点，
 # 使出口 IP 落在受支持地区（Gemini API 有地域限制，就近节点可能返回 FAILED_PRECONDITION）。
 [placement]
