@@ -41,6 +41,7 @@
 ## 其他约定
 
 - **git 提交约定**：改完代码后**自动提交并推送**到仓库（用户约定，无需再询问）。提交前先 `git pull --rebase` 避免远程有更新。
+- **git 推送目标（用户手记）**：**没有特殊说明时，改动一律直接推送到 `main` 分支，不要新建分支 / 不要开 PR**（fast-forward 推进；推 main 前先 `git fetch` 确认线性、不覆盖远程独占提交）。
 - **避免新增 npm 依赖**：本仓库仅依赖 hono。需要并发限制等小工具时自实现（如 `mcp-gateway.ts` 的 `mapWithLimit`）。
 - **类型检查**：`npx tsc --noEmit`（`npm run build` 的 wrangler dry-run 在部分环境会因日志写入权限退出非零，不代表构建失败）。
 - **存储键隔离**：新增 KV 键在 `config.ts` 的 `KV_KEYS` 注册；新功能数据与现有 providers / proxyKeys 键隔离。
