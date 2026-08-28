@@ -448,7 +448,7 @@ function toOpenAIModelEntries(infos: TraeModelInfo[]): Array<Record<string, any>
   }))
 }
 
-/** POST /admin/api/trae/:id/models：拉取模型并自动合并保存到 provider.models。 */
+/** POST /admin/api/trae/:id/models：拉取模型清单（仅返回，不自动入库）。 */
 export async function handleTraeModels(c: Context<AppEnv>) {
   const id = c.req.param('id') || ''
   if (!id) return c.json<ApiResponse>({ success: false, message: '缺少 id 参数' }, 400)
@@ -456,24 +456,8 @@ export async function handleTraeModels(c: Context<AppEnv>) {
   if (!provider) return c.json<ApiResponse>({ success: false, message: '提供商不存在' }, 404)
   if (!isTraeProvider(provider)) return c.json<ApiResponse>({ success: false, message: '不是 TRAE 提供商' }, 400)
   const { entries, from } = await fetchTraeModelsCached(c.env, provider)
-  // 自动合并（按 id 去重追加，保留已有 enabled 状态）
-  try {
-    const existing = provider.models || []
-    const existingIds = new Set(existing.map((m) => m.id))
-    const merged = [...existing]
-    for (const e of entries) {
-      const mid = String(e['id'])
-      if (!existingIds.has(mid)) {
-        merged.push({ id: mid, enabled: true })
-        existingIds.add(mid)
-      }
-    }
-    if (merged.length !== existing.length) {
-      await updateProvider(c.env, id, { models: merged })
-    }
-  } catch (e) {
-    console.warn(`[trae-models] auto-save failed: ${(e as Error).message}`)
-  }
+  // 仅返回模型清单（含来源 dynamic/static），由用户在面板手工「+」选择并点保存才正式入库；
+  // 拉取本身不写 provider.models，避免未保存就随刷新自动全部写入。
   return c.json<ApiResponse>({
     success: true,
     data: { data: entries, from },

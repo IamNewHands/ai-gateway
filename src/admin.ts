@@ -1472,25 +1472,9 @@ export async function handleOAuthModels(c: Context<AppEnv>) {
   if (!provider) return c.json<ApiResponse>({ success: false, message: '提供商不存在' }, 404)
 
   // CNB：cnb.cool 无公开模型列表端点（实测 /ai/models 等均返回 404 HTML），
-  // 与 Gemini 一致使用内置静态清单，一键拉取后自动合并保存。
+  // 与 Gemini 一致使用内置静态清单；仅返回清单，用户手工「+」/保存后才入库。
   if (isCnbProvider(provider)) {
     const models = CNB_MODELS.map((m) => ({ id: m }))
-    try {
-      const existing = provider.models || []
-      const existingIds = new Set(existing.map((m) => m.id))
-      const merged = [...existing]
-      for (const m of models) {
-        if (!existingIds.has(m.id)) {
-          merged.push({ id: m.id, enabled: true })
-          existingIds.add(m.id)
-        }
-      }
-      if (merged.length !== existing.length) {
-        await updateProvider(c.env, id, { models: merged })
-      }
-    } catch (e) {
-      console.warn(`[oauth-models] cnb auto-save failed: ${(e as Error).message}`)
-    }
     return c.json<ApiResponse>({ success: true, data: { data: models } })
   }
 
@@ -1517,23 +1501,7 @@ export async function handleOAuthModels(c: Context<AppEnv>) {
         return c.json<ApiResponse>({ success: false, message: result.message + ' --- 调试信息 --- ' + debugInfo, data: { providerId: provider.id } }, status as Parameters<typeof c.json>[1])
       }
       const models = result.models || []
-      // 自动合并保存到 provider.models（按 id 去重追加，保留已有 enabled 状态）
-      try {
-        const existing = provider.models || []
-        const existingIds = new Set(existing.map((m) => m.id))
-        const merged = [...existing]
-        for (const m of models) {
-          if (!existingIds.has(m.id)) {
-            merged.push({ id: m.id, enabled: true })
-            existingIds.add(m.id)
-          }
-        }
-        if (merged.length !== existing.length) {
-          await updateProvider(c.env, id, { models: merged })
-        }
-      } catch (e) {
-        console.warn(`[oauth-models] auto-save failed: ${(e as Error).message}`)
-      }
+      // 仅返回清单，用户手工「+」/保存后才入库
       return c.json<ApiResponse>({ success: true, data: { data: models } })
     } catch (err) {
       console.error(`[oauth-models] qoder exception:`, err)
@@ -1543,71 +1511,23 @@ export async function handleOAuthModels(c: Context<AppEnv>) {
   }
 
   // Gemini：模型列表为静态清单（参考 geminicli/internal/models/models.go），
-  // 无需请求上游；登录成功后一键拉取即可自动合并保存。
+  // 无需请求上游；仅返回清单，用户手工「+」/保存后才入库。
   if (isGeminiProvider(provider)) {
     const models = GEMINI_MODELS.map((m) => ({ id: m.id }))
-    try {
-      const existing = provider.models || []
-      const existingIds = new Set(existing.map((m) => m.id))
-      const merged = [...existing]
-      for (const m of models) {
-        if (!existingIds.has(m.id)) {
-          merged.push({ id: m.id, enabled: true })
-          existingIds.add(m.id)
-        }
-      }
-      if (merged.length !== existing.length) {
-        await updateProvider(c.env, id, { models: merged })
-      }
-    } catch (e) {
-      console.warn(`[oauth-models] gemini auto-save failed: ${(e as Error).message}`)
-    }
     return c.json<ApiResponse>({ success: true, data: { data: models } })
   }
 
   // M365 Copilot：模型清单为静态（订阅账号无公开 models 端点），
-  // 与 gemini 一致使用内置清单，登录成功后一键拉取自动合并保存。
+  // 与 gemini 一致使用内置清单；仅返回清单，用户手工「+」/保存后才入库。
   if (isM365Provider(provider)) {
     const models = M365_MODELS.map((m) => ({ id: m.id }))
-    try {
-      const existing = provider.models || []
-      const existingIds = new Set(existing.map((m) => m.id))
-      const merged = [...existing]
-      for (const m of models) {
-        if (!existingIds.has(m.id)) {
-          merged.push({ id: m.id, enabled: true })
-          existingIds.add(m.id)
-        }
-      }
-      if (merged.length !== existing.length) {
-        await updateProvider(c.env, id, { models: merged })
-      }
-    } catch (e) {
-      console.warn(`[oauth-models] m365 auto-save failed: ${(e as Error).message}`)
-    }
     return c.json<ApiResponse>({ success: true, data: { data: models } })
   }
 
   // WorkBuddy/CodeBuddy：无公开模型列表端点（实测 /console/…/models 等均返回 404），
-  // 与 gemini/cnb/m365 一致用内置静态清单，登录成功后一键拉取自动合并保存。
+  // 与 gemini/cnb/m365 一致用内置静态清单；仅返回清单，用户手工「+」/保存后才入库。
   if ((provider.authType === 'oauth-device' && provider.oauth?.flowType === 'browser') || provider.id.startsWith('workbuddy')) {
     const models = WORKBUDDY_MODELS.map((m) => ({ id: m }))
-    try {
-      const existing = provider.models || []
-      const existingIds = new Set(existing.map((m) => m.id))
-      const merged = [...existing]
-      for (const m of models) {
-        if (!existingIds.has(m.id)) {
-          merged.push({ id: m.id, enabled: true })
-          existingIds.add(m.id)
-        }
-      }
-      if (merged.length !== existing.length) {
-        await updateProvider(c.env, id, { models: merged })
-      }
-    } catch (e) {
-      console.warn(`[oauth-models] workbuddy auto-save failed: ${(e as Error).message}`)
-    }
     return c.json<ApiResponse>({ success: true, data: { data: models } })
   }
 
@@ -1683,24 +1603,7 @@ export async function handleOAuthModels(c: Context<AppEnv>) {
         if (models.length === 0) {
           return c.json<ApiResponse>({ success: false, message: '上游未返回任何模型', data: debug }, 502)
         }
-        // 自动合并保存到 provider.models（按 id 去重追加，保留已有 enabled 状态）
-        // 避免"获取模型→测试"时因未手动保存而报"模型 xxx 不存在于提供商"
-        try {
-          const existing = provider.models || []
-          const existingIds = new Set(existing.map((m) => m.id))
-          const merged = [...existing]
-          for (const m of models) {
-            if (!existingIds.has(m.id)) {
-              merged.push({ id: m.id, enabled: true })
-              existingIds.add(m.id)
-            }
-          }
-          if (merged.length !== existing.length) {
-            await updateProvider(c.env, id, { models: merged })
-          }
-        } catch (e) {
-          console.warn(`[oauth-models] auto-save failed: ${(e as Error).message}`)
-        }
+        // 仅返回清单，用户手工「+」添加并保存后才入库（不自动写 provider.models）
         return c.json<ApiResponse>({ success: true, data: { data: models } })
       }
 
