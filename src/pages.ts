@@ -1865,7 +1865,6 @@ function traeCheckin(id) {
   fetch('/admin/api/trae/' + encodeURIComponent(id) + '/checkin', { method: 'POST' }).then(r => r.json()).then(d => {
     if (!d.success) { if (st) showResult(st, false, d.message || '签到失败'); return }
     const results = d.data || []
-    renderTraeCheckin(id, results)
     if (st) showResult(st, true, '签到完成：' + results.length + ' 个账号')
     traeStatus(id)
   }).catch(() => { if (st) showResult(st, false, '网络错误，请重试') })
