@@ -680,7 +680,11 @@ async function proxyAnthropicNativeUpstream(
   cleanBase = cleanBase.replace(/\/v1\/?$/, '')
   const forwardUrl = `${cleanBase}/v1/messages`
 
-  const upstreamBody = openAIRequestToAnthropic(openaiBody)
+  // 思考预算钳制：部分 Anthropic 兼容端点（商汤日日新 senseNova）对 thinking.budget_tokens
+  // 有严格上限（实测 ≤1024），超限会被拒绝（Thinking.BudgetTokens invalid）。识别到该提供商时
+  // 在 OpenAI→Anthropic 出口把 reasoning_effort 换算出的预算钳到允许范围，保证工具调用链路可用。
+  const isSensenova = String(provider.id).toLowerCase() === 'sensenova' || (provider.baseUrl || '').toLowerCase().includes('sensenova')
+  const upstreamBody = openAIRequestToAnthropic(openaiBody, isSensenova ? { maxThinkingBudgetTokens: 1024 } : undefined)
 
   // R3 风格多 Key 顺序 failover：单 key 故障（HTTP 非 2xx 或网络异常）自动切换下一个
   let response: Response | undefined

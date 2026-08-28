@@ -1329,7 +1329,18 @@ function mapAnthropicStopReason(stopReason: string | undefined): string | null {
  * 内部保持 OpenAI 规范格式（消息/工具/注入等中间件都作用于 OpenAI 形态），
  * 在出口处转回 Anthropic 发送给 api.anthropic.com。
  */
-export function openAIRequestToAnthropic(openaiReq: Record<string, unknown>): Record<string, unknown> {
+/** Anthropic 原生上游转换选项。 */
+export interface AnthropicUpstreamOptions {
+  /**
+   * 思考预算上限（个 token）。部分 Anthropic 兼容端点（如商汤日日新 senseNova）
+   * 只允许 thinking.budget_tokens ≤ 上限（实测 1024），超过会被拒绝：
+   * "field Thinking.BudgetTokens invalid, should be at most 1024"。
+   * 设置后 reasoning_effort 换算出的预算会被钳制到该值；不设则不限制。
+   */
+  maxThinkingBudgetTokens?: number
+}
+
+export function openAIRequestToAnthropic(openaiReq: Record<string, unknown>, opts?: AnthropicUpstreamOptions): Record<string, unknown> {
   const messages = (openaiReq['messages'] as Array<Record<string, unknown>>) || []
   const systemParts: string[] = []
   const anthropicMessages: Array<{ role: 'user' | 'assistant'; content: string | AnthropicContentBlock[] }> = []
@@ -1482,15 +1493,16 @@ export function openAIRequestToAnthropic(openaiReq: Record<string, unknown>): Re
     const level = String(re).trim().toLowerCase()
     if (level === 'none' || level === 'off' || level === 'disabled' || level === 'minimal') {
       body['thinking'] = { type: 'disabled' }
-    } else if (level === 'low') {
-      body['thinking'] = { type: 'enabled', budget_tokens: 2048 }
-    } else if (level === 'high') {
-      body['thinking'] = { type: 'enabled', budget_tokens: 16384 }
-    } else if (level === 'ultra' || level === 'max' || level === 'extreme' || level === 'super' || level === 'x') {
-      body['thinking'] = { type: 'enabled', budget_tokens: 32768 }
     } else {
-      // medium 及未识别值
-      body['thinking'] = { type: 'enabled', budget_tokens: 8192 }
+      let budget: number
+      if (level === 'low') budget = 2048
+      else if (level === 'high') budget = 16384
+      else if (level === 'ultra' || level === 'max' || level === 'extreme' || level === 'super' || level === 'x') budget = 32768
+      else budget = 8192 // medium 及未识别值
+      // 兼容端点思考预算上限（如 senseNova 只允许 ≤1024）：超限钳制，避免被上游拒绝
+      const cap = opts?.maxThinkingBudgetTokens
+      if (cap && cap > 0 && budget > cap) budget = cap
+      body['thinking'] = { type: 'enabled', budget_tokens: budget }
     }
   }
 
