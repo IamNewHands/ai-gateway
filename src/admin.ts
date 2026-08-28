@@ -641,6 +641,45 @@ export async function handleTestKeyNew(c: Context<AppEnv>) {
     }
   }
 
+  // 商汤日日新（SenseNova）：模型列表统一在 https://token.sensenova.cn/v1/models。
+  // OpenAI 配置 baseUrl 已带 /v1（拼 /models 正确）；Anthropic 配置 baseUrl 为根域
+  // https://token.sensenova.cn（无 /v1），直接拼 /models 会 404。这里统一从 origin 拼 /v1/models。
+  // 鉴权 OpenAI 与 Anthropic 共用同一 API Key，均以 Authorization: Bearer 传递。
+  if (providerId === 'sensenova' || /token\.sensenova\.cn/.test(url)) {
+    let origin = ''
+    try { origin = new URL(url).origin } catch { /* ignore */ }
+    if (!origin) origin = 'https://token.sensenova.cn'
+    const modelsUrl = `${origin}/v1/models`
+    try {
+      const response = await fetch(modelsUrl, {
+        method: 'GET', headers: { 'Authorization': `Bearer ${apiKey}` }, signal: AbortSignal.timeout(15000),
+      })
+      let errBody = ''
+      if (response.ok) {
+        const body = await response.json().catch(() => null)
+        const models = parseModelList(body)
+        return c.json<ApiResponse>({
+          success: true,
+          data: { success: true, statusCode: 200, data: { data: models }, message: '' },
+        })
+      }
+      try {
+        const raw = await response.text()
+        errBody = raw.substring(0, 1000)
+        await writeLog(c.env, 'error', `[test-key] ${modelsUrl} → ${response.status}`, errBody)
+      } catch { /* ignore */ }
+      return c.json<ApiResponse>({
+        success: true,
+        data: { success: false, statusCode: response.status, message: `HTTP ${response.status}: ${errBody}` },
+      })
+    } catch (err) {
+      return c.json<ApiResponse>({
+        success: true,
+        data: { success: false, statusCode: 0, message: (err as Error).message || '连接失败' },
+      })
+    }
+  }
+
   const resolvedUrl = resolveProviderBaseUrl(c.env, url)
   if (!resolvedUrl) {
     return c.json<ApiResponse>({ success: false, message: 'baseUrl 含 {CF_ACCOUNT_ID} 占位符，但环境变量 CF_ACCOUNT_ID 未配置' }, 400)

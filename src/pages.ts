@@ -69,6 +69,10 @@ const escapePageJsx = (value: unknown) => escapePageHtml(escapePageJs(value))
 const isTraeProviderUI = (p: { id?: string; baseUrl?: string }) =>
   p.id === 'trae' || (typeof p.baseUrl === 'string' && p.baseUrl.includes('trae'))
 
+/** 是否商汤日日新（SenseNova）提供商（id 固定或用 token.sensenova.cn 域，与 src/admin.ts 对齐） */
+const isSensenovaProviderUI = (p: { id?: string; baseUrl?: string }) =>
+  p.id === 'sensenova' || (typeof p.baseUrl === 'string' && p.baseUrl.includes('token.sensenova.cn'))
+
 // UX8：厂商预设与 OAuth 预置模板——单一数据源。
 // SSR 下拉 option 与客户端 applyProviderPreset / applyOauthPreset* 共用，
 // 注入为页面 script 常量，消除服务端/客户端两套重复预设表。
@@ -86,6 +90,9 @@ const PROVIDER_PRESETS: Record<string, { name: string; id: string; baseUrl: stri
   volcengine:   { name: '火山方舟',            id: 'volcengine',   baseUrl: 'https://ark.cn-beijing.volces.com/api/v3',          apiType: 'openai' },
   qianfan:      { name: '百度千帆',            id: 'qianfan',      baseUrl: 'https://qianfan.baidubce.com/v2',                   apiType: 'openai' },
   openrouter:   { name: 'OpenRouter',         id: 'openrouter',   baseUrl: 'https://openrouter.ai/api/v1',                      apiType: 'openai' },
+  sensenova:    { name: '商汤日日新 (SenseNova)', id: 'sensenova', baseUrl: 'https://token.sensenova.cn/v1',                    apiType: 'openai',
+    models: ['sensenova-6.8-flash-lite', 'deepseek-v4-flash', 'deepseek-v4-pro', 'glm-5.2', 'kimi-k3'],
+  },
   'cloudflare-ai': { name: 'Cloudflare Workers AI', id: 'cloudflare-ai', baseUrl: 'https://api.cloudflare.com/client/v4/accounts/{CF_ACCOUNT_ID}/ai/v1', apiType: 'openai',
     models: ['@cf/meta/llama-3.3-70b-instruct-fp8-fast', '@cf/meta/llama-3.1-8b-instruct-fp8-fast', '@cf/meta/llama-4-scout-17b-16e-instruct', '@cf/mistralai/mistral-small-3.1-24b-instruct', '@cf/zai-org/glm-4.7-flash', '@cf/google/gemma-4-26b-a4b-it', '@cf/nvidia/nemotron-3-120b-a12b', '@cf/deepseek-ai/deepseek-r1-distill-qwen-32b'],
   },
@@ -564,7 +571,7 @@ ${H('管理')}
               </div>
               <fieldset class="form-group" id="atb-fs-${escapePageHtml(p.id)}"><legend>工具桥</legend><label class="switch-label"><span>启用工具桥（XYML 提示词注入 + 流式解析回 tool_calls，仅 CNB 需要）</span><span class="tg"><input type="checkbox" id="atb-${escapePageHtml(p.id)}" ${p.toolBridge?'checked':''}><span class="sl"></span></span></label></fieldset>
               <fieldset class="form-group" id="aum-fs-${escapePageHtml(p.id)}"><legend>模型策略</legend><label class="switch-label"><span>允许未配置模型透传——开启后请求该提供商的任意 modelId 都直接转发（跳过「未配置」校验），适合模型频繁上架、不想每次手动加模型的提供商（如 OpenRouter）。</span><span class="tg"><input type="checkbox" id="aum-${escapePageHtml(p.id)}" ${p.allowUnlistedModels?'checked':''}><span class="sl"></span></span></label></fieldset>
-              <div class="detail-actions"><div id="tr-${escapePageHtml(p.id)}" aria-live="polite"></div><div>${((p.id === 'cnb' || (p.baseUrl && p.baseUrl.indexOf('cnb.cool') !== -1)) || ((p.oauth && (p.oauth.flowType === 'm365-pkce' || p.oauth.flowType === 'm365-ropc')))) ? '<button class="btn btn-s" onclick="fetchOauthModels(\'' + escapePageJsx(p.id) + '\')"><i class="fas fa-download" aria-hidden="true"></i>获取模型</button>' : ((p.apiType === 'openai' || p.id === 'cline' || p.id === 'opencode') && !isTraeProviderUI(p)) ? '<button class="btn btn-s" onclick="fetchEditModels(\'' + escapePageJsx(p.id) + '\')"><i class="fas fa-download" aria-hidden="true"></i>获取模型</button>' : ''}${p.id === 'cline' ? '<button class="btn btn-s" onclick="clineOAuthConnect(\'' + escapePageJsx(p.id) + '\')"><i class="fas fa-sign-in-alt" aria-hidden="true"></i>一键授权获取 Token</button>' : ''}<button class="btn btn-d" onclick="del('${escapePageJsx(p.id)}')"><i class="fas fa-trash" aria-hidden="true"></i>删除</button><button class="btn btn-p" onclick="save('${escapePageJsx(p.id)}')"><i class="fas fa-save" aria-hidden="true"></i>保存更改</button></div></div>
+              <div class="detail-actions"><div id="tr-${escapePageHtml(p.id)}" aria-live="polite"></div><div>${((p.id === 'cnb' || (p.baseUrl && p.baseUrl.indexOf('cnb.cool') !== -1)) || ((p.oauth && (p.oauth.flowType === 'm365-pkce' || p.oauth.flowType === 'm365-ropc')))) ? '<button class="btn btn-s" onclick="fetchOauthModels(\'' + escapePageJsx(p.id) + '\')"><i class="fas fa-download" aria-hidden="true"></i>获取模型</button>' : ((isSensenovaProviderUI(p) || p.apiType === 'openai' || p.id === 'cline' || p.id === 'opencode') && !isTraeProviderUI(p)) ? '<button class="btn btn-s" onclick="fetchEditModels(\'' + escapePageJsx(p.id) + '\')"><i class="fas fa-download" aria-hidden="true"></i>获取模型</button>' : ''}${p.id === 'cline' ? '<button class="btn btn-s" onclick="clineOAuthConnect(\'' + escapePageJsx(p.id) + '\')"><i class="fas fa-sign-in-alt" aria-hidden="true"></i>一键授权获取 Token</button>' : ''}<button class="btn btn-d" onclick="del('${escapePageJsx(p.id)}')"><i class="fas fa-trash" aria-hidden="true"></i>删除</button><button class="btn btn-p" onclick="save('${escapePageJsx(p.id)}')"><i class="fas fa-save" aria-hidden="true"></i>保存更改</button></div></div>
             </div>
           </article>`).join('') : `<div class="empty-state"><i class="fas fa-server" aria-hidden="true"></i><h3>还没有提供商</h3><p>添加第一个上游提供商，配置 API 地址、Key 和模型。</p><button class="btn btn-p" onclick="showAdd()">添加提供商</button></div>`}
         </div>
