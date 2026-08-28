@@ -17,6 +17,7 @@ import { TRAE_DEFAULT_MODEL, TRAE_KEEPALIVE_MS, TRAE_STATIC_MODEL_IDS, TRAE_STRE
 import { chatStream, exchangeToken, needsTraeRefresh, parseAuth } from './upstream'
 import { aggregateSoloSse, soloStreamToOpenAIStream } from './sse'
 import type { SOLOStreamError } from './types'
+import { writeLog } from '../admin'
 import {
   cooldownTraeAccount,
   disableTraeAccount,
@@ -271,10 +272,20 @@ export async function proxyTraeChatRequest(
       const perf = await getPerfSettings(env)
       const keepAliveMs = perf.keepAliveMs > 0 ? perf.keepAliveMs : TRAE_KEEPALIVE_MS
       const idleTimeoutMs = perf.idleTimeoutMs || TRAE_STREAM_IDLE_TIMEOUT_MS
+      const startedAt = Date.now()
       const sseBody = withSSEKeepAlive(
         soloStreamToOpenAIStream(resp.body, configName, onErr),
         keepAliveMs,
-        idleTimeoutMs
+        idleTimeoutMs,
+        (reason) => {
+          // 流结束态诊断：区分 上游自然读完(complete) / 空闲超时(idle) / 客户端断开(cancel) / 读体异常(error)。
+          // 用于排查"回答中途停住"——若 9 分多钟那次的结束态是 cancel，说明是客户端掐断；
+          // idle 说明上游长时间无数据被 idle 兜底；complete 则是上游正常收尾。
+          const secs = Math.round((Date.now() - startedAt) / 1000)
+          const msg = `[trae-stream] provider=${provider.id} uid=${account.uid} model=${configName} end=${reason} duration=${secs}s`
+          console.log(msg)
+          writeLog(env, 'info', msg).catch(() => { /* 日志失败不影响流 */ })
+        }
       )
       return new Response(sseBody, {
         status: resp.status,

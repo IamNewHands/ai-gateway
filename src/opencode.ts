@@ -186,21 +186,31 @@ export function isEventStreamResponse(response: Response): boolean {
  *    `: keep-alive\n\n` 注释行。SSE 注释行客户端会忽略但能重置 idle 计时器。
  * 2. idle 兜底：上游超过 idleTimeoutMs 无任何数据时主动结束流，防止无限挂起。
  */
+/** 流式结束态：complete=上游自然读完 / idle=空闲超时结束 / cancel=客户端断开 / error=读 body 异常 */
+export type StreamCloseReason = 'complete' | 'idle' | 'cancel' | 'error'
+
 export function withSSEKeepAlive(
   body: ReadableStream<Uint8Array>,
   keepAliveMs: number,
-  idleTimeoutMs: number
+  idleTimeoutMs: number,
+  onClose?: (reason: StreamCloseReason) => void
 ): ReadableStream<Uint8Array> {
   const reader = body.getReader()
   const encoder = new TextEncoder()
   let closed = false
   let lastOutputAt = Date.now()
 
-  const finish = (controller: ReadableStreamDefaultController<Uint8Array>) => {
+  const notify = (reason: StreamCloseReason) => {
+    if (!onClose) return
+    try { onClose(reason) } catch { /* 回调异常不影响流收尾 */ }
+  }
+
+  const finish = (controller: ReadableStreamDefaultController<Uint8Array>, reason: StreamCloseReason) => {
     if (closed) return
     closed = true
     try { controller.close() } catch { /* ignore */ }
     reader.cancel().catch(() => { /* ignore */ })
+    notify(reason)
   }
 
   return new ReadableStream<Uint8Array>({
@@ -210,7 +220,7 @@ export function withSSEKeepAlive(
 
       const armIdle = () => {
         if (idleTimer) clearTimeout(idleTimer)
-        idleTimer = setTimeout(() => finish(controller), idleTimeoutMs)
+        idleTimer = setTimeout(() => finish(controller, 'idle'), idleTimeoutMs)
       }
       const armHeartbeat = () => {
         if (keepAliveMs <= 0) return
@@ -229,6 +239,7 @@ export function withSSEKeepAlive(
       armIdle()
       armHeartbeat()
 
+      let readError = false
       try {
         while (!closed) {
           const { done, value } = await reader.read()
@@ -237,12 +248,15 @@ export function withSSEKeepAlive(
           armIdle()
           controller.enqueue(value)
         }
-      } catch { /* abort / 读错误：结束流 */ }
-      finish(controller)
+      } catch { /* abort / 读错误：结束流 */ readError = true }
+      // 自然 EOF 为 complete；读 body 抛错为 error
+      finish(controller, readError ? 'error' : 'complete')
     },
     cancel() {
+      if (closed) return
       closed = true
       reader.cancel().catch(() => { /* ignore */ })
+      notify('cancel')
     },
   })
 }
