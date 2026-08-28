@@ -692,7 +692,13 @@ async function proxyAnthropicNativeUpstream(
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
+          // 同时携带两种认证头以兼容不同上游：
+          // - 官方 api.anthropic.com 认 x-api-key；
+          // - SenseNova 等第三方 Anthropic 兼容端点（https://platform.sensenova.cn/docs）
+          //   要求 Authorization: Bearer <key>，忽略 x-api-key，否则返回 code 16
+          //   "Authorization Not Found"。两个头都带，两端互不冲突。
           'x-api-key': key.key,
+          'Authorization': `Bearer ${key.key}`,
           'anthropic-version': '2023-06-01',
           'anthropic-dangerous-direct-browser-access': 'true',
           ...buildPassthroughHeaders(c),

@@ -132,6 +132,8 @@ anthropic-version: 2023-06-01
 anthropic-dangerous-direct-browser-access: true
 ```
 
+同时也携带 `Authorization: Bearer <key>`，以兼容 SenseNova（https://platform.sensenova.cn/docs）等第三方「Anthropic 兼容」端点——这类端点要求 `Authorization: Bearer`，忽略 `x-api-key`（否则返回 `code 16: Authorization Not Found`）。与官方 `api.anthropic.com` 同时发送两者互不冲突。
+
 - 请求路径固定为 `${cleanBase}/v1/messages`（baseUrl 兼容 `https://api.anthropic.com` 与 `https://api.anthropic.com/v1` 两种写法）。
 - 多 Key 顺序 failover：单 Key 故障（HTTP 非 2xx / 网络异常）自动切换下一个。
 - 客户端透传头（`x-` / `anthropic-` / `user-` 前缀）仍会原样透传给上游。
