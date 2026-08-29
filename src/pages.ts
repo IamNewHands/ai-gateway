@@ -167,7 +167,7 @@ const OAUTH_PRESETS: Record<string, { label: string; flowType: string; deviceCod
     refreshTokenUrl: '',
     clientId: '',
     clientSecret: '',
-    scope: 'openid email profile https://www.googleapis.com/auth/cloud-platform https://www.googleapis.com/auth/userinfo.email https://www.googleapis.com/auth/userinfo.profile cclog experimentsandconfigs',
+    scope: 'openid email profile https://www.googleapis.com/auth/cloud-platform https://www.googleapis.com/auth/userinfo.email https://www.googleapis.com/auth/userinfo.profile',
     tokenHeader: 'Authorization',
     tokenHeaderPrefix: 'Bearer ',
     extraHeaders: {},

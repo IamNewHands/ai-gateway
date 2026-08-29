@@ -756,8 +756,6 @@ export const GEMINI_OAUTH = {
     'https://www.googleapis.com/auth/cloud-platform',
     'https://www.googleapis.com/auth/userinfo.email',
     'https://www.googleapis.com/auth/userinfo.profile',
-    'cclog',
-    'experimentsandconfigs',
   ].join(' '),
 }
 
