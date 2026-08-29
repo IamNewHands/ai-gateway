@@ -1575,6 +1575,7 @@ function oauthPoolStatus(id) {
     if (!d.success) { if (st) showResult(st, false, d.message || '查询失败'); return }
     const pool = (d.data && d.data.pool) || []
     if (st) showResult(st, true, '共 ' + pool.length + ' 个账号')
+    const preferUid = (d.data && d.data.preferUid) || ''
     // 从签到状态里找本提供商的逐账号明细（data.workbuddy[].providerId === id）
     let ciAccounts = []
     if (cd && cd.success && cd.data && Array.isArray(cd.data.workbuddy)) {
@@ -1591,19 +1592,30 @@ function oauthPoolStatus(id) {
       // 均缺失时挂到序号上（账号数一致时按池顺序对齐，最后兜底）
       a.__idx = ai
     })
-    renderOauthPoolAccounts(id, pool, ciByUid, ciByNick, ciAccounts)
+    renderOauthPoolAccounts(id, pool, ciByUid, ciByNick, ciAccounts, preferUid)
   }).catch(() => { if (st) showResult(st, false, '查询失败') })
 }
-function renderOauthPoolAccounts(id, accs, ciByUid, ciByNick, ciAccounts) {
+function renderOauthPoolAccounts(id, accs, ciByUid, ciByNick, ciAccounts, preferUid) {
   const box = document.getElementById('wbp-acc-' + id)
   if (!box) return
   if (!accs.length) { box.innerHTML = '<p class="mu">账号池为空：点「发起连接」每登录一个 WorkBuddy 账号即自动加入（可登录多个账号）。</p>'; return }
+  preferUid = preferUid || ''
   ciByUid = ciByUid || {}
   ciByNick = ciByNick || {}
   ciAccounts = ciAccounts || []
+  // 首选账号下拉（对齐 TRAE 面板的手工指定交互）：留空 = 按剩余积分自动挑选
+  const opts = ['<option value="">自动挑选（按积分）</option>'].concat(accs.map(function (a) {
+    const sel = a.uid === preferUid ? ' selected' : ''
+    return '<option value="' + escapeHtml(a.uid) + '"' + sel + '>' + escapeHtml((a.nickname || a.uid)) + '</option>'
+  })).join('')
+  const preferBar = '<div class="fc mt-1 field-row" style="align-items:center;gap:8px"><label style="margin:0;white-space:nowrap">首选账号：</label>' +
+    '<select id="wbp-prefer-' + escapeHtml(id) + '" class="select-sm" style="max-width:280px">' + opts + '</select>' +
+    '<button class="btn btn-s btn-xs" onclick="oauthPoolSetPrefer(\\'' + escapeJsAttr(id) + '\\')">指定</button>' +
+    '<button class="btn btn-gh btn-xs" onclick="oauthPoolSetPrefer(\\'' + escapeJsAttr(id) + '\\',\\'\\')">恢复自动</button>' +
+    '<span id="wbp-prefer-msg-' + escapeHtml(id) + '"></span></div>'
   // 旧 KV 签到数据无 uid 且昵称可能两侧均空：账号数一致时按池顺序对齐作最后兜底
   const idxFallback = ciAccounts.length === accs.length ? ciAccounts : null
-  box.innerHTML = accs.map(function(a, i) {
+  box.innerHTML = preferBar + accs.map(function(a, i) {
     const badge = a.disabled ? '<span class="bd bd-off">已禁用</span>' : (a.cooling ? '<span class="bd bd-off">冷却中</span>' : '<span class="bd bd-on">健康</span>')
     // 签到结果匹配：uid → nickname → 顺序兜底（仅账号数一致时）
     const ci = ciByUid[a.uid] || (a.nickname && ciByNick[a.nickname]) || (idxFallback ? idxFallback[i] : null)
@@ -1665,6 +1677,23 @@ function oauthPoolRemove(id, uid) {
       }
     }).catch(function() { toast('移除失败', 'error') })
   })
+}
+// WorkBuddy 多账号池：设置首选账号（对齐 TRAE 面板交互；forcedUid 传入 '' 恢复自动挑选）
+function oauthPoolSetPrefer(id, forcedUid) {
+  const sel = document.getElementById('wbp-prefer-' + id)
+  const msg = document.getElementById('wbp-prefer-msg-' + id)
+  const uid = (forcedUid !== undefined ? forcedUid : ((sel || {}).value || '')).trim()
+  if (msg) msg.textContent = ''
+  fetch('/admin/api/oauth/' + encodeURIComponent(id) + '/pool/prefer', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ uid: uid }),
+  }).then(r => r.json()).then(function(d) {
+    if (!d.success) { if (msg) { msg.textContent = (d.message || '设置失败'); msg.style.color = 'var(--color-danger,#ef4444)' } return }
+    if (msg) { msg.textContent = (d.message || '已设置'); msg.style.color = 'var(--color-success,#16a34a)' }
+    if (sel) sel.value = uid
+    setTimeout(function () { oauthPoolStatus(id) }, 800)
+  }).catch(function() { if (msg) { msg.textContent = '网络错误，请重试'; msg.style.color = 'var(--color-danger,#ef4444)' } })
 }
 
 // ===== Qoder 多账号池：状态 / 移除 =====

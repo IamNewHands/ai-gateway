@@ -1164,6 +1164,7 @@ export async function handleOAuthStatus(c: Context<AppEnv>) {
   if (isOAuthPoolProvider(provider)) {
     try { await seedOauthPoolFromSingle(c.env, id) } catch { /* ignore */ }
     data.pool = await listOauthPoolStatus(c.env, id)
+    data.preferUid = provider.preferOauthUid || ''
   }
   // QoderWork 多账号池：返回池账号状态（脱敏）供面板展示
   if (provider.oauth?.flowType === 'qoder' || isQoderProvider(provider.id)) {
@@ -1194,6 +1195,27 @@ export async function handleOAuthPoolRemove(c: Context<AppEnv>) {
     : await removeOauthAccount(c.env, id, uid)
   if (!removed) return c.json<ApiResponse>({ success: false, message: '账号不存在' }, 404)
   return c.json<ApiResponse>({ success: true, message: '已从账号池删除 ' + uid })
+}
+
+/** POST /admin/api/oauth/:id/pool/prefer：设置首选账号（面板下拉框指定，留空则恢复自动挑选）。 */
+export async function handleOAuthPoolSetPrefer(c: Context<AppEnv>) {
+  const id = c.req.param('id')
+  if (!id) return c.json<ApiResponse>({ success: false, message: '缺少 id 参数' }, 400)
+  const provider = await getProvider(c.env, id)
+  if (!provider) return c.json<ApiResponse>({ success: false, message: '提供商不存在' }, 404)
+  const isQoder = provider.oauth?.flowType === 'qoder' || isQoderProvider(provider.id)
+  if (!isOAuthPoolProvider(provider) && !isQoder) {
+    return c.json<ApiResponse>({ success: false, message: '该提供商不是多账号池模式' }, 400)
+  }
+  const body = await c.req.json<{ uid?: string }>().catch(() => ({})) as { uid?: string }
+  const uid = String(body?.uid || '').trim()
+  // 校验 uid 必须是池内账号，防止乱填
+  if (uid) {
+    const uids = (await listOauthPoolStatus(c.env, id)).map(a => String(a.uid))
+    if (!uids.includes(uid)) return c.json<ApiResponse>({ success: false, message: '账号不存在' }, 400)
+  }
+  await updateProvider(c.env, id, { preferOauthUid: uid || undefined })
+  return c.json<ApiResponse>({ success: true, message: uid ? '已指定首选账号 ' + uid : '已恢复自动挑选' })
 }
 
 /** 发起 OAuth 设备码授权流程，返回授权链接与用户码 */

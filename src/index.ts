@@ -25,6 +25,7 @@ import {
   handleOAuthPoll,
   handleOAuthDisconnect,
   handleOAuthPoolRemove,
+  handleOAuthPoolSetPrefer,
   handleOAuthModels,
   handleClineModelSync,
   handleOAuthGeminiCallback,
@@ -176,6 +177,8 @@ app.post('/admin/api/oauth/:id/poll', handleOAuthPoll)
 app.post('/admin/api/oauth/:id/disconnect', handleOAuthDisconnect)
 // WorkBuddy 多账号池：删除池内指定 uid 账号
 app.post('/admin/api/oauth/:id/pool/remove', handleOAuthPoolRemove)
+// WorkBuddy 多账号池：设置首选账号（面板手工指定，留空恢复自动挑选）
+app.post('/admin/api/oauth/:id/pool/prefer', handleOAuthPoolSetPrefer)
 // S5：模型拉取有副作用（请求上游并自动合并保存到 provider.models），改 POST 防链接型 CSRF
 app.post('/admin/api/oauth/:id/models', handleOAuthModels)
 // Cline 动态模型同步（item6）

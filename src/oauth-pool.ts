@@ -150,14 +150,23 @@ export async function upsertOauthAccount(
   return pool
 }
 
-/** 挑号：healthy + 未 tried 中剩余积分最多者优先。 */
+/**
+ * 挑号：healthy + 未 tried 中剩余积分最多者优先；
+ * 若指定 preferUid（面板手工指定），且该 uid 账号 healthy 且尚未 tried，则优先返回它。
+ */
 export async function pickOauthAccount(
   env: Env,
   providerId: string,
-  tried: Set<string>
+  tried: Set<string>,
+  preferUid?: string
 ): Promise<OAuthPoolAccount | null> {
   const pool = await readOauthPool(env, providerId)
   const now = Date.now()
+  // 手工指定优先：精确匹配首选 uid，只在 healthy 且未 tried 时采用
+  if (preferUid) {
+    const preferred = pool.find(a => a.uid === preferUid && !tried.has(a.uid) && isOauthAccountHealthy(a, now))
+    if (preferred) return preferred
+  }
   let best: OAuthPoolAccount | null = null
   let bestCredits = -Infinity
   for (const a of pool) {

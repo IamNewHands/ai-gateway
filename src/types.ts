@@ -78,6 +78,12 @@ export interface Provider {
    */
   preferTraeUid?: string
   /**
+   * WorkBuddy/Qoder 多账号池首选账号 UID（面板下拉框手工指定，仅 OAuth pool 提供商生效）。
+   * 填写后转发时优先使用该账号（按 uid 精确匹配），
+   * 被冷却/禁用/失败时才回退到池内其他账号。留空 = 维持按剩余积分自动挑选。
+   */
+  preferOauthUid?: string
+  /**
    * 思维模式引导注入（provider 级勾选哪些模型启用）。
    * 值为需注入的模型 ID 数组（如 ['deepseek-v4-flash']）。命中的模型在转发前会被注入
    * 一段固定的思维引导 system 提示词（见 src/thinking.ts），未勾选的模型原样转发。

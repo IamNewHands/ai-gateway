@@ -1709,7 +1709,7 @@ async function proxyOAuthRequestPooledCore(
   let lastErr: Error | null = null
 
   for (let i = 0; i < MAX_OAUTH_ROTATE; i++) {
-    const account = await pickOauthAccount(c.env, provider.id, tried)
+    const account = await pickOauthAccount(c.env, provider.id, tried, i === 0 ? provider.preferOauthUid : undefined)
     if (!account) break
     tried.add(account.uid)
 
