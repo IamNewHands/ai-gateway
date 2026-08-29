@@ -204,6 +204,11 @@ function sanitizeBlockedTemplates(body: Record<string, unknown>): void {
 function sanitizeUpstreamBody(body: Record<string, unknown>): void {
   // 删除 reasoning_effort
   delete body['reasoning_effort']
+  // 删除 thinking（Anthropic 专用字段；Procedural/OpenAI 兼容上游（如 Google Gemini OpenAI 端点）
+  // 不认识该字段，会返回 Invalid JSON payload Unknown name "thinking"）
+  if (body['thinking'] !== undefined) {
+    delete body['thinking']
+  }
 
   const messages = body['messages'] as any[]
   if (!Array.isArray(messages)) return
