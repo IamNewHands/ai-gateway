@@ -167,7 +167,7 @@ const OAUTH_PRESETS: Record<string, { label: string; flowType: string; deviceCod
     refreshTokenUrl: '',
     clientId: '',
     clientSecret: '',
-    scope: 'https://www.googleapis.com/auth/cloud-platform https://www.googleapis.com/auth/userinfo.email https://www.googleapis.com/auth/userinfo.profile',
+    scope: 'openid email profile https://www.googleapis.com/auth/cloud-platform https://www.googleapis.com/auth/userinfo.email https://www.googleapis.com/auth/userinfo.profile cclog experimentsandconfigs',
     tokenHeader: 'Authorization',
     tokenHeaderPrefix: 'Bearer ',
     extraHeaders: {},
@@ -1789,12 +1789,8 @@ function oauthConnect(id) {
     return
   }
   if (isGemini) {
-    // 凭据可从环境变量读取（GEMINI_OAUTH_CLIENT_ID / GEMINI_OAUTH_CLIENT_SECRET），
-    // 表单留空时后端回退环境变量，故这里不强制
-    if (!oauth.clientId && !oauth.clientSecret) {
-      st.textContent = '请填写 Gemini Client ID / Client Secret，或配置环境变量 GEMINI_OAUTH_CLIENT_ID / GEMINI_OAUTH_CLIENT_SECRET'
-      return
-    }
+    // 凭据可留空：后端按「表单 → 环境变量 → gemini-cli 公开凭据」顺序兜底，
+    // 无需用户填写即可直接用谷歌账号登录（详见 src/oauth.ts geminiClientCreds）
   } else if (isM365ROPC) {
     // ROPC 无需发起授权，直接弹账号密码表单
     st.textContent = '请输入 M365 企业订阅账号与密码'
