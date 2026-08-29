@@ -748,6 +748,13 @@ export const GEMINI_OAUTH = {
   projectsUrl: 'https://cloudresourcemanager.googleapis.com/v1/projects',
   codeAssistBaseUrl: 'https://cloudcode-pa.googleapis.com',
   codeAssistVersion: 'v1internal',
+  // codeassist 上游端点逐级回退（参考 Antigravity-Manager UpstreamClient）：
+  // Sandbox 优先（对个人账号更宽容、规避 429）→ Daily → Prod 兜底
+  codeAssistBaseUrls: [
+    'https://daily-cloudcode-pa.sandbox.googleapis.com',
+    'https://daily-cloudcode-pa.googleapis.com',
+    'https://cloudcode-pa.googleapis.com',
+  ],
   redirectUri: 'http://127.0.0.1:8089/oauth2callback',
   scope: [
     'openid',
@@ -1065,13 +1072,17 @@ async function geminiFetchProjectIDs(accessToken: string): Promise<string[]> {
 }
 
 /**
- * 解析 CodeAssist 项目 ID（参考插件 auth/oauth.go setupCodeAssist）：
- * loadCodeAssist 拿默认 tier 与已绑定项目 → 未绑定则 onboardUser 自动发现 →
+ * 解析 CodeAssist 项目 ID。
+ * 参考 Antigravity-Manager 的 fetch_project_id：
+ * 用 loadCodeAssist（ideType=ANTIGRAVITY）取 cloudaicompanionProject，
+ * Sandbox 域名优先（对个人账号更宽容、规避 429），失败逐级回退 Daily/Prod。
  * 仍失败回退到项目列表第一个。全部失败返回 null（不阻塞登录）。
  */
 async function geminiResolveProjectId(accessToken: string, fallbackProjects: string[]): Promise<string> {
-  const base = `${GEMINI_OAUTH.codeAssistBaseUrl}/${GEMINI_OAUTH.codeAssistVersion}`
-  const metadata = { ideType: 'IDE_UNSPECIFIED', platform: 'PLATFORM_UNSPECIFIED', pluginType: 'GEMINI' }
+  // 优先用 Sandbox 域名（Antigravity 实测稳定且对个人账号友好）
+  const bases = GEMINI_OAUTH.codeAssistBaseUrls
+  const version = GEMINI_OAUTH.codeAssistVersion
+  const metadata = { ideType: 'ANTIGRAVITY', platform: 'PLATFORM_UNSPECIFIED', pluginType: 'GEMINI' }
   const headers = {
     Accept: 'application/json',
     Authorization: `Bearer ${accessToken}`,
@@ -1080,37 +1091,40 @@ async function geminiResolveProjectId(accessToken: string, fallbackProjects: str
     'X-Goog-Api-Client': GEMINI_API_CLIENT_HEADER,
   }
 
-  const call = async (endpoint: string, body: unknown): Promise<any> => {
-    const res = await fetch(`${base}:${endpoint}`, {
-      method: 'POST',
-      headers,
-      body: JSON.stringify(body),
-      signal: AbortSignal.timeout(30000),
-    })
-    if (!res.ok) {
-      const text = await res.text()
-      throw new Error(`HTTP ${res.status}: ${text.substring(0, 200)}`)
+  // 遍历所有回退端点，逐级尝试 loadCodeAssist → onboardUser
+  for (const base of bases) {
+    const call = async (endpoint: string, body: unknown): Promise<any> => {
+      const res = await fetch(`${base}/${version}:${endpoint}`, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify(body),
+        signal: AbortSignal.timeout(30000),
+      })
+      if (!res.ok) {
+        const text = await res.text()
+        throw new Error(`HTTP ${res.status}: ${text.substring(0, 200)}`)
+      }
+      return res.json()
     }
-    return res.json()
-  }
 
-  try {
-    // 1. loadCodeAssist：老账号直接带出已绑定的 cloudaicompanionProject
-    const loadResp = await call('loadCodeAssist', { metadata }) as {
-      allowedTiers?: Array<{ id?: string; isDefault?: boolean }>
-      cloudaicompanionProject?: unknown
-    }
-    let projectId = geminiProjectFromValue(loadResp?.cloudaicompanionProject)
-    if (projectId) return projectId
-
-    // 2. onboardUser 自动发现项目（新账号需先绑定项目）
-    const tierId = geminiDefaultTierId(loadResp?.allowedTiers)
-    const onboardResp = await call('onboardUser', { tierId, metadata }) as { done?: boolean; response?: { cloudaicompanionProject?: unknown } }
-    if (onboardResp?.done) {
-      projectId = geminiProjectFromValue(onboardResp?.response?.cloudaicompanionProject)
+    try {
+      // 1. loadCodeAssist：老账号直接带出已绑定的 cloudaicompanionProject
+      const loadResp = await call('loadCodeAssist', { metadata }) as {
+        allowedTiers?: Array<{ id?: string; isDefault?: boolean }>
+        cloudaicompanionProject?: unknown
+      }
+      let projectId = geminiProjectFromValue(loadResp?.cloudaicompanionProject)
       if (projectId) return projectId
-    }
-  } catch { /* fall through to project list */ }
+
+      // 2. onboardUser 自动发现项目（新账号需先绑定项目）
+      const tierId = geminiDefaultTierId(loadResp?.allowedTiers)
+      const onboardResp = await call('onboardUser', { tierId, metadata }) as { done?: boolean; response?: { cloudaicompanionProject?: unknown } }
+      if (onboardResp?.done) {
+        projectId = geminiProjectFromValue(onboardResp?.response?.cloudaicompanionProject)
+        if (projectId) return projectId
+      }
+    } catch { /* 当前端点失败，切换到下一个 */ }
+  }
 
   // 3. 回退：项目列表首个
   if (fallbackProjects.length > 0) {

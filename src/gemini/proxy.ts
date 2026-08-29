@@ -29,11 +29,22 @@ export const GEMINI_STREAM_PATH = '/v1internal:streamGenerateContent'
 export const GEMINI_COUNT_TOKENS_PATH = '/v1internal:countTokens'
 
 /**
+ * codeassist 上游端点逐级回退（参考 Antigravity-Manager UpstreamClient）：
+ * Sandbox 优先（对个人账号更宽容、规避 429）→ Daily → Prod 兜底
+ */
+export const GEMINI_FALLBACK_BASE_URLS = [
+  'https://daily-cloudcode-pa.sandbox.googleapis.com',
+  'https://daily-cloudcode-pa.googleapis.com',
+  'https://cloudcode-pa.googleapis.com',
+]
+
+/**
  * 解析 Gemini 推理基地址：优先取 provider.geminiBaseUrl（用户配置的美国中转地址），
- * 其次回退到内置默认直连地址。
+ * 其次回退到内置默认（Sandbox 优先）直连地址。
  */
 export function resolveGeminiBaseUrl(provider: Provider): string {
-  return (provider.geminiBaseUrl || GEMINI_BASE_URL).replace(/\/$/, '')
+  if (provider.geminiBaseUrl) return provider.geminiBaseUrl.replace(/\/$/, '')
+  return GEMINI_BASE_URL
 }
 
 /** 静态模型列表（参考 internal/models/models.go，输入 1048576 / 输出 65536） */
@@ -592,6 +603,8 @@ function geminiHeaders(token: string, model: string, stream: boolean): Record<st
     'Authorization': `Bearer ${token}`,
     'User-Agent': geminiUserAgent(model),
     'X-Goog-Api-Client': GEMINI_API_CLIENT_HEADER,
+    // Antigravity 官方客户端特征头（提升个人账号的配额/项目分配友好度）
+    'x-client-name': 'antigravity',
   }
 }
 
@@ -653,20 +666,37 @@ export async function proxyGeminiChatRequest(
   geminiBody = attachDefaultSafetySettings(geminiBody)
   const wrapped = wrapGeminiRequest(projectId, geminiBody, model)
 
-  const base = resolveGeminiBaseUrl(provider)
-  const endpoint = stream
-    ? `${base}${GEMINI_STREAM_PATH}?alt=sse`
-    : `${base}${GEMINI_GENERATE_PATH}`
+  const isCustomBase = !!provider.geminiBaseUrl
+  const bases = isCustomBase
+    ? [resolveGeminiBaseUrl(provider)]
+    : GEMINI_FALLBACK_BASE_URLS
 
-  let resp: Response
-  try {
-    resp = await streamFetchWithTimeout(endpoint, {
-      method: 'POST',
-      headers: geminiHeaders(token, model, stream),
-      body: JSON.stringify(wrapped),
-    })
-  } catch (err) {
-    return geminiErrorResponse(502, (err as Error).message || '网络请求失败')
+  let resp: Response | null = null
+  let lastErr: Error | null = null
+  for (const base of bases) {
+    const endpoint = stream
+      ? `${base}${GEMINI_STREAM_PATH}?alt=sse`
+      : `${base}${GEMINI_GENERATE_PATH}`
+    try {
+      resp = await streamFetchWithTimeout(endpoint, {
+        method: 'POST',
+        headers: geminiHeaders(token, model, stream),
+        body: JSON.stringify(wrapped),
+      })
+      // 端点级回退：仅对 404/5xx 尝试下一个端点（与 Antigravity fallback 一致）
+      if (resp.status >= 500 || resp.status === 404) {
+        lastErr = new Error(`HTTP ${resp.status}`)
+        resp = null
+        continue
+      }
+      break
+    } catch (err) {
+      lastErr = err as Error
+      resp = null
+    }
+  }
+  if (!resp) {
+    return geminiErrorResponse(502, lastErr?.message || '网络请求失败')
   }
 
   // 401/403：token 过期，刷新后重试一次
@@ -675,15 +705,33 @@ export async function proxyGeminiChatRequest(
     if (refreshed) {
       const fresh = await readOauthToken(env, provider.id)
       token = fresh?.access_token || token
-      try {
-        resp = await streamFetchWithTimeout(endpoint, {
-          method: 'POST',
-          headers: geminiHeaders(token, model, stream),
-          body: JSON.stringify(wrapped),
-        })
-      } catch (err) {
-        return geminiErrorResponse(502, (err as Error).message || '网络请求失败')
+      let retried: Response | null = null
+      let retryErr: Error | null = null
+      for (const base of bases) {
+        const endpoint = stream
+          ? `${base}${GEMINI_STREAM_PATH}?alt=sse`
+          : `${base}${GEMINI_GENERATE_PATH}`
+        try {
+          retried = await streamFetchWithTimeout(endpoint, {
+            method: 'POST',
+            headers: geminiHeaders(token, model, stream),
+            body: JSON.stringify(wrapped),
+          })
+          if (retried.status >= 500 || retried.status === 404) {
+            retryErr = new Error(`HTTP ${retried.status}`)
+            retried = null
+            continue
+          }
+          break
+        } catch (err) {
+          retryErr = err as Error
+          retried = null
+        }
       }
+      if (!retried) {
+        return geminiErrorResponse(502, retryErr?.message || '网络请求失败')
+      }
+      resp = retried
     }
   }
 
@@ -768,12 +816,21 @@ export async function proxyGeminiCountTokens(
   const geminiBody = await openAIToGeminiRequest(forwardBody as Record<string, any>)
   const body = { request: geminiBody }
   try {
-    const resp = await fetch(`${resolveGeminiBaseUrl(provider)}${GEMINI_COUNT_TOKENS_PATH}`, {
-      method: 'POST',
-      headers: geminiHeaders(token, model, false),
-      body: JSON.stringify(body),
-      signal: AbortSignal.timeout(30000),
-    })
+    const isCustomBase = !!provider.geminiBaseUrl
+    const bases = isCustomBase
+      ? [resolveGeminiBaseUrl(provider)]
+      : GEMINI_FALLBACK_BASE_URLS
+    const perResp = async (base: string) =>
+      fetch(`${base}${GEMINI_COUNT_TOKENS_PATH}`, {
+        method: 'POST',
+        headers: geminiHeaders(token, model, false),
+        body: JSON.stringify(body),
+        signal: AbortSignal.timeout(30000),
+      })
+    let resp = await perResp(bases[0])
+    for (let i = 1; i < bases.length && (resp.status >= 500 || resp.status === 404); i++) {
+      resp = await perResp(bases[i])
+    }
     if (!resp.ok) {
       return geminiErrorResponse(resp.status, await resp.text().catch(() => ''))
     }
