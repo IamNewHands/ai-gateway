@@ -36,6 +36,11 @@ export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const url = new URL(request.url)
 
+    // 诊断端点：报告 Worker 回源出口 IP 与地区（用于确认是否已规避地区限制）
+    if (url.pathname === '/__relay_info') {
+      return handleRelayInfo()
+    }
+
     // 按路径前缀挑选目标上游
     const route = UPSTREAM_ROUTES.find((r) => url.pathname.startsWith(r.prefix))
     if (!route) {
@@ -89,3 +94,26 @@ export default {
 
 /** 绑定类型占位（当前未使用任何 binding） */
 export interface Env {}
+
+/**
+ * 诊断端点处理：查询本 Worker 回源 fetch 的出口 IP 与地区。
+ * cloudflare.com/cdn-cgi/trace 返回当前请求的 IP / 所在地区。
+ */
+async function handleRelayInfo(): Promise<Response> {
+  const info: Record<string, string> = {}
+  try {
+    const r = await fetch('https://cloudflare.com/cdn-cgi/trace')
+    const trace = await r.text()
+    const parse = (k: string) => trace.match(new RegExp(`^${k}=(.+)$`, 'm'))?.[1] || ''
+    info.ip = parse('ip')
+    info.loc = parse('loc')
+    info.colo = parse('colo')
+    info.warp = parse('warp')
+  } catch (e) {
+    info.error = String(e)
+  }
+  return new Response(JSON.stringify(info, null, 2), {
+    status: 200,
+    headers: { 'content-type': 'application/json' },
+  })
+}

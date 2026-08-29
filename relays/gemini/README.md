@@ -52,3 +52,27 @@ npm run deploy      # 登录 CF 后部署，输出 https://gemini-relay.你的�
 ```
 客户端 ──► AI Gateway ──► 本 Worker ──► Google（按路径分流）
 ```
+
+## 验证实际出口地区
+
+部署后访问诊断端点，确认回源出口 IP 和地区：
+
+```bash
+curl https://gemini-relay.你的用户名.workers.dev/__relay_info
+```
+
+返回示例：
+
+```json
+{
+  "ip": "104.XX.XX.XX",
+  "loc": "US",
+  "colo": "LAX",
+  "warp": "off"
+}
+```
+
+- `loc` = 出口国家码（`US`=美国，`JP`=日本，`SG`=新加坡…）。**日/新/美都是 Google 支持地区**，
+  都能规避 `User location is not supported`，不强制要求是美国。
+- `ip` = Worker 回源出口 IP，Google 正是按这个 IP 的地区判定请求。
+- 只要 `loc` 属于 Google 支持地区（美/日/新等），即说明中转已生效。
