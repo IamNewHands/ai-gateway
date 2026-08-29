@@ -64,6 +64,8 @@ crons = ["0 */2 * * *", "0 1,13 * * *", "0 * * * *", "0 20 * * *"]
 # ADMIN_PASSWORD = "your-password"
 # MANAGEMENT_TOKEN = "对外管理 API (/api/manage/*) 的 Bearer Token；不配置则该 API 返回 503"
 # OPENCODE_MIRRORS_URL = "https://opencode.ai.cmliussss.net/zen/v1\nhttps://opencode.fastly.cmliussss.net/zen/v1\nhttps://opencode.gcore.cmliussss.net/zen/v1"
-# Gemini CLI OAuth 客户端凭据（也可在管理后台表单中粘贴；与 cpa-plugin-gemini-cli 中的官方凭据一致）
+# Gemini OAuth 客户端凭据（可选）. 默认使用 gemini-cli 公开发布的公共凭据，用户无需填写即可
+# 直接登录谷歌账号完成认证；仅在需要自建 Console 客户端时覆盖（通配 redirect_uri 需含
+# http://127.0.0.1:8089/oauth2callback）
 # GEMINI_OAUTH_CLIENT_ID = ""
 # GEMINI_OAUTH_CLIENT_SECRET = ""

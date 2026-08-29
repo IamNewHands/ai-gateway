@@ -750,17 +750,32 @@ export const GEMINI_OAUTH = {
   codeAssistVersion: 'v1internal',
   redirectUri: 'http://127.0.0.1:8089/oauth2callback',
   scope: [
+    'openid',
+    'email',
+    'profile',
     'https://www.googleapis.com/auth/cloud-platform',
     'https://www.googleapis.com/auth/userinfo.email',
     'https://www.googleapis.com/auth/userinfo.profile',
+    'cclog',
+    'experimentsandconfigs',
   ].join(' '),
 }
 
-/** Gemini OAuth 客户端凭据：优先取提供商表单（KV），其次取环境变量 */
+/**
+ * gemini-cli 公开发布的 installed-app OAuth Client（已在 Google Cloud 公开，无需自建）。
+ * Antigravity-Manager / gemini-cli 均硬编码此凭据实现「登录谷歌账号即可完成认证」。
+ */
+const GEMINI_PUBLIC_CLIENT_ID = '1071006060591-tmhssin2h21lcre235vtolojh4g403ep.apps.googleusercontent.com'
+const GEMINI_PUBLIC_CLIENT_SECRET = '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'
+
+/**
+ * Gemini OAuth 客户端凭据：优先取提供商表单（KV），其次取环境变量，
+ * 最后兜底使用 gemini-cli 公开凭据（无需用户填写即可直接登录谷歌账号）。
+ */
 function geminiClientCreds(env: Env, cfg: OAuthDeviceConfig): { clientId: string; clientSecret: string } {
   return {
-    clientId: cfg.clientId || env.GEMINI_OAUTH_CLIENT_ID || '',
-    clientSecret: cfg.clientSecret || env.GEMINI_OAUTH_CLIENT_SECRET || '',
+    clientId: cfg.clientId || env.GEMINI_OAUTH_CLIENT_ID || GEMINI_PUBLIC_CLIENT_ID,
+    clientSecret: cfg.clientSecret || env.GEMINI_OAUTH_CLIENT_SECRET || GEMINI_PUBLIC_CLIENT_SECRET,
   }
 }
 
@@ -782,9 +797,6 @@ async function startOauthGeminiFlow(env: Env, providerId: string, cfg: OAuthDevi
     const { verifier, challenge } = await makeQoderPKCE()
     const state = geminiRandomState()
     const creds = geminiClientCreds(env, cfg)
-    if (!creds.clientId) {
-      return { success: false, message: '缺少 Gemini OAuth Client ID：请在表单填写或配置环境变量 GEMINI_OAUTH_CLIENT_ID' }
-    }
     const params = new URLSearchParams({
       client_id: creds.clientId,
       redirect_uri: GEMINI_OAUTH.redirectUri,
