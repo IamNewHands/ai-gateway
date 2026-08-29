@@ -39,7 +39,9 @@ npm run deploy      # 登录 CF 后部署，输出 https://gemini-relay.你的�
    https://gemini-relay.你的用户名.workers.dev
    ```
 
-   网关会拼 `/v1beta/openai/chat/completions` 请求，本 Worker 原样透传到 Google。
+   网关会在该地址后自动拼 `/chat/completions`，请求变为
+   `https://gemini-relay.xxx.workers.dev/chat/completions`，本 Worker 会自动改写映射到
+   官方 OpenAI 兼容端点并转发到 Google。（直接填根地址即可，无需手动带 `/v1beta/openai` 后缀。）
 
 **方式 B — Gemini 授权码（OAuth）提供商：**
 

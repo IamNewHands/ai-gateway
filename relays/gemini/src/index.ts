@@ -24,11 +24,16 @@
  *      只改 Host，不能重写路径。
  */
 
-/** 上游路由：路径前缀 → 目标端点 */
-const UPSTREAM_ROUTES: Array<{ prefix: string; host: string }> = [
+/** 上游路由：路径前缀 → 目标端点与映射方式（rewriteTo 存在时把原路径映射到 /v1beta/openai 前缀下） */
+const UPSTREAM_ROUTES: Array<{ prefix: string; host: string; rewriteTo?: string }> = [
   { prefix: '/v1internal/', host: 'cloudcode-pa.googleapis.com' },
   { prefix: '/v1beta/openai/', host: 'generativelanguage.googleapis.com' },
   { prefix: '/v1beta/', host: 'generativelanguage.googleapis.com' },
+  // OpenAI 兼容裸路径兜底：网关拼 /chat/completions、/responses、/embeddings 时，
+  // 改写为官方 OpenAI 兼容端点（/v1beta/openai/...）
+  { prefix: '/chat/completions', host: 'generativelanguage.googleapis.com', rewriteTo: '/v1beta/openai/chat/completions' },
+  { prefix: '/responses', host: 'generativelanguage.googleapis.com', rewriteTo: '/v1beta/openai/responses' },
+  { prefix: '/embeddings', host: 'generativelanguage.googleapis.com', rewriteTo: '/v1beta/openai/embeddings' },
 ]
 
 /** 部署入口 */
@@ -50,7 +55,9 @@ export default {
       })
     }
 
-    const upstreamUrl = `https://${route.host}` + url.pathname + url.search
+    // 目标路径：默认原样透传；若配置了 rewriteTo 则替换（保留查询串）
+    const upstreamPath = route.rewriteTo ?? url.pathname
+    const upstreamUrl = `https://${route.host}${upstreamPath}${url.search}`
 
     // 组装转发请求：带上 Authorization / x-goog-api-key 等认证头，去掉 Worker 自身可能带来的头
     const headers = new Headers(request.headers)
