@@ -795,11 +795,17 @@ async function startOauthGeminiFlow(env: Env, providerId: string, cfg: OAuthDevi
     const { verifier, challenge } = await makeQoderPKCE()
     const state = geminiRandomState()
     const creds = geminiClientCreds(env, cfg)
+    // 过滤掉该客户端不支持的无效 scope（cclog/experimentsandconfigs），
+    // 避免历史 KV 中保存的旧配置导致 invalid_scope 400
+    const scope = (cfg.scope || GEMINI_OAUTH.scope)
+      .split(/\s+/)
+      .filter((s) => s && s !== 'cclog' && s !== 'experimentsandconfigs')
+      .join(' ')
     const params = new URLSearchParams({
       client_id: creds.clientId,
       redirect_uri: GEMINI_OAUTH.redirectUri,
       response_type: 'code',
-      scope: cfg.scope || GEMINI_OAUTH.scope,
+      scope,
       state,
       access_type: 'offline',
       prompt: 'consent',
