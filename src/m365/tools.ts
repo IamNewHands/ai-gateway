@@ -7,6 +7,7 @@
  * - 网关解析该块为标准 tool_calls 返回客户端，客户端执行后用 tool 结果续聊（客户端驱动循环）
  */
 import type { ChatHubTool } from './chathub'
+import { parseToolCalls } from '../cnb/xyml'
 
 /** 由客户端 tool 定义构造的简化结构 */
 export interface ToolDef {
@@ -19,10 +20,19 @@ const ANTI_TRUNCATION_PREFIX =
   'You are a helpful AI assistant. Provide a complete, thorough answer to the request. ' +
   'Do not truncate or stop partway through your response; cover all relevant points until the answer is fully delivered.\n\n'
 
+/** 原生插件通道的身份/工具可用声明前缀：插件定义在 payload 的 plugins 字段已携带，文本仅需声明可用性 */
+const PLUGIN_AGENT_PREFIX =
+  'You are an execution agent on the caller\'s Windows machine. The registered plugins in this conversation are real, active, and callable right now.\n' +
+  'When the user\'s request requires one, call the appropriate plugin with its defined parameters. ' +
+  'Do not analyze whether plugins are registered or available — they are. Do not say a plugin is unavailable. ' +
+  'Wait for the plugin result before claiming completion.\n' +
+  'You are NOT running in a sandbox/container, and there is no built-in code interpreter; only the registered plugins are available.\n\n'
+
 /**
  * 工具定义注入提示词（同原版 toolProtocolPrompt）。
  * - 无工具 / tool_choice=none：注入防截断前缀（原版对每个无工具请求均注入）。
- * - 有原生插件（hasPlugins）：payload 的 plugins 字段已携带工具定义，文本原样返回不注入。
+ * - 有原生插件（hasPlugins）：payload 的 plugins 字段已携带工具定义，故不重复注入 <tools> 块，
+ *   但补上身份声明/工具可用提示，防止模型「不知道有工具」或产生沙箱幻觉。
  * - 有工具但非原生插件：注入完整 <tools> 块，支持一个或多个 fenced block（并行多调用），
  *   并明确「不要使用内置 code interpreter / Python 沙箱」防幻觉段。
  */
@@ -32,7 +42,10 @@ export function toolProtocolPrompt(text: string, tools: ToolDef[], choice: unkno
     return ANTI_TRUNCATION_PREFIX + text
   }
   if (hasPlugins) {
-    return text
+    // 原生插件通道：把可用性声明放到用户请求之前，让模型明确知道工具可调用且非沙盒。
+    // 若 text 已带防截断前缀则避免叠加（防截断前缀只出现在无工具分支，此处通常不会命中）。
+    const body = text
+    return PLUGIN_AGENT_PREFIX + body
   }
   const defs: string[] = []
   for (const t of tools) {
@@ -369,23 +382,37 @@ export function fencedToolCalls(text: string, tools: ToolDef[], choice: unknown)
   // 1) 原生 <m365-tool-call> 约定
   const native = extractToolCalls(text, tools, choice)
   if (native.length > 0) return native
-  // 2) ```name\n{json}\n``` 约定
-  const allowed = allowedToolNames(tools)
-  const out: DetectedToolCall[] = []
-  let m: RegExpExecArray | null
-  const re = new RegExp(FENCED_TOOL, 'g')
-  while ((m = re.exec(text)) !== null) {
-    const name = m[1]
-    const args = m[2].trim()
-    let v: unknown
-    try {
-      v = JSON.parse(args)
-    } catch {
-      v = null
+  // 2) XYML/QNML/XML/JSON/text-kv 容错解析（复用 CNB 的 ToolForge 解析引擎，兼容多格式与结构损坏：
+  //    </parameter> 缺失、参数被 </invoke> 提前闭合、全角括号/竖线、CDATA 包裹等正则难以覆盖的形态）。
+  //    解析结果再经 schema 校验，避免容错放宽导致 args 形状非法。
+  let out: DetectedToolCall[] = []
+  const xymlCalls = parseToolCalls(text, tools as unknown as Record<string, unknown>[])
+  if (xymlCalls.length > 0) {
+    for (const c of xymlCalls) {
+      const name = c.name
+      if (!allowedToolNames(tools).has(name) || !toolChoiceAllows(choice, name)) continue
+      out.push({ id: c.id || `call_${crypto.randomUUID()}`, type: toolTypeOf(name, tools), name, arguments: JSON.stringify(c.input ?? {}) })
     }
-    if (!allowed.has(name) || !toolChoiceAllows(choice, name)) continue
-    if (v === null) continue
-    out.push({ id: `call_${crypto.randomUUID()}`, type: toolTypeOf(name, tools), name, arguments: JSON.stringify(v) })
+  }
+  // 3) ```name\n{json}\n``` 约定（XYML 引擎不解析 fenced 形态时的回退）
+  if (out.length === 0) {
+    out = []
+    const allowed = allowedToolNames(tools)
+    let m: RegExpExecArray | null
+    const re = new RegExp(FENCED_TOOL, 'g')
+    while ((m = re.exec(text)) !== null) {
+      const name = m[1]
+      const args = m[2].trim()
+      let v: unknown
+      try {
+        v = JSON.parse(args)
+      } catch {
+        v = null
+      }
+      if (!allowed.has(name) || !toolChoiceAllows(choice, name)) continue
+      if (v === null) continue
+      out.push({ id: `call_${crypto.randomUUID()}`, type: toolTypeOf(name, tools), name, arguments: JSON.stringify(v) })
+    }
   }
   return out
 }
