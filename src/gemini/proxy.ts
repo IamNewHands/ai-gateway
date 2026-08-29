@@ -28,6 +28,14 @@ export const GEMINI_GENERATE_PATH = '/v1internal:generateContent'
 export const GEMINI_STREAM_PATH = '/v1internal:streamGenerateContent'
 export const GEMINI_COUNT_TOKENS_PATH = '/v1internal:countTokens'
 
+/**
+ * 解析 Gemini 推理基地址：优先取 provider.geminiBaseUrl（用户配置的美国中转地址），
+ * 其次回退到内置默认直连地址。
+ */
+export function resolveGeminiBaseUrl(provider: Provider): string {
+  return (provider.geminiBaseUrl || GEMINI_BASE_URL).replace(/\/$/, '')
+}
+
 /** 静态模型列表（参考 internal/models/models.go，输入 1048576 / 输出 65536） */
 export const GEMINI_MODELS: Array<{ id: string; displayName: string }> = [
   { id: 'gemini-2.5-pro', displayName: 'Gemini 2.5 Pro' },
@@ -645,9 +653,10 @@ export async function proxyGeminiChatRequest(
   geminiBody = attachDefaultSafetySettings(geminiBody)
   const wrapped = wrapGeminiRequest(projectId, geminiBody, model)
 
+  const base = resolveGeminiBaseUrl(provider)
   const endpoint = stream
-    ? `${GEMINI_BASE_URL}${GEMINI_STREAM_PATH}?alt=sse`
-    : `${GEMINI_BASE_URL}${GEMINI_GENERATE_PATH}`
+    ? `${base}${GEMINI_STREAM_PATH}?alt=sse`
+    : `${base}${GEMINI_GENERATE_PATH}`
 
   let resp: Response
   try {
@@ -759,7 +768,7 @@ export async function proxyGeminiCountTokens(
   const geminiBody = await openAIToGeminiRequest(forwardBody as Record<string, any>)
   const body = { request: geminiBody }
   try {
-    const resp = await fetch(`${GEMINI_BASE_URL}${GEMINI_COUNT_TOKENS_PATH}`, {
+    const resp = await fetch(`${resolveGeminiBaseUrl(provider)}${GEMINI_COUNT_TOKENS_PATH}`, {
       method: 'POST',
       headers: geminiHeaders(token, model, false),
       body: JSON.stringify(body),

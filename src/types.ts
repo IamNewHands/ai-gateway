@@ -97,6 +97,14 @@ export interface Provider {
    * 未勾选的模型原样转发。留空/不配 = 全部模型不注入，零影响。
    */
   cachePrefixInject?: string[]
+  /**
+   * Gemini 推理中转基地址（可选，仅 oauth.flowType === 'gemini' 提供商生效）。
+   * Google 对部分地区的 Gemini 推理端点（cloudcode-pa.googleapis.com）按地理位置拒绝
+   * （HTTP 400 User location is not supported）。配置后，网关把对该 Gemini 的
+   * generateContent / streamGenerateContent / countTokens 推理请求转发到这个中转地址，
+   * 以规避地区限制。不配 = 使用内置默认直连地址，行为不变。
+   */
+  geminiBaseUrl?: string
 }
 
 /**
@@ -325,6 +333,7 @@ export interface CreateProviderRequest {
   allowUnlistedModels?: boolean
   thinkingInject?: string[]
   cachePrefixInject?: string[]
+  geminiBaseUrl?: string
 }
 
 export interface UpdateProviderRequest {
@@ -349,6 +358,7 @@ export interface UpdateProviderRequest {
   thinkingInject?: string[] | null
   /** 传空数组可清空缓存前缀注入选择 */
   cachePrefixInject?: string[] | null
+  geminiBaseUrl?: string
 }
 
 /**
@@ -374,6 +384,7 @@ export interface UpsertProviderRequest {
   allowUnlistedModels?: boolean
   thinkingInject?: string[]
   cachePrefixInject?: string[]
+  geminiBaseUrl?: string
 }
 
 /**

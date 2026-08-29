@@ -199,6 +199,9 @@ export async function handleCreateProvider(c: Context<AppEnv>) {
   if (!isSafeHttpUrl(body.baseUrl)) {
     return c.json<ApiResponse>({ success: false, message: 'baseUrl 必须是合法的 http/https 公网地址' }, 400)
   }
+  if (body.geminiBaseUrl && !isSafeHttpUrl(body.geminiBaseUrl)) {
+    return c.json<ApiResponse>({ success: false, message: 'geminiBaseUrl 必须是合法的 http/https 公网地址' }, 400)
+  }
   const oauthErr = validateOAuthUrls(body.oauth)
   if (oauthErr) {
     return c.json<ApiResponse>({ success: false, message: oauthErr }, 400)
@@ -225,6 +228,7 @@ export async function handleCreateProvider(c: Context<AppEnv>) {
     allowUnlistedModels: body.allowUnlistedModels,
     thinkingInject: body.thinkingInject,
     cachePrefixInject: body.cachePrefixInject,
+    geminiBaseUrl: body.geminiBaseUrl?.replace(/\/$/, ''),
     apiKeys: normalizeArray(body.apiKeys, (k) => ({ key: k, enabled: true })),
     models: body.models
       ? normalizeArray(body.models, (m) => ({ id: m, enabled: true }))
@@ -266,6 +270,12 @@ export async function handleUpdateProvider(c: Context<AppEnv>) {
   if (body.allowUnlistedModels !== undefined) updates.allowUnlistedModels = body.allowUnlistedModels
   if (body.thinkingInject !== undefined) updates.thinkingInject = body.thinkingInject ?? undefined
   if (body.cachePrefixInject !== undefined) updates.cachePrefixInject = body.cachePrefixInject ?? undefined
+  if (body.geminiBaseUrl !== undefined) {
+    if (body.geminiBaseUrl && !isSafeHttpUrl(body.geminiBaseUrl)) {
+      return c.json<ApiResponse>({ success: false, message: 'geminiBaseUrl 必须是合法的 http/https 公网地址' }, 400)
+    }
+    updates.geminiBaseUrl = body.geminiBaseUrl ? body.geminiBaseUrl.replace(/\/$/, '') : undefined
+  }
 if (body.apiKeys !== undefined) {
     updates.apiKeys = normalizeArray(body.apiKeys, (k) => ({ key: k, enabled: true }))
   }
@@ -323,6 +333,9 @@ export async function handleUpsertProvider(c: Context<AppEnv>) {
     if (!isSafeHttpUrl(body.baseUrl)) {
       return c.json<ApiResponse>({ success: false, message: 'baseUrl 必须是合法的 http/https 公网地址' }, 400)
     }
+    if (body.geminiBaseUrl && !isSafeHttpUrl(body.geminiBaseUrl)) {
+      return c.json<ApiResponse>({ success: false, message: 'geminiBaseUrl 必须是合法的 http/https 公网地址' }, 400)
+    }
     const now = new Date().toISOString()
     const provider: Provider = {
       id: body.id,
@@ -338,6 +351,7 @@ export async function handleUpsertProvider(c: Context<AppEnv>) {
       cooldown: body.cooldown,
       thinkingInject: body.thinkingInject,
       cachePrefixInject: body.cachePrefixInject,
+      geminiBaseUrl: body.geminiBaseUrl?.replace(/\/$/, ''),
       createdAt: now,
       updatedAt: now,
     }
@@ -356,6 +370,12 @@ export async function handleUpsertProvider(c: Context<AppEnv>) {
   }
   if (body.apiType !== undefined) updates.apiType = body.apiType
   if (body.authType !== undefined) updates.authType = body.authType
+  if (body.geminiBaseUrl !== undefined) {
+    if (body.geminiBaseUrl && !isSafeHttpUrl(body.geminiBaseUrl)) {
+      return c.json<ApiResponse>({ success: false, message: 'geminiBaseUrl 必须是合法的 http/https 公网地址' }, 400)
+    }
+    updates.geminiBaseUrl = body.geminiBaseUrl ? body.geminiBaseUrl.replace(/\/$/, '') : undefined
+  }
   if (body.toolBridge !== undefined) updates.toolBridge = body.toolBridge
   if (body.cnbPool !== undefined) updates.cnbPool = body.cnbPool
   if (body.cooldown !== undefined) updates.cooldown = body.cooldown
