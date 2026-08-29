@@ -741,6 +741,13 @@ async function qoderPoolSyncToken(env: Env, providerId: string, token: OAuthToke
 //      一并存入 KV token 状态
 //   5. 临近过期由 refreshOauthTokenGemini 自动刷新（POST oauth2.googleapis.com/token）
 
+/**
+ * 兜底项目 ID：CodeAssist 无法解析出项目时的公共兜底（对齐 Antigravity-Manager）。
+ * Antigravity-Manager 在个人账号拿不到 cloudaicompanionProject 时，
+ * 统一回退到该公共项目（token_manager / quota 共 8 处硬编码），项目对所有已登录 Google 账号开放。
+ */
+export const GEMINI_FALLBACK_PROJECT_ID = 'bamboo-precept-lgxtn'
+
 export const GEMINI_OAUTH = {
   authUrl: 'https://accounts.google.com/o/oauth2/v2/auth',
   tokenUrl: 'https://oauth2.googleapis.com/token',
@@ -923,11 +930,14 @@ export async function submitOauthGeminiCallback(
     const email = await geminiFetchEmail(data.access_token)
     if (email) tokenState.email = email
 
-    // CodeAssist 项目 ID：loadCodeAssist → onboardUser，失败回退到项目列表首个
+    // CodeAssist 项目 ID：loadCodeAssist → onboardUser，失败回退到项目列表首个；
+    // 仍取不到时使用 Antigravity 的公共兜底项目（对齐 Antigravity-Manager token_manager），
+    // 该公共项目对所有已登录 Google 账号开放，个人账号即可直接使用模型。
     const projects = await geminiFetchProjectIDs(data.access_token)
     if (projects.length > 0) tokenState.projectIds = projects
-    const projectId = await geminiResolveProjectId(data.access_token, projects)
-    if (projectId) tokenState.projectId = projectId
+    let projectId = await geminiResolveProjectId(data.access_token, projects)
+    if (!projectId) projectId = GEMINI_FALLBACK_PROJECT_ID
+    tokenState.projectId = projectId
 
     await writeOauthToken(env, providerId, tokenState)
     await env.KV.delete(deviceKey(providerId))

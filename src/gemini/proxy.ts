@@ -19,7 +19,7 @@
  */
 
 import type { Env, Provider } from '../types'
-import { getOauthAccessToken, readOauthToken, refreshOauthToken, GEMINI_OAUTH, GEMINI_API_CLIENT_HEADER, geminiUserAgent } from '../oauth'
+import { getOauthAccessToken, readOauthToken, refreshOauthToken, GEMINI_OAUTH, GEMINI_API_CLIENT_HEADER, geminiUserAgent, GEMINI_FALLBACK_PROJECT_ID } from '../oauth'
 import { streamFetchWithTimeout } from '../opencode'
 import { isSafeHttpUrl } from '../admin'
 
@@ -650,13 +650,7 @@ export async function proxyGeminiChatRequest(
     )
   }
 
-  const projectId = tokenState?.projectId || ''
-  if (!projectId) {
-    return new Response(
-      JSON.stringify({ error: { message: 'Gemini 项目 ID 缺失，请重新授权', type: 'configuration_error' } }),
-      { status: 502, headers: { 'Content-Type': 'application/json; charset=utf-8' } }
-    )
-  }
+  const projectId = tokenState?.projectId || GEMINI_FALLBACK_PROJECT_ID
 
   const model = stripProviderPrefix(String(forwardBody.model || ''))
   const stream = opts?.stream ?? forwardBody.stream === true
