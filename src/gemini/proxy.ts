@@ -406,15 +406,24 @@ function normalizeGemini25Thinking(body: Record<string, any>, model: string): Re
   return body
 }
 
-/** 默认关闭内容安全过滤（参考 compat/tools.go attachDefaultSafetySettings） */
+/** 默认关闭内容安全过滤（参考 Antigravity openai.rs / claude request.rs：仅 4 类，无 CIVIC_INTEGRITY） */
 function attachDefaultSafetySettings(body: Record<string, any>): Record<string, any> {
-  if (body.safetySettings) return body
+  // 仅保留 Antigravity 认可的 4 类；HARM_CATEGORY_CIVIC_INTEGRITY 在 Gemini 2.5 上游已不接受（400），故移除。
+  // 若调用方已显式传入 safetySettings，则不覆写。
+  if (body.safetySettings) {
+    // 顺带剔除其中可能被上游拒绝的 CIVIC_INTEGRITY，避免 400
+    if (Array.isArray(body.safetySettings)) {
+      body.safetySettings = (body.safetySettings as any[]).filter(
+        (s) => s && s.category !== 'HARM_CATEGORY_CIVIC_INTEGRITY'
+      )
+    }
+    return body
+  }
   body.safetySettings = [
     { category: 'HARM_CATEGORY_HARASSMENT', threshold: 'OFF' },
     { category: 'HARM_CATEGORY_HATE_SPEECH', threshold: 'OFF' },
     { category: 'HARM_CATEGORY_SEXUALLY_EXPLICIT', threshold: 'OFF' },
     { category: 'HARM_CATEGORY_DANGEROUS_CONTENT', threshold: 'OFF' },
-    { category: 'HARM_CATEGORY_CIVIC_INTEGRITY', threshold: 'BLOCK_NONE' },
   ]
   return body
 }
