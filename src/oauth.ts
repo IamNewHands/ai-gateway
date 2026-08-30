@@ -1092,22 +1092,21 @@ async function geminiFetchProjectIDs(accessToken: string): Promise<string[]> {
  * 仍失败回退到项目列表第一个。全部失败返回 null（不阻塞登录）。
  */
 async function geminiResolveProjectId(accessToken: string, fallbackProjects: string[]): Promise<string> {
-  // 优先用 Sandbox 域名（Antigravity 实测稳定且对个人账号友好）
+  // 完全对齐 Antigravity project_resolver.rs fetch_project_id：
+  // 只调 loadCodeAssist，body 仅 {"metadata":{"ideType":"ANTIGRAVITY"}}，
+  // Sandbox 域名优先（对个人账号友好、规避 Prod 429），失败逐级回退 Daily/Prod。
   const bases = GEMINI_OAUTH.codeAssistBaseUrls
   const version = GEMINI_OAUTH.codeAssistVersion
-  const metadata = { ideType: 'ANTIGRAVITY', platform: 'PLATFORM_UNSPECIFIED', pluginType: 'GEMINI' }
+  const body = { metadata: { ideType: 'ANTIGRAVITY' } }
   const headers = {
-    Accept: 'application/json',
     Authorization: `Bearer ${accessToken}`,
     'Content-Type': 'application/json',
-    'User-Agent': geminiUserAgent(),
-    'X-Goog-Api-Client': GEMINI_API_CLIENT_HEADER,
   }
 
-  // 遍历所有回退端点，逐级尝试 loadCodeAssist → onboardUser
+  // 遍历所有回退端点，只尝试 loadCodeAssist
   for (const base of bases) {
-    const call = async (endpoint: string, body: unknown): Promise<any> => {
-      const res = await fetch(`${base}/${version}:${endpoint}`, {
+    try {
+      const res = await fetch(`${base}/${version}:loadCodeAssist`, {
         method: 'POST',
         headers,
         body: JSON.stringify(body),
@@ -1115,47 +1114,20 @@ async function geminiResolveProjectId(accessToken: string, fallbackProjects: str
       })
       if (!res.ok) {
         const text = await res.text()
-        throw new Error(`HTTP ${res.status}: ${text.substring(0, 200)}`)
+        continue
       }
-      return res.json()
-    }
-
-    try {
-      // 1. loadCodeAssist：老账号直接带出已绑定的 cloudaicompanionProject
-      const loadResp = await call('loadCodeAssist', { metadata }) as {
-        allowedTiers?: Array<{ id?: string; isDefault?: boolean }>
-        cloudaicompanionProject?: unknown
-      }
-      let projectId = geminiProjectFromValue(loadResp?.cloudaicompanionProject)
+      const loadResp = (await res.json()) as { cloudaicompanionProject?: unknown }
+      const projectId = geminiProjectFromValue(loadResp?.cloudaicompanionProject)
       if (projectId) return projectId
-
-      // 2. onboardUser 自动发现项目（新账号需先绑定项目）
-      const tierId = geminiDefaultTierId(loadResp?.allowedTiers)
-      const onboardResp = await call('onboardUser', { tierId, metadata }) as { done?: boolean; response?: { cloudaicompanionProject?: unknown } }
-      if (onboardResp?.done) {
-        projectId = geminiProjectFromValue(onboardResp?.response?.cloudaicompanionProject)
-        if (projectId) return projectId
-      }
     } catch { /* 当前端点失败，切换到下一个 */ }
   }
 
-  // 3. 回退：项目列表首个
+  // 回退：项目列表首个
   if (fallbackProjects.length > 0) {
     const first = fallbackProjects.find((id) => id.trim() !== '')
     if (first) return first
   }
   return ''
-}
-
-function geminiDefaultTierId(tiers: unknown): string {
-  if (Array.isArray(tiers)) {
-    for (const t of tiers) {
-      if (t && typeof t === 'object' && (t as { isDefault?: boolean }).isDefault && (t as { id?: string }).id) {
-        return String((t as { id: string }).id).trim() || 'legacy-tier'
-      }
-    }
-  }
-  return 'legacy-tier'
 }
 
 function geminiProjectFromValue(value: unknown): string {
