@@ -624,10 +624,13 @@ function geminiHeaders(
     'Content-Type': 'application/json',
     'Accept': stream ? 'text/event-stream' : 'application/json',
     'Authorization': `Bearer ${token}`,
-    'User-Agent': geminiUserAgent(model),
-    'X-Goog-Api-Client': GEMINI_API_CLIENT_HEADER,
-    // Antigravity 官方客户端特征头（提升个人账号的配额/项目分配友好度）
+    // 对齐 Antigravity call_v1_internal_with_headers：UA 用官方客户端的 antigravity，
+    // 而非 GeminiCLI 的 UA（避免矛盾指纹）。官方客户端特征头齐全。
+    'User-Agent': 'antigravity',
     'x-client-name': 'antigravity',
+    'x-client-version': '4.6.2',
+    'x-machine-id': '6c3f2e8a9b7d4f1a0e5c8b6d2a4f9e3c',
+    'x-vscode-sessionid': 'antigravity-session-main',
   }
   // 对齐 Antigravity call_v1_internal_with_headers：把 project 同时注入 x-goog-user-project
   if (includeProject && projectId && projectId !== 'test-project' && projectId !== 'project-id') {
