@@ -356,7 +356,7 @@ export function finalizeText(streamed: string, final: string, emit?: (delta: str
  *
  * 上游 M365 常返回大量连续空行，让长回答看起来碎成一段一断。这里做 markdown 感知的紧凑化：
  * - 普通文字区域：连续的多个空行压缩为最多 maxConsecutive 个 `\n`（段落留白保留）；
- * - 代码块（```  / ~~~ 围栏）：内部所有空行原样保留，避免压缩破坏代码/文字排版缩进；
+ * - 代码块（```  /  ~~~ 围栏）：内部所有空行原样保留，避免压缩破坏代码/文字排版缩进；
  * - 末尾多余空行清掉。
  * 不动单个换行（列表项/标题/引用的行内结构保持），因此不会破坏有意的 markdown 排版。
  */
@@ -598,7 +598,7 @@ export async function chatWithHandlers(
   const wsURL = buildWSURL(acc, sessionId, conversationId, requestID)
   let socket: OutboundWebSocket
   try {
-    const httpUrl = wsURL.replace(/^wss:\/\/i/, 'https://').replace(/^ws:\/\/i/, 'http://')
+    const httpUrl = wsURL.replace(/^wss:\/\//i, 'https://').replace(/^ws:\/\//i, 'http://')
     const resp = await fetch(httpUrl, {
       method: 'GET',
       headers: {
