@@ -596,7 +596,13 @@ function geminiErrorResponse(status: number, bodyText: string): Response {
   )
 }
 
-function geminiHeaders(token: string, model: string, stream: boolean, projectId?: string): Record<string, string> {
+function geminiHeaders(
+  token: string,
+  model: string,
+  stream: boolean,
+  projectId?: string,
+  includeProject = true
+): Record<string, string> {
   const headers: Record<string, string> = {
     'Content-Type': 'application/json',
     'Accept': stream ? 'text/event-stream' : 'application/json',
@@ -607,10 +613,46 @@ function geminiHeaders(token: string, model: string, stream: boolean, projectId?
     'x-client-name': 'antigravity',
   }
   // 对齐 Antigravity call_v1_internal_with_headers：把 project 同时注入 x-goog-user-project
-  if (projectId && projectId !== 'test-project' && projectId !== 'project-id') {
+  if (includeProject && projectId && projectId !== 'test-project' && projectId !== 'project-id') {
     headers['x-goog-user-project'] = projectId
   }
   return headers
+}
+
+/**
+ * 遍历端点发送 Gemini 上游请求，返回首个非“可切换错误”的响应。
+ * 仅在 404/5xx 时切到下一个端点（与 Antigravity fallback 一致）。
+ */
+async function tryGeminiEndpoints(
+  bases: string[],
+  stream: boolean,
+  token: string,
+  model: string,
+  wrapped: unknown,
+  projectId?: string,
+  includeProject = true
+): Promise<{ resp: Response; failedStatus?: number }> {
+  let lastStatus: number | undefined
+  for (const base of bases) {
+    const endpoint = stream
+      ? `${base}${GEMINI_STREAM_PATH}?alt=sse`
+      : `${base}${GEMINI_GENERATE_PATH}`
+    try {
+      const resp = await streamFetchWithTimeout(endpoint, {
+        method: 'POST',
+        headers: geminiHeaders(token, model, stream, projectId, includeProject),
+        body: JSON.stringify(wrapped),
+      })
+      if (resp.status >= 500 || resp.status === 404) {
+        lastStatus = resp.status
+        continue
+      }
+      return { resp }
+    } catch (err) {
+      lastStatus = 502
+    }
+  }
+  return { resp: null as unknown as Response, failedStatus: lastStatus }
 }
 
 export interface GeminiProxyOptions {
@@ -672,60 +714,61 @@ export async function proxyGeminiChatRequest(
 
   let resp: Response | null = null
   let lastErr: Error | null = null
-  for (const base of bases) {
-    const endpoint = stream
-      ? `${base}${GEMINI_STREAM_PATH}?alt=sse`
-      : `${base}${GEMINI_GENERATE_PATH}`
-    try {
-      resp = await streamFetchWithTimeout(endpoint, {
-        method: 'POST',
-        headers: geminiHeaders(token, model, stream, projectId),
-        body: JSON.stringify(wrapped),
-      })
-      // 端点级回退：仅对 404/5xx 尝试下一个端点（与 Antigravity fallback 一致）
-      if (resp.status >= 500 || resp.status === 404) {
-        lastErr = new Error(`HTTP ${resp.status}`)
-        resp = null
-        continue
-      }
-      break
-    } catch (err) {
-      lastErr = err as Error
-      resp = null
-    }
+
+  // 首次请求：带 x-goog-user-project（对齐 Antigravity）
+  const attempt = await tryGeminiEndpoints(
+    bases,
+    stream,
+    token,
+    model,
+    wrapped,
+    projectId,
+    true
+  )
+  resp = attempt.resp ?? null
+  if (!resp && attempt.failedStatus) {
+    lastErr = new Error(`HTTP ${attempt.failedStatus}`)
   }
-  if (!resp) {
-    return geminiErrorResponse(502, lastErr?.message || '网络请求失败')
+
+  // 对齐 Antigravity call_v1_internal_with_headers：
+  // 当带 project header 收到 403（账号无权使用该 project）时，降级为不带该头重试一次。
+  // 去掉 header 后请求会回落到账号自身的默认权限/配额，规避 "no permission to use project" 403。
+  if (resp?.status === 403) {
+    const downgraded = await tryGeminiEndpoints(
+      bases,
+      stream,
+      token,
+      model,
+      wrapped,
+      projectId,
+      false
+    )
+    if (downgraded.resp) {
+      resp = downgraded.resp
+    }
   }
 
   // 401/403：token 过期，刷新后重试一次
-  if ((resp.status === 401 || resp.status === 403) && tokenState?.refresh_token) {
+  if ((resp?.status === 401 || resp?.status === 403) && tokenState?.refresh_token) {
     const refreshed = await refreshOauthToken(env, provider.id, cfg)
     if (refreshed) {
       const fresh = await readOauthToken(env, provider.id)
       token = fresh?.access_token || token
       let retried: Response | null = null
       let retryErr: Error | null = null
-      for (const base of bases) {
-        const endpoint = stream
-          ? `${base}${GEMINI_STREAM_PATH}?alt=sse`
-          : `${base}${GEMINI_GENERATE_PATH}`
-        try {
-          retried = await streamFetchWithTimeout(endpoint, {
-            method: 'POST',
-            headers: geminiHeaders(token, model, stream, projectId),
-            body: JSON.stringify(wrapped),
-          })
-          if (retried.status >= 500 || retried.status === 404) {
-            retryErr = new Error(`HTTP ${retried.status}`)
-            retried = null
-            continue
-          }
-          break
-        } catch (err) {
-          retryErr = err as Error
-          retried = null
-        }
+      const retriedAttempt = await tryGeminiEndpoints(
+        bases,
+        stream,
+        token,
+        model,
+        wrapped,
+        projectId,
+        true
+      )
+      if (retriedAttempt.resp) {
+        retried = retriedAttempt.resp
+      } else if (retriedAttempt.failedStatus) {
+        retryErr = new Error(`HTTP ${retriedAttempt.failedStatus}`)
       }
       if (!retried) {
         return geminiErrorResponse(502, retryErr?.message || '网络请求失败')
@@ -831,6 +874,20 @@ export async function proxyGeminiCountTokens(
     let resp = await perResp(bases[0])
     for (let i = 1; i < bases.length && (resp.status >= 500 || resp.status === 404); i++) {
       resp = await perResp(bases[i])
+    }
+    // 403（账号无权使用该 project）→ 移除 x-goog-user-project 头降级重试（对齐 Antigravity）
+    if (resp.status === 403) {
+      const downgrade = async (base: string) =>
+        fetch(`${base}${GEMINI_COUNT_TOKENS_PATH}`, {
+          method: 'POST',
+          headers: geminiHeaders(token, model, false, projectId, false),
+          body: JSON.stringify(body),
+          signal: AbortSignal.timeout(30000),
+        })
+      resp = await downgrade(bases[0])
+      for (let i = 1; i < bases.length && (resp.status >= 500 || resp.status === 404); i++) {
+        resp = await downgrade(bases[i])
+      }
     }
     if (!resp.ok) {
       return geminiErrorResponse(resp.status, await resp.text().catch(() => ''))
