@@ -420,8 +420,27 @@ function attachDefaultSafetySettings(body: Record<string, any>): Record<string, 
 }
 
 /** 组装发给 cloudcode-pa 的包装请求体（参考 compat.WrapRequest + BuildRequestInput） */
-function wrapGeminiRequest(projectId: string, geminiBody: Record<string, any>, model: string): Record<string, any> {
-  return { project: projectId, request: geminiBody, model }
+function wrapGeminiRequest(
+  projectId: string,
+  geminiBody: Record<string, any>,
+  model: string,
+  email?: string
+): Record<string, any> {
+  // 对齐 Antigravity wrapper.rs 的官方客户端指纹：
+  // 个人账号用 antigravity UA，企业账号用 jetski UA；非企业请求注入 Google One AI 信用标号。
+  const isEnterprise = !!email && !email.endsWith('@gmail.com') && !email.endsWith('@googlemail.com')
+  const officialUserAgent = isEnterprise ? 'jetski' : 'antigravity'
+  const defaultTier = 'legacy-tier'
+  return {
+    project: projectId,
+    request: geminiBody,
+    model,
+    userAgent: officialUserAgent,
+    requestType: 'agent',
+    requestId: `agent/${Date.now()}/${Math.random().toString(16).slice(2, 10)}`,
+    enabledCreditTypes: ['GOOGLE_ONE_AI'],
+    tierId: defaultTier,
+  }
 }
 
 // ===== Gemini → OpenAI 响应转换 =====
@@ -705,7 +724,7 @@ export async function proxyGeminiChatRequest(
   let geminiBody = await openAIToGeminiRequest(forwardBody as Record<string, any>)
   geminiBody = normalizeGemini25Thinking(geminiBody, model)
   geminiBody = attachDefaultSafetySettings(geminiBody)
-  const wrapped = wrapGeminiRequest(projectId, geminiBody, model)
+  const wrapped = wrapGeminiRequest(projectId, geminiBody, model, tokenState?.email)
 
   const isCustomBase = !!provider.geminiBaseUrl
   const bases = isCustomBase
