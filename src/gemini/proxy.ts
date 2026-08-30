@@ -596,8 +596,8 @@ function geminiErrorResponse(status: number, bodyText: string): Response {
   )
 }
 
-function geminiHeaders(token: string, model: string, stream: boolean): Record<string, string> {
-  return {
+function geminiHeaders(token: string, model: string, stream: boolean, projectId?: string): Record<string, string> {
+  const headers: Record<string, string> = {
     'Content-Type': 'application/json',
     'Accept': stream ? 'text/event-stream' : 'application/json',
     'Authorization': `Bearer ${token}`,
@@ -606,6 +606,11 @@ function geminiHeaders(token: string, model: string, stream: boolean): Record<st
     // Antigravity 官方客户端特征头（提升个人账号的配额/项目分配友好度）
     'x-client-name': 'antigravity',
   }
+  // 对齐 Antigravity call_v1_internal_with_headers：把 project 同时注入 x-goog-user-project
+  if (projectId && projectId !== 'test-project' && projectId !== 'project-id') {
+    headers['x-goog-user-project'] = projectId
+  }
+  return headers
 }
 
 export interface GeminiProxyOptions {
@@ -674,7 +679,7 @@ export async function proxyGeminiChatRequest(
     try {
       resp = await streamFetchWithTimeout(endpoint, {
         method: 'POST',
-        headers: geminiHeaders(token, model, stream),
+        headers: geminiHeaders(token, model, stream, projectId),
         body: JSON.stringify(wrapped),
       })
       // 端点级回退：仅对 404/5xx 尝试下一个端点（与 Antigravity fallback 一致）
@@ -708,7 +713,7 @@ export async function proxyGeminiChatRequest(
         try {
           retried = await streamFetchWithTimeout(endpoint, {
             method: 'POST',
-            headers: geminiHeaders(token, model, stream),
+            headers: geminiHeaders(token, model, stream, projectId),
             body: JSON.stringify(wrapped),
           })
           if (retried.status >= 500 || retried.status === 404) {
@@ -809,6 +814,8 @@ export async function proxyGeminiCountTokens(
   const model = stripProviderPrefix(String(forwardBody.model || ''))
   const geminiBody = await openAIToGeminiRequest(forwardBody as Record<string, any>)
   const body = { request: geminiBody }
+  const tokenState = await readOauthToken(env, provider.id)
+  const projectId = tokenState?.projectId || GEMINI_FALLBACK_PROJECT_ID
   try {
     const isCustomBase = !!provider.geminiBaseUrl
     const bases = isCustomBase
@@ -817,7 +824,7 @@ export async function proxyGeminiCountTokens(
     const perResp = async (base: string) =>
       fetch(`${base}${GEMINI_COUNT_TOKENS_PATH}`, {
         method: 'POST',
-        headers: geminiHeaders(token, model, false),
+        headers: geminiHeaders(token, model, false, projectId),
         body: JSON.stringify(body),
         signal: AbortSignal.timeout(30000),
       })
