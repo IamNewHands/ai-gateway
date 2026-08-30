@@ -763,6 +763,9 @@ export const GEMINI_OAUTH = {
     'https://cloudcode-pa.googleapis.com',
   ],
   redirectUri: 'http://127.0.0.1:8089/oauth2callback',
+  // 对齐 Antigravity-Manager oauth.rs：必须包含 cclog / experimentsandconfigs，
+  // 这是访问 Gemini CodeAssist（cloudcode-pa）项目的关键 scope；缺失会导致
+  // 对 fallback 项目的 serviceusage.serviceUsageConsumer 权限 403。
   scope: [
     'openid',
     'email',
@@ -770,6 +773,8 @@ export const GEMINI_OAUTH = {
     'https://www.googleapis.com/auth/cloud-platform',
     'https://www.googleapis.com/auth/userinfo.email',
     'https://www.googleapis.com/auth/userinfo.profile',
+    'https://www.googleapis.com/auth/cclog',
+    'https://www.googleapis.com/auth/experimentsandconfigs',
   ].join(' '),
 }
 
@@ -809,12 +814,9 @@ async function startOauthGeminiFlow(env: Env, providerId: string, cfg: OAuthDevi
     const { verifier, challenge } = await makeQoderPKCE()
     const state = geminiRandomState()
     const creds = geminiClientCreds(env, cfg)
-    // 过滤掉该客户端不支持的无效 scope（cclog/experimentsandconfigs），
-    // 避免历史 KV 中保存的旧配置导致 invalid_scope 400
-    const scope = (cfg.scope || GEMINI_OAUTH.scope)
-      .split(/\s+/)
-      .filter((s) => s && s !== 'cclog' && s !== 'experimentsandconfigs')
-      .join(' ')
+    // scope 采用 Antigravity-Manager 的完整集合（含 cclog / experimentsandconfigs，
+    // 它们是访问 CodeAssist 项目的关键权限）。不主动过滤，避免丢失服务权限。
+    const scope = cfg.scope || GEMINI_OAUTH.scope
     const params = new URLSearchParams({
       client_id: creds.clientId,
       redirect_uri: GEMINI_OAUTH.redirectUri,
@@ -823,6 +825,7 @@ async function startOauthGeminiFlow(env: Env, providerId: string, cfg: OAuthDevi
       state,
       access_type: 'offline',
       prompt: 'consent',
+      include_granted_scopes: 'true',
       code_challenge: challenge,
       code_challenge_method: 'S256',
     })
