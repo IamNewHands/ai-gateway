@@ -47,16 +47,31 @@ export function resolveGeminiBaseUrl(provider: Provider): string {
   return GEMINI_BASE_URL
 }
 
-/** 静态模型列表（参考 internal/models/models.go，输入 1048576 / 输出 65536） */
+/** 静态模型列表（对齐 Antigravity-Manager model_mapping.rs 的 CLAUDE_TO_GEMINI Gemini 模型全集） */
 export const GEMINI_MODELS: Array<{ id: string; displayName: string }> = [
   { id: 'gemini-2.5-pro', displayName: 'Gemini 2.5 Pro' },
   { id: 'gemini-2.5-flash', displayName: 'Gemini 2.5 Flash' },
   { id: 'gemini-2.5-flash-lite', displayName: 'Gemini 2.5 Flash Lite' },
+  { id: 'gemini-2.5-flash-thinking', displayName: 'Gemini 2.5 Flash Thinking' },
+  { id: 'gemini-3-pro', displayName: 'Gemini 3 Pro' },
   { id: 'gemini-3-pro-preview', displayName: 'Gemini 3 Pro Preview' },
+  { id: 'gemini-3-pro-low', displayName: 'Gemini 3 Pro Low' },
+  { id: 'gemini-3-pro-high', displayName: 'Gemini 3 Pro High' },
+  { id: 'gemini-3.1-pro', displayName: 'Gemini 3.1 Pro' },
   { id: 'gemini-3.1-pro-preview', displayName: 'Gemini 3.1 Pro Preview' },
+  { id: 'gemini-3.1-pro-low', displayName: 'Gemini 3.1 Pro Low' },
+  { id: 'gemini-3.1-pro-high', displayName: 'Gemini 3.1 Pro High' },
+  { id: 'gemini-3-flash', displayName: 'Gemini 3 Flash' },
   { id: 'gemini-3-flash-preview', displayName: 'Gemini 3 Flash Preview' },
   { id: 'gemini-3.1-flash-lite-preview', displayName: 'Gemini 3.1 Flash Lite Preview' },
   { id: 'gemini-3.5-flash', displayName: 'Gemini 3.5 Flash' },
+  { id: 'gemini-3.6-flash', displayName: 'Gemini 3.6 Flash' },
+  { id: 'gemini-3.7-flash', displayName: 'Gemini 3.7 Flash' },
+  { id: 'gemini-3.7-flash-tiered', displayName: 'Gemini 3.7 Flash Tiered' },
+  { id: 'gemini-3.7-flash-low', displayName: 'Gemini 3.7 Flash Low' },
+  { id: 'gemini-3.7-flash-medium', displayName: 'Gemini 3.7 Flash Medium' },
+  { id: 'gemini-3.7-flash-high', displayName: 'Gemini 3.7 Flash High' },
+  { id: 'gemini-3-pro-image', displayName: 'Gemini 3 Pro Image' },
 ]
 
 /** 是否 Gemini 提供商（OAuth flowType === 'gemini'），providerId 可自定义 */
