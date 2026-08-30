@@ -203,17 +203,51 @@ function isContentPolicyBlock(text: string): boolean {
   return false
 }
 
-/** 分类非协议错误的上游提示（供 durable 映射为 429/502/400 等） */
-export function classifyChatHubNotice(text: string): ChatHubErrorClass {
-  if (!text) return null
-  const low = text.toLowerCase()
-  if (
+/**
+ * 上游限流提示检测（同原版 chathub.go rateLimited，8-27 扩充词表）。
+ * 在 classifyChatHubNotice 与 chatWithHandlers 内部的 rateLimited 共用，避免两份列表漂移。
+ */
+function isRateLimitNoticeText(low: string): boolean {
+  return (
+    low.includes('temporarily unable to respond to this volume of requests') ||
     low.includes('temporarily unable to respond to this many requests') ||
     low.includes('太多请求') ||
     low.includes('无法响应这么多请求') ||
     low.includes('too many requests') ||
-    (low.includes('please retry') && low.includes('later'))
-  ) return 'rate_limit'
+    low.includes('请求量过大') ||
+    (low.includes('请稍后重试') && low.includes('暂时无法')) ||
+    (low.includes('please retry') || low.includes('please try again')) && low.includes('later')
+  )
+}
+
+/**
+ * 结构化 metering 节流（同原版 chathub.go checkMeteringError）：
+ * 遍历 meteringInformation 数组，按 per-capability 的 meterError/hasAccess 归类。
+ * - ImageGenInsufficientTokensThrottled → 图片额度耗尽（ErrImageLimit）
+ * - 其余（如 ImageGenSystemCapacityThrottled）→ metering 节流
+ */
+function checkMeteringError(mi: unknown): Error | null {
+  if (!Array.isArray(mi)) return null
+  for (const item of mi) {
+    if (!item || typeof item !== 'object' || Array.isArray(item)) continue
+    const m = item as Record<string, unknown>
+    const meterErr = typeof m['meterError'] === 'string' ? m['meterError'] : ''
+    const hasAccess = m['hasAccess'] === true
+    if (meterErr !== '' && !hasAccess) {
+      if (meterErr === 'ImageGenInsufficientTokensThrottled') {
+        return new Error('upstream image generation daily limit reached')
+      }
+      return new Error('upstream metering throttle: capability access denied')
+    }
+  }
+  return null
+}
+
+/** 分类非协议错误的上游提示（供 durable 映射为 429/502/400 等） */
+export function classifyChatHubNotice(text: string): ChatHubErrorClass {
+  if (!text) return null
+  const low = text.toLowerCase()
+  if (isRateLimitNoticeText(low)) return 'rate_limit'
   // chatWithHandlers 抛出的 ErrOffensiveContent 等价消息
   if (low.includes('content policy flagged as offensive')) return 'content_policy'
   if (isContentPolicyBlock(text)) return 'content_policy'
@@ -322,7 +356,7 @@ export function finalizeText(streamed: string, final: string, emit?: (delta: str
  *
  * 上游 M365 常返回大量连续空行，让长回答看起来碎成一段一断。这里做 markdown 感知的紧凑化：
  * - 普通文字区域：连续的多个空行压缩为最多 maxConsecutive 个 `\n`（段落留白保留）；
- * - 代码块（```  /  ~~~ 围栏）：内部所有空行原样保留，避免压缩破坏代码/文字排版缩进；
+ * - 代码块（```  / ~~~ 围栏）：内部所有空行原样保留，避免压缩破坏代码/文字排版缩进；
  * - 末尾多余空行清掉。
  * 不动单个换行（列表项/标题/引用的行内结构保持），因此不会破坏有意的 markdown 排版。
  */
@@ -564,7 +598,7 @@ export async function chatWithHandlers(
   const wsURL = buildWSURL(acc, sessionId, conversationId, requestID)
   let socket: OutboundWebSocket
   try {
-    const httpUrl = wsURL.replace(/^wss:\/\//i, 'https://').replace(/^ws:\/\//i, 'http://')
+    const httpUrl = wsURL.replace(/^wss:\/\/i/, 'https://').replace(/^ws:\/\/i/, 'http://')
     const resp = await fetch(httpUrl, {
       method: 'GET',
       headers: {
@@ -677,14 +711,7 @@ export async function chatWithHandlers(
 
     const rateLimited = (text: string): boolean => {
       if (streamedText !== '') return false
-      const t = text.toLowerCase()
-      return (
-        t.includes('temporarily unable to respond to this many requests') ||
-        t.includes('太多请求') ||
-        t.includes('无法响应这么多请求') ||
-        t.includes('too many requests') ||
-        (t.includes('please retry') && t.includes('later'))
-      )
+      return isRateLimitNoticeText(text.toLowerCase())
     }
 
     // 图片额度耗尽检测（同原版 imageLimitDetected：仅在无已流式文本时判定）
@@ -820,6 +847,17 @@ export async function chatWithHandlers(
               if (typeof res['value'] === 'string') {
                 rawResult = res['value']
                 debugEmit('chathub-result', rawResult)
+                // 同原版 8-27：result.value 非 "Success" 时先判定节流/上游错误（此前只查 message）
+                if (rawResult !== '' && rawResult !== 'Success') {
+                  const lowVal = rawResult.toLowerCase()
+                  if (lowVal.includes('throttl')) throw new Error('upstream metering throttle: capability access denied')
+                  throw new Error(`upstream result error: ${rawResult}`)
+                }
+              }
+              if (res['meteringInformation'] !== null && res['meteringInformation'] !== undefined) {
+                // 结构化 metering 节流（同原版 checkMeteringError）：per-capability meterError/hasAccess
+                const meterErr = checkMeteringError(res['meteringInformation'])
+                if (meterErr) throw meterErr
               }
               if (typeof res['message'] === 'string') {
                 finalText = res['message']
@@ -836,7 +874,17 @@ export async function chatWithHandlers(
 
         // complete：结束
         if (frame.type === 3) {
-          if (frame.error) throw new Error(`chathub completion error: ${JSON.stringify(frame.error)}`)
+          if (frame.error) {
+            // 同原版 8-27：完成错误按 code 分类（用户封禁/节流/额度不足 → 限流；其余带码透传便于定位）
+            const e = frame.error as Record<string, unknown>
+            const code = typeof e['code'] === 'string' ? e['code'] : ''
+            const message = typeof e['message'] === 'string' ? e['message'] : ''
+            if (code === 'ErrorUserBanned' || code === 'ErrorUserThrottled' || code === 'InsufficientTokens') {
+              throw new Error('upstream rate-limit notice')
+            }
+            if (message !== '') throw new Error(`chathub completion error: code=${JSON.stringify(code)} message=${JSON.stringify(message)}`)
+            throw new Error(`chathub completion error: ${JSON.stringify(frame.error)}`)
+          }
           // 同原版：先检查 final 是否限流，避免限流提示经 finalizeText 泄漏给客户端
           if (rateLimited(finalText)) throw new Error('upstream rate-limit notice')
           // 以最终消息对齐流式文本：流式漏掉的尾部在这里补发（原版 finalizeText）

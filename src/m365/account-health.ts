@@ -22,6 +22,7 @@ const SERVICE_UNAVAILABLE_COOLDOWN_MS = 15 * 1000 // 503 冷却 15s（同原版�
 const EMPTY_COOLDOWN_MS = 10 * 1000 // 空响应冷却 10s（原版 10–30s）
 const UNKNOWN_COOLDOWN_MS = 30 * 1000 // 未知错误冷却 30s（原版 10–30s）
 const IMAGE_LIMIT_COOLDOWN_MS = 24 * 60 * 60 * 1000 // 图片额度耗尽冷却 24h（同原版 MarkImageLimited）
+const METERING_COOLDOWN_MS = 15 * 60 * 1000 // 结构化 metering 节流固定冷却 15min（同原版 8-27）
 // 全局熔断器参数（同原版：30s 窗口内失败 ≥10 次且失败率 ≥50% → 熔断 30s）。
 // KV 落盘使其在跨实例/跨 DO 间共享，达到"全局"熔断语义。
 const BREAKER_WINDOW_MS = 30 * 1000
@@ -136,10 +137,16 @@ export function isAuthFailure(err: Error | string): boolean {
   )
 }
 
-/** 判断错误是否是空响应 */
+/** 判断错误是否为空响应 */
 export function isEmptyCompletion(err: Error | string): boolean {
   const msg = typeof err === 'string' ? err : err.message || ''
   return msg.includes('empty completion') || msg.includes('empty response')
+}
+
+/** 判断错误是否为结构化 metering 节流（同原版 ErrMeteringThrottled，固定 15min 冷却） */
+function isMeteringThrottle(err: Error | string): boolean {
+  const msg = typeof err === 'string' ? err : err.message || ''
+  return msg.includes('metering throttle') || msg.includes('capability access denied')
 }
 
 /**
@@ -197,6 +204,10 @@ export async function markAccountFailure(
     let cd: number
     if (retryAfterSeconds && retryAfterSeconds > 0) {
       cd = retryAfterSeconds * 1000
+    } else if (isMeteringThrottle(err)) {
+      // 结构化 metering 节流且无上游 Retry-After：固定 15min 冷却并复位退避计数（同原版 8-27）
+      state.rlFailures = 0
+      cd = METERING_COOLDOWN_MS
     } else if (isServiceUnavailable(msg)) {
       cd = SERVICE_UNAVAILABLE_COOLDOWN_MS
     } else {
