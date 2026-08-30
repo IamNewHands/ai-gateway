@@ -427,10 +427,9 @@ function wrapGeminiRequest(
   email?: string
 ): Record<string, any> {
   // 对齐 Antigravity wrapper.rs 的官方客户端指纹：
-  // 个人账号用 antigravity UA，企业账号用 jetski UA；非企业请求注入 Google One AI 信用标号。
+  // 个人账号用 antigravity UA，企业账号用 jetski UA；agent 请求注入 Google One AI 信用标号。
   const isEnterprise = !!email && !email.endsWith('@gmail.com') && !email.endsWith('@googlemail.com')
   const officialUserAgent = isEnterprise ? 'jetski' : 'antigravity'
-  const defaultTier = 'legacy-tier'
   return {
     project: projectId,
     request: geminiBody,
@@ -439,7 +438,6 @@ function wrapGeminiRequest(
     requestType: 'agent',
     requestId: `agent/${Date.now()}/${Math.random().toString(16).slice(2, 10)}`,
     enabledCreditTypes: ['GOOGLE_ONE_AI'],
-    tierId: defaultTier,
   }
 }
 
