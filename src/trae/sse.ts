@@ -323,8 +323,13 @@ export function soloStreamToOpenAIStream(
             case 'error': {
               const se: SOLOStreamError = { code: ev.errorCode, msg: ev.errorMessage }
               if (onErr) onErr(se)
-              const msg = `solo error code=${ev.errorCode} msg=${ev.errorMessage}`
-              controller.enqueue(new TextEncoder().encode(`event: error\ndata: ${JSON.stringify(msg)}\n\n`))
+              // 标准 OpenAI 错误帧：data 必须是 JSON 对象，不能是字符串。
+              // 原来这里发 `event: error` + `data:"solo error..."`，严格客户端
+              // （go-openai/langchaingo）会把字符串反序列化成流式对象失败 →
+              // "cannot unmarshal string into ... ChatOpenAIHTTPStreamResponse"。
+              // 改为标准 {error:{...}} 对象帧并去掉自定义 event: error。
+              const errFrame = { error: { message: `solo error code=${ev.errorCode} msg=${ev.errorMessage}`, type: 'upstream_error', code: String(ev.errorCode) } }
+              controller.enqueue(new TextEncoder().encode(`data: ${JSON.stringify(errFrame)}\n\n`))
               // 仍补标准收尾 chunk + [DONE]，避免客户端因无 finish_reason 而报 truncated
               writeChunk({}, sawToolCalls ? 'tool_calls' : 'stop')
               writeDone()

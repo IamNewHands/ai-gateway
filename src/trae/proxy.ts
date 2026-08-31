@@ -267,7 +267,9 @@ export async function proxyTraeChatRequest(
         return openaiError(502, 'upstream_empty', 'upstream returned empty body')
       }
       // 流内业务错误（1005 plan/5xx 等）→ 冷却账号，错误信息注入 SSE
-      const onErr = (se: SOLOStreamError) => { void applyStreamError(env, provider.id, account.uid, se, cd) }
+      // 记录最后一次 solo 错误，结束日志带上真实错误码（否则日志只见 end=complete，真因被掩盖）
+      let lastSoloErr: SOLOStreamError | null = null
+      const onErr = (se: SOLOStreamError) => { lastSoloErr = se; void applyStreamError(env, provider.id, account.uid, se, cd) }
       // 包 SSE 心跳 + idle 兜底：思考模型静默期客户端会因无事件 idle 超时判定流结束
       //（实测 ~15-20s 自动截断），`: keep-alive\n\n` 注释行重置客户端计时器；上游
       // 超过 idle 超时完全无数据则主动结束流防挂起。
@@ -286,7 +288,8 @@ export async function proxyTraeChatRequest(
           // 用于排查"回答中途停住"——若 9 分多钟那次的结束态是 cancel，说明是客户端掐断；
           // idle 说明上游长时间无数据被 idle 兜底；complete 则是上游正常收尾。
           const secs = Math.round((Date.now() - startedAt) / 1000)
-          const msg = `[trae-stream] provider=${provider.id} uid=${account.uid} model=${configName} end=${reason} duration=${secs}s`
+          const errInfo = lastSoloErr ? ` errCode=${lastSoloErr.code} errMsg=${lastSoloErr.msg}` : ''
+          const msg = `[trae-stream] provider=${provider.id} uid=${account.uid} model=${configName} end=${reason} duration=${secs}s${errInfo}`
           console.log(msg)
           writeLog(env, 'info', msg).catch(() => { /* 日志失败不影响流 */ })
         }
