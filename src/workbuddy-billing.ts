@@ -66,6 +66,9 @@ export async function billingCall(
     Accept: 'application/json',
     'Content-Type': 'application/json',
     'X-Domain': realm === 'global' ? 'workbuddy.ai' : 'codebuddy.cn',
+    // 网关要求带 Go HTTP 客户端 UA，否则对该站点计费面返回 http 403 非法请求（code=10085）。
+    // 参照 Go 参考实现（cpa-plugin billing.go，http 默认注入 Go-http-client/1.1）与本仓 qoder/billing.ts 的 Go-http-client/2.0。
+    'User-Agent': 'Go-http-client/2.0',
   }
   if (opts?.extraHeaders) Object.assign(headers, opts.extraHeaders)
   const body = opts && opts.body !== undefined ? JSON.stringify(opts.body) : '{}'
