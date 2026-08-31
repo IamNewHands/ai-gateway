@@ -96,12 +96,23 @@ export async function testTraeModel(
       stream: true,
     })
     if (!resp.body) return { success: false, message: '上游返回空响应体' }
-    // 读到首个字节即视为连接成功（minimal 请求，不校验内容）
+    // 首字节非空只代表"握手通了"，不代表模型可用：SOLO 流内 error（1005 plan 不足
+    // / 4008 配额耗尽等）也是非空字节，若只读首字节会误判为"连接成功"。
+    // 这里解析首块：命中 `event: error` 则如实报失败并带真实错误码。
     const reader = resp.body.getReader()
     const { value } = await reader.read()
     await reader.cancel().catch(() => {})
     if (!value || value.length === 0) {
       return { success: false, message: '上游无输出（可能被限流或 plan 权益不足）' }
+    }
+    const firstText = new TextDecoder().decode(value)
+    const errHit = /event:\s*error\s*\r?\ndata:\s*([^\n]*)/i.exec(firstText)
+    if (errHit) {
+      return {
+        success: false,
+        statusCode: resp.status,
+        message: `连接成功但模型不可用（上游 error）: ${(errHit[1] || '无详情').trim()}`,
+      }
     }
     return { success: true, message: '连接成功', statusCode: resp.status }
   } catch (e) {
@@ -136,11 +147,21 @@ export async function testTraeCredential(
       stream: true,
     })
     if (!resp.body) return { success: false, message: '上游返回空响应体' }
+    // 同上：只读首字节会漏掉流内 error，这边也校验首块 error 事件
     const reader = resp.body.getReader()
     const { value } = await reader.read()
     await reader.cancel().catch(() => {})
     if (!value || value.length === 0) {
       return { success: false, message: '上游无输出（可能被限流或 plan 权益不足）' }
+    }
+    const firstText = new TextDecoder().decode(value)
+    const errHit = /event:\s*error\s*\r?\ndata:\s*([^\n]*)/i.exec(firstText)
+    if (errHit) {
+      return {
+        success: false,
+        statusCode: resp.status,
+        message: `连接成功但模型不可用（上游 error）: ${(errHit[1] || '无详情').trim()}`,
+      }
     }
     return { success: true, message: '连接成功', statusCode: resp.status }
   } catch (e) {
