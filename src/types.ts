@@ -78,6 +78,24 @@ export interface Provider {
    */
   preferTraeUid?: string
   /**
+   * TRAE 账号级并发上限（特性A）。
+   * 单选/可并发调度：>1 时同一账号允许多个请求并发，占用会话数达到上限后该账号
+   * 暂不参与挑选；0/未配置 = 关闭并发控制（保持原有每次独占一个账号的挑选语义）。
+   * 与 conversations/active 计数联动，空闲会话可被下一请求回收。
+   */
+  traeConcurrency?: number
+  /**
+   * 空闲会话回收阈值（特性A，毫秒）。账号有活跃并发会话但最近活跃超过该阈值时，
+   * 视为空闲并允许回收给下一请求。0/未配置 = 不回收。
+   */
+  traeSessionIdleMs?: number
+  /**
+   * TRAE 强制 remote 模式模型列表（特性C，逗号分隔，忽略大小写；`*` 表示全部）。
+   * 命中模型走省输入积分预算改写路径（raw/remote 模式：历史裁剪 + 工具 schema 压缩）；
+   * 未命中模型保持现有 SOLO 热路径完全不变。0/未配置 = 全部走现有路径。
+   */
+  traeRemoteOnlyModels?: string
+  /**
    * WorkBuddy/Qoder 多账号池首选账号 UID（面板下拉框手工指定，仅 OAuth pool 提供商生效）。
    * 填写后转发时优先使用该账号（按 uid 精确匹配），
    * 被冷却/禁用/失败时才回退到池内其他账号。留空 = 维持按剩余积分自动挑选。

@@ -40,6 +40,10 @@ export interface TraeAccountState {
   /** 冷却至 epoch ms；0 = 无冷却 */
   until: number
   errCount: number
+  /** 账号级并发占用会话数（特性A 并发信号量） */
+  activeSessions?: number
+  /** 最近一次活跃会话时刻 epoch ms（特性A 空闲回收用） */
+  lastActiveAt?: number
 }
 
 /** 账号池：uid → 状态 */

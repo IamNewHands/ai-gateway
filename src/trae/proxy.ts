@@ -13,18 +13,21 @@
 import type { Env, Provider } from '../types'
 import { withSSEKeepAlive } from '../opencode'
 import { getPerfSettings } from '../perf'
-import { TRAE_DEFAULT_MODEL, TRAE_KEEPALIVE_MS, TRAE_STATIC_MODEL_IDS, TRAE_STREAM_IDLE_TIMEOUT_MS, normalizeTraeModelName } from './constants'
+import { TRAE_DEFAULT_MODEL, TRAE_KEEPALIVE_MS, TRAE_RAW_MAX_HISTORY_CHARS, TRAE_RAW_MAX_MESSAGES, TRAE_RAW_MAX_TOOL_SCHEMA_CHARS, TRAE_STATIC_MODEL_IDS, TRAE_STREAM_IDLE_TIMEOUT_MS, normalizeTraeModelName } from './constants'
 import { chatStream, exchangeToken, needsTraeRefresh, parseAuth } from './upstream'
+import { isRemoteOnlyModel, type HistoryBudget } from './payload'
 import { aggregateSoloSse, soloStreamToOpenAIStream } from './sse'
 import type { SOLOStreamError } from './types'
 import { writeLog } from '../admin'
 import {
+  acquireTraeSession,
   cooldownTraeAccount,
   disableTraeAccount,
   getTraeAccounts,
   noteTraeError,
   noteTraeSuccess,
   pickTraeAccount,
+  releaseTraeSession,
   resolveTraeCooldown,
   saveTraeAccount,
 } from './pool'
@@ -243,15 +246,33 @@ export async function proxyTraeChatRequest(
   }
   body['model'] = configName // setModelInBody：替换为 config_name
 
+  // 特性C：模型级 remote 路由（TRAE_REMOTE_ONLY_MODELS）。命中强制 remote 列表的模型
+  // 走省输入积分预算改写路径（历史裁剪 + 工具 schema 压缩），未命中保持现有 SOLO 路径。
+  // 通过 body.__budget 注入，chatStream→prepareBody 已消费（特性B 接线）；默认关闭。
+  const remoteCfg = (provider.traeRemoteOnlyModels || '').trim()
+  if (remoteCfg !== '' && isRemoteOnlyModel(configName, remoteCfg)) {
+    const budget: HistoryBudget = {
+      maxMessages: TRAE_RAW_MAX_MESSAGES,
+      maxHistoryChars: TRAE_RAW_MAX_HISTORY_CHARS,
+      maxToolSchemaChars: TRAE_RAW_MAX_TOOL_SCHEMA_CHARS,
+    }
+    body['__budget'] = budget
+  }
+
   const accounts = getTraeAccounts(provider)
   const cd = resolveTraeCooldown(provider)
   const tried = new Set<string>()
   let lastErr: Error | null = null
+  // 特性A：账号级并发上限与空闲回收阈值（未配置则维持原独占挑选语义）
+  const concurrency = typeof provider.traeConcurrency === 'number' ? provider.traeConcurrency : 0
+  const idleMs = typeof provider.traeSessionIdleMs === 'number' ? provider.traeSessionIdleMs : 0
 
   for (let i = 0; i < MAX_ROTATE; i++) {
-    const account = await pickTraeAccount(env, provider.id, accounts, tried, provider.preferTraeUid)
+    const account = await pickTraeAccount(env, provider.id, accounts, tried, provider.preferTraeUid, concurrency, idleMs)
     if (!account) break
     tried.add(account.uid)
+    // 占用会话：并发控制开启时 +1 计数；否则仅刷新活跃时刻（始终便于空闲感知）
+    await acquireTraeSession(env, provider.id, account.uid, concurrency > 0).catch(() => {})
 
     // token 临近过期 → 先 ExchangeToken 刷新（持锁换新并落盘；失败按错误分类冷却换号）
     try {
@@ -270,6 +291,7 @@ export async function proxyTraeChatRequest(
       } else {
         await cooldownTraeAccount(env, provider.id, account.uid, cd.errMs, 'refresh: ' + ((e as Error).message || '').substring(0, 120))
       }
+      await releaseTraeSession(env, provider.id, account.uid).catch(() => {})
       continue
     }
 
@@ -279,12 +301,14 @@ export async function proxyTraeChatRequest(
     } catch (e) {
       lastErr = e as Error
       await applyChatError(env, provider.id, account.uid, (e as any).kind || 'client', cd)
+      await releaseTraeSession(env, provider.id, account.uid).catch(() => {})
       continue
     }
 
     if (stream) {
       await noteTraeSuccess(env, provider.id, account.uid)
       if (!resp.body) {
+        await releaseTraeSession(env, provider.id, account.uid).catch(() => {})
         return openaiError(502, 'upstream_empty', 'upstream returned empty body')
       }
       // 流内业务错误（1005 plan/5xx 等）→ 冷却账号，错误信息注入 SSE
@@ -313,6 +337,8 @@ export async function proxyTraeChatRequest(
           const msg = `[trae-stream] provider=${provider.id} uid=${account.uid} model=${configName} end=${reason} duration=${secs}s${errInfo}`
           console.log(msg)
           writeLog(env, 'info', msg).catch(() => { /* 日志失败不影响流 */ })
+          // 流真正结束后释放会话占用（只在 acquire 过时实际减计数；release 幂等）
+          void releaseTraeSession(env, provider.id, account.uid).catch(() => {})
         }
       )
       return new Response(sseBody, {
@@ -332,9 +358,11 @@ export async function proxyTraeChatRequest(
     if (agg.err) {
       lastErr = new Error(`solo stream error code=${agg.err.code} msg=${agg.err.msg}`)
       await applyStreamError(env, provider.id, account.uid, agg.err, cd)
+      await releaseTraeSession(env, provider.id, account.uid).catch(() => {})
       continue
     }
     await noteTraeSuccess(env, provider.id, account.uid)
+    await releaseTraeSession(env, provider.id, account.uid).catch(() => {})
     const out = agg.resp!
     out['model'] = configName
     return new Response(JSON.stringify(out), {

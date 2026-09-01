@@ -34,6 +34,43 @@ export interface TraeCooldownConfig {
   errMs: number
 }
 
+/** 账号并发占用会话记录（用于账号级并发信号量与空闲回收）。 */
+export interface ActiveSession {
+  /** 会话开始时刻 */
+  startedAt: number
+  /** 最近一次活跃时刻 */
+  lastActiveAt: number
+}
+
+/** 解析账号级并发上限配置；非法/未配置 → 0（关闭并发控制）。 */
+export function parseConcurrency(value: unknown): number {
+  if (typeof value !== 'number' || !Number.isFinite(value)) return 0
+  return value > 0 ? Math.floor(value) : 0
+}
+
+/**
+ * 按占用并发数判定账号是否可用（acquire 决策）。
+ * concurrency=0（未配置）→ 恒可用；占用已满 → 不可用。
+ */
+export function typeConcurrencyHealth(concurrency: number, activeSessions: number): boolean {
+  if (concurrency <= 0) return true
+  return activeSessions < concurrency
+}
+
+/**
+ * 空闲会话回收判定：账号存在活跃会话，但最近活跃时刻超过 idleMs 阈值 → 视为空闲可回收。
+ * 无活跃会话标记 → 不回收（默认安全）。
+ */
+export function isAccountConcurrencyIdle(
+  state: Pick<TraeAccountState, 'activeSessions' | 'lastActiveAt'> | undefined,
+  idleMs: number,
+  now: number
+): boolean {
+  if (!state || !state.activeSessions || state.activeSessions <= 0) return false
+  if (!state.lastActiveAt) return false
+  return now - state.lastActiveAt > idleMs
+}
+
 /** 合并 provider.cooldown 与默认值；未配置/非法值回退默认。 */
 export function resolveTraeCooldown(provider: Provider): TraeCooldownConfig {
   const c = provider.cooldown
@@ -157,21 +194,37 @@ export async function removeTraeAccount(env: Env, providerId: string, uid: strin
  * 挑选账号：
  *  - 若指定 preferUid（面板手工指定），且该 uid 账号 healthy 且尚未 tried，则优先返回它；
  *  - 否则在 healthy 且未 tried 的账号中按剩余积分最多者挑选（原自动策略兜底）。
+ *  - 特性A：同时传入 { concurrency, idleMs } 时，忽略并发已满的账号（activeSessions
+ *    达上限），且超过 idleMs 的空闲账号可被回收（视为可用）；spec 传 null 则维持原语义
+ *    （每个请求独占一个账号，不做并发判定，保证旧热路径行为完全不变）。
  */
 export async function pickTraeAccount(
   env: Env,
   providerId: string,
   accounts: TraeAccount[],
   tried: Set<string>,
-  preferUid?: string
+  preferUid?: string,
+  concurrency?: number,
+  idleMs?: number
 ): Promise<TraeAccount | null> {
   if (accounts.length === 0) return null
   const pool = await readTraePool(env, providerId)
   const now = Date.now()
+  const doConcurrency = typeof concurrency === 'number' && concurrency > 0
+  const doIdle = typeof idleMs === 'number' && idleMs > 0
+  const usable = (uid: string): boolean => {
+    if (!isTraeHealthy(pool[uid], now)) return false
+    if (doConcurrency) {
+      const st = pool[uid]
+      const active = st?.activeSessions ?? 0
+      if (active >= concurrency) return false
+    }
+    return true
+  }
 
-  // 手工指定优先：精确匹配首选 uid，只在 healthy 且未 tried 时采用
+  // 手工指定优先：精确匹配首选 uid，只在 usable 且未 tried 时采用
   if (preferUid) {
-    const preferred = accounts.find(a => a.uid === preferUid && !tried.has(a.uid) && isTraeHealthy(pool[a.uid], now))
+    const preferred = accounts.find(a => a.uid === preferUid && !tried.has(a.uid) && usable(a.uid))
     if (preferred) return preferred
   }
 
@@ -179,11 +232,22 @@ export async function pickTraeAccount(
   let bestCredits = -Infinity
   for (const a of accounts) {
     if (tried.has(a.uid)) continue
-    if (!isTraeHealthy(pool[a.uid], now)) continue
+    if (!usable(a.uid)) continue
     const credits = pool[a.uid]?.credits ?? 0
     if (credits > bestCredits) {
       best = a
       bestCredits = credits
+    }
+  }
+  // 兜底：若并发控制下没有配额剩余但存在空闲会话可回收（超过 idleMs），取一个空闲账号
+  if (!best && doIdle) {
+    for (const a of accounts) {
+      if (tried.has(a.uid)) continue
+      if (!isTraeHealthy(pool[a.uid], now)) continue
+      if (isAccountConcurrencyIdle(pool[a.uid], idleMs, now)) {
+        best = a
+        break
+      }
     }
   }
   return best
@@ -220,6 +284,30 @@ export async function noteTraeError(env: Env, providerId: string, uid: string, t
   } else {
     pool[uid] = { ...st, errCount }
   }
+  await writeTraePool(env, providerId, pool)
+}
+
+/**
+ * 记录一次会话开始（特性A acquire）：占用 +1 并发计数并刷新活跃时刻。
+ * 传入 shouldAcquire=false（并发控制关闭）时仅刷新 lastActiveAt，不占用计数，
+ * 保证「该账号正被使用」的语义仍可被空闲回收感知。
+ */
+export async function acquireTraeSession(env: Env, providerId: string, uid: string, shouldAcquire: boolean): Promise<void> {
+  const pool = await readTraePool(env, providerId)
+  const st = pool[uid] || {}
+  const now = Date.now()
+  const activeSessions = shouldAcquire ? (st.activeSessions || 0) + 1 : st.activeSessions ?? 0
+  pool[uid] = { ...st, activeSessions, lastActiveAt: now }
+  await writeTraePool(env, providerId, pool)
+}
+
+/** 记录一次会话结束（特性A release）：占用 -1 并发计数（下限 0），并刷新活跃时刻。 */
+export async function releaseTraeSession(env: Env, providerId: string, uid: string): Promise<void> {
+  const pool = await readTraePool(env, providerId)
+  const st = pool[uid]
+  if (!st) return
+  const activeSessions = Math.max(0, (st.activeSessions || 0) - 1)
+  pool[uid] = { ...st, activeSessions, lastActiveAt: Date.now() }
   await writeTraePool(env, providerId, pool)
 }
 

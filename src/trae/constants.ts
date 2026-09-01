@@ -43,6 +43,14 @@ export const TRAE_STREAM_IDLE_TIMEOUT_MS = 180000
 /** chatStream 连接+响应头超时：仅覆盖建立连接与收到响应头的阶段，响应头到达后取消。 */
 export const TRAE_CHAT_CONNECT_TIMEOUT_MS = 30000
 
+// ===== raw/remote 省输入积分预算默认值（对齐 Trae2api-cn TRAE_RAW_* 常量） =====
+/** 保留的非 system 历史消息条数上限 */
+export const TRAE_RAW_MAX_MESSAGES = 20
+/** 历史文本字符上限（0 = 不限） */
+export const TRAE_RAW_MAX_HISTORY_CHARS = 0
+/** 工具 schema 字符预算（超限压缩，0 = 不压缩） */
+export const TRAE_RAW_MAX_TOOL_SCHEMA_CHARS = 10000
+
 /** 静态 SOLO 模型表（32 个 config_name，来自逆向报告；动态拉取失败时回退） */
 export const TRAE_STATIC_MODEL_IDS: string[] = [
   'Doubao-Seed-2.1-Pro',
