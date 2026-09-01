@@ -252,9 +252,9 @@ export async function proxyTraeChatRequest(
   const remoteCfg = (provider.traeRemoteOnlyModels || '').trim()
   if (remoteCfg !== '' && isRemoteOnlyModel(configName, remoteCfg)) {
     const budget: HistoryBudget = {
-      maxMessages: TRAE_RAW_MAX_MESSAGES,
-      maxHistoryChars: TRAE_RAW_MAX_HISTORY_CHARS,
-      maxToolSchemaChars: TRAE_RAW_MAX_TOOL_SCHEMA_CHARS,
+      maxMessages: typeof provider.traeMaxMessages === 'number' ? provider.traeMaxMessages : TRAE_RAW_MAX_MESSAGES,
+      maxHistoryChars: typeof provider.traeMaxHistoryChars === 'number' ? provider.traeMaxHistoryChars : TRAE_RAW_MAX_HISTORY_CHARS,
+      maxToolSchemaChars: typeof provider.traeMaxToolSchemaChars === 'number' ? provider.traeMaxToolSchemaChars : TRAE_RAW_MAX_TOOL_SCHEMA_CHARS,
     }
     body['__budget'] = budget
   }

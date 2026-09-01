@@ -96,6 +96,21 @@ export interface Provider {
    */
   traeRemoteOnlyModels?: string
   /**
+   * remote 模式历史最多保留条数（特性主，覆盖常量 TRAE_RAW_MAX_MESSAGES）。
+   * 仅命中 traeRemoteOnlyModels 的模型生效。0/未配置 = 用默认常量。
+   */
+  traeMaxMessages?: number
+  /**
+   * remote 模式历史总字符数上限（覆盖常量 TRAE_RAW_MAX_HISTORY_CHARS）。
+   * 0 = 不按字符裁剪，仅按条数裁剪。仅命中 remote 模型的模型生效。
+   */
+  traeMaxHistoryChars?: number
+  /**
+   * remote 模式单个工具 schema 压缩后字符上限（覆盖常量 TRAE_RAW_MAX_TOOL_SCHEMA_CHARS）。
+   * 仅命中 remote 模型的模型生效。
+   */
+  traeMaxToolSchemaChars?: number
+  /**
    * WorkBuddy/Qoder 多账号池首选账号 UID（面板下拉框手工指定，仅 OAuth pool 提供商生效）。
    * 填写后转发时优先使用该账号（按 uid 精确匹配），
    * 被冷却/禁用/失败时才回退到池内其他账号。留空 = 维持按剩余积分自动挑选。
