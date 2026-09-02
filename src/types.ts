@@ -267,6 +267,8 @@ export interface OAuthTokenState {
   oid?: string
   /** m365 模式：Entra ID 租户 ID（ChatHub WS 需要） */
   tid?: string
+  /** qoder/browser 模式：token 所属域（cn 默认 / global），决定推理与轮询/刷新端点 */
+  realm?: 'cn' | 'global'
 }
 
 /** 进行中的设备码/浏览器/Qoder 登录流程状态 */
@@ -291,7 +293,9 @@ export interface DeviceFlowState {
   verifier?: string
   /** qoder 模式：设备授权 nonce（与授权链接配对） */
   nonce?: string
-  /** browser 模式：本次登录使用的域（发起时按 cfg.loginRealm 固化，轮询/刷新时复用） */
+  /** qoder 模式：本次登录使用的机器标识（与授权链接配对，对齐 keirouter machine_id） */
+  machine_id?: string
+  /** qoder/browser 模式：本次登录使用的域（发起时按 cfg.loginRealm 固化，轮询/刷新时复用） */
   loginRealm?: 'cn' | 'global'
 }
 

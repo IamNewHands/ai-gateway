@@ -39,6 +39,8 @@ export interface QoderPoolAccount {
   enabled: boolean
   state: QoderPoolState
   updatedAt: number
+  /** 账号所属域：cn（默认）/ global，决定推理(payload)与模型端点（gateway.qoder.com.cn vs api3.qoder.sh） */
+  realm?: 'cn' | 'global'
 }
 
 export type QoderPool = QoderPoolAccount[]
@@ -121,6 +123,7 @@ export async function seedQoderPoolFromSingle(env: Env, providerId: string): Pro
     enabled: true,
     state: { credits: 0, disabled: false, until: 0, errCount: 0 },
     updatedAt: Date.now(),
+    realm: single.realm === 'global' ? 'global' : 'cn',
   }])
   return true
 }

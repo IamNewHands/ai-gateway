@@ -14,6 +14,16 @@
 
 import { md5Hex } from './md5'
 
+// ===== COSY 指纹常量（对齐 keirouter constants.go） =====
+// 这些值不是任意的——上游签名校验会把它们与签名时的值比对。
+const IDE_VERSION = '1.0.0'
+const CLIENT_TYPE = '5'
+const DATA_POLICY = 'disagree'
+const LOGIN_VERSION = 'v2'
+const MACHINE_OS = 'x86_64_windows'
+const MACHINE_TYPE = '5'
+const CLIENT_IP = '127.0.0.1'
+
 // ===== QoderEncoding（encoding.go） =====
 
 const QODER_CUSTOM_ALPHABET = '_doRTgHZBKcGVjlvpC,@aFSx#DPuNJme&i*MzLOEn)sUrthbf%Y^w.(kIQyXqWA!'
@@ -68,13 +78,17 @@ function uuid(): string {
   return crypto.randomUUID()
 }
 
-/** jsonSortedCompact：按键排序的紧凑 JSON（与 Go jsonSortedCompact 一致）。 */
-function jsonSortedCompact(m: Record<string, string>): string {
-  const keys = Object.keys(m).sort()
+/**
+ * jsonObjectOrdered：按给定键序构造紧凑 JSON。
+ * Go `json.Marshal` 对 struct 按字段声明顺序（而非字母序）序列化，
+ * keirouter 的 userInfo/cosyPayload 依赖此顺序，故身份与 payload 需固定键序
+ * 而非排序，确保与参考实现逐字节一致。
+ */
+function jsonObjectOrdered(entries: Array<[string, string]>): string {
   let out = '{'
-  for (let i = 0; i < keys.length; i++) {
+  for (let i = 0; i < entries.length; i++) {
     if (i > 0) out += ','
-    out += JSON.stringify(keys[i]) + ':' + JSON.stringify(m[keys[i]])
+    out += JSON.stringify(entries[i][0]) + ':' + JSON.stringify(entries[i][1])
   }
   out += '}'
   return out
@@ -208,18 +222,15 @@ export interface CosySession {
 }
 
 export interface CosyIdentity {
-  name: string
-  aid: string
+  /** 用户真实 uid（来自态 UserStatus/deviceToken user_id），绝不能是合成值 */
   uid: string
-  yxUid: string
-  organizationId: string
-  organizationName: string
-  userType: string
+  /** 上游信任的鉴权 token（access token） */
   securityOauthToken: string
-  refreshToken: string
+  name: string
+  email: string
 }
 
-/** newCosySession：精确移植 Go sign.go newCosySession。 */
+/** newCosySession：精确移植 Go sign.go newCosySession（身份字段对齐 keirouter userInfo）。 */
 async function newCosySession(id: CosyIdentity): Promise<CosySession> {
   const machineID = uuid()
   const seed = (uuid() + uuid()).slice(0, 50)
@@ -230,18 +241,15 @@ async function newCosySession(id: CosyIdentity): Promise<CosySession> {
   const cosyKeyBytes = rsaEncrypt(new TextEncoder().encode(tempKey))
   const cosyKey = base64Std(cosyKeyBytes)
 
-  const identityMap: Record<string, string> = {
-    name: id.name,
-    aid: id.aid,
-    uid: id.uid,
-    yx_uid: id.yxUid,
-    organization_id: id.organizationId,
-    organization_name: id.organizationName,
-    user_type: id.userType,
-    security_oauth_token: id.securityOauthToken,
-    refresh_token: id.refreshToken,
-  }
-  const identityJSON = jsonSortedCompact(identityMap)
+  // 身份 JSON 与 keirouter userInfo 完全一致：{uid, security_oauth_token, name, aid, email}
+  // aid 恒为空串。字段顺序用 jsonObjectOrdered 对齐 Go json.Marshal 的 struct 声明序。
+  const identityJSON = jsonObjectOrdered([
+    ['uid', id.uid],
+    ['security_oauth_token', id.securityOauthToken],
+    ['name', id.name],
+    ['aid', ''],
+    ['email', id.email],
+  ])
   // 只记长度，绝不打印 identityJSON（含 refresh_token / oauth token）/ tempKey 原文
   console.log('[cosy:session] identityJSON len=', identityJSON.length)
   console.log('[cosy:session] tempKey len=', tempKey.length)
@@ -276,14 +284,15 @@ export function buildBearer(sess: CosySession, body: string, rawUrl: string): Co
   const u = new URL(rawUrl)
   let pathSig = u.pathname
   if (pathSig.startsWith('/algo')) pathSig = pathSig.slice('/algo'.length)
-  const payload: Record<string, string> = {
-    cosyVersion: '0.1.43',
-    ideVersion: '',
-    info: sess.info,
-    requestId: uuid(),
+  const payload = {
+    // 对齐 keirouter cosyPayload struct 声明序：{version, requestId, info, cosyVersion, ideVersion}
     version: 'v1',
+    requestId: uuid(),
+    info: sess.info,
+    cosyVersion: IDE_VERSION,
+    ideVersion: '',
   }
-  const payloadJSON = jsonSortedCompact(payload)
+  const payloadJSON = JSON.stringify(payload)
   const payloadB64 = utf8ToBase64(payloadJSON)
   const date = String(Math.floor(Date.now() / 1000))
   const sigInput = payloadB64 + '\n' + sess.cosyKey + '\n' + date + '\n' + body + '\n' + pathSig
@@ -298,26 +307,37 @@ export function buildBearer(sess: CosySession, body: string, rawUrl: string): Co
   return { payloadB64, date, bearer: 'Bearer COSY.' + payloadB64 + '.' + sig, sigInput }
 }
 
-/** cosyHeaders：一次推理/模型请求的完整头集合。sse=true 时加 cache-control。 */
+/**
+ * cosyHeaders：一次推理/模型请求的完整头集合，对齐 keirouter BuildCosyHeaders。
+ * sse=true 时加 cache-control。accept 参数在参考实现中未使用，保留签名仅为兼容调用方。
+ */
 export function cosyHeaders(sess: CosySession, body: string, rawUrl: string, accept: string, sse: boolean): Record<string, string> {
   const { date, bearer } = buildBearer(sess, body, rawUrl)
+  const u = new URL(rawUrl)
+  let sigPath = u.pathname
+  if (sigPath.startsWith('/algo')) sigPath = sigPath.slice('/algo'.length)
+  // Cosy-Machinetoken 与 machineId 同值（与 keirouter MachineID 逻辑一致）
+  const machineID = sess.machineId
   const h: Record<string, string> = {
-    'cosy-data-policy': 'AGREE',
-    'content-type': 'application/json',
-    'cosy-machinetype': sess.machineType,
-    'cosy-clienttype': '5',
-    'cosy-date': date,
-    'cosy-user': sess.uid,
-    'cosy-key': sess.cosyKey,
-    'accept': accept,
-    'cosy-clientip': '169.254.198.161',
-    'authorization': bearer,
-    'accept-encoding': 'identity',
-    'cosy-version': '0.1.43',
-    'cosy-machineid': sess.machineId,
-    'cosy-machinetoken': sess.machineToken,
-    'login-version': 'v2',
-    'user-agent': 'Go-http-client/2.0',
+    'Authorization': bearer,
+    'Cosy-Key': sess.cosyKey,
+    'Cosy-User': sess.uid,
+    'Cosy-Date': date,
+    'Cosy-Version': IDE_VERSION,
+    'Cosy-Machineid': machineID,
+    'Cosy-Machinetoken': machineID,
+    'Cosy-Machinetype': sess.machineType,
+    'Cosy-Machineos': MACHINE_OS,
+    'Cosy-Clienttype': CLIENT_TYPE,
+    'Cosy-Clientip': CLIENT_IP,
+    'Cosy-Bodyhash': md5Hex(body),
+    'Cosy-Bodylength': String(body.length),
+    'Cosy-Sigpath': sigPath,
+    'Cosy-Data-Policy': DATA_POLICY,
+    'Cosy-Organization-Id': '',
+    'Cosy-Organization-Tags': '',
+    'Login-Version': LOGIN_VERSION,
+    'X-Request-Id': uuid(),
   }
   if (sse) h['cache-control'] = 'no-cache'
   return h
@@ -335,21 +355,17 @@ export async function cosySessionFor(
   accessToken: string,
   refreshToken: string,
   uid: string,
-  nickname: string
+  nickname: string,
+  email = ''
 ): Promise<CosySession> {
   const key = uid || accessToken.slice(0, 16)
   const cached = cosySessionCache.get(key)
   if (cached && cached.accessToken === accessToken) return cached.session
   const session = await newCosySession({
-    name: nickname,
-    aid: uid,
     uid,
-    yxUid: '',
-    organizationId: '',
-    organizationName: '',
-    userType: 'personal_professional_trial',
     securityOauthToken: accessToken,
-    refreshToken,
+    name: nickname,
+    email,
   })
   cosySessionCache.set(key, { session, accessToken })
   return session

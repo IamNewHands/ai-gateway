@@ -158,6 +158,13 @@ const OAUTH_PRESETS: Record<string, { label: string; flowType: string; deviceCod
     extraHeaders: {},
     _baseUrl: 'https://openapi.qoder.com.cn',
     _modelsUrl: 'https://gateway.qoder.com.cn/algo/api/v2/model/list?Encode=1',
+    // 国际版端点（对齐 keirouter）：授权 qoder.com / 推理 api3.qoder.sh / token openapi.qoder.sh
+    _globalBaseUrl: 'https://openapi.qoder.sh',
+    _globalModelsUrl: 'https://api3.qoder.sh/algo/api/v2/model/list?Encode=1',
+    _globalOrigin: 'https://qoder.com',
+    _globalDeviceCodeUrl: 'https://qoder.com/device/selectAccounts',
+    _globalDeviceTokenUrl: 'https://openapi.qoder.sh/api/v1/deviceToken/poll',
+    _globalRefreshTokenUrl: 'https://openapi.qoder.sh/api/v1/deviceToken/refresh',
   },
   gemini: {
     label: 'Gemini（官方 OAuth）',

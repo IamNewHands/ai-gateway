@@ -496,57 +496,90 @@ async function browserPoolUpsert(env: Env, providerId: string, token: OAuthToken
 //
 // 流程（无需 PAT）：
 //   1. 本地生成 PKCE verifier/challenge (S256) + nonce + machine_id，
-//      构造授权链接 https://qoder.com.cn/device/selectAccounts?challenge=...&client_id=...&redirect_uri=qoder-work-cn://
+//      构造授权链接 qoder.com.cn / qoder.com 的 /device/selectAccounts（按 loginRealm 分域）
 //   2. 用户在浏览器打开链接完成授权
 //   3. GET  {deviceTokenUrl}?nonce&verifier&challenge_method=S256  → 404/202=待授权；200 返回 {token:dt-, refresh_token:drt-, user_id}
 //   4. 刷新 POST {refreshTokenUrl} body {refresh_token: drt-}  → 新的 dt-/drt- 对
 //
-// 常量与桌面客户端一致：client_id=1c5e33e1-364d-4ce6-b02c-acaa81274a5c、redirect_uri=qoder-work-cn://
+// 授权链接参数与 keirouter QoderInitiateDeviceFlow 一致：仅 challenge/challenge_method/machine_id/nonce。
+// 不携带 client_id / redirect_uri。（国内原始实现曾带这两项，已对齐移除。）
 
 const QODER_WEBSITE_CN = 'https://qoder.com.cn'
-const QODER_REDIRECT_URI = 'qoder-work-cn://'
+const QODER_WEBSITE_INTL = 'https://qoder.com'
 
-/** 生成 PKCE verifier/challenge（RFC 7636 S256）。 */
-async function makeQoderPKCE(): Promise<{ verifier: string; challenge: string }> {
-  const alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~'
-  const raw = crypto.getRandomValues(new Uint8Array(64))
-  let verifier = ''
-  for (let i = 0; i < 64; i++) verifier += alphabet[raw[i] % alphabet.length]
-  const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(verifier))
-  const bytes = new Uint8Array(digest)
+/** 根据配置的登录域决定授权页域名（keirouter 国际版用 qoder.com；本地 CN 用 qoder.com.cn）。 */
+function qoderWebsite(cfg: OAuthDeviceConfig): string {
+  return cfg.loginRealm === 'global' ? QODER_WEBSITE_INTL : QODER_WEBSITE_CN
+}
+
+/** 生成 PKCE verifier/challenge（RFC 7636 S256，对齐 keirouter QoderInitiateDeviceFlow）。
+ *  verifier = 32 字节随机数 base64url（无填充）；challenge = S256(verifier) base64url。 */
+export async function makeQoderPKCE(): Promise<{ verifier: string; challenge: string }> {
+  const bytes = crypto.getRandomValues(new Uint8Array(32))
   let bin = ''
   for (const b of bytes) bin += String.fromCharCode(b)
-  const challenge = btoa(bin).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '')
+  const verifier = btoa(bin).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '')
+  const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(verifier))
+  const dbytes = new Uint8Array(digest)
+  let dbin = ''
+  for (const b of dbytes) dbin += String.fromCharCode(b)
+  const challenge = btoa(dbin).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '')
   return { verifier, challenge }
 }
 
-/** 解析 deviceToken 响应中的过期时间（expires_in 为毫秒，或 expires_at RFC3339）。默认 30 天。 */
-function qoderExpiryUnix(data: { expires_in?: number; expires_at?: string }): number {
-  if (data.expires_in && data.expires_in > 0) {
-    return Date.now() + data.expires_in
-  }
-  if (data.expires_at) {
-    const t = Date.parse(data.expires_at)
-    if (!Number.isNaN(t)) return t
-  }
-  return Date.now() + 30 * 24 * 60 * 60 * 1000
+/** deviceToken 响应中的过期字段（对齐 keirouter qoderExpiresIn 入参）。 */
+interface QoderExpiryData {
+  expires_in?: number
+  /** 毫秒时间戳（number）或 RFC3339 字符串（string）。 */
+  expires_at?: number | string
 }
 
-async function startOauthQoderFlow(env: Env, providerId: string, cfg: OAuthDeviceConfig): Promise<DeviceFlowResult> {
+/**
+ * 解析 Qoder deviceToken / refresh 响应的过期时间 → epoch ms（对齐 keirouter
+ * qoderExpiresIn，均为秒语义）：expires_at 优先，其次 expires_in（秒），
+ * 低于 1 天的值被忽略，缺省 30 天。返回的是未来某个绝对时刻（ms）。
+ */
+export function qoderExpiryUnix(data: QoderExpiryData): number {
+  const DAY = 24 * 60 * 60
+  const now = Date.now()
+  // expires_at 优先：number 为毫秒；string 为 RFC3339
+  const at = data.expires_at
+  if (typeof at === 'number' && at > 0) {
+    const remaining = Math.floor(at / 1000 - now / 1000)
+    if (remaining > DAY) return now + remaining * 1000
+  }
+  if (typeof at === 'string') {
+    const trimmed = at.trim()
+    if (trimmed) {
+      const t = Date.parse(trimmed)
+      if (!Number.isNaN(t)) {
+        const remaining = Math.floor((t - now) / 1000)
+        if (remaining > DAY) return now + remaining * 1000
+      }
+    }
+  }
+  // expires_in 单位为秒
+  if (typeof data.expires_in === 'number' && data.expires_in > DAY) {
+    return now + data.expires_in * 1000
+  }
+  return now + 30 * DAY * 1000
+}
+
+export async function startOauthQoderFlow(env: Env, providerId: string, cfg: OAuthDeviceConfig): Promise<DeviceFlowResult> {
   try {
     const { verifier, challenge } = await makeQoderPKCE()
     const nonce = crypto.randomUUID()
     const machineId = crypto.randomUUID()
 
+    // 授权链接参数对齐 keirouter QoderInitiateDeviceFlow：challenge/challenge_method/machine_id/nonce。
+    const realm = cfg.loginRealm === 'global' ? 'global' : 'cn'
     const params = new URLSearchParams({
       challenge,
       challenge_method: 'S256',
-      nonce,
       machine_id: machineId,
-      client_id: cfg.clientId || '1c5e33e1-364d-4ce6-b02c-acaa81274a5c',
-      redirect_uri: QODER_REDIRECT_URI,
+      nonce,
     })
-    const authUrl = `${QODER_WEBSITE_CN}/device/selectAccounts?${params.toString()}`
+    const authUrl = `${qoderWebsite(cfg)}/device/selectAccounts?${params.toString()}`
 
     const device: DeviceFlowState = {
       device_code: '',
@@ -557,6 +590,8 @@ async function startOauthQoderFlow(env: Env, providerId: string, cfg: OAuthDevic
       flowType: 'qoder',
       verifier,
       nonce,
+      machine_id: machineId,
+      loginRealm: realm,
     }
     await env.KV.put(deviceKey(providerId), JSON.stringify(device), { expirationTtl: 900 })
     return { success: true, message: '登录链接已生成', device }
@@ -565,20 +600,26 @@ async function startOauthQoderFlow(env: Env, providerId: string, cfg: OAuthDevic
   }
 }
 
-async function pollOauthQoderFlow(env: Env, providerId: string, cfg: OAuthDeviceConfig, device: DeviceFlowState): Promise<PollResult> {
+export async function pollOauthQoderFlow(env: Env, providerId: string, cfg: OAuthDeviceConfig, device: DeviceFlowState): Promise<PollResult> {
   if (Date.now() > device.expires_at) {
     await env.KV.delete(deviceKey(providerId))
     return { status: 'failed', message: '登录已超时（10 分钟），请重新发起' }
   }
 
   try {
+    // 轮询端点按登录域选（device.loginRealm 固化，对齐 browser 模式路由）
+    const realm = (device.loginRealm || cfg.loginRealm) === 'global' ? 'global' : 'cn'
+    const tokenUrl = realm === 'global' ? (cfg.globalDeviceTokenUrl || '') : cfg.deviceTokenUrl
+    if (!tokenUrl) {
+      return { status: 'error', message: '登录域为国际版但未配置 Global 域轮询端点（globalDeviceTokenUrl），请在 OAuth 配置中补全或改回国内版' }
+    }
     const params = new URLSearchParams({
       nonce: device.nonce || '',
       verifier: device.verifier || '',
       challenge_method: 'S256',
     })
-    const sep = cfg.deviceTokenUrl.includes('?') ? '&' : '?'
-    const pollUrl = `${cfg.deviceTokenUrl}${sep}${params.toString()}`
+    const sep = tokenUrl.includes('?') ? '&' : '?'
+    const pollUrl = `${tokenUrl}${sep}${params.toString()}`
     const res = await fetch(pollUrl, {
       method: 'GET',
       headers: { Accept: 'application/json', 'User-Agent': 'QoderWork' },
@@ -603,7 +644,8 @@ async function pollOauthQoderFlow(env: Env, providerId: string, cfg: OAuthDevice
     } | null
     const token = data?.token || data?.device_token
     if (!token) {
-      return { status: 'pending', message: '等待用户完成 QoderWork 设备授权…' }
+      // 对齐 keirouter QoderPollToken：200 但 token 为空视为异常，不再 pending
+      return { status: 'error', message: 'Qoder poll returned 200 but no token（授权服务异常，请重新发起登录）' }
     }
 
     await writeOauthToken(env, providerId, {
@@ -612,6 +654,7 @@ async function pollOauthQoderFlow(env: Env, providerId: string, cfg: OAuthDevice
       expires_at: qoderExpiryUnix(data),
       updated_at: Date.now(),
       user_id: data.user_id || undefined,
+      realm,
     })
     // Qoder 多账号池：每次成功登录把一个账号 upsert 进池（按 user_id 去重），
     // 池内多个账号按剩余积分自动挑选、错误冷却轮换。多登一个 = 多个账号。
@@ -621,6 +664,7 @@ async function pollOauthQoderFlow(env: Env, providerId: string, cfg: OAuthDevice
       expires_at: qoderExpiryUnix(data),
       updated_at: Date.now(),
       user_id: data.user_id || undefined,
+      realm,
     })
     await env.KV.delete(deviceKey(providerId))
     return { status: 'success', message: 'OAuth 连接成功' }
@@ -636,7 +680,11 @@ export async function refreshQoderTokenPair(
   prev?: OAuthTokenState
 ): Promise<OAuthTokenState | null> {
   try {
-    const res = await fetch(cfg.refreshTokenUrl, {
+    // 刷新端点按账号域选（prev.realm 固化；缺省 cn）
+    const realm = prev?.realm === 'global' ? 'global' : 'cn'
+    const refreshUrl = realm === 'global' ? (cfg.globalRefreshTokenUrl || '') : cfg.refreshTokenUrl
+    if (!refreshUrl) return null
+    const res = await fetch(refreshUrl, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
       body: JSON.stringify({ refresh_token: refreshToken }),
@@ -663,6 +711,7 @@ export async function refreshQoderTokenPair(
       // 刷新响应一般不带 user_id，保留原值
       user_id: data.user_id || prev?.user_id,
       nickname: prev?.nickname,
+      realm,
     }
   } catch {
     return null
@@ -692,10 +741,12 @@ async function qoderPoolUpsert(env: Env, providerId: string, token: OAuthTokenSt
     try { pool = raw ? JSON.parse(raw) : [] } catch { pool = [] }
     if (!Array.isArray(pool)) pool = []
     const existing = pool.find((a) => a && a.uid === uid)
+    const realm = token.realm === 'global' ? 'global' : 'cn'
     if (existing) {
       existing.token = token
       existing.enabled = true
       existing.updatedAt = Date.now()
+      existing.realm = realm
     } else {
       pool.push({
         uid,
@@ -704,6 +755,7 @@ async function qoderPoolUpsert(env: Env, providerId: string, token: OAuthTokenSt
         enabled: true,
         state: { credits: 0, disabled: false, until: 0, errCount: 0 },
         updatedAt: Date.now(),
+        realm,
       })
     }
     await env.KV.put(key, JSON.stringify(pool))
@@ -726,6 +778,7 @@ async function qoderPoolSyncToken(env: Env, providerId: string, token: OAuthToke
   if (!existing) return
   existing.token = token
   existing.updatedAt = Date.now()
+  existing.realm = token.realm === 'global' ? 'global' : 'cn'
   await env.KV.put(key, JSON.stringify(pool))
 }
 

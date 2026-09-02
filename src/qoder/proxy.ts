@@ -39,6 +39,23 @@ export const QODER_CHAT_URL =
   '/algo/api/v2/service/pro/sse/agent_chat_generation?FetchKeys=llm_model_result&AgentId=agent_common&Encode=1'
 export const QODER_MODELS_URL = QODER_GATEWAY + '/algo/api/v2/model/list?Encode=1'
 
+// 国际版（keirouter）端点：授权 qoder.com / 推理 api3.qoder.sh / token openapi.qoder.sh
+export const QODER_INTL_GATEWAY = 'https://api3.qoder.sh'
+export const QODER_CHAT_URL_INTL =
+  QODER_INTL_GATEWAY +
+  '/algo/api/v2/service/pro/sse/agent_chat_generation?FetchKeys=llm_model_result&AgentId=agent_common&Encode=1'
+export const QODER_MODELS_URL_INTL = QODER_INTL_GATEWAY + '/algo/api/v2/model/list?Encode=1'
+
+/** 按账号域解析推理（chat）端点：CN → gateway.qoder.com.cn，global → api3.qoder.sh。 */
+export function qoderChatUrl(realm: 'cn' | 'global' = 'cn'): string {
+  return realm === 'global' ? QODER_CHAT_URL_INTL : QODER_CHAT_URL
+}
+
+/** 按账号域解析模型列表端点（均带 Encode=1 参数）。 */
+export function qoderModelsUrl(realm: 'cn' | 'global' = 'cn'): string {
+  return realm === 'global' ? QODER_MODELS_URL_INTL : QODER_MODELS_URL
+}
+
 export function isQoderProvider(providerId: string): boolean {
   return providerId === QODER_PROVIDER_ID
 }
@@ -54,7 +71,7 @@ function stripProviderPrefix(model: string): string {
 async function buildQoderSession(
   env: Env,
   provider: Provider
-): Promise<{ session: CosySession; accessToken: string } | null> {
+): Promise<{ session: CosySession; accessToken: string; realm: 'cn' | 'global' } | null> {
   const cfg = provider.oauth
   if (!cfg) return null
   let token = await getOauthAccessToken(env, provider.id, cfg)
@@ -70,7 +87,7 @@ async function buildQoderSession(
     state?.user_id || '',
     state?.nickname || ''
   )
-  return { session, accessToken: token }
+  return { session, accessToken: token, realm: state?.realm === 'global' ? 'global' : 'cn' }
 }
 
 /** 从池账号构造 COSY 会话（必要时刷新 token 并写回池）。 */
@@ -353,15 +370,17 @@ async function sendQoderChatOnce(
   modelKey: string,
   model: string,
   wantStream: boolean,
-  accountUid?: string
+  accountUid?: string,
+  realm: 'cn' | 'global' = 'cn'
 ): Promise<QoderSendResult> {
-  const headers = cosyHeaders(session, encodedBody, QODER_CHAT_URL, 'text/event-stream', true)
+  const chatUrl = qoderChatUrl(realm)
+  const headers = cosyHeaders(session, encodedBody, chatUrl, 'text/event-stream', true)
   headers['x-model-key'] = modelKey
   headers['x-model-source'] = 'system'
 
   let resp: Response
   try {
-    resp = await streamFetchWithTimeout(QODER_CHAT_URL, {
+    resp = await streamFetchWithTimeout(chatUrl, {
       method: 'POST',
       headers,
       body: encodedBody,
@@ -517,7 +536,7 @@ export async function proxyQoderChatRequest(
         continue
       }
 
-      const r = await sendQoderChatOnce(session, encodedBody, modelKey, model, wantStream, account.uid)
+      const r = await sendQoderChatOnce(session, encodedBody, modelKey, model, wantStream, account.uid, account.realm === 'global' ? 'global' : 'cn')
       if (r.ok) {
         await noteQoderSuccess(env, provider.id, account.uid)
         return r.response
@@ -555,7 +574,7 @@ export async function proxyQoderChatRequest(
       { status: 502, headers: { 'Content-Type': 'application/json; charset=utf-8' } }
     )
   }
-  const r = await sendQoderChatOnce(data.session, encodedBody, modelKey, model, wantStream)
+  const r = await sendQoderChatOnce(data.session, encodedBody, modelKey, model, wantStream, undefined, data.realm)
   return r.ok ? r.response : classifiedErrorResponse(r.classified)
 }
 
@@ -570,16 +589,19 @@ export async function fetchQoderModels(
   const debug: Record<string, unknown> = {}
   console.log(`[qoder-models] start provider=${provider.id} flowType=${provider.oauth?.flowType}`)
   let session: CosySession | null = null
+  let sessionRealm: 'cn' | 'global' = 'cn'
   try {
     // 优先用池内账号（挑剩余积分最高的健康账号），池空回退单 token
     try { await seedQoderPoolFromSingle(env, provider.id) } catch { /* ignore */ }
     const acc = await pickQoderAccount(env, provider.id, new Set())
     if (acc) {
       session = await buildQoderAccountSession(env, provider, acc)
+      sessionRealm = acc.realm === 'global' ? 'global' : 'cn'
     }
     if (!session) {
       const data = await buildQoderSession(env, provider)
       session = data?.session || null
+      sessionRealm = data?.realm || 'cn'
     }
   } catch (err) {
     console.error(`[qoder-models] buildQoderSession threw:`, err)
@@ -612,14 +634,15 @@ export async function fetchQoderModels(
   }
 
   let headers: Record<string, string>
+  const modelsUrl = qoderModelsUrl(sessionRealm)
   try {
     // 先单独调用 buildBearer 获取签名中间值用于调试
-    const bearerInfo = buildBearer(session, encodedBody, QODER_MODELS_URL)
+    const bearerInfo = buildBearer(session, encodedBody, modelsUrl)
     debug.bearerDate = bearerInfo.date
     debug.bearerSigLen = bearerInfo.sigInput.length
     debug.cosyKeyLen = session.cosyKey.length
 
-    headers = cosyHeaders(session, encodedBody, QODER_MODELS_URL, 'application/json', false)
+    headers = cosyHeaders(session, encodedBody, modelsUrl, 'application/json', false)
     // 请求头可能含 Authorization Bearer 签名，只记头名列表
     console.log(`[qoder-models] request header names:`, Object.keys(headers).join(', '))
     debug.cosyHeaderNames = Object.keys(headers)
@@ -630,7 +653,7 @@ export async function fetchQoderModels(
 
   let resp: Response
   try {
-    resp = await fetch(QODER_MODELS_URL, {
+    resp = await fetch(modelsUrl, {
       method: 'GET',
       headers,
       signal: AbortSignal.timeout(20000),
