@@ -92,9 +92,16 @@ export interface Provider {
   /**
    * TRAE 强制 remote 模式模型列表（特性C，逗号分隔，忽略大小写；`*` 表示全部）。
    * 命中模型走省输入积分预算改写路径（raw/remote 模式：历史裁剪 + 工具 schema 压缩）；
-   * 未命中模型保持现有 SOLO 热路径完全不变。0/未配置 = 全部走现有路径。
+   * 未命中模型保持现有 SOLO 热路径完全不变。
+   * 注意：仅当 traeEnableRemoteBudget 开启时才生效；该字段留空 + 开关开启 = 所有模型都裁剪。
    */
   traeRemoteOnlyModels?: string
+  /**
+   * TRAE 省钱预算开关（特性C）。开启后，命中 traeRemoteOnlyModels 的模型（留空 = 全部）才走
+   * 历史/工具 schema 预算裁剪路径；关闭（默认）= 完全保持现有 SOLO 热路径，零影响。
+   * 界面左下方的「省钱预算」开关即此字段。
+   */
+  traeEnableRemoteBudget?: boolean
   /**
    * remote 模式历史最多保留条数（特性主，覆盖常量 TRAE_RAW_MAX_MESSAGES）。
    * 仅命中 traeRemoteOnlyModels 的模型生效。0/未配置 = 用默认常量。
@@ -367,6 +374,13 @@ export interface CreateProviderRequest {
   thinkingInject?: string[]
   cachePrefixInject?: string[]
   geminiBaseUrl?: string
+  /** TRAE 省钱预算开关（特性C）：开启后命中 remote 模型列表才走历史/工具 schema 裁剪 */
+  traeEnableRemoteBudget?: boolean
+  /** TRAE 命中的远程模型列表（逗号分隔，留空 + 开关开启 = 全部模型） */
+  traeRemoteOnlyModels?: string
+  traeMaxMessages?: number
+  traeMaxHistoryChars?: number
+  traeMaxToolSchemaChars?: number
 }
 
 export interface UpdateProviderRequest {
@@ -392,6 +406,12 @@ export interface UpdateProviderRequest {
   /** 传空数组可清空缓存前缀注入选择 */
   cachePrefixInject?: string[] | null
   geminiBaseUrl?: string
+  /** TRAE 省钱预算开关（传 null 关闭） */
+  traeEnableRemoteBudget?: boolean | null
+  traeRemoteOnlyModels?: string | null
+  traeMaxMessages?: number | null
+  traeMaxHistoryChars?: number | null
+  traeMaxToolSchemaChars?: number | null
 }
 
 /**
@@ -418,6 +438,11 @@ export interface UpsertProviderRequest {
   thinkingInject?: string[]
   cachePrefixInject?: string[]
   geminiBaseUrl?: string
+  traeEnableRemoteBudget?: boolean
+  traeRemoteOnlyModels?: string
+  traeMaxMessages?: number
+  traeMaxHistoryChars?: number
+  traeMaxToolSchemaChars?: number
 }
 
 /**

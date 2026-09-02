@@ -229,6 +229,11 @@ export async function handleCreateProvider(c: Context<AppEnv>) {
     thinkingInject: body.thinkingInject,
     cachePrefixInject: body.cachePrefixInject,
     geminiBaseUrl: body.geminiBaseUrl?.replace(/\/$/, ''),
+    traeEnableRemoteBudget: body.traeEnableRemoteBudget,
+    traeRemoteOnlyModels: body.traeRemoteOnlyModels,
+    traeMaxMessages: body.traeMaxMessages,
+    traeMaxHistoryChars: body.traeMaxHistoryChars,
+    traeMaxToolSchemaChars: body.traeMaxToolSchemaChars,
     apiKeys: normalizeArray(body.apiKeys, (k) => ({ key: k, enabled: true })),
     models: body.models
       ? normalizeArray(body.models, (m) => ({ id: m, enabled: true }))
@@ -276,6 +281,11 @@ export async function handleUpdateProvider(c: Context<AppEnv>) {
     }
     updates.geminiBaseUrl = body.geminiBaseUrl ? body.geminiBaseUrl.replace(/\/$/, '') : undefined
   }
+  if (body.traeEnableRemoteBudget !== undefined) updates.traeEnableRemoteBudget = body.traeEnableRemoteBudget ?? undefined
+  if (body.traeRemoteOnlyModels !== undefined) updates.traeRemoteOnlyModels = body.traeRemoteOnlyModels ?? undefined
+  if (body.traeMaxMessages !== undefined) updates.traeMaxMessages = body.traeMaxMessages ?? undefined
+  if (body.traeMaxHistoryChars !== undefined) updates.traeMaxHistoryChars = body.traeMaxHistoryChars ?? undefined
+  if (body.traeMaxToolSchemaChars !== undefined) updates.traeMaxToolSchemaChars = body.traeMaxToolSchemaChars ?? undefined
 if (body.apiKeys !== undefined) {
     updates.apiKeys = normalizeArray(body.apiKeys, (k) => ({ key: k, enabled: true }))
   }
@@ -352,6 +362,11 @@ export async function handleUpsertProvider(c: Context<AppEnv>) {
       thinkingInject: body.thinkingInject,
       cachePrefixInject: body.cachePrefixInject,
       geminiBaseUrl: body.geminiBaseUrl?.replace(/\/$/, ''),
+      traeEnableRemoteBudget: body.traeEnableRemoteBudget,
+      traeRemoteOnlyModels: body.traeRemoteOnlyModels,
+      traeMaxMessages: body.traeMaxMessages,
+      traeMaxHistoryChars: body.traeMaxHistoryChars,
+      traeMaxToolSchemaChars: body.traeMaxToolSchemaChars,
       createdAt: now,
       updatedAt: now,
     }
@@ -382,6 +397,11 @@ export async function handleUpsertProvider(c: Context<AppEnv>) {
   if (body.thinkingInject !== undefined) updates.thinkingInject = body.thinkingInject
   if (body.cachePrefixInject !== undefined) updates.cachePrefixInject = body.cachePrefixInject
   if (body.enabled !== undefined) updates.enabled = body.enabled
+  if (body.traeEnableRemoteBudget !== undefined) updates.traeEnableRemoteBudget = body.traeEnableRemoteBudget ?? undefined
+  if (body.traeRemoteOnlyModels !== undefined) updates.traeRemoteOnlyModels = body.traeRemoteOnlyModels ?? undefined
+  if (body.traeMaxMessages !== undefined) updates.traeMaxMessages = body.traeMaxMessages ?? undefined
+  if (body.traeMaxHistoryChars !== undefined) updates.traeMaxHistoryChars = body.traeMaxHistoryChars ?? undefined
+  if (body.traeMaxToolSchemaChars !== undefined) updates.traeMaxToolSchemaChars = body.traeMaxToolSchemaChars ?? undefined
 
   // keys 合并：以现有为底，按 key 字符串去重追加，保留原 enabled
   if (body.apiKeys !== undefined) {

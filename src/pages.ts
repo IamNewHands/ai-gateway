@@ -561,6 +561,20 @@ ${H('管理')}
                 <div id="trae-st-${escapePageHtml(p.id)}" class="oauth-status" aria-live="polite"></div>
                 <div id="trae-acc-${escapePageHtml(p.id)}" class="mt-1"></div>
                 <div class="fc mt-1 field-row" style="gap:8px"><input type="number" id="cd-plan-${escapePageHtml(p.id)}" value="${p.cooldown&&p.cooldown.planMs?Math.round(p.cooldown.planMs/60000):''}" style="width:88px" placeholder="plan冷却(分)"><input type="number" id="cd-soft-${escapePageHtml(p.id)}" value="${p.cooldown&&p.cooldown.softMs?Math.round(p.cooldown.softMs/1000):''}" style="width:88px" placeholder="429冷却(秒)"><input type="number" id="cd-err-${escapePageHtml(p.id)}" value="${p.cooldown&&p.cooldown.errThreshold?p.cooldown.errThreshold:''}" style="width:76px" placeholder="错误阈值"><input type="number" id="cd-errms-${escapePageHtml(p.id)}" value="${p.cooldown&&p.cooldown.errMs?Math.round(p.cooldown.errMs/60000):''}" style="width:88px" placeholder="错误冷却(分)"><span class="mu" style="font-size:12px">冷却参数（留空 = 默认 plan 12h / 429 60s / 连续 3 次错误冷却 10m）</span></div>
+                <div class="collapse-section">
+                  <button class="collapse-btn" onclick="toggleVbCollapse('trae-budget-adv-${escapePageJsx(p.id)}', this)" type="button" aria-expanded="false">
+                    <i class="fas fa-chevron-right collapse-icon" aria-hidden="true"></i> 省钱预算（历史裁剪 / 工具压缩，可选）
+                  </button>
+                  <div id="trae-budget-adv-${escapePageHtml(p.id)}" class="hd">
+                    <fieldset class="form-group"><legend>省钱预算</legend><span class="form-helper">开启后，命中下方「远程模型列表」的模型在转发前会被裁剪历史、压缩工具 schema，从而降低上游输入积分。模型列表留空 = 所有模型都裁剪；关闭开关 = 完全保持现有转发，零影响。</span>
+                      <label class="switch-label"><span>启用省钱预算（TRAE 长会话裁剪）</span><span class="tg"><input type="checkbox" id="trae-budget-${escapePageHtml(p.id)}" ${p.traeEnableRemoteBudget?'checked':''}><span class="sl"></span></span></label>
+                      <div class="fg"><label>远程模型列表（逗号分隔，留空 = 所有模型）</label><input type="text" id="trae-rmodels-${escapePageHtml(p.id)}" value="${escapePageHtml(p.traeRemoteOnlyModels||'')}" placeholder="如 deepseek_v4_pro,glm-5.2（留空 = 全部；支持 *）"></div>
+                      <div class="fg"><label>历史最多保留条数（留空 = 默认 20）</label><input type="number" id="trae-mm-${escapePageHtml(p.id)}" value="${p.traeMaxMessages??''}" placeholder="20"></div>
+                      <div class="fg"><label>历史总字符数上限（留空 = 不限）</label><input type="number" id="trae-mhc-${escapePageHtml(p.id)}" value="${p.traeMaxHistoryChars??''}" placeholder="0（不限）"></div>
+                      <div class="fg"><label>单个工具 schema 上限（留空 = 默认 10000）</label><input type="number" id="trae-mtsc-${escapePageHtml(p.id)}" value="${p.traeMaxToolSchemaChars??''}" placeholder="10000"></div>
+                    </fieldset>
+                  </div>
+                </div>
               </fieldset>`:''}
               <div class="collapse-section">
                 <button class="collapse-btn" onclick="toggleVbCollapse('vb-fs-${escapePageJsx(p.id)}', this)" type="button" aria-expanded="false">
@@ -1756,6 +1770,13 @@ function renderQoderPoolAccounts(id, accs, ciByUid, ciAccounts) {
   }).join('')
 }
 /** 收集冷却参数（trae / workbuddy 池共用 cd-* 输入）；无输入框返回 undefined，全空返回 null（恢复默认）。 */
+function numOrUndef(v) {
+  const s = (v == null ? '' : String(v)).trim()
+  if (s === '') return undefined
+  const n = Number(s)
+  return Number.isFinite(n) ? n : undefined
+}
+
 function collectCooldown(id) {
   if (!document.getElementById('cd-plan-' + id)) return undefined
   const num = function(prefix, div) {
@@ -2315,6 +2336,13 @@ async function save(id) {
     const inject = (document.getElementById('mcp-' + id + '-' + idx)||{}).checked === true
     return mid && inject ? mid : null
   }).filter(Boolean)
+  // TRAE 省钱预算：收集开关 + 模型列表 + 3 个常量
+  const traeBudgetEl = document.getElementById('trae-budget-' + id)
+  const traeEnableRemoteBudget = traeBudgetEl ? traeBudgetEl.checked === true : undefined
+  const traeRemoteOnlyModels = traeBudgetEl ? ((document.getElementById('trae-rmodels-' + id)||{}).value || '').trim() || undefined : undefined
+  const traeMaxMessages = traeBudgetEl ? numOrUndef((document.getElementById('trae-mm-' + id)||{}).value) : undefined
+  const traeMaxHistoryChars = traeBudgetEl ? numOrUndef((document.getElementById('trae-mhc-' + id)||{}).value) : undefined
+  const traeMaxToolSchemaChars = traeBudgetEl ? numOrUndef((document.getElementById('trae-mtsc-' + id)||{}).value) : undefined
   if (authType === 'oauth-device') {
     // 国际版必须带 Global 发起端点，否则发起登录会静默走国内端点
     if (oauth.loginRealm === 'global' && !oauth.globalDeviceCodeUrl) {
@@ -2337,7 +2365,7 @@ async function save(id) {
     const r = await fetch('/admin/api/providers/' + encodeURIComponent(id), {
       method: 'PUT',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ name: nm, baseUrl: url, apiType, authType, oauth: authType === 'oauth-device' ? oauth : undefined, apiKeys: keys, models, enabled, toolBridge: (document.getElementById('atb-' + id)||{}).checked === true, allowUnlistedModels: (document.getElementById('aum-' + id)||{}).checked === true, thinkingInject, cachePrefixInject, cooldown: collectCooldown(id), type: vb && vb.primary ? 'vision-bridge' : null, visionBridge: vb, geminiBaseUrl: ((document.getElementById('gbu-' + id)||{}).value || '').trim() || null })
+      body: JSON.stringify({ name: nm, baseUrl: url, apiType, authType, oauth: authType === 'oauth-device' ? oauth : undefined, apiKeys: keys, models, enabled, toolBridge: (document.getElementById('atb-' + id)||{}).checked === true, allowUnlistedModels: (document.getElementById('aum-' + id)||{}).checked === true, thinkingInject, cachePrefixInject, cooldown: collectCooldown(id), type: vb && vb.primary ? 'vision-bridge' : null, visionBridge: vb, geminiBaseUrl: ((document.getElementById('gbu-' + id)||{}).value || '').trim() || null, traeEnableRemoteBudget, traeRemoteOnlyModels, traeMaxMessages, traeMaxHistoryChars, traeMaxToolSchemaChars })
     })
     const d = await r.json()
     if (d.success) { toast('已保存', 'success'); reloadAdmin() }
