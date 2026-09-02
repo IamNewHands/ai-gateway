@@ -566,9 +566,9 @@ ${H('管理')}
                     <i class="fas fa-chevron-right collapse-icon" aria-hidden="true"></i> 省钱预算（历史裁剪 / 工具压缩，可选）
                   </button>
                   <div id="trae-budget-adv-${escapePageHtml(p.id)}" class="hd">
-                    <fieldset class="form-group"><legend>省钱预算</legend><span class="form-helper">开启后，命中下方「远程模型列表」的模型在转发前会被裁剪历史、压缩工具 schema，从而降低上游输入积分。模型列表留空 = 所有模型都裁剪；关闭开关 = 完全保持现有转发，零影响。</span>
+                    <fieldset class="form-group"><legend>省钱预算</legend><span class="form-helper">开启后，在上方模型列表里勾选了「命中省钱预算」的模型，转发前会被裁剪历史、压缩工具 schema，从而降低上游输入积分；勾选 = 仅所选模型生效；关闭开关 = 完全保持现有转发，零影响。</span>
                       <label class="switch-label"><span>启用省钱预算（TRAE 长会话裁剪）</span><span class="tg"><input type="checkbox" id="trae-budget-${escapePageHtml(p.id)}" ${p.traeEnableRemoteBudget?'checked':''}><span class="sl"></span></span></label>
-                      <div class="fg"><label>远程模型列表（逗号分隔，留空 = 所有模型）</label><input type="text" id="trae-rmodels-${escapePageHtml(p.id)}" value="${escapePageHtml(p.traeRemoteOnlyModels||'')}" placeholder="如 deepseek_v4_pro,glm-5.2（留空 = 全部；支持 *）"></div>
+                      <div id="trae-trm-${escapePageHtml(p.id)}" class="hd" data-rmodels="${escapePageHtml(p.traeRemoteOnlyModels||'')}"></div>
                       <div class="fg"><label>历史最多保留条数（留空 = 默认 20）</label><input type="number" id="trae-mm-${escapePageHtml(p.id)}" value="${p.traeMaxMessages??''}" placeholder="20"></div>
                       <div class="fg"><label>历史总字符数上限（留空 = 不限）</label><input type="number" id="trae-mhc-${escapePageHtml(p.id)}" value="${p.traeMaxHistoryChars??''}" placeholder="0（不限）"></div>
                       <div class="fg"><label>单个工具 schema 上限（留空 = 默认 10000）</label><input type="number" id="trae-mtsc-${escapePageHtml(p.id)}" value="${p.traeMaxToolSchemaChars??''}" placeholder="10000"></div>
@@ -2336,10 +2336,15 @@ async function save(id) {
     const inject = (document.getElementById('mcp-' + id + '-' + idx)||{}).checked === true
     return mid && inject ? mid : null
   }).filter(Boolean)
-  // TRAE 省钱预算：收集开关 + 模型列表 + 3 个常量
+  // TRAE 省钱预算：收集开关 + 勾选命中的模型列表 + 3 个常量
   const traeBudgetEl = document.getElementById('trae-budget-' + id)
   const traeEnableRemoteBudget = traeBudgetEl ? traeBudgetEl.checked === true : undefined
-  const traeRemoteOnlyModels = traeBudgetEl ? ((document.getElementById('trae-rmodels-' + id)||{}).value || '').trim() || undefined : undefined
+  const traeRemoteOnlyModels = traeBudgetEl ? (Array.from(document.querySelectorAll('#ml-' + id + ' [data-idx]')).map(item => {
+    const idx = parseInt(item.dataset.idx)
+    const mid = document.getElementById('mid-' + id + '-' + idx).value.trim()
+    const budgetHit = (document.getElementById('mrb-' + id + '-' + idx)||{}).checked === true
+    return mid && budgetHit ? mid : null
+  }).filter(Boolean).join(',')) || undefined : undefined
   const traeMaxMessages = traeBudgetEl ? numOrUndef((document.getElementById('trae-mm-' + id)||{}).value) : undefined
   const traeMaxHistoryChars = traeBudgetEl ? numOrUndef((document.getElementById('trae-mhc-' + id)||{}).value) : undefined
   const traeMaxToolSchemaChars = traeBudgetEl ? numOrUndef((document.getElementById('trae-mtsc-' + id)||{}).value) : undefined
@@ -2473,10 +2478,16 @@ function addMdl(id) {
   const inp = document.getElementById('nmid-' + id), mid = inp.value.trim()
   if (!mid) { toast('请输入模型 ID', 'error'); return }
   const c = document.getElementById('ml-' + id), cnt = c.querySelectorAll('[data-idx]').length
+  // 省钱预算命中勾选：仅当该提供商存在「省钱预算」区（trae）才显示；并按已存命中列表回显
+  const hasBudget = !!document.getElementById('trae-budget-' + id)
+  const trm = document.getElementById('trae-trm-' + id)
+  const savedList = hasBudget && trm ? (trm.getAttribute('data-rmodels') || '').split(',').map(function(s){ return s.trim().toLowerCase() }).filter(Boolean) : []
+  const dbChecked = hasBudget && savedList.indexOf(String(mid).trim().toLowerCase()) !== -1
+  const dbBox = hasBudget ? '<label class="tg" title="命中省钱预算（历史裁剪/工具压缩）"><input type="checkbox" id="mrb-' + escapeHtml(id) + '-' + cnt + '"' + (dbChecked ? ' checked' : '') + ' aria-label="命中省钱预算"><span class="sl"></span></label>' : ''
   const d = document.createElement('div')
   d.className = 'fc mb-3 field-row'
   d.dataset.idx = cnt
-  d.innerHTML = '<input type="text" value="' + escapeHtml(mid) + '" class="fx1" id="mid-' + escapeHtml(id) + '-' + cnt + '" placeholder="模型 ID" aria-label="模型 ID"><label class="tg" title="启用该模型"><input type="checkbox" checked id="men-' + escapeHtml(id) + '-' + cnt + '" aria-label="启用该模型"><span class="sl"></span></label><label class="tg" title="启用思维引导注入"><input type="checkbox" id="mit-' + escapeHtml(id) + '-' + cnt + '" aria-label="启用思维引导注入"><span class="sl"></span></label><label class="tg" title="启用缓存前缀注入"><input type="checkbox" id="mcp-' + escapeHtml(id) + '-' + cnt + '" aria-label="启用缓存前缀注入"><span class="sl"></span></label><button class="btn btn-gh btn-xs" id="tm-' + escapeHtml(id) + '-' + cnt + '" aria-label="测试该模型"><i class="fas fa-plug"></i></button><button class="btn btn-gh btn-xs" id="rm-' + escapeHtml(id) + '-' + cnt + '" aria-label="移除该模型"><i class="fas fa-times c-l"></i></button><span class="trt" id="mtr-' + escapeHtml(id) + '-' + cnt + '" style="flex-basis:100%" aria-live="polite"></span>'
+  d.innerHTML = '<input type="text" value="' + escapeHtml(mid) + '" class="fx1" id="mid-' + escapeHtml(id) + '-' + cnt + '" placeholder="模型 ID" aria-label="模型 ID"><label class="tg" title="启用该模型"><input type="checkbox" checked id="men-' + escapeHtml(id) + '-' + cnt + '" aria-label="启用该模型"><span class="sl"></span></label><label class="tg" title="启用思维引导注入"><input type="checkbox" id="mit-' + escapeHtml(id) + '-' + cnt + '" aria-label="启用思维引导注入"><span class="sl"></span></label><label class="tg" title="启用缓存前缀注入"><input type="checkbox" id="mcp-' + escapeHtml(id) + '-' + cnt + '" aria-label="启用缓存前缀注入"><span class="sl"></span></label>' + dbBox + '<button class="btn btn-gh btn-xs" id="tm-' + escapeHtml(id) + '-' + cnt + '" aria-label="测试该模型"><i class="fas fa-plug"></i></button><button class="btn btn-gh btn-xs" id="rm-' + escapeHtml(id) + '-' + cnt + '" aria-label="移除该模型"><i class="fas fa-times c-l"></i></button><span class="trt" id="mtr-' + escapeHtml(id) + '-' + cnt + '" style="flex-basis:100%" aria-live="polite"></span>'
   c.appendChild(d)
   document.getElementById('tm-' + id + '-' + cnt).addEventListener('click', function() { testMdl(id, mid, cnt) })
   document.getElementById('rm-' + id + '-' + cnt).addEventListener('click', function() { rmMdl(id, cnt) })

@@ -247,11 +247,12 @@ export async function proxyTraeChatRequest(
   body['model'] = configName // setModelInBody：替换为 config_name
 
   // 特性C：模型级 remote 路由（省输入积分预算改写路径）。
-  // 受 traeEnableRemoteBudget 开关控制（界面「省钱预算」开关）：开启后命中 remote 列表的
-  // 模型走历史裁剪 + 工具 schema 压缩；列表留空 = 全部模型都裁剪。关闭（默认）= 现有 SOLO 路径完全不变。
+  // 受 traeEnableRemoteBudget 开关控制（界面「省钱预算」开关）：开启且下方勾选了
+  // 「命中省钱预算」的模型（traeRemoteOnlyModels 非空）才走历史裁剪 + 工具 schema 压缩；
+  // 未勾选任何模型 = 不触发。关闭（默认）= 现有 SOLO 路径完全不变。
   const remoteEnabled = provider.traeEnableRemoteBudget === true
   const remoteCfg = (provider.traeRemoteOnlyModels || '').trim()
-  if (remoteEnabled && (remoteCfg === '' || isRemoteOnlyModel(configName, remoteCfg))) {
+  if (remoteEnabled && remoteCfg !== '' && isRemoteOnlyModel(configName, remoteCfg)) {
     const budget: HistoryBudget = {
       maxMessages: typeof provider.traeMaxMessages === 'number' ? provider.traeMaxMessages : TRAE_RAW_MAX_MESSAGES,
       maxHistoryChars: typeof provider.traeMaxHistoryChars === 'number' ? provider.traeMaxHistoryChars : TRAE_RAW_MAX_HISTORY_CHARS,
