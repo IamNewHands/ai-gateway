@@ -12,7 +12,7 @@
  */
 import { classifyUpdateMessages, extractToolEvents, normalizeFrame, imageURLs } from './events'
 import type { ChatHubStreamEvent } from './events'
-import { toolProtocolPrompt } from './tools'
+import { toolProtocolPrompt, clientToolWireName, redactPublicFunctionNames, redactSchemaDocumentation } from './tools'
 
 /**
  * Workers 出站 WebSocket 客户端。
@@ -538,18 +538,20 @@ function chatPayload(req: ChatHubRequest, requestID: string, firstTurn: boolean)
 }
 
 /** M365 原生插件列表（与原版 clientPlugins 一致的官方插件结构，字段名须大写）。
+ * 工具名使用混淆名（m365gw_client_<hex>），防止 M365 识别客户端工具原名。
  * mcpServerUrl 非空时附加 mcp-gateway 插件条目（同原版：Source:'MCPServer'）。 */
 function clientPlugins(tools: ChatHubTool[]): Record<string, unknown>[] {
   if (!tools || tools.length === 0) return []
   const plugins: Record<string, unknown>[] = []
+  const publicNames = tools.map((t) => t.function?.name || '').filter(Boolean)
   for (const t of tools) {
     const f = t.function
     if (!f || !f.name) continue
     plugins.push({
-      Id: f.name,
+      Id: clientToolWireName(f.name),
       Source: 'API',
-      Description: f.description || '',
-      Parameters: f.parameters ?? null,
+      Description: redactPublicFunctionNames(f.description || '', publicNames),
+      Parameters: redactSchemaDocumentation(f.parameters ?? null, publicNames),
     })
   }
   return plugins

@@ -12,7 +12,8 @@
 import type { Env } from '../types'
 import { chatWithHandlers, classifyChatHubNotice, collapseExcessBlankLines } from './chathub'
 import type { ChatHubAccount, ChatHubTool, ChatHubResult } from './chathub'
-import { flattenPromptMessages, modelToolRouterPrompt, parseModelToolDecision, fencedToolCalls, nativeToolCalls, compactToolResult, buildAgentLedger, canContinue, resolveMaxToolRounds, activeMessages, ledgerRouterContext, filterCompletedCalls, validateDetectedToolCalls, completionEvidenceAllows, isToolRefusal, isSandboxHallucination } from './tools'
+import { flattenPromptMessages, modelToolRouterPrompt, parseModelToolDecision, fencedToolCalls, nativeToolCalls, compactToolResult, buildAgentLedger, canContinue, resolveMaxToolRounds, activeMessages, ledgerRouterContext, filterCompletedCalls, validateDetectedToolCalls, isToolRefusal, isSandboxHallucination } from './tools'
+import { evaluateCompletionEvidence } from './completion-evidence'
 import type { DetectedToolCall, AgentLedger, OaiMsgLite } from './tools'
 import { resolveSession, bindSession, systemPromptHash, convCacheLookup, convCacheStore } from './session'
 import type { ResolveResult, ContextLike } from './session'
@@ -143,7 +144,7 @@ export class M365Session {
     // 多轮工具证据 ledger：从"最近一条 user 之后的连续窗口"解析已完成/待处理的工具调用
     // （activeMessages 同原版），去重并注入上下文。只用最近窗口统计 toolRounds，
     // 避免历史已完成工具调用累计而误触发上限（长会话第 N 轮被 409 的根因）。
-    const ledger: AgentLedger = buildAgentLedger(activeMessages(messages as OaiMsgLite[]))
+    const ledger: AgentLedger = await buildAgentLedger(activeMessages(messages as OaiMsgLite[]))
     const maxToolRounds = resolveMaxToolRounds(this.env.M365_MAX_TOOL_ROUNDS)
     if (!canContinue(ledger, maxToolRounds)) {
       try { await writeLog(this.env, 'warn', `[m365-chat] provider=${providerId} → tool loop gate blocked`, `stuckLoop=${ledger.stuckLoop} repeatedFailure=${ledger.repeatedFailure} toolRounds=${ledger.toolRounds}/${maxToolRounds} sig=${ledger.repetitionSignature || ''}`) } catch { /* ignore */ }
@@ -383,8 +384,9 @@ export class M365Session {
     const calls = filterCompletedCalls(validated.calls, ledger)
 
     let finalText = result.text
-    // 兜底 3：若存在工具证据但回答声称"已完成"，且无匹配工具结果，则替换为未确认措辞
-    if (toolDefs.length > 0 && !completionEvidenceAllows(finalText, ledger)) {
+    // 兜底 3：完成证据评估——若回答包含"已完成"声明但缺少匹配工具证据，
+    // 则按 disposition 降级或终止（替换为未确认措辞，避免虚构成功）
+    if (toolDefs.length > 0 && finalText && !evaluateCompletionEvidence(finalText, ledger).allowed) {
       finalText = 'I cannot confirm completion because no matching tool results were returned. No external action has been verified.'
     }
 
@@ -639,7 +641,7 @@ export class M365Session {
 
           // 完成证据校正（流式不可撤回，仅影响会话绑定文本）
           let finalText = collapseExcessBlankLines(result.text || streamedText)
-          if (toolDefs.length > 0 && !completionEvidenceAllows(finalText, ledger)) {
+          if (toolDefs.length > 0 && finalText && !evaluateCompletionEvidence(finalText, ledger).allowed) {
             finalText = 'I cannot confirm completion because no matching tool results were returned. No external action has been verified.'
           }
           sseLog('final', finalText)

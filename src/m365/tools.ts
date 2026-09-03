@@ -8,6 +8,56 @@
  */
 import type { ChatHubTool } from './chathub'
 import { parseToolCalls } from '../cnb/xyml'
+import { buildToolLedger, toolLedgerToAgentLedger, guardToolLedger, toolCallFingerprint } from './tool-ledger'
+
+/** 客户端工具名混淆常量（同 CF2 chathub.ts CLIENT_TOOL_ALIAS_PREFIX） */
+const CLIENT_TOOL_ALIAS_PREFIX = 'm365gw_client_'
+
+/** 生成客户端工具混淆名：原名 → `m365gw_client_<hex>`（同 CF2 clientToolWireName） */
+export function clientToolWireName(name: string): string {
+  const normalized = name.trim()
+  if (!normalized) return normalized
+  const hex = Array.from(new TextEncoder().encode(normalized), (byte) =>
+    byte.toString(16).padStart(2, '0')).join('')
+  return `${CLIENT_TOOL_ALIAS_PREFIX}${hex}`
+}
+
+/** 从 tools 数组构建混淆名映射：wireName → originalName */
+export function buildWireNameMap(tools: ToolDef[]): Map<string, string> {
+  const map = new Map<string, string>()
+  for (const t of tools) {
+    const name = t.function?.name
+    if (name) map.set(clientToolWireName(name), name)
+  }
+  return map
+}
+
+/** 从工具描述/文档中移除客户端工具原名，替换为 'caller function'（同 CF2 redactPublicFunctionNames） */
+export function redactPublicFunctionNames(value: string, names: readonly string[]): string {
+  let redacted = value
+  for (const name of [...names].sort((a, b) => b.length - a.length)) {
+    const escaped = name.replace(/[.*+?^${}()|[\]\\]/gu, '\\$&')
+    redacted = redacted.replace(
+      new RegExp(`(^|[^A-Za-z0-9_])${escaped}(?=$|[^A-Za-z0-9_])`, 'giu'),
+      '$1caller function',
+    )
+  }
+  return redacted
+}
+
+/** 递归从 schema 的 description/title/$comment 中移除原名（同 CF2 redactSchemaDocumentation） */
+export function redactSchemaDocumentation(value: unknown, names: readonly string[], depth = 0): unknown {
+  if (depth > 64 || !value || typeof value !== 'object') return value
+  if (Array.isArray(value)) return value.map((item) => redactSchemaDocumentation(item, names, depth + 1))
+  return Object.fromEntries(
+    Object.entries(value as Record<string, unknown>).map(([key, item]) => {
+      if (['description', 'title', '$comment'].includes(key) && typeof item === 'string') {
+        return [key, redactPublicFunctionNames(item, names)]
+      }
+      return [key, redactSchemaDocumentation(item, names, depth + 1)]
+    }),
+  )
+}
 
 /** 由客户端 tool 定义构造的简化结构 */
 export interface ToolDef {
@@ -48,15 +98,19 @@ export function toolProtocolPrompt(text: string, tools: ToolDef[], choice: unkno
     return PLUGIN_AGENT_PREFIX + body
   }
   const defs: string[] = []
+  const publicNames = tools.map((t) => t.function?.name || '').filter(Boolean)
   for (const t of tools) {
     const f = t.function
     if (!f || !f.name) continue
+    const wireName = clientToolWireName(f.name)
+    const description = redactPublicFunctionNames(f.description || '', publicNames)
+    const parameters = redactSchemaDocumentation(f.parameters, publicNames)
     let params = '{}'
     try {
-      const s = f.parameters === undefined ? '' : JSON.stringify(f.parameters)
+      const s = parameters === undefined ? '' : JSON.stringify(parameters)
       if (s && s !== 'null' && s.trim() !== '') params = s
     } catch { /* keep {} */ }
-    defs.push(`${f.name} — ${f.description || ''}\n\`\`\`${f.name}\n${params}\n\`\`\``)
+    defs.push(`${wireName} — caller-provided function; ${description}\n\`\`\`${wireName}\n${params}\n\`\`\``)
   }
   if (defs.length === 0) return ANTI_TRUNCATION_PREFIX + text
   return (
@@ -85,6 +139,20 @@ function allowedToolNames(tools: ToolDef[]): Set<string> {
     if (t.function?.name) out.add(t.function.name)
   }
   return out
+}
+
+/** 从 M365 返回的文本中解析工具名：接受原名或混淆名，返回原名（未找到返回 null） */
+export function resolveToolName(name: string, tools: ToolDef[]): string | null {
+  const allowed = allowedToolNames(tools)
+  if (allowed.has(name)) return name
+  if (name.startsWith(CLIENT_TOOL_ALIAS_PREFIX)) {
+    for (const t of tools) {
+      if (t.function?.name && clientToolWireName(t.function.name) === name) {
+        return t.function.name
+      }
+    }
+  }
+  return null
 }
 
 function toolTypeOf(name: string, tools: ToolDef[]): string {
@@ -132,79 +200,200 @@ export function toolFunction(name: string, tools: ToolDef[]): Record<string, unk
   return null
 }
 
-/** JSON Schema 校验（同原版 validateJSONSchema）。返回错误信息或 null。
- *  安全护栏（同对方 tool-schema.ts）：MAX_SCHEMA_DEPTH=64 限制递归深度、
- *  MAX_VALIDATION_NODES=50000 限制单次校验遍历节点数，防止调用方 schema 引发远程引用/无限递归。 */
+/** JSON Schema 校验（移植自 M365-Gateway-CF2 tool-schema.ts 的 validateJSONSchema）。
+ *  返回错误信息或 null。
+ *  安全护栏：MAX_SCHEMA_DEPTH=64 限制递归深度、MAX_VALIDATION_NODES=50000 限制单次校验遍历节点数，
+ *  防止调用方 schema 引发远程引用/无限递归。
+ *  支持：type（含 type 数组）、enum、const、properties/required/additionalProperties、
+ *  items/minItems/maxItems/uniqueItems、minProperties/maxProperties、minLength/maxLength、
+ *  数值边界（minimum、maximum、exclusive min/max、multipleOf）、$ref（仅本地引用）、allOf/anyOf/oneOf/not。 */
 const MAX_SCHEMA_DEPTH = 64
 const MAX_VALIDATION_NODES = 50000
-export function validateJSONSchema(value: unknown, schema: Record<string, unknown>, path: string, depth = 0, state?: { nodes: number }): string | null {
-  const st = state ?? { nodes: 0 }
+
+interface SchemaState {
+  nodes: number
+  /** 根 schema，用于解析 $ref 本地引用 */
+  root: unknown
+}
+
+function schemaIsObject(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === 'object' && !Array.isArray(value)
+}
+
+function schemaJsonEqual(left: unknown, right: unknown, depth = 0): boolean {
+  if (Object.is(left, right)) return true
+  if (depth > MAX_SCHEMA_DEPTH) return false
+  if (Array.isArray(left) && Array.isArray(right)) {
+    return left.length === right.length && left.every((value, index) => schemaJsonEqual(value, right[index], depth + 1))
+  }
+  if (schemaIsObject(left) && schemaIsObject(right)) {
+    const lk = Object.keys(left).sort()
+    const rk = Object.keys(right).sort()
+    return lk.length === rk.length && lk.every((key, index) => key === rk[index] && schemaJsonEqual(left[key], right[key], depth + 1))
+  }
+  return false
+}
+
+function schemaTypeMatches(value: unknown, type: string): boolean {
+  switch (type) {
+    case 'object': return schemaIsObject(value)
+    case 'array': return Array.isArray(value)
+    case 'string': return typeof value === 'string'
+    case 'number': return typeof value === 'number' && Number.isFinite(value)
+    case 'integer': return typeof value === 'number' && Number.isSafeInteger(value)
+    case 'boolean': return typeof value === 'boolean'
+    case 'null': return value === null
+    default: return false
+  }
+}
+
+/** 解析本地 $ref（仅 "#" / "#/..."，拒绝远程引用） */
+function schemaLocalReference(root: unknown, reference: string): unknown {
+  if (reference === '#') return root
+  if (!reference.startsWith('#/')) return undefined
+  let current: unknown = root
+  for (const rawPart of reference.slice(2).split('/')) {
+    const part = rawPart.replaceAll('~1', '/').replaceAll('~0', '~')
+    if (schemaIsObject(current) || Array.isArray(current)) {
+      if (!(part in current)) return undefined
+      current = (current as Record<string, unknown>)[part]
+    } else {
+      return undefined
+    }
+  }
+  return current
+}
+
+export function validateJSONSchema(value: unknown, schema: Record<string, unknown>, path: string, depth = 0, state?: SchemaState): string | null {
+  const st: SchemaState = state ?? { nodes: 0, root: schema }
   st.nodes++
   if (st.nodes > MAX_VALIDATION_NODES) return `${path} validation nodes exceeded safe limit`
   if (depth > MAX_SCHEMA_DEPTH) return `${path} schema exceeds max depth`
-  const enums = schema['enum']
-  if (Array.isArray(enums)) {
-    const a = JSON.stringify(value)
-    let found = false
-    for (const e of enums) {
-      if (JSON.stringify(e) === a) { found = true; break }
-    }
-    if (!found) return `${path} is not an allowed enum value`
+
+  // $ref：先解析到目标 schema 再继续校验；远程引用（非 "#/..."）一律拒绝
+  if (typeof schema['$ref'] === 'string') {
+    const target = schemaLocalReference(st.root, schema['$ref'])
+    if (target === undefined || target === schema) return `${path} unresolvable or recursive $ref`
+    const err = validateJSONSchema(value, target as Record<string, unknown>, path, depth + 1, st)
+    if (err) return err
+    // $ref 命中后仍继续校验当前节点的其余关键字（const/enum 等）
   }
-  const typ = schema['type']
-  switch (typ) {
-    case 'object': {
-      if (value === null || typeof value !== 'object' || Array.isArray(value)) return `${path} must be object`
-      const m = value as Record<string, unknown>
-      const req = schema['required']
-      if (Array.isArray(req)) {
-        for (const raw of req) {
-          const n = String(raw)
-          if (!(n in m)) return `missing required argument ${n}`
-        }
+
+  // const / enum
+  if ('const' in schema && !schemaJsonEqual(value, schema['const'])) return `${path} must equal the const value`
+  const enums = schema['enum']
+  if (Array.isArray(enums) && !enums.some((e) => schemaJsonEqual(value, e))) return `${path} is not an allowed enum value`
+
+  // allOf / anyOf / oneOf / not
+  if (Array.isArray(schema['allOf'])) {
+    for (let i = 0; i < schema['allOf'].length; i++) {
+      const err = validateJSONSchema(value, (schema['allOf'][i] as Record<string, unknown>), `${path}`, depth + 1, st)
+      if (err) return err
+    }
+  }
+  if (Array.isArray(schema['anyOf'])) {
+    let anyMatch = false
+    for (const branch of schema['anyOf'] as unknown[]) {
+      if (validateJSONSchema(value, branch as Record<string, unknown>, path, depth + 1, st) === null) { anyMatch = true; break }
+    }
+    if (!anyMatch) return `${path} does not match any anyOf branch`
+  }
+  if (Array.isArray(schema['oneOf'])) {
+    let matches = 0
+    for (const branch of schema['oneOf'] as unknown[]) {
+      if (validateJSONSchema(value, branch as Record<string, unknown>, path, depth + 1, st) === null) matches++
+    }
+    if (matches !== 1) return `${path} must match exactly one oneOf branch (matched ${matches})`
+  }
+  if (schema['not'] !== undefined) {
+    if (validateJSONSchema(value, schema['not'] as Record<string, unknown>, path, depth + 1, st) === null) {
+      return `${path} must not match the not schema`
+    }
+  }
+
+  const declaredTypes: string[] = typeof schema['type'] === 'string'
+    ? [schema['type']]
+    : Array.isArray(schema['type'])
+      ? (schema['type'] as unknown[]).filter((item): item is string => typeof item === 'string')
+      : []
+  if (declaredTypes.length > 0 && !declaredTypes.some((type) => schemaTypeMatches(value, type))) {
+    return `${path} must be of type ${declaredTypes.join('/')}`
+  }
+  const typeCheck = (type: string): boolean => declaredTypes.length === 0 || declaredTypes.includes(type)
+
+  // object 结构
+  if (schemaIsObject(value) && typeCheck('object')) {
+    const m = value as Record<string, unknown>
+    const keys = Object.keys(m)
+    if (typeof schema['minProperties'] === 'number' && keys.length < schema['minProperties']) return `${path} has too few properties`
+    if (typeof schema['maxProperties'] === 'number' && keys.length > schema['maxProperties']) return `${path} has too many properties`
+    const req = schema['required']
+    if (Array.isArray(req)) {
+      for (const raw of req) {
+        const n = String(raw)
+        if (!(n in m)) return `missing required argument ${n}`
       }
-      const props = (schema['properties'] as Record<string, unknown>) || {}
-      const ap = schema['additionalProperties']
-      if (typeof ap === 'boolean' && !ap) {
-        for (const n of Object.keys(m)) {
-          if (!(n in props)) return `${path}.${n} is not allowed`
-        }
-      }
-      for (const n of Object.keys(m)) {
+    }
+    const props = (schema['properties'] as Record<string, unknown>) || {}
+    const ap = schema['additionalProperties']
+    for (const n of keys) {
+      if (n in props) {
         const ps = props[n] as Record<string, unknown> | undefined
         if (ps) {
           const err = validateJSONSchema(m[n], ps, `${path}.${n}`, depth + 1, st)
           if (err) return err
         }
+      } else if (ap === false) {
+        return `${path}.${n} is not allowed`
+      } else if (schemaIsObject(ap) || typeof ap === 'boolean') {
+        const err = validateJSONSchema(m[n], ap as Record<string, unknown>, `${path}.${n}`, depth + 1, st)
+        if (err) return err
       }
-      return null
     }
-    case 'array': {
-      if (!Array.isArray(value)) return `${path} must be array`
-      const item = schema['items'] as Record<string, unknown> | undefined
-      if (item) {
-        for (let i = 0; i < value.length; i++) {
-          const err = validateJSONSchema(value[i], item, `${path}[${i}]`, depth + 1, st)
-          if (err) return err
+  }
+
+  // array 结构
+  if (Array.isArray(value) && typeCheck('array')) {
+    if (typeof schema['minItems'] === 'number' && value.length < schema['minItems']) return `${path} has too few items`
+    if (typeof schema['maxItems'] === 'number' && value.length > schema['maxItems']) return `${path} has too many items`
+    if (schema['uniqueItems'] === true) {
+      for (let i = 0; i < value.length; i++) {
+        for (let j = i + 1; j < value.length; j++) {
+          if (schemaJsonEqual(value[i], value[j])) return `${path} must contain unique items`
         }
       }
-      return null
     }
-    case 'string':
-      return typeof value === 'string' ? null : `${path} must be string`
-    case 'number':
-      return typeof value === 'number' ? null : `${path} must be number`
-    case 'integer': {
-      if (typeof value !== 'number' || Math.trunc(value) !== value) return `${path} must be integer`
-      return null
+    const item = schema['items'] as Record<string, unknown> | undefined
+    if (item) {
+      for (let i = 0; i < value.length; i++) {
+        const err = validateJSONSchema(value[i], item, `${path}[${i}]`, depth + 1, st)
+        if (err) return err
+      }
     }
-    case 'boolean':
-      return typeof value === 'boolean' ? null : `${path} must be boolean`
-    case 'null':
-      return value === null ? null : `${path} must be null`
-    default:
-      return null
   }
+
+  // string 边界
+  if (typeof value === 'string' && typeCheck('string')) {
+    const length = Array.from(value).length
+    if (typeof schema['minLength'] === 'number' && length < schema['minLength']) return `${path} is shorter than minLength`
+    if (typeof schema['maxLength'] === 'number' && length > schema['maxLength']) return `${path} is longer than maxLength`
+  }
+
+  // number 边界
+  if (typeof value === 'number' && Number.isFinite(value) && (typeCheck('number') || typeCheck('integer'))) {
+    if (typeof schema['minimum'] === 'number' && value < schema['minimum']) return `${path} is below minimum`
+    if (typeof schema['maximum'] === 'number' && value > schema['maximum']) return `${path} is above maximum`
+    if (typeof schema['exclusiveMinimum'] === 'number' && value <= schema['exclusiveMinimum']) return `${path} is not above exclusiveMinimum`
+    if (typeof schema['exclusiveMaximum'] === 'number' && value >= schema['exclusiveMaximum']) return `${path} is not below exclusiveMaximum`
+    if (typeof schema['multipleOf'] === 'number' && schema['multipleOf'] > 0) {
+      const quotient = value / schema['multipleOf']
+      if (Math.abs(quotient - Math.round(quotient)) > Number.EPSILON * Math.max(1, Math.abs(quotient)) * 8) {
+        return `${path} is not a multiple of ${schema['multipleOf']}`
+      }
+    }
+  }
+
+  return null
 }
 
 function schemaValid(args: Record<string, unknown>, fn: Record<string, unknown>): string | null {
@@ -266,8 +455,11 @@ export function extractToolCalls(text: string, tools: ToolDef[], choice: unknown
     for (const item of items) {
       if (!item || typeof item !== 'object' || Array.isArray(item)) continue
       const mi = item as Record<string, unknown>
-      const name = typeof mi['name'] === 'string' ? mi['name'] : ''
-      if (!allowed.has(name) || !toolChoiceAllows(choice, name)) continue
+      const rawName = typeof mi['name'] === 'string' ? mi['name'] : ''
+      // 解析原名或混淆名
+      const resolved = resolveToolName(rawName, tools)
+      const name = resolved ?? rawName
+      if (!allowed.has(name) || !toolChoiceAllows(choice, rawName)) continue
       let args = '{}'
       try {
         const s = mi['arguments'] === undefined ? undefined : JSON.stringify(mi['arguments'])
@@ -283,9 +475,19 @@ export function extractToolCalls(text: string, tools: ToolDef[], choice: unknown
  * 工具路由提示词（同原版 modelToolRouterPrompt）：
  * 注入完整工具定义 + 决策规则，让模型显式选择调用哪个工具（CALL_TOOL: name({...})）
  * 或判定无需工具（NO_TOOL_NEEDED）。这是让 M365 模型真正调用工具的核心机制。
+ * 工具名使用混淆名（m365gw_client_<hex>），防止 M365 识别客户端工具原名。
  */
 export function modelToolRouterPrompt(text: string, tools: ToolDef[], choice: unknown): string {
-  const defs = JSON.stringify(tools)
+  const wireTools = tools.map((t) => ({
+    ...t,
+    function: {
+      ...t.function,
+      name: clientToolWireName(t.function?.name || ''),
+      description: redactPublicFunctionNames(t.function?.description || '', tools.map((tt) => tt.function?.name || '').filter(Boolean)),
+      parameters: redactSchemaDocumentation(t.function?.parameters, tools.map((tt) => tt.function?.name || '').filter(Boolean)),
+    },
+  }))
+  const defs = JSON.stringify(wireTools)
   const mode = normalizedToolChoiceMode(choice)
   let rules =
     '- If a tool is needed, respond with: CALL_TOOL: tool_name({"arg1":"value1"})\n' +
@@ -316,17 +518,20 @@ export function modelToolRouterPrompt(text: string, tools: ToolDef[], choice: un
 export function parseModelToolDecision(text: string, tools: ToolDef[], choice: unknown): { calls: DetectedToolCall[]; parsed: boolean } {
   const t = text.trim()
   const lower = t.toLowerCase()
-  // 1) CALL_TOOL: name({...}) 自然语言格式
+  // 1) CALL_TOOL: name({...}) 自然语言格式（支持原名或混淆名）
   if (t.startsWith('CALL_TOOL:') || lower.startsWith('call_tool:')) {
     const rest = t.slice(t.indexOf(':') + 1).trim()
     const start = rest.indexOf('(')
     const end = rest.lastIndexOf(')')
     if (start > 0 && end > start) {
-      const name = rest.slice(0, start).trim()
+      const rawName = rest.slice(0, start).trim()
       const argsStr = rest.slice(start + 1, end)
       try {
         const args = JSON.parse(argsStr) as Record<string, unknown>
         if (args !== null && typeof args === 'object') {
+          // 解析混淆名 → 原名
+          const resolved = resolveToolName(rawName, tools)
+          const name = resolved ?? rawName
           const fn = toolFunction(name, tools)
           // 同原版 model_tool_router：必须通过 schema 校验才采用（schemaValid 返回 null 表示合法）
           if (fn && schemaValid(args, fn) === null && toolChoiceAllows(choice, name)) {
@@ -359,7 +564,9 @@ export function parseModelToolDecision(text: string, tools: ToolDef[], choice: u
         const calls: DetectedToolCall[] = []
         for (const c of env.calls) {
           if (!c || typeof c !== 'object') continue
-          const name = String(c.name || '')
+          const rawName = String(c.name || '')
+          const resolved = resolveToolName(rawName, tools)
+          const name = resolved ?? rawName
           const fn = toolFunction(name, tools)
           if (!fn || c.arguments === undefined || c.arguments === null) continue
           if (!toolChoiceAllows(choice, name)) continue
@@ -377,7 +584,8 @@ export function parseModelToolDecision(text: string, tools: ToolDef[], choice: u
 /** 解析 fenced code block 形式的工具调用（同原版 fencedToolCalls 的扩展解析） */
 const FENCED_TOOL = /```([A-Za-z0-9_-]+)\s*\n([\s\S]*?)\n```/
 
-/** 从回答文本解析所有 fenced 工具调用（含 <m365-tool-call> 与 ```name\n{json}\n``` 两种约定） */
+/** 从回答文本解析所有 fenced 工具调用（含 <m365-tool-call> 与 ```name\n{json}\n``` 两种约定）
+ *  支持原名和混淆名（m365gw_client_<hex>），混淆名自动解析为原名。 */
 export function fencedToolCalls(text: string, tools: ToolDef[], choice: unknown): DetectedToolCall[] {
   // 1) 原生 <m365-tool-call> 约定
   const native = extractToolCalls(text, tools, choice)
@@ -389,7 +597,9 @@ export function fencedToolCalls(text: string, tools: ToolDef[], choice: unknown)
   const xymlCalls = parseToolCalls(text, tools as unknown as Record<string, unknown>[])
   if (xymlCalls.length > 0) {
     for (const c of xymlCalls) {
-      const name = c.name
+      const rawName = c.name
+      const resolved = resolveToolName(rawName, tools)
+      const name = resolved ?? rawName
       if (!allowedToolNames(tools).has(name) || !toolChoiceAllows(choice, name)) continue
       out.push({ id: c.id || `call_${crypto.randomUUID()}`, type: toolTypeOf(name, tools), name, arguments: JSON.stringify(c.input ?? {}) })
     }
@@ -401,7 +611,9 @@ export function fencedToolCalls(text: string, tools: ToolDef[], choice: unknown)
     let m: RegExpExecArray | null
     const re = new RegExp(FENCED_TOOL, 'g')
     while ((m = re.exec(text)) !== null) {
-      const name = m[1]
+      const rawName = m[1]
+      const resolved = resolveToolName(rawName, tools)
+      const name = resolved ?? rawName
       const args = m[2].trim()
       let v: unknown
       try {
@@ -417,11 +629,18 @@ export function fencedToolCalls(text: string, tools: ToolDef[], choice: unknown)
   return out
 }
 
-/** 从原生工具事件列表提取工具调用（同原版 nativeToolCalls，遍历事件树找 name/arguments） */
+/** 从原生工具事件列表提取工具调用（同原版 nativeToolCalls，遍历事件树找 name/arguments）
+ *  支持原名和混淆名（m365gw_client_<hex>），混淆名自动解析为原名。 */
 export function nativeToolCalls(events: unknown[], tools: ToolDef[]): DetectedToolCall[] {
   const allowed = new Set<string>()
+  const wireMap = new Map<string, string>()
   for (const t of tools) {
-    if (t.function?.name) allowed.add(t.function.name)
+    const name = t.function?.name
+    if (name) {
+      allowed.add(name)
+      const wireName = clientToolWireName(name)
+      wireMap.set(wireName, name)
+    }
   }
   const out: DetectedToolCall[] = []
   const walk = (x: unknown) => {
@@ -432,9 +651,14 @@ export function nativeToolCalls(events: unknown[], tools: ToolDef[]): DetectedTo
     if (x && typeof x === 'object') {
       const obj = x as Record<string, unknown>
       let name = ''
+      // 先查混淆名（M365 返回的插件 ID 是混淆名），再查原名
       for (const k of ['name', 'toolName', 'pluginName', 'functionName', 'id']) {
         const s = obj[k]
-        if (typeof s === 'string' && allowed.has(s)) { name = s; break }
+        if (typeof s === 'string') {
+          if (allowed.has(s)) { name = s; break }
+          const mapped = wireMap.get(s)
+          if (mapped) { name = mapped; break }
+        }
       }
       if (name !== '') {
         let a: unknown
@@ -608,17 +832,18 @@ export function activeMessages(messages: OaiMsgLite[]): OaiMsgLite[] {
   return messages.slice(last)
 }
 
-/** 是否允许继续发起工具轮：死循环 / 反复失败 / 超轮数则停止（同原版 CanContinue） */
+/** 是否允许继续发起工具轮：死循环 / 反复失败 / 连续重复 / 超轮数则停止（同原版 CanContinue） */
 export function canContinue(l: AgentLedger, maxRounds = MAX_TOOL_ROUNDS_DEFAULT): boolean {
   if (l.stuckLoop) return false
   // 同一调用反复失败（>=2 次同样失败）且已有一次失败证据，继续重试无意义 → 熔断
   if (l.repeatedFailure) return false
+  // 连续相同调用超限（新版 ToolLedger：连续 3 次相同指纹）→ 熔断
+  if (l.repeatedCall) return false
   if (l.toolRounds >= maxRounds) return false
   return true
 }
 
 const failureSignal = /(exit\s*(code|status)?\s*[:=]?\s*[1-9]\d*|\berror\b|\bfailed\b|\bfailure\b|exception|traceback|timed?\s*out|permission denied|not found|refused)/i
-const unsupportedSuccess = /\b(installed|created|written|executed|ran|started|deployed|deleted|verified|completed|succeeded|successful(?:ly)?)\b/i
 
 export function normalizeFailure(s: string): string {
   s = s.toLowerCase()
@@ -627,8 +852,15 @@ export function normalizeFailure(s: string): string {
   return s
 }
 
-/** 从 messages 历史构建工具证据 ledger（assistant.tool_calls + tool 结果） */
-export function buildAgentLedger(messages: OaiMsgLite[]): AgentLedger {
+/** 从 messages 历史构建工具证据 ledger（assistant.tool_calls + tool 结果）
+ *  使用新 ToolLedger 实现，提供更丰富的检测：指纹、callId 生命周期、11 种问题检测 */
+export async function buildAgentLedger(messages: OaiMsgLite[]): Promise<AgentLedger> {
+  const tl = await buildToolLedger(messages)
+  return toolLedgerToAgentLedger(tl)
+}
+
+/** 同步版本，用于无需 async 的场景（保留旧签名兼容，但内部使用同步简化版） */
+export function buildAgentLedgerSync(messages: OaiMsgLite[]): AgentLedger {
   const calls: Record<string, ToolEvidence> = {}
   const order: string[] = []
   for (const m of messages) {
@@ -657,7 +889,6 @@ export function buildAgentLedger(messages: OaiMsgLite[]): AgentLedger {
   const l: AgentLedger = { completed: [], pending: [], toolRounds: 0, repeatedCall: false, repeatedFailure: false }
   const seenCall: Record<string, number> = {}
   const seenFailure: Record<string, number> = {}
-  /** 成功调用的重复计数（区别于失败，见下：不对合法重复成功调用误判死循环） */
   const seenSuccess: Record<string, number> = {}
   for (const id of order) {
     const e = calls[id]
@@ -673,7 +904,6 @@ export function buildAgentLedger(messages: OaiMsgLite[]): AgentLedger {
     } else {
       l.completed.push(e)
       if (e.failed) {
-        // 失败重试无进展才是真正的死循环：重复失败 >=3 次切断（同原版，阈值保持 3）
         const fs = e.name + '\x00' + e.arguments + '\x00' + normalizeFailure(e.result)
         seenFailure[fs] = (seenFailure[fs] || 0) + 1
         if (seenFailure[fs] >= 2) {
@@ -684,8 +914,6 @@ export function buildAgentLedger(messages: OaiMsgLite[]): AgentLedger {
           }
         }
       } else {
-        // 合法的重复成功调用（反复读同一文件 / 轮询状态）不应被误判死循环，
-        // 阈值放宽到 >=5（同原版 #68）；上限仍受 repeatedFailure 与轮数熔断兜底。
         seenSuccess[sig] = (seenSuccess[sig] || 0) + 1
         if (seenSuccess[sig] >= 5) {
           l.stuckLoop = true
@@ -696,7 +924,8 @@ export function buildAgentLedger(messages: OaiMsgLite[]): AgentLedger {
   return l
 }
 
-/** ledger 紧凑证据上下文（同原版 RouterContext），注入路由/主回答提示词 */
+/** ledger 紧凑证据上下文（同原版 RouterContext），注入路由/主回答提示词
+ *  支持新 ToolLedger 和旧 AgentLedger 两种格式 */
 export function ledgerRouterContext(l: AgentLedger): string {
   const compact = { completed: l.completed, pending: l.pending, repeated_call: l.repeatedCall }
   const json = JSON.stringify(compact)
@@ -733,18 +962,16 @@ export function completedCallIDs(l: AgentLedger): string[] {
   return l.completed.map((e) => e.id).sort()
 }
 
-/** 主回答是否允许作为"已完成"结论（存在待处理调用时不允许；有完成证据时不允许含失败措辞） */
-export function completionEvidenceAllows(answer: string, l: AgentLedger): boolean {
-  if (l.pending.length > 0) return false
-  if (l.completed.length === 0 && l.pending.length === 0) return !unsupportedSuccess.test(answer)
-  const low = answer.toLowerCase()
-  const failureKeywords = ['cannot confirm', 'not confirmed', 'unable to confirm', 'no tool result', 'no matching tool results were returned', 'no external action has been verified']
-  let hasFailure = false
-  for (const h of failureKeywords) if (low.includes(h)) { hasFailure = true; break }
-  if (l.completed.length > 0) return !hasFailure
-  if (unsupportedSuccess.test(answer)) return false
-  return true
-}
+// 迁移至 completion-evidence.ts 完整实现，保持兼容导出
+export { completionEvidenceAllows } from './completion-evidence'
+
+/** 保持兼容，重新导出新接口用于 durable.ts */
+export type {
+  CompletionAction,
+  CompletionEvidenceDecision,
+  CompletionEvidenceReason,
+  CompletionEvidenceSummary,
+} from './completion-evidence'
 
 /* ==================== 工具拒绝 / 沙箱幻觉检测（同原版 toolloop.go） ==================== */
 
