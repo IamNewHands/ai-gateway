@@ -581,4 +581,15 @@ label, legend { color: var(--color-ink-2); font-size: var(--text-xs); font-weigh
   *, *::before, *::after { animation-duration: .001ms !important; animation-iteration-count: 1 !important; transition-duration: .001ms !important; }
   .modal { transform: none; }
 }
+
+/* 模型行内 reasoning_effort 支持档位多选下拉（新建/编辑提供商共用） */
+.eff-dd { position: relative; display: inline-block; flex-shrink: 0; }
+.eff-dd > summary { cursor: pointer; list-style: none; font-size: var(--text-xs); line-height: 1.4; padding: .25rem .5rem; border: .0625rem solid var(--color-rule); border-radius: var(--radius-control); white-space: nowrap; user-select: none; color: var(--color-ink-2); background: var(--color-paper); }
+.eff-dd > summary::-webkit-details-marker { display: none; }
+.eff-dd > summary:hover { border-color: var(--color-rule-2); }
+.eff-dd[open] > summary { border-color: var(--color-accent); color: var(--color-accent); }
+.eff-dd > .eff-pop { position: absolute; z-index: 40; inset-inline-end: 0; top: calc(100% + .25rem); background: var(--color-paper); border: .0625rem solid var(--color-rule); border-radius: var(--radius-panel); padding: var(--space-2xs) var(--space-xs); box-shadow: var(--shadow-float); min-width: 8.5rem; display: flex; flex-direction: column; gap: .2rem; }
+.eff-item { display: flex; align-items: center; gap: .4rem; font-size: var(--text-xs); cursor: pointer; color: var(--color-ink-2); white-space: nowrap; }
+.eff-item:hover { color: var(--color-ink); }
+.eff-item input { accent-color: var(--color-accent); }
 `

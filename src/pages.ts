@@ -73,6 +73,26 @@ const isTraeProviderUI = (p: { id?: string; baseUrl?: string }) =>
 const isSensenovaProviderUI = (p: { id?: string; baseUrl?: string }) =>
   p.id === 'sensenova' || (typeof p.baseUrl === 'string' && p.baseUrl.includes('token.sensenova.cn'))
 
+/** reasoning_effort 全部合法档位（与 src/workbuddy-upstream.ts EFFORT_RANK 对齐） */
+const EFFORT_LEVELS = ['off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'] as const
+
+/** 模型行内「reasoning_effort 支持档位」多选下拉（编辑表单 SSR 模型行用；pol = 该模型已保存档位） */
+function effDdEditHtml(pid: string, mi: number, pol: readonly string[]): string {
+  const sum = pol.length ? pol.join(' + ') : 'effort 不启用'
+  const boxes = EFFORT_LEVELS.map((lv) =>
+    `<label class="eff-item"><input type="checkbox" class="eff-cb" value="${lv}"${pol.includes(lv) ? ' checked' : ''} aria-label="${lv}">${lv}</label>`
+  ).join('')
+  return `<details class="eff-dd" title="reasoning_effort 支持档位（多选；仅 WorkBuddy/CodeBuddy 上游生效）：请求档位在支持列表内透传，不支持则自动降级为 ≤请求档位的最高支持档"><summary class="eff-sum" id="effs-${escapePageHtml(pid)}-${mi}">${escapePageHtml(sum)}</summary><div class="eff-pop" id="eff-${escapePageHtml(pid)}-${mi}">${boxes}</div></details>`
+}
+
+/** 新建表单的 effort 下拉模板（注入 #eff-dd-tpl，浏览器 JS 克隆进每条模型行） */
+function effDdNewHtml(): string {
+  const boxes = EFFORT_LEVELS.map((lv) =>
+    `<label class="eff-item"><input type="checkbox" class="eff-cb" value="${lv}" aria-label="${lv}">${lv}</label>`
+  ).join('')
+  return `<details class="eff-dd" title="reasoning_effort 支持档位（多选；仅 WorkBuddy/CodeBuddy 上游生效）：请求档位在支持列表内透传，不支持则自动降级为 ≤请求档位的最高支持档"><summary class="eff-sum">effort 不启用</summary><div class="eff-pop">${boxes}</div></details>`
+}
+
 // UX8：厂商预设与 OAuth 预置模板——单一数据源。
 // SSR 下拉 option 与客户端 applyProviderPreset / applyOauthPreset* 共用，
 // 注入为页面 script 常量，消除服务端/客户端两套重复预设表。
@@ -471,14 +491,13 @@ ${H('管理')}
                     <div class="fg"><label>Global 域发起端点</label><input type="url" id="ao16" placeholder="https://www.workbuddy.ai/v2/plugin/auth/state?platform=CLI"><span class="form-helper">登录域选「国际版」时使用，留空回退国内端点。</span></div>
                     <div class="fg"><label>Global 域轮询端点</label><input type="url" id="ao17" placeholder="https://www.workbuddy.ai/v2/plugin/auth/token"></div>
                     <div class="fg"><label>Global 域刷新端点</label><input type="url" id="ao18" placeholder="https://www.workbuddy.ai/v2/plugin/auth/token/refresh"></div>
-                    <div class="fg"><label>reasoning_effort 能力表（JSON，可选）</label><textarea id="aofp" rows="3" placeholder='{"deepseek-v4-pro":["low","medium","high"]}'></textarea><span class="form-helper">声明各模型支持的 reasoning_effort 档位（off/minimal/low/medium/high/xhigh/max）。客户端请求档位模型不支持时自动降级为 ≤请求档位的最高支持档；被支持则透传。未声明的模型继续删除该字段。当前仅 WorkBuddy/CodeBuddy 上游生效。</span></div>
                   </div>
                 </div>
                 <div class="fc mt-1 field-row"><button class="btn btn-p" onclick="createProv({afterCreate:function(id){location.href='/admin?connect='+encodeURIComponent(id)}})"><i class="fas fa-plug" aria-hidden="true"></i>创建并发起连接</button><span class="form-helper">先创建提供商，保存后自动弹出 OAuth 登录链接；登录成功会自动拉取模型。</span></div>
               </fieldset>
             </div>
             <fieldset class="form-group" id="akeys-fs"><legend id="akey-legend">上游 API Keys</legend><div id="akeys"><div class="fc mb-4 field-row"><input type="password" placeholder="sk-xxx" class="fx1 aki" aria-label="上游 API Key"><button class="icon-btn" onclick="toggleKeyText(this)" title="显示/隐藏 Key"><i class="fas fa-eye" aria-hidden="true"></i></button><label class="tg" title="启用 Key"><input type="checkbox" checked class="ake" aria-label="启用 Key"><span class="sl"></span></label><button class="btn btn-gh btn-xs" onclick="testNewAKey(this)" title="测试 Key"><i class="fas fa-plug" aria-hidden="true"></i><span>测试</span></button><button class="icon-btn" onclick="this.parentElement.remove()" aria-label="移除 Key"><i class="fas fa-times" aria-hidden="true"></i></button></div></div><button class="btn btn-s btn-xs" onclick="addAKeyRow()"><i class="fas fa-plus" aria-hidden="true"></i>添加 Key</button><span id="akey-hint" class="form-helper"></span></fieldset>
-            <fieldset class="form-group" id="amodels-fs"><legend>模型 ID</legend><div id="amodels"><div class="fc mb-4 field-row"><input type="text" placeholder="deepseek-chat" class="fx1 ami" aria-label="模型 ID"><label class="tg" title="启用模型"><input type="checkbox" checked class="ame" aria-label="启用模型"><span class="sl"></span></label><label class="tg" title="对该模型启用思维引导注入（转发前注入固定思维引导 system 提示词）"><input type="checkbox" class="cti" aria-label="启用思维引导注入"><span class="sl"></span></label><label class="tg" title="对该模型启用缓存前缀注入（转发前注入固定缓存前缀以提升缓存命中率）"><input type="checkbox" class="ccp" aria-label="启用缓存前缀注入"><span class="sl"></span></label><button class="btn btn-gh btn-xs" onclick="testNewMdl(this)" title="测试模型"><i class="fas fa-plug" aria-hidden="true"></i><span>测试</span></button><button class="icon-btn" onclick="this.parentElement.remove()" aria-label="移除模型"><i class="fas fa-times" aria-hidden="true"></i></button></div></div><button class="btn btn-s btn-xs" onclick="addMdlRow()"><i class="fas fa-plus" aria-hidden="true"></i>添加模型</button><span class="form-helper">每个模型行上「启用模型」开关旁的开关依次为「思维引导注入」「缓存前缀注入」，勾选后该模型转发前会被注入对应固定提示词；不勾选则原样转发。</span></fieldset>
+            <fieldset class="form-group" id="amodels-fs"><legend>模型 ID</legend><div id="amodels"><div class="fc mb-4 field-row"><input type="text" placeholder="deepseek-chat" class="fx1 ami" aria-label="模型 ID"><label class="tg" title="启用模型"><input type="checkbox" checked class="ame" aria-label="启用模型"><span class="sl"></span></label><label class="tg" title="对该模型启用思维引导注入（转发前注入固定思维引导 system 提示词）"><input type="checkbox" class="cti" aria-label="启用思维引导注入"><span class="sl"></span></label><label class="tg" title="对该模型启用缓存前缀注入（转发前注入固定缓存前缀以提升缓存命中率）"><input type="checkbox" class="ccp" aria-label="启用缓存前缀注入"><span class="sl"></span></label><script type="text/plain" id="eff-dd-tpl">${effDdNewHtml()}</script><button class="btn btn-gh btn-xs" onclick="testNewMdl(this)" title="测试模型"><i class="fas fa-plug" aria-hidden="true"></i><span>测试</span></button><button class="icon-btn" onclick="this.parentElement.remove()" aria-label="移除模型"><i class="fas fa-times" aria-hidden="true"></i></button></div></div><button class="btn btn-s btn-xs" onclick="addMdlRow()"><i class="fas fa-plus" aria-hidden="true"></i>添加模型</button><span class="form-helper">每个模型行上「启用模型」开关旁的开关依次为「思维引导注入」「缓存前缀注入」，勾选后该模型转发前会被注入对应固定提示词；不勾选则原样转发。「effort」下拉声明该模型的 reasoning_effort 支持档位（多选，仅 WorkBuddy/CodeBuddy 上游生效），留空 = 不启用。</span></fieldset>
             <div class="collapse-section">
               <button class="collapse-btn" onclick="toggleVbCollapse('avb-fs', this)" type="button" aria-expanded="false">
                 <i class="fas fa-chevron-right collapse-icon" aria-hidden="true"></i> 识图模型配置（可选）
@@ -537,12 +556,11 @@ ${H('管理')}
                       <div class="fg"><label>Global 域发起端点（可选）</label><input type="url" id="eao16-${escapePageHtml(p.id)}" value="${escapePageHtml((p.oauth&&p.oauth.globalDeviceCodeUrl)||'')}" placeholder="https://www.workbuddy.ai/v2/plugin/auth/state?platform=CLI"><span class="form-helper">登录域选「国际版」时使用，留空回退国内端点。</span></div>
                       <div class="fg"><label>Global 域轮询端点（可选）</label><input type="url" id="eao17-${escapePageHtml(p.id)}" value="${escapePageHtml((p.oauth&&p.oauth.globalDeviceTokenUrl)||'')}" placeholder="https://www.workbuddy.ai/v2/plugin/auth/token"></div>
                       <div class="fg"><label>Global 域刷新端点（可选）</label><input type="url" id="eao18-${escapePageHtml(p.id)}" value="${escapePageHtml((p.oauth&&p.oauth.globalRefreshTokenUrl)||'')}" placeholder="https://www.workbuddy.ai/v2/plugin/auth/token/refresh"></div>
-                      <div class="fg"><label>reasoning_effort 能力表（JSON，可选）</label><textarea id="eaofp-${escapePageHtml(p.id)}" rows="3" placeholder='{"deepseek-v4-pro":["low","medium","high"]}'>${escapePageHtml((p.oauth&&p.oauth.effortPolicy)?JSON.stringify(p.oauth.effortPolicy,null,2):'')}</textarea><span class="form-helper">声明各模型支持的 reasoning_effort 档位（off/minimal/low/medium/high/xhigh/max），客户端请求档位不支持时自动降级、支持则透传；未声明的模型继续删除该字段。当前仅 WorkBuddy/CodeBuddy 上游生效。留空 = 不启用。</span></div>
                     </div>
                   </div>
                   <div class="fc mt-1 field-row"><button class="btn btn-s" onclick="oauthConnect('${escapePageJsx(p.id)}')"><i class="fas fa-plug" aria-hidden="true"></i>发起连接</button><button class="btn btn-gh" onclick="fetchOauthModels('${escapePageJsx(p.id)}')"><i class="fas fa-cloud-download-alt" aria-hidden="true"></i>获取模型</button><button class="btn btn-gh" onclick="oauthStatus('${escapePageJsx(p.id)}')"><i class="fas fa-sync" aria-hidden="true"></i>状态</button><button class="btn btn-gh" onclick="oauthDisconnect('${escapePageJsx(p.id)}')"><i class="fas fa-unlink" aria-hidden="true"></i>断开</button><span id="oauth-st-${escapePageHtml(p.id)}" class="oauth-status"></span></div>
                   ${(p.oauth&&p.oauth.flowType==='browser')?`
-                  <fieldset class="form-group" id="wbp-fs-${escapePageHtml(p.id)}"><legend>WorkBuddy 多账号池</legend><span class="form-helper">浏览器登录流每次成功登录都会把该账号加入账号池（按 uid 去重，多登一个 = 多个账号）。转发按三因子加权自动挑选账号（积分 / 闲置补偿 / 成功率），429/404/余额耗尽/401 等按策略冷却或禁用并轮换其他账号；无健康账号时从冷却账号选最早到期者顶班；每日签到后积分恢复自动解冻。冷却参数留空 = 默认（plan 12h / 429 60s / 连续 5 次错误冷却 10m）。reasoning_effort 透传/降级能力表在上方「高级 OAuth 配置」里配置。</span>
+                  <fieldset class="form-group" id="wbp-fs-${escapePageHtml(p.id)}"><legend>WorkBuddy 多账号池</legend><span class="form-helper">浏览器登录流每次成功登录都会把该账号加入账号池（按 uid 去重，多登一个 = 多个账号）。转发按三因子加权自动挑选账号（积分 / 闲置补偿 / 成功率），429/404/余额耗尽/401 等按策略冷却或禁用并轮换其他账号；无健康账号时从冷却账号选最早到期者顶班；每日签到后积分恢复自动解冻。冷却参数留空 = 默认（plan 12h / 429 60s / 连续 5 次错误冷却 10m）。reasoning_effort 透传/降级支持档位在下方「模型」列表每行的「effort」下拉里配置。</span>
                     <div class="fc mt-1 field-row"><button class="btn btn-s" onclick="oauthPoolStatus('${escapePageJsx(p.id)}')"><i class="fas fa-sync" aria-hidden="true"></i>刷新账号池</button><button class="btn btn-s" onclick="oauthConnect('${escapePageJsx(p.id)}')"><i class="fas fa-sign-in-alt" aria-hidden="true"></i>登录新账号</button><button class="btn btn-p" onclick="triggerCheckin('${escapePageJsx(p.id)}')"><i class="fas fa-calendar-check" aria-hidden="true"></i>立即签到</button><span id="wbp-st-${escapePageHtml(p.id)}" class="oauth-status"></span></div>
                     <div id="wbp-acc-${escapePageHtml(p.id)}" class="mt-1"></div>
                     <div class="fc mt-1 field-row" style="gap:8px"><input type="number" id="cd-plan-${escapePageHtml(p.id)}" value="${p.cooldown&&p.cooldown.planMs?Math.round(p.cooldown.planMs/60000):''}" style="width:88px" placeholder="plan冷却(分)"><input type="number" id="cd-soft-${escapePageHtml(p.id)}" value="${p.cooldown&&p.cooldown.softMs?Math.round(p.cooldown.softMs/1000):''}" style="width:88px" placeholder="429冷却(秒)"><input type="number" id="cd-err-${escapePageHtml(p.id)}" value="${p.cooldown&&p.cooldown.errThreshold?p.cooldown.errThreshold:''}" style="width:76px" placeholder="错误阈值"><input type="number" id="cd-errms-${escapePageHtml(p.id)}" value="${p.cooldown&&p.cooldown.errMs?Math.round(p.cooldown.errMs/60000):''}" style="width:88px" placeholder="错误冷却(分)"><span class="mu" style="font-size:12px">冷却参数（保存后生效）</span></div>
@@ -561,7 +579,7 @@ ${H('管理')}
                 </fieldset>
               </div>
               <fieldset class="form-group ${p.authType==='oauth-device'?'hd':''}" id="keys-fs-${escapePageHtml(p.id)}"><legend id="key-legend-${escapePageHtml(p.id)}">${isTraeProviderUI(p)?'TRAE 账号凭证（每个账号一行 JSON）':(p.id==='cline'?'Cline RefreshTokens（每个账号一行）':'上游 API Keys')}</legend><div id="keys-${escapePageHtml(p.id)}">${p.apiKeys.map((k, ki)=>`<div class="fc mb-3 field-row" data-kidx="${ki}"><input type="password" value="${escapePageHtml(k.key)}" class="fx1" id="k-${escapePageHtml(p.id)}-${ki}" placeholder="API Key" aria-label="API Key"><button class="icon-btn" onclick="toggleKeyText(this)" title="显示/隐藏 Key"><i class="fas fa-eye" aria-hidden="true"></i></button><label class="tg"><input type="checkbox" ${k.enabled?'checked':''} id="ken-${escapePageHtml(p.id)}-${ki}" aria-label="启用 Key"><span class="sl"></span></label><button class="btn btn-gh btn-xs" onclick="testKeyRow('${escapePageJsx(p.id)}',${ki})" title="测试 Key"><i class="fas fa-plug" aria-hidden="true"></i><span>测试</span></button><button class="icon-btn" onclick="rmKeyRow('${escapePageJsx(p.id)}',${ki})" aria-label="移除 Key"><i class="fas fa-times" aria-hidden="true"></i></button></div>`).join('')}</div><div class="fc mt-1 field-row"><input type="password" id="nk-${escapePageHtml(p.id)}" placeholder="${isTraeProviderUI(p)?'新的 TRAE 凭证 JSON（或点「登录账号」自动写入）':(p.id==='cline'?'新的 RefreshToken（一个账号一行）':'新的 API Key')}" class="fx1"><button class="btn btn-s btn-xs" onclick="addKeyRow('${escapePageJsx(p.id)}')"><i class="fas fa-plus" aria-hidden="true"></i>添加</button></div><span id="key-hint-${escapePageHtml(p.id)}" class="form-helper">${isTraeProviderUI(p)?'TRAE SOLO 账号凭证为登录后自动写入的 JSON（也可粘贴 trae 登录脚本落盘的 trae-*.json 内容）。每行一个账号、按剩余积分自动挑选，额度用尽自动冷却轮换；禁用该 Key 即停用账号。':(p.id==='cline'?'Cline 使用 Cline 账号的 refreshToken（长期钥匙）。每个账号一行，额度用完自动切换；留空禁用某个账号。':' ')}</span></fieldset>
-              <fieldset class="form-group" id="models-fs-${escapePageHtml(p.id)}"><legend>模型</legend><div id="ml-${escapePageHtml(p.id)}">${p.models.map((m,mi)=>`<div class="fc mb-3 field-row" data-idx="${mi}"><input type="text" value="${escapePageHtml(m.id)}" class="fx1" id="mid-${escapePageHtml(p.id)}-${mi}" placeholder="模型 ID"><label class="tg" title="启用模型"><input type="checkbox" ${m.enabled?'checked':''} id="men-${escapePageHtml(p.id)}-${mi}" aria-label="启用模型"><span class="sl"></span></label><label class="tg" title="启用思维引导注入"><input type="checkbox" ${(p.thinkingInject||[]).includes(m.id)?'checked':''} id="mit-${escapePageHtml(p.id)}-${mi}" aria-label="启用思维引导注入"><span class="sl"></span></label><label class="tg" title="启用缓存前缀注入"><input type="checkbox" ${(p.cachePrefixInject||[]).includes(m.id)?'checked':''} id="mcp-${escapePageHtml(p.id)}-${mi}" aria-label="启用缓存前缀注入"><span class="sl"></span></label><button class="btn btn-gh btn-xs" onclick="testMdl('${escapePageJsx(p.id)}','${escapePageJsx(m.id)}',${mi})" title="测试模型"><i class="fas fa-plug" aria-hidden="true"></i><span>测试</span></button><button class="icon-btn" onclick="rmMdl('${escapePageJsx(p.id)}',${mi})" aria-label="移除模型"><i class="fas fa-times" aria-hidden="true"></i></button></div>`).join('')}</div><div class="fc mt-1 field-row"><input type="text" id="nmid-${escapePageHtml(p.id)}" placeholder="新的模型 ID" class="fx1"><button class="btn btn-s btn-xs" onclick="addMdl('${escapePageJsx(p.id)}')"><i class="fas fa-plus" aria-hidden="true"></i>添加</button></div><span class="form-helper">每个模型行「启用模型」开关旁的开关依次为「思维引导注入」「缓存前缀注入」，勾选后该模型转发前会被注入对应固定提示词；不勾选则原样转发。</span></fieldset>
+              <fieldset class="form-group" id="models-fs-${escapePageHtml(p.id)}"><legend>模型</legend><div id="ml-${escapePageHtml(p.id)}">${p.models.map((m,mi)=>{ const pol=((p.oauth&&p.oauth.effortPolicy)||{})[m.id]||[]; return `<div class="fc mb-3 field-row" data-idx="${mi}"><input type="text" value="${escapePageHtml(m.id)}" class="fx1" id="mid-${escapePageHtml(p.id)}-${mi}" placeholder="模型 ID"><label class="tg" title="启用模型"><input type="checkbox" ${m.enabled?'checked':''} id="men-${escapePageHtml(p.id)}-${mi}" aria-label="启用模型"><span class="sl"></span></label><label class="tg" title="启用思维引导注入"><input type="checkbox" ${(p.thinkingInject||[]).includes(m.id)?'checked':''} id="mit-${escapePageHtml(p.id)}-${mi}" aria-label="启用思维引导注入"><span class="sl"></span></label><label class="tg" title="启用缓存前缀注入"><input type="checkbox" ${(p.cachePrefixInject||[]).includes(m.id)?'checked':''} id="mcp-${escapePageHtml(p.id)}-${mi}" aria-label="启用缓存前缀注入"><span class="sl"></span></label>${effDdEditHtml(p.id, mi, pol)}<button class="btn btn-gh btn-xs" onclick="testMdl('${escapePageJsx(p.id)}','${escapePageJsx(m.id)}',${mi})" title="测试模型"><i class="fas fa-plug" aria-hidden="true"></i><span>测试</span></button><button class="icon-btn" onclick="rmMdl('${escapePageJsx(p.id)}',${mi})" aria-label="移除模型"><i class="fas fa-times" aria-hidden="true"></i></button></div>`}).join('')}</div><div class="fc mt-1 field-row"><input type="text" id="nmid-${escapePageHtml(p.id)}" placeholder="新的模型 ID" class="fx1"><button class="btn btn-s btn-xs" onclick="addMdl('${escapePageJsx(p.id)}')"><i class="fas fa-plus" aria-hidden="true"></i>添加</button></div><span class="form-helper">每个模型行「启用模型」开关旁的开关依次为「思维引导注入」「缓存前缀注入」，勾选后该模型转发前会被注入对应固定提示词；不勾选则原样转发。「effort」下拉声明该模型的 reasoning_effort 支持档位（多选，仅 WorkBuddy/CodeBuddy 上游生效），留空 = 不启用。</span></fieldset>
               ${isTraeProviderUI(p)?`
               <fieldset class="form-group" id="trae-fs-${escapePageHtml(p.id)}"><legend>TRAE SOLO 账号池</legend><span class="form-helper">免费积分多账号反代：登录成功后凭证自动写入上方账号列表；转发时默认按剩余积分自动挑选账号，也可在下方「首选账号」下拉框中手工指定固定账号（被冷却/禁用/失败时才回退其他账号），额度用尽自动冷却轮换（1005/429/401 各按策略冷却/禁用），每日 01:00/13:00 自动签到补积分并解冻。</span>
                 <div class="fc mt-1 field-row">
@@ -1177,6 +1195,7 @@ function addMdlRow() {
   d.className = 'fc mb-4 field-row'
   d.innerHTML = '<input type="text" placeholder="deepseek-chat" class="fx1 ami" aria-label="模型 ID"><label class="tg"><input type="checkbox" checked class="ame" aria-label="启用该模型"><span class="sl"></span></label><label class="tg" title="启用思维引导注入"><input type="checkbox" class="cti" aria-label="启用思维引导注入"><span class="sl"></span></label><label class="tg" title="启用缓存前缀注入"><input type="checkbox" class="ccp" aria-label="启用缓存前缀注入"><span class="sl"></span></label><button class="btn btn-gh btn-xs" onclick="testNewMdl(this)" aria-label="测试该模型"><i class="fas fa-plug"></i></button><button class="btn btn-gh btn-xs" onclick="this.parentElement.remove()" aria-label="移除该模型"><i class="fas fa-times c-l"></i></button><span class="trt" style="flex-basis:100%" aria-live="polite"></span>'
   c.appendChild(d)
+  effDdEnsure(d)
 }
 
 function addMdlToForm(mid) {
@@ -1185,6 +1204,7 @@ function addMdlToForm(mid) {
   d.className = 'fc mb-4 field-row'
   d.innerHTML = '<input type="text" value="' + escapeHtml(mid) + '" class="fx1 ami" aria-label="模型 ID"><label class="tg"><input type="checkbox" checked class="ame" aria-label="启用该模型"><span class="sl"></span></label><label class="tg" title="启用思维引导注入"><input type="checkbox" class="cti" aria-label="启用思维引导注入"><span class="sl"></span></label><label class="tg" title="启用缓存前缀注入"><input type="checkbox" class="ccp" aria-label="启用缓存前缀注入"><span class="sl"></span></label><button class="btn btn-gh btn-xs" onclick="testNewMdl(this)" aria-label="测试该模型"><i class="fas fa-plug"></i></button><button class="btn btn-gh btn-xs" onclick="this.parentElement.remove()" aria-label="移除该模型"><i class="fas fa-times c-l"></i></button><span class="trt" style="flex-basis:100%" aria-live="polite"></span>'
   c.appendChild(d)
+  effDdEnsure(d)
 }
 
 function testNewMdl(btn) {
@@ -1305,26 +1325,71 @@ function syncGlobalOauthEdit(id) {
   fill('18', p._globalRefreshTokenUrl)
 }
 
-/**
- * 解析 reasoning_effort 能力表 textarea（JSON）为 oauth.effortPolicy。
- * 仅接受「plain object 且每个 value 都是非空 string[]」；空输入/非法 JSON/形状不符
- * 返回 undefined（与 extraHeaders 同策略：textarea 以当前值预填，正常编辑不会误清）。
- */
-function parseEffortPolicyJson(raw) {
-  const s = (raw || '').trim()
-  if (!s) return undefined
-  try {
-    const obj = JSON.parse(s)
-    if (!obj || typeof obj !== 'object' || Array.isArray(obj)) return undefined
-    const out = {}
-    for (const k of Object.keys(obj)) {
-      const v = obj[k]
-      const ok = Array.isArray(v) && v.length > 0 && v.every(function (x) { return typeof x === 'string' && x.trim() !== '' })
-      if (!ok) return undefined
-      out[k] = v
-    }
-    return Object.keys(out).length > 0 ? out : undefined
-  } catch { return undefined }
+/** reasoning_effort 支持档位多选下拉：从 SSR 模板 #eff-dd-tpl 克隆进缺少下拉的模型行（新建/编辑共用） */
+function effDdEnsure(row) {
+  if (!row || row.querySelector('.eff-dd')) return
+  const tpl = document.getElementById('eff-dd-tpl')
+  if (!tpl || !tpl.textContent) return
+  const holder = document.createElement('div')
+  holder.innerHTML = tpl.textContent
+  const dd = holder.firstElementChild
+  if (dd) row.insertBefore(dd, row.querySelector('button.btn-gh'))
+}
+
+/** 页面加载后给新建表单的首行（SSR 直出）注入 effort 下拉 */
+function effDdInit() {
+  Array.from(document.querySelectorAll('#amodels .field-row')).forEach(effDdEnsure)
+}
+if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', effDdInit)
+else effDdInit()
+
+/** 勾选变化后同步下拉摘要文本 */
+function updateEffSummary(dd) {
+  if (!dd) return
+  const sel = Array.from(dd.querySelectorAll('.eff-cb:checked')).map(function (c) { return c.value })
+  const sum = dd.querySelector('.eff-sum')
+  if (sum) sum.textContent = sel.length ? sel.join(' + ') : 'effort 不启用'
+}
+document.addEventListener('change', function (e) {
+  const t = e.target
+  if (t && t.matches && t.matches('.eff-cb')) updateEffSummary(t.closest('.eff-dd'))
+})
+document.addEventListener('click', function (e) {
+  // 点击下拉外部时收起已打开的 effort 下拉
+  document.querySelectorAll('.eff-dd[open]').forEach(function (dd) {
+    if (!dd.contains(e.target)) dd.removeAttribute('open')
+  })
+})
+
+/** 从单条模型行收集已勾选档位；无勾选返回 null */
+function collectEffPolicyFromRow(row, mid) {
+  if (!mid) return null
+  const dd = row.querySelector('.eff-dd')
+  if (!dd) return null
+  const sel = Array.from(dd.querySelectorAll('.eff-cb:checked')).map(function (c) { return c.value })
+  return sel.length > 0 ? sel : null
+}
+
+/** 编辑表单：按模型行收集 oauth.effortPolicy（模型 ID 行内重命名会跟随新 ID） */
+function collectEffortPolicyEdit(id) {
+  const out = {}
+  Array.from(document.querySelectorAll('#ml-' + id + ' [data-idx]')).forEach(function (item) {
+    const idx = parseInt(item.dataset.idx)
+    const mid = (document.getElementById('mid-' + id + '-' + idx) || {}).value?.trim() ?? ''
+    const sel = collectEffPolicyFromRow(item, mid)
+    if (sel) out[mid] = sel
+  })
+  return Object.keys(out).length > 0 ? out : undefined
+}
+
+/** 新建表单：按模型行收集 oauth.effortPolicy */
+function collectEffortPolicyNew() {
+  const out = {}
+  Array.from(document.querySelectorAll('#amodels .ami')).forEach(function (inp) {
+    const sel = collectEffPolicyFromRow(inp.parentElement, inp.value.trim())
+    if (sel) out[inp.value.trim()] = sel
+  })
+  return Object.keys(out).length > 0 ? out : undefined
 }
 
 function collectOauthNew() {
@@ -1343,7 +1408,7 @@ function collectOauthNew() {
     tokenHeader: g('ao6') || 'x-api-key',
     tokenHeaderPrefix: g('ao9') || undefined,
     extraHeaders,
-    effortPolicy: parseEffortPolicyJson(g('aofp')),
+    effortPolicy: collectEffortPolicyNew(),
     modelsUrl: g('ao10') || undefined,
     globalBaseUrl: g('ao11') || undefined,
     globalModelsUrl: g('ao12') || undefined,
@@ -1436,7 +1501,7 @@ function collectOauthEdit(id) {
     tokenHeader: g('6') || 'x-api-key',
     tokenHeaderPrefix: g('9') || undefined,
     extraHeaders,
-    effortPolicy: parseEffortPolicyJson(g('fp')),
+    effortPolicy: collectEffortPolicyEdit(id),
     modelsUrl: g('10') || undefined,
     globalBaseUrl: g('11') || undefined,
     globalModelsUrl: g('12') || undefined,
@@ -2542,6 +2607,7 @@ function addMdl(id) {
   d.dataset.idx = cnt
   d.innerHTML = '<input type="text" value="' + escapeHtml(mid) + '" class="fx1" id="mid-' + escapeHtml(id) + '-' + cnt + '" placeholder="模型 ID" aria-label="模型 ID"><label class="tg" title="启用该模型"><input type="checkbox" checked id="men-' + escapeHtml(id) + '-' + cnt + '" aria-label="启用该模型"><span class="sl"></span></label><label class="tg" title="启用思维引导注入"><input type="checkbox" id="mit-' + escapeHtml(id) + '-' + cnt + '" aria-label="启用思维引导注入"><span class="sl"></span></label><label class="tg" title="启用缓存前缀注入"><input type="checkbox" id="mcp-' + escapeHtml(id) + '-' + cnt + '" aria-label="启用缓存前缀注入"><span class="sl"></span></label>' + dbBox + '<button class="btn btn-gh btn-xs" id="tm-' + escapeHtml(id) + '-' + cnt + '" aria-label="测试该模型"><i class="fas fa-plug"></i></button><button class="btn btn-gh btn-xs" id="rm-' + escapeHtml(id) + '-' + cnt + '" aria-label="移除该模型"><i class="fas fa-times c-l"></i></button><span class="trt" id="mtr-' + escapeHtml(id) + '-' + cnt + '" style="flex-basis:100%" aria-live="polite"></span>'
   c.appendChild(d)
+  effDdEnsure(d)
   document.getElementById('tm-' + id + '-' + cnt).addEventListener('click', function() { testMdl(id, mid, cnt) })
   document.getElementById('rm-' + id + '-' + cnt).addEventListener('click', function() { rmMdl(id, cnt) })
   inp.value = ''
