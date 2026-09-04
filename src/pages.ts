@@ -471,6 +471,7 @@ ${H('管理')}
                     <div class="fg"><label>Global 域发起端点</label><input type="url" id="ao16" placeholder="https://www.workbuddy.ai/v2/plugin/auth/state?platform=CLI"><span class="form-helper">登录域选「国际版」时使用，留空回退国内端点。</span></div>
                     <div class="fg"><label>Global 域轮询端点</label><input type="url" id="ao17" placeholder="https://www.workbuddy.ai/v2/plugin/auth/token"></div>
                     <div class="fg"><label>Global 域刷新端点</label><input type="url" id="ao18" placeholder="https://www.workbuddy.ai/v2/plugin/auth/token/refresh"></div>
+                    <div class="fg"><label>reasoning_effort 能力表（JSON，可选）</label><textarea id="aofp" rows="3" placeholder='{"deepseek-v4-pro":["low","medium","high"]}'></textarea><span class="form-helper">声明各模型支持的 reasoning_effort 档位（off/minimal/low/medium/high/xhigh/max）。客户端请求档位模型不支持时自动降级为 ≤请求档位的最高支持档；被支持则透传。未声明的模型继续删除该字段。当前仅 WorkBuddy/CodeBuddy 上游生效。</span></div>
                   </div>
                 </div>
                 <div class="fc mt-1 field-row"><button class="btn btn-p" onclick="createProv({afterCreate:function(id){location.href='/admin?connect='+encodeURIComponent(id)}})"><i class="fas fa-plug" aria-hidden="true"></i>创建并发起连接</button><span class="form-helper">先创建提供商，保存后自动弹出 OAuth 登录链接；登录成功会自动拉取模型。</span></div>
@@ -536,11 +537,12 @@ ${H('管理')}
                       <div class="fg"><label>Global 域发起端点（可选）</label><input type="url" id="eao16-${escapePageHtml(p.id)}" value="${escapePageHtml((p.oauth&&p.oauth.globalDeviceCodeUrl)||'')}" placeholder="https://www.workbuddy.ai/v2/plugin/auth/state?platform=CLI"><span class="form-helper">登录域选「国际版」时使用，留空回退国内端点。</span></div>
                       <div class="fg"><label>Global 域轮询端点（可选）</label><input type="url" id="eao17-${escapePageHtml(p.id)}" value="${escapePageHtml((p.oauth&&p.oauth.globalDeviceTokenUrl)||'')}" placeholder="https://www.workbuddy.ai/v2/plugin/auth/token"></div>
                       <div class="fg"><label>Global 域刷新端点（可选）</label><input type="url" id="eao18-${escapePageHtml(p.id)}" value="${escapePageHtml((p.oauth&&p.oauth.globalRefreshTokenUrl)||'')}" placeholder="https://www.workbuddy.ai/v2/plugin/auth/token/refresh"></div>
+                      <div class="fg"><label>reasoning_effort 能力表（JSON，可选）</label><textarea id="eaofp-${escapePageHtml(p.id)}" rows="3" placeholder='{"deepseek-v4-pro":["low","medium","high"]}'>${escapePageHtml((p.oauth&&p.oauth.effortPolicy)?JSON.stringify(p.oauth.effortPolicy,null,2):'')}</textarea><span class="form-helper">声明各模型支持的 reasoning_effort 档位（off/minimal/low/medium/high/xhigh/max），客户端请求档位不支持时自动降级、支持则透传；未声明的模型继续删除该字段。当前仅 WorkBuddy/CodeBuddy 上游生效。留空 = 不启用。</span></div>
                     </div>
                   </div>
                   <div class="fc mt-1 field-row"><button class="btn btn-s" onclick="oauthConnect('${escapePageJsx(p.id)}')"><i class="fas fa-plug" aria-hidden="true"></i>发起连接</button><button class="btn btn-gh" onclick="fetchOauthModels('${escapePageJsx(p.id)}')"><i class="fas fa-cloud-download-alt" aria-hidden="true"></i>获取模型</button><button class="btn btn-gh" onclick="oauthStatus('${escapePageJsx(p.id)}')"><i class="fas fa-sync" aria-hidden="true"></i>状态</button><button class="btn btn-gh" onclick="oauthDisconnect('${escapePageJsx(p.id)}')"><i class="fas fa-unlink" aria-hidden="true"></i>断开</button><span id="oauth-st-${escapePageHtml(p.id)}" class="oauth-status"></span></div>
                   ${(p.oauth&&p.oauth.flowType==='browser')?`
-                  <fieldset class="form-group" id="wbp-fs-${escapePageHtml(p.id)}"><legend>WorkBuddy 多账号池</legend><span class="form-helper">浏览器登录流每次成功登录都会把该账号加入账号池（按 uid 去重，多登一个 = 多个账号）。转发按剩余积分自动挑选账号，429/plan/401 等按策略冷却或禁用并轮换其他账号；每日签到后积分恢复自动解冻。冷却参数留空 = 默认（plan 12h / 429 60s / 连续 5 次错误冷却 10m）。</span>
+                  <fieldset class="form-group" id="wbp-fs-${escapePageHtml(p.id)}"><legend>WorkBuddy 多账号池</legend><span class="form-helper">浏览器登录流每次成功登录都会把该账号加入账号池（按 uid 去重，多登一个 = 多个账号）。转发按三因子加权自动挑选账号（积分 / 闲置补偿 / 成功率），429/404/余额耗尽/401 等按策略冷却或禁用并轮换其他账号；无健康账号时从冷却账号选最早到期者顶班；每日签到后积分恢复自动解冻。冷却参数留空 = 默认（plan 12h / 429 60s / 连续 5 次错误冷却 10m）。reasoning_effort 透传/降级能力表在上方「高级 OAuth 配置」里配置。</span>
                     <div class="fc mt-1 field-row"><button class="btn btn-s" onclick="oauthPoolStatus('${escapePageJsx(p.id)}')"><i class="fas fa-sync" aria-hidden="true"></i>刷新账号池</button><button class="btn btn-s" onclick="oauthConnect('${escapePageJsx(p.id)}')"><i class="fas fa-sign-in-alt" aria-hidden="true"></i>登录新账号</button><button class="btn btn-p" onclick="triggerCheckin('${escapePageJsx(p.id)}')"><i class="fas fa-calendar-check" aria-hidden="true"></i>立即签到</button><span id="wbp-st-${escapePageHtml(p.id)}" class="oauth-status"></span></div>
                     <div id="wbp-acc-${escapePageHtml(p.id)}" class="mt-1"></div>
                     <div class="fc mt-1 field-row" style="gap:8px"><input type="number" id="cd-plan-${escapePageHtml(p.id)}" value="${p.cooldown&&p.cooldown.planMs?Math.round(p.cooldown.planMs/60000):''}" style="width:88px" placeholder="plan冷却(分)"><input type="number" id="cd-soft-${escapePageHtml(p.id)}" value="${p.cooldown&&p.cooldown.softMs?Math.round(p.cooldown.softMs/1000):''}" style="width:88px" placeholder="429冷却(秒)"><input type="number" id="cd-err-${escapePageHtml(p.id)}" value="${p.cooldown&&p.cooldown.errThreshold?p.cooldown.errThreshold:''}" style="width:76px" placeholder="错误阈值"><input type="number" id="cd-errms-${escapePageHtml(p.id)}" value="${p.cooldown&&p.cooldown.errMs?Math.round(p.cooldown.errMs/60000):''}" style="width:88px" placeholder="错误冷却(分)"><span class="mu" style="font-size:12px">冷却参数（保存后生效）</span></div>
@@ -1299,6 +1301,28 @@ function syncGlobalOauthEdit(id) {
   fill('18', p._globalRefreshTokenUrl)
 }
 
+/**
+ * 解析 reasoning_effort 能力表 textarea（JSON）为 oauth.effortPolicy。
+ * 仅接受「plain object 且每个 value 都是非空 string[]」；空输入/非法 JSON/形状不符
+ * 返回 undefined（与 extraHeaders 同策略：textarea 以当前值预填，正常编辑不会误清）。
+ */
+function parseEffortPolicyJson(raw) {
+  const s = (raw || '').trim()
+  if (!s) return undefined
+  try {
+    const obj = JSON.parse(s)
+    if (!obj || typeof obj !== 'object' || Array.isArray(obj)) return undefined
+    const out = {}
+    for (const k of Object.keys(obj)) {
+      const v = obj[k]
+      const ok = Array.isArray(v) && v.length > 0 && v.every(function (x) { return typeof x === 'string' && x.trim() !== '' })
+      if (!ok) return undefined
+      out[k] = v
+    }
+    return Object.keys(out).length > 0 ? out : undefined
+  } catch { return undefined }
+}
+
 function collectOauthNew() {
   const g = function(id) { return (document.getElementById(id) || {}).value?.trim() ?? '' }
   let extraHeaders
@@ -1315,6 +1339,7 @@ function collectOauthNew() {
     tokenHeader: g('ao6') || 'x-api-key',
     tokenHeaderPrefix: g('ao9') || undefined,
     extraHeaders,
+    effortPolicy: parseEffortPolicyJson(g('aofp')),
     modelsUrl: g('ao10') || undefined,
     globalBaseUrl: g('ao11') || undefined,
     globalModelsUrl: g('ao12') || undefined,
@@ -1407,6 +1432,7 @@ function collectOauthEdit(id) {
     tokenHeader: g('6') || 'x-api-key',
     tokenHeaderPrefix: g('9') || undefined,
     extraHeaders,
+    effortPolicy: parseEffortPolicyJson(g('fp')),
     modelsUrl: g('10') || undefined,
     globalBaseUrl: g('11') || undefined,
     globalModelsUrl: g('12') || undefined,
