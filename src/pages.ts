@@ -1738,7 +1738,8 @@ function renderOauthPoolAccounts(id, accs, ciByUid, ciByNick, ciAccounts, prefer
   // 旧 KV 签到数据无 uid 且昵称可能两侧均空：账号数一致时按池顺序对齐作最后兜底
   const idxFallback = ciAccounts.length === accs.length ? ciAccounts : null
   box.innerHTML = preferBar + accs.map(function(a, i) {
-    const badge = a.disabled ? '<span class="bd bd-off">已禁用</span>' : (a.cooling ? '<span class="bd bd-off">冷却中</span>' : '<span class="bd bd-on">健康</span>')
+    const isOff = a.disabled || a.enabled === false
+    const badge = isOff ? '<span class="bd bd-off">已禁用</span>' : (a.cooling ? '<span class="bd bd-off">冷却中</span>' : '<span class="bd bd-on">健康</span>')
     // 签到结果匹配：uid → nickname → 顺序兜底（仅账号数一致时）
     const ci = ciByUid[a.uid] || (a.nickname && ciByNick[a.nickname]) || (idxFallback ? idxFallback[i] : null)
     // 签到状态徽章（今日已签 / 失败 / 未签）
@@ -1776,8 +1777,12 @@ function renderOauthPoolAccounts(id, accs, ciByUid, ciByNick, ciAccounts, prefer
       pkgHtml = '<div class="collapse-section" style="margin-top:4px"><button class="collapse-btn" data-pkg="' + aid + '" type="button" aria-expanded="false"><i class="fas fa-chevron-right collapse-icon" aria-hidden="true"></i> 权益包明细（' + ci.packages.length + '）</button><div id="' + aid + '" class="hd usage-log-table-wrap"><table class="usage-log-table"><thead><tr><th>名称</th><th>到期时间</th><th>周期结束</th><th>已用/总额度</th></tr></thead><tbody>' + rows + '</tbody></table></div></div>'
     }
     let line = 'uid=' + escapeHtml(a.uid) + (a.nickname ? '（' + escapeHtml(a.nickname) + '）' : '') + ' · 积分=' + (a.credits || 0)
-    if (a.cooling && a.until) line += ' · 冷却至 ' + new Date(a.until).toLocaleString()
-    if (a.reason) line += ' · ' + escapeHtml(a.reason)
+    // 冷却状态字段（常显，对齐 TRAE 面板「冷却至」列）：禁用（原因）> 冷却中（到期时间+原因）> 无冷却（残留原因时标注上次）
+    let coolTxt
+    if (isOff) coolTxt = a.reason ? '已禁用（' + escapeHtml(a.reason) + '）' : '已禁用'
+    else if (a.cooling && a.until) coolTxt = '冷却至 ' + new Date(a.until).toLocaleString() + (a.reason ? '（' + escapeHtml(a.reason) + '）' : '')
+    else coolTxt = a.reason ? '无冷却（上次：' + escapeHtml(a.reason) + '）' : '无冷却'
+    line += ' · ' + coolTxt
     return '<div class="fc mb-2 field-row" style="align-items:flex-start"><div class="fx1" style="font-size:12px;min-width:0"><div>' + line + ' ' + badge + ciBadge + '</div>' + creditLine + pkgHtml + '</div><button class="btn btn-gh btn-xs" onclick="oauthPoolRemove(\\'' + escapeJsAttr(id) + '\\',\\'' + escapeJsAttr(a.uid) + '\\')"><i class="fas fa-trash" aria-hidden="true"></i>移除</button></div>'
   }).join('')
   // 绑定权益包折叠按钮（与签到区相同的 toggleCollapse 交互）
