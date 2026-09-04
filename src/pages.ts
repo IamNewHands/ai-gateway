@@ -700,7 +700,11 @@ ${H('管理')}
       <section id="mcps" class="workspace-section" aria-labelledby="mcps-title">
         <div class="section-heading section-heading--admin">
           <div><h2 id="mcps-title">MCP 网关</h2><p>聚合多个 MCP Server 的工具，统一暴露 JSON-RPC 端点 <code>/v1/mcp</code>（需转发 Key 认证）。工具名自动加前缀 <code>{MCP名称}-</code> 隔离命名空间。</p></div>
-          <button class="btn btn-p" onclick="mcpFormModal()"><i class="fas fa-plus" aria-hidden="true"></i>添加 MCP</button>
+          <div class="fc">
+            <button class="btn btn-gh" onclick="mcpHealth()" title="逐个探测各 MCP 的可达性与工具数"><i class="fas fa-heartbeat" aria-hidden="true"></i>健康检查</button>
+            <button class="btn btn-gh" onclick="mcpBatchImport()"><i class="fas fa-file-import" aria-hidden="true"></i>批量导入</button>
+            <button class="btn btn-p" onclick="mcpFormModal()"><i class="fas fa-plus" aria-hidden="true"></i>添加 MCP</button>
+          </div>
         </div>
         <div class="key-list">
           ${mcps.length===0?'<div class="empty-state"><i class="fas fa-boxes" aria-hidden="true"></i><h3>还没有 MCP Server</h3><p>添加 MCP Server 后，其 tools/list 工具会聚合到 <code>/v1/mcp</code>，支持 tools/call 路由。</p><button class="btn btn-p" onclick="mcpFormModal()">添加 MCP</button></div>':''}
@@ -3118,6 +3122,49 @@ function mcpDel(id) {
     fetch('/admin/api/mcps/' + encodeURIComponent(id), { method: 'DELETE' }).then(function (r) { return r.json() })
       .then(function (d) { if (d.success) { toast('已删除', 'success'); setTimeout(function () { reloadAdmin() }, 300) } else toast(d.message || '删除失败', 'error') })
   })
+}
+// 健康检查：逐个探测各 MCP 的可达性与工具数
+function mcpHealth() {
+  toast('正在探测 MCP…', 'info')
+  fetch('/admin/api/mcps/health').then(function (r) { return r.json() }).then(function (d) {
+    if (!d.success) { toast(d.message || '探测失败', 'error'); return }
+    var dt = d.data, servers = dt.servers || []
+    var okN = 0
+    var rows = servers.map(function (s) {
+      if (s.status === 'ok') okN++
+      var icon = s.status === 'ok' ? '<i class="fas fa-check-circle c-s"></i>' : (s.status === 'error' ? '<i class="fas fa-times-circle c-d"></i>' : '<i class="fas fa-pause-circle mu"></i>')
+      var cls = s.status === 'ok' ? 'bd bd-on' : (s.status === 'error' ? 'bd bd-off' : 'mu')
+      var label = s.status === 'ok' ? ('可达 · ' + s.tools + ' 个工具') : (s.status === 'error' ? ('异常 · ' + escapeHtml((s.error || '未知错误').slice(0, 80))) : '已禁用')
+      return '<div class="mcph-row">' + icon + '<div class="fx1"><div><strong>' + escapeHtml(s.name) + '</strong> <span class="' + cls + '">' + label + '</span></div><div class="mu"><code>' + escapeHtml(s.url) + '</code></div></div></div>'
+    }).join('')
+    if (rows === '') rows = '<div class="empty-state"><i class="fas fa-boxes"></i><p>尚未配置 MCP Server。</p></div>'
+    var summary = '<div style="padding:10px 2px 2px"><strong>健康检查</strong> ' + okN + '/' + (dt.enabled || dt.total || 0) + ' 在线，共 ' + (dt.total || 0) + ' 个</div>'
+    var h = '<h3><i class="fas fa-heartbeat c-p"></i> MCP 健康检查</h3>' + summary + '<div class="mcph-list">' + rows + '</div><div class="panel-actions"><div><button class="btn btn-p" onclick="closeM()">关闭</button></div></div>'
+    showM(h)
+  }).catch(function () { toast('健康检查请求失败', 'error') })
+}
+// 批量导入：粘贴 JSON 数组（[{name,url,httpHeaders,enabled},...]）一次注册多个
+function mcpBatchImport() {
+  var sample = '[{"name":"github","url":"https://api.githubcopilot.com/mcp/","httpHeaders":{"Authorization":"Bearer TOKEN"},"enabled":true}]'
+  var h = '<h3><i class="fas fa-file-import c-p"></i> 批量导入 MCP</h3>'
+  h += '<div class="fg"><label>JSON 数组（每个元素含 name/url，可选 httpHeaders/enabled）</label><textarea id="mcp-batch-json" rows="10" placeholder="' + escapeHtml(sample) + '"></textarea><span class="form-helper">一条即一个 MCP Server；格式非法的条目会自动跳过并在结果中说明。单次最多 200 个。</span></div>'
+  h += '<div class="panel-actions"><div><button class="btn btn-s" onclick="closeM()">取消</button><button class="btn btn-p" onclick="mcpBatchSubmit()"><i class="fas fa-file-import" aria-hidden="true"></i>导入</button></div></div>'
+  showM(h)
+}
+function mcpBatchSubmit() {
+  var raw = document.getElementById('mcp-batch-json').value.trim()
+  var list
+  try { list = JSON.parse(raw) } catch (e) { toast('JSON 解析失败：' + e.message, 'error'); return }
+  if (!Array.isArray(list) || list.length === 0) { toast('请输入非空数组', 'error'); return }
+  fetch('/admin/api/mcps/batch', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(list)
+  }).then(function (r) { return r.json() }).then(function (d) {
+    if (!d.success) { toast(d.message || '导入失败', 'error'); return }
+    var info = '成功导入 ' + d.data.created + ' 个'
+    if ((d.data.failed || []).length) info += '，跳过 ' + d.data.failed.length + ' 个'
+    closeM(); toast(info, 'success')
+    if (d.data.created > 0) setTimeout(function () { reloadAdmin() }, 300)
+  }).catch(function () { toast('网络错误', 'error') })
 }
 
 // ===== 联合模型（uni-model）管理 =====

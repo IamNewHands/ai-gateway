@@ -25,6 +25,7 @@ import {
   type CacheEntryView,
 } from './storage'
 import { testModelConnection } from './proxy'
+import { probeMcpServers } from './mcp-gateway'
 import { isTraeProvider, testTraeCredential, testTraeModel } from './trae/proxy'
 import { fetchOpenCodeModels, isOpenCodeProvider, resolveOpenCodeUrls, testOpenCodeModel } from './opencode'
 import { isQoderProvider, fetchQoderModels } from './qoder/proxy'
@@ -968,6 +969,23 @@ export async function handleMcpsBatch(c: Context<AppEnv>) {
 
   if (created.length > 0) await setMcps(c.env, [...existing, ...created])
   return c.json<ApiResponse>({ success: true, data: { created: created.length, failed: errors } })
+}
+
+/** MCP 健康检查（管理后台用）：逐个探测已配置 MCP 的可达性与工具数 */
+export async function handleMcpHealthAdmin(c: Context<AppEnv>) {
+  const servers = await probeMcpServers(c.env)
+  const active = servers.filter((s) => s.status === 'ok')
+  const enabledCount = servers.filter((s) => s.enabled).length
+  return c.json<ApiResponse>({
+    success: true,
+    data: {
+      healthy: enabledCount > 0 && active.length === enabledCount,
+      total: servers.length,
+      enabled: enabledCount,
+      healthyCount: active.length,
+      servers,
+    },
+  })
 }
 
 export async function handleUpdateMcp(c: Context<AppEnv>) {

@@ -348,6 +348,9 @@ label, legend { color: var(--color-ink-2); font-size: var(--text-xs); font-weigh
 .key-main h3 { margin-block-start: var(--space-3xs); font-size: var(--text-sm); }
 .key-main p { color: var(--color-muted); font-size: var(--text-xs); }
 .key-actions { display: flex; align-items: center; justify-content: flex-end; gap: var(--space-2xs); }
+.mcph-list { max-height: 18rem; overflow-y: auto; display: grid; gap: var(--space-2xs); margin-block-start: var(--space-sm); }
+.mcph-row { min-width: 0; display: flex; align-items: flex-start; gap: var(--space-xs); padding: var(--space-2xs) var(--space-xs); border: .0625rem solid var(--color-rule); border-radius: var(--radius-control); background: var(--color-paper-2); font-size: var(--text-xs); }
+.mcph-row code { overflow-wrap: anywhere; }
 .admin-footer { margin-block-start: auto; padding: var(--space-md) var(--space-sm); display: flex; align-items: center; justify-content: space-between; gap: var(--space-sm); border-block-start: .0625rem solid var(--color-rule); color: var(--color-muted); font-size: var(--text-xs); }
 .admin-footer a { white-space: nowrap; text-underline-offset: .125rem; }
 

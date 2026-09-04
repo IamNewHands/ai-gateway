@@ -44,6 +44,7 @@ import {
   handleUpdateMcp,
   handleDeleteMcp,
   handleMcpsBatch,
+  handleMcpHealthAdmin,
   handleGetUnimodels,
   handleCreateUnimodel,
   handleUpdateUnimodel,
@@ -225,6 +226,7 @@ app.post('/admin/api/m365/debug-sse', handleM365DebugConfig)
 app.get('/admin/api/mcps', handleGetMcps)
 app.post('/admin/api/mcps', handleCreateMcp)
 app.post('/admin/api/mcps/batch', handleMcpsBatch)
+app.get('/admin/api/mcps/health', handleMcpHealthAdmin)
 app.put('/admin/api/mcps/:id', handleUpdateMcp)
 app.delete('/admin/api/mcps/:id', handleDeleteMcp)
 

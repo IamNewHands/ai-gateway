@@ -275,27 +275,32 @@ export async function handleMcpJsonRpc(c: Context<AppEnv>): Promise<Response> {
   }
 }
 
-/**
- * GET /v1/mcp/health —— 排障端点：逐个实时探测每个已配置 MCP 的可达性与工具数，
- * 便于定位"哪个上游挂了"。不缓存、每次真实探测。
- * 已禁用的 MCP 标记为 disabled 且不参与探测。
- */
-export async function handleMcpHealth(c: Context<AppEnv>): Promise<Response> {
-  const all = await getMcps(c.env)
-  const servers = await Promise.all(
+/** 逐个实时探测每个已配置 MCP 的可达性与工具数（不缓存）。已禁用的不参与探测。 */
+export async function probeMcpServers(env: Env): Promise<
+  Array<{ name: string; url: string; enabled: boolean; status: 'ok' | 'error' | 'disabled'; error: string | null; tools: number }>
+> {
+  const all = await getMcps(env)
+  return Promise.all(
     all.map(async (m) => {
-      if (!m.enabled) return { name: m.name, url: m.url, enabled: false, status: 'disabled', error: null, tools: 0 }
+      if (!m.enabled) return { name: m.name, url: m.url, enabled: false, status: 'disabled' as const, error: null, tools: 0 }
       const r = await fetchMcpTools(m) // 内部自带超时与重试
       return {
         name: m.name,
         url: m.url,
         enabled: true,
-        status: r.error ? 'error' : 'ok',
+        status: (r.error ? 'error' : 'ok') as 'ok' | 'error',
         error: r.error ?? null,
         tools: r.error ? 0 : r.tools.length,
       }
     })
   )
+}
+
+/**
+ * GET /v1/mcp/health —— 排障端点：返回每个已配置 MCP 的可达性与工具数，便于定位"哪个上游挂了"。
+ */
+export async function handleMcpHealth(c: Context<AppEnv>): Promise<Response> {
+  const servers = await probeMcpServers(c.env)
   const active = servers.filter((s) => s.status === 'ok')
   const enabledCount = servers.filter((s) => s.enabled).length
   return c.json({
