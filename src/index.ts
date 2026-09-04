@@ -43,6 +43,7 @@ import {
   handleCreateMcp,
   handleUpdateMcp,
   handleDeleteMcp,
+  handleMcpsBatch,
   handleGetUnimodels,
   handleCreateUnimodel,
   handleUpdateUnimodel,
@@ -67,7 +68,7 @@ import {
   handleGetPerfSettings,
   handleSetPerfSettings,
 } from './admin'
-import { handleMcpJsonRpc } from './mcp-gateway'
+import { handleMcpJsonRpc, handleMcpHealth } from './mcp-gateway'
 import { renderLoginPage, renderAdminPage } from './pages'
 import { seedInitialData, getProviders } from './storage'
 import {
@@ -223,6 +224,7 @@ app.post('/admin/api/m365/debug-sse', handleM365DebugConfig)
 // MCP Server 管理（MCP 聚合网关）
 app.get('/admin/api/mcps', handleGetMcps)
 app.post('/admin/api/mcps', handleCreateMcp)
+app.post('/admin/api/mcps/batch', handleMcpsBatch)
 app.put('/admin/api/mcps/:id', handleUpdateMcp)
 app.delete('/admin/api/mcps/:id', handleDeleteMcp)
 
@@ -271,6 +273,8 @@ app.get('/v1/models', handleModels)
 
 // MCP 聚合网关（JSON-RPC，OpenAI 兼容端点之外的独立协议）
 app.post('/v1/mcp', handleMcpJsonRpc)
+// MCP 健康排障端点
+app.get('/v1/mcp/health', handleMcpHealth)
 
 // Anthropic Messages API — 必须在 /v1/* 通配之前注册
 app.post('/v1/messages', handleAnthropicMessages)

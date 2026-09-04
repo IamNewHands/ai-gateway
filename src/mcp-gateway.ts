@@ -1,7 +1,7 @@
 import { Context } from 'hono'
 import { getMcps } from './storage'
 import { isSafeHttpUrl } from './admin'
-import type { AppEnv, McpServer } from './types'
+import type { AppEnv, Env, McpServer } from './types'
 
 /**
  * MCP 聚合网关（从 aihub 移植）。
@@ -35,13 +35,20 @@ const MCP_RETRY_DELAY_MS = 1000
 const MCP_FETCH_CONCURRENCY = 6
 const MCP_FETCH_TIMEOUT_MS = 30_000
 
+// tools/list 聚合结果的内存快照缓存：降低重复连接对上游的读放大。
+// 与 storage.ts 的内存缓存同策略——多 isolate 下各实例独立，至多滞后一个 TTL（30s），对网关场景可接受。
+const MCPS_TOOLS_CACHE_TTL_MS = 30_000
+const mcpsToolsCache = new Map<string, { at: number; json: string }>()
+
+/** 配置指纹：任一 mcp 的 name/url/enabled/httpHeaders 变化都会使缓存失效 */
+function mcpsFingerprint(mcps: McpServer[]): string {
+  return JSON.stringify(mcps.map((m) => ({ n: m.name, u: m.url, e: m.enabled, h: m.httpHeaders })))
+}
+
 const isRetryableStatus = (status: number) => status === 408 || status === 429 || status >= 500
 
 /** 工具名前缀：mcp 名称的空格转下划线，与工具名用 `-` 分隔（与 aihub 一致） */
 const mcpToolPrefix = (mcp: McpServer) => mcp.name.replaceAll(' ', '_')
-
-/** 从命名空间前缀反解 MCP 名称（下划线转回空格，与 get-tools 加前缀规则对称） */
-const mcpNameFromPrefix = (prefix: string) => prefix.replaceAll('_', ' ')
 
 /** JSON-RPC 错误响应 */
 function rpcError(id: unknown, jsonrpc: unknown, code: number, message: string) {
@@ -59,14 +66,36 @@ function buildMcpHeaders(mcp: McpServer): Headers {
   return headers
 }
 
-/** 解析上游响应：普通 JSON 或 SSE（data: 行拼接） */
+/**
+ * 解析上游响应：普通 JSON 直接返回；SSE 场景下提取 JSON-RPC 负载。
+ * - 单条 data: 或单条 JSON 拆多行 → 拼接后整体可解析即返回拼接结果；
+ * - 存在多条独立 data:（如事件流 + 结果）→ 取最后一条能独立解析的 data:。
+ */
 function parseMcpResponseText(rawText: string): string {
   if (!rawText.includes('data:')) return rawText
-  return rawText
+  const lines = rawText
     .split('\n')
-    .filter((l) => l.startsWith('data:'))
-    .map((l) => l.slice(5).trim())
-    .join('')
+    .filter((l) => l.trim().startsWith('data:'))
+    .map((l) => l.slice(l.indexOf('data:') + 5).trim())
+  if (lines.length === 0) return rawText
+
+  const joined = lines.join('')
+  try {
+    JSON.parse(joined)
+    return joined
+  } catch {
+    /* 多行独立 JSON，走下面的逐条回退 */
+  }
+  // 从后往前取最后一条能独立解析的 data
+  for (let i = lines.length - 1; i >= 0; i--) {
+    try {
+      JSON.parse(lines[i])
+      return lines[i]
+    } catch {
+      /* 继续找更早的 data: 行 */
+    }
+  }
+  return joined
 }
 
 /** 拉取单个 MCP 的 tools 列表（失败重试，返回错误信息供聚合方决定跳过/报错） */
@@ -99,6 +128,20 @@ async function fetchMcpTools(mcp: McpServer): Promise<{ mcp: McpServer; tools: A
   }
 
   return { mcp, tools: [], error: lastError || '未知错误' }
+}
+
+/** 聚合拉取所有已启用 MCP 的工具（命名空间前缀 + 失败信息），供 tools/list 与 /v1/mcp/health 复用 */
+async function fetchAllTools(
+  env: Env
+): Promise<{ tools: Array<Record<string, unknown>>; failed: Array<{ name: string; error: string }> }> {
+  const mcps = (await getMcps(env)).filter((m) => m.enabled)
+  if (mcps.length === 0) return { tools: [], failed: [] }
+  const results = await mapWithLimit(mcps, MCP_FETCH_CONCURRENCY, fetchMcpTools)
+  const failed = results.filter((r) => r.error).map((r) => ({ name: r.mcp.name, error: r.error as string }))
+  const tools = results.flatMap((r) =>
+    r.error ? [] : r.tools.map((t) => ({ ...t, name: `${mcpToolPrefix(r.mcp)}-${t.name}` }))
+  )
+  return { tools, failed }
 }
 
 /**
@@ -146,22 +189,27 @@ export async function handleMcpJsonRpc(c: Context<AppEnv>): Promise<Response> {
         return c.json({ id, jsonrpc, result: { tools: [] } })
       }
 
-      const results = await mapWithLimit(mcps, MCP_FETCH_CONCURRENCY, fetchMcpTools)
-      const failed = results.filter((r) => r.error)
-      const allTools = results.flatMap((r) =>
-        r.error
-          ? []
-          : r.tools.map((t) => ({ ...t, name: `${mcpToolPrefix(r.mcp)}-${t.name}` }))
-      )
+      // 30s 内相同配置直接命中缓存，避免每次客户端连接都实时打上游
+      const fp = mcpsFingerprint(mcps)
+      const now = Date.now()
+      const cached = mcpsToolsCache.get(fp)
+      if (cached && now - cached.at <= MCPS_TOOLS_CACHE_TTL_MS) {
+        return c.json(JSON.parse(cached.json) as Record<string, unknown>)
+      }
+
+      const { tools, failed } = await fetchAllTools(c.env)
 
       // 单个 MCP 失败跳过（其余正常聚合）；全部失败才报错
-      if (allTools.length === 0 && failed.length > 0) {
+      if (tools.length === 0 && failed.length > 0) {
         return c.json(
-          rpcError(id, jsonrpc, -32603, `所有 MCP 拉取工具失败: ${failed.map((f) => `${f.mcp.name}(${f.error})`).join('; ')}`),
+          rpcError(id, jsonrpc, -32603, `所有 MCP 拉取工具失败: ${failed.map((f) => `${f.name}(${f.error})`).join('; ')}`),
           502
         )
       }
-      return c.json({ id, jsonrpc, result: { tools: allTools } })
+
+      const payload = { id, jsonrpc, result: { tools } } as Record<string, unknown>
+      mcpsToolsCache.set(fp, { at: now, json: JSON.stringify(payload) })
+      return c.json(payload)
     }
 
     case 'tools/call': {
@@ -171,22 +219,23 @@ export async function handleMcpJsonRpc(c: Context<AppEnv>): Promise<Response> {
         return c.json(rpcError(id, jsonrpc, -32602, 'Invalid params: missing tool name'), 400)
       }
 
-      // 按第一个 `-` 拆分命名空间前缀与工具名（与 get-tools 加前缀规则一致）
-      const sep = name.indexOf('-')
-      if (sep === -1) {
-        return c.json(rpcError(id, jsonrpc, -32602, `工具名格式错误 "${name}"，应为 {mcp名}-{工具名}`), 400)
+      // 最长前缀回查目标 MCP（而非按 `-` 拆分字符串）：MCP 客户端会原样回传 tools/list
+      // 下发的 "{mcp名}-{工具名}"，这里只需在已配置 MCP 中定位前缀所指的来源，
+      // 从而兼容 mcp 名 / 工具名里同时含 `-` 的情况。
+      const mcps = (await getMcps(c.env)).filter((m) => m.enabled)
+      let matched: { mcp: McpServer; toolName: string } | null = null
+      let matchedPrefixLen = -1
+      for (const m of mcps) {
+        const prefix = `${mcpToolPrefix(m)}-`
+        if (name.startsWith(prefix) && prefix.length > matchedPrefixLen) {
+          matched = { mcp: m, toolName: name.slice(prefix.length) }
+          matchedPrefixLen = prefix.length
+        }
       }
-      const prefix = name.substring(0, sep)
-      const toolName = name.substring(sep + 1)
-      const mcpName = mcpNameFromPrefix(prefix)
-
-      const mcp = (await getMcps(c.env)).find((m) => m.name === mcpName)
-      if (!mcp) {
-        return c.json(rpcError(id, jsonrpc, -32602, `MCP "${mcpName}" 不存在或未配置`), 404)
+      if (!matched) {
+        return c.json(rpcError(id, jsonrpc, -32602, `无法路由到任何已启用 MCP，工具名 "${name}" 缺少正确的 "{mcp名}-{工具名}" 前缀`), 400)
       }
-      if (!mcp.enabled) {
-        return c.json(rpcError(id, jsonrpc, -32602, `MCP "${mcpName}" 已禁用`), 403)
-      }
+      const { mcp, toolName } = matched
 
       const headers = buildMcpHeaders(mcp)
       // 路由到目标 MCP 时，params.name 还原为原始工具名
@@ -201,8 +250,14 @@ export async function handleMcpJsonRpc(c: Context<AppEnv>): Promise<Response> {
           signal: AbortSignal.timeout(MCP_FETCH_TIMEOUT_MS),
         })
         if (resp.ok) {
-          // 透传上游响应（JSON 或 SSE）
-          return new Response(resp.body, { status: resp.status, statusText: resp.statusText, headers: resp.headers })
+          // 归一化上游响应（JSON 或 SSE）：始终返回 JSON-RPC，避免客户端拿到裸 SSE 解析失败
+          const raw = parseMcpResponseText(await resp.text())
+          try {
+            return c.json(JSON.parse(raw) as Record<string, unknown>)
+          } catch {
+            // 上游返回了无法归一化的内容，原样透传避免丢数据
+            return new Response(raw, { status: resp.status, statusText: resp.statusText })
+          }
         }
         lastError = { status: resp.status, data: (await resp.text()).substring(0, 500) }
       } catch (err) {
@@ -218,4 +273,36 @@ export async function handleMcpJsonRpc(c: Context<AppEnv>): Promise<Response> {
     default:
       return c.json(rpcError(id, jsonrpc, -32601, `Method not found: ${method}`), 404)
   }
+}
+
+/**
+ * GET /v1/mcp/health —— 排障端点：逐个实时探测每个已配置 MCP 的可达性与工具数，
+ * 便于定位"哪个上游挂了"。不缓存、每次真实探测。
+ * 已禁用的 MCP 标记为 disabled 且不参与探测。
+ */
+export async function handleMcpHealth(c: Context<AppEnv>): Promise<Response> {
+  const all = await getMcps(c.env)
+  const servers = await Promise.all(
+    all.map(async (m) => {
+      if (!m.enabled) return { name: m.name, url: m.url, enabled: false, status: 'disabled', error: null, tools: 0 }
+      const r = await fetchMcpTools(m) // 内部自带超时与重试
+      return {
+        name: m.name,
+        url: m.url,
+        enabled: true,
+        status: r.error ? 'error' : 'ok',
+        error: r.error ?? null,
+        tools: r.error ? 0 : r.tools.length,
+      }
+    })
+  )
+  const active = servers.filter((s) => s.status === 'ok')
+  const enabledCount = servers.filter((s) => s.enabled).length
+  return c.json({
+    healthy: enabledCount > 0 && active.length === enabledCount,
+    total: servers.length,
+    enabled: enabledCount,
+    healthyCount: active.length,
+    servers,
+  })
 }

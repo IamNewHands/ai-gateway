@@ -14,6 +14,7 @@ import {
   addMcp,
   updateMcp,
   deleteMcp,
+  setMcps,
   getUnimodels,
   addUnimodel,
   updateUnimodel,
@@ -878,6 +879,37 @@ function normalizeHttpHeaders(value: unknown): Record<string, string> | null {
   return out
 }
 
+interface McpInputValidation {
+  ok: boolean
+  message?: string
+  /** 失败是否为名称冲突（用于区分 409 / 400） */
+  isDup?: boolean
+}
+
+/** 校验单个 MCP 输入，供单条新增与批量新增复用 */
+function validateMcpInput(raw: Partial<McpServer> | undefined | null, takenNames: Set<string>): McpInputValidation {
+  if (!raw || !raw.name || !raw.url) return { ok: false, message: 'name、url 为必填项' }
+  if (!isSafeHttpUrl(raw.url)) return { ok: false, message: 'url 必须是合法的 http/https 公网地址' }
+  if (normalizeHttpHeaders(raw.httpHeaders) === null) {
+    return { ok: false, message: 'httpHeaders 必须是普通对象（如 {"Authorization":"Bearer xxx"}）' }
+  }
+  if (takenNames.has(raw.name)) return { ok: false, message: `MCP 名称 "${raw.name}" 已存在`, isDup: true }
+  return { ok: true }
+}
+
+/** 根据校验结果构造 McpServer 记录 */
+function buildMcpRecord(raw: Partial<McpServer>, now: string): McpServer {
+  return {
+    id: raw.id || crypto.randomUUID(),
+    name: raw.name as string,
+    url: (raw.url as string).replace(/\/$/, ''),
+    httpHeaders: normalizeHttpHeaders(raw.httpHeaders) ?? {},
+    enabled: raw.enabled !== undefined ? raw.enabled : true,
+    createdAt: now,
+    updatedAt: now,
+  }
+}
+
 /** 校验 uni-model 候选模型列表：必须为数组、元素为非空字符串；非法的过滤并返回 */
 function normalizeUnimodelModels(value: unknown): string[] {
   if (!Array.isArray(value)) return []
@@ -891,34 +923,51 @@ export async function handleGetMcps(c: Context<AppEnv>) {
 
 export async function handleCreateMcp(c: Context<AppEnv>) {
   const body = await c.req.json<Partial<McpServer>>()
-  if (!body.name || !body.url) {
-    return c.json<ApiResponse>({ success: false, message: 'name、url 为必填项' }, 400)
-  }
-  if (!isSafeHttpUrl(body.url)) {
-    return c.json<ApiResponse>({ success: false, message: 'url 必须是合法的 http/https 公网地址' }, 400)
-  }
-  const httpHeaders = normalizeHttpHeaders(body.httpHeaders)
-  if (!httpHeaders) {
-    return c.json<ApiResponse>({ success: false, message: 'httpHeaders 必须是普通对象（如 {"Authorization":"Bearer xxx"}）' }, 400)
-  }
-
   const mcps = await getMcps(c.env)
-  if (mcps.some((m) => m.name === body.name)) {
-    return c.json<ApiResponse>({ success: false, message: `MCP 名称 "${body.name}" 已存在` }, 409)
+  const v = validateMcpInput(body, new Set(mcps.map((m) => m.name)))
+  if (!v.ok) {
+    return c.json<ApiResponse>({ success: false, message: v.message as string }, v.isDup ? 409 : 400)
   }
 
   const now = new Date().toISOString()
-  const mcp: McpServer = {
-    id: body.id || crypto.randomUUID(),
-    name: body.name,
-    url: body.url.replace(/\/$/, ''),
-    httpHeaders,
-    enabled: body.enabled !== undefined ? body.enabled : true,
-    createdAt: now,
-    updatedAt: now,
-  }
+  const mcp = buildMcpRecord(body, now)
   await addMcp(c.env, mcp)
   return c.json<ApiResponse<McpServer>>({ success: true, data: mcp }, 201)
+}
+
+/**
+ * 批量注册 MCP Server。请求体可为数组或 { mcps: [...] }，最多 200 个。
+ * 逐个校验，非法项跳过并在 errors 中说明；已创建的整批一次性写入 KV。
+ */
+export async function handleMcpsBatch(c: Context<AppEnv>) {
+  const rawBody = await c.req.json<Array<Partial<McpServer>> | { mcps?: Array<Partial<McpServer>> }>()
+  const items = Array.isArray(rawBody) ? rawBody : rawBody?.mcps
+  if (!Array.isArray(items) || items.length === 0) {
+    return c.json<ApiResponse>({ success: false, message: '请求体必须是非空数组（或 { mcps: [...] }）' }, 400)
+  }
+  if (items.length > 200) {
+    return c.json<ApiResponse>({ success: false, message: '单次批量最多 200 个' }, 400)
+  }
+
+  const now = new Date().toISOString()
+  const existing = await getMcps(c.env)
+  const takenNames = new Set(existing.map((m) => m.name))
+  const created: McpServer[] = []
+  const errors: Array<{ name?: string; error: string }> = []
+
+  for (const raw of items) {
+    const v = validateMcpInput(raw, takenNames)
+    if (!v.ok) {
+      errors.push({ name: raw?.name, error: v.message as string })
+      continue
+    }
+    const mcp = buildMcpRecord(raw, now)
+    takenNames.add(mcp.name)
+    created.push(mcp)
+  }
+
+  if (created.length > 0) await setMcps(c.env, [...existing, ...created])
+  return c.json<ApiResponse>({ success: true, data: { created: created.length, failed: errors } })
 }
 
 export async function handleUpdateMcp(c: Context<AppEnv>) {
