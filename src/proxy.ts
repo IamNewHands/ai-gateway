@@ -21,6 +21,7 @@ import { isGeminiProvider, proxyGeminiChatRequest } from './gemini/proxy'
 import { isCnbProvider, proxyCnbChatRequest, CnbStreamDiag } from './cnb/proxy'
 import { isM365Provider, proxyM365ChatRequest } from './m365/proxy'
 import { isTraeProvider, proxyTraeChatRequest } from './trae/proxy'
+import { isZcodeProvider, buildZcodeHeaders } from './zcode/proxy'
 import { writeLog } from './admin'
 import { getPerfSettings } from './perf'
 import { applyThinkingInjection } from './thinking'
@@ -1482,6 +1483,10 @@ export async function forwardProxy(
         // P7：白名单前缀头（x- / anthropic- / user-）透传，供上游识别客户端
         ...buildPassthroughHeaders(c),
       }
+      // 注入 ZCode 身份头，使上游识别为 ZCode 客户端
+      if (isZcodeProvider(providerId)) {
+        Object.assign(forwardHeaders, buildZcodeHeaders())
+      }
       const requestBody = JSON.stringify(forwardBody)
       const isStream = isStreamRequest(forwardBody as ProxyRequestBody)
       try {
@@ -2530,12 +2535,19 @@ export async function handleAnthropicMessages(c: Context<AppEnv>) {
     let lastStatus = 502
     for (const key of enabledKeys) {
       try {
+        const headers: Record<string, string> = {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${key.key}`,
+          // P7：白名单前缀头（x- / anthropic- / user-）透传，供上游识别客户端
+          ...buildPassthroughHeaders(c),
+        }
+        // 注入 ZCode 身份头，使上游识别为 ZCode 客户端
+        if (isZcodeProvider(provider.id)) {
+          Object.assign(headers, buildZcodeHeaders())
+        }
         const r = await fetchUpstream(c.env, forwardUrl, {
           method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            'Authorization': `Bearer ${key.key}`,
-          },
+          headers,
           body: JSON.stringify(upstreamBody),
         }, originalStream === true)
         if (r.ok) {

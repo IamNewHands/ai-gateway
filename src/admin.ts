@@ -35,6 +35,7 @@ import { startOauthDeviceFlow, pollOauthDeviceFlow, readOauthToken, deleteOauthT
 import { isOAuthPoolProvider, seedOauthPoolFromSingle, listOauthPoolStatus, removeOauthAccount } from './oauth-pool'
 import { seedQoderPoolFromSingle, listQoderPoolStatus, removeQoderAccount } from './qoder/pool'
 import { isM365Provider, M365_MODELS, testM365Model } from './m365/proxy'
+import { isZcodeProvider, testZcodeModel, buildZcodeHeaders, ZCODE_MODELS } from './zcode/proxy'
 import { listSessions as listM365Sessions, deleteSession as deleteM365Session } from './m365/session'
 import { listConversations as listM365Conversations, whitelistConversation, unwhitelistConversation, getCleanupMode, setCleanupMode, getCleanupConfig, setCleanupConfig, deleteConversationRecord } from './m365/conversation-manager'
 import { autoCleanupProvider } from './m365/auto-cleanup'
@@ -545,6 +546,12 @@ export async function handleTestModel(c: Context<AppEnv>) {
   // CNB：免 Key（CSRF 凭证池），由凭证池 + 最小 chat 请求验证完整链路，不走通用 API Key
   if (isCnbProvider(provider)) {
     const result = await testCnbConnection(c.env, provider, modelId)
+    return c.json<ApiResponse>({ success: true, data: result })
+  }
+
+  // ZCode：标准 OpenAI 兼容 API，注入身份头后测试
+  if (isZcodeProvider(provider.id)) {
+    const result = await testZcodeModel(c.env, provider, modelId)
     return c.json<ApiResponse>({ success: true, data: result })
   }
 
