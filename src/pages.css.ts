@@ -584,12 +584,17 @@ label, legend { color: var(--color-ink-2); font-size: var(--text-xs); font-weigh
 
 /* 模型行内 reasoning_effort 支持档位多选下拉（新建/编辑提供商共用） */
 .eff-dd { position: relative; display: inline-block; flex-shrink: 0; }
-.eff-dd > summary { cursor: pointer; list-style: none; font-size: var(--text-xs); line-height: 1.4; padding: .25rem .5rem; border: .0625rem solid var(--color-rule); border-radius: var(--radius-control); white-space: nowrap; user-select: none; color: var(--color-ink-2); background: var(--color-paper); }
+.eff-dd > summary { cursor: pointer; list-style: none; font-size: var(--text-xs); line-height: 1.4; padding: .3rem .55rem; border: .0625rem solid var(--color-rule); border-radius: var(--radius-control); white-space: nowrap; user-select: none; color: var(--color-ink-2); background: var(--color-paper); }
 .eff-dd > summary::-webkit-details-marker { display: none; }
 .eff-dd > summary:hover { border-color: var(--color-rule-2); }
 .eff-dd[open] > summary { border-color: var(--color-accent); color: var(--color-accent); }
-.eff-dd > .eff-pop { position: absolute; z-index: 40; inset-inline-end: 0; top: calc(100% + .25rem); background: var(--color-paper); border: .0625rem solid var(--color-rule); border-radius: var(--radius-panel); padding: var(--space-2xs) var(--space-xs); box-shadow: var(--shadow-float); min-width: 8.5rem; display: flex; flex-direction: column; gap: .2rem; }
-.eff-item { display: flex; align-items: center; gap: .4rem; font-size: var(--text-xs); cursor: pointer; color: var(--color-ink-2); white-space: nowrap; }
-.eff-item:hover { color: var(--color-ink); }
-.eff-item input { accent-color: var(--color-accent); }
+.eff-dd > .eff-pop { position: absolute; z-index: 40; inset-inline-end: 0; top: calc(100% + .25rem); background: var(--color-paper); border: .0625rem solid var(--color-rule); border-radius: var(--radius-panel); padding: var(--space-2xs) var(--space-2xs); box-shadow: var(--shadow-float); min-width: 8.5rem; display: flex; flex-direction: column; }
+.eff-item { position: relative; display: flex; align-items: center; gap: .45rem; padding: .3rem .4rem; font-size: var(--text-xs); line-height: 1; cursor: pointer; color: var(--color-ink-2); white-space: nowrap; border-radius: var(--radius-control); }
+.eff-item:hover { background: var(--color-paper-2); color: var(--color-ink); }
+/* 原生勾选框隐藏但保持可聚焦，改用 ::before 绘制与文字等高的自定义小勾选框 */
+.eff-item input { position: absolute; inset: 0; opacity: 0; cursor: pointer; }
+.eff-item::before { content: ''; width: .95em; height: .95em; flex-shrink: 0; box-sizing: border-box; border: .08em solid var(--color-rule-2); border-radius: .2em; background-color: var(--color-paper); background-repeat: no-repeat; background-position: center; background-size: .68em; transition: background-color .08s ease, border-color .08s ease; }
+.eff-item:has(input:checked)::before { background-color: var(--color-accent); border-color: var(--color-accent); background-image: url("data:image/svg+xml;charset=utf-8,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Cpath fill='none' stroke='white' stroke-width='2.6' stroke-linecap='round' stroke-linejoin='round' d='M3.5 8.5l3 3 6-7'/%3E%3C/svg%3E"); }
+.eff-item:has(input:checked) { color: var(--color-ink); }
+.eff-item:has(input:focus-visible)::before { box-shadow: 0 0 0 .15em var(--color-accent-soft); }
 `
