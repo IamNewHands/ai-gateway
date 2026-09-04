@@ -25,6 +25,10 @@ export const CSS_CONTENT = `
   --color-danger-hover: oklch(45% 0.175 25);
   --color-danger-soft: oklch(96% 0.022 25);
   --color-danger-ink: oklch(38% 0.145 25);
+  --color-warn: oklch(52% 0.130 75);
+  --color-warn-hover: oklch(47% 0.125 75);
+  --color-warn-soft: oklch(95% 0.045 80);
+  --color-warn-ink: oklch(38% 0.105 75);
   --color-graphite: oklch(22% 0.016 260);
   --color-graphite-2: oklch(28% 0.018 260);
   --color-graphite-rule: oklch(38% 0.020 258);
@@ -251,6 +255,8 @@ label, legend { color: var(--color-ink-2); font-size: var(--text-xs); font-weigh
 .bd-info, .protocol-chip { background: var(--color-accent-soft); color: var(--color-focus); }
 /* P0：状态徽章语义补齐 —— 失败/不可用用危险软底色，与成功/中性构成完整语义级 */
 .bd-danger { background: var(--color-danger-soft); color: var(--color-danger-ink); }
+/* 冷却/降级等过渡态：琥珀软底色（tokens 见 :root），与 success/danger 并列的第三语义（账号池冷却状态等） */
+.bd-warn { background: var(--color-warn-soft); color: var(--color-warn-ink); }
 .empty-inline { color: var(--color-muted); font-size: var(--text-xs); }
 .empty-state { padding: var(--space-xl) var(--space-sm); display: flex; flex-direction: column; align-items: center; gap: var(--space-xs); border: .0625rem dashed var(--color-rule-2); border-radius: var(--radius-panel); background: var(--color-paper-2); color: var(--color-muted); text-align: center; }
 .empty-state > i { font-size: var(--text-lg); color: var(--color-muted); }
