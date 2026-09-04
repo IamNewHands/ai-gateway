@@ -59,6 +59,40 @@ const CLINE_COOLDOWN_MAX_MS = 6 * 3600 * 1000
 const CLINE_COOLDOWN_LIMIT_MS = 5 * 60 * 1000   // 429 默认冷却
 const CLINE_COOLDOWN_EMPTY_MS = 60 * 1000       // 空响应（免费额度耗尽）默认冷却
 const CLINE_COOLDOWN_401_MS = 60 * 1000         // token 失效默认冷却
+// 推理空转（length 截断但无正文）默认冷却：比普通空响应短，便于快速切号重试
+const CLINE_COOLDOWN_RUNAWAY_MS = 30 * 1000
+
+/**
+ * max_tokens「护栏默认」与 effort 默认档（推理空转防御）。
+ *
+ * 实测（2026-09 一份 108 轮 cline/z-ai 会话）：正常轮次 reasoning 中位仅 ~1.5k 字符、
+ * 重的工具轮 ~10k–55k；真正病态的轮次是「推理退化空转」——吐 ~3.2 万条 reasoning 里
+ * 95% 是空白/换行、几乎不产出正文，最后以 length 截断。而 OpenAI 兼容推理模型把
+ * reasoning 与最终答案共用一个 max_tokens 总预算，空转会一次性烧光它。
+ *
+ * 因此把原来无脑兜底 128000 换成「护栏语义」：
+ *   - 客户端显式带 max_tokens / max_completion_tokens → 原样透传，尊重客户端请求
+ *     （超长回答不会被网关误掐）；
+ *   - 客户端没带 → 用 CLINE_MAX_TOKENS 作为护栏默认，避免空转烧光几十万预算。
+ * 空转的兜底见 isRunawayReasoningCutoff + proxyNonStreamChat 的重试/冷却。
+ */
+const CLINE_MAX_TOKENS = 32768          // 客户端未指定 max_tokens 时的护栏默认（原 128000 过激进）
+const CLINE_DEFAULT_REASONING_EFFORT = 'medium'  // 免费通道默认档位（原 high 过激进）
+
+/**
+ * 判定一次聚合结果是否为「推理空转被截断」：finish_reason=length 且几乎没有真实正文，
+ * 说明预算被 reasoning 耗尽而未产出答案。此时应视为失败（冷却+切号/重试），而不是
+ * 把一段空转后的 length 当作「正常被截断的答案」返回。
+ * @param content  聚合出的真实正文（assistant content）
+ * @param toolCalls 聚合出的工具调用
+ * @param finishReason 上游 finish_reason
+ */
+export function isRunawayReasoningCutoff(content: string, toolCalls: unknown[], finishReason: string): boolean {
+  if (finishReason !== 'length') return false
+  const hasContent = (content || '').trim().length > 0
+  const hasToolCall = Array.isArray(toolCalls) && toolCalls.length > 0
+  return !hasContent && !hasToolCall
+}
 
 interface Account {
   refreshToken: string
@@ -324,11 +358,18 @@ function buildUpstreamBody(
   isStream: boolean,
   sessionId: string
 ): Record<string, unknown> {
+  // 护栏语义：客户端显式带了 max_tokens 就原样透传（尊重其请求，不误掐长回答）；
+  // 客户端没带才用 CLINE_MAX_TOKENS 兜底，避免空转把预算一路烧到几十万。
+  const rawMax = forwardBody.max_tokens ?? forwardBody.max_completion_tokens
+  const maxTokens =
+    rawMax != null && rawMax !== ''
+      ? Math.max(Math.floor(Number(rawMax)) || 1, 1)
+      : CLINE_MAX_TOKENS
   const body: Record<string, unknown> = {
     model: (forwardBody.model as string) || DEFAULT_MODEL,
-    max_tokens: Number(forwardBody.max_tokens || forwardBody.max_completion_tokens || 128000),
+    max_tokens: maxTokens,
     session_id: sessionId,
-    reasoning_effort: String(forwardBody.reasoning_effort || forwardBody.reasoningEffort || 'high'),
+    reasoning_effort: String(forwardBody.reasoning_effort || forwardBody.reasoningEffort || CLINE_DEFAULT_REASONING_EFFORT),
     messages: Array.isArray(forwardBody.messages) ? forwardBody.messages : [],
   }
   if (isStream) body.stream = true
@@ -516,7 +557,13 @@ async function proxyNonStreamChat(pool: Pool, body: Record<string, unknown>, ses
     const agg = await aggregateStream(resp)
     last = agg
     if (agg.content) return jsonResponse(chatCompletionFromAgg(agg), 200)
-    // 有正常结束原因但无文本：不空转重试
+    // 推理空转被截断（length + 无正文/无工具调用）：预算烧在 reasoning 上未产出 → 冷却切号重试
+    if (isRunawayReasoningCutoff(agg.content, agg.toolCalls, agg.finishReason)) {
+      if (pool.current) cooldownAccount(pool.current, CLINE_COOLDOWN_RUNAWAY_MS)
+      await sleep(500 + Math.random() * 500)
+      continue
+    }
+    // 有正常结束原因但无文本：不空转重试（如 stop/tool_calls 但 content 空，属合法但不该重试）
     if (agg.finishReason) break
     if (pool.current) cooldownAccount(pool.current, CLINE_COOLDOWN_EMPTY_MS)
     await sleep(500 + Math.random() * 500)

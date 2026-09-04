@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest'
-import { parseCooldownMs, fetchClineModels } from './proxy'
+import { parseCooldownMs, fetchClineModels, isRunawayReasoningCutoff } from './proxy'
 
 describe('Cline 冷却时长解析（item3）', () => {
   it('解析 "Try again in 2h 51m" 为毫秒', () => {
@@ -32,5 +32,24 @@ describe('Cline 模型清单（回归保护）', () => {
     expect(Array.isArray(r.models)).toBe(true)
     expect(r.models.length).toBeGreaterThan(0)
     expect(r.models[0]).toHaveProperty('id')
+  })
+})
+
+describe('推理空转截断判定 isRunawayReasoningCutoff', () => {
+  it('length 截断且无正文/无工具调用 → 判定为空转', () => {
+    expect(isRunawayReasoningCutoff('', [], 'length')).toBe(true)
+    expect(isRunawayReasoningCutoff('   \n\n', [], 'length')).toBe(true) // 仅空白
+  })
+  it('length 截断但已有正文 → 不判空转（是正常被截断的长回答）', () => {
+    expect(isRunawayReasoningCutoff('有正文内容', [], 'length')).toBe(false)
+    expect(isRunawayReasoningCutoff('代码/正文', [], 'length')).toBe(false)
+  })
+  it('length 截断但已有工具调用 → 不判空转', () => {
+    expect(isRunawayReasoningCutoff('', [{ id: 'call_1' }], 'length')).toBe(false)
+  })
+  it('非 length 结束原因 → 一律不判空转', () => {
+    expect(isRunawayReasoningCutoff('', [], 'stop')).toBe(false)
+    expect(isRunawayReasoningCutoff('', [], 'tool_calls')).toBe(false)
+    expect(isRunawayReasoningCutoff('', [], '')).toBe(false)
   })
 })
