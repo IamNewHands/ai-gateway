@@ -67,6 +67,66 @@ npm run dev
 
 > 部署完成后，进入 Worker 的 **Settings → Variables** 检查环境变量，并建议绑定自定义域名。
 
+## MCP 聚合网关
+
+把多个 MCP Server 聚合成**一个**入口，通过统一的 JSON-RPC 端点对外暴露。客户端只需配置一个地址，即可发现并调用所有已启用 MCP 的工具。
+
+### 端点
+
+| 端点 | 方法 | 认证 | 说明 |
+| --- | --- | --- | --- |
+| `/v1/mcp` | `POST` | 转发 Key（`Bearer sk_cf_<KEY>`） | MCP JSON-RPC 入口（initialize / tools/list / tools/call） |
+| `/v1/mcp/health` | `GET` | 转发 Key | 健康排障：逐个探测各 MCP 的可达性与工具数 |
+| `/admin/api/mcps` | `GET/POST` | 管理后台会话 | 查询 / 新增单个 MCP Server |
+| `/admin/api/mcps/batch` | `POST` | 管理后台会话 | 批量导入（最多 200 个） |
+| `/admin/api/mcps/:id` | `PUT/DELETE` | 管理后台会话 | 更新 / 删除单个 MCP Server |
+| `/admin/api/mcps/health` | `GET` | 管理后台会话 | 与 `/v1/mcp/health` 同源，供后台面板调用 |
+
+### 配置方式
+
+1. **管理后台「MCP 网关」**：单个添加、批量导入 JSON 数组、或一键健康检查，均为可视化入口。
+2. **单个新增 API**：
+
+```bash
+curl -X POST https://你的域名/admin/api/mcps \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "name": "github",
+    "url": "https://api.githubcopilot.com/mcp/",
+    "httpHeaders": { "Authorization": "Bearer <TOKEN>" },
+    "enabled": true
+  }'
+```
+
+3. **批量导入 API**（请求体为数组或 `{ "mcps": [...] }`）：
+
+```bash
+curl -X POST https://你的域名/admin/api/mcps/batch \
+  -H 'Content-Type: application/json' \
+  -d '[
+    { "name": "github", "url": "https://api.githubcopilot.com/mcp/", "httpHeaders": { "Authorization": "Bearer <TOKEN>" } },
+    { "name": "notion", "url": "https://mcp.notion.com/mcp" }
+  ]'
+```
+
+### 客户端接入
+
+在 Claude Desktop / Cline / Trae 等任意支持 MCP 的客户端中，把 Server 指向网关：
+
+```
+URL    : https://你的域名/v1/mcp
+Header : Authorization: Bearer sk_cf_<KEY>
+```
+
+客户端通过标准的 `initialize` → `tools/list` 握手自动发现工具，无需预先登记。
+
+### 调用约定
+
+- `tools/list` 并发聚合所有已启用 MCP 的工具，工具名自动加 **`{MCP名称}-`** 前缀做命名空间隔离（MCP 名称中的空格会转成下划线）。
+- `tools/call` 按前缀路由到目标 MCP，并还原原始工具名转发；上游响应统一归一化为 JSON。
+- 单个 MCP 拉取失败会跳过（其余正常聚合），全部失败才返回错误。
+- 上游仅支持 **streamable HTTP 单端点**（`POST` JSON-RPC）；老式 SSE 双端点与 stdio 暂不支持。
+
 ## 使用方法
 
 - **API BASE URL**：`https://你的域名/v1`
