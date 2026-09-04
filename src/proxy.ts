@@ -29,6 +29,7 @@ import { applyCachePrefixInjection } from './cache-prefix'
 import { getOauthAccessToken, readOauthToken, refreshOauthToken, detectTokenRealm, buildOauthHeaders } from './oauth'
 import {
   cooldownOauthAccount,
+  cooldownOauthAccountUntilTomorrow4AM,
   disableOauthAccount,
   isOAuthPoolProvider,
   noteOauthError,
@@ -38,6 +39,11 @@ import {
   resolveOauthCooldown,
   seedOauthPoolFromSingle,
 } from './oauth-pool'
+import {
+  applyWorkbuddyReasoningEffort,
+  captureWorkbuddyReasoningEffort,
+  classifyWorkbuddyUpstreamError,
+} from './workbuddy-upstream'
 import {
   anthropicToOpenAI,
   openAIToAnthropic,
@@ -1651,11 +1657,14 @@ function logOAuthRequest(c: Context<AppEnv>, provider: import('./types').Provide
 
 /**
  * WorkBuddy 多账号池转发核心：每请求最多轮转 MAX_OAUTH_ROTATE 个账号。
- * 挑号（剩余积分最高）→ 临近过期先刷新 → 转发；失败按错误分类冷却/禁用并换号：
+ * 挑号（三因子加权随机：credits 比例×10 + 闲置补偿 + 成功率×3，Top5 内抽签 + 100ms 防惊群；
+ * 无健康账号时从冷却账号选最早到期者兜底顶班，禁用与余额耗尽号不参与）→ 临近过期先刷新 → 转发；
+ * 失败按错误分类（移植 workbuddy2api Classify）施加账号策略并换号：
  *   401/403（session 失效）→ 先刷新一次，仍失败禁用该账号；
- *   429 → 短冷却；404 → 短冷却（不累计 errCount）；5xx/其他 → 累计错误达阈值中冷却；
- *   plan 权益不足（响应体 1005/plan）→ 长冷却。签到后 credits>0 自动解冻。
- * 成功返回原始上游 Response（由调用方决定透传/聚合/转 Anthropic）；无健康账号抛错。
+ *   402/余额关键词 → 硬冷却到次日 04:00（等签到恢复，签到后 credits>0 自动解冻）；
+ *   429 → 短冷却；404 → 短冷却（不累计 errCount，防雪崩）；5xx → 累计错误达阈值冷却；
+ *   12153/session 死亡 → 永久禁用；其他 4xx（客户端问题）→ 不处罚账号，仅换号。
+ * 成功返回原始上游 Response（由调用方决定透传/聚合/转 Anthropic）；无可用账号抛错。
  */
 async function proxyOAuthRequestPooledCore(
   c: Context<AppEnv>,
@@ -1692,10 +1701,18 @@ async function proxyOAuthRequestPooledCore(
     const body = { ...forwardBody } as Record<string, unknown>
     // 捕获客户端原始 stream 意图（force 前），供非流式聚合判断
     const originalStream = body.stream === true
-    if (isWorkbuddyProvider(provider) && body.stream !== true) body.stream = true
     if (isWorkbuddyProvider(provider)) {
+      // reasoning_effort 降级（移植 workbuddy2api）：sanitize 删除前先捕获，
+      // 若运营者声明了该模型的能力表（oauth.effortPolicy）则按能力降级/透传，未声明保持删除（既有行为）
+      const capturedEffort = captureWorkbuddyReasoningEffort(body)
+      const effortPolicy = cfg.effortPolicy
+      if (body.stream !== true) body.stream = true
       sanitizeUpstreamBody(body)
       normalizeOpenAIToolChoice(body)
+      if (capturedEffort) {
+        const model = typeof body['model'] === 'string' ? body['model'] : ''
+        applyWorkbuddyReasoningEffort(body, capturedEffort, model ? effortPolicy?.[model] : undefined)
+      }
     }
     return fetchUpstream(c.env, buildForwardUrl(r), {
       method,
@@ -1719,7 +1736,9 @@ async function proxyOAuthRequestPooledCore(
   let lastErr: Error | null = null
 
   for (let i = 0; i < MAX_OAUTH_ROTATE; i++) {
-    const account = await pickOauthAccount(c.env, provider.id, tried, i === 0 ? provider.preferOauthUid : undefined)
+    // 挑号（三因子加权随机）+ 全冷却兜底：无健康账号时从冷却账号选最早到期者顶班
+    //（对齐 workbuddy2api pickEarliestExpiry；禁用与余额耗尽号永不参与兜底）
+    const account = await pickOauthAccount(c.env, provider.id, tried, i === 0 ? provider.preferOauthUid : undefined, { allowCoolingFallback: true })
     if (!account) break
     tried.add(account.uid)
 
@@ -1769,23 +1788,36 @@ async function proxyOAuthRequestPooledCore(
         lastErr = new Error(`account ${account.uid} session dead`)
         continue
       }
-    } else if (response.status === 429) {
-      await cooldownOauthAccount(c.env, provider.id, account.uid, cd.softMs, '429 rate limit')
-      lastErr = new Error(`account ${account.uid} rate limited`)
-      continue
-    } else if (response.status === 404) {
-      await cooldownOauthAccount(c.env, provider.id, account.uid, cd.softMs, 'upstream 404')
-      lastErr = new Error(`account ${account.uid} upstream 404`)
-      continue
     } else if (!response.ok) {
-      // plan 权益不足（1005/plan）→ 长冷却；其余累计错误
+      // 错误分类细化（移植 workbuddy2api Classify）：按「真实原因」施加账号策略，而非只看状态码
       const text = await response.text().catch(() => '')
-      if (text.includes('1005') || text.toLowerCase().includes('plan')) {
-        await cooldownOauthAccount(c.env, provider.id, account.uid, cd.planMs, 'plan 权益不足')
-      } else {
-        await noteOauthError(c.env, provider.id, account.uid, cd)
+      const kind = classifyWorkbuddyUpstreamError(response.status, text)
+      switch (kind) {
+        case 'hard_credit':
+          // 余额/权益耗尽 → 硬冷却到次日 04:00（等签到恢复，签到后 credits>0 自动解冻）
+          await cooldownOauthAccountUntilTomorrow4AM(c.env, provider.id, account.uid, '余额不足')
+          break
+        case 'soft_rate':
+          // 429 限流 → 短冷却
+          await cooldownOauthAccount(c.env, provider.id, account.uid, cd.softMs, '429 rate limit')
+          break
+        case 'not_found':
+          // 404 上游偶发 → 短冷却，不累计错误计数（防雪崩）
+          await cooldownOauthAccount(c.env, provider.id, account.uid, cd.softMs, 'upstream 404')
+          break
+        case 'session_dead':
+          // session 失效（12153/offline）→ 永久禁用，需重新登录
+          await disableOauthAccount(c.env, provider.id, account.uid, 'session dead (12153)')
+          break
+        case 'server':
+          // 5xx 上游故障 → 累计错误计数（达阈值自动冷却）
+          await noteOauthError(c.env, provider.id, account.uid, cd)
+          break
+        default:
+          // client（其他 4xx，如 400 参数错）：客户端请求问题，不处罚账号（防雪崩），仅换号
+          break
       }
-      lastErr = new Error(`account ${account.uid} http ${response.status}`)
+      lastErr = new Error(`account ${account.uid} http ${response.status} (${kind})`)
       continue
     }
 
@@ -1876,14 +1908,21 @@ async function proxyOAuthRequest(
     const body = { ...forwardBody } as Record<string, unknown>
     // WorkBuddy 只支持流式请求，强制 stream: true（所有以 workbuddy 开头的 provider ID）
     const originalStream = body.stream
-    if (isWorkbuddyProvider(provider) && body.stream !== true) {
-      body.stream = true
-    }
     // WorkBuddy 上游改写三件套：developer→system / 删 reasoning_effort / 空 content + tool_choice 归一化
     //（对齐 workbuddy-wild PrepareBody 关键不变量；仅 workbuddy 提供商，避免影响其他 oauth 提供商）
     if (isWorkbuddyProvider(provider)) {
+      // reasoning_effort 降级（移植 workbuddy2api）：sanitize 删除前先捕获，
+      // 运营者声明了 oauth.effortPolicy 能力表则按能力降级/透传，未声明保持删除（既有行为）
+      const capturedEffort = captureWorkbuddyReasoningEffort(body)
+      if (body.stream !== true) {
+        body.stream = true
+      }
       sanitizeUpstreamBody(body)
       normalizeOpenAIToolChoice(body)
+      if (capturedEffort) {
+        const m = typeof body['model'] === 'string' ? body['model'] : ''
+        applyWorkbuddyReasoningEffort(body, capturedEffort, m ? cfg.effortPolicy?.[m] : undefined)
+      }
     }
     return fetchUpstream(c.env, buildForwardUrl(r), {
       method,
@@ -2165,6 +2204,8 @@ export async function handleAnthropicMessages(c: Context<AppEnv>) {
       const cfg = provider.oauth
       // 强制流式（WorkBuddy 只支持流式）
       const upstreamBody: Record<string, unknown> = { ...openaiBody, stream: true }
+      // WorkBuddy reasoning_effort 捕获（sanitize 删除前抢救，仅 workbuddy 提供商恢复/降级）
+      const wbCapturedEffort = isWorkbuddyProvider(provider) ? captureWorkbuddyReasoningEffort(upstreamBody) : null
       // 清理上游不支持的字段 + 被屏蔽的 Claude Code 模板短语
       sanitizeUpstreamBody(upstreamBody)
       sanitizeBlockedTemplates(upstreamBody)
@@ -2179,6 +2220,11 @@ export async function handleAnthropicMessages(c: Context<AppEnv>) {
       // 会被 WorkBuddy 上游以 400 code=11101 拒绝，需转字符串（对齐 workbuddy-wild PrepareBody 不变量）
       if (isWorkbuddyProvider(provider)) {
         normalizeOpenAIToolChoice(upstreamBody)
+        // reasoning_effort 降级（移植 workbuddy2api）：运营者声明 oauth.effortPolicy 才恢复/降级，未声明保持删除
+        if (wbCapturedEffort) {
+          const m = typeof upstreamBody['model'] === 'string' ? upstreamBody['model'] : ''
+          applyWorkbuddyReasoningEffort(upstreamBody, wbCapturedEffort, m ? provider.oauth?.effortPolicy?.[m] : undefined)
+        }
       }
 
       // WorkBuddy 多账号池：browser 登录流提供商走池化转发（挑号 + 冷却/禁用 + 轮转）

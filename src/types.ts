@@ -242,6 +242,16 @@ export interface OAuthDeviceConfig {
    * 仅影响登录流程；登录成功后 token 的 CN/Global 域仍按 JWT iss 自动路由。
    */
   loginRealm?: 'cn' | 'global'
+  /**
+   * WorkBuddy reasoning_effort 能力表（可选，移植 workbuddy2api supportedEfforts 降级）。
+   * key = 模型 ID；value = 该模型支持的 reasoning_effort 档位（如 ["low","medium","high"]，
+   * 合法档位：off/minimal/low/medium/high/xhigh/max）。
+   * 声明后：客户端请求档位若模型不支持，自动降级为 ≤请求档位的最高支持档
+   * （支持档全部更高时取最低档）；请求档位被支持则原样透传。
+   * 未声明该模型的保持「删除 reasoning_effort」的既有行为（零回归）。
+   * 上游 models 端点实测 404 无法动态发现，故由运营者按需配置。
+   */
+  effortPolicy?: Record<string, string[]>
 }
 
 /** KV 中保存的 OAuth token 状态 */
