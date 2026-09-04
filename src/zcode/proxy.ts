@@ -146,3 +146,126 @@ export async function testZcodeModel(
     return { success: false, message: `连接失败: ${(err as Error).message?.substring(0, 200) || '未知错误'}` }
   }
 }
+
+// ===== 动态模型拉取 =====
+// 说明：Coding Plan 可用模型随账号订阅等级变化（Lite/Pro/Max 计费 credit 不同），
+// 上游提供标准 OpenAI 兼容 GET {baseUrl}/models 端点，应按账号实际可用动态拉取，
+// 静态 ZCODE_MODELS 仅作为无 Key / 拉取失败时的兜底清单。
+
+const ZCODE_MODELS_CACHE_PREFIX = 'zcode:models:'
+const ZCODE_MODELS_TTL_SUCCESS_SEC = 60 * 60      // 成功缓存 1h
+const ZCODE_MODELS_TTL_FAILURE_SEC = 5 * 60       // 失败负缓存 5min
+
+export interface ZcodeModelsResult {
+  ok: boolean
+  message: string
+  models: Array<{ id: string }>
+  /** dynamic = 上游实时拉取 | static = 失败回退静态清单 | cache = KV 缓存 */
+  from: 'dynamic' | 'static' | 'cache'
+}
+
+/**
+ * 动态拉取上游模型列表：GET {baseUrl}/models（带 ZCode 身份头 + Bearer Key）。
+ * KV 缓存策略：成功 1h / 失败 5min，避免频繁请求上游。
+ */
+export async function fetchZcodeModels(
+  env: Env,
+  provider: Provider
+): Promise<ZcodeModelsResult> {
+  const cacheKey = ZCODE_MODELS_CACHE_PREFIX + provider.id
+
+  interface CacheEntry { models?: string[]; fetchedAt?: number; failAt?: number }
+  let cache: CacheEntry | null = null
+  try {
+    const raw = await env.KV.get(cacheKey)
+    if (raw) cache = JSON.parse(raw) as CacheEntry
+  } catch { /* ignore */ }
+
+  const now = Date.now()
+  if (cache?.models && cache.fetchedAt && now - cache.fetchedAt < ZCODE_MODELS_TTL_SUCCESS_SEC * 1000) {
+    return {
+      ok: true,
+      message: `缓存命中，共 ${cache.models.length} 个模型`,
+      models: cache.models.map((id) => ({ id })),
+      from: 'cache',
+    }
+  }
+  if (cache?.failAt && now - cache.failAt < ZCODE_MODELS_TTL_FAILURE_SEC * 1000) {
+    return {
+      ok: true,
+      message: `上游拉取冷却中，回退静态清单（${ZCODE_MODELS.length} 个）`,
+      models: ZCODE_MODELS.map((id) => ({ id })),
+      from: 'static',
+    }
+  }
+
+  const enabledKeys = (provider.apiKeys || []).filter((k) => k.enabled)
+  if (enabledKeys.length === 0) {
+    return { ok: false, message: '未配置启用的 API Key，无法拉取模型', models: ZCODE_MODELS.map((id) => ({ id })), from: 'static' }
+  }
+
+  const baseUrl = provider.baseUrl.replace(/\/$/, '')
+  const url = `${baseUrl}/models`
+
+  try {
+    const response = await fetch(url, {
+      method: 'GET',
+      headers: {
+        'Authorization': `Bearer ${enabledKeys[0].key}`,
+        ...buildZcodeHeaders(),
+      },
+      signal: AbortSignal.timeout(20000),
+    })
+
+    if (!response.ok) {
+      const errText = (await response.text().catch(() => '')).substring(0, 300)
+      try {
+        await env.KV.put(cacheKey, JSON.stringify({ failAt: now }), { expirationTtl: ZCODE_MODELS_TTL_FAILURE_SEC })
+      } catch { /* ignore */ }
+      return {
+        ok: false,
+        message: `上游返回 HTTP ${response.status}: ${errText}`,
+        models: ZCODE_MODELS.map((id) => ({ id })),
+        from: 'static',
+      }
+    }
+
+    const data = await response.json() as { data?: Array<{ id?: string } | string> } | Array<{ id?: string } | string>
+    let modelIds: string[] = []
+    const rawList = Array.isArray(data) ? data : (Array.isArray(data.data) ? data.data : [])
+    for (const m of rawList) {
+      const id = typeof m === 'string' ? m : (m && typeof m.id === 'string' ? m.id : '')
+      if (id) modelIds.push(id)
+    }
+
+    if (modelIds.length > 0) {
+      try {
+        await env.KV.put(cacheKey, JSON.stringify({ models: modelIds, fetchedAt: now }), { expirationTtl: ZCODE_MODELS_TTL_SUCCESS_SEC })
+      } catch { /* ignore */ }
+      return {
+        ok: true,
+        message: `从上游拉取 ${modelIds.length} 个模型`,
+        models: modelIds.map((id) => ({ id })),
+        from: 'dynamic',
+      }
+    }
+
+    // 上游返回空：不算硬失败，但也不缓存成功，回退静态
+    return {
+      ok: true,
+      message: `上游返回空列表，回退静态清单（${ZCODE_MODELS.length} 个）`,
+      models: ZCODE_MODELS.map((id) => ({ id })),
+      from: 'static',
+    }
+  } catch (err) {
+    try {
+      await env.KV.put(cacheKey, JSON.stringify({ failAt: now }), { expirationTtl: ZCODE_MODELS_TTL_FAILURE_SEC })
+    } catch { /* ignore */ }
+    return {
+      ok: false,
+      message: `请求异常: ${(err as Error).message || '未知错误'}`,
+      models: ZCODE_MODELS.map((id) => ({ id })),
+      from: 'static',
+    }
+  }
+}

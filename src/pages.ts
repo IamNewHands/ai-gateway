@@ -1951,6 +1951,17 @@ function clineModels(id) {
     if (st) showResult(st, true, '已同步 ' + entries.length + ' 个模型' + (sync && sync.changed ? '，新增 ' + sync.added.length + ' 个' : '（无新增）'))
   }).catch(() => { if (st) showResult(st, false, '网络错误，请重试') })
 }
+function zcodeModels(id) {
+  const st = document.getElementById('tr-' + id)
+  if (st) { st.textContent = '拉取模型中…'; showSpinner(st) }
+  fetch('/admin/api/providers/' + encodeURIComponent(id) + '/zcode-models/sync', { method: 'POST' }).then(r => r.json()).then(d => {
+    if (!d.success) { if (st) showResult(st, false, d.message || '拉取模型失败'); return }
+    const entries = (d.data && d.data.data) || []
+    const from = (d.data && d.data.from) || 'dynamic'
+    showEditModelsList(id, entries)
+    if (st) showResult(st, true, '已拉取 ' + entries.length + ' 个模型（' + (from === 'dynamic' ? '上游动态' : from === 'cache' ? '缓存' : '静态兜底') + '），点击 + 添加或直接保存')
+  }).catch(() => { if (st) showResult(st, false, '网络错误，请重试') })
+}
 function traeStatus(id) {
   const st = document.getElementById('trae-st-' + id)
   const box = document.getElementById('trae-acc-' + id)
@@ -2245,6 +2256,8 @@ async function testKeyRow(id, idx) {
 async function fetchEditModels(id) {
   // Cline：仅保留一个「获取模型」按钮，改为动态拉官方 recommended-models（并入 provider.models）
   if (id === 'cline') { clineModels(id); return }
+  // ZCode：走专属 sync 端点（带 ZCode 身份头 + KV 缓存 + 静态兜底）
+  if (id === 'zcode') { zcodeModels(id); return }
   const url = document.getElementById('url-' + id).value.trim()
   const keys = getKeys(id)
   const apiKey = keys.length > 0 ? keys[0].key : ''

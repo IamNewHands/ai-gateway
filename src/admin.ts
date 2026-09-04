@@ -35,7 +35,7 @@ import { startOauthDeviceFlow, pollOauthDeviceFlow, readOauthToken, deleteOauthT
 import { isOAuthPoolProvider, seedOauthPoolFromSingle, listOauthPoolStatus, removeOauthAccount } from './oauth-pool'
 import { seedQoderPoolFromSingle, listQoderPoolStatus, removeQoderAccount } from './qoder/pool'
 import { isM365Provider, M365_MODELS, testM365Model } from './m365/proxy'
-import { isZcodeProvider, testZcodeModel, buildZcodeHeaders, ZCODE_MODELS } from './zcode/proxy'
+import { isZcodeProvider, testZcodeModel, buildZcodeHeaders, ZCODE_MODELS, fetchZcodeModels } from './zcode/proxy'
 import { listSessions as listM365Sessions, deleteSession as deleteM365Session } from './m365/session'
 import { listConversations as listM365Conversations, whitelistConversation, unwhitelistConversation, getCleanupMode, setCleanupMode, getCleanupConfig, setCleanupConfig, deleteConversationRecord } from './m365/conversation-manager'
 import { autoCleanupProvider } from './m365/auto-cleanup'
@@ -1491,6 +1491,31 @@ function parseModelList(json: any): Array<{ id: string }> {
  * Cline 「获取模型」：从官方 recommended-models 拉最新模型清单，仅返回给管理面板预览，
  * 不写入 provider.models —— 由用户在面板里手工「+ / 一键全部添加」确认后再保存入库。
  */
+/**
+ * ZCode：动态拉取上游模型列表（GET {baseUrl}/models + ZCode 身份头）。
+ * 与 Cline sync 同构：仅返回清单，由用户勾选/「一键全部添加」保存入库。
+ */
+export async function handleZcodeModelSync(c: Context<AppEnv>) {
+  const id = c.req.param('id')
+  if (!id) return c.json<ApiResponse>({ success: false, message: '缺少 id 参数' }, 400)
+  const provider = await getProvider(c.env, id)
+  if (!provider) return c.json<ApiResponse>({ success: false, message: '提供商不存在' }, 404)
+  if (!isZcodeProvider(provider.id)) {
+    return c.json<ApiResponse>({ success: false, message: '该提供商不是 ZCode' }, 400)
+  }
+  try {
+    const result = await fetchZcodeModels(c.env, provider)
+    const entries = result.models
+    return c.json<ApiResponse>({
+      success: result.ok,
+      data: { data: entries, from: result.from },
+      message: `${result.message}，请勾选后点「+」或「一键全部添加」保存`,
+    }, result.ok ? 200 : 502)
+  } catch (err) {
+    return c.json<ApiResponse>({ success: false, message: `拉取模型失败：${(err as Error).message || '未知错误'}` }, 502)
+  }
+}
+
 export async function handleClineModelSync(c: Context<AppEnv>) {
   const id = c.req.param('id')
   if (!id) return c.json<ApiResponse>({ success: false, message: '缺少 id 参数' }, 400)

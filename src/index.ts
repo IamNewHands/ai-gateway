@@ -28,6 +28,7 @@ import {
   handleOAuthPoolSetPrefer,
   handleOAuthModels,
   handleClineModelSync,
+  handleZcodeModelSync,
   handleOAuthGeminiCallback,
   handleOAuthM365Callback,
   handleOAuthM365ROPC,
@@ -183,6 +184,7 @@ app.post('/admin/api/oauth/:id/pool/prefer', handleOAuthPoolSetPrefer)
 app.post('/admin/api/oauth/:id/models', handleOAuthModels)
 // Cline 动态模型同步（item6）
 app.post('/admin/api/providers/:id/cline-models/sync', handleClineModelSync)
+app.post('/admin/api/providers/:id/zcode-models/sync', handleZcodeModelSync)
 // Gemini 授权回调：浏览器授权后把地址栏 URL 粘贴回后台提交（POST { callbackUrl }）
 app.post('/admin/api/oauth/:id/callback', handleOAuthGeminiCallback)
 // M365 PKCE 授权回调（POST { callbackUrl }）与 M365 ROPC 账号密码登录（POST { username, password }）
