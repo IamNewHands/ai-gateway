@@ -5,8 +5,9 @@ import {
   evaluateCompletionEvidence,
   summarizeCompletionEvidence,
   completionEvidenceAllows,
+  selectCompletionEvidenceMessages,
 } from './completion-evidence'
-import type { AgentLedger, ToolEvidence } from './tools'
+import type { AgentLedger, ToolEvidence, OaiMsgLite } from './tools'
 
 function toolEvidence(name: string, args: string, result: string, failed = false): ToolEvidence {
   return { id: `c_${Math.random()}`, name, arguments: args, result, failed }
@@ -184,5 +185,56 @@ describe('summarizeCompletionEvidence', () => {
     // deploy（mutation）在 run_tests（verify）之后 → verify 证据被失效
     expect(summary.actions.verify).toBeUndefined()
     expect(summary.actions.deploy?.latest).toBe('success')
+  })
+})
+
+describe('selectCompletionEvidenceMessages', () => {
+  it('普通消息（非继续）→ 窗口从最后一条 user 开始', () => {
+    const msgs: OaiMsgLite[] = [
+      { role: 'user', content: '第一次任务' },
+      { role: 'assistant', content: '完成', tool_calls: [{ id: 'c1', function: { name: 'sh', arguments: '{}' } }] },
+      { role: 'tool', tool_call_id: 'c1', content: 'ok' },
+      { role: 'user', content: '新任务' },
+      { role: 'assistant', content: '好的' },
+    ]
+    const selected = selectCompletionEvidenceMessages(msgs)
+    expect(selected.length).toBe(2)
+    expect(String(selected[0].content)).toBe('新任务')
+  })
+
+  it('"继续"消息 → 窗口向前扩展', () => {
+    const msgs: OaiMsgLite[] = [
+      { role: 'user', content: '帮我配置服务器' },
+      { role: 'assistant', content: '开始配置', tool_calls: [{ id: 'c1', function: { name: 'sh', arguments: '{}' } }] },
+      { role: 'tool', tool_call_id: 'c1', content: 'ok' },
+      { role: 'assistant', content: '配置完成' },
+      { role: 'user', content: '继续' },
+      { role: 'assistant', content: '好的' },
+    ]
+    const selected = selectCompletionEvidenceMessages(msgs)
+    expect(String(selected[0].content)).toBe('帮我配置服务器')
+  })
+
+  it('连续"继续"消息 → 扩展到最远非继续消息', () => {
+    const msgs: OaiMsgLite[] = [
+      { role: 'user', content: '初始化' },
+      { role: 'assistant', content: '已初始化' },
+      { role: 'user', content: '继续' },
+      { role: 'assistant', content: '继续中' },
+      { role: 'user', content: '接着做' },
+      { role: 'assistant', content: '继续中' },
+    ]
+    const selected = selectCompletionEvidenceMessages(msgs)
+    expect(String(selected[0].content)).toBe('初始化')
+  })
+
+  it('空数组返回空数组', () => {
+    expect(selectCompletionEvidenceMessages([])).toEqual([])
+  })
+
+  it('只有一条消息返回该消息', () => {
+    const msgs: OaiMsgLite[] = [{ role: 'user', content: 'hi' }]
+    const selected = selectCompletionEvidenceMessages(msgs)
+    expect(selected.length).toBe(1)
   })
 })

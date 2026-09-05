@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from 'vitest'
-import { finalizeText, collapseExcessBlankLines } from './chathub'
+import { finalizeText, collapseExcessBlankLines, appendChatHubDelta, scrubNarration } from './chathub'
 
 describe('finalizeText', () => {
   it('final 为空时返回 streamed（或空串）', () => {
@@ -63,5 +63,68 @@ describe('collapseExcessBlankLines', () => {
 
   it('空串安全返回', () => {
     expect(collapseExcessBlankLines('')).toBe('')
+  })
+})
+
+describe('appendChatHubDelta', () => {
+  it('chunk 为空 → 返回 current', () => {
+    expect(appendChatHubDelta('hello', '')).toBe('hello')
+  })
+
+  it('current 为空 → 返回 chunk 并触发 emit', () => {
+    const emit = vi.fn()
+    expect(appendChatHubDelta('', 'hello', emit)).toBe('hello')
+    expect(emit).toHaveBeenCalledWith('hello')
+  })
+
+  it('chunk === current → 返回 current（无变化）', () => {
+    const emit = vi.fn()
+    expect(appendChatHubDelta('hello', 'hello', emit)).toBe('hello')
+    expect(emit).not.toHaveBeenCalled()
+  })
+
+  it('current 以 chunk 结尾 → 返回 current（blind append 场景）', () => {
+    const emit = vi.fn()
+    expect(appendChatHubDelta('hello world', 'world', emit)).toBe('hello world')
+    expect(emit).not.toHaveBeenCalled()
+  })
+
+  it('chunk 以 current 开头 → 取增量并返回 chunk', () => {
+    const emit = vi.fn()
+    const result = appendChatHubDelta('hello', 'hello world', emit)
+    expect(result).toBe('hello world')
+    expect(emit).toHaveBeenCalledWith(' world')
+  })
+
+  it('chunk 与 current 无关 → 直接追加并触发 emit', () => {
+    const emit = vi.fn()
+    const result = appendChatHubDelta('hello', ' world', emit)
+    expect(result).toBe('hello world')
+    expect(emit).toHaveBeenCalledWith(' world')
+  })
+
+  it('无 emit 回调时不抛错', () => {
+    expect(appendChatHubDelta('a', 'bc')).toBe('abc')
+  })
+})
+
+describe('scrubNarration', () => {
+  it('剥除"我将执行"完整三字段旁白', () => {
+    const input = '我将执行：\n目的：配置服务器\n预期：成功。'
+    expect(scrubNarration(input)).toBe('')
+  })
+
+  it('剥除"我将执行"简短旁白', () => {
+    const input = '我将执行：配置服务器。后续内容。'
+    expect(scrubNarration(input)).toBe('后续内容。')
+  })
+
+  it('普通文本不受影响', () => {
+    const input = '已经完成了配置，服务器已重启。'
+    expect(scrubNarration(input)).toBe(input)
+  })
+
+  it('空串安全返回', () => {
+    expect(scrubNarration('')).toBe('')
   })
 })

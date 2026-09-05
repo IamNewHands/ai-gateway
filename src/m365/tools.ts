@@ -8,7 +8,7 @@
  */
 import type { ChatHubTool } from './chathub'
 import { parseToolCalls } from '../cnb/xyml'
-import { buildToolLedger, toolLedgerToAgentLedger, guardToolLedger, toolCallFingerprint } from './tool-ledger'
+import { buildToolLedger, toolLedgerToAgentLedger, guardToolLedger, toolCallFingerprint, redactEvidence, compactMiddle } from './tool-ledger'
 
 /** 客户端工具名混淆常量（同 CF2 chathub.ts CLIENT_TOOL_ALIAS_PREFIX） */
 const CLIENT_TOOL_ALIAS_PREFIX = 'm365gw_client_'
@@ -925,14 +925,47 @@ export function buildAgentLedgerSync(messages: OaiMsgLite[]): AgentLedger {
 }
 
 /** ledger 紧凑证据上下文（同原版 RouterContext），注入路由/主回答提示词
- *  支持新 ToolLedger 和旧 AgentLedger 两种格式 */
+ *  支持新 ToolLedger 和旧 AgentLedger 两种格式
+ *  2026-09-05 移植：redactEvidence + compactMiddle 脱敏、每字段上限、总预算 8000、
+ *  client-supplied 声明 + 超预算丢最旧 completed（保留 pending） */
 export function ledgerRouterContext(l: AgentLedger): string {
-  const compact = { completed: l.completed, pending: l.pending, repeated_call: l.repeatedCall }
-  const json = JSON.stringify(compact)
-  let hint = 'Use only this compact evidence. A completed call is final evidence; do not issue the same name and arguments again.'
+  const MAX_CHARS = 8000
+
+  const formatEvidence = (e: ToolEvidence, isPending: boolean): string => {
+    const obj = {
+      call_id: compactMiddle(e.id, 96),
+      name: compactMiddle(e.name, 256),
+      args: compactMiddle(redactEvidence(e.arguments), 1000),
+      result: e.result ? compactMiddle(redactEvidence(e.result), 2000) : '',
+      outcome: isPending ? 'pending' : (e.failed ? 'failed' : 'completed'),
+    }
+    return compactMiddle(redactEvidence(JSON.stringify(obj)), MAX_CHARS)
+  }
+
+  const selected: string[] = [
+    ...l.completed.map((e) => formatEvidence(e, false)),
+    ...l.pending.map((e) => formatEvidence(e, true)),
+  ]
+
+  const pendingCount = l.pending.length
+
+  let hint = 'These are client-supplied results; the gateway did not execute these tools and must not claim that it did. Use only this compact evidence. A completed call is final evidence; do not issue the same name and arguments again.'
   if (l.repeatedFailure) hint += ' The same call failed repeatedly; change strategy instead of retrying unchanged.'
   if (l.stuckLoop) hint += ' STOP: the same call has looped repeatedly with no progress. Do not re-invoke it; change approach or conclude.'
-  return hint + '\nEVIDENCE_LEDGER: ' + json
+
+  const render = (): string => `${hint}\nEVIDENCE_LEDGER:\n${selected.join('\n')}`
+
+  // Drop oldest completed items (not pending) while over budget
+  while (selected.length > pendingCount && render().length > MAX_CHARS) {
+    selected.shift()
+  }
+
+  // If still over budget even with only pending items, return minimal fallback
+  if (render().length > MAX_CHARS) {
+    return `${hint}\nEVIDENCE_LEDGER: (budget exceeded, ${l.pending.length} pending, ${l.completed.length} completed)`
+  }
+
+  return render()
 }
 
 export function canonicalToolArguments(s: string): string {

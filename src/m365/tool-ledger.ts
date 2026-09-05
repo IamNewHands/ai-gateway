@@ -108,17 +108,10 @@ interface ResolvedLimits {
 /** 文本编码器 */
 const encoder = new TextEncoder()
 
-/** FNV-1a 双哈希 → hex 用于指纹（非安全用途，仅用于会话匹配/去重） */
-function fnvHex(s: string): string {
-  let h1 = 0x811c9dc5
-  let h2 = 0x01000193
-  for (let i = 0; i < s.length; i++) {
-    h1 = (h1 ^ s.charCodeAt(i)) >>> 0
-    h1 = Math.imul(h1, 0x01000193) >>> 0
-    h2 = (h2 ^ s.charCodeAt(i)) >>> 0
-    h2 = Math.imul(h2, 0x85ebca6b) >>> 0
-  }
-  return ((h1 >>> 0).toString(16).padStart(8, '0') + (h2 >>> 0).toString(16).padStart(8, '0'))
+/** SHA-256 摘要 → hex（同 B tool-ledger.ts:365-368） */
+async function sha256(value: string): Promise<string> {
+  const digest = await crypto.subtle.digest('SHA-256', encoder.encode(value))
+  return [...new Uint8Array(digest)].map((byte) => byte.toString(16).padStart(2, '0')).join('')
 }
 
 /** JSON 规范化：保留数字精度，按键排序（同 CF2 canonicalJSONText 核心逻辑） */
@@ -274,38 +267,114 @@ function canonicalValue(value: unknown, ancestors: Set<object>): string {
 }
 
 /** 生成工具调用指纹：SHA-256 or FNV 哈希（同 CF2 toolCallFingerprint） */
-export function toolCallFingerprint(name: string, args: unknown): string {
-  const normalized = normalizeToolArguments(args)
-  const data = `${name}\0${normalized}`
-  // 使用 FNV 哈希（同步，适用于 Workers 环境）
-  return fnvHex(data)
+/** 生成工具调用指纹：SHA-256 哈希（同 B tool-ledger.ts:371-374）。
+ *  sha256: 前缀确保可识别性，用于快照持久化校验。 */
+export async function toolCallFingerprint(name: string, args: unknown): Promise<string> {
+  const normalizedName = typeof name === 'string' ? name.trim() : ''
+  return `sha256:${await sha256(`${normalizedName}\u0000${normalizeToolArguments(args)}`)}`
 }
 
 // ==================== 工具结果失败检测 ====================
 
 const processExitSignal = /(?:^|\n)Process exited with code\s+(-?\d+)(?:\s|$)/iu
-const leadingFailureSignal = /^(?:invalid\s+(?:patch|tool|arguments?|request|command|input)\s*:|errors?\s*:|failed\s*:|failure\s*:|exceptions?\s*:|traceback\b|permission denied\b|timed?\s*out\b|connection refused\b|\u9519\u8bef\s*[\uff1a:]|\u5931\u8d95\s*[\uff1a:]|\u8d85\u65f6\b|\u6743\u9650\u88ab\u62d2\u7edd\b)/iu
+const leadingFailureSignal = /^(?:invalid\s+(?:patch|tool|arguments?|request|command|input)\s*:|errors?\s*:|failed\s*:|failure\s*:|exceptions?\s*:|traceback\b|permission denied\b|timed?\s*out\b|connection refused\b|\u9519\u8bef\s*[\uff1a:]|\u5931\u8d25\s*[\uff1a:]|\u8d85\u65f6\b|\u6743\u9650\u88ab\u62d2\u7edd\b)/iu
 const powershellFailureSignal = /^[A-Za-z][A-Za-z0-9_.-]*\s*:\s*(?:cannot\s+find\s+path|the\s+term\b[^\n]{0,160}\bis\s+not\s+recognized|access\s+(?:is\s+)?denied|permission\s+denied)/iu
 const commandFailureSignal = /^[A-Za-z][A-Za-z0-9_.-]*\s+(?:failed|error|failure)\s*:/iu
 const operationFailureSignal = /^(?:the\s+)?(?:command|operation|request|action)\s+(?:failed|error|failure)\b/iu
 
+/** 部分客户端（PTY 封装）在真实负载前加横幅行；失败信号必须匹配剥离后的首行（同 B firstPayloadLine） */
 function firstPayloadLine(value: string): string {
-  const trimmed = value.trim()
-  const newline = trimmed.indexOf('\n')
-  return newline >= 0 ? trimmed.slice(0, newline) : trimmed
+  const lines = value.split('\n').map((line) => line.trim()).filter(Boolean)
+  while (lines.length > 0 && /^(?:Script completed|Wall time(?:\s+\d+(?:\.\d+)?\s+seconds?)?|(?:Final\s+)?Output\s*:?)$/iu.test(lines[0])) {
+    lines.shift()
+  }
+  return lines[0] ?? ''
 }
 
-/** 检测工具结果是否失败（兼容原版 failureSignal 的 exit code 模式） */
-export function resultFailed(value: string, call?: ToolCallRecord): boolean {
+/** 显式结构化状态优先于文本扫描（同 B structuredFailureStatus）：
+ *  exit_code/exitCode 解析数字（0=成功）、is_error/isError/failed 布尔、success 反相、status 枚举 */
+function structuredFailureStatus(value: unknown): boolean | null {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null
+  const record = value as Record<string, unknown>
+  for (const key of ['exit_code', 'exitCode'] as const) {
+    const raw = record[key]
+    if (typeof raw === 'number' && Number.isFinite(raw)) return raw !== 0
+    if (typeof raw === 'string' && /^-?\d+$/u.test(raw.trim())) return Number(raw) !== 0
+  }
+  for (const key of ['is_error', 'isError', 'failed'] as const) {
+    if (typeof record[key] === 'boolean') return record[key] as boolean
+  }
+  if (typeof record.success === 'boolean') return !record.success
+  if (typeof record.status === 'string') {
+    const status = record.status.trim().toLowerCase()
+    if (['error', 'failed', 'failure', 'cancelled', 'canceled', 'timed_out', 'timeout'].includes(status)) return true
+    if (['ok', 'success', 'succeeded', 'completed', 'complete'].includes(status)) return false
+  }
+  return null
+}
+
+/** 供回显判定用：仅做 CRLF 归一与空白折叠（B normalizeResult 的字符串子集） */
+function normalizeResultText(value: string): string {
+  return value.replace(/\r\n/gu, '\n').replace(/\s+/gu, ' ').trim()
+}
+
+function parsedToolArguments(value: unknown): Record<string, unknown> | null {
+  if (value && typeof value === 'object' && !Array.isArray(value)) return value as Record<string, unknown>
+  if (typeof value !== 'string') return null
+  try {
+    const parsed = JSON.parse(value) as unknown
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed as Record<string, unknown> : null
+  } catch {
+    return null
+  }
+}
+
+/** write_stdin 的输出若只是回显写入字符（剥横幅/提示符后），不算成功证据（同 B terminalWriteWasOnlyEcho）：
+ *  防止「stdin 被传输层接受但 shell 未执行」被当成执行成功 */
+function terminalWriteWasOnlyEcho(call: ToolCallRecord, value: string): boolean {
+  if (call.name.trim().toLowerCase() !== 'write_stdin') return false
+  const args = parsedToolArguments(call.arguments)
+  const chars = typeof args?.['chars'] === 'string' ? normalizeResultText(args['chars'] as string) : ''
+  if (!chars) return false
+  const meaningful = value.replace(/\r\n/gu, '\n').split('\n').map((line) => line.trim()).filter(Boolean).filter((line) => !(
+    /^(?:Script completed|Wall time(?:\s+\d+(?:\.\d+)?\s+seconds?)?|(?:Final\s+)?Output\s*:|Live output\s*:?)$/iu.test(line)
+    || /^Process (?:still )?running with (?:cell|session) ID\b/iu.test(line)
+    || /^Chunk ID\s*:/iu.test(line)
+  ))
+  if (meaningful.length === 0) return true
+  const normalizedPayload = meaningful.join('\n').trim()
+  if (normalizedPayload === chars) return true
+  if (meaningful.length === 1) {
+    const withoutPrompt = meaningful[0].replace(/^.*?(?:PS\s+[^>\n]*>|[$#>])\s*/u, '').trim()
+    return normalizeResultText(withoutPrompt) === chars
+  }
+  return false
+}
+
+/** 检测工具结果是否失败。
+ *  移植自 M365-Gateway 2026-09-04 resultFailed（B tool-ledger.ts:397-484）：
+ *  1) 结构化状态字段优先；
+ *  2) "Process exited with code N" 解析数字，0 不算失败（成功测试打印 ERROR 字样不得覆盖 exit 0）；
+ *  3) 无显式状态时只信任首行状态式诊断，不扫描正文中的 error/failed 字样，
+ *     防止「读取讨论错误路径的文件」被误判为失败而触发无谓的失败指纹/熔断；
+ *  4) 保留 A 特有的旧版 "exit code: N / exit status: N" 行首格式兼容（compactToolResult 自身
+ *     会产出该格式），仅限前 1024 字符且数字非零。
+ */
+export function resultFailed(value: string, rawValue?: unknown, call?: ToolCallRecord): boolean {
   if (!value) return false
-  if (processExitSignal.test(value)) return true
-  // 兼容旧版 failureSignal：exit code: 1 / exit status: 1 / exit code: 1, error 等格式
-  if (/(?:^|\n|\s)exit\s+(?:code|status)?\s*[:=]?\s*[1-9]\d*(?:\s|$|[.,;!?])/iu.test(value)) return true
+  const structured = structuredFailureStatus(rawValue)
+  if (structured !== null) return structured
+  const head = value.slice(0, 1_024)
+  const processExit = processExitSignal.exec(head)
+  if (processExit) return Number(processExit[1]) !== 0
+  // 旧版行首格式兼容（原为全文扫描——修复点：仅限前 1024 字符、行首锚定；数字本就要求非零）
+  if (/(?:^|\n)exit\s+(?:code|status)\s*[:=]?\s*[1-9]\d*(?:\s|$|[.,;!?])/iu.test(head)) return true
   const leading = firstPayloadLine(value)
   return leadingFailureSignal.test(leading)
     || powershellFailureSignal.test(leading)
     || commandFailureSignal.test(leading)
     || operationFailureSignal.test(leading)
+    || (call ? terminalWriteWasOnlyEcho(call, value) : false)
 }
 
 // ==================== Factory 与解析 ====================
@@ -368,7 +437,7 @@ async function registerCall(
   }
 
   const normalizedArguments = normalizeToolArguments(argumentsValue)
-  const fingerprint = toolCallFingerprint(name, argumentsValue)
+  const fingerprint = await toolCallFingerprint(name, argumentsValue)
   const call: ToolCallRecord = { callId, name, arguments: argumentsValue, normalizedArguments, fingerprint }
 
   if ((state.completedFingerprintCounts.get(fingerprint) ?? 0) >= MAX_COMPLETED_FINGERPRINT_OCCURRENCES) {
@@ -440,8 +509,8 @@ async function consumeResult(
 
   const result = typeof value === 'string' ? value : JSON.stringify(value)
   const normalizedResult = normalizeToolArguments(result)
-  const resultFingerprint = toolCallFingerprint(result, {})
-  const failed = failedOverride ?? resultFailed(result, call)
+  const resultFingerprint = `sha256:${await sha256(normalizedResult)}`
+  const failed = failedOverride ?? resultFailed(result, value, call)
 
   const evidence: CompletedToolEvidence = {
     ...call,
@@ -473,6 +542,15 @@ async function consumeResult(
   if (failed && evidence.failureFingerprint) {
     state.failureSignatures.add(evidence.failureFingerprint)
   }
+  // 提案期问题保护的是「下发前」边界；结果因果匹配返回后即成为不可变历史。
+  // 保留 repeated_failure 与协议错误，仅清除已决议的提案问题——否则下一次续接
+  // 的入口预检会因历史提案问题直接 409（同 B consumeResult，修复长任务续跑死循环）。
+  // 仅清除已决议的提案期问题（模型重复提案同一调用，结果因果匹配后即不可变历史）；
+  // consecutive_fingerprint_limit 和 tool_round_limit 是终端守卫，消费结果不解除阻断。
+  state.issues = state.issues.filter((issue) => issue.callId !== callId || ![
+    'completed_call_reissued',
+    'duplicate_pending_call',
+  ].includes(issue.code))
 }
 
 // ==================== Ledger 构建 ====================
@@ -620,5 +698,23 @@ export function ledgerRouterContext(ledger: ToolLedger): string {
   if (ledger.issues.some((i) => i.code === 'consecutive_fingerprint_limit')) {
     hint += ' STOP: the same call has been repeated consecutively with no progress. Do not re-invoke it.'
   }
-  return hint + '\nEVIDENCE_LEDGER: ' + json
+  return hint + '\nEVIDENCE_LEDGER: ' + redactEvidence(json)
+}
+
+/** 证据注入脱敏（同 B redactEvidence，tool-ledger.ts:959-964）：
+ *  Bearer 凭据、m365/cfk/sk 前缀凭据、token/key/password/secret 赋值 —— 防止工具结果里的
+ *  凭据随证据块原样进入提示词并回流到上游。 */
+export function redactEvidence(value: string): string {
+  return value
+    .replace(/\bBearer\s+[A-Za-z0-9._~+/=-]+/giu, 'Bearer [REDACTED]')
+    .replace(/\b(?:m365|cfk|sk)[_-][A-Za-z0-9_-]{8,}/giu, '[REDACTED_CREDENTIAL]')
+    .replace(/(["']?(?:access_?token|refresh_?token|api_?key|password|secret)["']?\s*[:=]\s*["'])[^"'\s]+/giu, '$1[REDACTED]')
+}
+
+/** 有界压缩：保留头尾、标注省略长度（同 B compactMiddle，tool-ledger.ts:952-957） */
+export function compactMiddle(value: string, maximum: number): string {
+  if (value.length <= maximum) return value
+  const head = Math.max(32, Math.floor(maximum / 3))
+  const tail = Math.max(32, maximum - head - 38)
+  return `${value.slice(0, head)}\n...[${value.length - head - tail} chars omitted]...\n${value.slice(-tail)}`
 }

@@ -175,7 +175,35 @@ async function safeFetchImage(url: string, redirects = 0): Promise<Response | nu
   return resp
 }
 
-/** 上游内容策略 / 图片额度 / 限流 / 空返回 的语义分类（同原版 IsContentPolicyBlock 等） */
+/** 提取上游机器标签。人工可读的微软消息可能包含租户数据、URL 或标识符，不得进入错误/日志（同原版 upstreamErrorLabel:159-178）。 */
+function upstreamErrorLabel(value: unknown): string {
+  if (value && typeof value === 'object' && !Array.isArray(value)) {
+    const record = value as Record<string, unknown>
+    for (const candidate of [record.code, record.errorCode, record.error]) {
+      if (candidate && typeof candidate === 'object') {
+        const nested = upstreamErrorLabel(candidate)
+        if (nested !== 'unknown') return nested
+      } else {
+        const label = safeProtocolLabel(candidate)
+        if (label !== 'unknown') return label
+      }
+    }
+    if (Object.hasOwn(record, 'message')) {
+      const label = safeProtocolLabel(record.message)
+      return label === 'unknown' ? 'unknown_error' : label
+    }
+    if (Object.hasOwn(record, 'error')) return 'unknown_error'
+  }
+  return safeProtocolLabel(value)
+}
+
+function safeProtocolLabel(value: unknown): string {
+  if (typeof value !== 'string') return 'unknown'
+  const label = value.trim()
+  return /^[A-Za-z][A-Za-z0-9_.-]{0,79}$/u.test(label) ? label : 'unknown'
+}
+
+/** 内容策略 / 图片额度 / 限流 / 空返回 的语义分类（同原版 IsContentPolicyBlock 等） */
 export type ChatHubErrorClass = 'rate_limit' | 'content_policy' | 'image_quota' | 'empty' | null
 // 原版 contentPolicyPatterns 精确词表（避免长回答中普通词误判）
 const contentPolicyPatterns = [
@@ -349,6 +377,38 @@ export function finalizeText(streamed: string, final: string, emit?: (delta: str
     return final
   }
   return final
+}
+
+/**
+ * 安全合并 writeAtCursor 增量：处理重复/累计帧问题（同 B appendChatHubDelta:1679-1693）。
+ * 部分租户下，后续帧可能包含累计文本而非纯增量，盲 append 导致重复输出。
+ */
+export function appendChatHubDelta(current: string, chunk: string, emit?: (delta: string) => void): string {
+  if (!chunk) return current
+  if (!current) {
+    emit?.(chunk)
+    return chunk
+  }
+  if (chunk === current || current.endsWith(chunk)) return current
+  if (chunk.startsWith(current)) {
+    const delta = chunk.slice(current.length)
+    if (delta) emit?.(delta)
+    return chunk
+  }
+  emit?.(chunk)
+  return current + chunk
+}
+
+/**
+ * 剥除"我将执行…"旁白（同 B scrubNarration:840-845）。
+ * 模型常以"我将执行：目的：预期："等叙述性文本开头，且不包含实际工具调用内容，
+ * 直接剥离以免占据有限的上下文或混淆下游。
+ */
+export function scrubNarration(text: string): string {
+  return text
+    .replace(/我将执行[：:][\s\S]*?\n\s*目的[：:][^\n]*\n?\s*预期[：:][^\n]*/gu, '')
+    .replace(/我将执行[：:][^\n。]{0,120}。/gu, '')
+    .trim()
 }
 
 /**
@@ -624,11 +684,15 @@ export async function chatWithHandlers(
     socket = resp.webSocket as unknown as OutboundWebSocket
     socket.accept()
   } catch (err) {
-    const wrapped = new Error(`ws dial: ${err instanceof Error ? err.message : String(err)}`) as Error & { retryAfterSeconds?: number }
+    // 脱敏：Cloudflare fetch 错误包含完整 URL（含 access_token query 参数），
+    // 不传播原始错误消息（同 B chathub.ts:1783-1791，Never propagate the fetch error）。
     // 保留上游 Retry-After（供 account-health 冷却）
-    if ((err as Error & { retryAfterSeconds?: number }).retryAfterSeconds) {
-      wrapped.retryAfterSeconds = (err as Error & { retryAfterSeconds?: number }).retryAfterSeconds
-    }
+    const retryAfterSeconds = (err as Error & { retryAfterSeconds?: number }).retryAfterSeconds
+    const sanitized = err instanceof Error && err.message.startsWith('ws dial failed: HTTP ')
+      ? err.message  // 来自上面非 101 的显式 throw，已脱敏，原样保留
+      : 'WS_DIAL_ERROR'  // 来自 fetch 层错误（含 URL/access_token），用固定标识替代
+    const wrapped = new Error(sanitized) as Error & { retryAfterSeconds?: number }
+    if (retryAfterSeconds) wrapped.retryAfterSeconds = retryAfterSeconds
     throw wrapped
   }
 
@@ -683,11 +747,42 @@ export async function chatWithHandlers(
   let progressDeadline = Math.min(deadline, Date.now() + progressIdleMs)
   // 客户端断连时中止（同原版 r.Context().Done() → 取消上游对话）
   const aborted = () => opts.signal?.aborted === true
+  let disengaged = false
+  let pingTimer: ReturnType<typeof setInterval> | undefined
 
   try {
-    // 3) 握手
+    // 3) 握手：发送 SignalR 握手请求，验证返回帧（同 B parseSignalRHandshake:1489-1524）
     socket.send(`{"protocol":"json","version":1}${RS}`)
-    await withTimeout(next(), 15_000, 'handshake')
+    const handshakeFrame = await withTimeout(next(), 15_000, 'handshake')
+    if (handshakeFrame.msg) {
+      // 握手帧可能与其他首帧合并到达（coalesced），需分离处理
+      const parts = handshakeFrame.msg.split(RS)
+      let foundHandshake = false
+      for (const partRaw of parts) {
+        const part = partRaw.trim()
+        if (!part) continue
+        if (!foundHandshake) {
+          foundHandshake = true
+          let handshake: unknown
+          try { handshake = JSON.parse(part) as unknown } catch { throw new Error('WS_HANDSHAKE_INVALID') }
+          if (!handshake || typeof handshake !== 'object' || Array.isArray(handshake)) throw new Error('WS_HANDSHAKE_INVALID')
+          const record = handshake as Record<string, unknown>
+          if (record.error) throw new Error('WS_HANDSHAKE_FAILED')
+          if (Object.keys(record).length > 0) throw new Error('WS_HANDSHAKE_UNEXPECTED_FRAME')
+          continue
+        }
+        // 握手后剩余帧重新入队供主循环消费
+        push({ msg: part })
+      }
+      if (!foundHandshake) throw new Error('WS_HANDSHAKE_EMPTY')
+    } else if (handshakeFrame.err) {
+      throw handshakeFrame.err
+    }
+
+    // 主动 15s ping 定时器：长思考期间防静默断连（同 B:1814-1816）
+    pingTimer = setInterval(() => {
+      try { socket.send(`{"type":6}${RS}`) } catch { /* read side reports closure */ }
+    }, 15_000)
 
     // 4) 发送 chat payload
     const payload = chatPayload(req, requestID, firstTurn)
@@ -805,6 +900,10 @@ export async function chatWithHandlers(
               if (ev.kind === 'reasoning') reasoningBuf += ev.text || ''
               if (ev.kind !== 'text' && onEvent) onEvent(ev)
             }
+            // Disengaged 检测（同 B:1947）：部分租户在终态前发送 Disengaged 标记
+            if (Array.isArray(msgs) && msgs.some((m) => m && typeof m === 'object' && (m as Record<string, unknown>)['messageType'] === 'Disengaged')) {
+              disengaged = true
+            }
             // 判断工具帧（跳过光标文本，工具帧的 writeAtCursor 不应当作答案输出）
             let toolFrame = false
             for (const mraw of msgs) {
@@ -819,10 +918,10 @@ export async function chatWithHandlers(
             const wac = a['writeAtCursor']
             if (typeof wac === 'string' && wac !== '' && !toolFrame) {
               debugEmit('chathub-delta', wac)
-              // HAR 05：writeAtCursor 是纯 append 增量。一旦存在文本基线就把它直接作 delta 透出，
-              // 避免把 33-47 个 cursor 帧折叠成 2-3 个巨大快照（同原项目 client.go：streamed 非空走 emitDelta）。
-              if (streamedText !== '') { streamedText += wac; onDelta?.(wac) }
-              else emitSnapshot(wac)
+              // 安全合并：处理重复/累计帧问题（同 B appendChatHubDelta:1679-1693）
+              if (streamedText !== '') {
+                streamedText = appendChatHubDelta(streamedText, wac, onDelta ?? undefined)
+              } else emitSnapshot(wac)
             }
             for (const mraw of msgs) {
               if (!mraw || typeof mraw !== 'object') continue
@@ -885,7 +984,7 @@ export async function chatWithHandlers(
               throw new Error('upstream rate-limit notice')
             }
             if (message !== '') throw new Error(`chathub completion error: code=${JSON.stringify(code)} message=${JSON.stringify(message)}`)
-            throw new Error(`chathub completion error: ${JSON.stringify(frame.error)}`)
+            throw new Error(`chathub completion error: ${upstreamErrorLabel(frame.error)}`)
           }
           // 同原版：先检查 final 是否限流，避免限流提示经 finalizeText 泄漏给客户端
           if (rateLimited(finalText)) throw new Error('upstream rate-limit notice')
@@ -911,6 +1010,29 @@ export async function chatWithHandlers(
             images: imageURLs(rawFrames),
           }
         }
+
+        // type=7 干净关闭（同 B:2013-2021）：部分 ChatHub rollout 在最终流式项后不发 type=3
+        // 直接关闭。仅当已有最终答案/工具/图片时才视为正常完成。
+        if (frame.type === 7) {
+          if (frame.error) {
+            throw new Error(`chathub closed before completion: ${upstreamErrorLabel(frame.error)}`)
+          }
+          if (finalText || collectedEvents.length > 0) {
+            const text = finalizeText(streamedText, finalText || streamedText, onDelta)
+            return {
+              text,
+              reasoning: reasoningBuf,
+              conversationId,
+              sessionId,
+              requestId: requestID,
+              events: collectedEvents,
+              rawResult,
+              throttling,
+              images: imageURLs(rawFrames),
+            }
+          }
+          throw new Error('chathub closed before completion: clean without final')
+        }
       }
       // 本次读到的消息中存在语义帧 → 续期进度截止
       if (semanticProgress) {
@@ -919,6 +1041,7 @@ export async function chatWithHandlers(
     }
     throw new Error('chathub response deadline exceeded before completion')
   } finally {
+    if (pingTimer) { clearInterval(pingTimer); pingTimer = undefined }
     try { socket.close() } catch { /* ignore */ }
   }
 }

@@ -10,10 +10,10 @@
  * 其中 sessionKey = providerId + ':' + explicitSessionId | contextFingerprint
  */
 import type { Env } from '../types'
-import { chatWithHandlers, classifyChatHubNotice, collapseExcessBlankLines } from './chathub'
+import { chatWithHandlers, classifyChatHubNotice, collapseExcessBlankLines, scrubNarration } from './chathub'
 import type { ChatHubAccount, ChatHubTool, ChatHubResult } from './chathub'
 import { flattenPromptMessages, modelToolRouterPrompt, parseModelToolDecision, fencedToolCalls, nativeToolCalls, compactToolResult, buildAgentLedger, canContinue, resolveMaxToolRounds, activeMessages, ledgerRouterContext, filterCompletedCalls, validateDetectedToolCalls, isToolRefusal, isSandboxHallucination } from './tools'
-import { evaluateCompletionEvidence } from './completion-evidence'
+import { evaluateCompletionEvidence, selectCompletionEvidenceMessages } from './completion-evidence'
 import type { DetectedToolCall, AgentLedger, OaiMsgLite } from './tools'
 import { resolveSession, bindSession, systemPromptHash, convCacheLookup, convCacheStore } from './session'
 import type { ResolveResult, ContextLike } from './session'
@@ -24,7 +24,7 @@ import type { RateLimitProbeFn } from './account-health'
 import { writeLog, isM365DebugSseEnabled } from '../admin'
 import { acquireSlot, releaseSlot, fluxSnapshot } from './account-flux'
 import { computeContextBudget, slidingWindow } from './context-budget'
-import { extractChatTaskAnchors, mergeTaskAnchors, decodeTaskAnchors, encodeTaskAnchors, reserveTaskAnchorContext } from './task-anchors'
+import { extractChatTaskAnchors, mergeTaskAnchors, decodeTaskAnchors, encodeTaskAnchors, reserveTaskAnchorContext, repairTaskAnchorArtifacts } from './task-anchors'
 import type { TaskAnchor } from './task-anchors'
 
 export interface M365ChatPayload {
@@ -145,6 +145,9 @@ export class M365Session {
     // （activeMessages 同原版），去重并注入上下文。只用最近窗口统计 toolRounds，
     // 避免历史已完成工具调用累计而误触发上限（长会话第 N 轮被 409 的根因）。
     const ledger: AgentLedger = await buildAgentLedger(activeMessages(messages as OaiMsgLite[]))
+    // 完成证据用的独立 ledger："继续"消息不切断前序证据链，
+    // 使前序工具完成证据对 completion evidence 校验可见（同 B selectChatCompletionEvidenceMessages）
+    const evidenceLedger: AgentLedger = await buildAgentLedger(selectCompletionEvidenceMessages(messages as OaiMsgLite[]))
     const maxToolRounds = resolveMaxToolRounds(this.env.M365_MAX_TOOL_ROUNDS)
     if (!canContinue(ledger, maxToolRounds)) {
       try { await writeLog(this.env, 'warn', `[m365-chat] provider=${providerId} → tool loop gate blocked`, `stuckLoop=${ledger.stuckLoop} repeatedFailure=${ledger.repeatedFailure} toolRounds=${ledger.toolRounds}/${maxToolRounds} sig=${ledger.repetitionSignature || ''}`) } catch { /* ignore */ }
@@ -383,11 +386,48 @@ export class M365Session {
     }
     const calls = filterCompletedCalls(validated.calls, ledger)
 
-    let finalText = result.text
+    let finalText = repairTaskAnchorArtifacts(scrubNarration(result.text), mergedAnchors)
     // 兜底 3：完成证据评估——若回答包含"已完成"声明但缺少匹配工具证据，
-    // 则按 disposition 降级或终止（替换为未确认措辞，避免虚构成功）
-    if (toolDefs.length > 0 && finalText && !evaluateCompletionEvidence(finalText, ledger).allowed) {
-      finalText = 'I cannot confirm completion because no matching tool results were returned. No external action has been verified.'
+    // 则先尝试恢复循环（独立对话，不写历史），让模型修正调用再继续（同原版 B:5247-5272）。
+    // 证据不足但类型为 pending_evidence 时不做恢复（直接降级，避免无限循环）。
+    let completionRecoveryCalls: DetectedToolCall[] | undefined
+    if (toolDefs.length > 0 && finalText && !evaluateCompletionEvidence(finalText, evidenceLedger).allowed) {
+      const decision = evaluateCompletionEvidence(finalText, evidenceLedger)
+      if (['failed_evidence', 'missing_evidence', 'unknown_evidence'].includes(decision.reason)) {
+        // 证据恢复：独立对话，不写历史（同原版 resolveFunctionCall 使用独立 exchange）
+        const failureContext = decision.reason === 'failed_evidence'
+          ? 'The latest matching client-tool action failed. Continue from that exact failure and use its result; do not restart the task or repeat the initial discovery steps.'
+          : 'The completion claim does not yet have matching successful client-tool evidence.'
+        const recoveryPrompt = mainPrompt + '\n\nCOMPLETION EVIDENCE RECOVERY: ' + failureContext +
+          ' The unsupported completion actions are: ' + (decision.unsupportedActions || []).join(', ') +
+          '. Do not repeat the completion answer. Select the next materially useful client tool action needed to repair or verify the current task. ' +
+          'Change the tool or arguments when the previous action failed, do not repeat a completed inspection unchanged, and do not perform a mutation outside the user\'s request.'
+        try {
+          const recoveryAcquired = await acquireSlot(this.env, providerId, usedAcc.oid)
+          try {
+            const recoveryRes = await chatWithHandlers(
+              usedAcc,
+              { text: recoveryPrompt, started: true, attachments, tools: toolDefs, toolChoice: toolChoice },
+              { timeoutMs: 300_000 },
+            )
+            const recoveryRaw = fencedToolCalls(recoveryRes.text, toolDefs, toolChoice)
+            const recoveryAll = recoveryRaw.length > 0 ? recoveryRaw : nativeToolCalls(recoveryRes.events, toolDefs)
+            if (recoveryAll.length > 0) {
+              const recoveryValidated = validateDetectedToolCalls(recoveryAll, toolDefs, toolChoice)
+              if (recoveryValidated.dropped === 0 && recoveryValidated.calls.length > 0) {
+                // 恢复成功：用恢复对话产生的工具调用替代原始 finalText
+                completionRecoveryCalls = filterCompletedCalls(recoveryValidated.calls, ledger)
+                finalText = scrubNarration(recoveryRes.text || streamedText)
+              }
+            }
+          } catch { /* fall through to hard replacement */ }
+          finally { if (recoveryAcquired) await releaseSlot(this.env, providerId, usedAcc.oid) }
+        } catch { /* fall through */ }
+      }
+      if (!completionRecoveryCalls) {
+        // 恢复失败或非恢复类型（pending_evidence）：硬替换（同原版不降级不可恢复的情况）
+        finalText = 'I cannot confirm completion because no matching tool results were returned. No external action has been verified.'
+      }
     }
 
     const outcome: ChatOutcome = {
@@ -395,7 +435,7 @@ export class M365Session {
       reasoning: result.reasoning || reasoning,
       conversationId: result.conversationId,
       sessionId: result.sessionId,
-      toolCalls: calls,
+      toolCalls: completionRecoveryCalls || calls,
       metadata: {
         conversationId: result.conversationId,
         images: result.images,
@@ -640,8 +680,8 @@ export class M365Session {
           }
 
           // 完成证据校正（流式不可撤回，仅影响会话绑定文本）
-          let finalText = collapseExcessBlankLines(result.text || streamedText)
-          if (toolDefs.length > 0 && finalText && !evaluateCompletionEvidence(finalText, ledger).allowed) {
+          let finalText = collapseExcessBlankLines(scrubNarration(result.text || streamedText))
+          if (toolDefs.length > 0 && finalText && !evaluateCompletionEvidence(finalText, evidenceLedger).allowed) {
             finalText = 'I cannot confirm completion because no matching tool results were returned. No external action has been verified.'
           }
           sseLog('final', finalText)

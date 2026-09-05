@@ -198,6 +198,77 @@ export interface TaskAnchorPromptReservation {
  * 把锚点渲染成 data-only 内部块。块最多占用 1/8 字符预算、1/16 token 预算，
  * 因此保留锚点永远不会饿死当前轮对话。
  */
+/**
+ * 修复中文路径中非 ASCII 字符后插入的 X 伪影（同 B repairTaskAnchorArtifacts:248-307）。
+ * 某些 M365 工具路由变体在非 ASCII 路径字符后插入孤立的 X 终止符，
+ * 如 `D:\项目X\config` 实际应为 `D:\项目\config`。需要精确的任务锚点才能修复：
+ * 没有锚点的话，字面 X 可能是真实文件名的一部分，必须保留。
+ */
+
+function exactPathAnchorBoundary(character: string | undefined, leading: boolean): boolean {
+  if (character === undefined) return true
+  return leading
+    ? /^[\s'"`([{<>=,;|&]$/u.test(character)
+    : /^[\s'"`)\]}<>,;|&]$/u.test(character)
+}
+
+function exactPathAnchorBoundaries(text: string, start: number, end: number): boolean {
+  const leading = start === 0 ? undefined : text[start - 1]
+  const trailing = end === text.length ? undefined : text[end]
+  if (leading === "'" || leading === '"' || leading === '`') return trailing === leading
+  return exactPathAnchorBoundary(leading, true) && exactPathAnchorBoundary(trailing, false)
+}
+
+export function repairTaskAnchorArtifacts(
+  text: string,
+  anchors: ReadonlyArray<TaskAnchor> | undefined,
+): string {
+  const pathAnchors = mergeTaskAnchors(anchors)
+    .filter((anchor) => ['windows_path', 'unc_path', 'unix_path'].includes(anchor.kind))
+  const exactValues = new Set(pathAnchors.map((anchor) => anchor.value))
+  const matches = new Map<string, {
+    start: number
+    end: number
+    candidate: string
+    replacements: Map<string, number>
+  }>()
+
+  for (const anchor of pathAnchors) {
+    const pattern = Array.from(anchor.value, (character) => {
+      const literal = character.replace(/[.*+?^${}()|[\]\\]/gu, '\\$&')
+      return character.codePointAt(0)! > 0x7f ? `${literal}X?` : literal
+    }).join('')
+    for (const match of text.matchAll(new RegExp(pattern, 'gu'))) {
+      const candidate = match[0]
+      const start = match.index!
+      const end = start + candidate.length
+      if (candidate === anchor.value || exactValues.has(candidate) || !exactPathAnchorBoundaries(text, start, end)) continue
+      const key = `${start}:${end}`
+      const repair = matches.get(key) ?? { start, end, candidate, replacements: new Map<string, number>() }
+      const edits = candidate.length - anchor.value.length
+      const previous = repair.replacements.get(anchor.value)
+      if (previous === undefined || edits < previous) repair.replacements.set(anchor.value, edits)
+      matches.set(key, repair)
+    }
+  }
+
+  // 多于一个保留任务路径可能产生相同的伪影形式。优先选择需要最少 X 移除的精确锚点；
+  // 当同样合理的锚点仍存在时，保留源文本而非猜测并可能删除合法的 X。
+  const repairs = [...matches.values()].flatMap((match) => {
+    const ordered = [...match.replacements.entries()].sort((left, right) => left[1] - right[1])
+    if (ordered.length === 0 || (ordered[1] && ordered[1][1] === ordered[0][1])) return []
+    return [{ start: match.start, end: match.end, value: ordered[0][0] }]
+  })
+  const nonOverlapping = repairs.filter((candidate, index) => !repairs.some((other, otherIndex) => (
+    otherIndex !== index && candidate.start < other.end && other.start < candidate.end
+  )))
+  let repaired = text
+  for (const repair of nonOverlapping.sort((left, right) => right.start - left.start)) {
+    repaired = `${repaired.slice(0, repair.start)}${repair.value}${repaired.slice(repair.end)}`
+  }
+  return repaired
+}
+
 export function reserveTaskAnchorContext(
   anchors: ReadonlyArray<TaskAnchor> | undefined,
   maxPromptCharacters: number,

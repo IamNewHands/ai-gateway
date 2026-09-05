@@ -8,7 +8,7 @@
  * 4. 证据汇总（summarizeCompletionEvidence）—— 安全的非敏感证据摘要
  * 5. 证据评估（evaluateCompletionEvidence）—— 完整的证据评估，替换 completionEvidenceAllows
  */
-import type { AgentLedger, ToolEvidence } from './tools'
+import type { AgentLedger, ToolEvidence, OaiMsgLite } from './tools'
 
 // ==================== 类型定义 ====================
 
@@ -581,4 +581,56 @@ export function evaluateCompletionEvidence(
  */
 export function completionEvidenceAllows(answer: string, ledger: AgentLedger): boolean {
   return evaluateCompletionEvidence(answer, ledger).allowed
+}
+
+// ==================== 证据消息选择 ====================
+
+/** "继续"消息正则（同 B continuationOnly，tool-ledger.ts:116）：仅含"继续/接着/重试/continue"等续接词 */
+const continuationOnly = /^(?:继续(?:执行|处理|完成|下去|吧)?|接着(?:执行|处理|做|吧)?|往下(?:做|继续)?|重试(?:一下)?|再试(?:一次)?|continue|go\s+on|proceed|keep\s+going|carry\s+on|retry|try\s+again)[\s.!！。?？,，]*$/iu
+
+/** 提取消息文本（同 B chatMessageText，tool-ledger.ts:724-732） */
+function chatMessageText(message: Record<string, unknown>): string {
+  if (typeof message.content === 'string') return message.content.trim()
+  if (!Array.isArray(message.content)) return ''
+  return message.content
+    .filter((part): part is Record<string, unknown> => typeof part === 'object' && part !== null)
+    .map((part) => typeof part.text === 'string' ? part.text : '')
+    .join('\n')
+    .trim()
+}
+
+/**
+ * 选择完成证据用的消息子集："继续"消息不切断前序证据链（同 B selectChatCompletionEvidenceMessages，
+ * tool-ledger.ts:740-819）。
+ *
+ * 对"继续"消息，向前扩展证据窗口到上一个非继续用户消息，使前序工具完成证据对 completion
+ * evidence 校验可见。执行循环守卫（canContinue）仍使用活跃轮次窗口（activeMessages），不受影响。
+ */
+export function selectCompletionEvidenceMessages(messages: OaiMsgLite[]): OaiMsgLite[] {
+  if (!Array.isArray(messages) || messages.length === 0) return []
+
+  // 找最后一条 user 消息
+  let lastUser = -1
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    const message = messages[index]
+    if (message && typeof message === 'object' && String((message as Record<string, unknown>).role ?? '').toLowerCase() === 'user') {
+      lastUser = index
+      break
+    }
+  }
+  if (lastUser < 0) return messages.slice(-1)
+
+  let start = lastUser
+  const latest = messages[lastUser]
+  if (latest && continuationOnly.test(chatMessageText(latest as Record<string, unknown>))) {
+    // 向前扩展至上一个非继续用户消息
+    for (let index = lastUser - 1; index >= 0; index -= 1) {
+      const message = messages[index]
+      if (!message || typeof message !== 'object' || String((message as Record<string, unknown>).role ?? '').toLowerCase() !== 'user') continue
+      start = index
+      if (!continuationOnly.test(chatMessageText(message as Record<string, unknown>))) break
+    }
+  }
+
+  return messages.slice(start)
 }
