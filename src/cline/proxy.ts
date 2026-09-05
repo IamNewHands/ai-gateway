@@ -75,6 +75,13 @@ const CLINE_COOLDOWN_RUNAWAY_MS = 30 * 1000
  *     （超长回答不会被网关误掐）；
  *   - 客户端没带 → 用 CLINE_MAX_TOKENS 作为护栏默认，避免空转烧光几十万预算。
  * 空转的兜底见 isRunawayReasoningCutoff + proxyNonStreamChat 的重试/冷却。
+ *
+ * 2026-09-05 复盘：昨天只把空转兜底挂在非流式路径（proxyNonStreamChat），而 DSH 等
+ * 客户端走的是流式透传（streamSSE 直通），退化照样直播到 UI（思考一屏一屏的换行/空格），
+ * 预算也照样被烧光直到 length 截断。本次给流式加同等防护：
+ *   - isDegenerateReasoningDeltas：流式早期退化检测（阈值按 342 个真实 reasoning 步校准）；
+ *   - proxyStreamChat：探测期缓冲 → 退化则取消上游 + 冷却 + 换号重试；健康才放行，
+ *     放行后继续滚动监控，退化中途出现则抑制后续 reasoning delta（不再往 UI 直播垃圾）。
  */
 const CLINE_MAX_TOKENS = 32768          // 客户端未指定 max_tokens 时的护栏默认（原 128000 过激进）
 const CLINE_DEFAULT_REASONING_EFFORT = 'medium'  // 免费通道默认档位（原 high 过激进）
@@ -92,6 +99,46 @@ export function isRunawayReasoningCutoff(content: string, toolCalls: unknown[], 
   const hasContent = (content || '').trim().length > 0
   const hasToolCall = Array.isArray(toolCalls) && toolCalls.length > 0
   return !hasContent && !hasToolCall
+}
+
+// ===== 推理退化检测（流式防护，2026-09-05） =====
+
+// 阈值按 DSH 会话日志（dsh-session-8711a1e7）342 个真实 reasoning 步校准：
+//   正常步：trash 比例 = 0、换行率 ≈ 0.01–0.02（哪怕 7k 字符的长思考）；
+//   病态步（"一个字一个空格 / 全是换行"）：trash 比例 ≥ 0.5、换行率 ≥ 0.3，且 8 个命中步零漏判零误伤。
+const DEGENERATE_MIN_DELTAS = 16   // 样本太少不判定（正常短思考也可能都是小 token）
+const DEGENERATE_TRASH_MIN_DELTAS = 24
+const DEGENERATE_TRASH_RATIO = 0.6 // "纯空白碎片 delta" 占比（trash = 可见字符 ≤ 2）
+const DEGENERATE_NL_RATIO = 0.3    // 换行字符占比（正常 ≈ 0.01，病态 ≥ 0.3，留 10 倍以上裕量）
+const DEGENERATE_BLANK_MIN_CHARS = 600
+const DEGENERATE_BLANK_MAX_VISIBLE_RATIO = 0.4  // 长文本里几乎全是空白的 "一个字一个空格" 形态
+const PROBE_MAX_DELTAS = 24        // 流式探测窗口：缓冲满这个数量即做放行/拦截判定
+const RING_SIZE = 32               // 放行后的滚动监控窗口
+
+/**
+ * 判定一组 reasoning delta 是否为「推理退化空转」的输出特征：
+ * 大量 delta 只有 1–2 个可见字符甚至纯空白/换行，换行密度异常高，
+ * 整体像碎片化的乱码而非连贯思考。
+ * @param deltas 按到达顺序排列的 reasoning 文本片段
+ */
+export function isDegenerateReasoningDeltas(deltas: string[]): boolean {
+  const n = deltas.length
+  if (n < DEGENERATE_MIN_DELTAS) return false
+  let chars = 0
+  let newlines = 0
+  let visible = 0
+  let trash = 0
+  for (const t of deltas) {
+    chars += t.length
+    newlines += (t.match(/\n/g) || []).length
+    const vis = t.replace(/\s/g, '')
+    visible += vis.length
+    if (vis.length <= 2) trash++
+  }
+  if (n >= DEGENERATE_TRASH_MIN_DELTAS && trash / n >= DEGENERATE_TRASH_RATIO && newlines > 0) return true
+  if (newlines / Math.max(1, chars) >= DEGENERATE_NL_RATIO) return true
+  if (chars >= DEGENERATE_BLANK_MIN_CHARS && visible / Math.max(1, chars) <= DEGENERATE_BLANK_MAX_VISIBLE_RATIO) return true
+  return false
 }
 
 interface Account {
@@ -394,56 +441,237 @@ function unwrapData(obj: unknown): unknown {
   return obj
 }
 
-/** OpenAI SSE 流式透传（剥 data 包装）。 */
-function streamSSE(upstream: Response): Response {
-  const { readable, writable } = new TransformStream<Uint8Array, Uint8Array>()
-  const writer = writable.getWriter()
-  const reader = upstream.body!.getReader()
+/** OpenAI SSE 流式帧规整（剥 data 包装），返回要写给客户端的原始文本行；无变化返回 null。 */
+function normalizeSSELine(line: string): string | null {
+  if (!line.startsWith('data:')) return line + '\n'
+  const payload = line.slice(5).trim()
+  if (payload === '' || payload === '[DONE]') return line + '\n\n'
+  try {
+    const normalized = unwrapData(JSON.parse(payload))
+    return 'data: ' + JSON.stringify(normalized) + '\n\n'
+  } catch {
+    return line + '\n'
+  }
+}
+
+/** 从一帧规整后的 payload 提取 (finish_reason, content 长度, 是否 tool_calls, reasoning 片段)。 */
+interface FrameFacts {
+  finishReason: string
+  contentChars: number
+  hasToolCalls: boolean
+  reasoningDelta: string | null
+}
+
+function inspectFrame(obj: Record<string, unknown> | null): FrameFacts {
+  const facts: FrameFacts = { finishReason: '', contentChars: 0, hasToolCalls: false, reasoningDelta: null }
+  if (!obj) return facts
+  const choice = (((obj.choices as Array<Record<string, unknown>>) || [])[0]) as Record<string, unknown> | undefined
+  if (!choice) return facts
+  if (choice.finish_reason) facts.finishReason = String(choice.finish_reason)
+  const delta = (choice.delta || choice.message) as Record<string, unknown> | undefined
+  if (!delta) return facts
+  if (delta.content) facts.contentChars = String(delta.content).length
+  if (delta.tool_calls && Array.isArray(delta.tool_calls) && delta.tool_calls.length > 0) facts.hasToolCalls = true
+  const r = (delta.reasoning_content ?? delta.reasoning) as string | undefined
+  if (r) facts.reasoningDelta = String(r)
+  return facts
+}
+
+interface StreamAttemptOutcome {
+  kind: 'healthy' | 'degenerate' | 'empty'
+  response?: Response
+  /** healthy 但透传期触发了抑制空转（全程无产出），调用方仍应冷却该账号。 */
+  runaway?: boolean
+}
+
+/**
+ * 单次流式尝试：探测期缓冲前 PROBE_MAX_DELTAS 条 reasoning delta，用退化检测器判定——
+ * 退化 → 取消上游，调用方冷却换号重试；健康 → 一次性放行缓冲帧后转实时透传，
+ * 并用滚动窗口持续监控，退化中途出现则抑制后续 reasoning delta（垃圾不再直播到客户端 UI），
+ * 全程未产出正文时按空转冷却处理。
+ */
+async function pumpStreamAttempt(resp: Response): Promise<StreamAttemptOutcome> {
+  const reader = resp.body!.getReader()
   const decoder = new TextDecoder()
   const encoder = new TextEncoder()
   let buf = ''
-  ;(async () => {
-    try {
-      while (true) {
-        const { done, value } = await reader.read()
-        if (done) break
-        buf += decoder.decode(value, { stream: true })
-        let idx
-        while ((idx = buf.indexOf('\n')) >= 0) {
-          const line = buf.slice(0, idx)
-          buf = buf.slice(idx + 1)
-          if (line.startsWith('data:')) {
-            const payload = line.slice(5).trim()
-            if (payload === '' || payload === '[DONE]') {
-              await writer.write(encoder.encode(line + '\n\n'))
-              continue
-            }
-            try {
-              const obj = JSON.parse(payload)
-              const normalized = unwrapData(obj)
-              await writer.write(encoder.encode('data: ' + JSON.stringify(normalized) + '\n\n'))
-            } catch {
-              await writer.write(encoder.encode(line + '\n'))
-            }
-          } else {
-            await writer.write(encoder.encode(line + '\n'))
-          }
+  let writer: WritableStreamDefaultWriter<Uint8Array> | null = null
+  let readable: ReadableStream<Uint8Array> | null = null
+  const buffered: string[] = []
+  const probeDeltas: string[] = []
+  let ring: string[] = []
+  let suppress = false
+  let runaway = false
+  let contentChars = 0
+  let hasToolCalls = false
+  let finishReason = ''
+
+  const openWriter = async (): Promise<WritableStreamDefaultWriter<Uint8Array>> => {
+    const ts = new TransformStream<Uint8Array, Uint8Array>()
+    readable = ts.readable
+    const w = ts.writable.getWriter()
+    for (const f of buffered) await w.write(encoder.encode(f))
+    buffered.length = 0
+    ring = probeDeltas.slice(-RING_SIZE)
+    return w
+  }
+
+  const writeOut = async (out: string) => {
+    if (writer) await writer.write(encoder.encode(out))
+    else buffered.push(out)
+  }
+
+  const degenerateNow = () =>
+    probeDeltas.length >= DEGENERATE_MIN_DELTAS && isDegenerateReasoningDeltas(probeDeltas)
+
+  const finishResponse = async (): Promise<Response> => {
+    const w = await openWriter()
+    await w.close().catch(() => {})
+    return new Response(readable!, {
+      status: 200,
+      headers: { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-store', 'X-Accel-Buffering': 'no' },
+    })
+  }
+
+  try {
+    while (true) {
+      const { done, value } = await reader.read()
+      if (done) break
+      buf += decoder.decode(value, { stream: true })
+      let idx: number
+      while ((idx = buf.indexOf('\n')) >= 0) {
+        const line = buf.slice(0, idx)
+        buf = buf.slice(idx + 1)
+        const out = normalizeSSELine(line)
+
+        if (!line.startsWith('data:')) {
+          if (out) await writeOut(out)
+          continue
         }
+        const payload = line.slice(5).trim()
+        if (payload === '' || payload === '[DONE]') {
+          if (out) await writeOut(out)
+          continue
+        }
+        let obj: Record<string, unknown> | null = null
+        try { obj = unwrapData(JSON.parse(payload)) as Record<string, unknown> } catch { obj = null }
+        const facts = inspectFrame(obj)
+        if (facts.finishReason) finishReason = facts.finishReason
+        contentChars += facts.contentChars
+        if (facts.hasToolCalls) hasToolCalls = true
+
+        const isReasoningFrame = facts.reasoningDelta !== null
+        if (!writer) {
+          // ---- 探测期：缓冲 + 判定 ----
+          if (isReasoningFrame) probeDeltas.push(facts.reasoningDelta as string)
+          if (facts.contentChars > 0 || hasToolCalls) {
+            // 模型已开始产出正文/工具调用 → 放行
+            writer = await openWriter()
+            await writeOut(out!)
+            continue
+          }
+          if (probeDeltas.length >= PROBE_MAX_DELTAS) {
+            if (degenerateNow()) {
+              await reader.cancel().catch(() => {})
+              return { kind: 'degenerate' }
+            }
+            writer = await openWriter()
+            await writeOut(out!)
+            continue
+          }
+          if (finishReason) {
+            // 上游在窗口内就结束了：退化 → 拦截重试；空转 length → 按空响应处理；否则照常放行
+            if (degenerateNow()) {
+              await reader.cancel().catch(() => {})
+              return { kind: 'degenerate' }
+            }
+            if (finishReason === 'length' && contentChars === 0 && !hasToolCalls) {
+              await reader.cancel().catch(() => {})
+              return { kind: 'empty' }
+            }
+            writer = await openWriter()
+            await writer!.close().catch(() => {})
+            return { kind: 'healthy', response: new Response(readable!, {
+              status: 200,
+              headers: { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-store', 'X-Accel-Buffering': 'no' },
+            }) }
+          }
+          if (out) await writeOut(out)
+          continue
+        }
+
+        // ---- 透传期：滚动监控，退化中途出现则抑制 reasoning 帧 ----
+        if (suppress && isReasoningFrame) continue
+        if (!suppress && isReasoningFrame) {
+          ring.push(facts.reasoningDelta as string)
+          if (ring.length > RING_SIZE) ring.shift()
+          if (ring.length >= DEGENERATE_MIN_DELTAS && isDegenerateReasoningDeltas(ring)) suppress = true
+          if (suppress) continue
+        }
+        if (facts.finishReason && suppress && contentChars === 0 && !hasToolCalls) {
+          // 已抑制 + 全程无产出：按空转处理（上游冷却），向客户端明确报错而不是静默空结束
+          runaway = true
+          const errMsg = { error: { message: 'Cline 推理退化空转：全程未产出正文，已抑制垃圾 reasoning', type: 'upstream_runaway' } }
+          await writer.write(encoder.encode('data: ' + JSON.stringify(errMsg) + '\n\n'))
+        }
+        if (out) await writer.write(encoder.encode(out))
       }
-    } catch {
-      /* 流异常，忽略 */
-    } finally {
-      try { await writer.close() } catch { /* already closed */ }
     }
-  })()
-  return new Response(readable, {
-    status: 200,
-    headers: {
-      'Content-Type': 'text/event-stream',
-      'Cache-Control': 'no-store',
-      'X-Accel-Buffering': 'no',
-    },
-  })
+  } catch {
+    /* 上游流异常：探测期按空响应处理，透传期尽力收尾 */
+  }
+
+  if (writer) {
+    await writer.close().catch(() => {})
+    return { kind: 'healthy', runaway, response: new Response(readable!, {
+      status: 200,
+      headers: { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-store', 'X-Accel-Buffering': 'no' },
+    }) }
+  }
+  // 流在探测期内结束：退化 → 拦截；有缓冲内容 → 放行；纯空 → 空响应
+  if (degenerateNow()) {
+    await reader.cancel().catch(() => {})
+    return { kind: 'degenerate' }
+  }
+  if (buffered.length > 0) return { kind: 'healthy', response: await finishResponse() }
+  await reader.cancel().catch(() => {})
+  return { kind: 'empty' }
+}
+
+/** 模型级冷却（与 clineFetchWithRetry 同语义：有 model 上下文时只冷却该账号的该模型）。 */
+function applyModelCooldown(pool: Pool, model: string, ms: number) {
+  if (!pool.current) return
+  if (model) pool.current.modelCooldowns.set(model, Date.now() + Math.max(ms, 60 * 1000))
+  else cooldownAccount(pool.current, ms)
+}
+
+/**
+ * 流式转发（带推理空转防护）：最多 3 次尝试，退化/空响应冷却切号重试；
+ * 全部失败时返回 502 错误 JSON（客户端按错误处理，可自行重试）。
+ */
+async function proxyStreamChat(pool: Pool, body: Record<string, unknown>, sessionId: string): Promise<Response> {
+  const model = String((body as Record<string, unknown>).model || '')
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const resp = await clineFetchWithRetry(pool, '/chat/completions', body, sessionId, true)
+    if (!resp.ok) {
+      const errText = await resp.text().catch(() => '')
+      return jsonResponse(
+        { error: { message: `Cline 上游 HTTP ${resp.status}: ${errText.slice(0, 300)}`, type: 'upstream_error' } },
+        resp.status || 502
+      )
+    }
+    const outcome = await pumpStreamAttempt(resp)
+    if (outcome.kind === 'healthy') {
+      if (outcome.runaway) applyModelCooldown(pool, model, CLINE_COOLDOWN_RUNAWAY_MS)
+      return outcome.response!
+    }
+    applyModelCooldown(pool, model, outcome.kind === 'degenerate' ? CLINE_COOLDOWN_RUNAWAY_MS : CLINE_COOLDOWN_EMPTY_MS)
+    await sleep(500 + Math.random() * 500)
+  }
+  return jsonResponse(
+    { error: { message: 'Cline 推理退化/空响应连续 3 次未产出正文，已冷却换号仍失败', type: 'upstream_runaway' } },
+    502
+  )
 }
 
 function jsonResponse(obj: unknown, status: number): Response {
@@ -599,15 +827,9 @@ export async function proxyClineChatRequest(
   const body = buildUpstreamBody(forwardBody, true, sessionId)
   try {
     if (wantStream) {
-      const resp = await clineFetchWithRetry(pool, '/chat/completions', body, sessionId, true)
-      if (!resp.ok) {
-        const errText = await resp.text().catch(() => '')
-        return jsonResponse(
-          { error: { message: `Cline 上游 HTTP ${resp.status}: ${errText.slice(0, 300)}`, type: 'upstream_error' } },
-          resp.status || 502
-        )
-      }
-      return streamSSE(resp)
+      // 2026-09-05：流式不再纯透传（原 streamSSE），改为带推理退化防护的流式转发：
+      // 探测期判定空转 → 冷却换号重试；健康才放行，透传期持续抑制退化 reasoning。
+      return await proxyStreamChat(pool, body, sessionId)
     }
     return await proxyNonStreamChat(pool, body, sessionId)
   } catch (err) {

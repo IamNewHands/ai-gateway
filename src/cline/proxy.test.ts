@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest'
-import { parseCooldownMs, fetchClineModels, isRunawayReasoningCutoff } from './proxy'
+import { parseCooldownMs, fetchClineModels, isRunawayReasoningCutoff, isDegenerateReasoningDeltas } from './proxy'
 
 describe('Cline 冷却时长解析（item3）', () => {
   it('解析 "Try again in 2h 51m" 为毫秒', () => {
@@ -51,5 +51,38 @@ describe('推理空转截断判定 isRunawayReasoningCutoff', () => {
     expect(isRunawayReasoningCutoff('', [], 'stop')).toBe(false)
     expect(isRunawayReasoningCutoff('', [], 'tool_calls')).toBe(false)
     expect(isRunawayReasoningCutoff('', [], '')).toBe(false)
+  })
+})
+
+describe('推理退化检测 isDegenerateReasoningDeltas（2026-09-05 流式防护）', () => {
+  // 样本取自 dsh-session-8711a1e7 日志的真实轮次
+  it('病态：纯空白/换行洪泛（T5/S34：71 条 delta 95% 是空白）→ 判定退化', () => {
+    const deltas = Array.from({ length: 71 }, (_, i) => (i % 3 === 0 ? '\n' : '  \n '))
+    expect(isDegenerateReasoningDeltas(deltas)).toBe(true)
+  })
+  it('病态：一个字一个空格的碎片流（T5/S19 形态）→ 判定退化', () => {
+    const deltas = Array.from({ length: 48 }, (_, i) => (i % 2 === 0 ? ' \n' : ' ('))
+    expect(isDegenerateReasoningDeltas(deltas)).toBe(true)
+  })
+  it('病态：短碎片 + 高换行密度（T12/S34 形态）→ 判定退化', () => {
+    const deltas = Array.from({ length: 21 }, (_, i) => (i % 5 === 0 ? 'close' : ' \n\n '))
+    expect(isDegenerateReasoningDeltas(deltas)).toBe(true)
+  })
+  it('病态："全是空格的长文"形态（大量字符但可见字符占比极低）→ 判定退化', () => {
+    const deltas = Array.from({ length: 30 }, () => 'a    '.repeat(10)) // 每条 50 字符仅 10 可见
+    expect(isDegenerateReasoningDeltas(deltas)).toBe(true)
+  })
+  it('正常：连贯英文思考 token 流（127 条、7k 字符，T6/S23 形态）→ 不误伤', () => {
+    const words = ['Now', ' I', ' see', ' the', ' issue', '.', ' The', ' `buildToolLedger`', ' uses', ' `toolCallFingerprint`', ' which', ' compiles', ' the', ' fingerprint', ' from', ' tool', ' calls', '.\n']
+    const deltas = Array.from({ length: 127 }, (_, i) => words[i % words.length])
+    expect(isDegenerateReasoningDeltas(deltas)).toBe(false)
+  })
+  it('正常：含代码块/列表的中文长思考（换行但连贯）→ 不误伤', () => {
+    const deltas = Array.from({ length: 60 }, (_, i) => (i % 5 === 0 ? '\n' : '先读取 `tool-ledger.ts` 的实现，再对比两边的差异。'))
+    expect(isDegenerateReasoningDeltas(deltas)).toBe(false)
+  })
+  it('样本不足 16 条 → 不判定（正常短思考也可能都是小 token）', () => {
+    expect(isDegenerateReasoningDeltas(['\n', ' ', ' \n'])).toBe(false)
+    expect(isDegenerateReasoningDeltas([])).toBe(false)
   })
 })
