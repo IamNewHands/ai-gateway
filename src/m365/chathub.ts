@@ -400,6 +400,22 @@ export function appendChatHubDelta(current: string, chunk: string, emit?: (delta
 }
 
 /**
+ * 假成功上游失败识别（同 B syntheticUpstreamFailureCode:853-861）。
+ * ChatHub 偶尔把账号节流包装在名义成功的 type:2 消息/增量里（HTTP 调用方会看到
+ * 200/completed 却没有任何工具调用）。只把短的、上游编排的容量占位文本判为失败；
+ * 提及限流的普通模型长文必须保持可见（≤512 字符 + 全文精确匹配，避免长文误判）。
+ */
+export function syntheticUpstreamFailureCode(value: unknown): 'CHAT_UPSTREAM_RATE_LIMITED' | null {
+  if (typeof value !== 'string') return null
+  const normalized = value.replace(/\s+/gu, ' ').trim().toLowerCase()
+  if (normalized.length === 0 || normalized.length > 512) return null
+  if (/^(?:we['’]?re|we are) temporarily unable to respond to (?:this|the current) volume of requests(?:[.! ]+please try again later[.!]*)?$/u.test(normalized)) {
+    return 'CHAT_UPSTREAM_RATE_LIMITED'
+  }
+  return null
+}
+
+/**
  * 剥除"我将执行…"旁白（同 B scrubNarration:840-845）。
  * 模型常以"我将执行：目的：预期："等叙述性文本开头，且不包含实际工具调用内容，
  * 直接剥离以免占据有限的上下文或混淆下游。
@@ -436,6 +452,16 @@ export function collapseExcessBlankLines(text: string, maxConsecutive = 1): stri
   }
   while (out.length > 0 && out[out.length - 1] === '') out.pop()
   return out.join('\n')
+}
+
+/**
+ * 判断一次拨号/握手失败是否值得重连（pre-submit 有界重连用，同 B chatHub mayRetryUnseenChatHubFailure 的传输类白名单）。
+ * 只对瞬时传输故障返回 true：拨号失败、握手协议类、握手空响应、握手读等待超时、WS 关闭/错误。
+ * 鉴权/限流/内容策略等语义失败一律不重试（重试无意义且会放大调用）。
+ */
+export function isRetryableChatConnectError(err: unknown): boolean {
+  if (!(err instanceof Error)) return false
+  return /WS_DIAL_ERROR|ws dial failed|WS_HANDSHAKE_INVALID|WS_HANDSHAKE_EMPTY|WS_HANDSHAKE_UNEXPECTED_FRAME|timeout waiting handshake|ws error|ws closed|ws already closed/.test(err.message)
 }
 
 /** 组装 ChatHub chat 帧（type=4 target=chat） */
@@ -625,6 +651,94 @@ function buildPlugins(tools: ChatHubTool[], mcpServerUrl?: string): Record<strin
   return plugins
 }
 
+/** WS 消息读取上限（同 B socketReader，chathub.ts:1547-1643 的 BoundedPayloadError 边界） */
+export const DEFAULT_MAX_QUEUED_SOCKET_CHARS = 2_000_000
+export const DEFAULT_MAX_FRAME_CHARS = 1_500_000
+
+export interface SocketRead { msg?: string; err?: Error }
+
+export interface SocketReaderLimits {
+  /** 队列积压字符上限：读循环来不及消费、积压超过上限即快速失败（防 Worker 隔离区被异常上游撑爆） */
+  maxQueuedChars?: number
+  /** 单帧字符上限：解码前/后拒绝超大帧 */
+  maxFrameChars?: number
+}
+
+/**
+ * 有界 WS 消息读取器（同 B socketReader）：事件驱动 → 同步式读取。
+ * - 队列积压超过 maxQueuedChars：清空积压、快速失败（WS_BUFFER_TOO_LARGE）并主动 close(1009)
+ * - 单帧超过 maxFrameChars：快速失败（WS_FRAME_TOO_LARGE）并主动 close(1009)，二进制帧在解码前就拒绝
+ * - 首终因保留：超限错误先入队，随后 close 事件的泛化错误排在后面，读循环先观察到真实原因
+ */
+export function socketReader(
+  socket: WebSocket,
+  limits: SocketReaderLimits = {},
+): { next(): Promise<SocketRead>; push(v: SocketRead): void } {
+  const maxQueued = limits.maxQueuedChars ?? DEFAULT_MAX_QUEUED_SOCKET_CHARS
+  const maxFrame = limits.maxFrameChars ?? DEFAULT_MAX_FRAME_CHARS
+  const queue: SocketRead[] = []
+  const waiters: ((v: SocketRead) => void)[] = []
+  let queuedChars = 0
+  let closed = false
+
+  const push = (v: SocketRead): void => {
+    if (closed) return
+    if (waiters.length > 0) {
+      // 有等待者时直接交付（同 B settle：直传不占队列）
+      waiters.shift()!(v)
+      return
+    }
+    const incoming = v.msg?.length ?? 0
+    if (queuedChars + incoming > maxQueued) {
+      queue.length = 0
+      queuedChars = 0
+      try { socket.close(1009, 'buffer too large') } catch { /* already closed */ }
+      queue.push({ err: new Error(`WS_BUFFER_TOO_LARGE: websocket queue exceeded ${maxQueued} chars`) })
+      return
+    }
+    queue.push(v)
+    queuedChars += incoming
+  }
+
+  socket.addEventListener('message', (e) => {
+    const data = (e as MessageEvent).data
+    if (data instanceof ArrayBuffer && data.byteLength > maxFrame) {
+      // 二进制帧超限：解码前提前拒绝（同 B binaryFrameByteLength early reject）
+      try { socket.close(1009, 'frame too large') } catch { /* already closed */ }
+      push({ err: new Error(`WS_FRAME_TOO_LARGE: frame ${data.byteLength} bytes > ${maxFrame}`) })
+      return
+    }
+    const text = typeof data === 'string' ? data : data instanceof ArrayBuffer ? new TextDecoder().decode(data) : String(data)
+    if (text.length > maxFrame) {
+      try { socket.close(1009, 'frame too large') } catch { /* already closed */ }
+      push({ err: new Error(`WS_FRAME_TOO_LARGE: frame ${text.length} chars > ${maxFrame}`) })
+      return
+    }
+    push({ msg: text })
+  })
+  socket.addEventListener('close', (e) => {
+    // 先入队再置 closed（push 内部会丢弃 closed 之后的项，顺序反了会导致 close 错误永远送不到读循环）
+    push({ err: new Error(`ws closed: code=${(e as CloseEvent).code} reason=${(e as CloseEvent).reason || ''}`) })
+    closed = true
+  })
+  socket.addEventListener('error', () => {
+    // close 事件随后触发；这里只兜底
+    push({ err: new Error('ws error') })
+  })
+
+  const next = (): Promise<SocketRead> => {
+    if (queue.length > 0) {
+      const v = queue.shift()!
+      queuedChars -= v.msg?.length ?? 0
+      if (queuedChars < 0) queuedChars = 0
+      return Promise.resolve(v)
+    }
+    if (closed) return Promise.resolve({ err: new Error('ws already closed') })
+    return new Promise((resolve) => waiters.push(resolve))
+  }
+  return { next, push }
+}
+
 /**
  * 核心对话入口：建立 WS → 握手 → 发送 payload → 流式解析事件 → 返回完整结果。
  * text delta 与 reasoning 通过 handler 即时送出，最终 Result 包含全文与推理。
@@ -654,82 +768,25 @@ export async function chatWithHandlers(
     await uploadAttachments(acc, conversationId, req.attachments, opts)
   }
 
-  // 2) 建立出站 WS（Cloudflare 出站 WebSocket 需用 fetch + Upgrade 头，
-  //    且 URL 必须把 wss:// 转成 https://，不能直接用 wss 协议 fetch。
-  //    参考 openai-agents-js CloudflareRealtimeTransport：wss→https 后取 resp.webSocket.accept()）
-  const wsURL = buildWSURL(acc, sessionId, conversationId, requestID)
-  let socket: OutboundWebSocket
-  try {
-    const httpUrl = wsURL.replace(/^wss:\/\//i, 'https://').replace(/^ws:\/\//i, 'http://')
-    const resp = await fetch(httpUrl, {
-      method: 'GET',
-      headers: {
-        Upgrade: 'websocket',
-        Connection: 'Upgrade',
-        Origin: 'https://m365.cloud.microsoft',
-        // UA 与真实浏览器统一为 Chrome（同原项目 NewClient）——M365 按会话指纹的 UA 识别，避免被当作异常客户端
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
-      },
-    })
-    if (resp.status !== 101 || !resp.webSocket) {
-      const text = await resp.text().catch(() => '')
-      // 读取 Retry-After 并挂到错误上，供 account-health 冷却使用（同原版 DialError.RetryAfter）
-      const retryAfterRaw = resp.headers.get('retry-after')
-      const err = new Error(`ws dial failed: HTTP ${resp.status} ${text.substring(0, 200)}`) as Error & { retryAfterSeconds?: number }
-      if (retryAfterRaw && /^\d+$/.test(retryAfterRaw.trim())) {
-        err.retryAfterSeconds = parseInt(retryAfterRaw.trim(), 10)
-      }
-      throw err
-    }
-    socket = resp.webSocket as unknown as OutboundWebSocket
-    socket.accept()
-  } catch (err) {
-    // 脱敏：Cloudflare fetch 错误包含完整 URL（含 access_token query 参数），
-    // 不传播原始错误消息（同 B chathub.ts:1783-1791，Never propagate the fetch error）。
-    // 保留上游 Retry-After（供 account-health 冷却）
-    const retryAfterSeconds = (err as Error & { retryAfterSeconds?: number }).retryAfterSeconds
-    const sanitized = err instanceof Error && err.message.startsWith('ws dial failed: HTTP ')
-      ? err.message  // 来自上面非 101 的显式 throw，已脱敏，原样保留
-      : 'WS_DIAL_ERROR'  // 来自 fetch 层错误（含 URL/access_token），用固定标识替代
-    const wrapped = new Error(sanitized) as Error & { retryAfterSeconds?: number }
-    if (retryAfterSeconds) wrapped.retryAfterSeconds = retryAfterSeconds
-    throw wrapped
-  }
-
-  // 消息队列：事件驱动 → 同步式读取
-  const queue: { msg?: string; err?: Error }[] = []
-  const waiters: ((v: { msg?: string; err?: Error }) => void)[] = []
-  let closed = false
-  const push = (v: { msg?: string; err?: Error }) => {
-    if (closed) return
-    if (waiters.length > 0) {
-      const w = waiters.shift()!
-      w(v)
-    } else {
-      queue.push(v)
-    }
-  }
-  socket.addEventListener('message', (e) => {
-    const data = (e as MessageEvent).data
-    const text = typeof data === 'string' ? data : data instanceof ArrayBuffer ? new TextDecoder().decode(data) : String(data)
-    push({ msg: text })
-  })
-  socket.addEventListener('close', (e) => {
-    // 先入队再置 closed（push 内部会丢弃 closed 之后的项，顺序反了会导致 close 错误永远送不到读循环）
-    push({ err: new Error(`ws closed: code=${(e as CloseEvent).code} reason=${(e as CloseEvent).reason || ''}`) })
-    closed = true
-  })
-  socket.addEventListener('error', () => {
-    // close 事件随后触发；这里只兜底
-    push({ err: new Error('ws error') })
-  })
-
-  const next = (): Promise<{ msg?: string; err?: Error }> => {
-    if (queue.length > 0) return Promise.resolve(queue.shift()!)
-    if (closed) return Promise.resolve({ err: new Error('ws already closed') })
-    return new Promise((resolve) => waiters.push(resolve))
-  }
-
+  // 2) 建立出站 WS + SignalR 握手（含 pre-submit 有界重连，同 B chatHub:2058-2117 之 pre-submit 段）。
+  //    Cloudflare 出站 WebSocket 用 fetch + Upgrade 头，URL 须 wss→https（同 openai-agents-js transport）。
+  //    拨号/握手属瞬时传输故障：在发送 invocation(payload) 之前最多重连 1 次，共享同一 deadline，
+  //    重试不拉长总时长；已发送 payload 之后的上游失败交由 durable 层账号切换重试，此处不重复重放。
+  const timeoutMs = opts.timeoutMs || 300_000
+  const readTimeoutMs = opts.readTimeoutMs || 90_000
+  const deadline = Date.now() + timeoutMs
+  // 无语义进展超时（同原版 04f5481）：微软会保持连接却长时间不发 update/result 帧。
+  // 收到语义帧才续期 progressDeadline，否则到达截止即失败，让客户端快速感知冻结而非看起来卡死。
+  const progressIdleMs = 90_000
+  let progressDeadline = Math.min(deadline, Date.now() + progressIdleMs)
+  // 客户端断连时中止（同原版 r.Context().Done() → 取消上游对话）
+  const aborted = () => opts.signal?.aborted === true
+  let disengaged = false
+  let pingTimer: ReturnType<typeof setInterval> | undefined
+  let socket!: OutboundWebSocket
+  let next!: () => Promise<SocketRead>
+  let push!: (v: SocketRead) => void
+  const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms))
   const withTimeout = <T>(p: Promise<T>, ms: number, what: string): Promise<T> => {
     return new Promise<T>((resolve, reject) => {
       const timer = setTimeout(() => reject(new Error(`timeout waiting ${what} (${ms}ms)`)), ms)
@@ -737,21 +794,47 @@ export async function chatWithHandlers(
     })
   }
 
-  const timeoutMs = opts.timeoutMs || 300_000
-  const readTimeoutMs = opts.readTimeoutMs || 90_000
-  const deadline = Date.now() + timeoutMs
-  // 无语义进展超时（同原版 04f5481）：微软会保持连接却长时间不发 update/result 帧。
-  // 此时不应挂满整个 timeoutMs；收到语义帧才续期 progressDeadline，否则到达截止即失败，
-  // 让客户端快速感知冻结并及时重试（而非看起来卡死）。
-  const progressIdleMs = 90_000
-  let progressDeadline = Math.min(deadline, Date.now() + progressIdleMs)
-  // 客户端断连时中止（同原版 r.Context().Done() → 取消上游对话）
-  const aborted = () => opts.signal?.aborted === true
-  let disengaged = false
-  let pingTimer: ReturnType<typeof setInterval> | undefined
+  const dialAndHandshake = async (): Promise<void> => {
+    // —— 出站拨号（脱敏：Cloudflare fetch 错误含完整 URL + access_token query，不传播原始消息，同 B:1783-1791；
+    //    保留上游 Retry-After 供 account-health 冷却）
+    const wsURL = buildWSURL(acc, sessionId, conversationId, requestID)
+    try {
+      const httpUrl = wsURL.replace(/^wss:\/\//i, 'https://').replace(/^ws:\/\//i, 'http://')
+      const resp = await fetch(httpUrl, {
+        method: 'GET',
+        headers: {
+          Upgrade: 'websocket',
+          Connection: 'Upgrade',
+          Origin: 'https://m365.cloud.microsoft',
+          // UA 与真实浏览器统一为 Chrome（同原项目 NewClient）——M365 按会话指纹的 UA 识别，避免被当作异常客户端
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+        },
+      })
+      if (resp.status !== 101 || !resp.webSocket) {
+        const text = await resp.text().catch(() => '')
+        const retryAfterRaw = resp.headers.get('retry-after')
+        const err = new Error(`ws dial failed: HTTP ${resp.status} ${text.substring(0, 200)}`) as Error & { retryAfterSeconds?: number }
+        if (retryAfterRaw && /^\d+$/.test(retryAfterRaw.trim())) err.retryAfterSeconds = parseInt(retryAfterRaw.trim(), 10)
+        throw err
+      }
+      socket = resp.webSocket as unknown as OutboundWebSocket
+      socket.accept()
+    } catch (err) {
+      const retryAfterSeconds = (err as Error & { retryAfterSeconds?: number }).retryAfterSeconds
+      const sanitized = err instanceof Error && err.message.startsWith('ws dial failed: HTTP ')
+        ? err.message  // 来自非 101 的显式 throw，已脱敏，原样保留
+        : 'WS_DIAL_ERROR'  // 来自 fetch 层错误（含 URL/access_token），用固定标识替代
+      const wrapped = new Error(sanitized) as Error & { retryAfterSeconds?: number }
+      if (retryAfterSeconds) wrapped.retryAfterSeconds = retryAfterSeconds
+      throw wrapped
+    }
 
-  try {
-    // 3) 握手：发送 SignalR 握手请求，验证返回帧（同 B parseSignalRHandshake:1489-1524）
+    // 有界消息读取器（见 socketReader）：事件驱动 → 同步式读取
+    const rd = socketReader(socket)
+    next = rd.next
+    push = rd.push
+
+    // —— 握手（同 B parseSignalRHandshake:1489-1524）：发送 SignalR 握手请求并验证返回帧
     socket.send(`{"protocol":"json","version":1}${RS}`)
     const handshakeFrame = await withTimeout(next(), 15_000, 'handshake')
     if (handshakeFrame.msg) {
@@ -778,7 +861,24 @@ export async function chatWithHandlers(
     } else if (handshakeFrame.err) {
       throw handshakeFrame.err
     }
+  }
 
+  // 仅对瞬时传输故障重试（拨号失败/握手协议类/握手空响应/读等待超时）；鉴权/限流等语义失败不重试。
+  const retryableConnectError = (err: unknown): boolean => isRetryableChatConnectError(err)
+
+  // 拨号+握手：最多 2 次、共享 deadline、250ms 退避。此时 payload 尚未发送（无任何语义/重复风险）。
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      await dialAndHandshake()
+      break
+    } catch (err) {
+      try { socket?.close() } catch { /* ignore */ }
+      if (attempt === 1 || aborted() || Date.now() >= deadline || !retryableConnectError(err)) throw err
+      await sleep(250)
+    }
+  }
+
+  try {
     // 主动 15s ping 定时器：长思考期间防静默断连（同 B:1814-1816）
     pingTimer = setInterval(() => {
       try { socket.send(`{"type":6}${RS}`) } catch { /* read side reports closure */ }
@@ -795,6 +895,8 @@ export async function chatWithHandlers(
     let streamedText = ''
     let rawResult = ''
     let throttling: unknown
+    /** 假成功节流占位标记：增量/快照/最终消息里出现上游容量占位文本（同 B syntheticFailureCode） */
+    let syntheticFailure = false
     /** 收集原生工具事件（含 messages[] 之外的插件调用），供上层 nativeToolCalls 提取 */
     const collectedEvents: unknown[] = []
     /** 收集图片 URL 的帧内容：update 帧 arguments + result 帧 item（同原版 events 全量收集） */
@@ -837,9 +939,11 @@ export async function chatWithHandlers(
     const emitSnapshot = (snapshot: string): void => {
       if (!snapshot) return
       debugEmit('chathub-snapshot', snapshot)
-      // 同原版顺序：图片额度 → 限流 → 内容策略
+      // 同原版顺序：图片额度 → 限流 → 假成功占位 → 内容策略
       if (imageLimitDetected(snapshot)) throw new Error('upstream image generation daily limit reached')
       if (rateLimited(snapshot)) throw new Error('upstream rate-limit notice')
+      // 假成功节流占位按普通 bot 消息到达时立即抛出（同 B:1861-1862）
+      if (syntheticUpstreamFailureCode(snapshot)) throw new Error('upstream rate-limit notice')
       if (contentPolicyDetected(snapshot)) throw new Error('upstream content policy flagged as offensive')
       const cur = streamedText
       if (cur === '') {
@@ -918,10 +1022,15 @@ export async function chatWithHandlers(
             const wac = a['writeAtCursor']
             if (typeof wac === 'string' && wac !== '' && !toolFrame) {
               debugEmit('chathub-delta', wac)
-              // 安全合并：处理重复/累计帧问题（同 B appendChatHubDelta:1679-1693）
-              if (streamedText !== '') {
-                streamedText = appendChatHubDelta(streamedText, wac, onDelta ?? undefined)
-              } else emitSnapshot(wac)
+              // 假成功节流占位：不透传给客户端，记为上游限流（同 B:1951）
+              if (syntheticUpstreamFailureCode(wac)) {
+                syntheticFailure = true
+              } else {
+                // 安全合并：处理重复/累计帧问题（同 B appendChatHubDelta:1679-1693）
+                if (streamedText !== '') {
+                  streamedText = appendChatHubDelta(streamedText, wac, onDelta ?? undefined)
+                } else emitSnapshot(wac)
+              }
             }
             for (const mraw of msgs) {
               if (!mraw || typeof mraw !== 'object') continue
@@ -965,6 +1074,8 @@ export async function chatWithHandlers(
                 debugEmit('chathub-result', finalText)
                 // 同原版 type=2 分支：final 消息三类检测（内容策略此处不带 streamed 守卫）
                 if (imageLimitDetected(finalText)) throw new Error('upstream image generation daily limit reached')
+                // 假成功节流占位（同 B:1995-1996）：名义成功消息携带上游容量占位文本 → 限流失败
+                if (syntheticUpstreamFailureCode(finalText)) throw new Error('upstream rate-limit notice')
                 if (rateLimited(finalText)) throw new Error('upstream rate-limit notice')
                 if (isContentPolicyBlock(finalText)) throw new Error('upstream content policy flagged as offensive')
               }
@@ -987,6 +1098,7 @@ export async function chatWithHandlers(
             throw new Error(`chathub completion error: ${upstreamErrorLabel(frame.error)}`)
           }
           // 同原版：先检查 final 是否限流，避免限流提示经 finalizeText 泄漏给客户端
+          if (syntheticFailure) throw new Error('upstream rate-limit notice')
           if (rateLimited(finalText)) throw new Error('upstream rate-limit notice')
           // 以最终消息对齐流式文本：流式漏掉的尾部在这里补发（原版 finalizeText）
           const text = finalizeText(streamedText, finalText || streamedText, onDelta)

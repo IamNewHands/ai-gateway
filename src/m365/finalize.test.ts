@@ -1,5 +1,40 @@
 import { describe, it, expect, vi } from 'vitest'
-import { finalizeText, collapseExcessBlankLines, appendChatHubDelta, scrubNarration } from './chathub'
+import { finalizeText, collapseExcessBlankLines, appendChatHubDelta, scrubNarration, syntheticUpstreamFailureCode } from './chathub'
+
+describe('syntheticUpstreamFailureCode（B:853-861 假成功限流占位识别）', () => {
+  it('上游容量占位文本 → CHAT_UPSTREAM_RATE_LIMITED', () => {
+    expect(syntheticUpstreamFailureCode("We're temporarily unable to respond to this volume of requests")).toBe('CHAT_UPSTREAM_RATE_LIMITED')
+    expect(syntheticUpstreamFailureCode('We are temporarily unable to respond to the current volume of requests. Please try again later!')).toBe('CHAT_UPSTREAM_RATE_LIMITED')
+  })
+
+  it('大小写与空白差异不敏感（归一化后匹配）', () => {
+    expect(syntheticUpstreamFailureCode('  we\'RE   TEMPORARILY   UNABLE to respond\n to this volume\t of requests ')).toBe('CHAT_UPSTREAM_RATE_LIMITED')
+  })
+
+  it('提及限流的普通模型长文保持可见（非精确匹配 → null）', () => {
+    expect(syntheticUpstreamFailureCode('The rate limit was hit because we\'re temporarily unable to respond to this volume of requests today, see docs.')).toBeNull()
+    expect(syntheticUpstreamFailureCode('用户提到 we are temporarily unable to respond to this volume of requests。')).toBeNull()
+  })
+
+  it('超过 512 字符直接不判定（防长文误判）', () => {
+    expect(syntheticUpstreamFailureCode('x'.repeat(513))).toBeNull()
+    // 边界：归一化后 513 字符的占位文本（原长可更长）仍不匹配
+    const long = 'we are temporarily unable to respond to this volume of requests. ' + 'y'.repeat(460)
+    expect(syntheticUpstreamFailureCode(long)).toBeNull()
+  })
+
+  it('裸句点结尾且无 please 尾巴的变体不判定（精确匹配边界，与 B 正则一致）', () => {
+    expect(syntheticUpstreamFailureCode("We're temporarily unable to respond to this volume of requests.")).toBeNull()
+  })
+
+  it('非字符串与空串返回 null', () => {
+    expect(syntheticUpstreamFailureCode(undefined)).toBeNull()
+    expect(syntheticUpstreamFailureCode(null)).toBeNull()
+    expect(syntheticUpstreamFailureCode(123)).toBeNull()
+    expect(syntheticUpstreamFailureCode('')).toBeNull()
+    expect(syntheticUpstreamFailureCode('   ')).toBeNull()
+  })
+})
 
 describe('finalizeText', () => {
   it('final 为空时返回 streamed（或空串）', () => {
