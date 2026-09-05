@@ -623,8 +623,14 @@ export async function checkinOneAccount(env: Env, provider: Provider): Promise<C
 
 // ===== 全量签到 =====
 
-// 签到仅支持 WorkBuddy（CN）和 QoderWork 账号。M365 Copilot 等不含签到功能，
-// 通过 `p.oauth.flowType !== 'm365-pkce' && p.oauth.flowType !== 'm365-ropc'` 排除。
+// 签到仅支持 WorkBuddy（CN）和 QoderWork 账号。M365 Copilot / Gemini CLI 不含签到功能，
+// 通过 flowType 排除（m365-pkce / m365-ropc / gemini）；TRAE SOLO 由 runTraeCheckins 单独处理。
+const CHECKIN_EXCLUDED_FLOWS = ['m365-pkce', 'm365-ropc', 'gemini'] as const
+
+/** 是否参与签到扫全量（WorkBuddy / QoderWork；排除 M365 / Gemini / TRAE）。 */
+function participatesInCheckin(p: Provider): boolean {
+  return p.authType === 'oauth-device' && !!p.oauth && !CHECKIN_EXCLUDED_FLOWS.includes(p.oauth.flowType as never) && !isTraeProvider(p)
+}
 
 export async function runAllCheckins(env: Env, silent = false): Promise<{
   total: number
@@ -635,7 +641,7 @@ export async function runAllCheckins(env: Env, silent = false): Promise<{
   results: CheckinResult[]
 }> {
   const providers = (await getProviders(env)) as Provider[]
-  const oauthProviders = providers.filter((p) => p.authType === 'oauth-device' && p.oauth && p.oauth.flowType !== 'm365-pkce' && p.oauth.flowType !== 'm365-ropc')
+  const oauthProviders = providers.filter(participatesInCheckin)
 
   const results: CheckinResult[] = []
   // 简单串行（账号数量通常很少，且避免并发刷新 token 冲突）
@@ -681,6 +687,8 @@ export async function handleCheckinTrigger(c: Context<{ Bindings: Env }>) {
     if (!p) return c.json<ApiResponse>({ success: false, message: '提供商不存在' }, 404)
     if (p.oauth?.flowType === 'm365-pkce' || p.oauth?.flowType === 'm365-ropc')
       return c.json<ApiResponse>({ success: false, message: 'M365 账号不参与签到' }, 400)
+    if (p.oauth?.flowType === 'gemini')
+      return c.json<ApiResponse>({ success: false, message: 'Gemini 账号无签到功能' }, 400)
     const result = await checkinOneAccount(c.env, p)
     if (!body.silent) {
       try { await writeLog(c.env, 'info', `[checkin] ${p.name} → ${result.reason}（手动）`, JSON.stringify(result)) } catch { /* ignore */ }
@@ -702,8 +710,8 @@ export async function handleCheckinTrigger(c: Context<{ Bindings: Env }>) {
 export async function handleCheckinStatus(c: Context<{ Bindings: Env }>) {
   const providers = (await getProviders(c.env)) as Provider[]
 
-  // WorkBuddy / QoderWork：oauth-device 家族
-  const oauthProviders = providers.filter((p) => p.authType === 'oauth-device' && p.oauth && p.oauth.flowType !== 'm365-pkce' && p.oauth.flowType !== 'm365-ropc' && !isTraeProvider(p))
+  // WorkBuddy / QoderWork：oauth-device 家族（排除 M365 / Gemini / TRAE）
+  const oauthProviders = providers.filter(participatesInCheckin)
 
   const workbuddy: CheckinResult[] = []
   for (const p of oauthProviders) {
@@ -742,7 +750,7 @@ export async function handleAdminOverview(c: Context<{ Bindings: Env }>) {
   const providers = (await getProviders(c.env)) as Provider[]
 
   // WorkBuddy/QoderWork 签到结果聚合：池账号逐个累加，单账号直接取
-  const oauthProviders = providers.filter((p) => p.authType === 'oauth-device' && p.oauth && p.oauth.flowType !== 'm365-pkce' && p.oauth.flowType !== 'm365-ropc' && !isTraeProvider(p))
+  const oauthProviders = providers.filter(participatesInCheckin)
   let checkedIn = 0, totalAccounts = 0, remain = 0, size = 0
   for (const p of oauthProviders) {
     const r = await readCheckinResult(c.env, p.id)
