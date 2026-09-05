@@ -101,44 +101,42 @@ export function isRunawayReasoningCutoff(content: string, toolCalls: unknown[], 
   return !hasContent && !hasToolCall
 }
 
-// ===== 推理退化检测（流式防护，2026-09-05） =====
+// ===== 推理退化检测（流式防护，2026-09-05，v2 校准） =====
 
-// 阈值按 DSH 会话日志（dsh-session-8711a1e7）342 个真实 reasoning 步校准：
-//   正常步：trash 比例 = 0、换行率 ≈ 0.01–0.02（哪怕 7k 字符的长思考）；
-//   病态步（"一个字一个空格 / 全是换行"）：trash 比例 ≥ 0.5、换行率 ≥ 0.3，且 8 个命中步零漏判零误伤。
-const DEGENERATE_MIN_DELTAS = 16   // 样本太少不判定（正常短思考也可能都是小 token）
-const DEGENERATE_TRASH_MIN_DELTAS = 24
-const DEGENERATE_TRASH_RATIO = 0.6 // "纯空白碎片 delta" 占比（trash = 可见字符 ≤ 2）
-const DEGENERATE_NL_RATIO = 0.3    // 换行字符占比（正常 ≈ 0.01，病态 ≥ 0.3，留 10 倍以上裕量）
-const DEGENERATE_BLANK_MIN_CHARS = 600
-const DEGENERATE_BLANK_MAX_VISIBLE_RATIO = 0.4  // 长文本里几乎全是空白的 "一个字一个空格" 形态
-const PROBE_MAX_DELTAS = 24        // 流式探测窗口：缓冲满这个数量即做放行/拦截判定
-const RING_SIZE = 32               // 放行后的滚动监控窗口
+// v1 用「空白碎片 delta 占比 / 换行率」判别（换行率 ≥0.3 即判退化），会误杀大量正常思考：
+// cline/z-ai 上游（glm）常把每个思考 token 单独成行/每个 token 后跟换行发出，使"换行率"
+// 虚高（实测正常思考到 0.2–0.3），内容却是连贯技术推理，被 v1 当成退化拦截，
+// 导致同轮 3 次重试全被掐 → 客户端收到 502 upstream_runaway，正常会话反而做不了。
+//
+// 用日志两批真实 reasoning 步校准「空白占比」（空白字符 ÷ 总字符）：
+//   真退化（空白/乱码洪泛，烧光预算）：0.59–0.96（T5/S34、T12/S39、T12/S34、T5/S30…）
+//   一词一行但连贯的思考（本次被误杀对象）：0.21–0.45（T18/S3/S6/S7…）
+//   正常散文/中文思考：0.15–0.25
+// 判别：空白占比 ≥0.55 且总字符 ≥250 → 退化。语言无关（英文/中文/乱码一致）。
+const DEGENERATE_MIN_DELTAS = 1        // 按字符占比判别，条数门槛放宽
+const DEGENERATE_MIN_CHARS = 250       // 太少字符无法稳定估计，且短垃圾自限不烧预算
+const DEGENERATE_MAX_WS_RATIO = 0.55   // 空白占比低于此判定（正常思考 ≤0.45，留裕量）
+const PROBE_MAX_DELTAS = 24            // 流式探测窗口：缓冲满这个数量即做放行/拦截判定
+const RING_SIZE = 32                   // 放行后的滚动监控窗口
 
 /**
- * 判定一组 reasoning delta 是否为「推理退化空转」的输出特征：
- * 大量 delta 只有 1–2 个可见字符甚至纯空白/换行，换行密度异常高，
- * 整体像碎片化的乱码而非连贯思考。
+ * 判定一组 reasoning delta 是否为「推理退化空转」。
+ *
+ * 不能看"换行多/碎片多"——正常思考也常被上游拆成一词一行。真正病态是「攒了很多字符却几乎
+ * 都是空白/换行」：乱码洪泛、单字符碎片铺满。用整体空白占比区分（语言无关，≥0.55 判退化；
+ * 正常连贯思考含一词一行 ≤0.45，不会误伤）。
  * @param deltas 按到达顺序排列的 reasoning 文本片段
  */
 export function isDegenerateReasoningDeltas(deltas: string[]): boolean {
-  const n = deltas.length
-  if (n < DEGENERATE_MIN_DELTAS) return false
+  if (deltas.length < DEGENERATE_MIN_DELTAS) return false
   let chars = 0
-  let newlines = 0
-  let visible = 0
-  let trash = 0
+  let ws = 0
   for (const t of deltas) {
     chars += t.length
-    newlines += (t.match(/\n/g) || []).length
-    const vis = t.replace(/\s/g, '')
-    visible += vis.length
-    if (vis.length <= 2) trash++
+    ws += (t.match(/\s/g) || []).length
   }
-  if (n >= DEGENERATE_TRASH_MIN_DELTAS && trash / n >= DEGENERATE_TRASH_RATIO && newlines > 0) return true
-  if (newlines / Math.max(1, chars) >= DEGENERATE_NL_RATIO) return true
-  if (chars >= DEGENERATE_BLANK_MIN_CHARS && visible / Math.max(1, chars) <= DEGENERATE_BLANK_MAX_VISIBLE_RATIO) return true
-  return false
+  if (chars < DEGENERATE_MIN_CHARS) return false
+  return ws / chars >= DEGENERATE_MAX_WS_RATIO
 }
 
 interface Account {
@@ -539,8 +537,16 @@ export async function pumpStreamAttempt(
     const isReasoning = facts.reasoningDelta !== null
     if (isReasoning) {
       state.ring.push(facts.reasoningDelta as string)
-      if (state.ring.length > RING_SIZE) state.ring.shift()
-      if (state.ring.length >= DEGENERATE_MIN_DELTAS && isDegenerateReasoningDeltas(state.ring)) state.suppress = true
+      // 按字符数约束窗口（需 ≥DEGENERATE_MIN_CHARS 才能做退化判定，故窗口要够大）
+      let ringChars = 0
+      for (let i = state.ring.length - 1; i >= 0; i--) {
+        ringChars += state.ring[i].length
+        if (ringChars >= DEGENERATE_MIN_CHARS * 2) {
+          state.ring = state.ring.slice(i)
+          break
+        }
+      }
+      if (isDegenerateReasoningDeltas(state.ring)) state.suppress = true
       if (state.suppress) return // 抑制垃圾 reasoning，不再直播到 UI
     }
     if (facts.finishReason && state.suppress && state.contentChars === 0 && !state.hasToolCalls) {
@@ -588,9 +594,16 @@ export async function pumpStreamAttempt(
     return { kind: 'healthy', response: new Response(ts.readable, { status: 200, headers: sseHeaders }) }
   }
 
-  /** 探测期结束判定（样本足够且退化）。 */
-  const probeDegenerate = () =>
-    probeDeltas.length >= DEGENERATE_MIN_DELTAS && isDegenerateReasoningDeltas(probeDeltas)
+  /** 探测期累计 reasoning 的空白占比（随时可算，无需等满 250 字符）。 */
+  const probeWsRatio = () => {
+    let chars = 0
+    let ws = 0
+    for (const t of probeDeltas) {
+      chars += t.length
+      ws += (t.match(/\s/g) || []).length
+    }
+    return { chars, ratio: chars ? ws / chars : 0 }
+  }
 
   // ---- 探测阶段：读行直到能做出放行/拦截判定 ----
   try {
@@ -620,24 +633,26 @@ export async function pumpStreamAttempt(
         const isReasoning = facts.reasoningDelta !== null
         if (isReasoning) probeDeltas.push(facts.reasoningDelta as string)
         const frame = 'data: ' + JSON.stringify(obj ?? payload) + '\n\n'
+        const { chars: pChars, ratio: pRatio } = probeWsRatio()
 
         // 模型已开始产出正文或工具调用 → 正常回答，健康放行
         if (facts.contentChars > 0 || state.hasToolCalls) {
           buffered.push(frame)
           return flushHealthy(buf)
         }
-        // 探测窗口已满：退化则拦截重试，否则放行
-        if (probeDeltas.length >= PROBE_MAX_DELTAS) {
-          if (probeDegenerate()) {
-            await reader.cancel().catch(() => {})
-            return { kind: 'degenerate' }
-          }
+        // 已缓冲足够 reasoning 且空白占绝对主导（≥0.55 持续）→ 退化空转，拦截重试
+        if (pChars >= DEGENERATE_MIN_CHARS && pRatio >= DEGENERATE_MAX_WS_RATIO) {
+          await reader.cancel().catch(() => {})
+          return { kind: 'degenerate' }
+        }
+        // 窗口满且空白未占主导 → 是正常（可能一词一行）的思考，健康放行
+        if (probeDeltas.length >= PROBE_MAX_DELTAS && pRatio < DEGENERATE_MAX_WS_RATIO) {
           buffered.push(frame)
           return flushHealthy(buf)
         }
-        // 探测期内上游已结束：退化/空转按需拦截，否则放行已缓冲内容
+        // 探测期内上游已结束：空白主导→退化；length 无产出→空响应；否则放行缓冲内容
         if (facts.finishReason) {
-          if (probeDegenerate()) {
+          if (pRatio >= DEGENERATE_MAX_WS_RATIO && pChars >= DEGENERATE_MIN_CHARS) {
             await reader.cancel().catch(() => {})
             return { kind: 'degenerate' }
           }
@@ -656,7 +671,8 @@ export async function pumpStreamAttempt(
   }
 
   // 探测阶段上游流自然结束
-  if (probeDegenerate()) {
+  const { chars: tailChars, ratio: tailRatio } = probeWsRatio()
+  if (tailChars >= DEGENERATE_MIN_CHARS && tailRatio >= DEGENERATE_MAX_WS_RATIO) {
     await reader.cancel().catch(() => {})
     return { kind: 'degenerate' }
   }
@@ -664,7 +680,7 @@ export async function pumpStreamAttempt(
     await reader.cancel().catch(() => {})
     return { kind: 'empty' }
   }
-  return await flushHealthy(buf)
+  return flushHealthy(buf)
 }
 
 /** 模型级冷却（与 clineFetchWithRetry 同语义：有 model 上下文时只冷却该账号的该模型）。 */

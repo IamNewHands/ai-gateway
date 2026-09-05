@@ -82,35 +82,39 @@ describe('推理空转截断判定 isRunawayReasoningCutoff', () => {
   })
 })
 
-describe('推理退化检测 isDegenerateReasoningDeltas（2026-09-05 流式防护）', () => {
-  // 样本取自 dsh-session-8711a1e7 日志的真实轮次
-  it('病态：纯空白/换行洪泛（T5/S34：71 条 delta 95% 是空白）→ 判定退化', () => {
-    const deltas = Array.from({ length: 71 }, (_, i) => (i % 3 === 0 ? '\n' : '  \n '))
+describe('推理退化检测 isDegenerateReasoningDeltas（2026-09-05 流式防护 v2）', () => {
+  // 样本取自真实会话日志校准
+  it('病态：纯空白/换行洪泛（空白占 95% 的乱码长文）→ 判定退化', () => {
+    // 250+ 字符，几乎全是空白/换行（T5/S34 / "3.2 万条 reasoning 95% 空白" 形态）
+    const deltas = Array.from({ length: 60 }, () => '\n  \n   \n  \n ')
     expect(isDegenerateReasoningDeltas(deltas)).toBe(true)
   })
-  it('病态：一个字一个空格的碎片流（T5/S19 形态）→ 判定退化', () => {
-    const deltas = Array.from({ length: 48 }, (_, i) => (i % 2 === 0 ? ' \n' : ' ('))
+  it('病态：单字符乱码铺满 250+ 字符 → 判定退化', () => {
+    const deltas = Array.from({ length: 90 }, (_, i) => (i % 5 === 0 ? '\uFFFD ' : '\n  \n '))
     expect(isDegenerateReasoningDeltas(deltas)).toBe(true)
   })
-  it('病态：短碎片 + 高换行密度（T12/S34 形态）→ 判定退化', () => {
-    const deltas = Array.from({ length: 21 }, (_, i) => (i % 5 === 0 ? 'close' : ' \n\n '))
-    expect(isDegenerateReasoningDeltas(deltas)).toBe(true)
-  })
-  it('病态："全是空格的长文"形态（大量字符但可见字符占比极低）→ 判定退化', () => {
-    const deltas = Array.from({ length: 30 }, () => 'a    '.repeat(10)) // 每条 50 字符仅 10 可见
-    expect(isDegenerateReasoningDeltas(deltas)).toBe(true)
-  })
-  it('正常：连贯英文思考 token 流（127 条、7k 字符，T6/S23 形态）→ 不误伤', () => {
-    const words = ['Now', ' I', ' see', ' the', ' issue', '.', ' The', ' `buildToolLedger`', ' uses', ' `toolCallFingerprint`', ' which', ' compiles', ' the', ' fingerprint', ' from', ' tool', ' calls', '.\n']
-    const deltas = Array.from({ length: 127 }, (_, i) => words[i % words.length])
+  it('正常：一词一行但内容连贯（本次被 v1 误杀的 T18/S7 形态）→ 不误伤（关键回归）', () => {
+    // glm 把每个思考 token 单独成行：空白占比 ~0.4，但内容是连贯技术推理
+    const prose = ['The ', 'user ', 'installed ', '`gh` ', 'CLI. ', 'The ', '422 ', 'root ', 'cause ', 'was ', 'clear ']
+    const deltas: string[] = []
+    for (let i = 0; i < 70; i++) {
+      const w = prose[i % prose.length]
+      // 每段后跟换行，模拟"一词一行"
+      deltas.push(w.replace(/ /g, '\n'))
+    }
     expect(isDegenerateReasoningDeltas(deltas)).toBe(false)
   })
-  it('正常：含代码块/列表的中文长思考（换行但连贯）→ 不误伤', () => {
-    const deltas = Array.from({ length: 60 }, (_, i) => (i % 5 === 0 ? '\n' : '先读取 `tool-ledger.ts` 的实现，再对比两边的差异。'))
+  it('正常：连贯英文思考 token 流（T6/S23 形态，换行稀疏）→ 不误伤', () => {
+    const words = ['Now', ' I', ' see', ' the', ' issue', '.', ' The', ' `buildToolLedger`', ' uses', ' `toolCallFingerprint`', ' which', ' compiles', ' the', ' fingerprint', '.\n']
+    const deltas = Array.from({ length: 90 }, (_, i) => words[i % words.length])
     expect(isDegenerateReasoningDeltas(deltas)).toBe(false)
   })
-  it('样本不足 16 条 → 不判定（正常短思考也可能都是小 token）', () => {
-    expect(isDegenerateReasoningDeltas(['\n', ' ', ' \n'])).toBe(false)
+  it('正常：中文长思考（无英文词、换行少）→ 不误伤', () => {
+    const deltas = Array.from({ length: 50 }, (_, i) => (i % 5 === 0 ? '\n' : '先读取 tool-ledger.ts 的实现，再对比两边的差异并规划重写。'))
+    expect(isDegenerateReasoningDeltas(deltas)).toBe(false)
+  })
+  it('短片段（<250 字符）不做退化判定 → 不误拦短思考', () => {
+    expect(isDegenerateReasoningDeltas(['\n\n\n\n\n\n'])).toBe(false) // 短空白自限
     expect(isDegenerateReasoningDeltas([])).toBe(false)
   })
 })
@@ -135,19 +139,19 @@ describe('流式转发 pumpStreamAttempt（2026-09-05 流式语义回归保护�
     expect(text).toContain('[DONE]')
   })
 
-  it('退化空转（空白洪泛超窗口）→ 拦截，返回 degenerate 不上游放行给客户端', async () => {
+  it('退化空转（空白洪泛 ≥250 字符）→ 拦截，返回 degenerate 不把垃圾放行给客户端', async () => {
     let body = ''
-    for (let i = 0; i < 60; i++) body += dataFrame({ reasoning_content: i % 3 === 0 ? '\n' : ' \n ' })
+    for (let i = 0; i < 160; i++) body += dataFrame({ reasoning_content: ' \n ' }) // ~480 字符，空白为主
     body += dataFrame({}, 'length')
     body += doneFrame()
     const outcome = await pumpStreamAttempt(sseResp(body))
     expect(outcome.kind).toBe('degenerate')
   })
 
-  it('退化空转（窗口内即结束的纯空白）→ 拦截为 degenerate', async () => {
+  it('退化空转（长纯空白即结束）→ 拦截为 degenerate（不烧预算）', async () => {
     let body = ''
-    for (let i = 0; i < 20; i++) body += dataFrame({ reasoning_content: ' \n\n' })
-    body += dataFrame({}, 'stop')
+    for (let i = 0; i < 160; i++) body += dataFrame({ reasoning_content: '\n \n' })
+    body += dataFrame({}, 'length')
     body += doneFrame()
     const outcome = await pumpStreamAttempt(sseResp(body))
     expect(outcome.kind).toBe('degenerate')
