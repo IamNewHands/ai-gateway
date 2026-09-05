@@ -480,59 +480,119 @@ function inspectFrame(obj: Record<string, unknown> | null): FrameFacts {
 interface StreamAttemptOutcome {
   kind: 'healthy' | 'degenerate' | 'empty'
   response?: Response
-  /** healthy 但透传期触发了抑制空转（全程无产出），调用方仍应冷却该账号。 */
-  runaway?: boolean
 }
 
 /**
- * 单次流式尝试：探测期缓冲前 PROBE_MAX_DELTAS 条 reasoning delta，用退化检测器判定——
- * 退化 → 取消上游，调用方冷却换号重试；健康 → 一次性放行缓冲帧后转实时透传，
- * 并用滚动窗口持续监控，退化中途出现则抑制后续 reasoning delta（垃圾不再直播到客户端 UI），
- * 全程未产出正文时按空转冷却处理。
+ * 单次流式尝试的探测阶段 + 后台续流。
+ *
+ * 关键约束：探测一旦判定「健康放行」，必须【立刻】把 SSE Response 返回给路由，
+ * Cloudflare 才会向客户端下发响应头并开始直播；续读上游放在后台任务里写进同一个流。
+ * 否则 pump 会等上游整轮结束才返回 → 客户端看不到任何输出（卡住直到超时）。
+ *
+ * 流程：
+ *   1. 探测期：缓冲前 PROBE_MAX_DELTAS 条 reasoning delta，用 isDegenerateReasoningDeltas 判定；
+ *      退化/空转 → 取消上游，返回 outcome 供调用方冷却换号重试。
+ *   2. 健康 → 建流、把缓冲帧写入、立刻返回 healthy Response，同时后台任务接管剩余上游帧。
+ *   3. 后台续流阶段：32 条滚动窗口持续监控，退化中途出现则抑制后续 reasoning delta，
+ *      全程未产出正文时发 upstream_runaway 错误帧，并回调 onRunaway 让调用方冷却账号。
  */
-async function pumpStreamAttempt(resp: Response): Promise<StreamAttemptOutcome> {
-  const reader = resp.body!.getReader()
+/** @internal 流式尝试的探测 + 后台续流（导出供测试验证流式语义）。 */
+export async function pumpStreamAttempt(
+  resp: Response,
+  onRunaway?: () => void
+): Promise<StreamAttemptOutcome> {  const reader = resp.body!.getReader()
   const decoder = new TextDecoder()
   const encoder = new TextEncoder()
-  let buf = ''
-  let writer: WritableStreamDefaultWriter<Uint8Array> | null = null
-  let readable: ReadableStream<Uint8Array> | null = null
-  const buffered: string[] = []
-  const probeDeltas: string[] = []
-  let ring: string[] = []
-  let suppress = false
-  let runaway = false
-  let contentChars = 0
-  let hasToolCalls = false
-  let finishReason = ''
-
-  const openWriter = async (): Promise<WritableStreamDefaultWriter<Uint8Array>> => {
+  const sseHeaders = { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-store', 'X-Accel-Buffering': 'no' }
+  const newStream = () => {
     const ts = new TransformStream<Uint8Array, Uint8Array>()
-    readable = ts.readable
-    const w = ts.writable.getWriter()
-    for (const f of buffered) await w.write(encoder.encode(f))
+    return { ts, writer: ts.writable.getWriter() }
+  }
+
+  // 后台续流阶段共享的滚动状态
+  const state = {
+    ring: [] as string[],
+    suppress: false,
+    contentChars: 0,
+    hasToolCalls: false,
+  }
+  let buf = ''
+  const probeDeltas: string[] = []   // 探测期收集的 reasoning delta
+  const buffered: string[] = []      // 探测期缓冲的原始帧，放行时一次性写回
+
+  /** 把单行 SSE 帧路由到 writer（供后台续流用），含退化监控 + 抑制 + 空转报错。 */
+  const routeToStream = async (line: string, w: WritableStreamDefaultWriter<Uint8Array>): Promise<void> => {
+    if (!line.startsWith('data:')) {
+      if (line !== '') await w.write(encoder.encode(line + '\n'))
+      return
+    }
+    const payload = line.slice(5).trim()
+    if (payload === '' || payload === '[DONE]') {
+      await w.write(encoder.encode(line + '\n\n'))
+      return
+    }
+    let obj: Record<string, unknown> | null = null
+    try { obj = unwrapData(JSON.parse(payload)) as Record<string, unknown> } catch { obj = null }
+    const facts = inspectFrame(obj)
+    state.contentChars += facts.contentChars
+    if (facts.hasToolCalls) state.hasToolCalls = true
+    const isReasoning = facts.reasoningDelta !== null
+    if (isReasoning) {
+      state.ring.push(facts.reasoningDelta as string)
+      if (state.ring.length > RING_SIZE) state.ring.shift()
+      if (state.ring.length >= DEGENERATE_MIN_DELTAS && isDegenerateReasoningDeltas(state.ring)) state.suppress = true
+      if (state.suppress) return // 抑制垃圾 reasoning，不再直播到 UI
+    }
+    if (facts.finishReason && state.suppress && state.contentChars === 0 && !state.hasToolCalls) {
+      onRunaway?.()
+      const errMsg = { error: { message: 'Cline 推理退化空转：全程未产出正文，已抑制垃圾 reasoning', type: 'upstream_runaway' } }
+      await w.write(encoder.encode('data: ' + JSON.stringify(errMsg) + '\n\n'))
+    }
+    await w.write(encoder.encode('data: ' + JSON.stringify(obj ?? payload) + '\n\n'))
+  }
+
+  /** 健康放行：立即返回 Response，缓冲帧与后续上游帧都在后台任务里写入（reader 挂上后再写，避免背压死锁）。 */
+  const flushHealthy = (continuationBuf: string): StreamAttemptOutcome => {
+    const { ts, writer: w } = newStream()
+    const initial = buffered.slice()
     buffered.length = 0
-    ring = probeDeltas.slice(-RING_SIZE)
-    return w
+    state.ring = probeDeltas.slice(-RING_SIZE)
+    void (async () => {
+      // 先写探测期缓冲的帧
+      for (const f of initial) await w.write(encoder.encode(f))
+      let cbuf = continuationBuf
+      // 排空探测期已读入但尚未处理的整行
+      let ci: number
+      while ((ci = cbuf.indexOf('\n')) >= 0) {
+        const line = cbuf.slice(0, ci)
+        cbuf = cbuf.slice(ci + 1)
+        await routeToStream(line, w)
+      }
+      try {
+        while (true) {
+          const { done, value } = await reader.read()
+          if (done) break
+          cbuf += decoder.decode(value, { stream: true })
+          let idx: number
+          while ((idx = cbuf.indexOf('\n')) >= 0) {
+            const line = cbuf.slice(0, idx)
+            cbuf = cbuf.slice(idx + 1)
+            await routeToStream(line, w)
+          }
+        }
+      } catch {
+        /* 上游流异常：尽力收尾 */
+      }
+      await w.close().catch(() => {})
+    })()
+    return { kind: 'healthy', response: new Response(ts.readable, { status: 200, headers: sseHeaders }) }
   }
 
-  const writeOut = async (out: string) => {
-    if (writer) await writer.write(encoder.encode(out))
-    else buffered.push(out)
-  }
-
-  const degenerateNow = () =>
+  /** 探测期结束判定（样本足够且退化）。 */
+  const probeDegenerate = () =>
     probeDeltas.length >= DEGENERATE_MIN_DELTAS && isDegenerateReasoningDeltas(probeDeltas)
 
-  const finishResponse = async (): Promise<Response> => {
-    const w = await openWriter()
-    await w.close().catch(() => {})
-    return new Response(readable!, {
-      status: 200,
-      headers: { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-store', 'X-Accel-Buffering': 'no' },
-    })
-  }
-
+  // ---- 探测阶段：读行直到能做出放行/拦截判定 ----
   try {
     while (true) {
       const { done, value } = await reader.read()
@@ -542,100 +602,69 @@ async function pumpStreamAttempt(resp: Response): Promise<StreamAttemptOutcome> 
       while ((idx = buf.indexOf('\n')) >= 0) {
         const line = buf.slice(0, idx)
         buf = buf.slice(idx + 1)
-        const out = normalizeSSELine(line)
 
         if (!line.startsWith('data:')) {
-          if (out) await writeOut(out)
+          if (line !== '') buffered.push(line + '\n')
           continue
         }
         const payload = line.slice(5).trim()
         if (payload === '' || payload === '[DONE]') {
-          if (out) await writeOut(out)
+          buffered.push(line + '\n\n')
           continue
         }
         let obj: Record<string, unknown> | null = null
         try { obj = unwrapData(JSON.parse(payload)) as Record<string, unknown> } catch { obj = null }
         const facts = inspectFrame(obj)
-        if (facts.finishReason) finishReason = facts.finishReason
-        contentChars += facts.contentChars
-        if (facts.hasToolCalls) hasToolCalls = true
+        state.contentChars += facts.contentChars
+        if (facts.hasToolCalls) state.hasToolCalls = true
+        const isReasoning = facts.reasoningDelta !== null
+        if (isReasoning) probeDeltas.push(facts.reasoningDelta as string)
+        const frame = 'data: ' + JSON.stringify(obj ?? payload) + '\n\n'
 
-        const isReasoningFrame = facts.reasoningDelta !== null
-        if (!writer) {
-          // ---- 探测期：缓冲 + 判定 ----
-          if (isReasoningFrame) probeDeltas.push(facts.reasoningDelta as string)
-          if (facts.contentChars > 0 || hasToolCalls) {
-            // 模型已开始产出正文/工具调用 → 放行
-            writer = await openWriter()
-            await writeOut(out!)
-            continue
-          }
-          if (probeDeltas.length >= PROBE_MAX_DELTAS) {
-            if (degenerateNow()) {
-              await reader.cancel().catch(() => {})
-              return { kind: 'degenerate' }
-            }
-            writer = await openWriter()
-            await writeOut(out!)
-            continue
-          }
-          if (finishReason) {
-            // 上游在窗口内就结束了：退化 → 拦截重试；空转 length → 按空响应处理；否则照常放行
-            if (degenerateNow()) {
-              await reader.cancel().catch(() => {})
-              return { kind: 'degenerate' }
-            }
-            if (finishReason === 'length' && contentChars === 0 && !hasToolCalls) {
-              await reader.cancel().catch(() => {})
-              return { kind: 'empty' }
-            }
-            writer = await openWriter()
-            await writer!.close().catch(() => {})
-            return { kind: 'healthy', response: new Response(readable!, {
-              status: 200,
-              headers: { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-store', 'X-Accel-Buffering': 'no' },
-            }) }
-          }
-          if (out) await writeOut(out)
-          continue
+        // 模型已开始产出正文或工具调用 → 正常回答，健康放行
+        if (facts.contentChars > 0 || state.hasToolCalls) {
+          buffered.push(frame)
+          return flushHealthy(buf)
         }
-
-        // ---- 透传期：滚动监控，退化中途出现则抑制 reasoning 帧 ----
-        if (suppress && isReasoningFrame) continue
-        if (!suppress && isReasoningFrame) {
-          ring.push(facts.reasoningDelta as string)
-          if (ring.length > RING_SIZE) ring.shift()
-          if (ring.length >= DEGENERATE_MIN_DELTAS && isDegenerateReasoningDeltas(ring)) suppress = true
-          if (suppress) continue
+        // 探测窗口已满：退化则拦截重试，否则放行
+        if (probeDeltas.length >= PROBE_MAX_DELTAS) {
+          if (probeDegenerate()) {
+            await reader.cancel().catch(() => {})
+            return { kind: 'degenerate' }
+          }
+          buffered.push(frame)
+          return flushHealthy(buf)
         }
-        if (facts.finishReason && suppress && contentChars === 0 && !hasToolCalls) {
-          // 已抑制 + 全程无产出：按空转处理（上游冷却），向客户端明确报错而不是静默空结束
-          runaway = true
-          const errMsg = { error: { message: 'Cline 推理退化空转：全程未产出正文，已抑制垃圾 reasoning', type: 'upstream_runaway' } }
-          await writer.write(encoder.encode('data: ' + JSON.stringify(errMsg) + '\n\n'))
+        // 探测期内上游已结束：退化/空转按需拦截，否则放行已缓冲内容
+        if (facts.finishReason) {
+          if (probeDegenerate()) {
+            await reader.cancel().catch(() => {})
+            return { kind: 'degenerate' }
+          }
+          if (facts.finishReason === 'length' && state.contentChars === 0 && !state.hasToolCalls) {
+            await reader.cancel().catch(() => {})
+            return { kind: 'empty' }
+          }
+          buffered.push(frame)
+          return flushHealthy(buf)
         }
-        if (out) await writer.write(encoder.encode(out))
+        buffered.push(frame)
       }
     }
   } catch {
-    /* 上游流异常：探测期按空响应处理，透传期尽力收尾 */
+    /* 探测期读上游异常：下方按空流处理 */
   }
 
-  if (writer) {
-    await writer.close().catch(() => {})
-    return { kind: 'healthy', runaway, response: new Response(readable!, {
-      status: 200,
-      headers: { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-store', 'X-Accel-Buffering': 'no' },
-    }) }
-  }
-  // 流在探测期内结束：退化 → 拦截；有缓冲内容 → 放行；纯空 → 空响应
-  if (degenerateNow()) {
+  // 探测阶段上游流自然结束
+  if (probeDegenerate()) {
     await reader.cancel().catch(() => {})
     return { kind: 'degenerate' }
   }
-  if (buffered.length > 0) return { kind: 'healthy', response: await finishResponse() }
-  await reader.cancel().catch(() => {})
-  return { kind: 'empty' }
+  if (buffered.length === 0) {
+    await reader.cancel().catch(() => {})
+    return { kind: 'empty' }
+  }
+  return await flushHealthy(buf)
 }
 
 /** 模型级冷却（与 clineFetchWithRetry 同语义：有 model 上下文时只冷却该账号的该模型）。 */
@@ -660,11 +689,8 @@ async function proxyStreamChat(pool: Pool, body: Record<string, unknown>, sessio
         resp.status || 502
       )
     }
-    const outcome = await pumpStreamAttempt(resp)
-    if (outcome.kind === 'healthy') {
-      if (outcome.runaway) applyModelCooldown(pool, model, CLINE_COOLDOWN_RUNAWAY_MS)
-      return outcome.response!
-    }
+    const outcome = await pumpStreamAttempt(resp, () => applyModelCooldown(pool, model, CLINE_COOLDOWN_RUNAWAY_MS))
+    if (outcome.kind === 'healthy') return outcome.response!
     applyModelCooldown(pool, model, outcome.kind === 'degenerate' ? CLINE_COOLDOWN_RUNAWAY_MS : CLINE_COOLDOWN_EMPTY_MS)
     await sleep(500 + Math.random() * 500)
   }

@@ -1,5 +1,33 @@
 import { describe, it, expect } from 'vitest'
-import { parseCooldownMs, fetchClineModels, isRunawayReasoningCutoff, isDegenerateReasoningDeltas } from './proxy'
+import { parseCooldownMs, fetchClineModels, isRunawayReasoningCutoff, isDegenerateReasoningDeltas, pumpStreamAttempt } from './proxy'
+
+/** 读取一个 Response 的完整文本（用于流式结果断言）。 */
+async function readAll(resp: Response): Promise<string> {
+  const reader = resp.body!.getReader()
+  const dec = new TextDecoder()
+  let s = ''
+  for (;;) {
+    const { done, value } = await reader.read()
+    if (done) break
+    s += dec.decode(value, { stream: true })
+  }
+  return s
+}
+
+function sseResp(body: string): Response {
+  return new Response(body, { status: 200 })
+}
+
+function dataFrame(delta: Record<string, unknown>, finish?: string): string {
+  const choice: Record<string, unknown> = { index: 0 }
+  if (finish) choice.finish_reason = finish
+  if (Object.keys(delta).length) choice.delta = delta
+  return `data: ${JSON.stringify({ id: 'x', choices: [choice] })}\n\n`
+}
+
+function doneFrame(): string {
+  return 'data: [DONE]\n\n'
+}
 
 describe('Cline 冷却时长解析（item3）', () => {
   it('解析 "Try again in 2h 51m" 为毫秒', () => {
@@ -84,5 +112,58 @@ describe('推理退化检测 isDegenerateReasoningDeltas（2026-09-05 流式防�
   it('样本不足 16 条 → 不判定（正常短思考也可能都是小 token）', () => {
     expect(isDegenerateReasoningDeltas(['\n', ' ', ' \n'])).toBe(false)
     expect(isDegenerateReasoningDeltas([])).toBe(false)
+  })
+})
+
+describe('流式转发 pumpStreamAttempt（2026-09-05 流式语义回归保护）', () => {
+  it('正常思考→放行：Response 立即返回并完整透传 reasoning + 正文（不整轮缓冲卡住）', async () => {
+    // 模拟一个正常 glm 会话：若干小 reasoning token，然后正文，然后 finish。
+    let body = ''
+    for (const t of ['Now', ' I', ' see', ' the', ' issue', '.', ' Let', ' me', ' plan', '.\n']) {
+      body += dataFrame({ reasoning_content: t })
+    }
+    for (const c of ['Hello', ' world', '!']) body += dataFrame({ content: c })
+    body += dataFrame({}, 'stop')
+    body += doneFrame()
+
+    const outcome = await pumpStreamAttempt(sseResp(body))
+    expect(outcome.kind).toBe('healthy')
+    const text = await readAll(outcome.response!)
+    expect(text).toContain('Now')
+    expect(text).toContain('Hello')
+    expect(text).toContain('stop')
+    expect(text).toContain('[DONE]')
+  })
+
+  it('退化空转（空白洪泛超窗口）→ 拦截，返回 degenerate 不上游放行给客户端', async () => {
+    let body = ''
+    for (let i = 0; i < 60; i++) body += dataFrame({ reasoning_content: i % 3 === 0 ? '\n' : ' \n ' })
+    body += dataFrame({}, 'length')
+    body += doneFrame()
+    const outcome = await pumpStreamAttempt(sseResp(body))
+    expect(outcome.kind).toBe('degenerate')
+  })
+
+  it('退化空转（窗口内即结束的纯空白）→ 拦截为 degenerate', async () => {
+    let body = ''
+    for (let i = 0; i < 20; i++) body += dataFrame({ reasoning_content: ' \n\n' })
+    body += dataFrame({}, 'stop')
+    body += doneFrame()
+    const outcome = await pumpStreamAttempt(sseResp(body))
+    expect(outcome.kind).toBe('degenerate')
+  })
+
+  it('短且正常（窗口内就结束、不足 24 条）→ 放行缓冲内容，不误拦', async () => {
+    let body = ''
+    for (const t of ['Clone', ' the', ' repo', '.', ' Let', ' me', ' start', '.']) {
+      body += dataFrame({ reasoning_content: t })
+    }
+    body += dataFrame({ content: 'Done' })
+    body += dataFrame({}, 'stop')
+    body += doneFrame()
+    const outcome = await pumpStreamAttempt(sseResp(body))
+    expect(outcome.kind).toBe('healthy')
+    const text = await readAll(outcome.response!)
+    expect(text).toContain('Done')
   })
 })
