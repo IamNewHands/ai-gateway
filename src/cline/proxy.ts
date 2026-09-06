@@ -157,6 +157,37 @@ export function isWhitespaceOnlyReasoningDelta(t: unknown): boolean {
   return !/\n\s*\n/.test(t)
 }
 
+/**
+ * 归一化单条 reasoning delta，让思考流在 UI 里可读（只影响转发直播，不影响退化判定）。
+ *
+ * 背景（2026-09-06 log4 确认）：独立 "\n" 空白 delta 被过滤后，glm 还有第二形态——
+ * 换行粘在标点 token 尾部（".\n" ",\n" "—\n\n" "...\n\n\n"），每个分句强制换行，
+ * 渲染出来一行一个短句，长思考没法看。策略：
+ *   - 尾部换行 ≥2 个 → 压成一个段落分隔 "\n\n"（保留结构）；
+ *   - 尾部单个换行   → 折叠成一个空格（分句连排成段）；
+ *   - 其余内容原样返回。
+ * 仅用于转发路径；probeDeltas/ring 的退化检测始终使用上游原始 delta。
+ */
+export function normalizeReasoningDeltaForUI(t: unknown): string {
+  if (typeof t !== 'string' || t === '') return typeof t === 'string' ? t : ''
+  const m = /\n[\n\t ]*$/.exec(t)
+  if (!m) return t
+  const head = t.slice(0, t.length - m[0].length)
+  const nl = (m[0].match(/\n/g) || []).length
+  if (nl >= 2) return head + '\n\n'
+  return head ? head + ' ' : ' '
+}
+
+/** 就地改写 SSE 帧内的 reasoning delta 为 UI 归一化版本（探测缓冲与续流共用）。 */
+function patchReasoningDeltaForUI(clone: Record<string, unknown>): void {
+  const choice = ((clone.choices as Array<Record<string, unknown>>) || [])[0] as Record<string, unknown> | undefined
+  if (!choice) return
+  const delta = (choice.delta || choice.message) as Record<string, unknown> | undefined
+  if (!delta) return
+  if (delta.reasoning_content !== undefined) delta.reasoning_content = normalizeReasoningDeltaForUI(delta.reasoning_content)
+  else if (delta.reasoning !== undefined) delta.reasoning = normalizeReasoningDeltaForUI(delta.reasoning)
+}
+
 interface Account {
   refreshToken: string
   accessToken: string | null
@@ -571,6 +602,9 @@ export async function pumpStreamAttempt(
       // 带 finish_reason 的帧不在此跳过——下方空转报错分支依赖它到达客户端。
       if (!facts.finishReason && isWhitespaceOnlyReasoningDelta(facts.reasoningDelta)) return
     }
+    // UI 归一化：粘在标点尾部的换行折叠（".\n"→". "，"…\n\n\n"→"…\n\n"）。
+    // 只改写转发帧；facts/probeDeltas/ring 里留的是原始 delta，退化判定不受影响。
+    if (isReasoning && obj) patchReasoningDeltaForUI(obj)
     if (facts.finishReason && state.suppress && state.contentChars === 0 && !state.hasToolCalls) {
       onRunaway?.()
       const errMsg = { error: { message: 'Cline 推理退化空转：全程未产出正文，已抑制垃圾 reasoning', type: 'upstream_runaway' } }
@@ -661,6 +695,8 @@ export async function pumpStreamAttempt(
         // 纯空白 "\n" 排版噪声：照常计入 probeDeltas（退化判定依赖空白占比），
         // 但不写入放行缓冲，放行后不会直播到 UI。
         const noiseFrame = isReasoning && isWhitespaceOnlyReasoningDelta(facts.reasoningDelta)
+        // 探测缓冲帧同样做 UI 归一化（粘在标点尾部的换行折叠），与续流路径行为一致。
+        if (isReasoning && obj) patchReasoningDeltaForUI(obj)
         const frame = 'data: ' + JSON.stringify(obj ?? payload) + '\n\n'
         const { chars: pChars, ratio: pRatio } = probeWsRatio()
 

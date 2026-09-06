@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest'
-import { parseCooldownMs, fetchClineModels, isRunawayReasoningCutoff, isDegenerateReasoningDeltas, isWhitespaceOnlyReasoningDelta, pumpStreamAttempt } from './proxy'
+import { parseCooldownMs, fetchClineModels, isRunawayReasoningCutoff, isDegenerateReasoningDeltas, isWhitespaceOnlyReasoningDelta, normalizeReasoningDeltaForUI, pumpStreamAttempt } from './proxy'
 
 /** 读取一个 Response 的完整文本（用于流式结果断言）。 */
 async function readAll(resp: Response): Promise<string> {
@@ -203,6 +203,39 @@ describe('单词间换行碎片过滤 isWhitespaceOnlyReasoningDelta（2026-09-0
     expect(text).toContain('\\n\\n') // 段落换行 delta 仍透传
     expect(text).not.toContain('reasoning_content":"\\n"') // 单词间 "\n" delta 已被过滤
     expect(text).not.toContain('reasoning_content":" "') // 空格 delta 同样被过滤
+  })
+})
+
+describe('粘标点换行归一化 normalizeReasoningDeltaForUI（2026-09-06 log4 确认的第二形态）', () => {
+  it('尾部单个换行 → 折叠成空格（分句连排成段）', () => {
+    expect(normalizeReasoningDeltaForUI('.\n')).toBe('. ')
+    expect(normalizeReasoningDeltaForUI(',\n')).toBe(', ')
+    expect(normalizeReasoningDeltaForUI(' (')).toBe(' (')
+    expect(normalizeReasoningDeltaForUI(' TLS')).toBe(' TLS')
+  })
+  it('尾部多个换行 → 压成一个段落分隔 "\\n\\n"（保留结构）', () => {
+    expect(normalizeReasoningDeltaForUI('—\n\n')).toBe('—\n\n')
+    expect(normalizeReasoningDeltaForUI('...\n\n\n')).toBe('...\n\n')
+    expect(normalizeReasoningDeltaForUI('a\n \n')).toBe('a\n\n')
+  })
+  it('纯空白段落分隔 delta 原样保留（"\n\n" 不是噪声）', () => {
+    expect(normalizeReasoningDeltaForUI('\n\n')).toBe('\n\n')
+  })
+  it('流式端到端：".\\n" 粘标点帧 → 客户端收到 ". "（换行不再切行），退化判定用原始 delta 不受影响', async () => {
+    let body = ''
+    for (const t of ['Try', '.\n', ' then', ',\n', ' verify', '—\n\n']) {
+      body += dataFrame({ reasoning_content: t })
+    }
+    body += dataFrame({ content: 'ok' })
+    body += dataFrame({}, 'stop')
+    body += doneFrame()
+    const outcome = await pumpStreamAttempt(sseResp(body))
+    expect(outcome.kind).toBe('healthy')
+    const text = await readAll(outcome.response!)
+    expect(text).toContain('reasoning_content":". "') // ".\n" → ". "
+    expect(text).toContain('reasoning_content":", "') // ",\n" → ", "
+    expect(text).toContain('reasoning_content":"—\\n\\n"') // "—\n\n" 保留为段落分隔
+    expect(text).not.toContain('reasoning_content":".\\n"')
   })
 })
 
