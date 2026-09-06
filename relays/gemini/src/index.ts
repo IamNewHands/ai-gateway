@@ -7,7 +7,7 @@
  * 本 Worker 部署在 Cloudflare 数据中心（出口为美国），把推理请求转发到 Google，
  * 并如实流式回传 SSE/JSON 响应。一条中转同时支持两条链路，按路径自动分流：
  *
- *   1. /v1internal/*（Gemini OAuth CLI 授权码链路）
+ *   1. /v1internal:*（Gemini OAuth CLI 授权码链路，冒号形式，如 /v1internal:generateContent）
  *        → cloudcode-pa.googleapis.com
  *        → 供 AI Gateway 提供商（Gemini 授权码）的 geminiBaseUrl 字段引用
  *   2. /v1beta/openai/*（Google 官方 API Key 链路，OpenAI 兼容端点）
@@ -26,7 +26,7 @@
 
 /** 上游路由：路径前缀 → 目标端点与映射方式（rewriteTo 存在时把原路径映射到 /v1beta/openai 前缀下） */
 const UPSTREAM_ROUTES: Array<{ prefix: string; host: string; rewriteTo?: string }> = [
-  { prefix: '/v1internal/', host: 'cloudcode-pa.googleapis.com' },
+  { prefix: '/v1internal', host: 'cloudcode-pa.googleapis.com' },
   { prefix: '/v1beta/openai/', host: 'generativelanguage.googleapis.com' },
   { prefix: '/v1beta/', host: 'generativelanguage.googleapis.com' },
   // OpenAI 兼容裸路径兜底：网关拼 /chat/completions、/responses、/embeddings 时，

@@ -10,8 +10,10 @@
  */
 
 // 上游路由：路径前缀 → 目标端点；rewriteTo 存在时把原路径改写为 OpenAI 兼容前缀
+// 注意：v1internal 端点是「冒号形式」（/v1internal:generateContent、:loadCodeAssist 等，
+// 与 Google 官方及 Antigravity-Manager 一致），因此前缀不能带尾斜杠。
 const UPSTREAM_ROUTES = [
-  { prefix: '/v1internal/', host: 'cloudcode-pa.googleapis.com' },
+  { prefix: '/v1internal', host: 'cloudcode-pa.googleapis.com' },
   { prefix: '/v1beta/openai/', host: 'generativelanguage.googleapis.com' },
   { prefix: '/v1beta/', host: 'generativelanguage.googleapis.com' },
   // OpenAI 兼容裸路径兜底：网关拼 /chat/completions、/responses、/embeddings 时，
