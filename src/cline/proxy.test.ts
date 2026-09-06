@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest'
-import { parseCooldownMs, fetchClineModels, isRunawayReasoningCutoff, isDegenerateReasoningDeltas, pumpStreamAttempt } from './proxy'
+import { parseCooldownMs, fetchClineModels, isRunawayReasoningCutoff, isDegenerateReasoningDeltas, isWhitespaceOnlyReasoningDelta, pumpStreamAttempt } from './proxy'
 
 /** 读取一个 Response 的完整文本（用于流式结果断言）。 */
 async function readAll(resp: Response): Promise<string> {
@@ -169,5 +169,59 @@ describe('流式转发 pumpStreamAttempt（2026-09-05 流式语义回归保护�
     expect(outcome.kind).toBe('healthy')
     const text = await readAll(outcome.response!)
     expect(text).toContain('Done')
+  })
+})
+
+describe('单词间换行碎片过滤 isWhitespaceOnlyReasoningDelta（2026-09-06 会话日志确认的 glm 一词一行形态）', () => {
+  it('纯空白单换行/空格 delta → 噪声', () => {
+    expect(isWhitespaceOnlyReasoningDelta('\n')).toBe(true)
+    expect(isWhitespaceOnlyReasoningDelta(' ')).toBe(true)
+    expect(isWhitespaceOnlyReasoningDelta(' \n ')).toBe(true)
+    expect(isWhitespaceOnlyReasoningDelta('')).toBe(false)
+    expect(isWhitespaceOnlyReasoningDelta(null)).toBe(false)
+    expect(isWhitespaceOnlyReasoningDelta(' TLS')).toBe(false)
+  })
+  it('段落级双换行 "\n\n" → 保留（模型真实思考排版）', () => {
+    expect(isWhitespaceOnlyReasoningDelta('\n\n')).toBe(false)
+    expect(isWhitespaceOnlyReasoningDelta('\n \n')).toBe(false)
+    expect(isWhitespaceOnlyReasoningDelta('.\n\n')).toBe(false)
+  })
+  it('流式端到端：token+独立"\\n"交替的思考流 → 健康放行，但纯空白 delta 不再直播到客户端', async () => {
+    // 模拟 glm 实测形态：每个 token 后跟一条独立的 "\n" delta（会话日志 reasoning-chunks 证实）
+    let body = ''
+    for (const t of [' TLS', '\n', ' S', '\n', 'NI', '\n', ' mismatch', '\n']) {
+      body += dataFrame({ reasoning_content: t })
+    }
+    body += dataFrame({ reasoning_content: '\n\n' }) // 段落分隔，必须保留
+    body += dataFrame({ content: 'ok' })
+    body += dataFrame({}, 'stop')
+    body += doneFrame()
+    const outcome = await pumpStreamAttempt(sseResp(body))
+    expect(outcome.kind).toBe('healthy')
+    const text = await readAll(outcome.response!)
+    expect(text).toContain('TLS')
+    expect(text).toContain('\\n\\n') // 段落换行 delta 仍透传
+    expect(text).not.toContain('reasoning_content":"\\n"') // 单词间 "\n" delta 已被过滤
+    expect(text).not.toContain('reasoning_content":" "') // 空格 delta 同样被过滤
+  })
+})
+
+describe('上游中途断流（upstream_interrupted 错误帧）', () => {
+  it('上游流中途 error → 客户端收到 upstream_interrupted 错误帧后流正常关闭（不再静默截断）', async () => {
+    // 前 3 帧正常，第 4 帧模拟网络重置（reader 抛异常）
+    let n = 0
+    const enc = new TextEncoder()
+    const body = new ReadableStream<Uint8Array>({
+      pull(c) {
+        n++
+        if (n <= 3) c.enqueue(enc.encode(dataFrame({ reasoning_content: `t${n}` })))
+        else c.error(new Error('network reset'))
+      },
+    })
+    const outcome = await pumpStreamAttempt(new Response(body, { status: 200 }))
+    expect(outcome.kind).toBe('healthy')
+    const text = await readAll(outcome.response!)
+    expect(text).toContain('t1')
+    expect(text).toContain('upstream_interrupted')
   })
 })

@@ -139,6 +139,24 @@ export function isDegenerateReasoningDeltas(deltas: string[]): boolean {
   return ws / chars >= DEGENERATE_MAX_WS_RATIO
 }
 
+/**
+ * 判定单条 reasoning delta 是否为「纯排版噪声」：整条只有空白，且不含段落换行。
+ *
+ * 背景（2026-09-06 会话日志确认）：glm 上游把每个思考 token 单独成行，真实输出是
+ * 「token delta + 独立 "\n" delta」交替。这些空白 delta 零信息量，拼进思考流就是
+ * 一屏一屏的换行；重试重生成时新旧两段换行流叠加，UI 上更夸张。
+ *
+ * 判定口径：整体是空白（^\s+$）且不是段落分隔（无 \n\s*\n 形态的双换行）。
+ * 段落级 "\n\n" 保留——那是模型真实的思考排版；单词间的单个 "\n"/" " 丢弃。
+ * 注意：只做「不转发」，不参与退化判定——探测期与滚动窗口仍会把它们计入
+ * probeDeltas/ring，纯空白洪泛（≥250 字符、空白占比 ≥0.55）照样被判退化拦截。
+ */
+export function isWhitespaceOnlyReasoningDelta(t: unknown): boolean {
+  if (typeof t !== 'string' || t === '') return false
+  if (!/^\s+$/.test(t)) return false
+  return !/\n\s*\n/.test(t)
+}
+
 interface Account {
   refreshToken: string
   accessToken: string | null
@@ -548,6 +566,10 @@ export async function pumpStreamAttempt(
       }
       if (isDegenerateReasoningDeltas(state.ring)) state.suppress = true
       if (state.suppress) return // 抑制垃圾 reasoning，不再直播到 UI
+      // 单词间独立 "\n" 空白 delta：零信息量排版噪声，不再往 UI 直播（段落级 "\n\n" 保留）。
+      // 仅跳过转发；ring 上面已计入，退化判定不受影响。
+      // 带 finish_reason 的帧不在此跳过——下方空转报错分支依赖它到达客户端。
+      if (!facts.finishReason && isWhitespaceOnlyReasoningDelta(facts.reasoningDelta)) return
     }
     if (facts.finishReason && state.suppress && state.contentChars === 0 && !state.hasToolCalls) {
       onRunaway?.()
@@ -587,7 +609,11 @@ export async function pumpStreamAttempt(
           }
         }
       } catch {
-        /* 上游流异常：尽力收尾 */
+        // 上游流异常（网络重置/断连等）：不再静默截断。给客户端发一帧错误后再收尾，
+        // 让 DSH 等客户端按可重试错误快速处理，而不是对着一个没有 finish_reason 的
+        // 半截流干等超时。帧格式与上方 upstream_runaway 错误帧一致。
+        const errMsg = { error: { message: 'Cline 上游流中途断开，连接异常终止', type: 'upstream_interrupted' } }
+        await w.write(encoder.encode('data: ' + JSON.stringify(errMsg) + '\n\n')).catch(() => {})
       }
       await w.close().catch(() => {})
     })()
@@ -632,12 +658,15 @@ export async function pumpStreamAttempt(
         if (facts.hasToolCalls) state.hasToolCalls = true
         const isReasoning = facts.reasoningDelta !== null
         if (isReasoning) probeDeltas.push(facts.reasoningDelta as string)
+        // 纯空白 "\n" 排版噪声：照常计入 probeDeltas（退化判定依赖空白占比），
+        // 但不写入放行缓冲，放行后不会直播到 UI。
+        const noiseFrame = isReasoning && isWhitespaceOnlyReasoningDelta(facts.reasoningDelta)
         const frame = 'data: ' + JSON.stringify(obj ?? payload) + '\n\n'
         const { chars: pChars, ratio: pRatio } = probeWsRatio()
 
         // 模型已开始产出正文或工具调用 → 正常回答，健康放行
         if (facts.contentChars > 0 || state.hasToolCalls) {
-          buffered.push(frame)
+          if (!noiseFrame) buffered.push(frame)
           return flushHealthy(buf)
         }
         // 已缓冲足够 reasoning 且空白占绝对主导（≥0.55 持续）→ 退化空转，拦截重试
@@ -647,7 +676,7 @@ export async function pumpStreamAttempt(
         }
         // 窗口满且空白未占主导 → 是正常（可能一词一行）的思考，健康放行
         if (probeDeltas.length >= PROBE_MAX_DELTAS && pRatio < DEGENERATE_MAX_WS_RATIO) {
-          buffered.push(frame)
+          if (!noiseFrame) buffered.push(frame)
           return flushHealthy(buf)
         }
         // 探测期内上游已结束：空白主导→退化；length 无产出→空响应；否则放行缓冲内容
@@ -660,10 +689,10 @@ export async function pumpStreamAttempt(
             await reader.cancel().catch(() => {})
             return { kind: 'empty' }
           }
-          buffered.push(frame)
+          if (!noiseFrame) buffered.push(frame)
           return flushHealthy(buf)
         }
-        buffered.push(frame)
+        if (!noiseFrame) buffered.push(frame)
       }
     }
   } catch {
