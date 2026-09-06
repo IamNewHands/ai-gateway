@@ -22,6 +22,7 @@ import type { Env, Provider } from '../types'
 import { getOauthAccessToken, readOauthToken, refreshOauthToken, GEMINI_OAUTH, GEMINI_API_CLIENT_HEADER, geminiUserAgent, GEMINI_FALLBACK_PROJECT_ID } from '../oauth'
 import { streamFetchWithTimeout } from '../opencode'
 import { isSafeHttpUrl } from '../admin'
+import { resolveGeminiRealModel } from './variants'
 
 export const GEMINI_BASE_URL = 'https://cloudcode-pa.googleapis.com'
 export const GEMINI_GENERATE_PATH = '/v1internal:generateContent'
@@ -770,9 +771,30 @@ export async function proxyGeminiChatRequest(
   const stream = opts?.stream ?? forwardBody.stream === true
 
   let geminiBody = await openAIToGeminiRequest(forwardBody as Record<string, any>)
-  geminiBody = normalizeGemini25Thinking(geminiBody, model)
+  // 变体族解析（对齐 Antigravity-Manager variant_mapping.rs）：gemini-3.7-flash 等规范族 ID
+  // 上游不直接接受，必须解析为真实变体 ID 并注入已校准的 thinkingBudget / maxOutputTokens。
+  const clientThinkingBudget = (geminiBody.generationConfig?.thinkingConfig &&
+      typeof (geminiBody.generationConfig.thinkingConfig as any).thinkingBudget === 'number')
+    ? (geminiBody.generationConfig.thinkingConfig as any).thinkingBudget as number
+    : undefined
+  const effort = (() => {
+    const r = (forwardBody as any).reasoning ?? (forwardBody as any).reasoning_effort
+    const v = typeof r === 'string' ? r : (r && typeof r === 'object' ? (r as any).effort : undefined)
+    return typeof v === 'string' ? v.toLowerCase() : undefined
+  })()
+  const resolvedVariant = resolveGeminiRealModel(model, { effort, thinkingBudget: clientThinkingBudget })
+  let effectiveModel = model
+  if (resolvedVariant) {
+    effectiveModel = resolvedVariant.id
+    const gc = (geminiBody.generationConfig = geminiBody.generationConfig || {})
+    gc.thinkingConfig = { thinkingBudget: resolvedVariant.thinkingBudget, includeThoughts: resolvedVariant.includeThoughts }
+    if (typeof gc.maxOutputTokens !== 'number' || (gc.maxOutputTokens as number) > resolvedVariant.maxOutputTokens) {
+      gc.maxOutputTokens = resolvedVariant.maxOutputTokens
+    }
+  }
+  geminiBody = normalizeGemini25Thinking(geminiBody, effectiveModel)
   geminiBody = attachDefaultSafetySettings(geminiBody)
-  const wrapped = wrapGeminiRequest(projectId, geminiBody, model, tokenState?.email)
+  const wrapped = wrapGeminiRequest(projectId, geminiBody, effectiveModel, tokenState?.email)
 
   const isCustomBase = !!provider.geminiBaseUrl
   const bases = isCustomBase
@@ -787,7 +809,7 @@ export async function proxyGeminiChatRequest(
     bases,
     stream,
     token,
-    model,
+    effectiveModel,
     wrapped,
     projectId,
     true
@@ -805,7 +827,7 @@ export async function proxyGeminiChatRequest(
       bases,
       stream,
       token,
-      model,
+      effectiveModel,
       wrapped,
       projectId,
       false
@@ -827,7 +849,7 @@ export async function proxyGeminiChatRequest(
         bases,
         stream,
         token,
-        model,
+        effectiveModel,
         wrapped,
         projectId,
         true
@@ -850,7 +872,7 @@ export async function proxyGeminiChatRequest(
   }
 
   if (stream) {
-    const readable = unwrapGeminiSSE(resp.body, model)
+    const readable = unwrapGeminiSSE(resp.body, effectiveModel)
     return new Response(readable, {
       status: 200,
       headers: {
@@ -873,7 +895,7 @@ export async function proxyGeminiChatRequest(
   if (payload && typeof payload === 'object' && (payload as any).response !== undefined) {
     inner = (payload as any).response
   }
-  const openai = geminiToOpenAIResponse(inner, model)
+  const openai = geminiToOpenAIResponse(inner, effectiveModel)
   return new Response(JSON.stringify(openai), {
     status: 200,
     headers: { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' },
