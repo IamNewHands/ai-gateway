@@ -529,7 +529,8 @@ ${H('管理')}
               <div class="fr"><div class="fg"><label>名称</label><input type="text" id="nm-${escapePageHtml(p.id)}" value="${escapePageHtml(p.name)}"></div><div class="fg"><label>ID</label><input type="text" value="${escapePageHtml(p.id)}" disabled></div></div>
               <div class="fg"><label>API 地址</label><input type="url" id="url-${escapePageHtml(p.id)}" value="${escapePageHtml(p.baseUrl)}"></div>
               ${(p.oauth&&p.oauth.flowType==='gemini')?`
-              <div class="fg" id="gbu-row-${escapePageHtml(p.id)}"><label for="gbu-${escapePageHtml(p.id)}">Gemini 推理中转地址（可选）</label><input type="url" id="gbu-${escapePageHtml(p.id)}" value="${escapePageHtml(p.geminiBaseUrl||'')}" placeholder="https://your-us-relay.example.com"><span class="form-helper">配置美国中转地址后，网关把 generateContent / countTokens 推理请求经该节点中转以规避地区限制（HTTP 400 User location is not supported）。OAuth 认证仍直连 Google。留空 = 直连内置默认地址。</span></div>`:''}
+              <div class="fg" id="gbu-row-${escapePageHtml(p.id)}"><label for="gbu-${escapePageHtml(p.id)}">Gemini 推理中转地址（可选）</label><input type="url" id="gbu-${escapePageHtml(p.id)}" value="${escapePageHtml(p.geminiBaseUrl||'')}" placeholder="https://your-us-relay.example.com"><span class="form-helper">配置美国中转地址后，网关把 generateContent / countTokens 推理请求经该节点中转以规避地区限制（HTTP 400 User location is not supported）。OAuth 认证仍直连 Google。留空 = 直连内置默认地址。</span></div>
+              <div class="fg" id="gquota-row-${escapePageHtml(p.id)}"><label>账号额度（5 小时窗口 / 周窗口）</label><div class="fr" style="align-items:center;gap:8px;"><button class="btn btn-s" onclick="geminiQuota('${escapePageJsx(p.id)}')"><i class="fas fa-gauge-high" aria-hidden="true"></i>查询额度</button><span id="gquota-tier-${escapePageHtml(p.id)}" class="pu"></span></div><div id="gquota-out-${escapePageHtml(p.id)}" class="form-helper" style="white-space:pre-wrap;"></div></div>`:''}
               <div class="fg"><label>API 格式</label><select id="at-${escapePageHtml(p.id)}" class="select-sm"><option value="openai" ${(p.apiType||'openai')==='openai'?'selected':''}>OpenAI 兼容</option><option value="anthropic" ${p.apiType==='anthropic'?'selected':''}>Anthropic 兼容</option></select></div>
               <div class="fg"><label>认证方式</label><select id="auth-${escapePageHtml(p.id)}" class="select-sm" onchange="toggleAuthTypeEdit('${escapePageJsx(p.id)}')"><option value="api-key" ${(p.authType||'api-key')==='api-key'?'selected':''}>API Key</option><option value="oauth-device" ${p.authType==='oauth-device'?'selected':''}>OAuth 设备码登录</option></select></div>
               <div id="oauth-edit-${escapePageHtml(p.id)}" class="${p.authType==='oauth-device'?'form-group':'hd form-group'}">
@@ -2304,6 +2305,57 @@ async function fetchOauthModels(id) {
     console.error('fetchOauthModels error:', e)
     if (tr) showResult(tr, false, '请求失败: ' + (e.message || '未知错误'))
     if (st) st.textContent = '拉取失败'
+  }
+}
+
+// Gemini（Antigravity 链路）账号额度：订阅档位 + 5h/周窗口摘要 + 按模型剩余
+async function geminiQuota(id, force) {
+  const out = document.getElementById('gquota-out-' + id)
+  const tier = document.getElementById('gquota-tier-' + id)
+  if (!out) return
+  out.textContent = '查询中…'
+  try {
+    const r = await fetch('/admin/api/oauth/' + encodeURIComponent(id) + '/gemini-quota' + (force ? '?force=1' : ''))
+    const d = await r.json()
+    if (!d.success) {
+      out.textContent = d.message || '查询失败'
+      return
+    }
+    const q = d.data || {}
+    if (tier) tier.textContent = q.subscriptionTier ? ('订阅档位: ' + q.subscriptionTier + (q.email ? ' · ' + q.email : '')) : ''
+    const NL = String.fromCharCode(10)
+    let html = ''
+    const pct = v => (typeof v === 'number' ? Math.round(v) : 0)
+    // 分组摘要：5h 窗口 + 周窗口（retrieveUserQuotaSummary）
+    if (q.groups && q.groups.length > 0) {
+      q.groups.forEach(function (g) {
+        html += '<div style="margin:6px 0 2px;font-weight:600;">' + escapeHtml(g.displayName || '配额分组') + '</div>'
+        ;(g.buckets || []).forEach(function (b) {
+          const p = pct(b.remainingPercent)
+          const label = (b.window === '5h' ? '5 小时窗口' : b.window === 'weekly' ? '周窗口' : (b.window || b.bucketId || '窗口'))
+          const color = p >= 50 ? '#22c55e' : p >= 20 ? '#eab308' : '#ef4444'
+          const reset = b.resetTime ? '（' + new Date(b.resetTime).toLocaleString() + ' 重置）' : ''
+          html += '<div style="margin:2px 0;">' + label + '：<span style="font-weight:600;">' + p + '%</span> 剩余' + reset +
+            '<div style="background:rgba(128,128,128,.2);border-radius:4px;height:6px;margin-top:2px;"><div style="width:' + p + '%;background:' + color + ';height:6px;border-radius:4px;"></div></div></div>'
+        })
+      })
+    }
+    // 按模型剩余（fetchAvailableModels）
+    if (q.models && q.models.length > 0) {
+      const hot = q.models.filter(function (m) { return m.name.indexOf('pro') !== -1 || m.name.indexOf('flash') !== -1 }).slice(0, 8)
+      if (hot.length > 0) {
+        html += '<div style="margin:6px 0 2px;font-weight:600;">按模型（5 小时窗口剩余）</div>'
+        html += hot.map(function (m) {
+          return '<span style="display:inline-block;margin:2px 6px 2px 0;padding:1px 8px;border-radius:10px;background:rgba(128,128,128,.15);">' + escapeHtml(m.displayName || m.name) + ' ' + pct(m.percentage) + '%</span>'
+        }).join('')
+      }
+    }
+    if (q.warnings && q.warnings.length > 0) {
+      html += NL + q.warnings.map(function (w) { return '⚠ ' + w }).join(NL)
+    }
+    out.innerHTML = html || '无额度数据'
+  } catch (e) {
+    out.textContent = '请求失败: ' + (e.message || '未知错误')
   }
 }
 

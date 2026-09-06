@@ -31,6 +31,7 @@ import { fetchOpenCodeModels, isOpenCodeProvider, resolveOpenCodeUrls, testOpenC
 import { isQoderProvider, fetchQoderModels } from './qoder/proxy'
 import { isClineProvider, fetchClineModels, fetchClineRecommendedModels, testClineChat, testClineRefreshToken, startClineOAuth, pollClineOAuth } from './cline/proxy'
 import { isGeminiProvider, testGeminiModel, GEMINI_MODELS } from './gemini/proxy'
+import { fetchGeminiQuota } from './gemini/quota'
 import { isCnbProvider, testCnbConnection, CNB_MODELS } from './cnb/proxy'
 import { PROXY_KEY_PREFIX, EXPIRY_OPTIONS, OPENCODE_DEFAULT_URL } from './config'
 import { startOauthDeviceFlow, pollOauthDeviceFlow, readOauthToken, deleteOauthToken, getOauthAccessToken, buildOauthHeaders, detectTokenRealm, submitOauthGeminiCallback, submitOauthM365Callback, submitOauthM365ROPC, OAUTH_POOL_KV_PREFIX } from './oauth'
@@ -1330,6 +1331,21 @@ export async function handleOAuthPoolSetPrefer(c: Context<AppEnv>) {
   }
   await updateProvider(c.env, id, { preferOauthUid: uid || undefined })
   return c.json<ApiResponse>({ success: true, message: uid ? '已指定首选账号 ' + uid : '已恢复自动挑选' })
+}
+
+/** GET /admin/api/oauth/:id/gemini-quota：Gemini（Antigravity 链路）账号额度（订阅档位 + 5h/周窗口 + 按模型剩余）。
+ *  查询参数 force=1 跳过 5 分钟 KV 缓存强制刷新。 */
+export async function handleGeminiQuota(c: Context<AppEnv>) {
+  const id = c.req.param('id')
+  if (!id) return c.json<ApiResponse>({ success: false, message: '缺少 id 参数' }, 400)
+  const provider = await getProvider(c.env, id)
+  if (!provider) return c.json<ApiResponse>({ success: false, message: '提供商不存在' }, 404)
+  if (!isGeminiProvider(provider)) {
+    return c.json<ApiResponse>({ success: false, message: '该提供商不是 Gemini 授权码（Gemini CLI）模式' }, 400)
+  }
+  const force = c.req.query('force') === '1'
+  const snapshot = await fetchGeminiQuota(c.env, provider, force)
+  return c.json<ApiResponse>({ success: true, data: snapshot })
 }
 
 /** 发起 OAuth 设备码授权流程，返回授权链接与用户码 */

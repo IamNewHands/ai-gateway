@@ -30,6 +30,7 @@ import {
   handleClineModelSync,
   handleZcodeModelSync,
   handleOAuthGeminiCallback,
+  handleGeminiQuota,
   handleOAuthM365Callback,
   handleOAuthM365ROPC,
   handleClineOAuthConnect,
@@ -189,6 +190,8 @@ app.post('/admin/api/providers/:id/cline-models/sync', handleClineModelSync)
 app.post('/admin/api/providers/:id/zcode-models/sync', handleZcodeModelSync)
 // Gemini 授权回调：浏览器授权后把地址栏 URL 粘贴回后台提交（POST { callbackUrl }）
 app.post('/admin/api/oauth/:id/callback', handleOAuthGeminiCallback)
+// Gemini（Antigravity 链路）账号额度：订阅档位 + 5h/周窗口摘要 + 按模型剩余（force=1 跳过缓存）
+app.get('/admin/api/oauth/:id/gemini-quota', handleGeminiQuota)
 // M365 PKCE 授权回调（POST { callbackUrl }）与 M365 ROPC 账号密码登录（POST { username, password }）
 app.post('/admin/api/oauth/:id/m365-callback', handleOAuthM365Callback)
 app.post('/admin/api/oauth/:id/m365-ropc', handleOAuthM365ROPC)
