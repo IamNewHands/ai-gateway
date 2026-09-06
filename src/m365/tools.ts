@@ -1008,6 +1008,17 @@ export type {
 
 /* ==================== 工具拒绝 / 沙箱幻觉检测（同原版 toolloop.go） ==================== */
 
+/**
+ * 通用"整体无内容"拒答模板（移植 M365-Gateway 20260906 openai.ts genericAssistantNonAnswer）：
+ * 与模型家族无关的空答复——"Sorry, I wasn't able to respond..." / "I can't chat about this" /
+ * "Hmm… I was not able to respond to that" 等。全文锚定正则，只匹配整条消息即该模板的场合，
+ * 不会命中包含此措辞的真实回答。用途：这类模板化空答复应视为工具拒答，触发既有纠正重试。
+ */
+export function genericAssistantNonAnswer(text: string): boolean {
+  const value = text.trim()
+  return /^(?:(?:Sorry,?\s*)|(?:Hmm(?:\.{3}|…)\s*))?(?:it\s+looks\s+like\s+)?I\s+(?:(?:wasn['’]t|was not|couldn['’]t|could not|am not)\s+able to respond(?:\s+to that)?|can(?:not|['’]t)\s+chat\s+about\s+(?:this|that))[.!]?\s*(?:Is there something else I can help with\?|Let['’]s try a different topic[.!]?)?$/iu.test(value)
+}
+
 const toolRefusalPatterns = [
   'tools are not available', 'tool is not available', 'cannot access the Windows path', 'only provides Linux',
   '只提供 Linux 容器', '工具未暴露', '工具不可用', '没有可调用的', '无法继续操作',
@@ -1029,6 +1040,9 @@ const sandboxHallucinationPatterns = [
 
 /** 检测模型是否错误拒绝使用工具（触发纠正重试）。同原版 toolloop.go：长文本不判定，避免误判 */
 export function isToolRefusal(text: string): boolean {
+  // 模板化空答复整体命中即拒答（B 20260906 移植）：锚定全文、长度有限，先于长度守卫也安全，
+  // 但保持与既有行为一致仍在守卫之后判定。
+  if (text.length < 200 && genericAssistantNonAnswer(text)) return true
   if (text.length >= 200) return false
   const low = text.toLowerCase()
   for (const p of toolRefusalPatterns) if (low.includes(p)) return true

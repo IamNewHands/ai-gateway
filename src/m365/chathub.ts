@@ -287,7 +287,30 @@ export function classifyChatHubNotice(text: string): ChatHubErrorClass {
  * 上传图片附件到 M365 UploadFile 端点（form-urlencoded，base64 data URL）。
  * 远程 https URL 会先下载再转 base64。返回 docId 供消息注解使用。
  */
-async function uploadAttachments(acc: ChatHubAccount, conversationID: string, attachments: ChatHubAttachment[], opts: ChatHubOptions): Promise<void> {
+/** 有界读取响应体再 JSON 解析（移植 M365-Gateway 20260906 image-upload.ts 的 readJSONLimited 思路）：
+ * 防止异常上游用超大响应体撑爆内存。超限或解析失败一律抛错。 */
+export async function readJsonBounded(resp: Response, maxBytes: number): Promise<unknown> {
+  const reader = resp.body?.getReader()
+  if (!reader) throw new Error('image attachment upload returned empty body')
+  const parts: Uint8Array[] = []
+  let total = 0
+  for (;;) {
+    const { done, value } = await reader.read()
+    if (done) break
+    total += value.byteLength
+    if (total > maxBytes) {
+      try { await reader.cancel() } catch { /* ignore */ }
+      throw new Error('image attachment upload response exceeds bounded read limit')
+    }
+    parts.push(value)
+  }
+  const merged = new Uint8Array(total)
+  let offset = 0
+  for (const p of parts) { merged.set(p, offset); offset += p.byteLength }
+  return JSON.parse(new TextDecoder().decode(merged))
+}
+
+export async function uploadAttachments(acc: ChatHubAccount, conversationID: string, attachments: ChatHubAttachment[], opts: ChatHubOptions): Promise<void> {
   let imageCount = 0
   for (let i = 0; i < attachments.length; i++) {
     const a = attachments[i]
@@ -315,11 +338,15 @@ async function uploadAttachments(acc: ChatHubAccount, conversationID: string, at
     form.set('FileBase64', imageData)
     form.append('optionsSets', 'cwcgptvsan')
     form.append('optionsSets', 'flux_v3_gptv_enable_upload_multi_image_in_turn_wo_ch')
+    // 2048 归一化（B 20260906 image-upload.ts）：上游将大图归一后绑定，减小带宽并提升识别率
+    form.append('optionsSets', 'gptvnorm2048')
 
     let resp: Response
     try {
       resp = await fetch('https://substrate.office.com/m365Copilot/UploadFile', {
         method: 'POST',
+        // 不跟随重定向：携带 Microsoft 凭据的请求一旦被重定向，凭据可能泄露到第三方（同 B redirect:"manual"）
+        redirect: 'manual',
         headers: {
           'Content-Type': 'application/x-www-form-urlencoded',
           'Authorization': `Bearer ${acc.accessToken}`,
@@ -331,18 +358,25 @@ async function uploadAttachments(acc: ChatHubAccount, conversationID: string, at
           'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:148.0) Gecko/20100101 Firefox/148.0',
         },
         body: form.toString(),
+        // 单图上传 30s 上限（B 20260906）：上传卡死时尽快失败，不让整个对话挂起
+        signal: AbortSignal.timeout(30_000),
       })
     } catch (e) {
       throw new Error(`image attachment upload failed: ${e instanceof Error ? e.message : String(e)}`)
     }
     if (!resp.ok) throw new Error(`image attachment upload HTTP ${resp.status}`)
-    let out: { docId?: string; fileName?: string; fileType?: string; result?: { value?: string } }
+    let out: { docId?: string; fileName?: string; fileType?: string; result?: { value?: string }; conversationId?: string }
     try {
-      out = await resp.json()
-    } catch {
+      // 有界读取（≤64KiB）后再解析，防超大响应体（B 20260906）
+      out = await readJsonBounded(resp, 64 * 1024) as typeof out
+    } catch (e) {
+      if (e instanceof Error && e.message.includes('bounded read limit')) throw e
       throw new Error('image attachment upload returned invalid JSON')
     }
+    // 绑定校验（B 20260906 image-upload.ts IMAGE_UPLOAD_NOT_BOUND）：
+    // 上游必须确认 Success + 返回 docId + 确认归属当前对话，缺一不可，否则拒绝发送对话
     if (out.result?.value !== 'Success' || !out.docId) throw new Error(`image attachment upload rejected: ${out.result?.value || 'unknown'}`)
+    if (out.conversationId !== conversationID) throw new Error(`image attachment upload not bound to conversation (got ${out.conversationId ? 'a different conversation' : 'no binding'})`)
     a.docId = out.docId
     a.fileType = (out.fileType || '').toLowerCase().replace(/^\./, '')
     if (a.fileType === 'jpeg') a.fileType = 'jpg'

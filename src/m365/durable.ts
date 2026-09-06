@@ -516,6 +516,9 @@ export class M365Session {
     // 流式终态三分（同对方 request-metrics.ts 的 trackStreamingResponse 判定）：
     // complete=自然 EOF 正常收尾 / error=上游失败走了错误收尾 / canceled=客户端取消 ReadableStream。
     // 由 start 与 cancel 共享，用于 exactly-once 收尾与诊断日志，避免重复 close/挂起。
+    // 完成证据 ledger：本方法（流式）此前误引用了外层非流式方法的 evidenceLedger（TS2304，
+    // 运行时 ReferenceError），导致带工具的流式对话在最终校验处必炸——按非流式路径（:150）同款重建。
+    const evidenceLedger: AgentLedger = await buildAgentLedger(selectCompletionEvidenceMessages(messages as OaiMsgLite[]))
     let streamState: 'complete' | 'error' | 'canceled' = 'complete'
     let closed = false
     // 恰到一次收尾：心跳 interval 与 controller.close() 只执行一次

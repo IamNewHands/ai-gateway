@@ -47,7 +47,22 @@ const SPEC_3_FLASH_AGENT: GeminiRealModelSpec = { id: 'gemini-3-flash-agent', th
 const SPEC_31_PRO_LOW: GeminiRealModelSpec = { id: 'gemini-3.1-pro-low', thinkingBudget: 1001, maxOutputTokens: 65535, includeThoughts: true }
 const SPEC_PRO_AGENT: GeminiRealModelSpec = { id: 'gemini-pro-agent', thinkingBudget: 10001, maxOutputTokens: 65535, includeThoughts: true }
 
+const SPEC_31_FLASH_LITE: GeminiRealModelSpec = { id: 'gemini-3.1-flash-lite', thinkingBudget: 0, maxOutputTokens: 16384, includeThoughts: false }
+const SPEC_CLAUDE_SONNET_46: GeminiRealModelSpec = { id: 'claude-sonnet-4-6', thinkingBudget: 1024, maxOutputTokens: 64000, includeThoughts: true }
+const SPEC_CLAUDE_OPUS_46: GeminiRealModelSpec = { id: 'claude-opus-4-6-thinking', thinkingBudget: 1024, maxOutputTokens: 64000, includeThoughts: true }
+const SPEC_GPT_OSS_120B: GeminiRealModelSpec = { id: 'gpt-oss-120b-medium', thinkingBudget: 8192, maxOutputTokens: 32768, includeThoughts: true }
+
 export const GEMINI_FAMILIES: CanonicalFamily[] = [
+  {
+    canonicalId: 'gemini-3.8-flash',
+    tiers: { low: SPEC_37_FLASH_LOW, medium: SPEC_37_FLASH_MEDIUM, high: SPEC_37_FLASH_HIGH },
+    aliases: {
+      'gemini-3.8-flash-high': { policy: 'honor' },
+      'gemini-3.8-flash-medium': { policy: 'fixed', tier: 'medium' },
+      'gemini-3.8-flash-low': { policy: 'fixed', tier: 'low' },
+      'gemini-3.8-flash-tiered': { policy: 'honor' },
+    },
+  },
   {
     canonicalId: 'gemini-3.7-flash',
     tiers: { low: SPEC_37_FLASH_LOW, medium: SPEC_37_FLASH_MEDIUM, high: SPEC_37_FLASH_HIGH },
@@ -70,7 +85,10 @@ export const GEMINI_FAMILIES: CanonicalFamily[] = [
       'gemini-3.5-flash-high': { policy: 'honor' },
       'gemini-3.5-flash-medium': { policy: 'fixed', tier: 'medium' },
       'gemini-3.5-flash-low': { policy: 'fixed', tier: 'low' },
+      'gemini-3.5-flash-extra-low': { policy: 'fixed', tier: 'low' },
       'gemini-3-flash': { policy: 'honor' },
+      'gemini-3-flash-agent': { policy: 'honor' },
+      'gemini-3.5-flash-tiered': { policy: 'honor' },
     },
   },
   {
@@ -78,11 +96,31 @@ export const GEMINI_FAMILIES: CanonicalFamily[] = [
     tiers: { low: SPEC_31_PRO_LOW, medium: SPEC_PRO_AGENT, high: SPEC_PRO_AGENT },
     aliases: {
       'gemini-3.1-pro-high': { policy: 'honor' },
+      'gemini-3.1-pro-medium': { policy: 'honor' },
       'gemini-pro': { policy: 'honor' },
+      'gemini-pro-agent': { policy: 'honor' },
       'gemini-3.1-pro-low': { policy: 'fixed', tier: 'low' },
+      'gemini-3.1-pro-tiered': { policy: 'honor' },
     },
   },
 ]
+
+export function resolveNonVariantModel(model: string): GeminiRealModelSpec | null {
+  const key = String(model || '').trim().toLowerCase()
+  if (['gemini-3.1-flash-lite', 'gemini-2.5-flash-lite', 'gemini-2.5-flash', 'gemini-2.5-flash-thinking'].includes(key)) {
+    return SPEC_31_FLASH_LITE
+  }
+  if (key === 'claude-sonnet-4-6' || key === 'claude-3-7-sonnet' || key === 'claude-3.7-sonnet') {
+    return SPEC_CLAUDE_SONNET_46
+  }
+  if (['claude-opus-4-6-thinking', 'claude-opus-4-6', 'claude-3-7-opus'].includes(key)) {
+    return SPEC_CLAUDE_OPUS_46
+  }
+  if (key === 'gpt-oss-120b-medium' || key === 'gpt-oss-120b') {
+    return SPEC_GPT_OSS_120B
+  }
+  return null
+}
 
 export function inferTier(thinkingBudget?: number): VariantTier {
   if (typeof thinkingBudget !== 'number') return 'high'
@@ -104,6 +142,12 @@ export function resolveGeminiRealModel(
 ): GeminiRealModelSpec | null {
   const key = String(model || '').trim().toLowerCase()
   if (!key) return null
+
+  // 1. 优先检查非变体模型
+  const nonVariant = resolveNonVariantModel(key)
+  if (nonVariant) return nonVariant
+
+  // 2. 变体族推断
   const tier: VariantTier = (opts?.effort === 'low' || opts?.effort === 'medium' || opts?.effort === 'high')
     ? opts.effort
     : inferTier(opts?.thinkingBudget)

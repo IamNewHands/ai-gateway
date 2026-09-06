@@ -1687,10 +1687,21 @@ export async function handleOAuthModels(c: Context<AppEnv>) {
     }
   }
 
-  // Gemini：模型列表为静态清单（参考 geminicli/internal/models/models.go），
-  // 无需请求上游；仅返回清单，用户手工「+」/保存后才入库。
+  // Gemini：动态从 fetchAvailableModels 获取可用模型，降级使用完整静态清单
   if (isGeminiProvider(provider)) {
-    const models = GEMINI_MODELS.map((m) => ({ id: m.id }))
+    try {
+      const snapshot = await fetchGeminiQuota(c.env, provider, true)
+      if (snapshot.models && snapshot.models.length > 0) {
+        const dynamicModels = snapshot.models.map((m) => ({
+          id: m.name,
+          displayName: m.displayName || m.name,
+        }))
+        return c.json<ApiResponse>({ success: true, data: { data: dynamicModels } })
+      }
+    } catch (e) {
+      console.warn('[oauth-models] fetchGeminiQuota failed, falling back to static GEMINI_MODELS:', e)
+    }
+    const models = GEMINI_MODELS.map((m) => ({ id: m.id, displayName: m.displayName }))
     return c.json<ApiResponse>({ success: true, data: { data: models } })
   }
 

@@ -48,31 +48,50 @@ export function resolveGeminiBaseUrl(provider: Provider): string {
   return GEMINI_BASE_URL
 }
 
-/** 静态模型列表（对齐 Antigravity-Manager model_mapping.rs 的 CLAUDE_TO_GEMINI Gemini 模型全集） */
+/** 静态模型列表（对齐 Antigravity-Manager 支持的完整模型列表） */
 export const GEMINI_MODELS: Array<{ id: string; displayName: string }> = [
+  // GPT-OSS & Claude
+  { id: 'gpt-oss-120b-medium', displayName: 'GPT-OSS 120B (Medium)' },
+  { id: 'claude-sonnet-4-6', displayName: 'Claude Sonnet 4.6 (Thinking)' },
+  { id: 'claude-opus-4-6-thinking', displayName: 'Claude Opus 4.6 (Thinking)' },
+  // Gemini 3.8
+  { id: 'gemini-3.8-flash-high', displayName: 'Gemini 3.8 Flash (High)' },
+  { id: 'gemini-3.8-flash-medium', displayName: 'Gemini 3.8 Flash (Medium)' },
+  { id: 'gemini-3.8-flash-low', displayName: 'Gemini 3.8 Flash (Low)' },
+  { id: 'gemini-3.8-flash', displayName: 'Gemini 3.8 Flash' },
+  { id: 'gemini-3.8-flash-tiered', displayName: 'gemini-3.8-flash-tiered' },
+  // Gemini 3.7
+  { id: 'gemini-3.7-flash-high', displayName: 'Gemini 3.7 Flash (High)' },
+  { id: 'gemini-3.7-flash-medium', displayName: 'Gemini 3.7 Flash (Medium)' },
+  { id: 'gemini-3.7-flash-low', displayName: 'Gemini 3.7 Flash (Low)' },
+  { id: 'gemini-3.7-flash', displayName: 'Gemini 3.7 Flash' },
+  { id: 'gemini-3.7-flash-tiered', displayName: 'gemini-3.7-flash-tiered' },
+  // Gemini 3.6
+  { id: 'gemini-3.6-flash-high', displayName: 'Gemini 3.6 Flash (High)' },
+  { id: 'gemini-3.6-flash-medium', displayName: 'Gemini 3.6 Flash (Medium)' },
+  { id: 'gemini-3.6-flash-low', displayName: 'Gemini 3.6 Flash (Low)' },
+  { id: 'gemini-3.6-flash', displayName: 'Gemini 3.6 Flash' },
+  { id: 'gemini-3.6-flash-tiered', displayName: 'gemini-3.6-flash-tiered' },
+  // Gemini 3.5
+  { id: 'gemini-3.5-flash-high', displayName: 'Gemini 3.5 Flash (High)' },
+  { id: 'gemini-3.5-flash-medium', displayName: 'Gemini 3.5 Flash (Medium)' },
+  { id: 'gemini-3.5-flash-low', displayName: 'Gemini 3.5 Flash (Low)' },
+  { id: 'gemini-3.5-flash', displayName: 'Gemini 3.5 Flash' },
+  { id: 'gemini-3.5-flash-lite', displayName: 'Gemini 3.5 Flash Lite' },
+  // Gemini 3 Flash / Pro
+  { id: 'gemini-3-flash', displayName: 'Gemini 3 Flash' },
+  { id: 'gemini-3.1-pro-high', displayName: 'Gemini 3.1 Pro (High)' },
+  { id: 'gemini-3.1-pro-low', displayName: 'Gemini 3.1 Pro (Low)' },
+  { id: 'gemini-3.1-pro', displayName: 'Gemini 3.1 Pro' },
+  { id: 'gemini-3-pro-image', displayName: 'Gemini 3 Pro Image' },
+  // Gemini 2.5
   { id: 'gemini-2.5-pro', displayName: 'Gemini 2.5 Pro' },
   { id: 'gemini-2.5-flash', displayName: 'Gemini 2.5 Flash' },
   { id: 'gemini-2.5-flash-lite', displayName: 'Gemini 2.5 Flash Lite' },
   { id: 'gemini-2.5-flash-thinking', displayName: 'Gemini 2.5 Flash Thinking' },
-  { id: 'gemini-3-pro', displayName: 'Gemini 3 Pro' },
-  { id: 'gemini-3-pro-preview', displayName: 'Gemini 3 Pro Preview' },
-  { id: 'gemini-3-pro-low', displayName: 'Gemini 3 Pro Low' },
-  { id: 'gemini-3-pro-high', displayName: 'Gemini 3 Pro High' },
-  { id: 'gemini-3.1-pro', displayName: 'Gemini 3.1 Pro' },
-  { id: 'gemini-3.1-pro-preview', displayName: 'Gemini 3.1 Pro Preview' },
-  { id: 'gemini-3.1-pro-low', displayName: 'Gemini 3.1 Pro Low' },
-  { id: 'gemini-3.1-pro-high', displayName: 'Gemini 3.1 Pro High' },
-  { id: 'gemini-3-flash', displayName: 'Gemini 3 Flash' },
-  { id: 'gemini-3-flash-preview', displayName: 'Gemini 3 Flash Preview' },
-  { id: 'gemini-3.1-flash-lite-preview', displayName: 'Gemini 3.1 Flash Lite Preview' },
-  { id: 'gemini-3.5-flash', displayName: 'Gemini 3.5 Flash' },
-  { id: 'gemini-3.6-flash', displayName: 'Gemini 3.6 Flash' },
-  { id: 'gemini-3.7-flash', displayName: 'Gemini 3.7 Flash' },
-  { id: 'gemini-3.7-flash-tiered', displayName: 'Gemini 3.7 Flash Tiered' },
-  { id: 'gemini-3.7-flash-low', displayName: 'Gemini 3.7 Flash Low' },
-  { id: 'gemini-3.7-flash-medium', displayName: 'Gemini 3.7 Flash Medium' },
-  { id: 'gemini-3.7-flash-high', displayName: 'Gemini 3.7 Flash High' },
-  { id: 'gemini-3-pro-image', displayName: 'Gemini 3 Pro Image' },
+  // Other Gemini 3.1
+  { id: 'gemini-3.1-flash-lite', displayName: 'Gemini 3.1 Flash Lite' },
+  { id: 'gemini-3.1-flash-image', displayName: 'Gemini 3.1 Flash Image' },
 ]
 
 /** 是否 Gemini 提供商（OAuth flowType === 'gemini'），providerId 可自定义 */
@@ -804,7 +823,10 @@ export async function proxyGeminiChatRequest(
   let resp: Response | null = null
   let lastErr: Error | null = null
 
-  // 首次请求：带 x-goog-user-project（对齐 Antigravity）
+  // 内容生成请求（generateContent / streamGenerateContent）：
+  // 对齐 Antigravity-Manager src-tauri/src/proxy/upstream/client.rs：
+  // 必须移除 x-goog-user-project 请求头（includeProject = false），避免触发 GCP Project Quota 429/403；
+  // 但保留 body 中的 project 字段。
   const attempt = await tryGeminiEndpoints(
     bases,
     stream,
@@ -812,29 +834,11 @@ export async function proxyGeminiChatRequest(
     effectiveModel,
     wrapped,
     projectId,
-    true
+    false
   )
   resp = attempt.resp ?? null
   if (!resp && attempt.failedStatus) {
     lastErr = new Error(`HTTP ${attempt.failedStatus}`)
-  }
-
-  // 对齐 Antigravity call_v1_internal_with_headers：
-  // 当带 project header 收到 403（账号无权使用该 project）时，降级为不带该头重试一次。
-  // 去掉 header 后请求会回落到账号自身的默认权限/配额，规避 "no permission to use project" 403。
-  if (resp?.status === 403) {
-    const downgraded = await tryGeminiEndpoints(
-      bases,
-      stream,
-      token,
-      effectiveModel,
-      wrapped,
-      projectId,
-      false
-    )
-    if (downgraded.resp) {
-      resp = downgraded.resp
-    }
   }
 
   // 401/403：token 过期，刷新后重试一次
@@ -914,7 +918,7 @@ export async function testGeminiModel(
   const resp = await proxyGeminiChatRequest(
     env,
     provider,
-    { model: modelId, messages: [{ role: 'user', content: 'hi' }], max_tokens: 1, stream: false }
+    { model: modelId, messages: [{ role: 'user', content: 'hi' }], stream: false }
   )
   if (resp.ok) {
     return { success: true, message: '连接成功', statusCode: resp.status }
