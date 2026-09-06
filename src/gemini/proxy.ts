@@ -99,6 +99,15 @@ export function isGeminiProvider(provider: Provider): boolean {
   return provider.oauth?.flowType === 'gemini'
 }
 
+// ===== 客户端指纹常量（对齐 Antigravity-Manager constants.rs）=====
+// AM 每次启动会动态解析 max(本地, 远端最新, 4.3.0)；Worker 无法动态解析，
+// 固定为当前 AM 最新版（CHANGELOG v4.6.8, 2026-09-06）。
+export const GEMINI_CLIENT_VERSION = '4.6.8'
+export const GEMINI_CLIENT_USER_AGENT =
+  'Antigravity/4.6.8 (Windows NT 10.0; Win64; x64) Chrome/132.0.6834.160 Electron/39.2.3'
+/** 额度端点 UA（对齐 AM NATIVE_OAUTH_USER_AGENT：vscode/1.X.X (Antigravity/<ver>)） */
+export const GEMINI_NATIVE_OAUTH_USER_AGENT = `vscode/1.X.X (Antigravity/${GEMINI_CLIENT_VERSION})`
+
 function stripProviderPrefix(model: string): string {
   const i = model.indexOf('/')
   if (i > 0) return model.slice(i + 1)
@@ -691,11 +700,12 @@ function geminiHeaders(
     'Content-Type': 'application/json',
     'Accept': stream ? 'text/event-stream' : 'application/json',
     'Authorization': `Bearer ${token}`,
-    // 对齐 Antigravity call_v1_internal_with_headers：UA 用官方客户端的 antigravity，
-    // 而非 GeminiCLI 的 UA（避免矛盾指纹）。官方客户端特征头齐全。
-    'User-Agent': 'antigravity',
+    // 对齐 Antigravity constants.rs USER_AGENT：完整 Electron 客户端指纹 UA
+    // （裸 "antigravity" 不是官方客户端任何形态的 UA，属于矛盾指纹，会被上游从严限流）。
+    // 格式：Antigravity/<ver> (<platform>) Chrome/<chrome> Electron/<electron>
+    'User-Agent': GEMINI_CLIENT_USER_AGENT,
     'x-client-name': 'antigravity',
-    'x-client-version': '4.6.2',
+    'x-client-version': GEMINI_CLIENT_VERSION,
     'x-machine-id': '6c3f2e8a9b7d4f1a0e5c8b6d2a4f9e3c',
     'x-vscode-sessionid': 'antigravity-session-main',
   }
@@ -732,6 +742,14 @@ async function tryGeminiEndpoints(
       })
       if (resp.status >= 500 || resp.status === 404) {
         lastStatus = resp.status
+        continue
+      }
+      // 429 瞬时限流（通用 RESOURCE_EXHAUSTED）：短暂退避后在下一端点重试一次。
+      // 对齐 AM quota 接口的 429 回退语义与 rate_limit.rs 的瞬时限流分类。
+      if (resp.status === 429 && base !== bases[bases.length - 1]) {
+        lastStatus = 429
+        await resp.text().catch(() => '')
+        await new Promise((r) => setTimeout(r, 1000))
         continue
       }
       return { resp }

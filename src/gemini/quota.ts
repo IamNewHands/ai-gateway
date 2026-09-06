@@ -15,15 +15,15 @@
  */
 import type { Env, Provider } from '../types'
 import { getOauthAccessToken, readOauthToken, GEMINI_FALLBACK_PROJECT_ID } from '../oauth'
-import { GEMINI_FALLBACK_BASE_URLS } from './proxy'
+import { GEMINI_FALLBACK_BASE_URLS, GEMINI_NATIVE_OAUTH_USER_AGENT } from './proxy'
 import { isGeminiProvider } from './proxy'
 import { KV_KEYS } from '../config'
 
 /** 端点回退顺序（Sandbox → Daily → Prod），与推理转发一致 */
 const QUOTA_BASE_URLS = GEMINI_FALLBACK_BASE_URLS
 
-/** 与 Antigravity-Manager NATIVE_OAUTH_USER_AGENT 对齐（其版本随客户端动态解析，这里固定 4.6.2） */
-const QUOTA_USER_AGENT = 'vscode/1.X.X (Antigravity/4.6.2)'
+/** 与 Antigravity-Manager NATIVE_OAUTH_USER_AGENT 对齐（版本跟随 proxy.ts 的 GEMINI_CLIENT_VERSION） */
+const QUOTA_USER_AGENT = GEMINI_NATIVE_OAUTH_USER_AGENT
 
 /** 额度缓存 TTL（秒）：额度本身按分钟级变化，5 分钟足够且省配额 */
 const QUOTA_CACHE_TTL_SEC = 300
