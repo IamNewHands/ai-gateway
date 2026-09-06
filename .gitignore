@@ -9,3 +9,6 @@ docs/
 .testout/
 # 对比分析的第三方仓库克隆（含对方 .dev.vars 等潜在敏感文件），绝不提交
 .comparison/
+# 本地调试日志，绝不提交
+debug.log
+*.log

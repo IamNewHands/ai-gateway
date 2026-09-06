@@ -19,7 +19,8 @@ import { resolveSession, bindSession, systemPromptHash, convCacheLookup, convCac
 import type { ResolveResult, ContextLike } from './session'
 import { listM365Accounts, refreshM365AccountIfNeeded } from './oauth'
 import { recordConversation, shouldCleanup, cleanupConversations, getCleanupMode, getCleanupConfig } from './conversation-manager'
-import { markAccountSuccess, markAccountFailure, markAccountImageLimited, accountCooldownSeconds, isAccountAvailable, isRateLimited, isAuthFailure, isEmptyCompletion, isRetryable, confirmAndMarkRateLimit } from './account-health'
+import { markAccountSuccess, markAccountFailure, markAccountImageLimited, accountCooldownSeconds, isAccountAvailable, isRateLimited, isAuthFailure, isEmptyCompletion, isRetryable, confirmAndMarkRateLimit, recordAccountAllowance } from './account-health'
+import { extractRemainingAllowance } from './chathub'
 import type { RateLimitProbeFn } from './account-health'
 import { writeLog, isM365DebugSseEnabled } from '../admin'
 import { acquireSlot, releaseSlot, fluxSnapshot } from './account-flux'
@@ -450,6 +451,8 @@ export class M365Session {
 
     // 标记账户健康：成功
     await markAccountSuccess(this.env, usedAcc.oid)
+    // 配额余量观测回写（移植自 M365-2api updateAccountAllowance）：供账号选择避开耗尽账号
+    try { await recordAccountAllowance(this.env, usedAcc.oid, extractRemainingAllowance(result.throttling)) } catch { /* 不影响主流程 */ }
     // 写入 convCache（account+model+systemPromptHash），供后续复用
     if (sysHash) {
       try { await convCacheStore(this.env, providerId, usedAcc.oid || providerId, model, sysHash, outcome.sessionId, outcome.conversationId, payload.tenant) } catch { /* ignore */ }
@@ -698,6 +701,8 @@ export class M365Session {
           try {
             await bindSession(this.env, providerId, result.sessionId, result.conversationId, usedAcc.oid || providerId, messages as never[], finalText, ctx)
             await markAccountSuccess(this.env, usedAcc.oid)
+            // 配额余量观测回写（同非流式路径）
+            try { await recordAccountAllowance(this.env, usedAcc.oid, extractRemainingAllowance(result.throttling)) } catch { /* ignore */ }
             if (sysHash) {
               try { await convCacheStore(this.env, providerId, usedAcc.oid || providerId, model, sysHash, result.sessionId, result.conversationId, ctx.tenant) } catch { /* ignore */ }
             }

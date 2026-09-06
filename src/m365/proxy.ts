@@ -17,6 +17,17 @@
 import type { Env, Provider } from '../types'
 import { sessionKey } from './durable'
 import type { M365ChatPayload } from './durable'
+import { stableSessionCandidateBody } from './session-candidates'
+
+/**
+ * 模型名归一化（移植自 M365-2api canonicalModel 的容错子集，2026-09-06）：
+ * 剥离 CC Switch 类客户端习惯附加的上下文窗口括号后缀（[1M] / (200k) / [200K]）
+ * 与首尾空白，保证 usage 回显与 convCache 键稳定。M365 上游不按模型名路由，
+ * 仅做展示/键稳定；不做"未知模型静默换模型"（保持明确性）。
+ */
+export function normalizeModelName(raw: string): string {
+  return raw.replace(/\s*[([]\s*\d{1,4}\s*[kKmM]\s*[\])]$/g, '').trim()
+}
 
 /** 是否 M365 Copilot 提供商（OAuth flowType ∈ m365-pkce | m365-ropc） */
 export function isM365Provider(provider: Provider): boolean {
@@ -56,10 +67,15 @@ export interface M365ProxyContext {
 /** 内部透传租户用的 body 字段（Anthropic/Responses 特殊路径没有 context 参数时使用） */
 const TENANT_BODY_FIELD = '__m365_tenant'
 
-/** 从请求体提取客户端指定的会话 ID（可选，X-M365-Session-Id 的 JSON 对应字段） */
+/**
+ * 从请求体提取客户端指定的会话 ID。
+ * 扩展候选链（移植自 M365-2api session-resolver，2026-09-06）：
+ * m365_session_id / session_id（A 原有）→ session_key / conversation_id / chat_id /
+ * prompt_cache_key → metadata.* → 会话根指纹（system+首条 user，先剥 IDE 动态日期噪声）。
+ */
 function extractExplicitSession(body: Record<string, unknown>): string | undefined {
-  const v = body['m365_session_id'] ?? body['session_id']
-  return typeof v === 'string' && v.trim() !== '' ? v.trim() : undefined
+  const id = stableSessionCandidateBody(body)
+  return id !== '' ? id : undefined
 }
 
 /**
@@ -84,7 +100,7 @@ export async function proxyM365ChatRequest(
 
   const payload: M365ChatPayload = {
     providerId: provider.id,
-    model: typeof body['model'] === 'string' ? body['model'] : '',
+    model: normalizeModelName(typeof body['model'] === 'string' ? body['model'] : ''),
     body,
     stream: body['stream'] === true,
     explicitSessionId,

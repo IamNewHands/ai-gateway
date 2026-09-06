@@ -47,6 +47,10 @@ export interface AccountHealthState {
   breakerTotal?: number
   /** 熔断到期时间（Unix ms），0 表示未熔断 */
   trippedUntil?: number
+  /** 上游配额余量（capability → remainingAllowance，移植自 M365-2api updateAccountAllowance，2026-09-06） */
+  allowance?: Record<string, number>
+  /** 余量观测时间（Unix ms），0 表示无观测 */
+  allowanceAt?: number
   /** 最后更新时间 */
   updatedAt: number
 }
@@ -65,6 +69,8 @@ async function readHealth(env: Env, accountId: string): Promise<AccountHealthSta
       breakerFailures: s.breakerFailures || 0,
       breakerTotal: s.breakerTotal || 0,
       trippedUntil: s.trippedUntil || 0,
+      allowance: s.allowance,
+      allowanceAt: s.allowanceAt || 0,
       updatedAt: s.updatedAt || 0,
     }
   } catch {
@@ -262,7 +268,20 @@ export async function markAccountSuccess(env: Env, accountId: string): Promise<v
   })
 }
 
-/** 账户是否可用 */
+/** 记录上游配额余量观测（移植自 M365-2api updateAccountAllowance，2026-09-06）。
+ * 供账号选择避开已耗尽（全部 capability 余量 ≤0）的账号；观测随时间老化（ALLOWANCE_STALE_MS）失效。 */
+const ALLOWANCE_STALE_MS = 6 * 60 * 60 * 1000
+
+export async function recordAccountAllowance(env: Env, accountId: string, allowance: Record<string, number> | null): Promise<void> {
+  if (!allowance || Object.keys(allowance).length === 0) return
+  const state = await readHealth(env, accountId)
+  state.allowance = allowance
+  state.allowanceAt = Date.now()
+  await writeHealth(env, accountId, state)
+  console.log(`[account-health] ${accountId} allowance observed: ${JSON.stringify(allowance).substring(0, 200)}`)
+}
+
+/** 账号是否可用 */
 export async function isAccountAvailable(env: Env, accountId: string): Promise<boolean> {
   const state = await readHealth(env, accountId)
   if (state.authFailed) return false
@@ -270,6 +289,11 @@ export async function isAccountAvailable(env: Env, accountId: string): Promise<b
   if (state.cooldownUntil > 0 && Date.now() < state.cooldownUntil) return false
   // 全局熔断器：命中时跳过该账号（跨实例/跨 DO 共享）
   if (state.trippedUntil && Date.now() < state.trippedUntil) return false
+  // 配额余量：近期观测显示全部 capability 余量耗尽 → 跳过（观测老化后恢复可用，等下一轮观测刷新）
+  if (state.allowance && state.allowanceAt && Date.now() - state.allowanceAt < ALLOWANCE_STALE_MS) {
+    const values = Object.values(state.allowance)
+    if (values.length > 0 && values.every((v) => v <= 0)) return false
+  }
   return true
 }
 

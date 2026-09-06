@@ -106,6 +106,24 @@ const app = new Hono<AppEnv>()
 app.use('*', cors())
 app.use('*', logger())
 
+// ===== API 路径归一化（移植自 M365-2api gateway-handler.ts:657-662，2026-09-06） =====
+// 1) 折叠重复前缀 /v1/v1/… → /v1/…；2) 常见根路径端点自动补 /v1。
+// 用 308 重定向（保留方法与请求体），客户端只需跟随重定向一次。
+const API_ROOT_ALIASES = [
+  '/chat/completions', '/completions', '/messages', '/responses',
+  '/models', '/embeddings', '/images/generations', '/images/edits', '/mcp', '/sessions',
+]
+app.use('*', async (c, next) => {
+  const path = new URL(c.req.url).pathname
+  if (path === '/v1' || path.startsWith('/v1/')) {
+    const folded = path.replace(/^\/v1(?:\/v1)+\//, '/v1/')
+    if (folded !== path) return c.redirect(new URL(folded, c.req.url).toString(), 308)
+  } else if (API_ROOT_ALIASES.includes(path)) {
+    return c.redirect(new URL('/v1' + path, c.req.url).toString(), 308)
+  }
+  return next()
+})
+
 // 首次请求时填充虚拟数据
 let seeded = false
 app.use('*', async (c, next) => {

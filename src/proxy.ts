@@ -20,6 +20,7 @@ import { isVisionBridgeProvider, buildVisionBridgeRequestBody } from './vision/b
 import { isGeminiProvider, proxyGeminiChatRequest } from './gemini/proxy'
 import { isCnbProvider, proxyCnbChatRequest, CnbStreamDiag } from './cnb/proxy'
 import { isM365Provider, proxyM365ChatRequest } from './m365/proxy'
+import { sessionCandidateFromRequest } from './m365/session-candidates'
 import { isTraeProvider, proxyTraeChatRequest } from './trae/proxy'
 import { isZcodeProvider, buildZcodeHeaders } from './zcode/proxy'
 import { writeLog } from './admin'
@@ -1363,8 +1364,14 @@ export async function forwardProxy(
     // 协议适配与 WS 会话承载在 Durable Object（env.M365_SESSION）中完成，
     // 网关透传 DO 返回的 OpenAI SSE/JSON。
     if (isM365Provider(provider)) {
+      // 会话候选链（移植自 M365-2api session-resolver，2026-09-06）：
+      // A 自有 X-M365-Session-Id 优先，其次九种常见会话 header 与 URL query
+      const headerCandidate =
+        c.req.header('X-M365-Session-Id') ||
+        sessionCandidateFromRequest(c.req.raw) ||
+        ''
       const response = await proxyM365ChatRequest(c.env, provider, forwardBody as Record<string, unknown>, {
-        explicitSessionId: c.req.header('X-M365-Session-Id') || '',
+        explicitSessionId: headerCandidate,
         ip: c.req.header('cf-connecting-ip') || c.req.header('x-real-ip') || '',
         userAgent: c.req.header('user-agent') || '',
         // 租户隔离：调用方 API Key 的不可逆哈希（auth 中间件已计算）

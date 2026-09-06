@@ -414,6 +414,64 @@ export function finalizeText(streamed: string, final: string, emit?: (delta: str
 }
 
 /**
+ * 正文自发生成思考标签的剥离兜底（移植自 M365-2api chathub.ts:1896-1901）：
+ * 上游未走 CoT 信号、但正文里自己冒出 <thought>/<thinking> 标签时，
+ * 剥离正文并归入 reasoning。仅在调用方确认尚无 CoT reasoning 时使用。
+ */
+const thoughtTagPattern = /<(?:thought|thinking)>([\s\S]*?)<\/(?:thought|thinking)>/i
+
+export function extractThoughtTags(text: string): { text: string; reasoning: string } {
+  const match = text.match(thoughtTagPattern)
+  if (!match) return { text, reasoning: '' }
+  const reasoning = match[1].trim()
+  if (reasoning === '') return { text, reasoning: '' }
+  return { text: text.replace(/<(?:thought|thinking)>[\s\S]*?<\/(?:thought|thinking)>/gi, '').trim(), reasoning }
+}
+
+/** CoT 消息判定（同 C answer 过滤）：推理消息不得进入正文快照/finalText（P1 修复，M365-2api chathub.ts:1759-1762） */
+export function isChainOfThoughtMessage(m: Record<string, unknown>): boolean {
+  return m['addToChainOfThought'] === true ||
+    (typeof m['contentOrigin'] === 'string' && (m['contentOrigin'] as string) === 'ChainOfThoughtSummary')
+}
+
+/**
+ * 从 throttling 对象提取剩余配额数值表（移植自 M365-2api chathub.ts:296-328）。
+ * 顶层对象：数值直接收录；嵌套对象取 remainingAllowance/remaining/balance 数值字段；
+ * 另深入 metering/quotas 两个已知子对象。返回 null 表示无可提取余量。
+ */
+export function extractRemainingAllowance(value: unknown): Record<string, number> | null {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null
+  const result: Record<string, number> = {}
+
+  function extractFrom(obj: Record<string, unknown>): void {
+    for (const [k, v] of Object.entries(obj)) {
+      if (typeof v === 'number' && Number.isFinite(v)) {
+        result[k] = v
+      } else if (v && typeof v === 'object' && !Array.isArray(v)) {
+        const item = v as Record<string, unknown>
+        if (typeof item['remainingAllowance'] === 'number' && Number.isFinite(item['remainingAllowance'])) {
+          result[k] = item['remainingAllowance']
+        } else if (typeof item['remaining'] === 'number' && Number.isFinite(item['remaining'])) {
+          result[k] = item['remaining']
+        } else if (typeof item['balance'] === 'number' && Number.isFinite(item['balance'])) {
+          result[k] = item['balance']
+        }
+      }
+    }
+  }
+
+  const throttling = value as Record<string, unknown>
+  extractFrom(throttling)
+  if (throttling['metering'] && typeof throttling['metering'] === 'object' && !Array.isArray(throttling['metering'])) {
+    extractFrom(throttling['metering'] as Record<string, unknown>)
+  }
+  if (throttling['quotas'] && typeof throttling['quotas'] === 'object' && !Array.isArray(throttling['quotas'])) {
+    extractFrom(throttling['quotas'] as Record<string, unknown>)
+  }
+  return Object.keys(result).length > 0 ? result : null
+}
+
+/**
  * 安全合并 writeAtCursor 增量：处理重复/累计帧问题（同 B appendChatHubDelta:1679-1693）。
  * 部分租户下，后续帧可能包含累计文本而非纯增量，盲 append 导致重复输出。
  */
@@ -1069,6 +1127,9 @@ export async function chatWithHandlers(
             for (const mraw of msgs) {
               if (!mraw || typeof mraw !== 'object') continue
               const m = mraw as Record<string, unknown>
+              // CoT 推理消息与正文同为 author=bot + messageType=''：必须排除，否则推理文本经
+              // emitSnapshot→onDelta 污染正文流（同 C 过滤，M365-2api chathub.ts:1759-1762）
+              if (isChainOfThoughtMessage(m)) continue
               if (m['author'] === 'bot' && (m['messageType'] || '') === '' && typeof m['text'] === 'string' && m['text'] !== '') {
                 emitSnapshot(m['text'] as string)
               }
@@ -1085,6 +1146,13 @@ export async function chatWithHandlers(
           if (item) {
             // 图片 URL 也可能只出现在 result 帧（item/result 元数据）：一并纳入收集
             rawFrames.push(item)
+            // 终帧 reasoning 收割（同 C chathub.ts:2053-2057）：推理可能只出现在 result 帧的
+            // messages 数组，仅靠 type=1 收集会丢失。只收 reasoning，正文以 finalText 为准不重发。
+            if (Array.isArray(item['messages'])) {
+              for (const ev of classifyUpdateMessages(item['messages'] as unknown[])) {
+                if (ev.kind === 'reasoning' && ev.text) reasoningBuf += ev.text
+              }
+            }
             if (item['throttling'] !== undefined) throttling = item['throttling']
             const res = item['result'] as Record<string, unknown> | undefined
             if (res) {
@@ -1135,7 +1203,12 @@ export async function chatWithHandlers(
           if (syntheticFailure) throw new Error('upstream rate-limit notice')
           if (rateLimited(finalText)) throw new Error('upstream rate-limit notice')
           // 以最终消息对齐流式文本：流式漏掉的尾部在这里补发（原版 finalizeText）
-          const text = finalizeText(streamedText, finalText || streamedText, onDelta)
+          let text = finalizeText(streamedText, finalText || streamedText, onDelta)
+          // thinking 标签剥离兜底：上游没走 CoT 信号时，正文自带的 <thought>/<thinking> 归入 reasoning（同 C:1896-1901）
+          if (reasoningBuf.trim() === '') {
+            const stripped = extractThoughtTags(text)
+            if (stripped.reasoning) { text = stripped.text; reasoningBuf += stripped.reasoning }
+          }
           debugEmit('chathub-final', text)
           if (imageLimitDetected(text)) throw new Error('upstream image generation daily limit reached')
           if (rateLimited(text)) throw new Error('upstream rate-limit notice')
@@ -1164,7 +1237,12 @@ export async function chatWithHandlers(
             throw new Error(`chathub closed before completion: ${upstreamErrorLabel(frame.error)}`)
           }
           if (finalText || collectedEvents.length > 0) {
-            const text = finalizeText(streamedText, finalText || streamedText, onDelta)
+            let text = finalizeText(streamedText, finalText || streamedText, onDelta)
+            // type=7 与 type=3 相同的 thinking 标签剥离兜底
+            if (reasoningBuf.trim() === '') {
+              const stripped = extractThoughtTags(text)
+              if (stripped.reasoning) { text = stripped.text; reasoningBuf += stripped.reasoning }
+            }
             return {
               text,
               reasoning: reasoningBuf,

@@ -5,6 +5,13 @@ function msg(role: string, content: string): Record<string, any> {
   return { role, content }
 }
 
+// applyHistoryBudget/applyToolSchemaBudget 在生产中以宽松 unknown[] 签名处理 TRAE 原始消息/schema，
+// 测试需在访问元素属性时做一次窄化（仅类型层面，不影响运行期）。
+type LiteMsg = { role: string; content: unknown; [k: string]: unknown }
+type LiteTool = { type: string; function: { name: string; parameters?: unknown } }
+const asMsgs = (a: unknown[]): LiteMsg[] => a as unknown as LiteMsg[]
+const asTools = (a: unknown[]): LiteTool[] => a as unknown as LiteTool[]
+
 describe('applyHistoryBudget：历史消息裁剪（raw/remote 长会话省输入积分）', () => {
   const system = msg('system', 'sys')
   it('未配置预算(maxMessages=0) → 原样返回，不动数组', () => {
@@ -16,7 +23,7 @@ describe('applyHistoryBudget：历史消息裁剪（raw/remote 长会话省输�
 
   it('maxMessages 保留最近 non-system 消息，system 恒保留', () => {
     const messages = [system, msg('user', 'u1'), msg('assistant', 'a1'), msg('user', 'u2'), msg('assistant', 'a2')]
-    const out = applyHistoryBudget(messages, { maxMessages: 3, maxHistoryChars: 0, maxToolSchemaChars: 0 })
+    const out = asMsgs(applyHistoryBudget(messages, { maxMessages: 3, maxHistoryChars: 0, maxToolSchemaChars: 0 }))
     expect(out.length).toBe(4) // system + 最近3条
     expect(out[0]).toBe(system)
     expect(out[1].content).toBe('a1')
@@ -32,7 +39,7 @@ describe('applyHistoryBudget：历史消息裁剪（raw/remote 长会话省输�
       { role: 'assistant', content: null, tool_calls: [{ id: 'call_1' }] },
       { role: 'tool', tool_call_id: 'call_1', content: 'result' },
     ]
-    const out = applyHistoryBudget(messages, { maxMessages: 1, maxHistoryChars: 0, maxToolSchemaChars: 0 })
+    const out = asMsgs(applyHistoryBudget(messages, { maxMessages: 1, maxHistoryChars: 0, maxToolSchemaChars: 0 }))
     // 最后 pair 必须整体保留（至少 2 条），不能拆散
     expect(out.length).toBeGreaterThanOrEqual(1)
     const roles = out.map((m) => m.role)
@@ -46,7 +53,7 @@ describe('applyHistoryBudget：历史消息裁剪（raw/remote 长会话省输�
   it('maxHistoryChars 截断后的消息整体剔除而不是半条', () => {
     const messages = [msg('user', 'a'.repeat(10)), msg('assistant', 'b'.repeat(10))]
     // 预算只够 1 条 → 只保留最近 1 条完整消息
-    const out = applyHistoryBudget(messages, { maxMessages: 0, maxHistoryChars: 12, maxToolSchemaChars: 0 })
+    const out = asMsgs(applyHistoryBudget(messages, { maxMessages: 0, maxHistoryChars: 12, maxToolSchemaChars: 0 }))
     expect(out.length).toBe(1)
     expect(out[0].content).toBe('b'.repeat(10))
   })
@@ -72,7 +79,7 @@ describe('applyToolSchemaBudget：工具 schema 压缩（省输入积分，超�
   it('超预算 → 仅压缩 function.parameters 为保留必填字段的最小 schema', () => {
     const bigParams = { type: 'object', properties: { a: { type: 'string', description: 'x'.repeat(200) }, b: { type: 'integer', description: 'y'.repeat(200) } } }
     const tools = [tool('t', JSON.stringify(bigParams))]
-    const out = applyToolSchemaBudget(tools, 100)
+    const out = asTools(applyToolSchemaBudget(tools, 100))
     expect(out.length).toBe(1)
     const fn = out[0].function
     expect(fn.name).toBe('t')

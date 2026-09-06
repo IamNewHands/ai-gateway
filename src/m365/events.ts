@@ -111,13 +111,31 @@ export function extractToolEvents(value: unknown, seen: Set<string>): ChatHubStr
   return out
 }
 
-/** 判断是否像图片 URL（同原版 chathub isImageURL 启发式） */
+/** 判断是否像图片 URL（同原版 chathub isImageURL 启发式；2026-09-06 增补微软系域名判定，移植自 M365-2api multimodal.ts:271-301） */
 function looksLikeImageURL(v: string): boolean {
   if (v.startsWith('data:image/')) return true
-  const low = v.toLowerCase()
-  if (!low.startsWith('https://')) return false
-  // 原版用 path+query 整体匹配：Designer 生成 URL 的扩展名常在 query 里（?path=.../dalle-xxx.png&...）
-  const withQuery = low.split('#')[0]
+  let url: URL
+  try {
+    url = new URL(v)
+  } catch {
+    return false
+  }
+  const host = url.hostname.toLowerCase()
+  const path = url.pathname.toLowerCase()
+  const withQuery = (v.split('#')[0] || '').toLowerCase()
+  // 微软系域名（Bing/Designer/Office/SharePoint）生成的图片 URL：扩展名常在 query 里，
+  // 或以 /th、create、image 等路径特征出现，仅靠扩展名/substring 'image' 会漏判
+  if (
+    host.endsWith('bing.com') || host.endsWith('bing.net') ||
+    host.endsWith('windows.net') || host.endsWith('microsoft.com') ||
+    host.endsWith('office.com') || host.endsWith('sharepoint.com')
+  ) {
+    if (
+      path.includes('/th') || path.includes('create') || path.includes('image') ||
+      url.searchParams.has('id') || url.searchParams.has('pid') ||
+      /\.(?:gif|jpe?g|png|webp)(&|$)/.test(path)
+    ) return true
+  }
   if (/\.(png|jpe?g|gif|webp)(&|$)/.test(withQuery)) return true
   if (withQuery.includes('image')) return true
   return false
@@ -131,7 +149,7 @@ function looksLikeImageURL(v: string): boolean {
 export function imageURLs(events: unknown[]): string[] {
   const out: string[] = []
   const seen = new Set<string>()
-  const IMG_KEYS = new Set(['url', 'imageurl', 'thumbnailurl', 'downloadurl', 'src'])
+  const IMG_KEYS = new Set(['url', 'imageurl', 'thumbnailurl', 'downloadurl', 'src', 'contenturl', 'mediaurl', 'originalimageurl'])
   const walk = (x: unknown) => {
     if (Array.isArray(x)) {
       for (const item of x) walk(item)

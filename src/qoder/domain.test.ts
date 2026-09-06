@@ -16,8 +16,10 @@ function makeKV(initial?: Record<string, string>) {
 function cfg(over: Partial<OAuthDeviceConfig> = {}): OAuthDeviceConfig {
   return {
     flowType: 'qoder',
+    deviceCodeUrl: 'https://qoder.com.cn/device/selectAccounts',
     deviceTokenUrl: 'https://openapi.qoder.com.cn/api/v1/deviceToken/poll',
     refreshTokenUrl: 'https://openapi.qoder.com.cn/api/v1/deviceToken/refresh',
+    clientId: '1c5e33e1-364d-4ce6-b02c-acaa81274a5c',
     pollInterval: 5,
     ...over,
   }
@@ -69,7 +71,7 @@ describe('qoderChatUrl / qoderModelsUrl（按域分端点，含 Encode=1）', ()
 describe('Qoder OAuth 域路由（poll/refresh）', () => {
   it('poll 缺省走 CN 轮询端点 openapi.qoder.com.cn', async () => {
     const { env } = makeKV()
-    const fetchMock = vi.fn(async () => new Response(
+    const fetchMock = vi.fn(async (_input: unknown) => new Response(
       JSON.stringify({ token: 'dt-1', refresh_token: 'drt-1', user_id: 'u1' }),
       { status: 200, headers: { 'Content-Type': 'application/json' } }
     ))
@@ -82,7 +84,7 @@ describe('Qoder OAuth 域路由（poll/refresh）', () => {
 
   it('poll 按 device.loginRealm=global 走 global 轮询端点 openapi.qoder.sh', async () => {
     const { env } = makeKV()
-    const fetchMock = vi.fn(async () => new Response(
+    const fetchMock = vi.fn(async (_input: unknown) => new Response(
       JSON.stringify({ token: 'dt-1', refresh_token: 'drt-1', user_id: 'u1' }),
       { status: 200, headers: { 'Content-Type': 'application/json' } }
     ))
@@ -102,7 +104,7 @@ describe('Qoder OAuth 域路由（poll/refresh）', () => {
 
   it('refresh 按 prev.realm=global 走 global 刷新端点 openapi.qoder.sh', async () => {
     const c = cfg({ globalRefreshTokenUrl: 'https://openapi.qoder.sh/api/v1/deviceToken/refresh' })
-    const fetchMock = vi.fn(async () => new Response(
+    const fetchMock = vi.fn(async (_input: unknown) => new Response(
       JSON.stringify({ token: 'dt-2', refresh_token: 'drt-2' }),
       { status: 200, headers: { 'Content-Type': 'application/json' } }
     ))
@@ -115,7 +117,7 @@ describe('Qoder OAuth 域路由（poll/refresh）', () => {
   })
 
   it('refresh 缺省走 CN 刷新端点 openapi.qoder.com.cn', async () => {
-    const fetchMock = vi.fn(async () => new Response(
+    const fetchMock = vi.fn(async (_input: unknown) => new Response(
       JSON.stringify({ token: 'dt-3', refresh_token: 'drt-3' }),
       { status: 200, headers: { 'Content-Type': 'application/json' } }
     ))

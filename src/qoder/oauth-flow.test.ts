@@ -16,8 +16,10 @@ function makeKV(initial?: Record<string, string>) {
 function cfg(over: Partial<OAuthDeviceConfig> = {}): OAuthDeviceConfig {
   return {
     flowType: 'qoder',
+    deviceCodeUrl: 'https://qoder.com.cn/device/selectAccounts',
     deviceTokenUrl: 'https://openapi.qoder.com.cn/api/v1/deviceToken/poll',
     refreshTokenUrl: 'https://openapi.qoder.com.cn/api/v1/refreshToken',
+    clientId: '1c5e33e1-364d-4ce6-b02c-acaa81274a5c',
     pollInterval: 5,
     ...over,
   }
