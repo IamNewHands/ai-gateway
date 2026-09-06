@@ -628,11 +628,34 @@ function unwrapGeminiSSE(upstreamBody: ReadableStream<Uint8Array>, model: string
   })
 }
 
-/** 上游错误 → OpenAI 错误格式 */
+/**
+ * 429 分类（对齐 Antigravity-Manager rate_limit.rs 的 parse_rate_limit_reason）：
+ *   - 带 details QUOTA_EXHAUSTED / quotaId：窗口额度耗尽（5h 或周窗口），等 resetTime 重置
+ *   - 其余（含裸 RESOURCE_EXHAUSTED）：瞬时限流（TPM/RPM），短超时自动恢复
+ */
+function classifyGemini429(bodyText: string): 'quota_exhausted' | 'rate_limit' | 'unknown' {
+  const low = String(bodyText || '').toLowerCase()
+  if (low.includes('quota_exhausted') || low.includes('quotaid') || low.includes('violation')) return 'quota_exhausted'
+  if (low.includes('resource_exhausted') || low.includes('rate limit') || low.includes('rate_limit')) return 'rate_limit'
+  return 'unknown'
+}
+
+/** 上游错误 → OpenAI 错误格式（429 附加可操作的分类提示） */
 function geminiErrorResponse(status: number, bodyText: string): Response {
   const text = String(bodyText || '').substring(0, 500)
+  let hint = ''
+  if (status === 429) {
+    const kind = classifyGemini429(text)
+    if (kind === 'quota_exhausted') {
+      hint = '（分类：窗口额度耗尽——请在管理后台该提供商的「查询额度」查看 5 小时/周窗口剩余与重置时间，等重置或换模型）'
+    } else if (kind === 'rate_limit') {
+      hint = '（分类：瞬时限流——请求频率/TPM 达到限流阈值，稍等片刻重试即可；也可用「查询额度」确认窗口额度未耗尽）'
+    } else {
+      hint = '（分类：限流——稍后重试，或用「查询额度」确认窗口剩余）'
+    }
+  }
   return new Response(
-    JSON.stringify({ error: { message: `Gemini 上游 HTTP ${status}: ${text}`, type: 'upstream_error' } }),
+    JSON.stringify({ error: { message: `Gemini 上游 HTTP ${status}: ${text}${hint}`, type: 'upstream_error' } }),
     { status: status || 502, headers: { 'Content-Type': 'application/json; charset=utf-8' } }
   )
 }
