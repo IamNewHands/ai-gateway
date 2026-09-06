@@ -178,7 +178,15 @@ export function normalizeReasoningDeltaForUI(t: unknown): string {
   return head ? head + ' ' : ' '
 }
 
-/** 就地改写 SSE 帧内的 reasoning delta 为 UI 归一化版本（探测缓冲与续流共用）。 */
+/**
+ * 就地改写 SSE 帧内的 reasoning delta 为 UI 归一化版本（探测缓冲与续流共用）。
+ *
+ * 字段覆盖（2026-09-06 实测 Novita 池帧结构确认）：cline 免费通道的 glm 由多个
+ * 推理商（Parasail/Novita/…）轮换托管，delta 字段不统一——有的发 reasoning_content，
+ * 有的发 reasoning + reasoning_details 双字段。DSH 的思考流读的是
+ * reasoning_details[].text（与 DSH replayState.blocks 结构逐字段一致），漏改它
+ * 等于所有归一化白做（log6 实测三连换行原样穿透的根因）。三处同步改写。
+ */
 function patchReasoningDeltaForUI(clone: Record<string, unknown>): void {
   const choice = ((clone.choices as Array<Record<string, unknown>>) || [])[0] as Record<string, unknown> | undefined
   if (!choice) return
@@ -186,6 +194,14 @@ function patchReasoningDeltaForUI(clone: Record<string, unknown>): void {
   if (!delta) return
   if (delta.reasoning_content !== undefined) delta.reasoning_content = normalizeReasoningDeltaForUI(delta.reasoning_content)
   else if (delta.reasoning !== undefined) delta.reasoning = normalizeReasoningDeltaForUI(delta.reasoning)
+  const details = delta.reasoning_details as Array<Record<string, unknown>> | undefined
+  if (Array.isArray(details)) {
+    for (const item of details) {
+      if (item && item.type === 'reasoning.text' && typeof item.text === 'string') {
+        item.text = normalizeReasoningDeltaForUI(item.text)
+      }
+    }
+  }
 }
 
 interface Account {

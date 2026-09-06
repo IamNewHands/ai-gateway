@@ -239,6 +239,37 @@ describe('粘标点换行归一化 normalizeReasoningDeltaForUI（2026-09-06 log
   })
 })
 
+describe('reasoning_details 双字段帧（2026-09-06 Novita 池实测形态）', () => {
+  /** 构造 Novita 风格帧：delta.reasoning + delta.reasoning_details 双字段，无 reasoning_content */
+  function novitaFrame(reasoning: string): string {
+    return 'data: ' + JSON.stringify({
+      id: 'gen-x', object: 'chat.completion.chunk', created: 0, model: 'z-ai/glm-5.3-flash', provider: 'Novita',
+      choices: [{
+        index: 0, finish_reason: null, native_finish_reason: null,
+        delta: { content: '', role: 'assistant', reasoning, reasoning_details: [{ type: 'reasoning.text', text: reasoning, format: 'unknown', index: 0 }] },
+      }],
+    }) + '\n\n'
+  }
+  it('归一化必须同步写穿 reasoning_details[].text（DSH 思考流读的是它）', async () => {
+    let body = ''
+    for (const t of [' thinking', '.\n', ' more', ',\n', ' done', '—\n\n\n']) {
+      body += novitaFrame(t)
+    }
+    body += dataFrame({ content: 'ok' })
+    body += dataFrame({}, 'stop')
+    body += doneFrame()
+    const outcome = await pumpStreamAttempt(sseResp(body))
+    expect(outcome.kind).toBe('healthy')
+    const text = await readAll(outcome.response!)
+    // text 与 reasoning 双字段同步归一化
+    expect(text).toContain('text":". "')
+    expect(text).toContain('text":", "')
+    expect(text).toContain('text":"—\\n\\n"') // 三换行压成段落分隔
+    expect(text).not.toContain('"text":".\\n"')
+    expect(text).not.toContain('"text":".\\n\\n\\n"')
+  })
+})
+
 describe('上游中途断流（upstream_interrupted 错误帧）', () => {
   it('上游流中途 error → 客户端收到 upstream_interrupted 错误帧后流正常关闭（不再静默截断）', async () => {
     // 前 3 帧正常，第 4 帧模拟网络重置（reader 抛异常）
