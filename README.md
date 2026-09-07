@@ -173,4 +173,4 @@ Header : Authorization: Bearer sk_cf_<KEY>
 
 ## License
 
-Apache 2.0
+AGPL-3.0
