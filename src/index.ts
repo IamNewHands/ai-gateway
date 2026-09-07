@@ -1,7 +1,7 @@
 import { Hono } from 'hono'
 import { cors } from 'hono/cors'
 import { logger } from 'hono/logger'
-import { adminAuthMiddleware, proxyKeyAuthMiddleware, managementAuthMiddleware, handleLogin, handleLogout } from './auth'
+import { adminAuthMiddleware, cloudflareAccessMiddleware, proxyKeyAuthMiddleware, managementAuthMiddleware, handleLogin, handleLogout } from './auth'
 import { handleProxy, handleModels, handleAnthropicMessages, handleResponses } from './proxy'
 import { handleImageGeneration, handleImageFile } from './m365/images'
 import { isM365Provider } from './m365/proxy'
@@ -150,6 +150,10 @@ app.post('/admin/login', handleLogin)
 app.post('/admin/logout', handleLogout)
 
 // ===== 管理后台（需 Session 验证） =====
+// Cloudflare Access 加固：配置 CF_ACCESS_AUD + CF_ACCESS_TEAM_DOMAIN 后，
+// 管理后台额外强制校验 Cf-Access-Jwt（未配置则放行）。只挂 /admin/*，
+// 与客户端 /v1/* 的转发 Key 鉴权完全无关。
+app.use('/admin/*', cloudflareAccessMiddleware)
 app.use('/admin/*', adminAuthMiddleware)
 // S5：CSRF 防护——管理面写操作校验 Origin 与 Host 同源。
 // 同源 fetch/表单都带 Origin；跨站提交（含旧浏览器无 Origin）另有 SameSite=Lax 兜底。

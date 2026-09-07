@@ -544,6 +544,14 @@ export interface Env {
   OPENCODE_MIRRORS_URL?: string
   /** 对外管理 API 的认证 Token；未配置时 /api/manage/* 返回 503 */
   MANAGEMENT_TOKEN?: string
+  /**
+   * Cloudflare Access 加固（可选，仅作用于 /admin/*）。
+   * 配置 CF_ACCESS_AUD（Access Application 的 Audience/AUD 标签）+ CF_ACCESS_TEAM_DOMAIN
+   * （你的团队域名，如 <team>.cloudflareaccess.com）后，管理后台额外要求携带有效
+   * Cf-Access-Jwt；与客户端 /v1/* 的转发 Key 鉴权完全无关，不影响模型对接。
+   */
+  CF_ACCESS_AUD?: string
+  CF_ACCESS_TEAM_DOMAIN?: string
   /** Gemini OAuth 客户端凭据（官方公开凭据，避免硬编码进代码） */
   GEMINI_OAUTH_CLIENT_ID?: string
   GEMINI_OAUTH_CLIENT_SECRET?: string
@@ -586,6 +594,8 @@ export interface AppVariables {
   username?: string
   proxyKey?: ProxyKey
   proxyKeyHash?: string
+  /** Cloudflare Access 校验通过后写入的登录用户邮箱（仅配置 CF_ACCESS_AUD 时存在） */
+  cvAccessEmail?: string
 }
 
 export type AppEnv = {

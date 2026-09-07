@@ -64,6 +64,11 @@ crons = ["0 */2 * * *", "0 1,13 * * *", "0 * * * *", "0 20 * * *"]
 # ADMIN_PASSWORD = "your-password"
 # MANAGEMENT_TOKEN = "对外管理 API (/api/manage/*) 的 Bearer Token；不配置则该 API 返回 503"
 # OPENCODE_MIRRORS_URL = "https://opencode.ai.cmliussss.net/zen/v1\nhttps://opencode.fastly.cmliussss.net/zen/v1\nhttps://opencode.gcore.cmliussss.net/zen/v1"
+# Cloudflare Access 加固（可选，仅作用于管理后台 /admin/*，不影响客户端 /v1/*）。
+# 在 CF Zero Trust → Access 建一个只覆盖 /admin 与 /admin/* 的应用（身份可用邮箱一次性验证码），
+# 把它的 Audience/AUD 标签设到 CF_ACCESS_AUD，把团队域名（如 example.cloudflareaccess.com）设到 CF_ACCESS_TEAM_DOMAIN。
+# CF_ACCESS_AUD = "你的Access应用AUD"
+# CF_ACCESS_TEAM_DOMAIN = "你的团队域名.cloudflareaccess.com"
 # Gemini OAuth 客户端凭据（可选）. 默认使用 gemini-cli 公开发布的公共凭据，用户无需填写即可
 # 直接登录谷歌账号完成认证；仅在需要自建 Console 客户端时覆盖（通配 redirect_uri 需含
 # http://127.0.0.1:8089/oauth2callback）

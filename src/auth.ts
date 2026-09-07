@@ -83,6 +83,144 @@ export async function managementAuthMiddleware(c: Context<AppEnv>, next: Next) {
   return next()
 }
 
+// ===== Cloudflare Access JWT 校验（可选加固，仅作用于 /admin/*） =====
+//
+// 背景：Cloudflare Access 默认只在「边缘」拦截请求。若 Worker 挂在多个域名 / 原始
+// *.workers.dev 上，或有人拿到备用域名直连，边缘拦截可能被绕过。这里在 Worker 内再做
+// 一次 Cf-Access-Jwt 的签名 + 声明校验，做到"绕过边缘也进不来管理后台"。
+//
+// 关键点：本中间件**只挂到 /admin/***，且配置了 CF_ACCESS_AUD 才启用（未配置是空操作）。
+// 客户端走 /v1/* 的转发 Key（sk_cf_*）鉴权，与本中间件完全无关，绝不会被它影响。
+//
+// Cloudflare Access JWT 规格（RS256）：
+//   - 公钥：GET https://{team}.cloudflareaccess.com/cdn-cgi/access/certs → { keys: [{kid,n,e}] }
+//   - 签名：RSASSA-PKCS1-v1_5 + SHA-256，输入 = header.payload（base64url 原文）
+//   - 声明：aud 需包含 CF_ACCESS_AUD；校验 exp / nbf。
+
+/** base64url → Uint8Array（补齐 padding 后走 atob，兼容任意字节序列） */
+function b64urlDecode(str: string): Uint8Array {
+  let b64 = str.replace(/-/g, '+').replace(/_/g, '/')
+  while (b64.length % 4 !== 0) b64 += '='
+  const bin = atob(b64)
+  const bytes = new Uint8Array(bin.length)
+  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i)
+  return bytes
+}
+
+/** Access JWKS 内存缓存（5 分钟 TTL），避免每个管理请求都去 fetch 公钥 */
+let accessCertCache = { at: 0, keys: null as Array<{ kid: string; n: string; e: string }> | null }
+const ACCESS_CERTS_TTL_MS = 5 * 60 * 1000
+
+async function getAccessKeys(teamDomain: string): Promise<Array<{ kid: string; n: string; e: string }> | null> {
+  if (accessCertCache.keys && Date.now() - accessCertCache.at < ACCESS_CERTS_TTL_MS) {
+    return accessCertCache.keys
+  }
+  try {
+    const res = await fetch(`https://${teamDomain}/cdn-cgi/access/certs`, { signal: AbortSignal.timeout(10_000) })
+    if (!res.ok) return null
+    const body = (await res.json()) as { keys?: Array<{ kid?: string; n?: string; e?: string }> }
+    const keys = (body.keys || [])
+      .filter((k) => k.kid && k.n && k.e)
+      .map((k) => ({ kid: k.kid as string, n: k.n as string, e: k.e as string }))
+    accessCertCache = { at: Date.now(), keys }
+    return keys
+  } catch {
+    return null
+  }
+}
+
+/**
+ * Cloudflare Access JWT 校验中间件。
+ * - 未配置 CF_ACCESS_AUD → 直接放行（零影响，保持现状）。
+ * - 配置后：对 /admin/* 校验 Cf-Access-Jwt 签名与 aud/exp/nbf；不合法返回 403。
+ *   CF_ACCESS_AUD 已配但 CF_ACCESS_TEAM_DOMAIN 缺失 → 配置错误，返回 500 并说明。
+ */
+export async function cloudflareAccessMiddleware(c: Context<AppEnv>, next: Next) {
+  const aud = c.env.CF_ACCESS_AUD
+  if (!aud) return next() // 未启用 → 跳过，绝不碰客户端 /v1
+  const teamDomain = c.env.CF_ACCESS_TEAM_DOMAIN
+  if (!teamDomain) {
+    return c.json({ success: false, message: '已配置 CF_ACCESS_AUD 但缺少 CF_ACCESS_TEAM_DOMAIN' }, 500)
+  }
+
+  const jwt = c.req.header('Cf-Access-Jwt')
+  if (!jwt) {
+    return c.json({ success: false, message: 'Cloudflare Access 认证失败：缺少 Cf-Access-Jwt 头' }, 403)
+  }
+
+  const parts = jwt.split('.')
+  if (parts.length !== 3) {
+    return c.json({ success: false, message: 'Cloudflare Access 认证失败：JWT 格式错误' }, 403)
+  }
+  const [headerB64, payloadB64, sigB64] = parts
+  if (!sigB64) {
+    return c.json({ success: false, message: 'Cloudflare Access 认证失败：JWT 未签名' }, 403)
+  }
+
+  let header: { kid?: string; alg?: string }
+  let claims: Record<string, unknown>
+  let payloadBytes: Uint8Array
+  try {
+    header = JSON.parse(new TextDecoder().decode(b64urlDecode(headerB64)))
+    payloadBytes = b64urlDecode(payloadB64)
+    claims = JSON.parse(new TextDecoder().decode(payloadBytes))
+  } catch {
+    return c.json({ success: false, message: 'Cloudflare Access 认证失败：JWT 载荷无法解析' }, 403)
+  }
+  if (!header.kid) {
+    return c.json({ success: false, message: 'Cloudflare Access 认证失败：缺少 kid' }, 403)
+  }
+
+  const keys = await getAccessKeys(teamDomain)
+  if (!keys) {
+    return c.json({ success: false, message: 'Cloudflare Access 认证失败：获取公钥失败' }, 503)
+  }
+  const jwk = keys.find((k) => k.kid === header.kid)
+  if (!jwk) {
+    return c.json({ success: false, message: 'Cloudflare Access 认证失败：公钥不匹配' }, 403)
+  }
+
+  // 校验签名（RSASSA-PKCS1-v1_5 + SHA-256）
+  try {
+    const key = await crypto.subtle.importKey(
+      'jwk',
+      { kty: 'RSA', n: jwk.n, e: jwk.e, alg: 'RS256', use: 'sig' },
+      { name: 'RSASSA-PKCS1-v1_5', hash: 'SHA-256' },
+      false,
+      ['verify'],
+    )
+    const valid = await crypto.subtle.verify(
+      { name: 'RSASSA-PKCS1-v1_5', hash: 'SHA-256' },
+      key,
+      b64urlDecode(sigB64),
+      new TextEncoder().encode(`${headerB64}.${payloadB64}`),
+    )
+    if (!valid) {
+      return c.json({ success: false, message: 'Cloudflare Access 认证失败：签名无效' }, 403)
+    }
+  } catch {
+    return c.json({ success: false, message: 'Cloudflare Access 认证失败：验签异常' }, 403)
+  }
+
+  // 校验声明：aud 包含目标 AUD；exp / nbf 时效
+  const now = Math.floor(Date.now() / 1000)
+  const claimAud = claims.aud as Array<unknown> | unknown
+  const auds = Array.isArray(claimAud) ? claimAud.map(String) : [String(claimAud)]
+  if (!auds.includes(aud)) {
+    return c.json({ success: false, message: 'Cloudflare Access 认证失败：aud 不匹配' }, 403)
+  }
+  if (typeof claims.exp === 'number' && claims.exp < now) {
+    return c.json({ success: false, message: 'Cloudflare Access 认证失败：已过期' }, 403)
+  }
+  if (typeof claims.nbf === 'number' && claims.nbf > now + 60) {
+    return c.json({ success: false, message: 'Cloudflare Access 认证失败：尚未生效' }, 403)
+  }
+
+  // 通过后可把邮箱放进上下文，供后台展示/审计
+  c.set('cvAccessEmail', typeof claims.email === 'string' ? claims.email : undefined)
+  return next()
+}
+
 /** 管理员登录 */
 export async function handleLogin(c: Context<AppEnv>) {
   const { username, password } = await c.req.json()
