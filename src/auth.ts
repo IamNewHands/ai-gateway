@@ -131,16 +131,20 @@ async function getAccessKeys(teamDomain: string): Promise<Array<{ kid: string; n
 
 /**
  * Cloudflare Access JWT 校验中间件。
- * - 未配置 CF_ACCESS_AUD → 直接放行（零影响，保持现状）。
- * - 配置后：对 /admin/* 校验 Cf-Access-Jwt 签名与 aud/exp/nbf；不合法返回 403。
- *   CF_ACCESS_AUD 已配但 CF_ACCESS_TEAM_DOMAIN 缺失 → 配置错误，返回 500 并说明。
+ * - CF_ACCESS_ENABLED !== 'true' → 直接放行（零影响，保持现状，绝不碰客户端 /v1）。
+ * - 开启后：对 /admin/* 校验 Cf-Access-Jwt 签名与 aud/exp/nbf；不合法返回 403。
+ *   但 CF_ACCESS_AUD 或 CF_ACCESS_TEAM_DOMAIN 缺失 → 配置错误，返回 500 并说明。
  */
 export async function cloudflareAccessMiddleware(c: Context<AppEnv>, next: Next) {
+  // 开关：CF_ACCESS_ENABLED 必须为 'true' 才启用；否则直接放行，绝不碰客户端 /v1
+  if (c.env.CF_ACCESS_ENABLED !== 'true') return next()
   const aud = c.env.CF_ACCESS_AUD
-  if (!aud) return next() // 未启用 → 跳过，绝不碰客户端 /v1
+  if (!aud) {
+    return c.json({ success: false, message: '已开启 CF_ACCESS_ENABLED 但缺少 CF_ACCESS_AUD' }, 500)
+  }
   const teamDomain = c.env.CF_ACCESS_TEAM_DOMAIN
   if (!teamDomain) {
-    return c.json({ success: false, message: '已配置 CF_ACCESS_AUD 但缺少 CF_ACCESS_TEAM_DOMAIN' }, 500)
+    return c.json({ success: false, message: '已开启 CF_ACCESS_ENABLED 但缺少 CF_ACCESS_TEAM_DOMAIN' }, 500)
   }
 
   // Access 登录后 JWT 有两种携带方式：边缘注入的 Cf-Access-Jwt 头，或浏览器里的

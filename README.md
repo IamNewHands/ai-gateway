@@ -88,8 +88,9 @@ npm run dev
    - **Policy**：身份验证选 **Email OTP（一次性邮箱验证码）** 或 Google / Microsoft OAuth，这就是你要的邮箱验证码登录，无需自己接发信服务。
    - 记下该应用的 **Audience / AUD** 标签。
    - **Policy 的 Session duration** 建议设成较长时间，避免频繁重新验证。
-2. **Worker → Settings → Variables** 新增两个环境变量（`CF_ACCESS_AUD` 不配则本加固完全关闭，不影响任何路径）：
+2. **Worker → Settings → Variables** 新增环境变量（**开关 `CF_ACCESS_ENABLED` 必须设为 `true` 才生效；不设或设为其它值则完全关闭，不影响任何路径**）：
    ```toml
+   CF_ACCESS_ENABLED = "true"
    CF_ACCESS_AUD = "<Access 应用的 AUD 标签>"
    CF_ACCESS_TEAM_DOMAIN = "<你的团队名>.cloudflareaccess.com"
    ```
@@ -100,8 +101,9 @@ npm run dev
 
 - 访问 `/admin*`：先过 Access（输邮箱验证码）→ 通过后再进入原有用户名 / 密码登录。
 - 客户端 `/v1*`：完全不变，只认 `Bearer sk_cf_<KEY>`，正常调用模型。
+- **开关**：`CF_ACCESS_ENABLED != "true"` 时本加固完全关闭（中间件直接放行），不会影响任何路径；关闭后仅靠 `ADMIN_USERNAME` / `ADMIN_PASSWORD` 登录。
 - 中间件在校验时**优先读 `Cf-Access-Jwt` 头，回退读 `CF_Authorization` Cookie**，两种通道都能正确识别已认证用户。
-- `CF_ACCESS_AUD` 已配置但缺少 `CF_ACCESS_TEAM_DOMAIN` 时会返回 500 提示配置错误（防止静默放行）。
+- 开关开启但 `CF_ACCESS_AUD` 或 `CF_ACCESS_TEAM_DOMAIN` 缺失时会返回 500 提示配置错误（防止静默放行）。
 
 ## MCP 聚合网关
 

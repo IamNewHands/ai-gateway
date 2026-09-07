@@ -545,11 +545,13 @@ export interface Env {
   /** 对外管理 API 的认证 Token；未配置时 /api/manage/* 返回 503 */
   MANAGEMENT_TOKEN?: string
   /**
-   * Cloudflare Access 加固（可选，仅作用于 /admin/*）。
-   * 配置 CF_ACCESS_AUD（Access Application 的 Audience/AUD 标签）+ CF_ACCESS_TEAM_DOMAIN
-   * （你的团队域名，如 <team>.cloudflareaccess.com）后，管理后台额外要求携带有效
-   * Cf-Access-Jwt；与客户端 /v1/* 的转发 Key 鉴权完全无关，不影响模型对接。
+   * Cloudflare Access 加固开关（可选，仅作用于 /admin/*）。
+   * 设 'true' 才启用；否则一律放行（不影响客户端 /v1/*，也不影响任何其它路径）。
+   * 启用后需要同时配置 CF_ACCESS_AUD（Access Application 的 Audience/AUD 标签）与
+   * CF_ACCESS_TEAM_DOMAIN（团队域名，如 <team>.cloudflareaccess.com），
+   * 管理后台会额外要求携带有效 Cf-Access-Jwt（头优先，回退 CF_Authorization Cookie）。
    */
+  CF_ACCESS_ENABLED?: string
   CF_ACCESS_AUD?: string
   CF_ACCESS_TEAM_DOMAIN?: string
   /** Gemini OAuth 客户端凭据（官方公开凭据，避免硬编码进代码） */
