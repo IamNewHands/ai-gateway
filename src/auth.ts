@@ -143,7 +143,10 @@ export async function cloudflareAccessMiddleware(c: Context<AppEnv>, next: Next)
     return c.json({ success: false, message: '已配置 CF_ACCESS_AUD 但缺少 CF_ACCESS_TEAM_DOMAIN' }, 500)
   }
 
-  const jwt = c.req.header('Cf-Access-Jwt')
+  // Access 登录后 JWT 有两种携带方式：边缘注入的 Cf-Access-Jwt 头，或浏览器里的
+  // CF_Authorization Cookie（Access 一定会写 Cookie；而头可能因配置/层叠未注给 Worker）。
+  // 这里头优先、Cookie 兜底，保证只要用户真的过了 Access 认证就能通过。
+  const jwt = c.req.header('Cf-Access-Jwt') || getCookie(c, 'CF_Authorization')
   if (!jwt) {
     return c.json({ success: false, message: 'Cloudflare Access 认证失败：缺少 Cf-Access-Jwt 头' }, 403)
   }
