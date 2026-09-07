@@ -67,6 +67,42 @@ npm run dev
 
 > 部署完成后，进入 Worker 的 **Settings → Variables** 检查环境变量，并建议绑定自定义域名。
 
+## 管理后台认证（Cloudflare Access，可选）
+
+默认只靠 `ADMIN_USERNAME` / `ADMIN_PASSWORD` 登录后台。为了更安全，可以用 **Cloudflare Access**（Zero Trust）给管理后台再加一道「邮箱验证码 / Google 登录」认证，并且**完全不影响客户端对接 `/v1` 使用模型**。
+
+### 原理
+
+三层鉴权本就互相独立，客户端 `/v1/*` 走转发 Key（`Bearer sk_cf_<KEY>`），永远不经过管理后台认证：
+
+| 路径 | 鉴权 |
+| --- | --- |
+| `/v1/*`（客户端调模型） | 转发 Key（不受本方案影响） |
+| `/admin/*`（管理后台） | Cloudflare Access JWT + 原有 Session |
+| `/api/manage/*`（外部管理 API） | `MANAGEMENT_TOKEN` |
+
+### 配置步骤
+
+1. **Cloudflare 控制台 → Zero Trust → Access → Applications → Add application**，类型选 **Self-hosted**。
+   - **Domain / Path**：填你的 Worker 域名，**Path 只覆盖 `/admin` 与 `/admin/*`** —— 这样只有管理后台被 Access 拦截，客户端 `/v1*` 无需登录。
+   - **Policy**：身份验证选 **Email OTP（一次性邮箱验证码）** 或 Google / Microsoft OAuth，这就是你要的邮箱验证码登录，无需自己接发信服务。
+   - 记下该应用的 **Audience / AUD** 标签。
+   - **Policy 的 Session duration** 建议设成较长时间，避免频繁重新验证。
+2. **Worker → Settings → Variables** 新增两个环境变量（`CF_ACCESS_AUD` 不配则本加固完全关闭，不影响任何路径）：
+   ```toml
+   CF_ACCESS_AUD = "<Access 应用的 AUD 标签>"
+   CF_ACCESS_TEAM_DOMAIN = "<你的团队名>.cloudflareaccess.com"
+   ```
+   > `CF_ACCESS_TEAM_DOMAIN` 是你的 Zero Trust 团队域名（Dashboard → Zero Trust → Settings → Team domain），用于拉取 Access 验签公钥，**不是**你的 Worker 主域名。
+3. 重新部署 Worker。
+
+### 行为说明
+
+- 访问 `/admin*`：先过 Access（输邮箱验证码）→ 通过后再进入原有用户名 / 密码登录。
+- 客户端 `/v1*`：完全不变，只认 `Bearer sk_cf_<KEY>`，正常调用模型。
+- 中间件在校验时**优先读 `Cf-Access-Jwt` 头，回退读 `CF_Authorization` Cookie**，两种通道都能正确识别已认证用户。
+- `CF_ACCESS_AUD` 已配置但缺少 `CF_ACCESS_TEAM_DOMAIN` 时会返回 500 提示配置错误（防止静默放行）。
+
 ## MCP 聚合网关
 
 把多个 MCP Server 聚合成**一个**入口，通过统一的 JSON-RPC 端点对外暴露。客户端只需配置一个地址，即可发现并调用所有已启用 MCP 的工具。
