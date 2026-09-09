@@ -18,6 +18,7 @@ import type { Env, Provider } from '../types'
 import { sessionKey } from './durable'
 import type { M365ChatPayload } from './durable'
 import { stableSessionCandidateBody } from './session-candidates'
+import { canonicalModel, MODELS } from './models'
 
 /**
  * 模型名归一化（移植自 M365-2api canonicalModel 的容错子集，2026-09-06）：
@@ -38,17 +39,7 @@ export function isM365Provider(provider: Provider): boolean {
  * M365 Copilot 可用模型清单（静态。订阅账号的模型命名与官方客户端一致，
  * 无公开 models 端点，登录成功后由后台一键拉取自动合并保存）。
  */
-export const M365_MODELS: Array<{ id: string; displayName: string }> = [
-  { id: 'gpt-4o', displayName: 'GPT-4o' },
-  { id: 'gpt-4.1', displayName: 'GPT-4.1' },
-  { id: 'gpt-5', displayName: 'GPT-5' },
-  { id: 'gpt-5.1', displayName: 'GPT-5.1' },
-  { id: 'gpt-5.6', displayName: 'GPT-5.6' },
-  { id: 'gpt-5.6-high', displayName: 'GPT-5.6 High' },
-  { id: 'gpt-5.6-mini', displayName: 'GPT-5.6 Mini' },
-  { id: 'o4-mini', displayName: 'o4-mini' },
-  { id: 'o3', displayName: 'o3' },
-]
+export const M365_MODELS: Array<{ id: string; displayName: string }> = MODELS.map(({ id, displayName }) => ({ id, displayName: displayName || id }))
 
 export interface M365ProxyContext {
   explicitSessionId?: string
@@ -90,6 +81,16 @@ export async function proxyM365ChatRequest(
   context?: M365ProxyContext
 ): Promise<Response> {
   const messages = (body['messages'] as Array<Record<string, unknown>>) || []
+  let model: string
+  try {
+    model = canonicalModel(body['model'])
+  } catch {
+    return new Response(JSON.stringify({ error: { message: `Unsupported M365 model: ${String(body['model'] ?? '')}`, type: 'invalid_request_error', code: 'UNSUPPORTED_MODEL' } }), {
+      status: 400,
+      headers: { 'Content-Type': 'application/json' },
+    })
+  }
+  body['model'] = model
   // 显式会话 ID 优先级：HTTP 头 X-M365-Session-Id > 请求体字段（m365_session_id / session_id）
   const explicitSessionId = context?.explicitSessionId || extractExplicitSession(body)
   // 租户隔离：优先 context 传入，其次特殊路径经 body 内部字段透传（读取后剥离，不进 DO）

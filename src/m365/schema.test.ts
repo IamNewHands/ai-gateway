@@ -43,6 +43,26 @@ describe('validateJSONSchema 基础类型', () => {
   it('无 type 的 schema 不限制类型', () => {
     expect(ok('anything', {})).toBe(true)
   })
+
+  it('支持布尔 schema，true 接受而 false 拒绝', () => {
+    expect(ok('anything', true as unknown as Record<string, unknown>)).toBe(true)
+    expect(ok('anything', false as unknown as Record<string, unknown>)).toBe(false)
+  })
+
+  it('required 只接受对象自身属性，不接受原型链属性', () => {
+    const inherited = Object.create({ cmd: 'dir' }) as Record<string, unknown>
+    const schema = {
+      type: 'object',
+      properties: { cmd: { type: 'string' } },
+      required: ['cmd'],
+    }
+    expect(ok(inherited, schema)).toBe(false)
+  })
+
+  it('布尔 additionalProperties schema 不抛异常并按语义校验', () => {
+    expect(ok({ extra: 1 }, { type: 'object', additionalProperties: true })).toBe(true)
+    expect(ok({ extra: 1 }, { type: 'object', additionalProperties: false })).toBe(false)
+  })
 })
 
 describe('validateJSONSchema enum / const', () => {

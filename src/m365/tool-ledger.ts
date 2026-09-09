@@ -80,6 +80,89 @@ export interface ToolLedgerOptions {
   maxConsecutiveFingerprints?: number
 }
 
+/** 可持久化的工具账本快照。只包含 JSON-safe 数据，不包含 Map/Set 等运行时结构。 */
+export interface ToolLedgerSnapshot {
+  calls: ToolCallRecord[]
+  completed: CompletedToolEvidence[]
+  pending: ToolCallRecord[]
+  consumedCallIds: string[]
+  issues: ToolLedgerIssue[]
+  roundCount: number
+  maxToolRounds: number
+  maxConsecutiveFingerprints: number
+}
+
+function cloneJSONValue<T>(value: T): T {
+  return JSON.parse(JSON.stringify(value)) as T
+}
+
+/** 将运行时 ToolLedger 编码为可由 Durable Object 持久化的独立快照。 */
+export function snapshotToolLedger(ledger: ToolLedger): ToolLedgerSnapshot {
+  return cloneJSONValue({
+    calls: ledger.calls,
+    completed: ledger.completed,
+    pending: ledger.pending,
+    consumedCallIds: ledger.consumedCallIds,
+    issues: ledger.issues,
+    roundCount: ledger.roundCount,
+    maxToolRounds: ledger.maxToolRounds,
+    maxConsecutiveFingerprints: ledger.maxConsecutiveFingerprints,
+  })
+}
+
+/**
+ * 从持久快照恢复 ToolLedger，并验证 call identity 与 pending/completed 不变量。
+ * 损坏状态必须明确失败，不能静默构造第二份执行真相。
+ */
+export function restoreToolLedgerSnapshot(snapshot: ToolLedgerSnapshot): ToolLedger {
+  if (!snapshot || typeof snapshot !== 'object') throw new Error('INVALID_TOOL_LEDGER_SNAPSHOT')
+
+  const calls = Array.isArray(snapshot.calls) ? cloneJSONValue(snapshot.calls) : []
+  const completed = Array.isArray(snapshot.completed) ? cloneJSONValue(snapshot.completed) : []
+  const pending = Array.isArray(snapshot.pending) ? cloneJSONValue(snapshot.pending) : []
+  const consumedCallIds = Array.isArray(snapshot.consumedCallIds)
+    ? snapshot.consumedCallIds.filter((value): value is string => typeof value === 'string')
+    : []
+  const issues = Array.isArray(snapshot.issues) ? cloneJSONValue(snapshot.issues) : []
+
+  const callIds = new Set<string>()
+  for (const call of calls) {
+    if (!call || typeof call.callId !== 'string' || !call.callId || callIds.has(call.callId)) {
+      throw new Error('INVALID_OR_DUPLICATE_TOOL_CALL_ID')
+    }
+    callIds.add(call.callId)
+  }
+
+  const completedIds = new Set(completed.map((item) => item.callId))
+  const pendingIds = new Set(pending.map((item) => item.callId))
+  for (const callId of pendingIds) {
+    if (completedIds.has(callId)) throw new Error('TOOL_CALL_CANNOT_BE_COMPLETED_AND_PENDING')
+  }
+  for (const callId of [...completedIds, ...pendingIds]) {
+    if (!callIds.has(callId)) throw new Error('TOOL_LEDGER_EVIDENCE_REFERENCES_UNKNOWN_CALL')
+  }
+
+  const limits = resolveLimits({
+    maxToolRounds: snapshot.maxToolRounds,
+    maxConsecutiveFingerprints: snapshot.maxConsecutiveFingerprints,
+  })
+  const roundCount = Number.isSafeInteger(snapshot.roundCount) && snapshot.roundCount >= 0
+    ? snapshot.roundCount
+    : calls.length
+
+  return {
+    calls,
+    completed,
+    pending,
+    consumedCallIds,
+    issues,
+    roundCount,
+    maxToolRounds: limits.maxToolRounds,
+    maxConsecutiveFingerprints: limits.maxConsecutiveFingerprints,
+    blocked: issues.length > 0,
+  }
+}
+
 // ==================== 内部状态 ====================
 
 interface MutableLedgerState {

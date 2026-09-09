@@ -27,6 +27,11 @@ import { acquireSlot, releaseSlot, fluxSnapshot } from './account-flux'
 import { computeContextBudget, slidingWindow } from './context-budget'
 import { extractChatTaskAnchors, mergeTaskAnchors, decodeTaskAnchors, encodeTaskAnchors, reserveTaskAnchorContext, repairTaskAnchorArtifacts } from './task-anchors'
 import type { TaskAnchor } from './task-anchors'
+import type { SessionSnapshotV1 } from './session-state'
+import { M365SessionStore } from './session-store'
+import { canonicalModel, modelTone } from './models'
+import { classifyAccountFailure } from './account-routing'
+import { extractPublicReasoningSummaries } from './public-reasoning'
 
 export interface M365ChatPayload {
   providerId: string
@@ -79,11 +84,13 @@ export function estimateTokens(s: string): number {
 
 export class M365Session {
   env: Env
-  /** 会话串行队列：同一 DO 实例的请求逐个执行 */
+  private readonly sessionStore: M365SessionStore
+  /** 会话串行队列：同一 DO 实例的请求逐个执行，仅作为实例内优化；SQL store 是持久状态真相。 */
   private queue: Promise<unknown> = Promise.resolve()
 
   constructor(ctx: DurableObjectState, env: Env) {
     this.env = env
+    this.sessionStore = new M365SessionStore(ctx.storage)
   }
 
   private enqueue<T>(fn: () => Promise<T>): Promise<T> {
@@ -101,16 +108,24 @@ export class M365Session {
       } catch {
         return cjson({ error: { message: 'bad json', type: 'invalid_request_error' } }, 400)
       }
-      return this.enqueue(() => this.handleChat(payload, request.signal))
+      return this.enqueue(() => this.handleChat(payload, request.signal)).catch((error: unknown) => {
+        if (error instanceof Error && error.message === 'UNSUPPORTED_MODEL') {
+          return cjson({ error: { message: 'unsupported M365 model', type: 'invalid_request_error', code: 'UNSUPPORTED_MODEL' } }, 400)
+        }
+        throw error
+      })
     }
     return cjson({ error: { message: 'not found', type: 'not_found' } }, 404)
   }
 
   private async handleChat(payload: M365ChatPayload, requestSignal?: AbortSignal): Promise<Response> {
-    const { providerId, model, body, stream, explicitSessionId, explicitAccountId, user, ip, userAgent, tenant } = payload
+    const { providerId, body, stream, explicitSessionId, explicitAccountId, user, ip, userAgent, tenant } = payload
+    const model = canonicalModel(payload.model)
     const messages = (body['messages'] as Array<Record<string, unknown>>) || []
     const tools = (body['tools'] as unknown[]) || []
     const toolChoice = body['tool_choice']
+    const reasoningEffort = body['reasoning_effort'] ?? body['reasoningEffort']
+    const tone = modelTone(model, reasoningEffort)
 
     // 1) 会话解析（显式 ID / 内容键），按租户（API Key 哈希）隔离
     const ctx = { explicitSessionId, user, ip, userAgent, tenant: payload.tenant }
@@ -172,6 +187,39 @@ export class M365Session {
     }
     const acc = ordered[0]
 
+    // SQL Durable Object 是 M365 请求生命周期的 canonical owner。
+    // 先锁定当前 generation，再获取账号锁；任一冲突都必须在上游执行前终止。
+    const snapshot = this.sessionStore.loadOrCreate(resolved.sessionId)
+    const expectedGeneration = snapshot.generation
+    const leaseToken = crypto.randomUUID()
+    const leaseTtlMs = 10 * 60 * 1000
+    const lease = this.sessionStore.acquireLease({
+      sessionId: snapshot.sessionId,
+      accountId: acc.oid,
+      token: leaseToken,
+      expectedGeneration,
+      now: Date.now(),
+      ttlMs: leaseTtlMs,
+    })
+    if (!lease.ok) {
+      return cjson({ error: { message: lease.reason, type: lease.reason } }, 409)
+    }
+
+    const accountLock = this.sessionStore.acquireAccountLock(
+      acc.oid,
+      snapshot.sessionId,
+      leaseToken,
+      Date.now(),
+      leaseTtlMs,
+    )
+    if (!accountLock.ok) {
+      this.sessionStore.releaseLease(snapshot.sessionId, leaseToken)
+      return cjson({ error: { message: accountLock.reason, type: accountLock.reason } }, 409)
+    }
+
+    let lifecycleTransferredToStream = false
+    let lockedAccountId = acc.oid
+    try {
     // convCache 复用层：新会话且无工具时，命中 account+model+systemPromptHash+tenant 则沿用云端对话（同原版第三层复用，租户隔离对齐 #57）
     const sysHash = model ? systemPromptHash(messages as never[]) : ''
     if (resolved.isNew && model && sysHash) {
@@ -202,7 +250,7 @@ export class M365Session {
       let route: Awaited<ReturnType<typeof this.tryToolRouter>> | null = null
       const routerAcquired = await acquireSlot(this.env, providerId, acc.oid)
       try {
-        route = await this.tryToolRouter(acc, answerPrompt, toolDefs, toolChoice, attachments, ledgerCtx)
+        route = await this.tryToolRouter(acc, answerPrompt, toolDefs, toolChoice, attachments, ledgerCtx, tone)
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err)
         const detail = `model=${model} tools=${toolDefs.length} promptLen=${answerPrompt.length} err=${msg}`
@@ -246,10 +294,12 @@ export class M365Session {
 
     // 流式：增量透传主回答文本/推理，随事件实时推送，客户端断连可中止上游（同原版真实流式）
     if (stream) {
+      lifecycleTransferredToStream = true
       return await this.streamMainAnswer({
-        providerId, model, ordered, resolved,
+        providerId, model, tone, ordered, resolved,
         mainPrompt, attachments, mainTools, mainChoice,
         toolDefs, toolChoice, ledger, messages, ctx, requestSignal, mcpServerUrl, sysHash,
+        snapshot, expectedGeneration, leaseToken,
       })
     }
 
@@ -272,6 +322,20 @@ export class M365Session {
     }
     for (let i = 0; i < ordered.length; i++) {
       usedAcc = ordered[i]
+      if (usedAcc.oid !== lockedAccountId) {
+        const nextAccountLock = this.sessionStore.acquireAccountLock(
+          usedAcc.oid,
+          snapshot.sessionId,
+          leaseToken,
+          Date.now(),
+          leaseTtlMs,
+        )
+        if (!nextAccountLock.ok) {
+          return cjson({ error: { message: nextAccountLock.reason, type: nextAccountLock.reason } }, 409)
+        }
+        this.sessionStore.releaseAccountLock(lockedAccountId, snapshot.sessionId, leaseToken)
+        lockedAccountId = usedAcc.oid
+      }
       // 并发闸门：占用该账号一个并发位；满则轮询等待，超时后该账号视为"忙"试下一个
       const acquired = await acquireSlot(this.env, providerId, usedAcc.oid)
       if (!acquired) {
@@ -289,6 +353,8 @@ export class M365Session {
             attachments,
             tools: mainTools,
             toolChoice: mainChoice,
+            tone,
+            messageProfile: mainTools.length > 0 ? 'caller_tool' : 'answer',
             mcpServerUrl,
           },
           { timeoutMs: 300_000, debug: debugSse, onDebug: (tag, text) => sseLog(tag, text) },
@@ -314,7 +380,7 @@ export class M365Session {
         }
         // 限流先做二次确认探测（误报不冷却），鉴权/其他失败直接标记
         if (isRateLimited(errObj)) {
-          await confirmAndMarkRateLimit(this.env, usedAcc.oid, errObj, this.createRateLimitProbe(usedAcc), ra)
+          await confirmAndMarkRateLimit(this.env, usedAcc.oid, errObj, this.createRateLimitProbe(usedAcc, tone), ra)
         } else {
           await markAccountFailure(this.env, usedAcc.oid, errObj, ra)
         }
@@ -332,7 +398,8 @@ export class M365Session {
         }
         failoverLastResp = this.mapChatError(msg)
         // 上游限流/鉴权失败/可重试临时错误 且 为全新会话时允许切号；已绑定会话直接返回退避响应
-        const canFailover = isRateLimited(errObj) || isAuthFailure(errObj) || isRetryable(errObj)
+        const dispo = classifyAccountFailure(errObj)
+        const canFailover = isRateLimited(errObj) || isAuthFailure(errObj) || isRetryable(errObj) || (dispo?.mayFailOverBeforeVisibleOutput === true)
         if (!canFailover || !resolved.isNew) return failoverLastResp
         if (i === ordered.length - 1) return failoverLastResp
       } finally {
@@ -365,7 +432,18 @@ export class M365Session {
         : 'Your previous response incorrectly denied that caller tools are available. They are real, active, and callable on the caller\'s Windows machine. Call the appropriate tool now. Do not explain tool availability.\n\nUser request:\n' + mainPrompt
       const corrAcquired = await acquireSlot(this.env, providerId, usedAcc.oid)
       try {
-        const corrRes = await chatWithHandlers(usedAcc, { text: correction, conversationId: resolved.isNew ? undefined : resolved.conversationId, sessionId: resolved.isNew ? undefined : resolved.sessionId, started: resolved.isNew, attachments }, { timeoutMs: 300_000 })
+        const corrRes = await chatWithHandlers(usedAcc, {
+          text: correction,
+          conversationId: resolved.isNew ? undefined : resolved.conversationId,
+          sessionId: resolved.isNew ? undefined : resolved.sessionId,
+          started: resolved.isNew,
+          attachments,
+          tools: mainTools,
+          toolChoice: mainChoice,
+          tone,
+          messageProfile: 'caller_tool',
+          mcpServerUrl,
+        }, { timeoutMs: 300_000 })
         const stillBad = sandboxDetected ? isSandboxHallucination(corrRes.text) : isToolRefusal(corrRes.text)
         if (!stillBad) {
           result = { ...corrRes, events: result.events }
@@ -431,6 +509,7 @@ export class M365Session {
       }
     }
 
+    const publicSummaries = extractPublicReasoningSummaries(result.events)
     const outcome: ChatOutcome = {
       text: collapseExcessBlankLines(finalText),
       reasoning: result.reasoning || reasoning,
@@ -441,6 +520,7 @@ export class M365Session {
         conversationId: result.conversationId,
         images: result.images,
         throttling: result.throttling ?? undefined,
+        ...(publicSummaries.length > 0 ? { publicReasoningSummary: publicSummaries } : {}),
       },
     }
 
@@ -476,8 +556,31 @@ export class M365Session {
       }
     }
 
+    snapshot.protocolTail = {
+      protocol: 'chat',
+      items: [
+        ...snapshot.protocolTail.items,
+        { role: 'assistant', content: outcome.text },
+      ],
+    }
+
+    const commit = this.sessionStore.commitWithLease({
+      snapshot,
+      expectedGeneration,
+      leaseToken,
+    })
+    if (!commit.ok) {
+      return cjson({ error: { message: commit.reason, type: commit.reason } }, 409)
+    }
+
     const id = 'chatcmpl-' + crypto.randomUUID()
     return buildJSON(id, model, outcome)
+    } finally {
+      if (!lifecycleTransferredToStream) {
+        this.sessionStore.releaseAccountLock(lockedAccountId, snapshot.sessionId, leaseToken)
+        this.sessionStore.releaseLease(snapshot.sessionId, leaseToken)
+      }
+    }
   }
 
   /**
@@ -488,6 +591,7 @@ export class M365Session {
   private async streamMainAnswer(a: {
     providerId: string
     model: string
+    tone: string
     ordered: ChatHubAccount[]
     resolved: ResolveResult
     mainPrompt: string
@@ -502,8 +606,11 @@ export class M365Session {
     requestSignal?: AbortSignal
     mcpServerUrl?: string
     sysHash?: string
+    snapshot: SessionSnapshotV1
+    expectedGeneration: number
+    leaseToken: string
   }): Promise<Response> {
-    const { providerId, model, ordered, resolved, mainPrompt, attachments, mainTools, mainChoice, toolDefs, toolChoice, ledger, messages, ctx, requestSignal, mcpServerUrl, sysHash } = a
+    const { providerId, model, tone, ordered, resolved, mainPrompt, attachments, mainTools, mainChoice, toolDefs, toolChoice, ledger, messages, ctx, requestSignal, mcpServerUrl, sysHash, snapshot, expectedGeneration, leaseToken } = a
     const encoder = new TextEncoder()
     const aborter = new AbortController()
     // 客户端断连（requestSignal）或响应体被取消（cancel）都中止上游 ChatHub
@@ -511,10 +618,12 @@ export class M365Session {
     else requestSignal?.addEventListener('abort', () => aborter.abort(), { once: true })
     const created = Math.floor(Date.now() / 1000)
     const id = 'chatcmpl-' + crypto.randomUUID()
-    const usedAcc = ordered[0]
+    let usedAcc = ordered[0]
     if (!usedAcc || !usedAcc.oid) {
       return cjson({ error: { message: 'no available M365 account', type: 'rate_limit_error' } }, 429, { 'Retry-After': '5' })
     }
+    let lockedAccountId = usedAcc.oid
+    const leaseTtlMs = 10 * 60 * 1000
 
     // 流式终态三分（同对方 request-metrics.ts 的 trackStreamingResponse 判定）：
     // complete=自然 EOF 正常收尾 / error=上游失败走了错误收尾 / canceled=客户端取消 ReadableStream。
@@ -560,13 +669,6 @@ export class M365Session {
         // 打开：role assistant
         push(chunk({ role: 'assistant', content: '' }, null))
 
-        const acquired = await acquireSlot(this.env, providerId, usedAcc.oid)
-        if (!acquired) {
-          push(usageSSE(0, 0, 'stop', ''))
-          push('data: [DONE]\n\n')
-          return
-        }
-
         let streamedText = ''
         let reasoningBuf = ''
         let result: Awaited<ReturnType<typeof chatWithHandlers>> | undefined
@@ -583,32 +685,67 @@ export class M365Session {
           try { controller.enqueue(encoder.encode(': keep-alive\n\n')) } catch { /* 客户端已断开，交由 finally 收尾 */ }
         }, 5000)
         try {
-          result = await chatWithHandlers(
-            usedAcc,
-            {
-              text: mainPrompt,
-              conversationId: resolved.isNew ? undefined : resolved.conversationId,
-              sessionId: resolved.isNew ? undefined : resolved.sessionId,
-              started: resolved.isNew,
-              attachments,
-              tools: mainTools,
-              toolChoice: mainChoice,
-              mcpServerUrl,
-            },
-            { timeoutMs: 300_000, signal: aborter.signal, debug: debugSse, onDebug: (tag, text) => sseLog(tag, text) },
-            (delta) => {
-              if (!delta) return
-              streamedText += delta
-              sseLog('delta', delta)
-              push(chunk({ content: delta }, null))
-            },
-            (ev) => {
-              if (ev.kind === 'reasoning' && ev.text) {
-                reasoningBuf += ev.text
-                push(chunk({ reasoning_content: ev.text }, null))
-              }
-            },
-          )
+          let lastUpstreamError: unknown
+          for (let i = 0; i < ordered.length; i++) {
+            usedAcc = ordered[i]
+            if (usedAcc.oid !== lockedAccountId) {
+              const nextAccountLock = this.sessionStore.acquireAccountLock(
+                usedAcc.oid,
+                snapshot.sessionId,
+                leaseToken,
+                Date.now(),
+                leaseTtlMs,
+              )
+              if (!nextAccountLock.ok) throw new Error(nextAccountLock.reason)
+              this.sessionStore.releaseAccountLock(lockedAccountId, snapshot.sessionId, leaseToken)
+              lockedAccountId = usedAcc.oid
+            }
+
+            const acquired = await acquireSlot(this.env, providerId, usedAcc.oid)
+            if (!acquired) continue
+            try {
+              result = await chatWithHandlers(
+                usedAcc,
+                {
+                  text: mainPrompt,
+                  conversationId: resolved.isNew ? undefined : resolved.conversationId,
+                  sessionId: resolved.isNew ? undefined : resolved.sessionId,
+                  started: resolved.isNew,
+                  attachments,
+                  tools: mainTools,
+                  toolChoice: mainChoice,
+                  tone,
+                  messageProfile: mainTools.length > 0 ? 'caller_tool' : 'answer',
+                  mcpServerUrl,
+                },
+                { timeoutMs: 300_000, signal: aborter.signal, debug: debugSse, onDebug: (tag, text) => sseLog(tag, text) },
+                (delta) => {
+                  if (!delta) return
+                  streamedText += delta
+                  sseLog('delta', delta)
+                  push(chunk({ content: delta }, null))
+                },
+                (ev) => {
+                  if (ev.kind === 'reasoning' && ev.text) {
+                    reasoningBuf += ev.text
+                    push(chunk({ reasoning_content: ev.text }, null))
+                  }
+                },
+              )
+              break
+            } catch (err) {
+              lastUpstreamError = err
+              const errObj = err instanceof Error ? err : new Error(String(err))
+              const hasEmittedOutput = streamedText.length > 0 || reasoningBuf.length > 0
+              const canFailover = resolved.isNew
+                && !hasEmittedOutput
+                && (isRateLimited(errObj) || isAuthFailure(errObj) || isRetryable(errObj))
+              if (!canFailover || i === ordered.length - 1) throw err
+            } finally {
+              try { await releaseSlot(this.env, providerId, usedAcc.oid) } catch { /* ignore */ }
+            }
+          }
+          if (!result) throw lastUpstreamError ?? new Error('all M365 accounts are busy')
 
           // 流式结尾：模型错误拒绝使用工具 / 产生沙箱幻觉时，发起纠正对话重试。
           // 已流出的正文无法撤回，故纠正成功后把纠正文本作为追加 delta 推送，
@@ -632,6 +769,8 @@ export class M365Session {
                   attachments,
                   tools: mainTools,
                   toolChoice: mainChoice,
+                  tone,
+                  messageProfile: 'caller_tool',
                   mcpServerUrl,
                 },
                 { timeoutMs: 300_000, signal: aborter.signal, debug: debugSse, onDebug: (tag, text) => sseLog(tag, text) },
@@ -713,6 +852,21 @@ export class M365Session {
           } catch (persistErr) {
             try { await writeLog(this.env, 'warn', `[m365-chat] provider=${providerId} → stream persist failed`, persistErr instanceof Error ? persistErr.message : String(persistErr)) } catch { /* ignore */ }
           }
+
+          snapshot.protocolTail = {
+            protocol: 'chat',
+            items: [
+              ...snapshot.protocolTail.items,
+              { role: 'assistant', content: finalText },
+            ],
+          }
+          const commit = this.sessionStore.commitWithLease({
+            snapshot,
+            expectedGeneration,
+            leaseToken,
+          })
+          if (!commit.ok) throw new Error(commit.reason)
+
           streamState = 'complete'
         } catch (err) {
           streamState = 'error'
@@ -730,7 +884,7 @@ export class M365Session {
               await markAccountFailure(this.env, usedAcc.oid, errObj, ra)
             }
           } else if (isRateLimited(errObj)) {
-            await confirmAndMarkRateLimit(this.env, usedAcc.oid, errObj, this.createRateLimitProbe(usedAcc), ra)
+            await confirmAndMarkRateLimit(this.env, usedAcc.oid, errObj, this.createRateLimitProbe(usedAcc, tone), ra)
           } else {
             await markAccountFailure(this.env, usedAcc.oid, errObj, ra)
           }
@@ -743,7 +897,8 @@ export class M365Session {
           push(usageSSE(0, 0, 'stop', ''))
           push('data: [DONE]\n\n')
         } finally {
-          try { await releaseSlot(this.env, providerId, usedAcc.oid) } catch { /* ignore */ }
+          this.sessionStore.releaseAccountLock(lockedAccountId, snapshot.sessionId, leaseToken)
+          this.sessionStore.releaseLease(snapshot.sessionId, leaseToken)
           // 流式终态三分诊断：canceled 说明客户端主动掐断（中止上游成功），其余为自然 EOF / 上游失败
           if (streamState !== 'complete') {
             const reason = streamState === 'canceled'
@@ -832,12 +987,20 @@ export class M365Session {
   }
 
   /** 限流二次确认探测：用最小消息发全新 ChatHub 对话，30s 内成功即判定上次限流为误报（不冷却） */
-  private createRateLimitProbe(account: ChatHubAccount): RateLimitProbeFn {
+  private createRateLimitProbe(account: ChatHubAccount, tone: string): RateLimitProbeFn {
     return async () => {
       try {
         await chatWithHandlers(
           account,
-          { text: 'Reply with exactly: OK', conversationId: undefined, sessionId: undefined, started: true, attachments: undefined },
+          {
+            text: 'Reply with exactly: OK',
+            conversationId: undefined,
+            sessionId: undefined,
+            started: true,
+            attachments: undefined,
+            tone,
+            messageProfile: 'answer',
+          },
           { timeoutMs: 30_000 },
         )
         // 成功取到回复 → 上次限流是误报，不标记冷却
@@ -886,6 +1049,7 @@ export class M365Session {
     toolChoice: unknown,
     attachments: { type: 'image'; url: string }[],
     ledgerCtx: string,
+    tone: string,
   ): Promise<{ calls: DetectedToolCall[]; res: ChatHubResult; requiredFailed?: boolean } | null> {
     if (toolDefs.length === 0) return null
     const choiceStr = String(toolChoice ?? 'auto').toLowerCase()
@@ -897,7 +1061,7 @@ export class M365Session {
     // 不应让一次可选的决策对话因限流而阻断整个请求（同原版 failover 对路由阶段限流不致命）。
     let routeRes: Awaited<ReturnType<typeof chatWithHandlers>>
     try {
-      routeRes = await chatWithHandlers(acc, { text: routePrompt, started: true, attachments }, opts)
+      routeRes = await chatWithHandlers(acc, { text: routePrompt, started: true, attachments, tone, messageProfile: 'router' }, opts)
     } catch {
       return null
     }
@@ -909,7 +1073,7 @@ export class M365Session {
         'Do not invent calls; use {"calls":[]} if unrecoverable. OUTPUT:\n' +
         compactToolResult(routeRes.text, 6000)
       try {
-        const repairRes = await chatWithHandlers(acc, { text: repairPrompt, started: true, attachments }, opts)
+        const repairRes = await chatWithHandlers(acc, { text: repairPrompt, started: true, attachments, tone, messageProfile: 'router' }, opts)
         const r2 = parseModelToolDecision(repairRes.text, toolDefs, toolChoice)
         if (r2.parsed) {
           calls = r2.calls
@@ -927,7 +1091,7 @@ export class M365Session {
         'Return JSON only as {"calls":[{"name":"function_name","arguments":{}}]}.\n' +
         'APPLICATION_REQUEST_AND_EVIDENCE:\n' + prompt + (ledgerCtx ? '\n' + ledgerCtx : '') + '\nFUNCTION_DEFINITIONS:\n' + JSON.stringify(toolDefs)
       try {
-        const retryRes = await chatWithHandlers(acc, { text: retryPrompt, started: true, attachments }, opts)
+        const retryRes = await chatWithHandlers(acc, { text: retryPrompt, started: true, attachments, tone, messageProfile: 'router' }, opts)
         const r3 = parseModelToolDecision(retryRes.text, toolDefs, toolChoice)
         if (r3.parsed && r3.calls.length > 0) return { calls: r3.calls, res: retryRes }
       } catch { /* fall through */ }

@@ -64,6 +64,8 @@ export interface ChatHubRequest {
   attachments?: ChatHubAttachment[]
   tools?: ChatHubTool[]
   toolChoice?: unknown
+  /** 消息消费配置：普通回答保留完整事件集，工具调用和隔离路由使用紧凑事件集。 */
+  messageProfile?: 'answer' | 'caller_tool' | 'router'
   /** 首轮标记：会话/对话 ID 为空或首次使用时为 true */
   started?: boolean
   /** MCP 网关 URL：非空时向 plugins 注入 {Id:'mcp-gateway', Source:'MCPServer'}（同原版） */
@@ -556,8 +558,28 @@ export function isRetryableChatConnectError(err: unknown): boolean {
   return /WS_DIAL_ERROR|ws dial failed|WS_HANDSHAKE_INVALID|WS_HANDSHAKE_EMPTY|WS_HANDSHAKE_UNEXPECTED_FRAME|timeout waiting handshake|ws error|ws closed|ws already closed/.test(err.message)
 }
 
+const ANSWER_MESSAGE_TYPES = [
+  'Chat', 'Suggestion', 'InternalSearchQuery', 'Disengaged', 'InternalLoaderMessage', 'Progress',
+  'RenderCardRequest', 'SemanticSerp', 'GenerateContentQuery', 'SearchQuery', 'ConfirmationCard',
+  'DeveloperLogs', 'EndOfRequest', 'ReferencesListComplete', 'GeneratedCode',
+]
+
+const COMPACT_MESSAGE_TYPES = [
+  'Chat', 'Disengaged', 'Progress', 'ConfirmationCard', 'EndOfRequest', 'ReferencesListComplete',
+]
+
+export function chatHubAllowedMessageTypes(
+  req: Pick<ChatHubRequest, 'tools' | 'toolChoice' | 'messageProfile'>
+): string[] {
+  const inferredCompact = (req.tools?.length ?? 0) > 0 || req.toolChoice === 'none'
+  const compact = req.messageProfile === 'caller_tool'
+    || req.messageProfile === 'router'
+    || (req.messageProfile === undefined && inferredCompact)
+  return [...(compact ? COMPACT_MESSAGE_TYPES : ANSWER_MESSAGE_TYPES)]
+}
+
 /** 组装 ChatHub chat 帧（type=4 target=chat） */
-function chatPayload(req: ChatHubRequest, requestID: string, firstTurn: boolean): string {
+export function chatPayload(req: ChatHubRequest, requestID: string, firstTurn = false): string {
   const tools = req.tools || []
   const attachments = req.attachments || []
   const hasPlugins = clientPlugins(tools).length > 0
@@ -672,7 +694,7 @@ function chatPayload(req: ChatHubRequest, requestID: string, firstTurn: boolean)
         sessionId: req.sessionId,
         optionsSets,
         options: {},
-        allowedMessageTypes: ['Chat', 'Suggestion', 'Disengaged', 'Progress', 'EndOfRequest', 'InternalLoaderMessage', 'GeneratedCode', 'SearchQuery', 'TriggerPlugin', 'MemoryUpdate', 'SideBySide', 'ReferencesListComplete', 'RichResponse', 'GenerateGraphicArt', 'GenerateContentQuery', 'RenderCardRequest', 'PromptSuggestion', 'CodeInterpreterResult', 'AudioResult', 'ImageResult', 'MeetingInsights', 'TranscriptSearch', 'DraftWithCopilot', 'MeetingTranscript', 'TranslationSuggestion', 'Citation', 'ActionCard', 'UserPromptSuggestion', 'GeneratedQuestions', 'SummaryInsights', 'SubTopicSuggestion'],
+        allowedMessageTypes: chatHubAllowedMessageTypes(req),
         sliceIds: [],
         threadLevelGptId: {},
         // HAR 逆向：参数层不再下发 conversationId/productThreadType/toolChoice，

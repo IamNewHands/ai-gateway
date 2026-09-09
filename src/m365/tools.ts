@@ -22,6 +22,122 @@ export function clientToolWireName(name: string): string {
   return `${CLIENT_TOOL_ALIAS_PREFIX}${hex}`
 }
 
+type SafeTextDecodeResult = { ok: true; value: unknown } | { ok: false }
+
+function decodeAZHEXString(value: string): string | null {
+  let decoded = ''
+  for (let index = 0; index < value.length; index++) {
+    const character = value[index]
+    if (character === 'Z') {
+      const hexadecimal = value.slice(index + 1, index + 3)
+      if (/^[0-9A-F]{2}$/u.test(hexadecimal) && value[index + 3] === 'X') {
+        decoded += String.fromCharCode(Number.parseInt(hexadecimal, 16))
+        index += 3
+        continue
+      }
+      const unicodeHexadecimal = value.slice(index + 1, index + 5)
+      if (/^[0-9A-F]{4}$/u.test(unicodeHexadecimal)) {
+        const codeUnit = Number.parseInt(unicodeHexadecimal, 16)
+        if (codeUnit <= 0x7f) return null
+        decoded += String.fromCharCode(codeUnit)
+        index += 4
+        continue
+      }
+      return null
+    }
+    if (character.codePointAt(0)! <= 0x7f && !/^[A-Ya-z0-9]$/u.test(character)) return null
+    decoded += character
+  }
+  return decoded
+}
+
+function decodeAZHEXValue(value: unknown, depth = 0, budget = { visited: 0 }): SafeTextDecodeResult {
+  budget.visited++
+  if (depth > 32 || budget.visited > 50_000) return { ok: false }
+  if (typeof value === 'string') {
+    const decoded = decodeAZHEXString(value)
+    return decoded === null ? { ok: false } : { ok: true, value: decoded }
+  }
+  if (value === null || typeof value === 'number' || typeof value === 'boolean') {
+    return { ok: true, value }
+  }
+  if (Array.isArray(value)) {
+    const output: unknown[] = []
+    for (const item of value) {
+      const decoded = decodeAZHEXValue(item, depth + 1, budget)
+      if (!decoded.ok) return decoded
+      output.push(decoded.value)
+    }
+    return { ok: true, value: output }
+  }
+  if (!value || typeof value !== 'object') return { ok: false }
+  const entries: Array<[string, unknown]> = []
+  const keys = new Set<string>()
+  for (const [key, item] of Object.entries(value as Record<string, unknown>)) {
+    const decodedKey = decodeAZHEXString(key)
+    if (decodedKey === null || keys.has(decodedKey)) return { ok: false }
+    keys.add(decodedKey)
+    const decoded = decodeAZHEXValue(item, depth + 1, budget)
+    if (!decoded.ok) return decoded
+    entries.push([decodedKey, decoded.value])
+  }
+  return { ok: true, value: Object.fromEntries(entries) }
+}
+
+export function decodeAZHEXArguments(value: unknown): unknown | null {
+  let candidate = value
+  if (typeof candidate === 'string') {
+    try { candidate = JSON.parse(candidate) } catch { /* scalar encoded value */ }
+  }
+  const decoded = decodeAZHEXValue(candidate)
+  return decoded.ok ? decoded.value : null
+}
+
+const SENSITIVE_CLIENT_TOOL_ARGUMENT_KEYS: Record<string, readonly string[]> = {
+  exec_command: [
+    'cmd', 'justification', 'login', 'max_output_tokens', 'prefix_rule',
+    'sandbox_permissions', 'shell', 'tty', 'workdir', 'yield_time_ms',
+  ],
+  write_stdin: ['chars', 'max_output_tokens', 'session_id', 'yield_time_ms'],
+  view_image: ['detail', 'path'],
+}
+
+function clientToolParameterKeys(name: string, tools: ToolDef[]): Set<string> {
+  const keys = new Set(SENSITIVE_CLIENT_TOOL_ARGUMENT_KEYS[name] ?? [])
+  for (const tool of tools) {
+    if (tool.function?.name !== name || !tool.function.parameters || typeof tool.function.parameters !== 'object' || Array.isArray(tool.function.parameters)) continue
+    const properties = (tool.function.parameters as { properties?: unknown }).properties
+    if (!properties || typeof properties !== 'object' || Array.isArray(properties)) continue
+    for (const key of Object.keys(properties as Record<string, unknown>)) keys.add(key)
+  }
+  return keys
+}
+
+/**
+ * M365 偶尔把 AZHEX 回退参数的下划线改写为连字符。仅依据已声明 schema
+ * 和固定敏感工具参数表进行规范化；若两个输入键映射到同一规范键则拒绝。
+ */
+export function normalizeClientArgumentKeys(name: string, value: unknown, tools: ToolDef[]): unknown | null {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return value
+  const canonicalKeys = clientToolParameterKeys(name, tools)
+  if (canonicalKeys.size === 0) return value
+  const bySignature = new Map<string, string | null>()
+  for (const key of canonicalKeys) {
+    const signature = key.toLowerCase().replaceAll('-', '').replaceAll('_', '')
+    const previous = bySignature.get(signature)
+    bySignature.set(signature, previous === undefined || previous === key ? key : null)
+  }
+  const output: Record<string, unknown> = {}
+  for (const [rawKey, item] of Object.entries(value as Record<string, unknown>)) {
+    const signature = rawKey.toLowerCase().replaceAll('-', '').replaceAll('_', '')
+    const matched = bySignature.get(signature)
+    const key = matched === undefined || matched === null ? rawKey : matched
+    if (Object.hasOwn(output, key)) return null
+    output[key] = item
+  }
+  return output
+}
+
 /** 从 tools 数组构建混淆名映射：wireName → originalName */
 export function buildWireNameMap(tools: ToolDef[]): Map<string, string> {
   const map = new Map<string, string>()
@@ -264,11 +380,13 @@ function schemaLocalReference(root: unknown, reference: string): unknown {
   return current
 }
 
-export function validateJSONSchema(value: unknown, schema: Record<string, unknown>, path: string, depth = 0, state?: SchemaState): string | null {
+export function validateJSONSchema(value: unknown, schema: Record<string, unknown> | boolean, path: string, depth = 0, state?: SchemaState): string | null {
   const st: SchemaState = state ?? { nodes: 0, root: schema }
   st.nodes++
   if (st.nodes > MAX_VALIDATION_NODES) return `${path} validation nodes exceeded safe limit`
   if (depth > MAX_SCHEMA_DEPTH) return `${path} schema exceeds max depth`
+  if (schema === true) return null
+  if (schema === false) return `${path} is rejected by the false schema`
 
   // $ref：先解析到目标 schema 再继续校验；远程引用（非 "#/..."）一律拒绝
   if (typeof schema['$ref'] === 'string') {
@@ -331,7 +449,7 @@ export function validateJSONSchema(value: unknown, schema: Record<string, unknow
     if (Array.isArray(req)) {
       for (const raw of req) {
         const n = String(raw)
-        if (!(n in m)) return `missing required argument ${n}`
+        if (!Object.hasOwn(m, n)) return `missing required argument ${n}`
       }
     }
     const props = (schema['properties'] as Record<string, unknown>) || {}
@@ -402,6 +520,73 @@ function schemaValid(args: Record<string, unknown>, fn: Record<string, unknown>)
   return validateJSONSchema(args, params as Record<string, unknown>, 'arguments')
 }
 
+const INTEGRITY_SENSITIVE_CLIENT_TOOLS = new Set(['exec_command', 'write_stdin', 'view_image'])
+
+function boundedInteger(value: unknown, minimum: number): boolean {
+  return Number.isSafeInteger(value) && Number(value) >= minimum && Number(value) <= 1_000_000_000
+}
+
+/**
+ * Responses continuation 可能省略 tools 数组。仅对固定敏感工具使用封闭参数表和严格类型校验，
+ * 未知属性、错误类型和越界整数均拒绝，避免把 continuation 兼容变成通用 schema 绕过。
+ */
+function acceptsFixedSensitiveClientCall(name: string, args: Record<string, unknown>): boolean {
+  if (!INTEGRITY_SENSITIVE_CLIENT_TOOLS.has(name)) return false
+  const allowed = new Set(SENSITIVE_CLIENT_TOOL_ARGUMENT_KEYS[name])
+  if (Object.keys(args).some((key) => !allowed.has(key))) return false
+
+  if (name === 'exec_command') {
+    if (typeof args.cmd !== 'string') return false
+    if (args.justification !== undefined && typeof args.justification !== 'string') return false
+    if (args.login !== undefined && typeof args.login !== 'boolean') return false
+    if (args.max_output_tokens !== undefined && !boundedInteger(args.max_output_tokens, 1)) return false
+    if (args.prefix_rule !== undefined
+      && (!Array.isArray(args.prefix_rule) || args.prefix_rule.some((item) => typeof item !== 'string'))) return false
+    if (args.sandbox_permissions !== undefined
+      && !['use_default', 'require_escalated'].includes(String(args.sandbox_permissions))) return false
+    if (args.shell !== undefined && typeof args.shell !== 'string') return false
+    if (args.tty !== undefined && typeof args.tty !== 'boolean') return false
+    if (args.workdir !== undefined && typeof args.workdir !== 'string') return false
+    if (args.yield_time_ms !== undefined && !boundedInteger(args.yield_time_ms, 0)) return false
+    return true
+  }
+
+  if (name === 'write_stdin') {
+    if (!boundedInteger(args.session_id, 1)) return false
+    if (args.chars !== undefined && typeof args.chars !== 'string') return false
+    if (args.max_output_tokens !== undefined && !boundedInteger(args.max_output_tokens, 1)) return false
+    if (args.yield_time_ms !== undefined && !boundedInteger(args.yield_time_ms, 0)) return false
+    return true
+  }
+
+  if (typeof args.path !== 'string' || !args.path.trim()) return false
+  return args.detail === undefined || args.detail === 'high' || args.detail === 'original'
+}
+
+/**
+ * 兼容旧 exec_command schema 仅遗漏安全执行控制字段的情况。命令及路径、shell 类型保持严格，
+ * 并保留调用方已声明 schema 的全部 required 字段约束。
+ */
+function acceptsBoundedExecArguments(name: string, args: Record<string, unknown>, tools: ToolDef[]): boolean {
+  if (name !== 'exec_command' || typeof args.cmd !== 'string') return false
+  if (args.workdir !== undefined && typeof args.workdir !== 'string') return false
+  if (args.shell !== undefined && typeof args.shell !== 'string') return false
+  if (args.max_output_tokens !== undefined && !boundedInteger(args.max_output_tokens, 1)) return false
+  if (args.yield_time_ms !== undefined && !boundedInteger(args.yield_time_ms, 0)) return false
+
+  const declared = tools.find((tool) => tool.function?.name === name)
+  const schema = declared?.function?.parameters
+  if (schema && typeof schema === 'object' && !Array.isArray(schema)) {
+    const required = (schema as Record<string, unknown>)['required']
+    if (Array.isArray(required)) {
+      for (const key of required) {
+        if (typeof key === 'string' && !Object.hasOwn(args, key)) return false
+      }
+    }
+  }
+  return true
+}
+
 /**
  * 工具调用信任边界校验（同原版 tooldecision.go validateDetectedToolCalls）。
  * 模型输出天然不可信——可能调用未注册工具或拼出不符合 schema 的参数。
@@ -413,7 +598,8 @@ export function validateDetectedToolCalls(calls: DetectedToolCall[], tools: Tool
   let dropped = 0
   for (const c of calls) {
     const fn = toolFunction(c.name, tools)
-    if (!fn) { dropped++; continue }
+    // continuation 可能省略 tools；仅固定敏感工具可继续进入封闭校验。
+    if (!fn && !INTEGRITY_SENSITIVE_CLIENT_TOOLS.has(c.name)) { dropped++; continue }
     // tool_choice 约束：named/required 下不匹配当前调用的直接剔除（同原版 toolChoiceAllows）
     if (!toolChoiceAllows(choice, c.name)) { dropped++; continue }
     let args: Record<string, unknown>
@@ -428,7 +614,15 @@ export function validateDetectedToolCalls(calls: DetectedToolCall[], tools: Tool
         args = v
       } catch { dropped++; continue }
     }
-    if (schemaValid(args, fn) !== null) { dropped++; continue }
+    const hasAZHEXToken = /Z[0-9A-F]{2}X/u.test(raw)
+    const decoded = hasAZHEXToken ? decodeAZHEXArguments(args) : args
+    const normalized = decoded === null ? null : normalizeClientArgumentKeys(c.name, decoded, tools)
+    if (!normalized || typeof normalized !== 'object' || Array.isArray(normalized)) { dropped++; continue }
+    args = normalized as Record<string, unknown>
+    const schemaAccepted = fn !== null && schemaValid(args, fn) === null
+    const fixedSensitiveAccepted = acceptsFixedSensitiveClientCall(c.name, args)
+    const boundedExecAccepted = acceptsBoundedExecArguments(c.name, args, tools)
+    if (!schemaAccepted && !fixedSensitiveAccepted && !boundedExecAccepted) { dropped++; continue }
     out.push({ ...c, arguments: JSON.stringify(args) })
   }
   return { calls: out, dropped }
@@ -459,7 +653,7 @@ export function extractToolCalls(text: string, tools: ToolDef[], choice: unknown
       // 解析原名或混淆名
       const resolved = resolveToolName(rawName, tools)
       const name = resolved ?? rawName
-      if (!allowed.has(name) || !toolChoiceAllows(choice, rawName)) continue
+      if (!allowed.has(name) || !toolChoiceAllows(choice, name)) continue
       let args = '{}'
       try {
         const s = mi['arguments'] === undefined ? undefined : JSON.stringify(mi['arguments'])
@@ -548,7 +742,7 @@ export function parseModelToolDecision(text: string, tools: ToolDef[], choice: u
   if (t.includes('NO_TOOL_NEEDED') || lower.includes('no_tool_needed')) {
     return { calls: [], parsed: true }
   }
-  // 3) 兜底：fenced code block 或 JSON envelope {"calls":[...]}
+  // 3) 兜底：fenced code block 或 JSON envelope {"decision": ...} / {"calls":[...]}
   let body = t
   const fenceStart = t.indexOf('```')
   if (fenceStart >= 0) {
@@ -559,10 +753,41 @@ export function parseModelToolDecision(text: string, tools: ToolDef[], choice: u
   if (js >= 0 && je > js) {
     const inner = body.slice(js, je + 1)
     try {
-      const env = JSON.parse(inner) as { calls?: Array<{ name?: string; arguments?: unknown }> }
-      if (env && Array.isArray(env.calls)) {
+      const env = JSON.parse(inner) as Record<string, unknown>
+      if (env && typeof env === 'object' && !Array.isArray(env)) {
+        const keys = Object.keys(env).sort()
+        // 严格 decision=answer
+        if (keys.length === 2 && keys[0] === 'decision' && keys[1] === 'text' && env['decision'] === 'answer' && typeof env['text'] === 'string') {
+          return { calls: [], parsed: true }
+        }
+        // 严格 decision=tool_call
+        if (
+          keys.length === 3 &&
+          keys[0] === 'arguments' &&
+          keys[1] === 'decision' &&
+          keys[2] === 'name' &&
+          env['decision'] === 'tool_call' &&
+          typeof env['name'] === 'string' &&
+          env['arguments'] &&
+          typeof env['arguments'] === 'object' &&
+          !Array.isArray(env['arguments'])
+        ) {
+          const rawName = env['name'] as string
+          const resolved = resolveToolName(rawName, tools)
+          const name = resolved ?? rawName
+          const fn = toolFunction(name, tools)
+          const argsObj = env['arguments'] as Record<string, unknown>
+          if (fn && schemaValid(argsObj, fn) === null && toolChoiceAllows(choice, name)) {
+            return {
+              calls: [{ id: `call_${crypto.randomUUID()}`, type: toolTypeOf(name, tools), name, arguments: JSON.stringify(argsObj) }],
+              parsed: true,
+            }
+          }
+        }
+      }
+      if (env && Array.isArray(env['calls'])) {
         const calls: DetectedToolCall[] = []
-        for (const c of env.calls) {
+        for (const c of env['calls'] as Array<{ name?: string; arguments?: unknown }>) {
           if (!c || typeof c !== 'object') continue
           const rawName = String(c.name || '')
           const resolved = resolveToolName(rawName, tools)
@@ -632,48 +857,63 @@ export function fencedToolCalls(text: string, tools: ToolDef[], choice: unknown)
 /** 从原生工具事件列表提取工具调用（同原版 nativeToolCalls，遍历事件树找 name/arguments）
  *  支持原名和混淆名（m365gw_client_<hex>），混淆名自动解析为原名。 */
 export function nativeToolCalls(events: unknown[], tools: ToolDef[]): DetectedToolCall[] {
-  const allowed = new Set<string>()
-  const wireMap = new Map<string, string>()
+  const names = new Map<string, string>()
   for (const t of tools) {
     const name = t.function?.name
-    if (name) {
-      allowed.add(name)
-      const wireName = clientToolWireName(name)
-      wireMap.set(wireName, name)
-    }
+    if (!name) continue
+    names.set(name, name)
+    names.set(clientToolWireName(name), name)
   }
+
   const out: DetectedToolCall[] = []
-  const walk = (x: unknown) => {
+  let visited = 0
+  const walk = (x: unknown, depth: number, inheritedInvocationContext = false): void => {
+    if (depth > 32 || visited++ > 50_000 || x === null || typeof x !== 'object') return
     if (Array.isArray(x)) {
-      for (const item of x) walk(item)
+      for (const item of x) walk(item, depth + 1, inheritedInvocationContext)
       return
     }
-    if (x && typeof x === 'object') {
-      const obj = x as Record<string, unknown>
-      let name = ''
-      // 先查混淆名（M365 返回的插件 ID 是混淆名），再查原名
-      for (const k of ['name', 'toolName', 'pluginName', 'functionName', 'id']) {
-        const s = obj[k]
-        if (typeof s === 'string') {
-          if (allowed.has(s)) { name = s; break }
-          const mapped = wireMap.get(s)
-          if (mapped) { name = mapped; break }
+
+    const obj = x as Record<string, unknown>
+    const invocationContext = inheritedInvocationContext || [obj['contentType'], obj['messageType'], obj['type'], obj['kind']]
+      .some((item) => typeof item === 'string' && /(?:tool|function|plugin).*(?:call|invocation)|(?:call|invocation).*(?:tool|function|plugin)/iu.test(item))
+    const candidates: Array<{ name: unknown; fields: string[] }> = [
+      { name: obj['functionName'], fields: ['functionArguments', 'arguments', 'args', 'input', ...(invocationContext ? ['parameters'] : [])] },
+      { name: obj['toolName'], fields: ['arguments', 'args', 'input', 'functionArguments', ...(invocationContext ? ['parameters'] : [])] },
+      { name: obj['pluginName'], fields: ['arguments', 'args', 'input', 'functionArguments', ...(invocationContext ? ['parameters'] : [])] },
+      { name: obj['name'], fields: ['arguments', 'args', 'input', 'functionArguments', ...(invocationContext ? ['parameters'] : [])] },
+      { name: obj['id'], fields: ['arguments', 'args', 'input', 'functionArguments', ...(invocationContext ? ['parameters'] : [])] },
+    ]
+
+    for (const candidate of candidates) {
+      if (typeof candidate.name !== 'string') continue
+      const name = names.get(candidate.name)
+      if (!name) continue
+      for (const key of candidate.fields) {
+        if (!Object.hasOwn(obj, key)) continue
+        let argumentsJSON: string
+        try {
+          argumentsJSON = JSON.stringify(obj[key])
+        } catch {
+          continue
         }
-      }
-      if (name !== '') {
-        let a: unknown
-        for (const k of ['arguments', 'args', 'parameters', 'input', 'functionArguments']) {
-          if (obj[k] !== undefined) { a = obj[k]; break }
-        }
-        if (a !== undefined && a !== null) {
-          out.push({ id: `call_${crypto.randomUUID()}`, type: toolTypeOf(name, tools), name, arguments: JSON.stringify(a) })
+        const validated = validateDetectedToolCalls([
+          { id: `call_${crypto.randomUUID()}`, type: toolTypeOf(name, tools), name, arguments: argumentsJSON },
+        ], tools)
+        if (validated.calls.length > 0) {
+          out.push(validated.calls[0])
           return
         }
       }
-      for (const k of Object.keys(obj)) walk(obj[k])
+    }
+
+    for (const [key, nested] of Object.entries(obj)) {
+      const childInvocationContext = invocationContext && ['payload', 'invocation', 'call', 'toolCall', 'functionCall', 'value'].includes(key)
+      walk(nested, depth + 1, childInvocationContext)
     }
   }
-  for (const ev of events) walk(ev)
+
+  for (const event of events) walk(event, 0)
   return out
 }
 
