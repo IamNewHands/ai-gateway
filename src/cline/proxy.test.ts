@@ -181,9 +181,9 @@ describe('单词间换行碎片过滤 isWhitespaceOnlyReasoningDelta（2026-09-0
     expect(isWhitespaceOnlyReasoningDelta(null)).toBe(false)
     expect(isWhitespaceOnlyReasoningDelta(' TLS')).toBe(false)
   })
-  it('段落级双换行 "\n\n" → 保留（模型真实思考排版）', () => {
-    expect(isWhitespaceOnlyReasoningDelta('\n\n')).toBe(false)
-    expect(isWhitespaceOnlyReasoningDelta('\n \n')).toBe(false)
+  it('纯空白双换行也属于供应商排版噪声，正文双换行仍交给归一化处理', () => {
+    expect(isWhitespaceOnlyReasoningDelta('\n\n')).toBe(true)
+    expect(isWhitespaceOnlyReasoningDelta('\n \n')).toBe(true)
     expect(isWhitespaceOnlyReasoningDelta('.\n\n')).toBe(false)
   })
   it('流式端到端：token+独立"\\n"交替的思考流 → 健康放行，但纯空白 delta 不再直播到客户端', async () => {
@@ -200,7 +200,7 @@ describe('单词间换行碎片过滤 isWhitespaceOnlyReasoningDelta（2026-09-0
     expect(outcome.kind).toBe('healthy')
     const text = await readAll(outcome.response!)
     expect(text).toContain('TLS')
-    expect(text).toContain('\\n\\n') // 段落换行 delta 仍透传
+    expect(text).not.toContain('reasoning_content":"\\n\\n"') // 独立双换行同样视为供应商排版噪声
     expect(text).not.toContain('reasoning_content":"\\n"') // 单词间 "\n" delta 已被过滤
     expect(text).not.toContain('reasoning_content":" "') // 空格 delta 同样被过滤
   })
@@ -213,13 +213,13 @@ describe('粘标点换行归一化 normalizeReasoningDeltaForUI（2026-09-06 log
     expect(normalizeReasoningDeltaForUI(' (')).toBe(' (')
     expect(normalizeReasoningDeltaForUI(' TLS')).toBe(' TLS')
   })
-  it('尾部多个换行 → 压成一个段落分隔 "\\n\\n"（保留结构）', () => {
-    expect(normalizeReasoningDeltaForUI('—\n\n')).toBe('—\n\n')
-    expect(normalizeReasoningDeltaForUI('...\n\n\n')).toBe('...\n\n')
-    expect(normalizeReasoningDeltaForUI('a\n \n')).toBe('a\n\n')
+  it('尾部多个换行 → 折叠成空格，避免供应商逐句双换行形成空白段落', () => {
+    expect(normalizeReasoningDeltaForUI('—\n\n')).toBe('— ')
+    expect(normalizeReasoningDeltaForUI('...\n\n\n')).toBe('... ')
+    expect(normalizeReasoningDeltaForUI('a\n \n')).toBe('a ')
   })
-  it('纯空白段落分隔 delta 原样保留（"\n\n" 不是噪声）', () => {
-    expect(normalizeReasoningDeltaForUI('\n\n')).toBe('\n\n')
+  it('纯空白段落分隔 delta 归一化为空格，流式调用方会将其作为噪声抑制', () => {
+    expect(normalizeReasoningDeltaForUI('\n\n')).toBe(' ')
   })
   it('流式端到端：".\\n" 粘标点帧 → 客户端收到 ". "（换行不再切行），退化判定用原始 delta 不受影响', async () => {
     let body = ''
@@ -234,7 +234,8 @@ describe('粘标点换行归一化 normalizeReasoningDeltaForUI（2026-09-06 log
     const text = await readAll(outcome.response!)
     expect(text).toContain('reasoning_content":". "') // ".\n" → ". "
     expect(text).toContain('reasoning_content":", "') // ",\n" → ", "
-    expect(text).toContain('reasoning_content":"—\\n\\n"') // "—\n\n" 保留为段落分隔
+    expect(text).toContain('reasoning_content":"— "') // 尾部双换行同样折叠为空格
+    expect(text).not.toContain('reasoning_content":"—\\n\\n"')
     expect(text).not.toContain('reasoning_content":".\\n"')
   })
 })
@@ -264,7 +265,8 @@ describe('reasoning_details 双字段帧（2026-09-06 Novita 池实测形态）'
     // text 与 reasoning 双字段同步归一化
     expect(text).toContain('text":". "')
     expect(text).toContain('text":", "')
-    expect(text).toContain('text":"—\\n\\n"') // 三换行压成段落分隔
+    expect(text).toContain('text":"— "') // 三换行折叠为空格并同步写穿 reasoning_details
+    expect(text).not.toContain('text":"—\\n\\n"')
     expect(text).not.toContain('"text":".\\n"')
     expect(text).not.toContain('"text":".\\n\\n\\n"')
   })
@@ -287,5 +289,25 @@ describe('上游中途断流（upstream_interrupted 错误帧）', () => {
     const text = await readAll(outcome.response!)
     expect(text).toContain('t1')
     expect(text).toContain('upstream_interrupted')
+  })
+})
+
+describe('reasoning 双换行回归（2026-09-10 Cline 分片漂移）', () => {
+  it('普通短句尾部双换行不再形成一词一段', async () => {
+    let body = ''
+    for (const t of ['First sentence.\n\n', 'Second sentence.\n\n', 'Third sentence.']) {
+      body += dataFrame({ reasoning_content: t })
+    }
+    body += dataFrame({ content: 'ok' })
+    body += dataFrame({}, 'stop')
+    body += doneFrame()
+
+    const outcome = await pumpStreamAttempt(sseResp(body))
+    expect(outcome.kind).toBe('healthy')
+    const text = await readAll(outcome.response!)
+    expect(text).toContain('reasoning_content":"First sentence. "')
+    expect(text).toContain('reasoning_content":"Second sentence. "')
+    expect(text).not.toContain('reasoning_content":"First sentence.\\n\\n"')
+    expect(text).not.toContain('reasoning_content":"Second sentence.\\n\\n"')
   })
 })

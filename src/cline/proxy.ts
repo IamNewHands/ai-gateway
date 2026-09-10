@@ -140,21 +140,18 @@ export function isDegenerateReasoningDeltas(deltas: string[]): boolean {
 }
 
 /**
- * 判定单条 reasoning delta 是否为「纯排版噪声」：整条只有空白，且不含段落换行。
+ * 判定单条 reasoning delta 是否为「纯排版噪声」：整条内容仅由空白组成。
  *
- * 背景（2026-09-06 会话日志确认）：glm 上游把每个思考 token 单独成行，真实输出是
- * 「token delta + 独立 "\n" delta」交替。这些空白 delta 零信息量，拼进思考流就是
- * 一屏一屏的换行；重试重生成时新旧两段换行流叠加，UI 上更夸张。
+ * 背景（2026-09-06、2026-09-10 会话日志确认）：glm 上游既会发送 token 与独立
+ * "\n" 交替的分片，也会发送独立 "\n\n" 或把双换行粘在短句尾部。纯空白分片
+ * 不携带语义，直接拼入思考流会造成大量空白行，因此单换行、双换行和空格均不转发。
  *
- * 判定口径：整体是空白（^\s+$）且不是段落分隔（无 \n\s*\n 形态的双换行）。
- * 段落级 "\n\n" 保留——那是模型真实的思考排版；单词间的单个 "\n"/" " 丢弃。
- * 注意：只做「不转发」，不参与退化判定——探测期与滚动窗口仍会把它们计入
- * probeDeltas/ring，纯空白洪泛（≥250 字符、空白占比 ≥0.55）照样被判退化拦截。
+ * 注意：这里只影响直播转发，不影响退化判定。原始分片仍会计入 probeDeltas/ring，
+ * 纯空白洪泛（≥250 字符、空白占比 ≥0.55）仍会被判定为退化并拦截。
  */
 export function isWhitespaceOnlyReasoningDelta(t: unknown): boolean {
   if (typeof t !== 'string' || t === '') return false
-  if (!/^\s+$/.test(t)) return false
-  return !/\n\s*\n/.test(t)
+  return /^\s+$/.test(t)
 }
 
 /**
@@ -173,8 +170,9 @@ export function normalizeReasoningDeltaForUI(t: unknown): string {
   const m = /\n[\n\t ]*$/.exec(t)
   if (!m) return t
   const head = t.slice(0, t.length - m[0].length)
-  const nl = (m[0].match(/\n/g) || []).length
-  if (nl >= 2) return head + '\n\n'
+  // Cline 的轮换推理供应商可能把每个短句甚至 token 以双换行结尾。
+  // 在单条 delta 内无法可靠区分语义段落与供应商排版，因此正文尾部的
+  // 任意数量换行统一折叠成一个空格；纯空白 delta 由调用方直接抑制。
   return head ? head + ' ' : ' '
 }
 
@@ -193,7 +191,7 @@ function patchReasoningDeltaForUI(clone: Record<string, unknown>): void {
   const delta = (choice.delta || choice.message) as Record<string, unknown> | undefined
   if (!delta) return
   if (delta.reasoning_content !== undefined) delta.reasoning_content = normalizeReasoningDeltaForUI(delta.reasoning_content)
-  else if (delta.reasoning !== undefined) delta.reasoning = normalizeReasoningDeltaForUI(delta.reasoning)
+  if (delta.reasoning !== undefined) delta.reasoning = normalizeReasoningDeltaForUI(delta.reasoning)
   const details = delta.reasoning_details as Array<Record<string, unknown>> | undefined
   if (Array.isArray(details)) {
     for (const item of details) {
