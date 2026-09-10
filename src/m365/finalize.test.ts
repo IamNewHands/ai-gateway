@@ -5,6 +5,8 @@ describe('syntheticUpstreamFailureCode（B:853-861 假成功限流占位识别�
   it('上游容量占位文本 → CHAT_UPSTREAM_RATE_LIMITED', () => {
     expect(syntheticUpstreamFailureCode("We're temporarily unable to respond to this volume of requests")).toBe('CHAT_UPSTREAM_RATE_LIMITED')
     expect(syntheticUpstreamFailureCode('We are temporarily unable to respond to the current volume of requests. Please try again later!')).toBe('CHAT_UPSTREAM_RATE_LIMITED')
+    expect(syntheticUpstreamFailureCode("We're currently experiencing high traffic. Please try again later.")).toBe('CHAT_UPSTREAM_RATE_LIMITED')
+    expect(syntheticUpstreamFailureCode('We are currently experiencing high traffic')).toBe('CHAT_UPSTREAM_RATE_LIMITED')
   })
 
   it('大小写与空白差异不敏感（归一化后匹配）', () => {

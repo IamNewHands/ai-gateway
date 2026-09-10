@@ -503,7 +503,7 @@ export function syntheticUpstreamFailureCode(value: unknown): 'CHAT_UPSTREAM_RAT
   if (typeof value !== 'string') return null
   const normalized = value.replace(/\s+/gu, ' ').trim().toLowerCase()
   if (normalized.length === 0 || normalized.length > 512) return null
-  if (/^(?:we['’]?re|we are) temporarily unable to respond to (?:this|the current) volume of requests(?:[.! ]+please try again later[.!]*)?$/u.test(normalized)) {
+  if (/^(?:we['’]?re|we are) (?:temporarily unable to respond to (?:this|the current) volume of requests|currently experiencing high traffic)(?:[.! ]+please try again later[.!]*)?$/u.test(normalized)) {
     return 'CHAT_UPSTREAM_RATE_LIMITED'
   }
   return null
