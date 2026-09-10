@@ -5,7 +5,10 @@ import {
   decodeSessionSnapshot,
   encodeSessionSnapshot,
   normalizeSessionSnapshot,
+  encodeEncryptedSessionSnapshot,
+  decodeEncryptedSessionSnapshot,
 } from './session-state'
+import { randomToken } from './crypto'
 import {
   buildToolLedger,
   restoreToolLedgerSnapshot,
@@ -136,4 +139,20 @@ describe('ToolLedger persisted snapshot', () => {
 
     expect(() => restoreToolLedgerSnapshot(snapshot)).toThrow(/completed.*pending|pending.*completed/i)
   })
+
+  it('加密编码与解密会话快照完整恢复', async () => {
+    const key1 = randomToken(32)
+    const key2 = randomToken(32)
+    const snapshot = createEmptySessionSnapshot('session-enc-1')
+    snapshot.generation = 3
+    snapshot.taskAnchors = [{ kind: 'windows_path', value: 'C:\\test\\file.txt' }]
+
+    const encrypted = await encodeEncryptedSessionSnapshot(snapshot, key2)
+    expect(typeof encrypted).toBe('string')
+    expect(encrypted).not.toContain('session-enc-1')
+
+    const decrypted = await decodeEncryptedSessionSnapshot(encrypted, [key1, key2])
+    expect(decrypted).toEqual(snapshot)
+  })
 })
+

@@ -2034,6 +2034,13 @@ async function proxyOAuthRequest(
  * 全量列表在内存中缓存（TTL 同 providers，可经管理后台「内存缓存」查看/清空），
  * 之后按转发 Key 的 allowedModels 逐请求过滤；并回写 Cache-Control 让客户端/CDN 缓存。 */
 export async function handleModels(c: Context<AppEnv>) {
+  const clientVersion = c.req.query('client_version')
+  if (clientVersion !== undefined) {
+    const { codexModelCatalog } = await import('./m365/models')
+    c.header('Cache-Control', 'public, max-age=10')
+    return c.json(codexModelCatalog(clientVersion || ''))
+  }
+
   const cached = getModelsListCache()
   let models: Array<{
     id: string

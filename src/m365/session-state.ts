@@ -204,3 +204,24 @@ export function decodeSessionSnapshot(encoded: string | null | undefined): Sessi
   }
   return normalizeSessionSnapshot(parsed)
 }
+
+/**
+ * 使用 AES-GCM 加密编码会话快照（便携压缩胶囊）
+ */
+export async function encodeEncryptedSessionSnapshot(snapshot: SessionSnapshotV1, key: string): Promise<string> {
+  const { encryptCompactionCapsule } = await import('./crypto')
+  return encryptCompactionCapsule(normalizeSessionSnapshot(snapshot), key)
+}
+
+/**
+ * 使用 AES-GCM 多 Key 容错解密会话快照
+ */
+export async function decodeEncryptedSessionSnapshot(
+  payload: string,
+  keys: string | readonly string[],
+): Promise<SessionSnapshotV1> {
+  const { decryptCompactionCapsule } = await import('./crypto')
+  const decrypted = await decryptCompactionCapsule<unknown>(payload, keys)
+  return normalizeSessionSnapshot(decrypted)
+}
+

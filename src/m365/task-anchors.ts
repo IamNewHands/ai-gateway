@@ -44,6 +44,19 @@ function userTextContent(m: OaiMsgLite): string {
   return contentToString(m.content)
 }
 
+function visibleUserText(content: unknown): string[] {
+  if (typeof content === 'string') return [content]
+  if (!Array.isArray(content)) return []
+  const result: string[] = []
+  for (const raw of content) {
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) continue
+    const item = raw as Record<string, unknown>
+    if (!['text', 'input_text'].includes(String(item.type ?? ''))) continue
+    if (typeof item.text === 'string') result.push(item.text)
+  }
+  return result
+}
+
 function chatUserTexts(messages: unknown): string[] {
   if (!Array.isArray(messages)) return []
   const result: string[] = []
@@ -51,7 +64,20 @@ function chatUserTexts(messages: unknown): string[] {
     if (!raw || typeof raw !== 'object' || Array.isArray(raw)) continue
     const message = raw as Record<string, unknown>
     if (String(message.role ?? '').toLowerCase() !== 'user') continue
-    result.push(contentToString(message.content))
+    result.push(...visibleUserText(message.content))
+  }
+  return result
+}
+
+function responsesUserTexts(input: unknown): string[] {
+  if (typeof input === 'string') return [input]
+  if (!Array.isArray(input)) return []
+  const result: string[] = []
+  for (const raw of input) {
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) continue
+    const item = raw as Record<string, unknown>
+    if (String(item.role ?? '').toLowerCase() !== 'user') continue
+    result.push(...visibleUserText(item.content))
   }
   return result
 }
@@ -171,6 +197,11 @@ function extract(texts: string[]): TaskAnchor[] {
 /** 从 OpenAI chat messages 提取任务锚点（仅信任 role=user） */
 export function extractChatTaskAnchors(messages: unknown): TaskAnchor[] {
   return extract(chatUserTexts(messages))
+}
+
+/** 从 OpenAI Responses API input 提取任务锚点（仅信任 role=user） */
+export function extractResponsesTaskAnchors(input: unknown): TaskAnchor[] {
+  return extract(responsesUserTexts(input))
 }
 
 /** 防御性解析持久化状态；损坏或非法时返回空 */

@@ -222,10 +222,10 @@ export function modelCatalog(): Record<string, unknown>[] {
       streaming: true,
       tools: true,
       reasoning: model.reasoning,
-      vision: false,
+      vision: true,
       image_generation: false,
       audio: false,
-      modalities: ['text'],
+      modalities: ['text', 'image'],
     },
   }))
 }
@@ -270,13 +270,13 @@ export function codexModelCatalog(clientVersion = ''): { models: Record<string, 
         support_verbosity: true,
         default_verbosity: 'low',
         truncation_policy: { mode: 'tokens', limit: 10_000 },
-        supports_image_detail_original: false,
+        supports_image_detail_original: true,
         ...(model.availability ? { x_m365_availability: model.availability } : {}),
         context_window: model.contextWindow,
         max_context_window: model.contextWindow,
         auto_compact_token_limit: Math.min(CODEX_AUTO_COMPACT_TOKEN_LIMIT, Math.floor(model.contextWindow * 0.9)),
         experimental_supported_tools: [],
-        input_modalities: ['text'],
+        input_modalities: ['text', 'image'],
         supports_search_tool: false,
         // Codex 0.152+ carries its live caller contract in
         // input[].additional_tools. Older clients retain the direct path.

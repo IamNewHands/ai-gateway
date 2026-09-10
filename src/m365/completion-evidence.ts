@@ -16,6 +16,16 @@ export type CompletionAction =
   | 'deploy' | 'fix' | 'install' | 'verify' | 'upload'
   | 'delete' | 'create' | 'configure' | 'start' | 'complete'
 
+export interface CompletionEvidenceRecord {
+  name?: string
+  arguments?: unknown
+  normalizedArguments?: string
+  operationHints?: readonly OperationalAction[]
+  result?: unknown
+  failed?: boolean
+  status?: Exclude<CompletionEvidenceStatus, 'pending'>
+}
+
 export type CompletionEvidenceStatus = 'success' | 'failure' | 'unknown' | 'pending'
 export type OperationalAction = Exclude<CompletionAction, 'complete'>
 
@@ -283,11 +293,16 @@ function isStaticFileCreationCommand(command: string): boolean {
 
 // ==================== 行动分类 ====================
 
-/** 分类工具调用表示的操作动作 */
-export function classifyCompletionActions(record: { name: string; arguments: string }): ClassifiedEvidenceActions {
+/** 分类工具调用表示的操作动作与 Code Mode 排序验证信息 */
+export function classifyCompletionActions(record: CompletionEvidenceRecord | { name: string; arguments: string }): ClassifiedEvidenceActions {
   const actions = new Set<OperationalAction>()
-  const name = normalizedOperationName(record.name)
-  const args = parsedOperationArguments(record)
+  const hints = 'operationHints' in record && Array.isArray(record.operationHints) ? record.operationHints : []
+  for (const hint of hints) {
+    if (operationalActions.includes(hint)) actions.add(hint)
+  }
+
+  const name = normalizedOperationName(record.name ?? '')
+  const args = parsedOperationArguments(record as { arguments: string; name: string })
   const selectors = trustedSelectorTexts(args)
 
   for (const action of operationalActions) {
@@ -307,11 +322,15 @@ export function classifyCompletionActions(record: { name: string; arguments: str
     }
   }
 
+  const hintedOrderedVerification = Boolean(
+    hints.includes('verify') && [...actions].some((action) => action !== 'verify'),
+  )
+
   // Code Mode 的额外检测
   if (name === 'exec') {
     const commands = trustedCommandTexts(name, args).map(commandTextWithoutOpaqueOperands)
     let mutationSeen = false
-    let orderedVerificationAfterMutation = false
+    let orderedVerificationAfterMutation = hintedOrderedVerification
     for (const command of commands) {
       const commandActions = operationalActions.filter((action) => commandMatchesAction(command, action))
       if (commandActions.some((action) => action !== 'verify')) mutationSeen = true
@@ -324,8 +343,12 @@ export function classifyCompletionActions(record: { name: string; arguments: str
     return { actions: [...actions], orderedVerificationAfterMutation }
   }
 
-  return { actions: [...actions], orderedVerificationAfterMutation: false }
+  return { actions: [...actions], orderedVerificationAfterMutation: hintedOrderedVerification }
 }
+
+/** 兼容 M365-Gateway completionEvidenceActions 接口 */
+export const completionEvidenceActions = classifyCompletionActions
+
 
 // ==================== 证据状态检测 ====================
 
@@ -399,7 +422,7 @@ export function summarizeCompletionEvidence(ledger: AgentLedger): CompletionEvid
     else if (status === 'failure') summary.failedTools += 1
     else summary.unknownTools += 1
 
-    const classified = classifyCompletionActions(record)
+    const classified = completionEvidenceActions(record)
     const actions = classified.actions
     if (status === 'success' && actions.length > 0) summary.classifiedSuccessfulTools += 1
     if (status === 'failure' && actions.length > 0) summary.classifiedFailedTools += 1
@@ -409,7 +432,7 @@ export function summarizeCompletionEvidence(ledger: AgentLedger): CompletionEvid
   }
 
   for (const record of ledger.pending) {
-    const classified = classifyCompletionActions(record)
+    const classified = completionEvidenceActions(record)
     updateOrderedActionEvidence(summary, classified.actions, 'pending', classified.orderedVerificationAfterMutation)
   }
 

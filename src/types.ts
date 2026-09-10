@@ -145,6 +145,11 @@ export interface Provider {
    * 以规避地区限制。不配 = 使用内置默认直连地址，行为不变。
    */
   geminiBaseUrl?: string
+  /**
+   * M365 会话级多账号分摊开关（仅 M365 提供商生效）。
+   * 开启后跨请求轮询不同健康账号分摊负载。
+   */
+  accountSpread?: boolean
 }
 
 /**

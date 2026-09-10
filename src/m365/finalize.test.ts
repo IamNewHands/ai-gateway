@@ -1,5 +1,13 @@
 import { describe, it, expect, vi } from 'vitest'
-import { finalizeText, collapseExcessBlankLines, appendChatHubDelta, scrubNarration, syntheticUpstreamFailureCode } from './chathub'
+import {
+  finalizeText,
+  collapseExcessBlankLines,
+  appendChatHubDelta,
+  scrubNarration,
+  syntheticUpstreamFailureCode,
+  reconcileChatHubText,
+  chatHubUpdateHasSemanticProgress,
+} from './chathub'
 
 describe('syntheticUpstreamFailureCode（B:853-861 假成功限流占位识别）', () => {
   it('上游容量占位文本 → CHAT_UPSTREAM_RATE_LIMITED', () => {
@@ -165,3 +173,48 @@ describe('scrubNarration', () => {
     expect(scrubNarration('')).toBe('')
   })
 })
+
+describe('reconcileChatHubText', () => {
+  it('当 final 和 streamed 一致或为前缀时判定为非偏离', () => {
+    const res1 = reconcileChatHubText('hello world', 'hello world')
+    expect(res1.divergent).toBe(false)
+    expect(res1.text).toBe('hello world')
+
+    const res2 = reconcileChatHubText('hello', 'hello world')
+    expect(res2.divergent).toBe(false)
+    expect(res2.text).toBe('hello world')
+  })
+
+  it('当 final 和 streamed 冲突偏离时判定为 divergent: true 并以 final 优先', () => {
+    const res = reconcileChatHubText('Hello, world!', 'Goodbye, world!')
+    expect(res.divergent).toBe(true)
+    expect(res.text).toBe('Goodbye, world!')
+    expect(res.streamedCharacters).toBe(13)
+    expect(res.finalCharacters).toBe(15)
+  })
+})
+
+describe('chatHubUpdateHasSemanticProgress', () => {
+  it('包含 throttling 时返回 true', () => {
+    expect(chatHubUpdateHasSemanticProgress({ throttling: {} })).toBe(true)
+  })
+
+  it('包含 writeAtCursor 时返回 true', () => {
+    expect(chatHubUpdateHasSemanticProgress({ writeAtCursor: 'a' })).toBe(true)
+  })
+
+  it('包含 Progress / SearchResults / ToolCall 消息时返回 true', () => {
+    expect(chatHubUpdateHasSemanticProgress({
+      messages: [{ messageType: 'Progress' }],
+    })).toBe(true)
+    expect(chatHubUpdateHasSemanticProgress({
+      messages: [{ contentType: 'ToolCall' }],
+    })).toBe(true)
+  })
+
+  it('普通空消息返回 false', () => {
+    expect(chatHubUpdateHasSemanticProgress({})).toBe(false)
+    expect(chatHubUpdateHasSemanticProgress({ messages: [] })).toBe(false)
+  })
+})
+

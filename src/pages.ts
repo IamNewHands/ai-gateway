@@ -574,7 +574,8 @@ ${H('管理')}
                   </fieldset>`:''}
                   ${(p.oauth&&(p.oauth.flowType==='m365-pkce'||p.oauth.flowType==='m365-ropc'))?`
                   <fieldset class="form-group" id="m365-fs-${escapePageHtml(p.id)}"><legend>M365 账号池</legend><span class="form-helper">本提供商可挂多个订阅账号（授权码/账密各连一次即入池）。网关按健康与并发自动轮询，限流/超限自动切换。每账号默认并发上限 8（可变 M365_ACCOUNT_DEFAULT_CONCURRENCY）。</span>
-                    <div class="fc mt-1 field-row"><button class="btn btn-s" onclick="oauthConnect('${escapePageJsx(p.id)}')"><i class="fas fa-sign-in-alt" aria-hidden="true"></i>连接新账号</button><button class="btn btn-s" onclick="m365Render('${escapePageJsx(p.id)}')"><i class="fas fa-sync" aria-hidden="true"></i>刷新账号池</button></div>
+                    <div class="fc mt-1 field-row"><button class="btn btn-s" onclick="oauthConnect('${escapePageJsx(p.id)}')"><i class="fas fa-sign-in-alt" aria-hidden="true"></i>连接新账号</button><button class="btn btn-s" onclick="m365Render('${escapePageJsx(p.id)}')"><i class="fas fa-sync" aria-hidden="true"></i>刷新账号池</button><button class="btn btn-s" onclick="m365ConversationsModal('${escapePageJsx(p.id)}')"><i class="fas fa-comments" aria-hidden="true"></i>云端会话管理</button></div>
+                    <div class="fc mt-1 field-row"><label class="tg" title="启用会话级多账号分摊 (Account Spread)"><input type="checkbox" id="m365-spread-${escapePageHtml(p.id)}" ${p.accountSpread?'checked':''}><span class="sl"></span></label><span style="font-size:13px;margin-left:6px">会话级多账号分摊 (Account Spread)</span><span class="mu" style="font-size:12px;margin-left:8px">开启后跨请求轮询不同健康账号分摊负载</span></div>
                     <div id="m365-acc-${escapePageHtml(p.id)}" class="mt-1"><p class="mu">展开后自动加载账号池。</p></div>
                   </fieldset>`:''}
                 </fieldset>
@@ -1027,6 +1028,91 @@ function m365Remove(providerId, oid, btn) {
     .then(function (r) { return r.json().then(function (j) { return { ok: r.ok, j: j }; }); })
     .then(function (res) { if (btn) btn.disabled = false; if (res.ok) m365Render(providerId); else window.alert((res.j && res.j.message) || '移除失败'); })
     .catch(function () { if (btn) btn.disabled = false; window.alert('请求异常'); });
+}
+
+function m365ConversationsModal(providerId) {
+  showM('<h3><i class="fas fa-comments c-p"></i> M365 云端会话管理</h3>' +
+    '<div id="m365-conv-body"><p class="mu">加载中…</p></div>' +
+    '<div class="fa"><button class="btn btn-s" onclick="closeM()">关闭</button></div>');
+  fetch('/admin/api/m365/conversations?provider_id=' + encodeURIComponent(providerId))
+    .then(function (r) { return r.json(); })
+    .then(function (d) {
+      var body = document.getElementById('m365-conv-body');
+      if (!body) return;
+      if (!d.success) {
+        body.innerHTML = '<p class="c-d">加载失败：' + m365Esc((d.error && d.error.message) || '未知错误') + '</p>';
+        return;
+      }
+      var list = d.data || [];
+      var cfg = d.config || {};
+      var html = '<div class="fc mb-2 field-row" style="gap:8px;flex-wrap:wrap">' +
+        '<span class="mu" style="font-size:13px">清理策略：</span>' +
+        '<select id="m365-cl-mode" class="select-sm">' +
+        '<option value="after_response"' + (cfg.mode === 'after_response' ? ' selected' : '') + '>每次响应后自动清理</option>' +
+        '<option value="keep_n"' + (cfg.mode === 'keep_n' ? ' selected' : '') + '>保留最新 N 个</option>' +
+        '<option value="max_age"' + (cfg.mode === 'max_age' ? ' selected' : '') + '>按最大存活时间</option>' +
+        '<option value="on_exit"' + (cfg.mode === 'on_exit' ? ' selected' : '') + '>手动/退出清理</option>' +
+        '</select>' +
+        '<input type="number" id="m365-cl-keep" value="' + (cfg.keep_n || 5) + '" style="width:60px" placeholder="保留N个">' +
+        '<input type="number" id="m365-cl-age" value="' + (cfg.max_age_hours || 24) + '" style="width:60px" placeholder="小时">' +
+        '<button class="btn btn-s btn-xs" onclick="m365SaveCleanupConfig(\'' + m365Esc(providerId) + '\')">保存策略</button>' +
+        '<button class="btn btn-d btn-xs" onclick="m365TriggerCleanup(\'' + m365Esc(providerId) + '\')"><i class="fas fa-broom"></i>立即清理</button>' +
+        '</div>';
+      if (list.length === 0) {
+        html += '<p class="mu">当前无活跃云端会话记录。</p>';
+      } else {
+        html += '<table class="tbl" style="font-size:12px"><thead><tr><th>会话 ID</th><th>账号 OID</th><th>更新时间</th><th>操作</th></tr></thead><tbody>' +
+          list.map(function (c) {
+            var dateStr = c.last_used_at ? new Date(c.last_used_at).toLocaleString() : '-';
+            return '<tr><td><code>' + m365Esc(c.id) + '</code></td><td><code>' + m365Esc(c.account_id || '-') + '</code></td><td>' + dateStr + '</td>' +
+              '<td><button class="btn btn-gh btn-xs" onclick="m365ToggleWhitelist(\'' + m365Esc(providerId) + '\',\'' + m365Esc(c.id) + '\',false)"><i class="fas fa-shield-alt"></i>白名单</button></td></tr>';
+          }).join('') + '</tbody></table>';
+      }
+      body.innerHTML = html;
+    })
+    .catch(function (e) {
+      var body = document.getElementById('m365-conv-body');
+      if (body) body.innerHTML = '<p class="c-d">请求失败：' + m365Esc(e && e.message || String(e)) + '</p>';
+    });
+}
+function m365SaveCleanupConfig(providerId) {
+  var mode = (document.getElementById('m365-cl-mode') || {}).value;
+  var keepN = parseInt((document.getElementById('m365-cl-keep') || {}).value, 10);
+  var maxAge = parseInt((document.getElementById('m365-cl-age') || {}).value, 10);
+  fetch('/admin/api/m365/conversations/config?provider_id=' + encodeURIComponent(providerId), {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ mode: mode, keep_n: isNaN(keepN) ? 5 : keepN, max_age_hours: isNaN(maxAge) ? 24 : maxAge })
+  }).then(function (r) { return r.json(); }).then(function (d) {
+    if (d.success) toast('清理配置已更新', 'success');
+    else toast((d.error && d.error.message) || '更新失败', 'error');
+  }).catch(function () { toast('请求异常', 'error'); });
+}
+function m365TriggerCleanup(providerId) {
+  if (!window.confirm('确认立即执行云端会话清理？')) return;
+  fetch('/admin/api/m365/conversations/cleanup?provider_id=' + encodeURIComponent(providerId), {
+    method: 'POST'
+  }).then(function (r) { return r.json(); }).then(function (d) {
+    if (d.success) {
+      toast('清理完成，共删除 ' + (d.deleted || 0) + ' 个会话', 'success');
+      m365ConversationsModal(providerId);
+    } else {
+      toast((d.error && d.error.message) || '清理失败', 'error');
+    }
+  }).catch(function () { toast('请求异常', 'error'); });
+}
+function m365ToggleWhitelist(providerId, convId, remove) {
+  fetch('/admin/api/m365/conversations/whitelist', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ provider_id: providerId, conversation_id: convId, action: remove ? 'remove' : 'add' })
+  }).then(function (r) { return r.json(); }).then(function (d) {
+    if (d.success) {
+      toast(remove ? '已移出白名单' : '已加入白名单（受保护不被自动清理）', 'success');
+    } else {
+      toast((d.error && d.error.message) || '操作失败', 'error');
+    }
+  }).catch(function () { toast('请求异常', 'error'); });
 }
 
 // UX2：保存/删除等操作后 location.reload() 会把页面打回顶部、收起所有面板。
@@ -2554,7 +2640,7 @@ async function save(id) {
     const r = await fetch('/admin/api/providers/' + encodeURIComponent(id), {
       method: 'PUT',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ name: nm, baseUrl: url, apiType, authType, oauth: authType === 'oauth-device' ? oauth : undefined, apiKeys: keys, models, enabled, toolBridge: (document.getElementById('atb-' + id)||{}).checked === true, allowUnlistedModels: (document.getElementById('aum-' + id)||{}).checked === true, thinkingInject, cachePrefixInject, cooldown: collectCooldown(id), type: vb && vb.primary ? 'vision-bridge' : null, visionBridge: vb, geminiBaseUrl: ((document.getElementById('gbu-' + id)||{}).value || '').trim() || null, traeEnableRemoteBudget, traeRemoteOnlyModels, traeMaxMessages, traeMaxHistoryChars, traeMaxToolSchemaChars })
+      body: JSON.stringify({ name: nm, baseUrl: url, apiType, authType, oauth: authType === 'oauth-device' ? oauth : undefined, apiKeys: keys, models, enabled, toolBridge: (document.getElementById('atb-' + id)||{}).checked === true, allowUnlistedModels: (document.getElementById('aum-' + id)||{}).checked === true, thinkingInject, cachePrefixInject, cooldown: collectCooldown(id), type: vb && vb.primary ? 'vision-bridge' : null, visionBridge: vb, geminiBaseUrl: ((document.getElementById('gbu-' + id)||{}).value || '').trim() || null, traeEnableRemoteBudget, traeRemoteOnlyModels, traeMaxMessages, traeMaxHistoryChars, traeMaxToolSchemaChars, accountSpread: (document.getElementById('m365-spread-' + id)||{}).checked === true })
     })
     const d = await r.json()
     if (d.success) { toast('已保存', 'success'); reloadAdmin() }

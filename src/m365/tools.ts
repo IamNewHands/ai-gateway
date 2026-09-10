@@ -917,6 +917,41 @@ export function nativeToolCalls(events: unknown[], tools: ToolDef[]): DetectedTo
   return out
 }
 
+/**
+ * 从单条原生事件或对象树中解析原生工具/函数调用（同 CF2 chathub.ts parseNativeFunctionCall）。
+ * 仅在名字和参数字段均显式匹配时接受调用。
+ */
+export function parseNativeFunctionCall(value: unknown, tools: ToolDef[] = []): DetectedToolCall | null {
+  const calls = nativeToolCalls([value], tools)
+  return calls.length > 0 ? calls[0] : null
+}
+
+/**
+ * 检测上游原生工具/函数调用信封（同 CF2 chathub.ts hasNativeFunctionCallEnvelope）。
+ * 用于区分模型语法错误/畸形调用与空白网络传输异常，避免将模型调用误判为空响应降级。
+ */
+export function hasNativeFunctionCallEnvelope(value: unknown): boolean {
+  let visited = 0
+  const walk = (candidate: unknown, depth: number, inherited = false): boolean => {
+    if (depth > 32 || visited++ > 50_000 || candidate === null || typeof candidate !== 'object') return false
+    if (Array.isArray(candidate)) return candidate.some((item) => walk(item, depth + 1, inherited))
+    const record = candidate as Record<string, unknown>
+    const invocation = inherited || [record['contentType'], record['messageType'], record['type'], record['kind']]
+      .some((item) => typeof item === 'string' && /(?:tool|function|plugin).*(?:call|invocation)|(?:call|invocation).*(?:tool|function|plugin)/iu.test(item))
+    const named = [record['functionName'], record['toolName'], record['pluginName'], record['name'], record['id']]
+      .some((item) => typeof item === 'string' && item.trim().length > 0)
+    const argumentsPresent = ['functionArguments', 'arguments', 'args', 'input', 'parameters']
+      .some((key) => Object.hasOwn(record, key))
+    if (invocation && named && argumentsPresent) return true
+    return Object.entries(record).some(([key, nested]) => walk(
+      nested,
+      depth + 1,
+      invocation && ['payload', 'invocation', 'call', 'toolCall', 'functionCall', 'value', 'item', 'result'].includes(key),
+    ))
+  }
+  return walk(value, 0)
+}
+
 /** OpenAI messages → ChatHub 单文本 prompt（保留角色边界与工具调用身份，同原版 flattenPromptMessages） */
 export interface OaiMsgLite {
   role?: string

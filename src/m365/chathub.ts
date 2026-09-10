@@ -415,6 +415,44 @@ export function finalizeText(streamed: string, final: string, emit?: (delta: str
   return final
 }
 
+export interface ChatHubTextReconciliation {
+  text: string
+  divergent: boolean
+  streamedCharacters: number
+  finalCharacters: number
+}
+
+/**
+ * Type:2 补全结果与流式结果协调（同 CF2 chathub.ts reconcileChatHubText）。
+ * 校验流式 delta 与终端帧是否偏离，返回权威正文及偏离标记。
+ */
+export function reconcileChatHubText(streamed: string, final: string): ChatHubTextReconciliation {
+  const divergent = Boolean(
+    streamed
+    && final
+    && !streamed.startsWith(final)
+    && !final.startsWith(streamed),
+  )
+  return {
+    text: final || streamed,
+    divergent,
+    streamedCharacters: streamed.length,
+    finalCharacters: final.length,
+  }
+}
+
+/** 仅真实可见或协议进展事件可续期空闲超时（同 CF2 chathub.ts chatHubUpdateHasSemanticProgress） */
+export function chatHubUpdateHasSemanticProgress(update: Record<string, unknown>): boolean {
+  if (Object.hasOwn(update, 'throttling')) return true
+  if (typeof update.writeAtCursor === 'string' && update.writeAtCursor.length > 0) return true
+  const messages = Array.isArray(update.messages) ? update.messages as Array<Record<string, unknown>> : []
+  return messages.some((message) =>
+    message.messageType === 'Progress'
+    || ['SearchResults', 'Code', 'ToolCall'].includes(String(message.contentType ?? ''))
+    || (typeof message.text === 'string' && message.text.length > 0)
+    || (typeof message.hiddenText === 'string' && message.hiddenText.length > 0))
+}
+
 /**
  * 正文自发生成思考标签的剥离兜底（移植自 M365-2api chathub.ts:1896-1901）：
  * 上游未走 CoT 信号、但正文里自己冒出 <thought>/<thinking> 标签时，
@@ -1291,3 +1329,6 @@ export async function chatWithHandlers(
     try { socket.close() } catch { /* ignore */ }
   }
 }
+
+export { parseNativeFunctionCall, hasNativeFunctionCallEnvelope } from './tools'
+

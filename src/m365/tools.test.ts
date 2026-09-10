@@ -10,6 +10,8 @@ import {
   normalizeClientArgumentKeys,
   parseModelToolDecision,
   validateDetectedToolCalls,
+  parseNativeFunctionCall,
+  hasNativeFunctionCallEnvelope,
 } from './tools'
 import type { OaiMsgLite, ToolDef } from './tools'
 
@@ -95,6 +97,31 @@ describe('M365 工具调用信任边界', () => {
     }]
 
     expect(nativeToolCalls(events, [readTool])).toEqual([])
+  })
+
+  it('parseNativeFunctionCall 正确解析有效的原生工具事件', () => {
+    const event = {
+      contentType: 'ToolCall',
+      name: clientToolWireName('read'),
+      arguments: { file_path: 'README.md' },
+    }
+    const call = parseNativeFunctionCall(event, [readTool])
+    expect(call).not.toBeNull()
+    expect(call?.name).toBe('read')
+    expect(JSON.parse(call?.arguments || '{}')).toEqual({ file_path: 'README.md' })
+  })
+
+  it('hasNativeFunctionCallEnvelope 检测畸形或显式调用信封', () => {
+    expect(hasNativeFunctionCallEnvelope({
+      contentType: 'ToolCall',
+      name: 'some_function',
+      arguments: 'invalid_json',
+    })).toBe(true)
+
+    expect(hasNativeFunctionCallEnvelope({
+      type: 'message',
+      text: 'hello world',
+    })).toBe(false)
   })
 
   it('named tool_choice 接受所选工具的混淆名文本调用', () => {

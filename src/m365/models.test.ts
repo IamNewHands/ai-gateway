@@ -89,5 +89,13 @@ describe('M365 model profiles', () => {
     expect(modern.models[0].use_responses_lite).toBe(true)
     expect(modern.models[0].tool_mode).toBe('code_mode_only')
     expect(modern.models[0].multi_agent_version).toBe('v2')
+    expect(modern.models[0].supports_image_detail_original).toBe(true)
+    expect(modern.models[0].input_modalities).toEqual(['text', 'image'])
+  })
+
+  it('declares vision and multimodal image capabilities in standard catalog', () => {
+    const catalog = modelCatalog()
+    expect((catalog[0].capabilities as any).vision).toBe(true)
+    expect((catalog[0].capabilities as any).modalities).toEqual(['text', 'image'])
   })
 })
