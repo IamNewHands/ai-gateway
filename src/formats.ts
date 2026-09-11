@@ -798,11 +798,13 @@ export function aggregateOpenAIToAnthropic(chunks: OpenAIChunk[]): Record<string
  */
 export function aggregateOpenAIToResponses(chunks: OpenAIChunk[]): Record<string, unknown> {
   let content = ''
+  let reasoning = ''
   const toolCallAccum: Map<number, { id: string; name: string; args: string }> = new Map()
   let model = ''
   let respId = ''
   let inputTokens = 0
   let outputTokens = 0
+  let gatewayMeta: Record<string, unknown> | undefined
 
   for (const chunk of chunks) {
     if (!respId && chunk.id) respId = chunk.id
@@ -811,11 +813,14 @@ export function aggregateOpenAIToResponses(chunks: OpenAIChunk[]): Record<string
       inputTokens = chunk.usage.prompt_tokens || inputTokens
       outputTokens = chunk.usage.completion_tokens || outputTokens
     }
+    const gm = (chunk as unknown as Record<string, unknown>)['m365_gateway'] as Record<string, unknown> | undefined
+    if (gm) gatewayMeta = gm
     const choice = chunk.choices?.[0]
     if (!choice) continue
 
     const delta = choice.delta
     if (!delta) continue
+    if (delta.reasoning_content) reasoning += delta.reasoning_content
     if (delta.content) content += delta.content
     if (delta.tool_calls) {
       for (const tc of delta.tool_calls) {
@@ -832,13 +837,28 @@ export function aggregateOpenAIToResponses(chunks: OpenAIChunk[]): Record<string
   }
 
   const output: Record<string, unknown>[] = []
+  if (reasoning) {
+    output.push({
+      id: `reasoning_${Date.now()}`,
+      type: 'reasoning',
+      status: 'completed',
+      summary: [{ type: 'summary_text', text: reasoning }],
+    })
+  }
   if (content) {
-    output.push({ type: 'message', role: 'assistant', content: [{ type: 'output_text', text: content }] })
+    output.push({
+      id: `item_${Date.now()}`,
+      type: 'message',
+      status: 'completed',
+      role: 'assistant',
+      content: [{ type: 'output_text', text: content, annotations: [] }],
+    })
   }
   for (const [, entry] of toolCallAccum) {
     output.push({
+      id: `fc_${entry.id}`,
       type: 'function_call',
-      id: entry.id,
+      status: 'completed',
       call_id: entry.id,
       name: entry.name,
       arguments: entry.args,
@@ -849,7 +869,9 @@ export function aggregateOpenAIToResponses(chunks: OpenAIChunk[]): Record<string
     id: respId || `resp_${Date.now()}`,
     object: 'response',
     model,
+    status: 'completed',
     output,
+    ...(gatewayMeta ? { end_turn: false, m365_gateway: gatewayMeta } : {}),
     usage: {
       input_tokens: inputTokens,
       output_tokens: outputTokens,
@@ -876,7 +898,8 @@ export function responsesOutputToAssistantMessage(output: Array<Record<string, u
     } else if (type === 'function_call') {
       const args = item['arguments']
       toolCalls.push({
-        id: (item['id'] as string) || '',
+        // 优先用 call_id（OpenAI 原始调用 id）；id 在 Responses 表达里带 fc_ 前缀
+        id: (item['call_id'] as string) || (item['id'] as string) || '',
         type: 'function',
         function: {
           name: (item['name'] as string) || '',
@@ -900,6 +923,13 @@ interface ResponsesRequest {
     role?: string
     type?: string
     content?: string | Array<{ type: string; text?: string; image_url?: { url: string } }>
+    /** Codex/GPT-5 的 function_call item（assistant 发起工具调用，需还原为 tool_calls） */
+    id?: string
+    call_id?: string
+    name?: string
+    arguments?: string
+    /** function_call_output item 的输出内容（string 或结构化 parts） */
+    output?: string | Array<{ type?: string; text?: string }>
     /** Codex 等客户端把工具声明放进 input 项的 additional_tools，而非顶层 tools */
     tools?: Array<{
       type: string
@@ -941,7 +971,13 @@ export function responsesToOpenAI(responsesReq: ResponsesRequest): Record<string
   if (typeof responsesReq.input === 'string') {
     messages.push({ role: 'user', content: responsesReq.input })
   } else if (Array.isArray(responsesReq.input)) {
-    for (const item of responsesReq.input) {
+    // 协议段成对保护：function_call 与紧随其后的 function_call_output 必须一起保留，
+    // 否则模型会看到"调用了工具却没有结果"而重复调用或断链（对齐原版 responsesPromptUnits）。
+    // 这里把 item 序列切成 [普通消息] 与 [工具调用协议段] 两类单元处理。
+    const callIds = new Set<string>()
+    let index = 0
+    while (index < responsesReq.input.length) {
+      const item = responsesReq.input[index]
       // additional_tools：非消息项，提取其工具声明，不进入 messages
       if (item.type === 'additional_tools' && Array.isArray(item.tools)) {
         for (const t of item.tools) {
@@ -950,6 +986,44 @@ export function responsesToOpenAI(responsesReq: ResponsesRequest): Record<string
           if (name === 'wait' || name === 'request_user_input') continue
           additionalTools.push(t)
         }
+        index += 1
+        continue
+      }
+      // function_call：连续多个合并进同一条 assistant 消息的 tool_calls
+      if (item.type === 'function_call') {
+        const toolCalls: Array<Record<string, unknown>> = []
+        while (index < responsesReq.input.length && responsesReq.input[index].type === 'function_call') {
+          const call = responsesReq.input[index]
+          const callId = call.call_id || call.id || ''
+          if (callId) callIds.add(callId)
+          toolCalls.push({
+            id: callId,
+            type: 'function',
+            function: {
+              name: call.name || '',
+              arguments: typeof call.arguments === 'string' ? call.arguments : JSON.stringify(call.arguments ?? {}),
+            },
+          })
+          index += 1
+        }
+        if (toolCalls.length) {
+          messages.push({ role: 'assistant', content: '', tool_calls: toolCalls })
+        }
+        continue
+      }
+      // function_call_output：还原为 tool 消息；无匹配调用则丢弃（避免污染协议）
+      if (item.type === 'function_call_output') {
+        const callId = item.call_id || item.id || ''
+        const rawOutput = item.output
+        const output = typeof rawOutput === 'string'
+          ? rawOutput
+          : Array.isArray(rawOutput)
+            ? rawOutput.map((p) => (typeof p === 'string' ? p : p?.text || '')).join('')
+            : ''
+        if (callId && callIds.has(callId)) {
+          messages.push({ role: 'tool', tool_call_id: callId, content: output })
+        }
+        index += 1
         continue
       }
       if (typeof item.content === 'string') {
@@ -963,6 +1037,7 @@ export function responsesToOpenAI(responsesReq: ResponsesRequest): Record<string
         })
         messages.push({ role: item.role, content: parts })
       }
+      index += 1
     }
   }
 
@@ -1075,9 +1150,21 @@ export function openAIChunkToResponsesSSE(
     /** item8：推理内容（reasoning_content → reasoning_summary_text.delta）。可选，未提供则跳过。 */
     reasoningContent?: string
     reasoningItemId?: string | null
+    /** 顺序分配器：每个 output item 拿到的稳定 output_index（避免固定猜测值导致漂移） */
+    nextOutputIndex?: number
+    messageIndex?: number
+    reasoningIndex?: number
+    /** tool_call 的 OpenAI 下标 → 分配的 output_index */
+    toolIndexes?: Map<number, number>
+    /** 已完成 item 的有序列表，用于在 response.completed 中回带真实 output */
+    outputItems?: Array<Record<string, unknown>>
   }
 ): string {
   const events: string[] = []
+  if (acc.nextOutputIndex === undefined) acc.nextOutputIndex = 0
+  if (!acc.toolIndexes) acc.toolIndexes = new Map()
+  if (!acc.outputItems) acc.outputItems = []
+  const allocIndex = (): number => (acc.nextOutputIndex as number)++
 
   if (!acc.hasStarted) {
     acc.responseId = chunk.id
@@ -1112,7 +1199,8 @@ export function openAIChunkToResponsesSSE(
           id: acc.responseId,
           object: 'response',
           model: acc.model,
-          output: [],
+          status: 'completed',
+          output: acc.outputItems,
           usage: chunk.usage ? {
             input_tokens: chunk.usage.prompt_tokens ?? acc.inputTokens,
             output_tokens: chunk.usage.completion_tokens ?? 0,
@@ -1130,17 +1218,18 @@ export function openAIChunkToResponsesSSE(
     if (!acc.reasoningContent) {
       acc.reasoningContent = ''
       acc.reasoningItemId = acc.reasoningItemId || `reasoning_${Date.now()}`
+      acc.reasoningIndex = allocIndex()
       events.push(`event: response.output_item.added`)
       events.push(`data: ${JSON.stringify({
         type: 'response.output_item.added',
-        output_index: acc.itemId ? 2 : 1,
+        output_index: acc.reasoningIndex,
         item: { id: acc.reasoningItemId, type: 'reasoning', summary: [], status: 'in_progress' },
       })}`)
       events.push(`event: response.reasoning_summary_part.added`)
       events.push(`data: ${JSON.stringify({
         type: 'response.reasoning_summary_part.added',
         item_id: acc.reasoningItemId,
-        output_index: acc.itemId ? 2 : 1,
+        output_index: acc.reasoningIndex,
         summary_index: 0,
         part: { type: 'summary_text', text: '' },
       })}`)
@@ -1150,7 +1239,7 @@ export function openAIChunkToResponsesSSE(
     events.push(`data: ${JSON.stringify({
       type: 'response.reasoning_summary_text.delta',
       item_id: acc.reasoningItemId,
-      output_index: acc.itemId ? 2 : 1,
+      output_index: acc.reasoningIndex,
       summary_index: 0,
       delta: delta.reasoning_content,
     })}`)
@@ -1160,17 +1249,18 @@ export function openAIChunkToResponsesSSE(
   if (delta.content) {
     if (!acc.itemId) {
       acc.itemId = `item_${Date.now()}`
+      acc.messageIndex = allocIndex()
       events.push(`event: response.output_item.added`)
       events.push(`data: ${JSON.stringify({
         type: 'response.output_item.added',
-        output_index: 0,
+        output_index: acc.messageIndex,
         item: { id: acc.itemId, type: 'message', role: 'assistant', content: [] },
       })}`)
       events.push(`event: response.content_part.added`)
       events.push(`data: ${JSON.stringify({
         type: 'response.content_part.added',
         item_id: acc.itemId,
-        output_index: 0,
+        output_index: acc.messageIndex,
         content_index: 0,
         part: { type: 'output_text', text: '' },
       })}`)
@@ -1180,7 +1270,7 @@ export function openAIChunkToResponsesSSE(
     events.push(`data: ${JSON.stringify({
       type: 'response.output_text.delta',
       item_id: acc.itemId,
-      output_index: 0,
+      output_index: acc.messageIndex,
       content_index: 0,
       delta: delta.content,
     })}`)
@@ -1193,11 +1283,13 @@ export function openAIChunkToResponsesSSE(
       if (tc.id && tc.function?.name) {
         acc.toolCalls.set(idx, { id: tc.id, name: tc.function.name, args: tc.function.arguments || '' })
         const callId = `fc_${tc.id}`
+        const outIdx = allocIndex()
+        acc.toolIndexes!.set(idx, outIdx)
         events.push(`event: response.output_item.added`)
         events.push(`data: ${JSON.stringify({
           type: 'response.output_item.added',
-          output_index: acc.toolCalls.size,
-          item: { id: callId, type: 'function_call', call_id: tc.id, name: tc.function.name, arguments: '' },
+          output_index: outIdx,
+          item: { id: callId, type: 'function_call', status: 'in_progress', call_id: tc.id, name: tc.function.name, arguments: '' },
         })}`)
       } else if (tc.function?.arguments) {
         const entry = acc.toolCalls.get(idx)
@@ -1207,7 +1299,7 @@ export function openAIChunkToResponsesSSE(
           events.push(`data: ${JSON.stringify({
             type: 'response.function_call_arguments.delta',
             item_id: `fc_${entry.id}`,
-            output_index: idx,
+            output_index: acc.toolIndexes!.get(idx) ?? idx,
             delta: tc.function.arguments,
           })}`)
         }
@@ -1222,7 +1314,7 @@ export function openAIChunkToResponsesSSE(
       events.push(`data: ${JSON.stringify({
         type: 'response.output_text.done',
         item_id: acc.itemId,
-        output_index: 0,
+        output_index: acc.messageIndex,
         content_index: 0,
         text: acc.textContent,
       })}`)
@@ -1230,42 +1322,89 @@ export function openAIChunkToResponsesSSE(
       events.push(`data: ${JSON.stringify({
         type: 'response.content_part.done',
         item_id: acc.itemId,
-        output_index: 0,
+        output_index: acc.messageIndex,
         content_index: 0,
         part: { type: 'output_text', text: acc.textContent },
       })}`)
+      const messageItem = {
+        id: acc.itemId,
+        type: 'message',
+        status: 'completed',
+        role: 'assistant',
+        content: [{ type: 'output_text', text: acc.textContent, annotations: [] }],
+      }
       events.push(`event: response.output_item.done`)
       events.push(`data: ${JSON.stringify({
         type: 'response.output_item.done',
-        output_index: 0,
-        item: { id: acc.itemId, type: 'message', role: 'assistant', content: [] },
+        output_index: acc.messageIndex,
+        item: messageItem,
       })}`)
+      acc.outputItems!.push(messageItem)
     }
 
     // 关闭 tool call items
     for (const [idx, entry] of acc.toolCalls) {
+      const outIdx = acc.toolIndexes!.get(idx) ?? idx
       events.push(`event: response.function_call_arguments.done`)
       events.push(`data: ${JSON.stringify({
         type: 'response.function_call_arguments.done',
         item_id: `fc_${entry.id}`,
-        output_index: idx,
+        output_index: outIdx,
         arguments: entry.args,
       })}`)
+      const callItem = {
+        id: `fc_${entry.id}`,
+        type: 'function_call',
+        status: 'completed',
+        call_id: entry.id,
+        name: entry.name,
+        arguments: entry.args,
+      }
       events.push(`event: response.output_item.done`)
       events.push(`data: ${JSON.stringify({
         type: 'response.output_item.done',
-        output_index: idx + 1,
-        item: {
-          id: `fc_${entry.id}`,
-          type: 'function_call',
-          call_id: entry.id,
-          name: entry.name,
-          arguments: entry.args,
-        },
+        output_index: outIdx,
+        item: callItem,
+      })}`)
+      acc.outputItems!.push(callItem)
+    }
+
+    // 关闭 reasoning item（若存在）
+    if (acc.reasoningContent && acc.reasoningItemId) {
+      events.push(`event: response.reasoning_summary_text.done`)
+      events.push(`data: ${JSON.stringify({
+        type: 'response.reasoning_summary_text.done',
+        item_id: acc.reasoningItemId,
+        output_index: acc.reasoningIndex,
+        summary_index: 0,
+        text: acc.reasoningContent,
+      })}`)
+      events.push(`event: response.reasoning_summary_part.done`)
+      events.push(`data: ${JSON.stringify({
+        type: 'response.reasoning_summary_part.done',
+        item_id: acc.reasoningItemId,
+        output_index: acc.reasoningIndex,
+        summary_index: 0,
+        part: { type: 'summary_text', text: acc.reasoningContent },
+      })}`)
+      const reasoningItem = {
+        id: acc.reasoningItemId,
+        type: 'reasoning',
+        status: 'completed',
+        summary: [{ type: 'summary_text', text: acc.reasoningContent }],
+      }
+      events.push(`event: response.output_item.done`)
+      events.push(`data: ${JSON.stringify({
+        type: 'response.output_item.done',
+        output_index: acc.reasoningIndex,
+        item: reasoningItem,
       })}`)
     }
 
     acc.completed = true
+    // Codex 语义：上游检查点（m365_gateway.checkpoint）表示 provider 拥有的后续采样，
+    // 该 Responses 对象虽已完成传输，但整个 user turn 尚未结束 → end_turn=false（非终态）。
+    const gatewayMeta = (chunk as unknown as Record<string, unknown>)['m365_gateway'] as Record<string, unknown> | undefined
     events.push(`event: response.completed`)
     events.push(`data: ${JSON.stringify({
       type: 'response.completed',
@@ -1273,7 +1412,9 @@ export function openAIChunkToResponsesSSE(
         id: acc.responseId,
         object: 'response',
         model: acc.model,
-        output: [],
+        status: 'completed',
+        output: acc.outputItems,
+        ...(gatewayMeta ? { end_turn: false, m365_gateway: gatewayMeta } : {}),
         usage: chunk.usage ? {
           input_tokens: chunk.usage.prompt_tokens ?? acc.inputTokens,
           output_tokens: chunk.usage.completion_tokens ?? 0,
@@ -1286,6 +1427,66 @@ export function openAIChunkToResponsesSSE(
   // SSE: events separated by double newline
   return formatAnthropicSSE(events)
 }
+
+/**
+ * 流式兜底：上游未发送 finish_reason 时补一个 response.completed。
+ * 携带已累积的 output items（而非空数组），避免客户端拿到空响应；
+ * 并从已累积状态重建近似 output（message / function_call / reasoning）。
+ */
+export function buildResponsesFallbackCompleted(acc: {
+  responseId: string
+  model?: string
+  itemId: string | null
+  textContent: string
+  toolCalls: Map<number, { id: string; name: string; args: string }>
+  reasoningContent?: string
+  reasoningItemId?: string | null
+  outputItems?: Array<Record<string, unknown>>
+}): string {
+  let output = acc.outputItems && acc.outputItems.length ? acc.outputItems : []
+  if (!output.length) {
+    const rebuilt: Array<Record<string, unknown>> = []
+    if (acc.reasoningContent && acc.reasoningItemId) {
+      rebuilt.push({
+        id: acc.reasoningItemId,
+        type: 'reasoning',
+        status: 'completed',
+        summary: [{ type: 'summary_text', text: acc.reasoningContent }],
+      })
+    }
+    if (acc.itemId || acc.textContent) {
+      rebuilt.push({
+        id: acc.itemId || `item_${Date.now()}`,
+        type: 'message',
+        status: 'completed',
+        role: 'assistant',
+        content: [{ type: 'output_text', text: acc.textContent, annotations: [] }],
+      })
+    }
+    for (const [, entry] of acc.toolCalls) {
+      rebuilt.push({
+        id: `fc_${entry.id}`,
+        type: 'function_call',
+        status: 'completed',
+        call_id: entry.id,
+        name: entry.name,
+        arguments: entry.args,
+      })
+    }
+    output = rebuilt
+  }
+  return `event: response.completed\ndata: ${JSON.stringify({
+    type: 'response.completed',
+    response: {
+      id: acc.responseId || 'resp_unknown',
+      object: 'response',
+      model: acc.model || '',
+      status: 'completed',
+      output,
+    },
+  })}\n\n`
+}
+
 
 // ============================================================
 //  OpenAI Chat Completions 请求 → Anthropic Messages 请求  反向转换

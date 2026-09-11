@@ -1342,6 +1342,18 @@ function buildSSE(id: string, model: string, o: ChatOutcome, payload: M365ChatPa
     return 'data: ' + JSON.stringify(chunk) + '\n\n'
   }
   const push = (s: string) => chunks.push(encoder.encode(s))
+  // 检查点终态：与 /chat/completions 非流式一致，在终态 chunk 上附带 m365_gateway，
+  // 供 Responses 路径转出 end_turn=false（provider 拥有的后续采样，非终态）。
+  const checkpointExtra: Record<string, unknown> = o.checkpoint
+    ? {
+        m365_gateway: {
+          checkpoint: true,
+          continuation_required: true,
+          checkpoint_reason: o.checkpoint.reason,
+          continuation_token: o.checkpoint.continuationToken,
+        },
+      }
+    : {}
 
   const first: Record<string, unknown> = { role: 'assistant', content: '' }
   if (o.reasoning) first['reasoning_content'] = o.reasoning
@@ -1384,6 +1396,7 @@ function buildSSE(id: string, model: string, o: ChatOutcome, payload: M365ChatPa
       id, object: 'chat.completion.chunk', created, model,
       choices: [{ index: 0, delta: {}, finish_reason: 'tool_calls' }],
       usage: { prompt_tokens: pt, completion_tokens: ct, total_tokens: pt + ct, m365_conversation: o.conversationId },
+      ...checkpointExtra,
     }
     push('data: ' + JSON.stringify(usageChunk) + '\n\n')
   } else if (o.reasoning) {
@@ -1394,6 +1407,7 @@ function buildSSE(id: string, model: string, o: ChatOutcome, payload: M365ChatPa
       id, object: 'chat.completion.chunk', created, model,
       choices: [{ index: 0, delta: {}, finish_reason: 'stop' }],
       usage: { prompt_tokens: pt, completion_tokens: ct, total_tokens: pt + ct, m365_conversation: o.conversationId },
+      ...checkpointExtra,
     }
     push('data: ' + JSON.stringify(usageChunk) + '\n\n')
   } else {
@@ -1402,6 +1416,7 @@ function buildSSE(id: string, model: string, o: ChatOutcome, payload: M365ChatPa
       id, object: 'chat.completion.chunk', created, model,
       choices: [{ index: 0, delta: {}, finish_reason: 'stop' }],
       usage: { prompt_tokens: pt, completion_tokens: ct, total_tokens: pt + ct, m365_conversation: o.conversationId },
+      ...checkpointExtra,
     }
     push('data: ' + JSON.stringify(usageChunk) + '\n\n')
   }

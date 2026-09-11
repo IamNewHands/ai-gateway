@@ -54,6 +54,7 @@ import {
   responsesToOpenAI,
   openAIToResponses,
   openAIChunkToResponsesSSE,
+  buildResponsesFallbackCompleted,
   responsesOutputToAssistantMessage,
   aggregateOpenAIToResponses,
   finalizeAnthropicStream,
@@ -3489,7 +3490,7 @@ export async function handleResponses(c: Context<AppEnv>) {
             if (!acc.completed) {
               try {
                 controller.enqueue(new TextEncoder().encode(
-                  `event: response.completed\ndata: ${JSON.stringify({ type: 'response.completed', response: { id: acc.responseId || 'resp_unknown', output: [] } })}\n\n`
+                  buildResponsesFallbackCompleted(acc)
                 ))
               } catch { /* enqueue failed */ }
             }
@@ -3666,7 +3667,7 @@ export async function handleResponses(c: Context<AppEnv>) {
           if (!acc.completed) {
             try {
               controller.enqueue(new TextEncoder().encode(
-                `event: response.completed\ndata: ${JSON.stringify({ type: 'response.completed', response: { id: acc.responseId || 'resp_unknown', output: [] } })}\n\n`
+                buildResponsesFallbackCompleted(acc)
               ))
             } catch { /* enqueue failed */ }
           }
@@ -3824,7 +3825,7 @@ async function handleResponsesVisionBridge(
         if (!acc.completed) {
           try {
             controller.enqueue(new TextEncoder().encode(
-              `event: response.completed\ndata: ${JSON.stringify({ type: 'response.completed', response: { id: acc.responseId || 'resp_unknown', output: [] } })}\n\n`
+              buildResponsesFallbackCompleted(acc)
             ))
           } catch { /* enqueue failed */ }
         }
@@ -3994,7 +3995,7 @@ async function handleResponsesSpecial(
         if (!acc.completed) {
           try {
             controller.enqueue(new TextEncoder().encode(
-              `event: response.completed\ndata: ${JSON.stringify({ type: 'response.completed', response: { id: acc.responseId || 'resp_unknown', output: [] } })}\n\n`
+              buildResponsesFallbackCompleted(acc)
             ))
           } catch { /* enqueue failed */ }
         }

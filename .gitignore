@@ -16,3 +16,5 @@ debug.log
 .pnpm-store/
 pnpm-lock.yaml
 pnpm-workspace.yaml
+# npm 本地缓存（沙箱/测试用）
+.npm-cache/
