@@ -1055,8 +1055,8 @@ function m365ConversationsModal(providerId) {
         '</select>' +
         '<input type="number" id="m365-cl-keep" value="' + (cfg.keep_n || 5) + '" style="width:60px" placeholder="保留N个">' +
         '<input type="number" id="m365-cl-age" value="' + (cfg.max_age_hours || 24) + '" style="width:60px" placeholder="小时">' +
-        '<button class="btn btn-s btn-xs" onclick="m365SaveCleanupConfig(\'' + m365Esc(providerId) + '\')">保存策略</button>' +
-        '<button class="btn btn-d btn-xs" onclick="m365TriggerCleanup(\'' + m365Esc(providerId) + '\')"><i class="fas fa-broom"></i>立即清理</button>' +
+        '<button class="btn btn-s btn-xs" onclick="m365SaveCleanupConfig(\\'' + m365Esc(providerId) + '\\')">保存策略</button>' +
+        '<button class="btn btn-d btn-xs" onclick="m365TriggerCleanup(\\'' + m365Esc(providerId) + '\\')"><i class="fas fa-broom"></i>立即清理</button>' +
         '</div>';
       if (list.length === 0) {
         html += '<p class="mu">当前无活跃云端会话记录。</p>';
@@ -1065,7 +1065,7 @@ function m365ConversationsModal(providerId) {
           list.map(function (c) {
             var dateStr = c.last_used_at ? new Date(c.last_used_at).toLocaleString() : '-';
             return '<tr><td><code>' + m365Esc(c.id) + '</code></td><td><code>' + m365Esc(c.account_id || '-') + '</code></td><td>' + dateStr + '</td>' +
-              '<td><button class="btn btn-gh btn-xs" onclick="m365ToggleWhitelist(\'' + m365Esc(providerId) + '\',\'' + m365Esc(c.id) + '\',false)"><i class="fas fa-shield-alt"></i>白名单</button></td></tr>';
+              '<td><button class="btn btn-gh btn-xs" onclick="m365ToggleWhitelist(\\'' + m365Esc(providerId) + '\\',\\'' + m365Esc(c.id) + '\\',false)"><i class="fas fa-shield-alt"></i>白名单</button></td></tr>';
           }).join('') + '</tbody></table>';
       }
       body.innerHTML = html;
