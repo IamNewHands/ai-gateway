@@ -475,6 +475,19 @@ export function isChainOfThoughtMessage(m: Record<string, unknown>): boolean {
 }
 
 /**
+ * 提取用户可见的 bot 回答文本（对齐 M365-Gateway chatHubAnswerMessageText）。
+ * ChatHub 正常答案快照显式标注 `messageType: "Chat"`；把其它非空 messageType 当作
+ * 控制元数据。只认 `undefined`/`"Chat"`，避免静默丢弃真实完成（历史 bug：只认 ''）。
+ */
+export function chatHubAnswerMessageText(message: Record<string, unknown>): string {
+  if (message['author'] !== 'bot') return ''
+  const text = message['text']
+  if (typeof text !== 'string' || text.length === 0) return ''
+  const type = message['messageType']
+  return type === undefined || type === 'Chat' ? text : ''
+}
+
+/**
  * 从 throttling 对象提取剩余配额数值表（移植自 M365-2api chathub.ts:296-328）。
  * 顶层对象：数值直接收录；嵌套对象取 remainingAllowance/remaining/balance 数值字段；
  * 另深入 metering/quotas 两个已知子对象。返回 null 表示无可提取余量。
@@ -1217,12 +1230,13 @@ export async function chatWithHandlers(
             for (const mraw of msgs) {
               if (!mraw || typeof mraw !== 'object') continue
               const m = mraw as Record<string, unknown>
-              // CoT 推理消息与正文同为 author=bot + messageType=''：必须排除，否则推理文本经
-              // emitSnapshot→onDelta 污染正文流（同 C 过滤，M365-2api chathub.ts:1759-1762）
+              // CoT 推理消息必须排除，否则推理文本经 emitSnapshot→onDelta 污染正文流
+              // （同 C 过滤，M365-2api chathub.ts:1759-1762）
               if (isChainOfThoughtMessage(m)) continue
-              if (m['author'] === 'bot' && (m['messageType'] || '') === '' && typeof m['text'] === 'string' && m['text'] !== '') {
-                emitSnapshot(m['text'] as string)
-              }
+              // 用户可见正文：ChatHub 正常答案快照显式标注 messageType='Chat'，
+              // 仅 undefined/'Chat' 两种才算正文（对齐 chatHubAnswerMessageText）。
+              const answer = chatHubAnswerMessageText(m)
+              if (answer !== '') emitSnapshot(answer)
             }
           }
           continue

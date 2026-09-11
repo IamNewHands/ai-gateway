@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { chatHubAllowedMessageTypes, chatPayload } from './chathub'
+import { chatHubAllowedMessageTypes, chatHubAnswerMessageText, chatPayload } from './chathub'
 
 const ANSWER_ONLY_TYPES = [
   'Chat',
@@ -56,5 +56,26 @@ describe('ChatHub message profiles', () => {
 
     expect(invocation.arguments[0].tone).toBe('Gpt_5_6_Chat')
     expect(invocation.arguments[0].allowedMessageTypes).toEqual(COMPACT_TYPES)
+  })
+})
+
+describe('chatHubAnswerMessageText（对齐 M365-Gateway，防静默丢弃真实回答）', () => {
+  it('接受显式 messageType="Chat" 的正常答案（历史 bug 会丢弃）', () => {
+    expect(chatHubAnswerMessageText({ author: 'bot', messageType: 'Chat', text: 'real answer' })).toBe('real answer')
+  })
+
+  it('接受 messageType 为 undefined 的答案', () => {
+    expect(chatHubAnswerMessageText({ author: 'bot', text: 'answer' })).toBe('answer')
+  })
+
+  it('拒绝控制类 messageType（如 Progress/SearchQuery）', () => {
+    expect(chatHubAnswerMessageText({ author: 'bot', messageType: 'Progress', text: 'x' })).toBe('')
+    expect(chatHubAnswerMessageText({ author: 'bot', messageType: 'SearchQuery', text: 'x' })).toBe('')
+  })
+
+  it('拒绝非 bot 作者与空文本', () => {
+    expect(chatHubAnswerMessageText({ author: 'user', messageType: 'Chat', text: 'x' })).toBe('')
+    expect(chatHubAnswerMessageText({ author: 'bot', messageType: 'Chat', text: '' })).toBe('')
+    expect(chatHubAnswerMessageText({ author: 'bot', messageType: 'Chat', text: 123 })).toBe('')
   })
 })

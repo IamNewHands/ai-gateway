@@ -9,6 +9,8 @@
 import type { ChatHubTool } from './chathub'
 import { parseToolCalls } from '../cnb/xyml'
 import { buildToolLedger, toolLedgerToAgentLedger, guardToolLedger, toolCallFingerprint, redactEvidence, compactMiddle } from './tool-ledger'
+import type { TaskAnchor } from './task-anchors'
+import { repairTaskAnchorArtifacts } from './task-anchors'
 
 /** 客户端工具名混淆常量（同 CF2 chathub.ts CLIENT_TOOL_ALIAS_PREFIX） */
 const CLIENT_TOOL_ALIAS_PREFIX = 'm365gw_client_'
@@ -1352,12 +1354,588 @@ const resolutionPatterns = [
   /(?:已|成功|完成|完毕|搞定|处理好)/,
 ]
 
-/** 检测模型是否"承诺了下一步行动却未给出任何工具调用" */
+/**
+ * 检测模型是否"承诺了下一步行动却未给出任何工具调用"。
+ *
+ * 契约兼容：目标历史签名带 hasToolCalls 短路参数（源为纯 (text)）；保留该参数以免破坏现有调用方，
+ * 但内部升级为源版质量——先用 assistantProseWithoutQuotedData 剥离代码块/引用/引号数据，
+ * 再用时态承诺正则（源 progressive/未来式，含无主语中文进度句），避免把"引用文档里的将来时"误判。
+ */
 export function unresolvedAssistantCommitment(text: string, hasToolCalls: boolean): boolean {
   if (hasToolCalls) return false
   const value = (text || '').trim()
   if (!value) return false
-  const low = value.toLowerCase()
+  const prose = assistantProseWithoutQuotedData(value)
+  const low = prose.toLowerCase()
   if (resolutionPatterns.some((p) => p.test(low))) return false
-  return commitmentPatterns.some((p) => p.test(value))
+  return commitmentPatterns.some((p) => p.test(prose))
+}
+
+/* ==================== caller-local 能力分类 + 本地执行拒绝恢复（同原版 openai.ts） ==================== */
+
+/** 本地补丁类工具的参数名（同原版 LOCAL_PATCH_PROPERTY_NAMES） */
+const LOCAL_PATCH_PROPERTY_NAMES = ['patch', 'patch_text', 'patchtext', 'diff', 'old_string', 'new_string'] as const
+
+/** 本地补丁类工具的描摹模式（同原版 LOCAL_PATCH_DESCRIPTION_PATTERN） */
+const LOCAL_PATCH_DESCRIPTION_PATTERN = /(?:patch|diff|edit|modify|replace|补丁|编辑|修改|替换)/iu
+
+/** tool_choice 是否要求必须调用工具（同原版 toolRequired） */
+export function toolRequired(choice: unknown): boolean {
+  if (String(choice ?? '').toLowerCase() === 'required') return true
+  if (!choice || typeof choice !== 'object') return false
+  const value = choice as { type?: string; function?: { name?: string }; name?: string }
+  return value.type === 'function' || Boolean(value.function?.name || value.name)
+}
+
+/** 调用方本地能力分类（同原版 CallerLocalCapability） */
+export type CallerLocalCapability =
+  | 'process_start'
+  | 'process_continue'
+  | 'filesystem_read'
+  | 'filesystem_search'
+  | 'filesystem_write'
+  | 'filesystem_patch'
+  | 'visual_read'
+  | 'computer_control'
+
+/**
+ * 调用方本地工具候选（同原版 CallerLocalToolCandidate）。
+ * 适配点：源继承 FunctionToolDefinition（含 raw/name/description/parameters），
+ * 目标只读 ToolDef 的 function，故这里内联 name/description/parameters 并以 raw 保留原始定义。
+ */
+export interface CallerLocalToolCandidate {
+  raw: unknown
+  name: string
+  description: string
+  parameters: unknown
+  capabilities: CallerLocalCapability[]
+}
+
+/** 本地执行拒绝恢复判定输入（同原版 FableLocalExecRefusalInput，省略 freshCallerLocalResult 可选字段） */
+export interface FableLocalExecRefusalInput {
+  tone: string
+  toolChoice: unknown
+  tools: unknown[] | undefined
+  responseText: string
+  prompt: string
+  /** 仅当结构化客户端协议证明本轮在续接调用方本地工具运行时为 true；绝不从工具输出推断（同原版 FableLocalExecRefusalInput） */
+  freshCallerLocalResult?: boolean
+}
+
+/** 把任意声明归一为工具定义（同原版 function-tools.ts functionToolDefinition，支持 parameters/input_schema/inputSchema） */
+function functionToolDefinition(raw: unknown): { raw: unknown; name: string; description: string; parameters: unknown } | null {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null
+  const record = raw as Record<string, unknown>
+  if (record['type'] !== undefined && record['type'] !== 'function') return null
+  const candidate = (record['function'] && typeof record['function'] === 'object' && !Array.isArray(record['function']))
+    ? record['function'] as Record<string, unknown>
+    : record
+  const name = typeof candidate['name'] === 'string' ? candidate['name'].trim() : ''
+  if (!name) return null
+  const parameters = candidate['parameters'] ?? candidate['input_schema'] ?? candidate['inputSchema']
+  return {
+    raw,
+    name,
+    description: typeof candidate['description'] === 'string' ? candidate['description'] : '',
+    parameters,
+  }
+}
+
+/** 归一化工具标识符：camelCase → snake_case、小写、非字母数字压成下划线并去首尾（同原版 normalizedToolIdentifier） */
+export function normalizedToolIdentifier(value: string): string {
+  return value
+    .replace(/([a-z0-9])([A-Z])/gu, '$1_$2')
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/gu, '_')
+    .replace(/^_+|_+$/gu, '')
+}
+
+/** 提取 JSON Schema 顶层 properties 的归一化键集合（同原版 schemaPropertyNames） */
+function schemaPropertyNames(parameters: unknown): Set<string> {
+  if (!parameters || typeof parameters !== 'object' || Array.isArray(parameters)) return new Set()
+  const properties = (parameters as { properties?: unknown }).properties
+  if (!properties || typeof properties !== 'object' || Array.isArray(properties)) return new Set()
+  return new Set(Object.keys(properties as Record<string, unknown>).map(normalizedToolIdentifier))
+}
+
+/** 集合中是否命中任一候选（同原版 hasAny） */
+function hasAny(values: ReadonlySet<string>, candidates: readonly string[]): boolean {
+  return candidates.some((candidate) => values.has(candidate))
+}
+
+/** 从工具声明本身分类调用方本地能力（同原版 callerLocalToolCandidate）。
+ *  产品名是有用证据，但参数形状与描述也可识别改名/命名空间化的等价工具，
+ *  同时不会把不相关的网络工具误判为本地 shell/文件系统能力。 */
+export function callerLocalToolCandidate(raw: unknown): CallerLocalToolCandidate | null {
+  const definition = functionToolDefinition(raw)
+  if (!definition) return null
+  const name = normalizedToolIdentifier(definition.name)
+  const properties = schemaPropertyNames(definition.parameters)
+  const description = definition.description
+  const capabilities = new Set<CallerLocalCapability>()
+
+  const commandShape = hasAny(properties, ['cmd', 'command', 'commands', 'code', 'script'])
+  const sessionShape = hasAny(properties, ['session_id', 'sessionid', 'process_id', 'processid', 'pid'])
+  const processActionShape = sessionShape && hasAny(properties, ['action', 'chars', 'input', 'data', 'signal'])
+  const pathShape = hasAny(properties, [
+    'path', 'file_path', 'filepath', 'directory', 'folder', 'root', 'workdir', 'cwd',
+    'source', 'source_path', 'destination', 'destination_path',
+  ])
+  const patternShape = hasAny(properties, ['pattern', 'glob', 'query', 'include', 'regex'])
+  const contentShape = hasAny(properties, ['content', 'contents', 'text', 'data'])
+  const patchShape = hasAny(properties, LOCAL_PATCH_PROPERTY_NAMES)
+  const localDescription = /(?:caller|local|file\s*system|filesystem|workspace|working\s+directory|terminal|shell|desktop|computer|调用方|本机|本地|文件系统|工作区|终端|桌面)/iu.test(description)
+  // 熟悉的名称并不代表有权在调用方执行。Hermes 等客户端会在真正的本地终端/文件系统工具旁
+  // 暴露托管式 code/computer 工具；因此显式的非调用方执行环境会覆盖下面所有名称/schema 正信号。
+  const hostedDescription = /(?:hosted|remote|sandbox(?:ed)?|cloud|server[- ]side|container|virtual\s+machine|vm\b|execution\s+environment|托管|远程|沙箱|云端|服务端|容器|虚拟机|执行环境)/iu.test(description)
+    && !/(?:caller[- ]side|caller['’]?s|local|on\s+your\s+(?:machine|computer)|调用方|本机|本地)/iu.test(description)
+  if (hostedDescription) return null
+  const fileDescription = /(?:file|directory|folder|path|filesystem|文件|目录|路径)/iu.test(description)
+  const executionDescription = /(?:run|execute|command|shell|terminal|code|process|运行|执行|命令|终端|代码|进程)/iu.test(description)
+  const readDescription = /(?:read|inspect|view|load|读取|查看|检查|加载)/iu.test(description)
+  const searchDescription = /(?:search|find|glob|grep|match|搜索|查找|匹配)/iu.test(description)
+  const writeDescription = /(?:write|create|save|写入|创建|保存)/iu.test(description)
+  const patchDescription = LOCAL_PATCH_DESCRIPTION_PATTERN.test(description)
+
+  if (['exec', 'exec_command', 'bash', 'terminal', 'shell', 'powershell', 'execute_code'].includes(name)
+    || (commandShape && executionDescription && (localDescription || hasAny(properties, ['workdir', 'cwd'])))) {
+    capabilities.add('process_start')
+  }
+  if (['write_stdin', 'process'].includes(name)
+    || (processActionShape && executionDescription)) {
+    capabilities.add('process_continue')
+  }
+  if (['read', 'read_file'].includes(name) && (pathShape || (localDescription && fileDescription))
+    || (pathShape && localDescription && fileDescription && readDescription)) {
+    capabilities.add('filesystem_read')
+  }
+  if (['find', 'glob', 'grep', 'list_directory', 'ls', 'search_files'].includes(name)
+    && (patternShape || pathShape || (localDescription && fileDescription))
+    || (patternShape && pathShape && fileDescription && searchDescription)) {
+    capabilities.add('filesystem_search')
+  }
+  if (['move_file', 'write', 'write_file'].includes(name) && (pathShape || contentShape || (localDescription && fileDescription))
+    || (pathShape && contentShape && fileDescription && writeDescription)) {
+    capabilities.add('filesystem_write')
+  }
+  if (['edit', 'edit_file', 'multi_edit', 'patch', 'apply_patch'].includes(name)
+    && (patchShape || patchDescription || properties.size === 0)
+    || (patchShape && patchDescription)) {
+    capabilities.add('filesystem_patch')
+  }
+  if (name === 'view_image'
+    || (pathShape && localDescription && /(?:image|picture|screenshot|图像|图片|截图)/iu.test(description))) {
+    capabilities.add('visual_read')
+  }
+  if (name === 'computer_use'
+    || (localDescription && /(?:computer|desktop|mouse|keyboard|screen|电脑|桌面|鼠标|键盘|屏幕)/iu.test(description))) {
+    capabilities.add('computer_control')
+  }
+
+  return capabilities.size > 0 ? { ...definition, capabilities: [...capabilities] } : null
+}
+
+/** 从工具数组中筛出全部调用方本地候选（同原版 callerLocalToolCandidates） */
+export function callerLocalToolCandidates(tools: unknown[] = []): CallerLocalToolCandidate[] {
+  return tools.flatMap((raw) => {
+    const candidate = callerLocalToolCandidate(raw)
+    return candidate ? [candidate] : []
+  })
+}
+
+/** 调用方本地工具名列表（同原版 callerLocalToolNames） */
+function callerLocalToolNames(tools: unknown[] = []): string[] {
+  return callerLocalToolCandidates(tools).map((candidate) => candidate.name)
+}
+
+/** 为第二次有界路由尝试挑选单个调用方本地工具（同原版 preferredSecondAttemptLocalToolName）。
+ *  首次尝试保留调用方全部候选集；若宽路由未产生 schema 合法调用，收窄到有充分支持的下一步，
+ *  可在不臆造参数、不在 Worker 内执行任何东西的前提下让修复确定化，
+ *  产出的调用仍须通过原有的 schema、指纹与轮数守卫。
+ *  适配点：入参 ledger 由源 ToolLedger 改为目标 AgentLedger，仅读取完成证据。 */
+export function preferredSecondAttemptLocalToolName(
+  tools: unknown[] | undefined,
+  ledger: AgentLedger,
+  prompt: string,
+): string | null {
+  const candidates = callerLocalToolCandidates(tools)
+  if (candidates.length === 0) return null
+  if (candidates.length === 1) return candidates[0].name
+
+  const ranked = (capability: CallerLocalCapability, preferredNames: readonly string[]): string | null => {
+    const matches = candidates.filter((candidate) => candidate.capabilities.includes(capability))
+    if (matches.length === 0) return null
+    for (const preferred of preferredNames) {
+      const match = matches.find((candidate) => normalizedToolIdentifier(candidate.name) === preferred)
+      if (match) return match.name
+    }
+    return matches.length === 1 ? matches[0].name : null
+  }
+
+  const latest = ledger.completed.at(-1)
+  const latestCandidate = latest
+    ? candidates.find((candidate) => candidate.name === latest.name)
+    : undefined
+  if (latestCandidate?.capabilities.includes('filesystem_search')) {
+    const reader = ranked('filesystem_read', ['read', 'read_file'])
+    if (reader) return reader
+  }
+
+  const text = prompt.toLowerCase()
+  const processAction = /\b(?:run|execute|build|test|deploy|ssh|login|connect)\b|(?:运行|执行|构建|测试|部署|登录|连接)/iu.test(text)
+  if (processAction) {
+    const process = ranked('process_start', ['exec', 'exec_command', 'terminal', 'bash', 'shell', 'powershell'])
+    if (process) return process
+  }
+  const specificFile = /(?:\b[\w.-]+\.(?:jsonc?|tsx?|jsx?|mjs|cjs|md|toml|ya?ml|css|html|sql|py|go|rs)\b|package\.json|wrangler\.jsonc)/iu.test(text)
+  const readAction = /\b(?:read|open|inspect|view)\b|(?:读取|打开|查看)/iu.test(text)
+  if (specificFile && readAction) {
+    const reader = ranked('filesystem_read', ['read', 'read_file'])
+    if (reader) return reader
+  }
+  const searchAction = /\b(?:inspect|analy[sz]e|list|find|search|inventory|repository|repo|project|workspace|directory|folder)\b|(?:分析|查看|列出|查找|搜索|盘点|仓库|项目|工作区|目录|文件夹)/iu.test(text)
+  if (searchAction) return ranked('filesystem_search', ['glob', 'search_files', 'grep'])
+  return null
+}
+
+/** 在已声明 schema 中按归一化候选名反查真实属性名（同原版 declaredPropertyName） */
+function declaredPropertyName(definition: { parameters: unknown }, candidates: readonly string[]): string | null {
+  if (!definition.parameters || typeof definition.parameters !== 'object' || Array.isArray(definition.parameters)) return null
+  const properties = (definition.parameters as { properties?: unknown }).properties
+  if (!properties || typeof properties !== 'object' || Array.isArray(properties)) return null
+  const entries = Object.keys(properties as Record<string, unknown>)
+  for (const candidate of candidates) {
+    const matched = entries.find((entry) => normalizedToolIdentifier(entry) === candidate)
+    if (matched) return matched
+  }
+  return null
+}
+
+/** 仅检测模型"工具不可用"的声明，绝不授予另选工具的权限；调用方须另行证明用户意图（同原版 isCallerLocalExecRefusal） */
+export function isCallerLocalExecRefusal(input: FableLocalExecRefusalInput): boolean {
+  if (String(input.toolChoice ?? 'auto').toLowerCase() !== 'auto') return false
+  const localTools = callerLocalToolCandidates(input.tools)
+  if (localTools.length === 0) return false
+
+  const refusal = input.responseText.trim()
+  // 这段固定道歉是与模型家族无关的空答复。仅按 Claude 处理会让同样的 GPT 完成句
+  // 通过语义续接审计而被当作可用终态回答。
+  const genericNonAnswer = genericAssistantNonAnswer(refusal)
+  // 某些 Responses continuation 会非人称地描述已声明的调用方路由
+  //（"no matching caller-local execution tool is available"）而非"I cannot access it"。
+  // 上面的声明检查使这是一个具体矛盾，而不是泛泛的失败解释。
+  const englishDeclaredToolAbsence = /\bno\s+(?:matching\s+)?(?:(?:caller(?:-local|-side)?|client(?:-side)?|local|Windows)\s+)?(?:execution\s+)?(?:tools?|runtime|channels?|capabilit(?:y|ies))\s+(?:is|are)\s+(?:currently\s+)?(?:available|accessible|exposed|provided)\b/iu.test(refusal)
+  const englishRefusal = /(?:\b(?:I|we)\s+(?:can(?:not|['’]t)|am unable to|are unable to|do not have|have no)\b[\s\S]{0,180}\b(?:access|use|interact with|reach)\b[\s\S]{0,180}\b(?:the\s+)?(?:(?:caller['’]?s|your)\s+(?:local\s+)?(?:machine|computer|file\s*system|filesystem|tools?|runtime|environment|execution\s+channel|capabilit(?:y|ies))|local\s+(?:machine|computer|file\s*system|filesystem|tools?|execution\s+channel|capabilit(?:y|ies))|(?:another|different)\s+(?:execution|runtime)\s+environment)\b|\b(?:local\s+(?:file\s*system|filesystem)\s+tools?|(?:another|different)\s+(?:execution|runtime)\s+environment)\b[\s\S]{0,180}\b(?:is|are)\s+(?:not\s+accessible|unavailable)\b|\b(?:current\s+)?(?:session|conversation|chat|turn)\b[\s\S]{0,120}\b(?:does\s+not|doesn['’]t|has\s+not|hasn['’]t)\b[\s\S]{0,80}\b(?:expose|provide|connect|include|offer)\b[\s\S]{0,120}\b(?:client(?:-side)?|local|Windows)\b[\s\S]{0,80}\b(?:execution\s+)?(?:tools?|runtime|channels?|capabilit(?:y|ies))\b)/iu.test(refusal)
+  const chineseLocalSubject = /(?:调用方[^\n]{0,32}(?:本机|本地|文件系统|工具|环境|通道|能力)|你[^\n]{0,48}(?:本机|本地)|(?:本机|本地)[^\n]{0,24}(?:文件系统|工具|环境|通道|能力)|(?:客户端|Windows)[^\n]{0,40}(?:执行)?(?:工具|通道|能力)|(?:另一|不同)(?:个|的)?(?:执行|运行)环境|(?:弹出|远程)[^\n]{0,24}(?:登录|连接)?窗口|(?:服务器列表|登录窗口|连接窗口))/u
+  const chineseRefusal = (
+    /(?:无法|不能|无权|没有权限|不具备)[\s\S]{0,80}(?:访问|使用|操作|读取|连接|调用|执行|写入|修改|继续|重试)[\s\S]{0,160}/u.test(refusal)
+      && chineseLocalSubject.test(refusal)
+  ) || (
+    chineseLocalSubject.test(refusal)
+      && /(?:无法|不能|无权|没有权限|不具备)[\s\S]{0,80}(?:访问|使用|操作|读取|连接|调用|执行|写入|修改|继续|重试)/u.test(refusal)
+  ) || (
+    /(?:当前|这个)?(?:会话|对话)[\s\S]{0,80}(?:未|没有|并未)[\s\S]{0,40}(?:暴露|提供|接入|连接)[\s\S]{0,100}(?:客户端|本地|本机|Windows)[\s\S]{0,40}(?:执行)?工具/u.test(refusal)
+  ) || (
+    /(?:当前|这个)?(?:会话|对话|回合)[\s\S]{0,80}(?:未|没有|并未)[\s\S]{0,48}(?:可调用|可用|暴露|提供|接入|连接)?[\s\S]{0,100}(?:客户端|本地|本机|Windows)[\s\S]{0,48}(?:执行)?(?:工具|通道|能力)/u.test(refusal)
+  ) || (
+    /(?:请|需要)[\s\S]{0,40}(?:重新|再次)[\s\S]{0,40}(?:连接|接入)[\s\S]{0,60}(?:本地|客户端)?工具(?:运行时|环境)?/u.test(refusal)
+  )
+  // 具备视觉能力的客户端通过调用方侧工具暴露本地图片。模型仍可能声称看不到像素
+  // 或图片输入不受支持。仅当请求确实声明了视觉读取器时，才把该回答视为可用性矛盾；
+  // 只有 exec 或纯文本的客户端不得被路由到臆造的图像操作。
+  const hasVisualReadTool = localTools.some((tool) => tool.capabilities.includes('visual_read'))
+  const visualRefusal = hasVisualReadTool && (
+    /(?:当前|这个|该)?(?:环境|会话|对话|回合)[\s\S]{0,64}(?:不支持|无法|不能)[\s\S]{0,48}(?:图片|图像|视觉)(?:输入|读取|识别|内容)?/u.test(refusal)
+      || /(?:无法|不能|没有|未能)[\s\S]{0,64}(?:实际)?(?:看到|读取|访问|获取|识别)[\s\S]{0,64}(?:图片|图像|截图|像素|画面)(?:内容)?/u.test(refusal)
+      || /(?:只|仅)[\s\S]{0,40}(?:收到|看到|获取到)[\s\S]{0,56}(?:图片)?(?:文件名|路径|占位(?:符|信息))/u.test(refusal)
+      || /\b(?:I|we)\s+(?:can(?:not|['’]t)|am unable to|are unable to|do not)\b[\s\S]{0,80}\b(?:see|read|access|view|inspect|analy[sz]e)\b[\s\S]{0,64}\b(?:the\s+)?(?:actual\s+)?(?:image|picture|screenshot|pixels?|visual(?:\s+content)?)\b/iu.test(refusal)
+      || /\b(?:current\s+)?(?:environment|session|conversation|chat|turn)\b[\s\S]{0,80}\b(?:does\s+not|doesn['’]t|cannot|can['’]t)\b[\s\S]{0,64}\bsupport\b[\s\S]{0,40}\b(?:image|visual)\s+input\b/iu.test(refusal)
+      || /\bonly\s+(?:received|have|got)\b[\s\S]{0,64}\b(?:file\s*name|path|placeholder)\b[\s\S]{0,64}\b(?:image|picture|screenshot|pixels?|visual)\b/iu.test(refusal)
+  )
+  return genericNonAnswer || englishDeclaredToolAbsence || englishRefusal || chineseRefusal || visualRefusal
+}
+
+/** 检测任一模型"在当前请求已声明这些工具的情况下仍声称调用方本地工具缺失"的具体声明。
+ *  同时要求拒绝文本与具体本地动作，因此普通解释、真实命令失败与无任务的工具结果续接
+ *  永远不会被升级为猜测的工具调用（同原版 shouldRecoverCallerLocalExecRefusal）。 */
+export function shouldRecoverCallerLocalExecRefusal(input: FableLocalExecRefusalInput): boolean {
+  if (!isCallerLocalExecRefusal(input)) return false
+
+  const lastUserMarker = input.prompt.lastIndexOf('[USER]\n')
+  const toolProtocolOnly = lastUserMarker < 0
+    && /\[(?:ASSISTANT TOOL CALL|TOOL RESULT|ASSISTANT|TOOL)(?:\s|\])/iu.test(input.prompt)
+  const userRequest = lastUserMarker >= 0
+    ? input.prompt.slice(lastUserMarker + 7).split(/\n\n\[[A-Z][^\]]*\]\n/u, 1)[0]
+    : toolProtocolOnly ? '' : input.prompt
+  const explanatoryOnly = /^(?:\s*(?:please\s+)?(?:explain|describe|tell me (?:how|why)|what|why|how (?:does|can|would))\b|\s*(?:请)?(?:解释|说明|为什么|如何|怎么))/iu.test(userRequest)
+  // 具体的可用性拒绝本已是很强的证据，说明模型未能履行调用方本地任务。一旦因果关系上的
+  // USER 条目存在，就把其自然语言内容作为权威，交由隔离的语义路由判断是否真的需要动作。
+  // 不要用有限的动词/路径词表来把关恢复：像"接上那台机器"或"按刚才的结果继续"这类的
+  // 命令即使不含网关历史上的关键词也仍是命令。解释性提问与显式"失败即停止"请求按策略
+  // 保持为仅回答。
+  const textualIntent = Boolean(userRequest.trim())
+    && !explanatoryOnly
+    && !callerRequestedStopOnFailure(userRequest)
+  // 新鲜证据证明调用方本地工具存在，但不会揭示用户缺失的任务，也不会授权网关猜测下一步。
+  // 无状态 Responses continuation 会保留上述因果 USER 条目，而纯工具输入必须保持不可路由。
+  return textualIntent
+}
+
+/** 向后兼容导出，供针对 Claude 的定向测试使用（同原版 shouldRecoverFableLocalExecRefusal） */
+export function shouldRecoverFableLocalExecRefusal(input: FableLocalExecRefusalInput): boolean {
+  if (!/^Claude_(?:Fable|Opus|Sonnet)(?:_|$)/u.test(input.tone)) return false
+  return shouldRecoverCallerLocalExecRefusal(input)
+}
+
+/**
+ * 仅用已验证的结构化工具历史识别"进行中的本地任务"（同原版 hasFreshCallerLocalContinuationEvidence）。
+ * 覆盖那些活跃 prompt 含 function_call_output 却有意省略原始 user 消息的 Responses continuation。
+ *
+ * 类型映射（语义等价，非降级）：
+ * - 源 `ToolLedger.consumedCallIds` = 结果已被消费的 callId 集合；目标等价物即
+ *   `ledger.completed`（result 非空的证据）的 id 集合，因为 completed 恰是"已拿到结果"的调用。
+ * - 源 `ledger.calls`（全部已注册调用，含未消费）≈ 目标 `completed ∪ pending` 的 id→name 映射。
+ * 因此本谓词在目标侧等价于"存在任一本地工具调用已获得完成结果"。
+ */
+export function hasFreshCallerLocalContinuationEvidence(
+  tools: unknown[] | undefined,
+  ledger: AgentLedger,
+): boolean {
+  const localNames = new Set(callerLocalToolNames(tools).map(normalizedToolIdentifier))
+  if (localNames.size === 0) return false
+  // consumedCallIds 等价物：已获得结果（completed）的调用 id 集合
+  const consumedIds = new Set(ledger.completed.map((e) => e.id))
+  const freshLocalCallIds = new Set(
+    [...ledger.completed, ...ledger.pending]
+      .filter((item) => consumedIds.has(item.id) && localNames.has(normalizedToolIdentifier(item.name)))
+      .map((item) => item.id),
+  )
+  return ledger.completed.some((item) => freshLocalCallIds.has(item.id))
+}
+
+/**
+ * 新鲜的调用方侧失败结果意味着请求的动作尚未成功（同原版 hasFreshCallerLocalFailureEvidence）。
+ * 保持完全基于证据：网关不选择工作流或替代工具，但也不得让独立路由在因果用户任务仍活跃时
+ * 把该失败变成 NO_TOOL_REQUIRED。
+ *
+ * 适配点：与 hasFreshCallerLocalContinuationEvidence 相同——consumedCallIds 用 completed 的 id 近似。
+ */
+export function hasFreshCallerLocalFailureEvidence(
+  tools: unknown[] | undefined,
+  ledger: AgentLedger,
+): boolean {
+  const localNames = new Set(callerLocalToolNames(tools).map(normalizedToolIdentifier))
+  if (localNames.size === 0) return false
+  const consumedIds = new Set(ledger.completed.map((e) => e.id))
+  const freshLocalCallIds = new Set(
+    [...ledger.completed, ...ledger.pending]
+      .filter((item) => consumedIds.has(item.id) && localNames.has(normalizedToolIdentifier(item.name)))
+      .map((item) => item.id),
+  )
+  const latestFreshLocalResult = ledger.completed
+    .filter((item) => freshLocalCallIds.has(item.id))
+    .at(-1)
+  return latestFreshLocalResult?.failed ?? false
+}
+
+/** 提取最近的 user 请求文本（同原版 callerLocalRecoveryUserRequest） */
+function callerLocalRecoveryUserRequest(prompt: string): string {
+  const lastUserMarker = prompt.lastIndexOf('[USER]\n')
+  return lastUserMarker >= 0
+    ? prompt.slice(lastUserMarker + 7).split(/\n\n\[[A-Z][^\]]*\]\n/u, 1)[0]
+    : prompt
+}
+
+/** 用户是否显式要求"失败即停止"（同原版 callerRequestedStopOnFailure） */
+function callerRequestedStopOnFailure(userRequest: string): boolean {
+  return /(?:失败|报错|出错)[^。！？\n]{0,32}(?:停止|终止|不要继续|别继续)|(?:停止|终止|不要继续|别继续)[^。！？\n]{0,32}(?:失败|报错|出错)|\b(?:(?:if|when|on)\b[^.!?\n]{0,32}\b(?:error|fail)|(?:error|fail)\b[^.!?,\n]{0,32}\b(?:then\s+)?(?:stop|abort|do not continue|don['’]t continue)|(?:stop|abort|do not continue|don['’]t continue)\b[^.!?\n]{0,40}\b(?:error|fail))/iu.test(userRequest)
+}
+
+/** 有界仓库列举命令（同原版 boundedRepositoryCommand）：仅做只读首轮盘点 */
+export function boundedRepositoryCommand(workdir: string): string {
+  if (!workdir) return 'Get-ChildItem -Force | Select-Object -First 200 Name,FullName,Mode,Length,LastWriteTime'
+  const safeWorkdir = workdir.replace(/'/gu, "''")
+  return `Get-ChildItem -LiteralPath '${safeWorkdir}' -Force | Select-Object -First 200 Name,FullName,Mode,Length,LastWriteTime`
+}
+
+/**
+ * 必需调用方本地动作的最后一道"无网络"恢复（同原版 deterministicToolRouterRecovery）。
+ * 仅当 tool_choice 为 required 时，从"唯一路径任务锚点 + 只读意图"合成一个**有界的只读首次探查**调用。
+ * 写入/修改/补丁/删除/部署/发布/SSH/登录/连接/运行/执行/构建/测试等一律不进入此路径，
+ * 这些操作必须由模型给出通过 schema 校验的参数，网关绝不代猜。
+ *
+ * 目标适配点：
+ * - 源 FunctionToolDefinition/functionToolDefinition → 目标内部 functionToolDefinition + callerLocalToolCandidate 的 raw。
+ * - 源 FunctionCall → 目标 DetectedToolCall（id 用 `call_${Date.now()}`，type 固定 'function'）。
+ * - 源 repairFunctionCallTaskAnchors 仅在 argumentEncoding==='legacy_azhex' 时修复传输损坏；
+ *   目标的合成参数由本函数自己 JSON.stringify 生成，不含 legacy AZHEX 伪影，
+ *   因此这里跳过该修复（DetectedToolCall 也无 argumentEncoding 字段）。
+ * - 源 boundPublicExecFunctionCall → 目标用 normalizeClientArgumentKeys 做键归一（等价于
+ *   normalizeClientFunctionCall 内的归一化），失败即放弃。
+ * - 源 validateToolArguments / guardProposedToolCalls → 目标用 validateDetectedToolCalls(choice='required')，
+ *   与源路径同样要求 schema 校验通过（且 required 模式下 toolChoiceAllows 恒为真，不影响结果）。
+ * - 源 guardProposedToolCalls/consecutive_fingerprint_limit → 目标无该守卫，用
+ *   "canonicalToolArguments 指纹 + ledgerHasCompleted + completed/pending 同名同参去重"作为等价护栏。
+ */
+export async function deterministicToolRouterRecovery(
+  prompt: string,
+  tools: unknown[] | undefined,
+  choice: unknown,
+  ledger: AgentLedger,
+  taskAnchors: ReadonlyArray<TaskAnchor> = [],
+): Promise<DetectedToolCall | null> {
+  if (!toolRequired(choice)) return null
+  const definitions = (tools ?? []).flatMap((raw) => {
+    const definition = functionToolDefinition(raw)
+    return definition ? [definition] : []
+  })
+  const explicit = typeof choice === 'object' && choice
+    ? ((choice as { function?: { name?: string }; name?: string }).function?.name
+      ?? (choice as { name?: string }).name)
+    : undefined
+  const selectedName = explicit
+    ?? preferredSecondAttemptLocalToolName(tools, ledger, prompt)
+    ?? (definitions.length === 1 ? definitions[0].name : undefined)
+  if (!selectedName) return null
+  const definition = definitions.find((candidate) => candidate.name === selectedName)
+  const local = definition ? callerLocalToolCandidate(definition.raw) : null
+  if (!definition || !local) return null
+
+  const pathAnchors = [...new Set(taskAnchors
+    .filter((anchor) => ['windows_path', 'unc_path', 'unix_path'].includes(anchor.kind))
+    .map((anchor) => anchor.value))]
+  if (pathAnchors.length !== 1) return null
+  const target = pathAnchors[0]
+  const argumentsObject: Record<string, unknown> = {}
+  const normalizedName = normalizedToolIdentifier(selectedName)
+  const readIntent = /\b(?:read|open|inspect|view|list|inventory|analy[sz]e)\b|(?:读取|打开|查看|列出|盘点|分析)/iu.test(prompt)
+  const unsafeIntent = /\b(?:write|edit|modify|patch|delete|remove|deploy|publish|ssh|login|connect|run|execute|build|test)\b|(?:写入|编辑|修改|删除|部署|发布|登录|连接|运行|执行|构建|测试)/iu.test(prompt)
+
+  if (local.capabilities.includes('filesystem_read')) {
+    const pathKey = declaredPropertyName(definition, ['path', 'file_path', 'filepath'])
+    const looksLikeFile = /[\\/][^\\/]+(?:\.[A-Za-z0-9_-]{1,16}|(?:README|LICENSE|Makefile))$/iu.test(target)
+    if (!pathKey || !looksLikeFile || !readIntent || unsafeIntent) return null
+    argumentsObject[pathKey] = target
+  } else if (local.capabilities.includes('filesystem_search') && !normalizedName.includes('grep')) {
+    const patternKey = declaredPropertyName(definition, ['pattern', 'glob', 'query', 'include'])
+    const pathKey = declaredPropertyName(definition, ['path', 'directory', 'folder', 'root', 'workdir', 'cwd'])
+    if (!patternKey || !readIntent || unsafeIntent) return null
+    const separator = target.includes('\\') ? '\\' : '/'
+    argumentsObject[patternKey] = pathKey ? '*' : `${target.replace(/[\\/]$/u, '')}${separator}*`
+    if (pathKey) argumentsObject[pathKey] = target
+  } else if (local.capabilities.includes('process_start')
+    && ['exec_command', 'powershell'].includes(normalizedName)) {
+    const commandKey = declaredPropertyName(definition, ['cmd', 'command'])
+    const workdirKey = declaredPropertyName(definition, ['workdir', 'cwd'])
+    const windowsTarget = /^[A-Za-z]:[\\/]|^\\\\/u.test(target)
+    if (!commandKey || !windowsTarget || !readIntent || unsafeIntent) return null
+    argumentsObject[commandKey] = boundedRepositoryCommand(target)
+    if (workdirKey) argumentsObject[workdirKey] = target
+  } else {
+    return null
+  }
+
+  // 合成调用：id 用时间戳（无需 crypto）与 type 固定为 'function' 适配 DetectedToolCall。
+  let candidate: DetectedToolCall = { id: `call_${Date.now()}`, type: 'function', name: selectedName, arguments: JSON.stringify(argumentsObject) }
+  // 目标归一/校验函数要求 ToolDef[]，而本函数签名按源保留 tools: unknown[]，故此处收窄类型。
+  const typedTools = (tools ?? []) as ToolDef[]
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(candidate.arguments)
+  } catch {
+    return null
+  }
+  const normalizedArguments = normalizeClientArgumentKeys(candidate.name, parsed, typedTools)
+  if (!normalizedArguments || typeof normalizedArguments !== 'object' || Array.isArray(normalizedArguments)) return null
+  candidate = { ...candidate, arguments: JSON.stringify(normalizedArguments) }
+  // 目标等价的信息完整性校验：与源路径相同的 schema 校验（required 模式下不会因 tool_choice 被剔除）。
+  const validated = validateDetectedToolCalls([candidate], typedTools, 'required')
+  if (validated.dropped !== 0 || validated.calls.length !== 1) return null
+  candidate = validated.calls[0]
+  // 目标架构下的等价护栏：canonicalToolArguments 指纹 + 已完成/进行中同名同参去重，
+  // 替代源 ToolLedger.calls/completed/pending 的指纹比对与 guardedFunctionCall 守卫。
+  const fingerprint = canonicalToolArguments(candidate.arguments)
+  if (ledgerHasCompleted(ledger, candidate.name, candidate.arguments)) return null
+  const duplicated = [...ledger.completed, ...ledger.pending].some((item) => (
+    item.name === candidate.name && canonicalToolArguments(item.arguments) === fingerprint
+  ))
+  if (duplicated) return null
+  return candidate
+}
+
+/* ==================== 长任务终态判定：未完成结局 / 续接审计 / 流缓冲（同原版 openai.ts） ==================== */
+
+/**
+ * 剥离代码块、行内代码、成对引号内容与引用行，得到"助手散文"。
+ * 用于把引用文档/代码里的将来时与真实承诺区分开（同原版 assistantProseWithoutQuotedData）。
+ */
+function assistantProseWithoutQuotedData(text: string): string {
+  return text
+    .replace(/```[\s\S]*?```/gu, ' ')
+    .replace(/`[^`\n]*`/gu, ' ')
+    .replace(/"[^"\n]*"|“[^”\n]*”|‘[^’\n]*’/gu, ' ')
+    .split(/\r?\n/u)
+    .filter((line) => !/^\s*>/u.test(line))
+    .join('\n')
+}
+
+/**
+ * 诚实的"未完成"状态报告：可以报告未完成的工作而不承诺动作（同原版 assistantReportsIncompleteOutcome）。
+ * 与 unresolvedAssistantCommitment 分开，使用户显式要求的暂停/状态汇报仍可正常终止。
+ */
+export function assistantReportsIncompleteOutcome(text: string): boolean {
+  const prose = assistantProseWithoutQuotedData(text)
+  return /(?:尚未|仍未|还未|并未|未能)[^。！？\n]{0,120}(?:完成|完毕|收尾|结束|执行|落实|验证|测试|部署|同步|提交|写入|修改|修复)|(?:还不能|尚不能|暂不能)[^。！？\n]{0,48}(?:完成|收尾|结束)|\b(?:still|not\s+yet|hasn['’]t|haven['’]t|remains?\s+to\s+be)[^.!?\n]{0,120}\b(?:complete|completed|done|finish(?:ed)?|deploy(?:ed)?|verify|verified|test(?:ed)?|submit(?:ted)?|write|written|fix(?:ed)?)\b/iu.test(prose)
+}
+
+/**
+ * 结构化本地结果 + 因果 USER 段存在时，是否应触发同模型续接审计（同原版 shouldAuditCallerLocalContinuation）。
+ * 权威来自"结构化本地结果 + USER 段"，不用有限动词表把关：隔离的 auto 路由按语义决定
+ * 是否需要再次动作或 NO_TOOL_REQUIRED 是否正确。
+ *
+ * 适配点：源用 callerLocalToolNames（返回名字数组）判定非空；目标等价物为 callerLocalToolCandidates。
+ */
+export function shouldAuditCallerLocalContinuation(input: FableLocalExecRefusalInput): boolean {
+  if (String(input.toolChoice ?? 'auto').toLowerCase() !== 'auto') return false
+  if (!input.freshCallerLocalResult || callerLocalToolCandidates(input.tools).length === 0) return false
+  if (input.prompt.lastIndexOf('[USER]\n') < 0) return false
+  const userRequest = callerLocalRecoveryUserRequest(input.prompt)
+  const explanatoryOnly = /^(?:\s*(?:please\s+)?(?:explain|describe|tell me (?:how|why)|what|why|how (?:does|can|would))\b|\s*(?:请)?(?:解释|说明|为什么|如何|怎么))/iu.test(userRequest)
+  return Boolean(userRequest.trim())
+    && !explanatoryOnly
+    && !callerRequestedStopOnFailure(userRequest)
+}
+
+/** 用户是否指向调用方本地目标（本地/工作区/路径等），且未指向托管目的地（同原版 callerLocalDestinationRequest） */
+function callerLocalDestinationRequest(prompt: string): boolean {
+  const request = callerLocalRecoveryUserRequest(prompt)
+  const localDestination = /(?:\b(?:local|workspace|working\s+(?:tree|directory)|current\s+(?:directory|folder)|repository|repo|project|file|folder|directory)\b|(?:本机|本地|工作区|当前目录|仓库|项目|文件|文件夹|目录))/iu.test(request)
+  const localPath = /(?:[A-Za-z]:\\|\\\\|(?:^|[\s'"`(])(?:\.\.\/|\.\/|\/(?:home|Users|workspace|workspaces|tmp|var\/tmp)\/))[^\n]{1,240}/u.test(request)
+  const hostedDestinationRequested = /(?:\b(?:teams|sharepoint|onedrive|hosted|cloud|upload|publish)\b|(?:Teams|SharePoint|OneDrive|托管|云端|上传|发布))/iu.test(request)
+  return (localDestination || localPath) && !hostedDestinationRequested
+}
+
+/**
+ * 是否为"目标在调用方工作区"的变更/校验请求（同原版 callerLocalMutationRequest）。
+ * 仅用于进行中与完成证据校验；语义工具选择不依赖它。
+ */
+function callerLocalMutationRequest(prompt: string): boolean {
+  if (!callerLocalDestinationRequest(prompt)) return false
+  const request = callerLocalRecoveryUserRequest(prompt)
+  const action = /(?:\b(?:edit|modify|write|patch|create|generate|scaffold|build|fix|verify|validate|check|read\s+back)\b|(?:编辑|修改|写入|打补丁|创建|生成|搭建|构建|修复|验证|检查|回读))/iu.test(request)
+  const failedOutcome = /(?:\b(?:missing|empty|not\s+(?:there|written|created|saved)|wasn['’]t\s+(?:written|created|saved))\b|(?:没有|为空|不存在|没(?:有)?(?:写入|创建|生成|保存|改)|未(?:写入|创建|生成|保存|修改)))/iu.test(request)
+  if (action || failedOutcome) return true
+  // 显式调用方路径 + 非解释性用户回合即已是任务边界：不依赖不断增长的动词表。
+  const explanatoryOnly = /^(?:\s*(?:please\s+)?(?:explain|describe|tell me (?:how|why)|what|why|how (?:does|can|would))\b|\s*(?:请)?(?:解释|说明|为什么|如何|怎么))/iu.test(request)
+  return Boolean(request.trim()) && !explanatoryOnly && !callerRequestedStopOnFailure(request)
+}
+
+/**
+ * 是否应缓冲工具流（同原版 shouldBufferToolStream）：
+ * 有工具且 tool_choice 非 none → 缓冲以便原子化校验；
+ * 无工具的兼容请求若要求创建/校验调用方工作区文件，也保持原子，供托管产物与完成证据护栏撤回不安全散文。
+ */
+export function shouldBufferToolStream(tools: unknown[] | undefined, toolChoice: unknown, prompt = ''): boolean {
+  if (Boolean(tools?.length) && String(toolChoice ?? 'auto').toLowerCase() !== 'none') return true
+  return Boolean(prompt.trim()) && callerLocalMutationRequest(prompt)
 }

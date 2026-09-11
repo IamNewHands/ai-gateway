@@ -2,7 +2,7 @@ import { describe, it, expect } from 'vitest'
 import { openAIChunkToResponsesSSE, responsesToOpenAI, buildResponsesFallbackCompleted } from './formats'
 
 // 构造一个响应转换器的累加器（与 proxy.ts handleResponsesSpecial 的用法一致）
-function acc() {
+function acc(): Parameters<typeof openAIChunkToResponsesSSE>[1] {
   return {
     responseId: '',
     model: '',

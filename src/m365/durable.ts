@@ -12,7 +12,7 @@
 import type { Env } from '../types'
 import { chatWithHandlers, classifyChatHubNotice, collapseExcessBlankLines, scrubNarration, mayFailOverChatHubFailure } from './chathub'
 import type { ChatHubAccount, ChatHubTool, ChatHubResult } from './chathub'
-import { flattenPromptMessages, modelToolRouterPrompt, parseModelToolDecision, fencedToolCalls, nativeToolCalls, compactToolResult, buildAgentLedger, canContinue, resolveMaxToolRounds, activeMessages, ledgerRouterContext, filterCompletedCalls, validateDetectedToolCalls, isToolRefusal, isSandboxHallucination, unresolvedAssistantCommitment } from './tools'
+import { flattenPromptMessages, modelToolRouterPrompt, parseModelToolDecision, fencedToolCalls, nativeToolCalls, compactToolResult, buildAgentLedger, canContinue, resolveMaxToolRounds, activeMessages, ledgerRouterContext, filterCompletedCalls, validateDetectedToolCalls, isToolRefusal, isSandboxHallucination, unresolvedAssistantCommitment, shouldRecoverCallerLocalExecRefusal, deterministicToolRouterRecovery, assistantReportsIncompleteOutcome, shouldAuditCallerLocalContinuation, hasFreshCallerLocalContinuationEvidence } from './tools'
 import { evaluateCompletionEvidence, selectCompletionEvidenceMessages } from './completion-evidence'
 import type { DetectedToolCall, AgentLedger, OaiMsgLite } from './tools'
 import { resolveSession, bindSession, systemPromptHash, convCacheLookup, convCacheStore } from './session'
@@ -309,13 +309,15 @@ export class M365Session {
     // 4) 工具路由：带 tools 且 toolChoice != none 时，先发起一次独立的路由对话，
     //    注入完整工具定义 + ledger 证据让模型显式决策是否调用工具（同原版 planningMode="router"）。
     //    路由对话是临时会话（started=true，不绑定持久会话）。
+    //    任务锚点提前到路由之前合并：确定性恢复需要唯一路径锚点来合成有界只读探查调用。
+    const mergedAnchors = await this.reconcileTaskAnchors(providerId, messages, payload.tenant)
     const choiceStr = String(toolChoice ?? 'auto').toLowerCase()
     let toolRouterFailed = false
     if (toolDefs.length > 0 && choiceStr !== 'none') {
       let route: Awaited<ReturnType<typeof this.tryToolRouter>> | null = null
       const routerAcquired = await acquireSlot(this.env, providerId, acc.oid)
       try {
-        route = await this.tryToolRouter(acc, answerPrompt, toolDefs, toolChoice, attachments, ledgerCtx, tone, deadline)
+        route = await this.tryToolRouter(acc, answerPrompt, toolDefs, toolChoice, attachments, ledgerCtx, tone, deadline, ledger, mergedAnchors)
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err)
         const detail = `model=${model} tools=${toolDefs.length} promptLen=${answerPrompt.length} err=${msg}`
@@ -345,9 +347,8 @@ export class M365Session {
 
     // 5) 执行主回答对话（持久会话），带账号级 failover：
     //    限流/鉴权失败且为"新会话"时自动切换到下一个健康账号重试；已绑定会话不切号（云端对话归属该账号）。
-    // 任务锚点：先合并本租户持久化锚点 + 新观测引用（写回 KV），再以受限预算注入主 prompt 前缀，
+    // 任务锚点：已在路由前合并（mergedAnchors 见上），此处直接以受限预算注入主 prompt 前缀，
     //    防止上下文裁剪后模型丢失跨轮任务目标（data-only 块，永不当作指令执行）。
-    const mergedAnchors = await this.reconcileTaskAnchors(providerId, messages, payload.tenant)
     const anchorRes = reserveTaskAnchorContext(mergedAnchors, answerPrompt.length, estimateTokens(answerPrompt))
     let mainPrompt = anchorRes.context ? anchorRes.context + '\n\n' + answerPrompt : answerPrompt
     if (ledger.completed.length > 0 || ledger.pending.length > 0) mainPrompt += '\n' + ledgerCtx
@@ -506,8 +507,29 @@ export class M365Session {
 
     // 主回答兜底 1：模型错误拒绝使用工具 或 产生沙箱幻觉时，发起纠正对话重试。
     // 两类独立检测：isToolRefusal 带长度守卫；isSandboxHallucination 无长度限制、用专门纠正词（同原版 toolloop.go）。
+    // 追加：caller-local 语义拒绝检测（移植 M365-Gateway isCallerLocalExecRefusal 家族）——
+    // 覆盖中/英/视觉多族的"调用方本地工具不可用"可用性矛盾，比词表版更严格且需用户因果意图成立。
     const answerText = result.text || streamedText
-    const refusalDetected = toolDefs.length > 0 && isToolRefusal(answerText)
+    const callerLocalRefusal = toolDefs.length > 0 && shouldRecoverCallerLocalExecRefusal({
+      tone,
+      toolChoice: mainChoice,
+      tools: mainTools,
+      responseText: answerText,
+      prompt: mainPrompt,
+    })
+    // 续接审计门禁（移植 M365-Gateway shouldAuditCallerLocalContinuation）：
+    // 当结构化历史证明本轮在续接一次本地工具运行时（hasFreshCallerLocalContinuationEvidence），
+    // 且存在因果 USER 段时，即使文本不是显式拒绝，也要求同模型复核是否仍需下一次动作。
+    const continuationAudit = shouldAuditCallerLocalContinuation({
+      tone,
+      toolChoice: mainChoice,
+      tools: mainTools,
+      responseText: answerText,
+      prompt: mainPrompt,
+      freshCallerLocalResult: hasFreshCallerLocalContinuationEvidence(mainTools, ledger),
+    })
+    const refusalDetected = toolDefs.length > 0
+      && (isToolRefusal(answerText) || callerLocalRefusal || continuationAudit)
     const sandboxDetected = toolDefs.length > 0 && isSandboxHallucination(answerText)
     if (refusalDetected || sandboxDetected) {
       const correction = sandboxDetected
@@ -555,7 +577,12 @@ export class M365Session {
     // 复核仍无调用则置位检查点终态（continuation_required），让客户端明确"任务未完成"。
     let continuationCalls: DetectedToolCall[] | undefined
     let checkpoint: ChatOutcome['checkpoint']
-    if (toolDefs.length > 0 && calls.length === 0 && unresolvedAssistantCommitment(finalText, false)) {
+    // 兜底 2.5 触发条件：承诺了行动未落地（unresolvedAssistantCommitment），
+    // 或诚实报告"未完成"却无工具调用（assistantReportsIncompleteOutcome，同源 openai.ts 的终态判定）。
+    const incompleteCommitment = toolDefs.length > 0 && calls.length === 0 && (
+      unresolvedAssistantCommitment(finalText, false) || assistantReportsIncompleteOutcome(finalText)
+    )
+    if (incompleteCommitment) {
       const continuationPrompt = mainPrompt +
         '\n\nCONTINUATION DECISION REVIEW: Your previous response promised an action but produced no tool call. ' +
         'A promise without a tool call leaves the task unfinished. Do not restate the plan or the promise. ' +
@@ -912,8 +939,16 @@ export class M365Session {
           // 流式结尾：模型错误拒绝使用工具 / 产生沙箱幻觉时，发起纠正对话重试。
           // 已流出的正文无法撤回，故纠正成功后把纠正文本作为追加 delta 推送，
           // 并用纠正文本作为工具解析与会话绑定的最终来源（与聚合路径 L352-372 一致）。
+          // 追加 caller-local 语义拒绝检测（同聚合路径）。
           const answerText = result.text || streamedText
-          const refusalDetected = toolDefs.length > 0 && isToolRefusal(answerText)
+          const callerLocalRefusal = toolDefs.length > 0 && shouldRecoverCallerLocalExecRefusal({
+            tone,
+            toolChoice: mainChoice,
+            tools: mainTools,
+            responseText: answerText,
+            prompt: mainPrompt,
+          })
+          const refusalDetected = toolDefs.length > 0 && (isToolRefusal(answerText) || callerLocalRefusal)
           const sandboxDetected = toolDefs.length > 0 && isSandboxHallucination(answerText)
           if (refusalDetected || sandboxDetected) {
             const correction = sandboxDetected
@@ -1231,6 +1266,8 @@ export class M365Session {
     ledgerCtx: string,
     tone: string,
     deadline: number,
+    ledger: AgentLedger,
+    taskAnchors: ReadonlyArray<TaskAnchor> = [],
   ): Promise<{ calls: DetectedToolCall[]; res: ChatHubResult; requiredFailed?: boolean } | null> {
     if (toolDefs.length === 0) return null
     const choiceStr = String(toolChoice ?? 'auto').toLowerCase()
@@ -1264,8 +1301,10 @@ export class M365Session {
           return { calls, res: repairRes }
         }
       } catch { /* fall through */ }
-      // 解析失败：非 required 时降级走主回答；required 时视为选择失败
+      // 解析失败：非 required 时降级走主回答；required 时先尝试确定性恢复，再视为选择失败
       if (choiceStr !== 'required') return null
+      const recovered = await this.deterministicRecovery(prompt, toolDefs, toolChoice, ledger, taskAnchors)
+      if (recovered) return { calls: [recovered], res: routeRes }
       return { calls: [], res: routeRes, requiredFailed: true }
     }
     // tool_choice='required' 时必须调用工具：路由判定无调用时强制重试（注入完整工具定义）
@@ -1279,10 +1318,28 @@ export class M365Session {
         const r3 = parseModelToolDecision(retryRes.text, toolDefs, toolChoice)
         if (r3.parsed && r3.calls.length > 0) return { calls: r3.calls, res: retryRes }
       } catch { /* fall through */ }
+      // 模型多次仍未给出必需工具调用：最后一道无网络确定性恢复（同原版 deterministicToolRouterRecovery）
+      const recovered = await this.deterministicRecovery(prompt, toolDefs, toolChoice, ledger, taskAnchors)
+      if (recovered) return { calls: [recovered], res: routeRes }
       return { calls: [], res: routeRes, requiredFailed: true }
     }
     if (calls.length === 0) return null
     return { calls, res: routeRes }
+  }
+
+  /** 确定性恢复包装：把 ChatHubTool 适配为 ToolDef 后调用移植的确定性恢复函数 */
+  private async deterministicRecovery(
+    prompt: string,
+    toolDefs: ChatHubTool[],
+    toolChoice: unknown,
+    ledger: AgentLedger,
+    taskAnchors: ReadonlyArray<TaskAnchor>,
+  ): Promise<DetectedToolCall | null> {
+    try {
+      return await deterministicToolRouterRecovery(prompt, toolDefs, toolChoice, ledger, taskAnchors)
+    } catch {
+      return null
+    }
   }
 }
 
