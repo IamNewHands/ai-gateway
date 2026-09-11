@@ -209,6 +209,30 @@ Select-String -Path "D:\GitHub_Clone\M365-Gateway\src\*.ts" `
 | `ResponseAliasSnapshot` / `startResponseBranch` / `discardResponseBranch` | 目标以 KV 别名"不可变分支点 + call_id 一次性消费"（`storage.ts`）内联实现，功能覆盖，无分支丢弃（靠 TTL 过期），架构不同 |
 | `RESPONSE_ALIAS_TTL_MS` / `MAX_RESPONSE_ALIASES_TOTAL` / `RESPONSE_ALIAS_REGISTRY_NAME` | 目标 `storage.ts` 有单位/命名适配版（`RESPONSE_ALIAS_TTL_SECONDS`/`MAX_RESPONSE_ALIASES_PER_SESSION`/KV 前缀），语义覆盖 |
 
+### 批次四复核与移植结论（已完成）
+
+**已移植（自包含、隐私安全的可复用基础设施）**：
+
+| 符号 | 目标落地 | 验证 |
+|---|---|---|
+| `RequestMetricTracker` / `IncrementalTokenEstimate` | 新建 `src/m365/request-metrics.ts`，逐行等价（终态幂等门、账号末次选择、增量 token 估算仅存分类计数器） | `request-metrics.test.ts` 18 例 |
+| `trackStreamingResponse` / `trackBufferedResponse` | 同上（自然 EOF / 源失败 / 下游取消三分；EOF 兜底被幂等门安全忽略） | 同上 |
+| `shouldRetainRequestObservation` / `SLOW_REQUEST_OBSERVATION_MS`(45s) / `SUCCESS_OBSERVATION_SAMPLE_DENOMINATOR`(64) | 同上（失败/取消/慢请求全保留 + 普通成功确定性 1/64 采样） | 同上 |
+
+> 该模块为纯逻辑，未强制绑定存储后端；后续可作为 sink 接入目标现有 `src/analytics/`（Cloudflare Analytics Engine），当前仅落地为可复用件与单测。
+
+**复核后判定为"目标架构不适用 / 已等价覆盖"，不重复移植**：
+
+| 符号 | 结论 |
+|---|---|
+| `r2-archive.ts` 整模块 / `R2ArchiveQueue` / `R2_ARCHIVE_MIN_SESSION_SIGNAL_BYTES` | 目标 `wrangler.toml` 无 `[[r2_buckets]]` 绑定、`types.ts` 无 R2 绑定；目标可观测走 Analytics Engine。引入需新增云资源，超出本次"适配目标"范围，**不适用** |
+| `verifyAccountMigration` / `MigrationRequestError` / `ACCOUNT_MIGRATION_PATH` / `MAX_MIGRATION_ACCOUNTS` / `MAX_MIGRATION_BODY_BYTES` | 强依赖源特有部署模型与 Env（`MIGRATION_ENABLED`/`MIGRATION_CANDIDATE_TAG`/`MIGRATION_SIGNING_KEY`/`CF_VERSION_METADATA`/`MAX_ACCOUNTS`/`AccountEgress`），目标全部不存在；该 API 用途为"版本切换时账号迁移"，目标账号经 KV/admin 管理，**不适用** |
+| `runCloudCleanup` / `CloudCleanupResult` / `AccountCleanupDetail` | 目标 `auto-cleanup.ts`（`autoCleanupProvider`/`autoCleanupAll`）+ `cloud-api.ts cleanupCloudConversations` + `conversation-manager.ts` + `index.ts` cron/admin 触发，三层解耦已等价覆盖，仅命名/返回类型不同 |
+| `cleanupAccountCloudConversations` | 目标 `cleanupCloudConversations`（`cloud-api.ts:161`），批次零已确认改名 |
+| `GatewayStats` / `RequestMetricRecord` | 目标以 Analytics Engine `UsageMetrics` 表达统计，数据模型不同 |
+| `functionToolDefinition` | ✅ 已存在于 `tools.ts:1426`（未导出，低优先，无需移植） |
+| `DiagnosticInput` / `DiagnosticRecord` | 目标 `writeLog`/admin 诊断体系覆盖 |
+
 ### 未移植 ❌（按批次）
 
 #### 批次一：长任务稳定性（✅ 已完成）
@@ -232,16 +256,9 @@ Select-String -Path "D:\GitHub_Clone\M365-Gateway\src\*.ts" `
 
 > 本批次：字节预算/检查点 hydrate/推理投递已落地；流取消与路由采纳经复核判定为目标架构已等价覆盖，不重复移植。
 
-#### 批次四：运维/可观测
+#### 批次四：运维/可观测（✅ 已完成，见上方"批次四复核与移植结论"）
 
-| 符号 | 说明 |
-|---|---|
-| `r2-archive.ts` 整模块 | R2 会话归档（outbox/重试/脱敏） |
-| `RequestMetricTracker` / `trackStreamingResponse` / `trackBufferedResponse` | 请求指标追踪 |
-| `SLOW_REQUEST_OBSERVATION_MS` / `shouldRetainRequestObservation` | 慢请求保留 |
-| `verifyAccountMigration` / `MigrationRequestError` / `ACCOUNT_MIGRATION_PATH` | 账号迁移 API |
-| `runCloudCleanup` / `CloudCleanupResult` | 云端清理编排 |
-| `functionToolDefinition` | 工具定义归一（目标有等价物，低优先） |
+> 本批次：自包含的隐私安全指标追踪已移植；其余项经复核判定依赖目标不存在的云资源/部署模型，不适用，不重复移植。
 
 ---
 
@@ -253,10 +270,11 @@ Select-String -Path "D:\GitHub_Clone\M365-Gateway\src\*.ts" `
 | 批次一 | 长任务稳定性：工具路由确定性恢复 + Fable 拒绝恢复 + 续接审计 + 未完成结局 | 高 | ✅ 已完成 |
 | 批次二 | 安全护栏：请求体限制 + 有界负载 + 配额判定 + 重连护栏 | 高 | ✅ 已完成 |
 | 批次三 | 会话模型：可移植状态 + 分支隔离 + 检查点 hydrate | 中 | ✅ 已完成 |
-| 批次四 | 运维：请求指标追踪 + R2 归档 + 账号迁移 API | 中 | 🔄 进行中 |
+| 批次四 | 运维：请求指标追踪 + R2 归档 + 账号迁移 API | 中 | ✅ 已完成 |
 
 **每批次统一验收**：`npx tsc --noEmit` + `npx vitest run` 全量通过 + 新增针对性测试。
 
 **进度快照**：批次零/一完成时全量回归 = 41 文件 / 559 测试全部通过，tsc 零错误。
 批次二完成时全量回归 = 43 文件 / 590 测试全部通过，tsc 零错误（新增 `src/request-body.test.ts` 12 项、`src/m365/payload-guardrails.test.ts` 19 项）。
 批次三完成时全量回归 = 44 文件 / 618 测试全部通过，tsc 零错误（新增 `src/m365/portable-session.test.ts` 17 项，另在 `session-state.test.ts`/`public-reasoning.test.ts` 各增 6/4 项）。
+批次四完成时全量回归 = 45 文件 / 636 测试全部通过，tsc 零错误（新增 `src/m365/request-metrics.test.ts` 18 项）。**四个批次全部完成。**
