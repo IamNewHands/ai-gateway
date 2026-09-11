@@ -129,10 +129,14 @@ export async function testM365Model(
   modelId: string
 ): Promise<{ success: boolean; message: string; statusCode?: number }> {
   try {
+    // Connectivity probes must not share the deterministic "hi" session shard.
+    // A unique explicit ID isolates each probe from active or stale leases.
+    const probeSessionId = `model-test-${crypto.randomUUID()}`
     const resp = await proxyM365ChatRequest(
       env,
       provider,
-      { model: modelId, messages: [{ role: 'user', content: 'hi' }], stream: false }
+      { model: modelId, messages: [{ role: 'user', content: 'hi' }], stream: false },
+      { explicitSessionId: probeSessionId }
     )
     if (resp.ok) {
       return { success: true, message: '连接成功', statusCode: resp.status }
