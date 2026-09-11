@@ -110,6 +110,58 @@ describe('M365 Durable Object SQL session store', () => {
     })
   })
 
+  it('heartbeats an account lock only for its exact session and lease owner', () => {
+    const sql = new MemorySqlStorage()
+    const store = new M365SessionStore(({ sql, transactionSync: sql.transactionSync.bind(sql) } as unknown as DurableObjectStorage))
+
+    expect(store.acquireAccountLock('account-1', 'session-owner', 'lease-owner', 100, 50)).toEqual({
+      ok: true,
+      expiresAt: 150,
+    })
+    expect(store.heartbeatAccountLock('account-1', 'session-owner', 'lease-owner', 120, 50)).toEqual({
+      ok: true,
+      expiresAt: 170,
+    })
+    expect(store.heartbeatAccountLock('account-1', 'session-other', 'lease-owner', 130, 50)).toEqual({
+      ok: false,
+      reason: 'lease_conflict',
+    })
+    expect(store.heartbeatAccountLock('account-1', 'session-owner', 'lease-other', 130, 50)).toEqual({
+      ok: false,
+      reason: 'lease_conflict',
+    })
+    expect(store.heartbeatAccountLock('account-2', 'session-owner', 'lease-owner', 130, 50)).toEqual({
+      ok: false,
+      reason: 'lease_conflict',
+    })
+  })
+
+  it('migrates lease account identity only for the exact current owner', () => {
+    const sql = new MemorySqlStorage()
+    const store = new M365SessionStore(({ sql, transactionSync: sql.transactionSync.bind(sql) } as unknown as DurableObjectStorage))
+    const snapshot = store.loadOrCreate('session-migrate')
+
+    expect(store.acquireLease({
+      sessionId: snapshot.sessionId,
+      accountId: 'account-1',
+      token: 'lease-owner',
+      expectedGeneration: snapshot.generation,
+      now: 100,
+      ttlMs: 50,
+    })).toEqual({ ok: true, expiresAt: 150 })
+
+    expect(store.migrateLeaseAccount('session-migrate', 'lease-owner', 'account-1', 'account-2')).toEqual({ ok: true })
+    expect(store.loadOrCreate('session-migrate').lease?.accountId).toBe('account-2')
+    expect(store.migrateLeaseAccount('session-migrate', 'lease-owner', 'account-1', 'account-3')).toEqual({
+      ok: false,
+      reason: 'lease_conflict',
+    })
+    expect(store.migrateLeaseAccount('session-migrate', 'wrong-lease', 'account-2', 'account-3')).toEqual({
+      ok: false,
+      reason: 'lease_conflict',
+    })
+  })
+
   it('recovers only the committed SQL snapshot through a fresh storage instance', () => {
     const state = createFaithfulSqlState()
     const firstSql = new FaithfulSqlStorage(state)

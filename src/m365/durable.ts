@@ -219,6 +219,36 @@ export class M365Session {
 
     let lifecycleTransferredToStream = false
     let lockedAccountId = acc.oid
+    const lifecycleHeartbeat = {
+      timer: undefined as ReturnType<typeof setInterval> | undefined,
+      failed: undefined as string | undefined,
+    }
+    const stopLifecycleHeartbeat = () => {
+      if (lifecycleHeartbeat.timer) {
+        clearInterval(lifecycleHeartbeat.timer)
+        lifecycleHeartbeat.timer = undefined
+      }
+    }
+    lifecycleHeartbeat.timer = setInterval(() => {
+      const now = Date.now()
+      const leaseHeartbeat = this.sessionStore.heartbeatLease(snapshot.sessionId, leaseToken, now, leaseTtlMs)
+      if (!leaseHeartbeat.ok) {
+        lifecycleHeartbeat.failed = leaseHeartbeat.reason
+        stopLifecycleHeartbeat()
+        return
+      }
+      const accountHeartbeat = this.sessionStore.heartbeatAccountLock(
+        lockedAccountId,
+        snapshot.sessionId,
+        leaseToken,
+        now,
+        leaseTtlMs,
+      )
+      if (!accountHeartbeat.ok) {
+        lifecycleHeartbeat.failed = accountHeartbeat.reason
+        stopLifecycleHeartbeat()
+      }
+    }, Math.max(1000, Math.floor(leaseTtlMs / 3)))
     try {
     // convCache 复用层：新会话且无工具时，命中 account+model+systemPromptHash+tenant 则沿用云端对话（同原版第三层复用，租户隔离对齐 #57）
     const sysHash = model ? systemPromptHash(messages as never[]) : ''
@@ -299,7 +329,7 @@ export class M365Session {
         providerId, model, tone, ordered, resolved,
         mainPrompt, attachments, mainTools, mainChoice,
         toolDefs, toolChoice, ledger, messages, ctx, requestSignal, mcpServerUrl, sysHash,
-        snapshot, expectedGeneration, leaseToken,
+        snapshot, expectedGeneration, leaseToken, lifecycleHeartbeat, stopLifecycleHeartbeat,
       })
     }
 
@@ -332,6 +362,16 @@ export class M365Session {
         )
         if (!nextAccountLock.ok) {
           return cjson({ error: { message: nextAccountLock.reason, type: nextAccountLock.reason } }, 409)
+        }
+        const migrated = this.sessionStore.migrateLeaseAccount(
+          snapshot.sessionId,
+          leaseToken,
+          lockedAccountId,
+          usedAcc.oid,
+        )
+        if (!migrated.ok) {
+          this.sessionStore.releaseAccountLock(usedAcc.oid, snapshot.sessionId, leaseToken)
+          return cjson({ error: { message: migrated.reason, type: migrated.reason } }, 409)
         }
         this.sessionStore.releaseAccountLock(lockedAccountId, snapshot.sessionId, leaseToken)
         lockedAccountId = usedAcc.oid
@@ -564,6 +604,9 @@ export class M365Session {
       ],
     }
 
+    if (lifecycleHeartbeat.failed) {
+      return cjson({ error: { message: lifecycleHeartbeat.failed, type: lifecycleHeartbeat.failed } }, 409)
+    }
     const commit = this.sessionStore.commitWithLease({
       snapshot,
       expectedGeneration,
@@ -577,6 +620,7 @@ export class M365Session {
     return buildJSON(id, model, outcome)
     } finally {
       if (!lifecycleTransferredToStream) {
+        stopLifecycleHeartbeat()
         this.sessionStore.releaseAccountLock(lockedAccountId, snapshot.sessionId, leaseToken)
         this.sessionStore.releaseLease(snapshot.sessionId, leaseToken)
       }
@@ -609,8 +653,13 @@ export class M365Session {
     snapshot: SessionSnapshotV1
     expectedGeneration: number
     leaseToken: string
+    lifecycleHeartbeat: {
+      timer: ReturnType<typeof setInterval> | undefined
+      failed: string | undefined
+    }
+    stopLifecycleHeartbeat: () => void
   }): Promise<Response> {
-    const { providerId, model, tone, ordered, resolved, mainPrompt, attachments, mainTools, mainChoice, toolDefs, toolChoice, ledger, messages, ctx, requestSignal, mcpServerUrl, sysHash, snapshot, expectedGeneration, leaseToken } = a
+    const { providerId, model, tone, ordered, resolved, mainPrompt, attachments, mainTools, mainChoice, toolDefs, toolChoice, ledger, messages, ctx, requestSignal, mcpServerUrl, sysHash, snapshot, expectedGeneration, leaseToken, lifecycleHeartbeat, stopLifecycleHeartbeat } = a
     const encoder = new TextEncoder()
     const aborter = new AbortController()
     // 客户端断连（requestSignal）或响应体被取消（cancel）都中止上游 ChatHub
@@ -634,7 +683,7 @@ export class M365Session {
     let streamState: 'complete' | 'error' | 'canceled' = 'complete'
     let closed = false
     // 恰到一次收尾：心跳 interval 与 controller.close() 只执行一次
-    let heartbeat: ReturnType<typeof setInterval> | undefined
+    let sseHeartbeat: ReturnType<typeof setInterval> | undefined
 
     const stream = new ReadableStream<Uint8Array>({
       start: async (controller) => {
@@ -678,10 +727,10 @@ export class M365Session {
         const closeStream = () => {
           if (closed) return
           closed = true
-          if (heartbeat) { clearInterval(heartbeat); heartbeat = undefined }
+          if (sseHeartbeat) { clearInterval(sseHeartbeat); sseHeartbeat = undefined }
           try { controller.close() } catch { /* 已关闭 */ }
         }
-        heartbeat = setInterval(() => {
+        sseHeartbeat = setInterval(() => {
           try { controller.enqueue(encoder.encode(': keep-alive\n\n')) } catch { /* 客户端已断开，交由 finally 收尾 */ }
         }, 5000)
         try {
@@ -697,6 +746,16 @@ export class M365Session {
                 leaseTtlMs,
               )
               if (!nextAccountLock.ok) throw new Error(nextAccountLock.reason)
+              const migrated = this.sessionStore.migrateLeaseAccount(
+                snapshot.sessionId,
+                leaseToken,
+                lockedAccountId,
+                usedAcc.oid,
+              )
+              if (!migrated.ok) {
+                this.sessionStore.releaseAccountLock(usedAcc.oid, snapshot.sessionId, leaseToken)
+                throw new Error(migrated.reason)
+              }
               this.sessionStore.releaseAccountLock(lockedAccountId, snapshot.sessionId, leaseToken)
               lockedAccountId = usedAcc.oid
             }
@@ -860,6 +919,7 @@ export class M365Session {
               { role: 'assistant', content: finalText },
             ],
           }
+          if (lifecycleHeartbeat.failed) throw new Error(lifecycleHeartbeat.failed)
           const commit = this.sessionStore.commitWithLease({
             snapshot,
             expectedGeneration,
@@ -897,6 +957,7 @@ export class M365Session {
           push(usageSSE(0, 0, 'stop', ''))
           push('data: [DONE]\n\n')
         } finally {
+          stopLifecycleHeartbeat()
           this.sessionStore.releaseAccountLock(lockedAccountId, snapshot.sessionId, leaseToken)
           this.sessionStore.releaseLease(snapshot.sessionId, leaseToken)
           // 流式终态三分诊断：canceled 说明客户端主动掐断（中止上游成功），其余为自然 EOF / 上游失败

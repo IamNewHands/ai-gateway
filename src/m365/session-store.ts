@@ -284,6 +284,27 @@ export class M365SessionStore {
     return { ok: true, expiresAt }
   }
 
+  migrateLeaseAccount(
+    sessionId: string,
+    token: string,
+    currentAccountId: string,
+    nextAccountId: string,
+  ): ReleaseResult {
+    const cursor = this.sql.exec(
+      `UPDATE m365_sessions
+       SET lease_account_id = ?
+       WHERE session_id = ? AND lease_token = ? AND lease_account_id = ?`,
+      nextAccountId,
+      sessionId,
+      token,
+      currentAccountId,
+    )
+    if (cursor.rowsWritten !== 1) {
+      return { ok: false, reason: 'lease_conflict' }
+    }
+    return { ok: true }
+  }
+
   releaseLease(sessionId: string, token: string): ReleaseResult {
     const snapshot = this.loadOrCreate(sessionId)
     if (!snapshot.lease || snapshot.lease.token !== token) {
@@ -343,6 +364,29 @@ export class M365SessionStore {
       ownerSessionId: rows[0].session_id,
       expiresAt: rows[0].expires_at,
     }
+  }
+
+  heartbeatAccountLock(
+    accountId: string,
+    sessionId: string,
+    token: string,
+    now: number,
+    ttlMs: number,
+  ): LeaseResult {
+    const expiresAt = now + ttlMs
+    const cursor = this.sql.exec(
+      `UPDATE m365_account_locks
+       SET expires_at = ?
+       WHERE account_id = ? AND session_id = ? AND lease_token = ?`,
+      expiresAt,
+      accountId,
+      sessionId,
+      token,
+    )
+    if (cursor.rowsWritten !== 1) {
+      return { ok: false, reason: 'lease_conflict' }
+    }
+    return { ok: true, expiresAt }
   }
 
   releaseAccountLock(accountId: string, sessionId: string, token: string): ReleaseResult {

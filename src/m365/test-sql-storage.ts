@@ -177,6 +177,17 @@ export class FaithfulSqlStorage {
       return cursor<T>([], 1)
     }
 
+    if (/^UPDATE m365_sessions SET lease_account_id = \? WHERE session_id = \? AND lease_token = \? AND lease_account_id = \?$/i.test(sql)) {
+      const row = this.state.sessions.get(String(bindings[1]))
+      if (
+        !row
+        || row.lease_token !== String(bindings[2])
+        || row.lease_account_id !== String(bindings[3])
+      ) return cursor<T>([], 0)
+      row.lease_account_id = String(bindings[0])
+      return cursor<T>([], 1)
+    }
+
     if (/^UPDATE m365_sessions SET lease_token = NULL, lease_account_id = NULL, lease_expires_at = NULL WHERE session_id = \? AND lease_token = \?$/i.test(sql)) {
       const row = this.state.sessions.get(String(bindings[0]))
       if (!row || row.lease_token !== String(bindings[1])) return cursor<T>([], 0)
@@ -205,6 +216,17 @@ export class FaithfulSqlStorage {
     if (/^SELECT session_id, expires_at FROM m365_account_locks WHERE account_id = \?$/i.test(sql)) {
       const row = this.state.accountLocks.get(String(bindings[0]))
       return cursor<T>(row ? [{ session_id: row.session_id, expires_at: row.expires_at } as unknown as T] : [])
+    }
+
+    if (/^UPDATE m365_account_locks SET expires_at = \? WHERE account_id = \? AND session_id = \? AND lease_token = \?$/i.test(sql)) {
+      const row = this.state.accountLocks.get(String(bindings[1]))
+      if (
+        !row
+        || row.session_id !== String(bindings[2])
+        || row.lease_token !== String(bindings[3])
+      ) return cursor<T>([], 0)
+      row.expires_at = Number(bindings[0])
+      return cursor<T>([], 1)
     }
 
     if (/^DELETE FROM m365_account_locks WHERE account_id = \? AND session_id = \? AND lease_token = \?$/i.test(sql)) {
