@@ -7,6 +7,8 @@ import {
   normalizeSessionSnapshot,
   encodeEncryptedSessionSnapshot,
   decodeEncryptedSessionSnapshot,
+  shouldRestoreChatPortableCheckpoint,
+  hydrateSessionSnapshotFromCheckpoint,
 } from './session-state'
 import { randomToken } from './crypto'
 import {
@@ -153,6 +155,46 @@ describe('ToolLedger persisted snapshot', () => {
 
     const decrypted = await decodeEncryptedSessionSnapshot(encrypted, [key1, key2])
     expect(decrypted).toEqual(snapshot)
+  })
+})
+
+describe('M365 会话检查点恢复（移植自 M365-Gateway shouldRestoreChatPortableCheckpoint/hydrateLeaseFromCompaction）', () => {
+  it('满足全部条件时才允许从可移植检查点恢复', () => {
+    expect(shouldRestoreChatPortableCheckpoint(false, true, true, [], 1)).toBe(true)
+  })
+
+  it('会话已开始/账号未锁定/无尾部/无完成证据时不恢复', () => {
+    expect(shouldRestoreChatPortableCheckpoint(true, true, true, [], 1)).toBe(false)
+    expect(shouldRestoreChatPortableCheckpoint(false, false, true, [], 1)).toBe(false)
+    expect(shouldRestoreChatPortableCheckpoint(false, true, false, [], 1)).toBe(false)
+    expect(shouldRestoreChatPortableCheckpoint(false, true, true, [], 0)).toBe(false)
+  })
+
+  it('当前请求携带 user 消息时不恢复（避免覆盖新指令）', () => {
+    expect(shouldRestoreChatPortableCheckpoint(false, true, true, [{ role: 'user' }], 1)).toBe(false)
+    expect(shouldRestoreChatPortableCheckpoint(false, true, true, [{ role: 'assistant' }], 1)).toBe(true)
+  })
+
+  it('空/全新快照被检查点完整填充', () => {
+    const checkpoint = { reason: 'compaction', continuationToken: 'tok', createdAt: 1 }
+    const empty = createEmptySessionSnapshot('s-new')
+    const result = hydrateSessionSnapshotFromCheckpoint(empty, checkpoint)
+    expect(result.checkpoint).toEqual(checkpoint)
+  })
+
+  it('已有持久化状态时绝不被更旧胶囊回滚', () => {
+    const checkpoint = { reason: 'old', continuationToken: 'old', createdAt: 1 }
+    const snapshot = createEmptySessionSnapshot('s-live')
+    snapshot.generation = 5
+    snapshot.taskAnchors = [{ kind: 'unix_path', value: '/work' }]
+    const result = hydrateSessionSnapshotFromCheckpoint(snapshot, checkpoint)
+    expect(result.checkpoint).toBeNull()
+    expect(result.taskAnchors).toEqual([{ kind: 'unix_path', value: '/work' }])
+  })
+
+  it('checkpoint 为 null 时原样返回', () => {
+    const snapshot = createEmptySessionSnapshot('s-null')
+    expect(hydrateSessionSnapshotFromCheckpoint(snapshot, null)).toBe(snapshot)
   })
 })
 

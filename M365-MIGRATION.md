@@ -181,9 +181,37 @@ Select-String -Path "D:\GitHub_Clone\M365-Gateway\src\*.ts" `
 | `normalizeClientFunctionCall` | 目标 `normalizeClientArgumentKeys`（键归一）+ `validateDetectedToolCalls`（schema 校验），语义等价 |
 | `parseToolDecisionAnswer` / `isOrdinaryToolDecisionAnswer` / `parseFunctionCall` | 属 AGT 决策协议/超大函数解析，目标走 `parseModelToolDecision`/`fencedToolCalls`/`nativeToolCalls` 路线，设计差异，不做 1:1 搬运 |
 
+### 批次三复核与移植结论（已完成）
+
+**已移植并接线**：
+
+| 符号 | 目标落地 | 验证 |
+|---|---|---|
+| `boundedUtf8Suffix` / `boundedPortableProtocolSuffix` / `boundPortableSessionState` / `portableSessionByteLength` / `PortableSessionState` | 新建 `src/m365/portable-session.ts`，逐行等价（UTF-8 码点安全后缀 + 成帧回合裁剪 + 超大回合紧凑检查点） | `portable-session.test.ts` 17 例 |
+| `MAX_CHAT_SESSION_STATE_BYTES`(192KiB) / `MAX_PORTABLE_SESSION_BYTES`(64KiB) / `MAX_CALLER_TOOLS_SNAPSHOT_BYTES`(64KiB) | 同上（另含 `MAX_TOOL_LEDGER_SNAPSHOT_BYTES`） | 同上 |
+| 协议尾部字节上界接线 | `session-state.ts` 新增 `boundProtocolTailItems`：`normalizeProtocolTail` 内按字节预算从尾部保留完整条目；因 `commitWithLease → cloneSnapshot → encodeSessionSnapshot → normalizeSessionSnapshot` 全覆盖，两条写入路径（`durable.ts:723`/`1059`）自动受保护 | 新增守卫逻辑 |
+| 账本快照字节上界 | `session-state.ts normalizeToolLedger`：超 64 KiB 抛 `TOOL_LEDGER_SNAPSHOT_TOO_LARGE`（同源 `validateToolLedgerSnapshot`） | 同上 |
+| `shouldRestoreChatPortableCheckpoint` | `session-state.ts`；**适配点**：源入参 `(started, accountLocked, portableTail, messages, completedToolResults)`，目标改为 `(started, accountLocked, protocolTailPresent, messages, completedToolResults)`（目标无字符串 `portableProtocolTail`） | `session-state.test.ts` 新增 6 例 |
+| `hydrateLeaseFromCompaction` | `session-state.ts hydrateSessionSnapshotFromCheckpoint`；**适配点**：源按 `ChatLease` 字段填充，目标按 `SessionSnapshotV1`；**核心"合并不回滚"原则保留**：已有持久化状态时绝不被更旧胶囊回滚 | 同上 |
+| `chatDeliversPublicReasoning` / `chatReasoningContent` | `public-reasoning.ts`；**已接线** `durable.ts` chat 路径：`summary:"none"` 抑制推理，否则优先用去重+有界的公开摘要，缺失回退原始 reasoning 流 | `public-reasoning.test.ts` 新增 4 例 |
+
+**复核后判定为"目标已等价实现/架构不同"，不重复移植**：
+
+| 符号 | 结论 |
+|---|---|
+| `PortableSessionState`（类型） | 目标 `SessionSnapshotV1` 等价，且已含 `toolLedger`/`lease`/`pendingCall`/`checkpoint`，更完整；本批次仅补字节预算维度 |
+| `validateToolLedgerSnapshot` | 目标 `restoreToolLedgerSnapshot`（`tool-ledger.ts:117`）校验强度充分（callId 唯一性/pending-completed 互斥/证据引用有效性）；本批次仅补字节上界 |
+| `ChatTurnCheckpoint` / `ChatCompactionCheckpoint` | 目标 `CompactionCheckpoint`（`session-state.ts:36`）语义覆盖 |
+| `compactRetainedMessages` / `compactPortableTaskTail` | 目标 `context-budget.ts slidingWindow`（token 预算）+ `session.ts cloneMessages` 原子边界裁剪，架构不同（token 预算 vs 字符串压缩） |
+| `createStreamCancellation` | 目标以 `durable.ts:793` 内联 `AbortController` + `upstream-lifecycle.ts` 闸门实现等价取消/释放，无独立抽象；不重复移植 |
+| `adoptToolRouterResult` / `isolatedToolRouterCoordinates` | 目标 `tryToolRouter`（`durable.ts:1260`）返回路由结果后由调用方合并，且路由用独立临时会话（`started:true`）；语义等价，无独立 adopt 步骤 |
+| `SupersededUpstreamRun` / `SupersededChatLease` | 目标用 generation + lease_token 冲突拒绝（`session-store.ts` commitWithLease），非"顶替"语义 |
+| `ResponseAliasSnapshot` / `startResponseBranch` / `discardResponseBranch` | 目标以 KV 别名"不可变分支点 + call_id 一次性消费"（`storage.ts`）内联实现，功能覆盖，无分支丢弃（靠 TTL 过期），架构不同 |
+| `RESPONSE_ALIAS_TTL_MS` / `MAX_RESPONSE_ALIASES_TOTAL` / `RESPONSE_ALIAS_REGISTRY_NAME` | 目标 `storage.ts` 有单位/命名适配版（`RESPONSE_ALIAS_TTL_SECONDS`/`MAX_RESPONSE_ALIASES_PER_SESSION`/KV 前缀），语义覆盖 |
+
 ### 未移植 ❌（按批次）
 
-#### 批次一：长任务稳定性（✅ 已完成，见上方"批次一复核与移植结论"）
+#### 批次一：长任务稳定性（✅ 已完成）
 
 | 符号 | 说明 |
 |---|---|
@@ -191,31 +219,18 @@ Select-String -Path "D:\GitHub_Clone\M365-Gateway\src\*.ts" `
 | `shouldAuditCallerLocalContinuation` | ✅ 已移植并接线 |
 | `assistantReportsIncompleteOutcome` | ✅ 已移植并接线 |
 | `shouldBufferToolStream` | ✅ 已移植（架构等价） |
-| `createStreamCancellation` | 归入批次三评估 |
+| `createStreamCancellation` | ✅ 批次三复核：目标内联等价 |
 | `boundPublicExecFunctionCall` | ✅ 语义等价（`normalizeClientArgumentKeys` 归一 + `validateDetectedToolCalls` 校验） |
-| `adoptToolRouterResult` / `isolatedToolRouterCoordinates` | 归入批次三评估 |
-| `chatDeliversPublicReasoning` / `chatReasoningContent` | 归入批次三评估 |
+| `adoptToolRouterResult` / `isolatedToolRouterCoordinates` | ✅ 批次三复核：目标等价 |
+| `chatDeliversPublicReasoning` / `chatReasoningContent` | ✅ 批次三已移植并接线 |
 
 #### 批次二：安全护栏（✅ 已完成，见上方"批次二复核与移植结论"）
 
 > 本批次全部项已落地或复核为等价实现，无遗留。
 
-#### 批次三：会话模型
+#### 批次三：会话模型（✅ 已完成，见上方"批次三复核与移植结论"）
 
-| 符号 | 说明 |
-|---|---|
-| `PortableSessionState` / `boundPortableSessionState` | 可移植会话状态 + 字节预算 |
-| `boundedUtf8Suffix` / `boundedPortableProtocolSuffix` / `portableSessionByteLength` | 后缀裁剪工具 |
-| `ChatSession.startResponseBranch` / `discardResponseBranch` / `seed` | 别名分支隔离 |
-| `ResponseAliasSnapshot` | 别名快照（含可移植协议状态） |
-| `MAX_CHAT_SESSION_STATE_BYTES` / `MAX_PORTABLE_SESSION_BYTES` / `MAX_CALLER_TOOLS_SNAPSHOT_BYTES` | 容量上限 |
-| `RESPONSE_ALIAS_REGISTRY_NAME` | 跨对象注册表 |
-| `validateToolLedgerSnapshot` | 账本快照校验 |
-| `ChatTurnCheckpoint` / `SupersededUpstreamRun` / `SupersededChatLease` | 检查点/被顶替运行 |
-| `hydrateLeaseFromCompaction` | 从压缩胶囊恢复租约 |
-| `shouldRestoreChatPortableCheckpoint` | 可移植检查点恢复 |
-| `compactRetainedMessages` / `compactPortableTaskTail` | 压缩保留 |
-| `shouldRestorePortableTaskFollowup` | 可移植任务续接 |
+> 本批次：字节预算/检查点 hydrate/推理投递已落地；流取消与路由采纳经复核判定为目标架构已等价覆盖，不重复移植。
 
 #### 批次四：运维/可观测
 
@@ -237,10 +252,11 @@ Select-String -Path "D:\GitHub_Clone\M365-Gateway\src\*.ts" `
 | 批次零 | 复核 🔍 项，修复现有实现（改名/内联/有bug/未接线） | 高 | ✅ 已完成 |
 | 批次一 | 长任务稳定性：工具路由确定性恢复 + Fable 拒绝恢复 + 续接审计 + 未完成结局 | 高 | ✅ 已完成 |
 | 批次二 | 安全护栏：请求体限制 + 有界负载 + 配额判定 + 重连护栏 | 高 | ✅ 已完成 |
-| 批次三 | 会话模型：可移植状态 + 分支隔离 + 检查点 hydrate | 中 | 🔄 进行中 |
-| 批次四 | 运维：请求指标追踪 + R2 归档 + 账号迁移 API | 中 | ⬜ 待开始 |
+| 批次三 | 会话模型：可移植状态 + 分支隔离 + 检查点 hydrate | 中 | ✅ 已完成 |
+| 批次四 | 运维：请求指标追踪 + R2 归档 + 账号迁移 API | 中 | 🔄 进行中 |
 
 **每批次统一验收**：`npx tsc --noEmit` + `npx vitest run` 全量通过 + 新增针对性测试。
 
 **进度快照**：批次零/一完成时全量回归 = 41 文件 / 559 测试全部通过，tsc 零错误。
 批次二完成时全量回归 = 43 文件 / 590 测试全部通过，tsc 零错误（新增 `src/request-body.test.ts` 12 项、`src/m365/payload-guardrails.test.ts` 19 项）。
+批次三完成时全量回归 = 44 文件 / 618 测试全部通过，tsc 零错误（新增 `src/m365/portable-session.test.ts` 17 项，另在 `session-state.test.ts`/`public-reasoning.test.ts` 各增 6/4 项）。

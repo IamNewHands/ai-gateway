@@ -4,6 +4,8 @@ import {
   appendPublicReasoning,
   publicReasoningEvents,
   extractPublicReasoningSummaries,
+  chatDeliversPublicReasoning,
+  chatReasoningContent,
 } from './public-reasoning'
 
 describe('M365 public reasoning summaries', () => {
@@ -98,5 +100,40 @@ describe('M365 public reasoning summaries', () => {
 
     const extracted = extractPublicReasoningSummaries(events)
     expect(extracted).toEqual(['Final summary revised', 'Second summary'])
+  })
+})
+
+describe('M365 chat 公开推理投递（移植自 M365-Gateway chatDeliversPublicReasoning/chatReasoningContent）', () => {
+  it('缺省投递，仅 summary:none 抑制', () => {
+    expect(chatDeliversPublicReasoning(undefined)).toBe(true)
+    expect(chatDeliversPublicReasoning(null)).toBe(true)
+    expect(chatDeliversPublicReasoning({})).toBe(true)
+    expect(chatDeliversPublicReasoning({ summary: 'auto' })).toBe(true)
+    expect(chatDeliversPublicReasoning({ summary: 'concise' })).toBe(true)
+    expect(chatDeliversPublicReasoning({ generate_summary: 'detailed' })).toBe(true)
+    expect(chatDeliversPublicReasoning({ summary: 'none' })).toBe(false)
+    expect(chatDeliversPublicReasoning({ generate_summary: 'none' })).toBe(false)
+  })
+
+  it('把摘要渲染为 reasoning_content：去重 + 空行连接', () => {
+    expect(chatReasoningContent(['A', 'B'])).toBe('A\n\nB')
+    expect(chatReasoningContent(['A', 'A', 'B'])).toBe('A\n\nB')
+  })
+
+  it('空/无效摘要返回 undefined', () => {
+    expect(chatReasoningContent(undefined)).toBeUndefined()
+    expect(chatReasoningContent([])).toBeUndefined()
+    expect(chatReasoningContent(['', '   '])).toBeUndefined()
+  })
+
+  it('超过 16384 字符预算的摘要被丢弃', () => {
+    const huge = 'x'.repeat(20_000)
+    expect(chatReasoningContent([huge])).toBeUndefined()
+    // 预算内累积：16000 + 1 均在同一 16384 预算内
+    const ok = chatReasoningContent(['y'.repeat(16_000), 'z'])
+    expect(ok).toBe(`${'y'.repeat(16_000)}\n\nz`)
+    // 已用满预算后，后续摘要被丢弃
+    const saturated = chatReasoningContent(['y'.repeat(16_384), 'z'])
+    expect(saturated).toBe('y'.repeat(16_384))
   })
 })

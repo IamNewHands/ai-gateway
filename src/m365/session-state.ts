@@ -6,6 +6,7 @@ import {
   snapshotToolLedger,
 } from './tool-ledger'
 import type { ToolLedger, ToolLedgerSnapshot } from './tool-ledger'
+import { MAX_PORTABLE_SESSION_BYTES, MAX_TOOL_LEDGER_SNAPSHOT_BYTES, utf8Bytes } from './portable-session'
 
 export const SESSION_SNAPSHOT_VERSION = 1
 
@@ -121,8 +122,28 @@ function normalizeProtocolTail(value: unknown): PortableProtocolTail {
   return {
     protocol,
     ...(previousResponseId ? { previousResponseId } : {}),
-    items: Array.isArray(raw.items) ? raw.items : [],
+    items: boundProtocolTailItems(Array.isArray(raw.items) ? raw.items : []),
   }
+}
+
+/**
+ * 协议尾部按字节预算保留最新的完整条目（移植自 M365-Gateway chat-session.ts
+ * 的 boundedPortableProtocolSuffix 语义）。原始字节后缀可能在某个条目中间
+ * 开始，恢复时会丢弃最新任务；此处按"条目"为最小单位从尾部保留，绝不切断
+ * 单条结构，防止 DO 持久化快照无界增长（isolate 128 MiB 上限）。
+ */
+function boundProtocolTailItems(items: unknown[]): unknown[] {
+  if (items.length === 0) return items
+  if (utf8Bytes(JSON.stringify(items)) <= MAX_PORTABLE_SESSION_BYTES) return items
+  let start = items.length
+  let bytes = 2
+  for (let i = items.length - 1; i >= 0; i -= 1) {
+    const itemBytes = utf8Bytes(JSON.stringify(items[i] ?? null)) + 1
+    if (bytes + itemBytes > MAX_PORTABLE_SESSION_BYTES) break
+    bytes += itemBytes
+    start = i
+  }
+  return items.slice(start)
 }
 
 function normalizeTaskAnchors(value: unknown): TaskAnchor[] {
@@ -167,7 +188,13 @@ function normalizeToolLedger(value: unknown): ToolLedgerSnapshot {
   if (!value || typeof value !== 'object' || Array.isArray(value)) {
     return snapshotToolLedger(emptyToolLedger())
   }
-  return snapshotToolLedger(restoreToolLedgerSnapshot(value as ToolLedgerSnapshot))
+  const snapshot = snapshotToolLedger(restoreToolLedgerSnapshot(value as ToolLedgerSnapshot))
+  // 账本快照有独立字节上界（同源 validateToolLedgerSnapshot）：
+  // 防止异常的巨型账本把 DO 持久化快照撑爆 isolate 内存上限。
+  if (utf8Bytes(JSON.stringify(snapshot)) > MAX_TOOL_LEDGER_SNAPSHOT_BYTES) {
+    throw new Error('TOOL_LEDGER_SNAPSHOT_TOO_LARGE')
+  }
+  return snapshot
 }
 
 export function normalizeSessionSnapshot(value: unknown): SessionSnapshotV1 {
@@ -223,5 +250,52 @@ export async function decodeEncryptedSessionSnapshot(
   const { decryptCompactionCapsule } = await import('./crypto')
   const decrypted = await decryptCompactionCapsule<unknown>(payload, keys)
   return normalizeSessionSnapshot(decrypted)
+}
+
+/**
+ * 判断一个已持久化的会话是否应从"压缩胶囊检查点"恢复（移植自
+ * M365-Gateway openai.ts shouldRestoreChatPortableCheckpoint 的语义，
+ * 适配目标：started/accountLocked 对应未开始的空租约，protocolTail 对应
+ * 目标的结构化协议尾部，completedToolResults 对应账本已完成证据数）。
+ *
+ * 仅当：会话尚未开始、账号已锁定、协议尾部/检查点存在、且已有至少一个
+ * 完成的工具证据、并且当前请求没有携带任何 user 消息时，才允许恢复。
+ * 否则一律以现有持久化状态为准，绝不能被更旧的胶囊回滚。
+ */
+export function shouldRestoreChatPortableCheckpoint(
+  started: boolean,
+  accountLocked: boolean,
+  protocolTailPresent: boolean,
+  messages: ReadonlyArray<Record<string, unknown>>,
+  completedToolResults: number,
+): boolean {
+  if (started || !accountLocked || !protocolTailPresent || completedToolResults < 1) return false
+  return !messages.some((message) => String(message.role ?? '').toLowerCase() === 'user')
+}
+
+/**
+ * 从检查点恢复会话快照（移植自 M365-Gateway openai.ts
+ * hydrateLeaseFromCompaction 的"合并不回滚"原则，适配目标 SessionSnapshotV1）。
+ *
+ * 一个部分存活的 DO 绝不能被更旧的胶囊回滚：若已有任何持久化状态，
+ * 只合并缺失的加性字段（任务锚点/账本/待调用），保留更权威的现有状态。
+ * 只有当会话确实为空/全新时，才用检查点完整填充。
+ */
+export function hydrateSessionSnapshotFromCheckpoint(
+  snapshot: SessionSnapshotV1,
+  checkpoint: CompactionCheckpoint | null | undefined,
+): SessionSnapshotV1 {
+  if (!checkpoint) return snapshot
+  const hasDurableState = snapshot.generation > 0
+    || snapshot.pendingCall !== null
+    || snapshot.toolLedger.calls.length > 0
+    || snapshot.taskAnchors.length > 0
+    || snapshot.protocolTail.items.length > 0
+    || Boolean(snapshot.lease)
+  if (hasDurableState) return snapshot
+  return {
+    ...snapshot,
+    checkpoint,
+  }
 }
 

@@ -31,7 +31,7 @@ import type { SessionSnapshotV1 } from './session-state'
 import { M365SessionStore } from './session-store'
 import { canonicalModel, modelTone } from './models'
 import { classifyAccountFailure } from './account-routing'
-import { extractPublicReasoningSummaries } from './public-reasoning'
+import { extractPublicReasoningSummaries, chatDeliversPublicReasoning, chatReasoningContent } from './public-reasoning'
 import { getProvider } from '../storage'
 
 export interface M365ChatPayload {
@@ -673,9 +673,15 @@ export class M365Session {
     }
 
     const publicSummaries = extractPublicReasoningSummaries(result.events)
+    // 公开推理投递（移植自 M365-Gateway chatDeliversPublicReasoning/chatReasoningContent）：
+    // 客户端显式 summary:"none" 时抑制推理；否则优先用去重+有界的上游公开摘要，
+    // 缺失时回退到原始 reasoning 流。
+    const deliverPublicReasoning = chatDeliversPublicReasoning(body['reasoning'])
     const outcome: ChatOutcome = {
       text: collapseExcessBlankLines(finalText),
-      reasoning: result.reasoning || reasoning,
+      reasoning: deliverPublicReasoning
+        ? (chatReasoningContent(publicSummaries) || result.reasoning || reasoning)
+        : '',
       conversationId: result.conversationId,
       sessionId: result.sessionId,
       toolCalls: completionRecoveryCalls || continuationCalls || calls,

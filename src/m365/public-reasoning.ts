@@ -16,6 +16,38 @@ export function requestsPublicReasoning(value: unknown): boolean {
   return mode === 'auto' || mode === 'concise' || mode === 'detailed'
 }
 
+/**
+ * 判断一次 Chat Completions 请求是否应投递公开推理（移植自 M365-Gateway
+ * openai.ts chatDeliversPublicReasoning）。缺省为投递；仅当 summary 显式
+ * 为 "none" 时关闭。与 requestsPublicReasoning 方向相反：后者问"客户端是否
+ * 请求"，本函数问"是否应投递"。
+ */
+export function chatDeliversPublicReasoning(reasoning: unknown): boolean {
+  if (!reasoning || typeof reasoning !== 'object' || Array.isArray(reasoning)) return true
+  const options = reasoning as Record<string, unknown>
+  const mode = options['summary'] === undefined ? options['generate_summary'] : options['summary']
+  return mode !== 'none'
+}
+
+/**
+ * 把上游公开推理摘要渲染为 Chat Completions 的 reasoning_content
+ * （移植自 M365-Gateway openai.ts chatReasoningContent）：去重、按 16384
+ * 字符总预算截断、以空行连接。
+ */
+export function chatReasoningContent(summaries: readonly string[] | undefined): string | undefined {
+  if (!summaries?.length) return undefined
+  const seen = new Set<string>()
+  const parts: string[] = []
+  let remaining = 16_384
+  for (const text of summaries) {
+    if (typeof text !== 'string' || !text.trim() || seen.has(text) || text.length > remaining) continue
+    seen.add(text)
+    parts.push(text)
+    remaining -= text.length
+  }
+  return parts.length ? parts.join('\n\n') : undefined
+}
+
 export function appendPublicReasoning(
   output: unknown[],
   summaries: readonly string[] | undefined,
