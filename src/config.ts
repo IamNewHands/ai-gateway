@@ -47,6 +47,10 @@ export const KV_KEYS = {
   CACHE_PREFIX: 'cache:prefix',
   PERF_SETTINGS: 'perf:settings',
   RESPONSES_PREFIX: 'proxy:responses:',
+  /** Responses 别名（previous_response_id）元数据：分支不可变 + call_id 一次性消费记录 */
+  RESPONSES_ALIAS_PREFIX: 'proxy:resp-alias:',
+  /** Responses 别名所属会话的 call_id 消费表（防重复执行有副作用工具） */
+  RESPONSES_CONSUMED_PREFIX: 'proxy:resp-consumed:',
 } as const
 
 /** uni-model 虚拟提供商 ID（模型 ID 前缀，如 unimodel/xxx） */

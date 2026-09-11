@@ -10,9 +10,9 @@
  * 其中 sessionKey = providerId + ':' + explicitSessionId | contextFingerprint
  */
 import type { Env } from '../types'
-import { chatWithHandlers, classifyChatHubNotice, collapseExcessBlankLines, scrubNarration } from './chathub'
+import { chatWithHandlers, classifyChatHubNotice, collapseExcessBlankLines, scrubNarration, mayFailOverChatHubFailure } from './chathub'
 import type { ChatHubAccount, ChatHubTool, ChatHubResult } from './chathub'
-import { flattenPromptMessages, modelToolRouterPrompt, parseModelToolDecision, fencedToolCalls, nativeToolCalls, compactToolResult, buildAgentLedger, canContinue, resolveMaxToolRounds, activeMessages, ledgerRouterContext, filterCompletedCalls, validateDetectedToolCalls, isToolRefusal, isSandboxHallucination } from './tools'
+import { flattenPromptMessages, modelToolRouterPrompt, parseModelToolDecision, fencedToolCalls, nativeToolCalls, compactToolResult, buildAgentLedger, canContinue, resolveMaxToolRounds, activeMessages, ledgerRouterContext, filterCompletedCalls, validateDetectedToolCalls, isToolRefusal, isSandboxHallucination, unresolvedAssistantCommitment } from './tools'
 import { evaluateCompletionEvidence, selectCompletionEvidenceMessages } from './completion-evidence'
 import type { DetectedToolCall, AgentLedger, OaiMsgLite } from './tools'
 import { resolveSession, bindSession, systemPromptHash, convCacheLookup, convCacheStore } from './session'
@@ -23,7 +23,7 @@ import { markAccountSuccess, markAccountFailure, markAccountImageLimited, accoun
 import { extractRemainingAllowance } from './chathub'
 import type { RateLimitProbeFn } from './account-health'
 import { writeLog, isM365DebugSseEnabled } from '../admin'
-import { acquireSlot, releaseSlot, fluxSnapshot } from './account-flux'
+import { acquireSlot, releaseSlot, fluxSnapshot, nextSpreadCursor } from './account-flux'
 import { computeContextBudget, slidingWindow } from './context-budget'
 import { extractChatTaskAnchors, mergeTaskAnchors, decodeTaskAnchors, encodeTaskAnchors, reserveTaskAnchorContext, repairTaskAnchorArtifacts } from './task-anchors'
 import type { TaskAnchor } from './task-anchors'
@@ -32,6 +32,7 @@ import { M365SessionStore } from './session-store'
 import { canonicalModel, modelTone } from './models'
 import { classifyAccountFailure } from './account-routing'
 import { extractPublicReasoningSummaries } from './public-reasoning'
+import { getProvider } from '../storage'
 
 export interface M365ChatPayload {
   providerId: string
@@ -60,6 +61,15 @@ interface ChatOutcome {
   toolCalls: DetectedToolCall[]
   /** 附加元数据（conversation/images/throttling 等，非流式响应透传为 m365 块） */
   metadata?: Record<string, unknown>
+  /**
+   * 检查点终态：模型承诺了行动却未能产出工具调用时置位。
+   * 客户端据此判定"任务未完成、需要基于 continuationToken 续接"，而非误判为已完成。
+   */
+  checkpoint?: {
+    continuationRequired: true
+    reason: string
+    continuationToken: string
+  }
 }
 
 function sha256Hex(s: string): string {
@@ -80,6 +90,28 @@ export function estimateTokens(s: string): number {
   const cjk = (s.match(/[\u4e00-\u9fff]/g) || []).length
   const other = s.length - cjk
   return Math.ceil(cjk / 1.5) + Math.ceil(other / 4)
+}
+
+/** 单段上游对话的默认超时（毫秒）：工具路由、主回答、纠正、恢复各段的上限 */
+const SEGMENT_TIMEOUT_MS = 300_000
+/** 单个逻辑请求默认总截止时间（毫秒，10 分钟），可用 M365_LOGICAL_REQUEST_TIMEOUT_MS 覆盖 */
+const DEFAULT_LOGICAL_REQUEST_TIMEOUT_MS = 600_000
+
+/** 逻辑请求总预算：排队 + 重连 + 上游读取共享同一 deadline，不因多段重试叠加成无限任务 */
+function logicalRequestTimeoutMs(env: Env): number {
+  const raw = env.M365_LOGICAL_REQUEST_TIMEOUT_MS
+  const n = typeof raw === 'string' ? parseInt(raw, 10) : NaN
+  return Number.isInteger(n) && n > 0 ? n : DEFAULT_LOGICAL_REQUEST_TIMEOUT_MS
+}
+
+/**
+ * 计算本次段调用可用的超时：取「单段上限」与「剩余总预算」的较小值。
+ * 剩余预算耗尽（<=0）时返回 0，调用方据此判定 CHAT_DEADLINE_EXCEEDED 并停止后续重试。
+ */
+function boundedSegmentTimeout(deadline: number, now = Date.now()): number {
+  const remaining = deadline - now
+  if (remaining <= 0) return 0
+  return Math.min(SEGMENT_TIMEOUT_MS, remaining)
 }
 
 export class M365Session {
@@ -120,6 +152,9 @@ export class M365Session {
 
   private async handleChat(payload: M365ChatPayload, requestSignal?: AbortSignal): Promise<Response> {
     const { providerId, body, stream, explicitSessionId, explicitAccountId, user, ip, userAgent, tenant } = payload
+    // 逻辑请求统一截止时间：从收到请求起算，工具路由/主回答/纠正/证据恢复共享同一预算，
+    // 不会因多段重试叠加成无限任务（对齐 M365-Gateway LOGICAL_REQUEST_TIMEOUT_MS）。
+    const deadline = Date.now() + logicalRequestTimeoutMs(this.env)
     const model = canonicalModel(payload.model)
     const messages = (body['messages'] as Array<Record<string, unknown>>) || []
     const tools = (body['tools'] as unknown[]) || []
@@ -280,7 +315,7 @@ export class M365Session {
       let route: Awaited<ReturnType<typeof this.tryToolRouter>> | null = null
       const routerAcquired = await acquireSlot(this.env, providerId, acc.oid)
       try {
-        route = await this.tryToolRouter(acc, answerPrompt, toolDefs, toolChoice, attachments, ledgerCtx, tone)
+        route = await this.tryToolRouter(acc, answerPrompt, toolDefs, toolChoice, attachments, ledgerCtx, tone, deadline)
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err)
         const detail = `model=${model} tools=${toolDefs.length} promptLen=${answerPrompt.length} err=${msg}`
@@ -322,6 +357,11 @@ export class M365Session {
     const mainTools = toolRouterFailed ? [] : toolDefs
     const mainChoice = toolRouterFailed ? 'none' : toolChoice
 
+    // 逻辑请求总预算耗尽：不再发起主回答（避免排队/重试把请求拖成无限任务），返回明确失败终态
+    if (boundedSegmentTimeout(deadline) <= 0) {
+      return cjson({ error: { message: 'logical request deadline exceeded before main answer', type: 'CHAT_DEADLINE_EXCEEDED' } }, 504)
+    }
+
     // 流式：增量透传主回答文本/推理，随事件实时推送，客户端断连可中止上游（同原版真实流式）
     if (stream) {
       lifecycleTransferredToStream = true
@@ -329,7 +369,7 @@ export class M365Session {
         providerId, model, tone, ordered, resolved,
         mainPrompt, attachments, mainTools, mainChoice,
         toolDefs, toolChoice, ledger, messages, ctx, requestSignal, mcpServerUrl, sysHash,
-        snapshot, expectedGeneration, leaseToken, lifecycleHeartbeat, stopLifecycleHeartbeat,
+        snapshot, expectedGeneration, leaseToken, lifecycleHeartbeat, stopLifecycleHeartbeat, deadline,
       })
     }
 
@@ -397,7 +437,7 @@ export class M365Session {
             messageProfile: mainTools.length > 0 ? 'caller_tool' : 'answer',
             mcpServerUrl,
           },
-          { timeoutMs: 300_000, debug: debugSse, onDebug: (tag, text) => sseLog(tag, text) },
+          { timeoutMs: boundedSegmentTimeout(deadline) || 1, debug: debugSse, onDebug: (tag, text) => sseLog(tag, text) },
           (delta) => { streamedText += delta },
           (ev) => { if (ev.kind === 'reasoning') reasoning += ev.text || '' },
         )
@@ -437,9 +477,12 @@ export class M365Session {
           return cjson({ error: { message: 'M365 image generation quota is exhausted; try again later or use another account', type: 'rate_limit_error' } }, 429, { 'Retry-After': '86400' })
         }
         failoverLastResp = this.mapChatError(msg)
-        // 上游限流/鉴权失败/可重试临时错误 且 为全新会话时允许切号；已绑定会话直接返回退避响应
+        // 上游限流/鉴权失败/可重试临时错误 且 为全新会话时允许切号；已绑定会话直接返回退避响应。
+        // 额外门禁：payload 已提交（invocationSubmitted）的失败绝不允许跨账号转移——
+        // 微软可能已产生副作用，重放会重复执行用户任务（同 M365-Gateway mayFailOverChatHubFailure）。
         const dispo = classifyAccountFailure(errObj)
-        const canFailover = isRateLimited(errObj) || isAuthFailure(errObj) || isRetryable(errObj) || (dispo?.mayFailOverBeforeVisibleOutput === true)
+        const mayFailOver = mayFailOverChatHubFailure(errObj)
+        const canFailover = mayFailOver && (isRateLimited(errObj) || isAuthFailure(errObj) || isRetryable(errObj) || (dispo?.mayFailOverBeforeVisibleOutput === true))
         if (!canFailover || !resolved.isNew) return failoverLastResp
         if (i === ordered.length - 1) return failoverLastResp
       } finally {
@@ -483,7 +526,7 @@ export class M365Session {
           tone,
           messageProfile: 'caller_tool',
           mcpServerUrl,
-        }, { timeoutMs: 300_000 })
+        }, { timeoutMs: boundedSegmentTimeout(deadline) || 1 })
         const stillBad = sandboxDetected ? isSandboxHallucination(corrRes.text) : isToolRefusal(corrRes.text)
         if (!stillBad) {
           result = { ...corrRes, events: result.events }
@@ -506,11 +549,64 @@ export class M365Session {
     const calls = filterCompletedCalls(validated.calls, ledger)
 
     let finalText = repairTaskAnchorArtifacts(scrubNarration(result.text), mergedAnchors)
+    // 兜底 2.5：未提交承诺复核（移植自 M365-Gateway unresolvedAssistantCommitment）。
+    // 模型声明"我将要执行 X"却没给出任何工具调用时，长任务客户端会误判为完成。
+    // 先在同账号同会话发起一次续接复核（CONTINUATION DECISION REVIEW），要求其落地具体工具调用；
+    // 复核仍无调用则置位检查点终态（continuation_required），让客户端明确"任务未完成"。
+    let continuationCalls: DetectedToolCall[] | undefined
+    let checkpoint: ChatOutcome['checkpoint']
+    if (toolDefs.length > 0 && calls.length === 0 && unresolvedAssistantCommitment(finalText, false)) {
+      const continuationPrompt = mainPrompt +
+        '\n\nCONTINUATION DECISION REVIEW: Your previous response promised an action but produced no tool call. ' +
+        'A promise without a tool call leaves the task unfinished. Do not restate the plan or the promise. ' +
+        'Call the next materially useful client tool now (single call, valid arguments), or, if no tool is needed, ' +
+        'state plainly that the task is already complete with supporting evidence.'
+      const contAcquired = await acquireSlot(this.env, providerId, usedAcc.oid)
+      try {
+        const contRes = await chatWithHandlers(usedAcc, {
+          text: continuationPrompt,
+          conversationId: resolved.isNew ? undefined : resolved.conversationId,
+          sessionId: resolved.isNew ? undefined : resolved.sessionId,
+          started: resolved.isNew,
+          attachments,
+          tools: mainTools,
+          toolChoice: mainChoice,
+          tone,
+          messageProfile: 'caller_tool',
+          mcpServerUrl,
+        }, { timeoutMs: boundedSegmentTimeout(deadline) || 1 })
+        const contRaw = fencedToolCalls(contRes.text, toolDefs, toolChoice)
+        const contAll = contRaw.length > 0 ? contRaw : nativeToolCalls(contRes.events, toolDefs)
+        const contValidated = validateDetectedToolCalls(contAll, toolDefs, toolChoice)
+        if (contValidated.dropped === 0 && contValidated.calls.length > 0) {
+          continuationCalls = filterCompletedCalls(contValidated.calls, ledger)
+          finalText = repairTaskAnchorArtifacts(scrubNarration(contRes.text || finalText), mergedAnchors)
+        } else if (!unresolvedAssistantCommitment(contRes.text || finalText, false)) {
+          // 复核给出了明确完成声明或直接答复：采纳其文本，不再置检查点
+          finalText = repairTaskAnchorArtifacts(scrubNarration(contRes.text || finalText), mergedAnchors)
+        } else {
+          checkpoint = {
+            continuationRequired: true,
+            reason: 'unresolved_assistant_commitment',
+            continuationToken: sha256Hex(`${providerId}:${resolved.sessionId || resolved.conversationId || ''}:${Date.now()}`),
+          }
+        }
+      } catch {
+        // 复核失败：保守置检查点，避免把"承诺未落地"的文本当成功返回
+        checkpoint = {
+          continuationRequired: true,
+          reason: 'continuation_review_failed',
+          continuationToken: sha256Hex(`${providerId}:${resolved.sessionId || resolved.conversationId || ''}:${Date.now()}`),
+        }
+      } finally {
+        if (contAcquired) await releaseSlot(this.env, providerId, usedAcc.oid)
+      }
+    }
     // 兜底 3：完成证据评估——若回答包含"已完成"声明但缺少匹配工具证据，
     // 则先尝试恢复循环（独立对话，不写历史），让模型修正调用再继续（同原版 B:5247-5272）。
     // 证据不足但类型为 pending_evidence 时不做恢复（直接降级，避免无限循环）。
     let completionRecoveryCalls: DetectedToolCall[] | undefined
-    if (toolDefs.length > 0 && finalText && !evaluateCompletionEvidence(finalText, evidenceLedger).allowed) {
+    if (!checkpoint && toolDefs.length > 0 && finalText && !evaluateCompletionEvidence(finalText, evidenceLedger).allowed) {
       const decision = evaluateCompletionEvidence(finalText, evidenceLedger)
       if (['failed_evidence', 'missing_evidence', 'unknown_evidence'].includes(decision.reason)) {
         // 证据恢复：独立对话，不写历史（同原版 resolveFunctionCall 使用独立 exchange）
@@ -527,7 +623,7 @@ export class M365Session {
             const recoveryRes = await chatWithHandlers(
               usedAcc,
               { text: recoveryPrompt, started: true, attachments, tools: toolDefs, toolChoice: toolChoice },
-              { timeoutMs: 300_000 },
+              { timeoutMs: boundedSegmentTimeout(deadline) || 1 },
             )
             const recoveryRaw = fencedToolCalls(recoveryRes.text, toolDefs, toolChoice)
             const recoveryAll = recoveryRaw.length > 0 ? recoveryRaw : nativeToolCalls(recoveryRes.events, toolDefs)
@@ -555,13 +651,14 @@ export class M365Session {
       reasoning: result.reasoning || reasoning,
       conversationId: result.conversationId,
       sessionId: result.sessionId,
-      toolCalls: completionRecoveryCalls || calls,
+      toolCalls: completionRecoveryCalls || continuationCalls || calls,
       metadata: {
         conversationId: result.conversationId,
         images: result.images,
         throttling: result.throttling ?? undefined,
         ...(publicSummaries.length > 0 ? { publicReasoningSummary: publicSummaries } : {}),
       },
+      ...(checkpoint ? { checkpoint } : {}),
     }
 
     // 6) 绑定会话（记录全量历史 + 助手回复），把实际使用的账号 oid 记为 accountId
@@ -603,6 +700,10 @@ export class M365Session {
         { role: 'assistant', content: outcome.text },
       ],
     }
+    // 检查点终态持久化：写入 snapshot.checkpoint，供后续续接请求识别未完成任务
+    snapshot.checkpoint = checkpoint
+      ? { reason: checkpoint.reason, continuationToken: checkpoint.continuationToken, createdAt: Date.now() }
+      : null
 
     if (lifecycleHeartbeat.failed) {
       return cjson({ error: { message: lifecycleHeartbeat.failed, type: lifecycleHeartbeat.failed } }, 409)
@@ -658,8 +759,9 @@ export class M365Session {
       failed: string | undefined
     }
     stopLifecycleHeartbeat: () => void
+    deadline: number
   }): Promise<Response> {
-    const { providerId, model, tone, ordered, resolved, mainPrompt, attachments, mainTools, mainChoice, toolDefs, toolChoice, ledger, messages, ctx, requestSignal, mcpServerUrl, sysHash, snapshot, expectedGeneration, leaseToken, lifecycleHeartbeat, stopLifecycleHeartbeat } = a
+    const { providerId, model, tone, ordered, resolved, mainPrompt, attachments, mainTools, mainChoice, toolDefs, toolChoice, ledger, messages, ctx, requestSignal, mcpServerUrl, sysHash, snapshot, expectedGeneration, leaseToken, lifecycleHeartbeat, stopLifecycleHeartbeat, deadline } = a
     const encoder = new TextEncoder()
     const aborter = new AbortController()
     // 客户端断连（requestSignal）或响应体被取消（cancel）都中止上游 ChatHub
@@ -777,7 +879,7 @@ export class M365Session {
                   messageProfile: mainTools.length > 0 ? 'caller_tool' : 'answer',
                   mcpServerUrl,
                 },
-                { timeoutMs: 300_000, signal: aborter.signal, debug: debugSse, onDebug: (tag, text) => sseLog(tag, text) },
+                { timeoutMs: boundedSegmentTimeout(deadline) || 1, signal: aborter.signal, debug: debugSse, onDebug: (tag, text) => sseLog(tag, text) },
                 (delta) => {
                   if (!delta) return
                   streamedText += delta
@@ -798,6 +900,7 @@ export class M365Session {
               const hasEmittedOutput = streamedText.length > 0 || reasoningBuf.length > 0
               const canFailover = resolved.isNew
                 && !hasEmittedOutput
+                && mayFailOverChatHubFailure(errObj)
                 && (isRateLimited(errObj) || isAuthFailure(errObj) || isRetryable(errObj))
               if (!canFailover || i === ordered.length - 1) throw err
             } finally {
@@ -832,7 +935,7 @@ export class M365Session {
                   messageProfile: 'caller_tool',
                   mcpServerUrl,
                 },
-                { timeoutMs: 300_000, signal: aborter.signal, debug: debugSse, onDebug: (tag, text) => sseLog(tag, text) },
+                { timeoutMs: boundedSegmentTimeout(deadline) || 1, signal: aborter.signal, debug: debugSse, onDebug: (tag, text) => sseLog(tag, text) },
               )
               const corrBad = sandboxDetected ? isSandboxHallucination(corrRes.text) : isToolRefusal(corrRes.text)
               if (!corrBad) {
@@ -985,14 +1088,17 @@ export class M365Session {
   /**
    * 账号池选择（多账号 failover 的入口）：
    * - 已绑定会话（非新）：只返回绑定的账号（oid）；该账号若不在池中/不健康则返回空（走 401/退避）。
-   * - 新会话：返回所有健康账号，按最近未用优先（round-robin），便于在限流/鉴权失败时切号重试。
-   * 返回按尝试顺序排列的 ChatHubAccount 候选数组。
+   * - 新会话：默认**单活为主**——固定第一个健康账号，仅在分类故障时才按序接棒到紧邻健康账号，
+   *   且单请求最多接触 2 个账号（当前 + 直接后继），对齐 M365-Gateway 的风控取向。
+   * - 可选 spread：provider.accountSpread 勾选（后台 UI）或 M365_ACCOUNT_SPREAD=true（env 回退）时，
+   *   新会话按持久化游标在全部健康账号间均匀轮转（复刻原版 accountSpread）；每账号仍串行 + 1s 间隔。
+   * 返回按尝试顺序排列的 ChatHubAccount 候选数组（单活模式 <= 2，分摊模式为全部健康账号）。
    */
   private async selectAccounts(providerId: string, resolved: ResolveResult, explicitAccountId?: string): Promise<ChatHubAccount[]> {
     const accounts = await listM365Accounts(this.env, providerId)
     if (accounts.length === 0) return []
     const snapshot: { limit: number; inflight: Record<string, number> } =
-      await fluxSnapshot(this.env, providerId).catch(() => ({ limit: 8, inflight: {} }))
+      await fluxSnapshot(this.env, providerId).catch(() => ({ limit: 1, inflight: {} }))
     const healthy: ChatHubAccount[] = []
     for (const a of accounts) {
       if (!a.accessToken || !a.oid) continue
@@ -1016,12 +1122,25 @@ export class M365Session {
       const pinned = healthy.find((a) => a.oid === resolved.accountId)
       return pinned ? [pinned] : []
     }
-    if (resolved.isNew && resolved.accountId) {
-      // 新会话但存在 content 指纹命中的历史账号偏好：优先复用，其次健康账号轮询
-      const pref = healthy.find((a) => a.oid === resolved.accountId)
-      if (pref) return [pref, ...healthy.filter((a) => a.oid !== resolved.accountId)]
+
+    // 会话级多账号分摊（Account Spread）：
+    // 优先读 provider 配置（后台勾选框 accountSpread），环境变量 M365_ACCOUNT_SPREAD 作为兼容回退。
+    // 开启后新会话按持久化游标在全部健康账号间均匀轮转，且仍受每账号并发/最小间隔约束。
+    const provider = await getProvider(this.env, providerId)
+    const spread = provider?.accountSpread === true
+      || (provider?.accountSpread === undefined && String(this.env.M365_ACCOUNT_SPREAD ?? '').toLowerCase() === 'true')
+    if (spread && resolved.isNew && healthy.length > 0) {
+      // 轮转游标跨会话共享：cursor 对健康账号数取模得到选中下标，实现均匀分摊
+      const cursor = await nextSpreadCursor(this.env, providerId)
+      const offset = cursor % healthy.length
+      const rotated = [...healthy.slice(offset), ...healthy.slice(0, offset)]
+      // 分摊模式下允许在多个健康账号间轮转，候选数放宽到全部健康账号（仍按顺序尝试）
+      return rotated
     }
-    return healthy
+
+    // 单活为主：固定第一个健康账号；仅在分类故障时按序接棒，因此最多返回 2 个候选
+    if (healthy.length === 0) return []
+    return healthy.slice(0, 2)
   }
 
   /**
@@ -1111,12 +1230,16 @@ export class M365Session {
     attachments: { type: 'image'; url: string }[],
     ledgerCtx: string,
     tone: string,
+    deadline: number,
   ): Promise<{ calls: DetectedToolCall[]; res: ChatHubResult; requiredFailed?: boolean } | null> {
     if (toolDefs.length === 0) return null
     const choiceStr = String(toolChoice ?? 'auto').toLowerCase()
     if (choiceStr === 'none') return null
 
-    const opts = { timeoutMs: 300_000 }
+    // 路由段受逻辑请求总预算约束；预算耗尽则直接跳过路由（降级走主回答，由主回答的预算检查兜底）
+    const routerTimeout = boundedSegmentTimeout(deadline)
+    if (routerTimeout <= 0) return null
+    const opts = { timeoutMs: routerTimeout }
     const routePrompt = modelToolRouterPrompt(prompt + (ledgerCtx ? '\n' + ledgerCtx : ''), toolDefs, toolChoice)
     // 路由对话是"决策是否调用工具"的辅助轮：上游限流/异常时优雅降级（返回 null 走主回答），
     // 不应让一次可选的决策对话因限流而阻断整个请求（同原版 failover 对路由阶段限流不致命）。
@@ -1188,6 +1311,14 @@ function buildJSON(id: string, model: string, o: ChatOutcome): Response {
   }
   if (o.metadata && Object.keys(o.metadata).length) {
     resp['m365'] = o.metadata
+  }
+  if (o.checkpoint) {
+    resp['m365_gateway'] = {
+      checkpoint: true,
+      continuation_required: true,
+      checkpoint_reason: o.checkpoint.reason,
+      continuation_token: o.checkpoint.continuationToken,
+    }
   }
   return cjson(resp, 200)
 }

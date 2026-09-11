@@ -55,7 +55,7 @@ export interface AccountHealthState {
   updatedAt: number
 }
 
-async function readHealth(env: Env, accountId: string): Promise<AccountHealthState> {
+export async function readHealth(env: Env, accountId: string): Promise<AccountHealthState> {
   try {
     const raw = await env.KV.get(ACCOUNT_HEALTH_PREFIX + accountId)
     if (!raw) return { cooldownUntil: 0, authFailed: false, imageLimitedUntil: 0, rlFailures: 0, updatedAt: 0 }

@@ -573,7 +573,7 @@ ${H('管理')}
                     <div class="fc mt-1 field-row" style="gap:8px"><input type="number" id="cd-plan-${escapePageHtml(p.id)}" value="${p.cooldown&&p.cooldown.planMs?Math.round(p.cooldown.planMs/60000):''}" style="width:88px" placeholder="额度耗尽冷却(分)"><input type="number" id="cd-soft-${escapePageHtml(p.id)}" value="${p.cooldown&&p.cooldown.softMs?Math.round(p.cooldown.softMs/1000):''}" style="width:88px" placeholder="429冷却(秒)"><input type="number" id="cd-err-${escapePageHtml(p.id)}" value="${p.cooldown&&p.cooldown.errThreshold?p.cooldown.errThreshold:''}" style="width:76px" placeholder="错误阈值"><input type="number" id="cd-errms-${escapePageHtml(p.id)}" value="${p.cooldown&&p.cooldown.errMs?Math.round(p.cooldown.errMs/60000):''}" style="width:88px" placeholder="错误冷却(分)"><span class="mu" style="font-size:12px">冷却参数（保存后生效）</span></div>
                   </fieldset>`:''}
                   ${(p.oauth&&(p.oauth.flowType==='m365-pkce'||p.oauth.flowType==='m365-ropc'))?`
-                  <fieldset class="form-group" id="m365-fs-${escapePageHtml(p.id)}"><legend>M365 账号池</legend><span class="form-helper">本提供商可挂多个订阅账号（授权码/账密各连一次即入池）。网关按健康与并发自动轮询，限流/超限自动切换。每账号默认并发上限 8（可变 M365_ACCOUNT_DEFAULT_CONCURRENCY）。</span>
+                  <fieldset class="form-group" id="m365-fs-${escapePageHtml(p.id)}"><legend>M365 账号池</legend><span class="form-helper">本提供商可挂多个订阅账号（授权码/账密各连一次即入池）。网关按健康自动选择，限流/超限自动切换。每个账号默认串行（并发上限 1，可选 M365_ACCOUNT_DEFAULT_CONCURRENCY 调整），两次调用间至少间隔 1 秒。</span>
                     <div class="fc mt-1 field-row"><button class="btn btn-s" onclick="oauthConnect('${escapePageJsx(p.id)}')"><i class="fas fa-sign-in-alt" aria-hidden="true"></i>连接新账号</button><button class="btn btn-s" onclick="m365Render('${escapePageJsx(p.id)}')"><i class="fas fa-sync" aria-hidden="true"></i>刷新账号池</button><button class="btn btn-s" onclick="m365ConversationsModal('${escapePageJsx(p.id)}')"><i class="fas fa-comments" aria-hidden="true"></i>云端会话管理</button></div>
                     <div class="fc mt-1 field-row"><label class="tg" title="启用会话级多账号分摊 (Account Spread)"><input type="checkbox" id="m365-spread-${escapePageHtml(p.id)}" ${p.accountSpread?'checked':''}><span class="sl"></span></label><span style="font-size:13px;margin-left:6px">会话级多账号分摊 (Account Spread)</span><span class="mu" style="font-size:12px;margin-left:8px">开启后跨请求轮询不同健康账号分摊负载</span></div>
                     <div id="m365-acc-${escapePageHtml(p.id)}" class="mt-1"><p class="mu">展开后自动加载账号池。</p></div>
@@ -1009,16 +1009,60 @@ function m365Render(providerId) {
     .then(function (res) {
       if (!res.ok || !res.j.success) { root.innerHTML = '<p class="c-d">加载失败：' + m365Esc(((res.j && res.j.message) || (res.j && res.j.error) || '未知错误')) + '</p>'; return; }
       var accs = (res.j.data && res.j.data.accounts) || []
+      var sum = (res.j.data && res.j.data.summary) || {}
       if (accs.length === 0) { root.innerHTML = '<div class="empty-state"><i class="fas fa-users"></i><h3>暂无账号</h3><p>点上方「连接新账号」，用授权码或账密登录，第一个账号即进入此池。</p></div>'; return; }
-      root.innerHTML = '<table class="tbl"><thead><tr><th>账号</th><th>OID</th><th>状态</th><th>操作</th></tr></thead><tbody>' +
+      // 顶部聚合状态条（对齐 M365-Gateway 账号池概览）
+      var summaryHtml = '<div class="fc mb-2" style="flex-wrap:wrap;gap:8px;font-size:12px">' +
+        '<span class="mu">共 <b>' + (sum.total || accs.length) + '</b> 个</span>' +
+        '<span class="bd bd-on">使用中 ' + (sum.inUse || 0) + '</span>' +
+        '<span class="bd bd-off">空闲 ' + (sum.idle || 0) + '</span>' +
+        '<span class="bd bd-off">休眠 ' + (sum.dormant || 0) + '</span>' +
+        (sum.cooling ? '<span class="bd bd-warn">冷却 ' + sum.cooling + '</span>' : '') +
+        (sum.unhealthy ? '<span class="bd bd-danger">异常 ' + sum.unhealthy + '</span>' : '') +
+        '<span class="mu">每账号并发上限 ' + (sum.concurrencyLimit != null ? sum.concurrencyLimit : 1) + '</span>' +
+        '</div>'
+      root.innerHTML = summaryHtml + '<table class="tbl"><thead><tr><th>账号</th><th>OID</th><th>状态</th><th>令牌有效期</th><th>最近使用</th><th>操作</th></tr></thead><tbody>' +
         accs.map(function (a) {
-          var status = a.connected ? (a.healthy ? '<span class="bd bd-on">健康</span>' : '<span class="bd bd-danger">不可用</span>') : '<span class="bd bd-off">未连接</span>';
-          return '<tr><td>' + m365Esc(a.email || a.oid || '?') + '</td><td><code>' + m365Esc(a.oid || '') + '</code></td><td>' + status + '</td>' +
-            '<td><button class="btn btn-d btn-xs" onclick="m365Remove(\\'' + m365Esc(providerId) + '\\',\\'' + m365Esc(a.oid || '') + '\\',this)"><i class="fas fa-trash"></i>移除</button></td></tr>';
+          // 状态徽章：使用中 > 未连接 > 授权失效 > 已隔离 > 冷却中 > 休眠 > 空闲
+          var st = a.state || (a.healthy ? 'idle' : 'cooldown')
+          var badge
+          if (st === 'in_use') badge = '<span class="bd bd-on">使用中</span>'
+          else if (st === 'idle') badge = '<span class="bd bd-on">空闲</span>'
+          else if (st === 'dormant') badge = '<span class="bd bd-off">休眠待命</span>'
+          else if (st === 'cooldown') badge = '<span class="bd bd-warn">冷却中</span>'
+          else if (st === 'auth_failed') badge = '<span class="bd bd-danger">授权已失效</span>'
+          else if (st === 'isolated') badge = '<span class="bd bd-danger">已隔离</span>'
+          else if (st === 'disconnected') badge = '<span class="bd bd-off">未连接</span>'
+          else badge = '<span class="bd bd-off">' + m365Esc(String(st)) + '</span>'
+          // 冷却/隔离剩余时间提示
+          var detail = ''
+          if (a.cooldownUntil) detail = ' 冷却至 ' + new Date(a.cooldownUntil).toLocaleString()
+          else if (a.trippedUntil) detail = ' 熔断至 ' + new Date(a.trippedUntil).toLocaleString()
+          else if (a.imageLimitedUntil) detail = ' 图片额度恢复 ' + new Date(a.imageLimitedUntil).toLocaleString()
+          var stCell = badge + (detail ? '<span class="mu">' + m365Esc(detail) + '</span>' : '')
+          // 令牌有效期 + 自动续期说明
+          var exp = '—'
+          if (a.tokenExpiresAt) {
+            exp = new Date(a.tokenExpiresAt).toLocaleString()
+            if (a.tokenExpiresAt <= Date.now()) exp += ' <span class="bd bd-danger">已过期</span>'
+            else exp += ' <span class="mu">· 自动续期</span>'
+          }
+          var last = a.lastUsedAt ? new Date(a.lastUsedAt).toLocaleString() : '<span class="mu">从未使用</span>'
+          return '<tr><td>' + m365Esc(a.email || a.oid || '?') + '</td><td><code>' + m365Esc(a.oid || '') + '</code></td><td>' + stCell + '</td><td>' + exp + '</td><td>' + last + '</td>' +
+            '<td>' +
+            (a.state === 'cooldown' ? '<button class="btn btn-gh btn-xs" onclick="m365ClearCooldown(\\'' + m365Esc(providerId) + '\\',\\'' + m365Esc(a.oid || '') + '\\',this)" title="清除该账号冷却"><i class="fas fa-fire-extinguisher"></i>清除冷却</button> ' : '') +
+            '<button class="btn btn-d btn-xs" onclick="m365Remove(\\'' + m365Esc(providerId) + '\\',\\'' + m365Esc(a.oid || '') + '\\',this)"><i class="fas fa-trash"></i>移除</button></td></tr>';
         }).join('') + '</tbody></table>' +
-        '<p class="mu" style="margin-top:8px">共 ' + accs.length + ' 个账号。</p>';
+        '<p class="mu" style="margin-top:8px">状态说明：使用中=当前有请求在途；空闲=健康可立即接单；休眠=超过 24h 未使用（唤醒时自动续期）；冷却=被上游限流/熔断，到期自动恢复。</p>';
     })
     .catch(function (e) { root.innerHTML = '<p class="c-d">请求异常：' + m365Esc(String(e && e.message || e)) + '</p>'; });
+}
+function m365ClearCooldown(providerId, oid, btn) {
+  if (btn) btn.disabled = true;
+  fetch('/admin/api/m365/cooldown/' + encodeURIComponent(providerId) + (oid ? '?oid=' + encodeURIComponent(oid) : ''), { method: 'POST' })
+    .then(function (r) { return r.json().then(function (j) { return { ok: r.ok, j: j }; }); })
+    .then(function (res) { if (btn) btn.disabled = false; if (res.ok) m365Render(providerId); else window.alert((res.j && res.j.message) || '清除失败'); })
+    .catch(function () { if (btn) btn.disabled = false; window.alert('请求异常'); });
 }
 function m365Remove(providerId, oid, btn) {
   if (!oid) return;

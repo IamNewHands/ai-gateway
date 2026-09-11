@@ -1331,3 +1331,33 @@ export function isSandboxHallucination(text: string): boolean {
   for (const p of sandboxHallucinationPatterns) if (low.includes(p)) return true
   return false
 }
+
+/**
+ * 未提交承诺检测（移植自 M365-Gateway unresolvedAssistantCommitment）：
+ * 模型声明"我将要/正在执行某动作"却没有产生任何工具调用，即"承诺了行动但未落地"。
+ * 这类回答会被长任务客户端误判为完成，必须触发同会话续接复核或返回检查点终态。
+ *
+ * 边界：仅匹配明确的未来/进行时行动措辞（中英文），且要求回答不含"已完成"式完成声明，
+ * 避免与 completion-evidence 的完成声明校验重叠；长度不设上限但要求文本非空。
+ */
+const commitmentPatterns = [
+  /\bI(?:'ll| will)\s+(?:now\s+)?(?:run|execute|apply|create|write|edit|update|delete|remove|install|deploy|fix|start|restart|upload|configure|verify|test|check|build|patch)\b/i,
+  /\b(?:let me|I(?:'m| am)\s+going to|I(?:'m| am)\s+about to)\s+(?:run|execute|apply|create|write|edit|update|delete|remove|install|deploy|fix|start|restart|upload|configure|verify|test|check|build|patch)\b/i,
+  /(?:接下来|现在|马上|即将|我将|我会|让我|准备)\s*(?:执行|运行|创建|写入|修改|更新|删除|移除|安装|部署|修复|启动|重启|上传|配置|验证|测试|检查|构建|打补丁|应用)/,
+]
+
+/** 完成声明措辞：出现时说明模型在声称结果而非承诺行动，不应判为未提交承诺 */
+const resolutionPatterns = [
+  /\b(?:successfully\s+)?(?:done|completed|finished|deployed|installed|fixed|created|updated|deleted|removed|configured|verified|passed|applied)\b/i,
+  /(?:已|成功|完成|完毕|搞定|处理好)/,
+]
+
+/** 检测模型是否"承诺了下一步行动却未给出任何工具调用" */
+export function unresolvedAssistantCommitment(text: string, hasToolCalls: boolean): boolean {
+  if (hasToolCalls) return false
+  const value = (text || '').trim()
+  if (!value) return false
+  const low = value.toLowerCase()
+  if (resolutionPatterns.some((p) => p.test(low))) return false
+  return commitmentPatterns.some((p) => p.test(value))
+}

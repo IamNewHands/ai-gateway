@@ -259,6 +259,75 @@ export async function getResponseHistory(env: Env, responseId: string): Promise<
   } catch { return null }
 }
 
+// ===== Responses 别名强约束（对齐 M365-Gateway RESPONSE_ALIAS 语义） =====
+// 目标：previous_response_id 是**不可变分支点**——重复引用同一别名会派生独立分支而非改写原别名；
+// 已消费的 call_id 拒绝再次提交，防止重复执行有副作用工具；别名与消费表均带 TTL 与个数上限。
+export const RESPONSE_ALIAS_TTL_SECONDS = 7 * 24 * 60 * 60 // 7 天（同原版 RESPONSE_ALIAS_TTL_MS）
+export const MAX_RESPONSE_ALIASES_PER_SESSION = 64
+export const MAX_CONSUMED_CALL_IDS = 512
+
+export interface ResponseAliasMeta {
+  /** 别名指向的会话/响应，本次引用会据此派生分支 */
+  sourceResponseId: string
+  createdAt: number
+  /** 已消费的 tool call_id 列表（一次性：提交过 tool 结果后不得再提交） */
+  consumedCallIds: string[]
+}
+
+export async function saveResponseAlias(env: Env, responseId: string, meta: ResponseAliasMeta): Promise<void> {
+  if (!responseId) return
+  try {
+    // 别名不可变：已存在则不覆盖（分支点一旦确定，后续只能派生新分支）
+    const existing = await env.KV.get(KV_KEYS.RESPONSES_ALIAS_PREFIX + responseId)
+    if (existing) return
+    const bounded: ResponseAliasMeta = {
+      sourceResponseId: meta.sourceResponseId,
+      createdAt: meta.createdAt,
+      consumedCallIds: (meta.consumedCallIds || []).slice(-MAX_CONSUMED_CALL_IDS),
+    }
+    await env.KV.put(KV_KEYS.RESPONSES_ALIAS_PREFIX + responseId, JSON.stringify(bounded), {
+      expirationTtl: RESPONSE_ALIAS_TTL_SECONDS,
+    })
+  } catch { /* 别名保存失败不影响响应 */ }
+}
+
+export async function getResponseAlias(env: Env, responseId: string): Promise<ResponseAliasMeta | null> {
+  if (!responseId) return null
+  try {
+    const raw = await env.KV.get(KV_KEYS.RESPONSES_ALIAS_PREFIX + responseId)
+    if (!raw) return null
+    const parsed = JSON.parse(raw) as ResponseAliasMeta
+    if (!parsed || typeof parsed !== 'object') return null
+    return {
+      sourceResponseId: String(parsed.sourceResponseId || responseId),
+      createdAt: Number(parsed.createdAt) || 0,
+      consumedCallIds: Array.isArray(parsed.consumedCallIds) ? parsed.consumedCallIds.map(String) : [],
+    }
+  } catch { return null }
+}
+
+/**
+ * 消费一个 tool call_id（一次性）。返回 false 表示该 call_id 已被消费过，
+ * 调用方应返回 409 tool_output_already_consumed，避免重复执行有副作用的工具。
+ */
+export async function consumeResponseCallId(env: Env, responseId: string, callId: string): Promise<boolean> {
+  if (!responseId || !callId) return true
+  try {
+    const alias = await getResponseAlias(env, responseId)
+    if (!alias) return true
+    if (alias.consumedCallIds.includes(callId)) return false
+    alias.consumedCallIds = [...alias.consumedCallIds, callId].slice(-MAX_CONSUMED_CALL_IDS)
+    // 消费表更新采用就地覆盖（与别名"不可变分支点"互不冲突：只追加消费记录）
+    await env.KV.put(KV_KEYS.RESPONSES_ALIAS_PREFIX + responseId, JSON.stringify(alias), {
+      expirationTtl: RESPONSE_ALIAS_TTL_SECONDS,
+    })
+    return true
+  } catch {
+    // 消费表故障时放行（不能因记录失败阻断正常请求），但已记录场景仍会拒绝
+    return true
+  }
+}
+
 // ===== MCP Server CRUD（MCP 聚合网关） =====
 
 export async function getMcps(env: Env): Promise<McpServer[]> {

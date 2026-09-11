@@ -596,6 +596,32 @@ export function isRetryableChatConnectError(err: unknown): boolean {
   return /WS_DIAL_ERROR|ws dial failed|WS_HANDSHAKE_INVALID|WS_HANDSHAKE_EMPTY|WS_HANDSHAKE_UNEXPECTED_FRAME|timeout waiting handshake|ws error|ws closed|ws already closed/.test(err.message)
 }
 
+/**
+ * ChatHub 调用失败（移植自 M365-Gateway ChatHubAttemptError）：
+ * `invocationSubmitted` 为真表示 chat payload 已发出，微软可能已产生副作用。
+ * 此时**任何**重连/重试/跨账号失败转移都必须被拒绝，否则会重复执行用户任务。
+ */
+export class ChatHubAttemptError extends Error {
+  readonly invocationSubmitted: boolean
+  readonly reconnectSafe: boolean
+  constructor(message: string, invocationSubmitted: boolean) {
+    super(message)
+    this.name = 'ChatHubAttemptError'
+    this.invocationSubmitted = invocationSubmitted
+    this.reconnectSafe = !invocationSubmitted
+  }
+}
+
+/**
+ * 判断一次 ChatHub 调用失败是否允许跨账号失败转移（同 B mayFailOverChatHubFailure）。
+ * payload 已提交 → 绝不允许（会重复执行）；客户端主动中止/总截止/进度超时 → 不允许（重试无意义）。
+ */
+export function mayFailOverChatHubFailure(err: unknown): boolean {
+  if (err instanceof ChatHubAttemptError) return !err.invocationSubmitted
+  if (!(err instanceof Error)) return false
+  return !/REQUEST_ABORTED|CHAT_DEADLINE_EXCEEDED|CHAT_PROGRESS_TIMEOUT|deadline exceeded|progress deadline/.test(err.message)
+}
+
 const ANSWER_MESSAGE_TYPES = [
   'Chat', 'Suggestion', 'InternalSearchQuery', 'Disengaged', 'InternalLoaderMessage', 'Progress',
   'RenderCardRequest', 'SemanticSerp', 'GenerateContentQuery', 'SearchQuery', 'ConfirmationCard',
@@ -935,6 +961,8 @@ export async function chatWithHandlers(
   const aborted = () => opts.signal?.aborted === true
   let disengaged = false
   let pingTimer: ReturnType<typeof setInterval> | undefined
+  /** 一旦 chat payload 发出即置位：禁止后续任何重连/重试/跨账号转移，避免重复执行副作用 */
+  let invocationSubmitted = false
   let socket!: OutboundWebSocket
   let next!: () => Promise<SocketRead>
   let push!: (v: SocketRead) => void
@@ -1036,9 +1064,11 @@ export async function chatWithHandlers(
       try { socket.send(`{"type":6}${RS}`) } catch { /* read side reports closure */ }
     }, 15_000)
 
-    // 4) 发送 chat payload
+    // 4) 发送 chat payload。发送之后 invocationSubmitted 置位：上游可能已产生副作用，
+    //    后续任何失败都不允许重连/重试/跨账号转移（由 ChatHubAttemptError 向调用方表达）。
     const payload = chatPayload(req, requestID, firstTurn)
     socket.send(payload)
+    invocationSubmitted = true
 
     // 5) 事件循环
     const seenStreamTools = new Set<string>()
@@ -1324,6 +1354,15 @@ export async function chatWithHandlers(
       }
     }
     throw new Error('chathub response deadline exceeded before completion')
+  } catch (err) {
+    // 把调用失败包装为 ChatHubAttemptError，向调用方暴露 invocationSubmitted：
+    // payload 已提交的失败绝不允许重连/重试/跨账号转移（避免重复执行用户任务）。
+    if (err instanceof ChatHubAttemptError) throw err
+    const message = err instanceof Error ? err.message : String(err)
+    const wrapped = new ChatHubAttemptError(message, invocationSubmitted) as ChatHubAttemptError & { retryAfterSeconds?: number }
+    const retryAfterSeconds = (err as Error & { retryAfterSeconds?: number })?.retryAfterSeconds
+    if (typeof retryAfterSeconds === 'number') wrapped.retryAfterSeconds = retryAfterSeconds
+    throw wrapped
   } finally {
     if (pingTimer) { clearInterval(pingTimer); pingTimer = undefined }
     try { socket.close() } catch { /* ignore */ }

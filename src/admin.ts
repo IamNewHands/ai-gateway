@@ -43,7 +43,8 @@ import { listSessions as listM365Sessions, deleteSession as deleteM365Session } 
 import { listConversations as listM365Conversations, whitelistConversation, unwhitelistConversation, getCleanupMode, setCleanupMode, getCleanupConfig, setCleanupConfig, deleteConversationRecord } from './m365/conversation-manager'
 import { autoCleanupProvider } from './m365/auto-cleanup'
 import { getM365AccountInfos, listM365Accounts, removeM365Account, m365PoolDiagnostic } from './m365/oauth'
-import { clearAccountHealth, isAccountAvailable, accountCooldownSeconds } from './m365/account-health'
+import { clearAccountHealth, isAccountAvailable, accountCooldownSeconds, readHealth } from './m365/account-health'
+import { fluxSnapshot } from './m365/account-flux'
 import type {
   AppEnv,
   Env,
@@ -238,6 +239,7 @@ export async function handleCreateProvider(c: Context<AppEnv>) {
     traeMaxMessages: body.traeMaxMessages,
     traeMaxHistoryChars: body.traeMaxHistoryChars,
     traeMaxToolSchemaChars: body.traeMaxToolSchemaChars,
+    accountSpread: body.accountSpread,
     apiKeys: normalizeArray(body.apiKeys, (k) => ({ key: k, enabled: true })),
     models: body.models
       ? normalizeArray(body.models, (m) => ({ id: m, enabled: true }))
@@ -290,6 +292,7 @@ export async function handleUpdateProvider(c: Context<AppEnv>) {
   if (body.traeMaxMessages !== undefined) updates.traeMaxMessages = body.traeMaxMessages ?? undefined
   if (body.traeMaxHistoryChars !== undefined) updates.traeMaxHistoryChars = body.traeMaxHistoryChars ?? undefined
   if (body.traeMaxToolSchemaChars !== undefined) updates.traeMaxToolSchemaChars = body.traeMaxToolSchemaChars ?? undefined
+  if (body.accountSpread !== undefined) updates.accountSpread = body.accountSpread ?? undefined
 if (body.apiKeys !== undefined) {
     updates.apiKeys = normalizeArray(body.apiKeys, (k) => ({ key: k, enabled: true }))
   }
@@ -371,6 +374,7 @@ export async function handleUpsertProvider(c: Context<AppEnv>) {
       traeMaxMessages: body.traeMaxMessages,
       traeMaxHistoryChars: body.traeMaxHistoryChars,
       traeMaxToolSchemaChars: body.traeMaxToolSchemaChars,
+      accountSpread: body.accountSpread,
       createdAt: now,
       updatedAt: now,
     }
@@ -406,6 +410,7 @@ export async function handleUpsertProvider(c: Context<AppEnv>) {
   if (body.traeMaxMessages !== undefined) updates.traeMaxMessages = body.traeMaxMessages ?? undefined
   if (body.traeMaxHistoryChars !== undefined) updates.traeMaxHistoryChars = body.traeMaxHistoryChars ?? undefined
   if (body.traeMaxToolSchemaChars !== undefined) updates.traeMaxToolSchemaChars = body.traeMaxToolSchemaChars ?? undefined
+  if (body.accountSpread !== undefined) updates.accountSpread = body.accountSpread ?? undefined
 
   // keys 合并：以现有为底，按 key 字符串去重追加，保留原 enabled
   if (body.apiKeys !== undefined) {
@@ -2409,6 +2414,9 @@ export async function handleM365ClearCooldown(c: Context<AppEnv>) {
   }
 }
 
+/** 账号超过该时长未被使用即视为"休眠"（对齐 M365-Gateway 的休眠待命语义） */
+const M365_DORMANT_MS = 24 * 60 * 60 * 1000
+
 /** M365 账号池管理：GET 列出；DELETE 移除指定账号(?oid=) */
 export async function handleM365Accounts(c: Context<AppEnv>) {
   const providerId = c.req.param('id')
@@ -2434,19 +2442,57 @@ export async function handleM365Accounts(c: Context<AppEnv>) {
       return c.json({ success: removed, message: removed ? '账号已移除' : '未找到该账号' }, removed ? 200 : 404)
     }
     const infos = await getM365AccountInfos(c.env, providerId)
+    // 并发快照：inflight 按 oid 计数，用于判断账号"使用中"
+    const snap = await fluxSnapshot(c.env, providerId).catch(() => ({ limit: 1, inflight: {} as Record<string, number> }))
+    const now = Date.now()
     const accounts = []
     for (const info of infos) {
       const oid = info.oid || ''
+      const health = oid ? await readHealth(c.env, oid) : null
+      const cooldownUntil = health?.cooldownUntil && health.cooldownUntil > now ? health.cooldownUntil : 0
+      const imageLimitedUntil = health?.imageLimitedUntil && health.imageLimitedUntil > now ? health.imageLimitedUntil : 0
+      const trippedUntil = health?.trippedUntil && health.trippedUntil > now ? health.trippedUntil : 0
+      const authFailed = !!health?.authFailed
+      const inflight = oid ? (snap.inflight[oid] || 0) : 0
+      const available = info.connected ? (oid ? await isAccountAvailable(c.env, oid) : false) : false
+      const cooldownSeconds = info.connected ? (oid ? await accountCooldownSeconds(c.env, oid) : 0) : 0
+      // 账号状态语义：使用中(inflight>0) > 未连接 > 授权失效 > 已隔离(图片额度耗尽/鉴权) > 冷却中 > 休眠(长期未用) > 空闲
+      const idleMs = info.lastUsedAt ? now - info.lastUsedAt : -1
+      let state: 'in_use' | 'idle' | 'dormant' | 'cooldown' | 'auth_failed' | 'isolated' | 'disconnected'
+      if (!info.connected) state = 'disconnected'
+      else if (inflight > 0) state = 'in_use'
+      else if (authFailed) state = 'auth_failed'
+      else if (imageLimitedUntil > 0) state = 'isolated'
+      else if (cooldownUntil > 0 || trippedUntil > 0) state = 'cooldown'
+      else if (idleMs < 0 || idleMs > M365_DORMANT_MS) state = 'dormant'
+      else state = 'idle'
       accounts.push({
         connected: info.connected ?? false,
         email: info.email ?? null,
         oid: oid || null,
         tid: info.tid ?? null,
         tokenExpiresAt: info.expiresAt ?? null,
-        healthy: oid ? await isAccountAvailable(c.env, oid) : false,
+        lastUsedAt: info.lastUsedAt ?? null,
+        inflight,
+        state,
+        available,
+        cooldownSeconds,
+        cooldownUntil: cooldownUntil || null,
+        imageLimitedUntil: imageLimitedUntil || null,
+        trippedUntil: trippedUntil || null,
+        healthy: available && cooldownSeconds === 0,
       })
     }
-    return c.json({ success: true, data: { provider: providerId, accounts } })
+    const summary = {
+      total: accounts.length,
+      inUse: accounts.filter((a) => a.state === 'in_use').length,
+      idle: accounts.filter((a) => a.state === 'idle').length,
+      dormant: accounts.filter((a) => a.state === 'dormant').length,
+      cooling: accounts.filter((a) => a.state === 'cooldown').length,
+      unhealthy: accounts.filter((a) => !a.healthy).length,
+      concurrencyLimit: snap.limit,
+    }
+    return c.json({ success: true, data: { provider: providerId, accounts, summary } })
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err)
     return c.json({ error: { message: msg, type: 'internal_error' } }, 500)

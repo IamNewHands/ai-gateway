@@ -400,6 +400,8 @@ export interface CreateProviderRequest {
   traeMaxMessages?: number
   traeMaxHistoryChars?: number
   traeMaxToolSchemaChars?: number
+  /** M365 会话级多账号分摊（Account Spread）：开启后跨请求轮询不同健康账号分摊负载 */
+  accountSpread?: boolean
 }
 
 export interface UpdateProviderRequest {
@@ -431,6 +433,8 @@ export interface UpdateProviderRequest {
   traeMaxMessages?: number | null
   traeMaxHistoryChars?: number | null
   traeMaxToolSchemaChars?: number | null
+  /** M365 会话级多账号分摊（Account Spread，传 false/null 关闭） */
+  accountSpread?: boolean | null
 }
 
 /**
@@ -462,6 +466,8 @@ export interface UpsertProviderRequest {
   traeMaxMessages?: number
   traeMaxHistoryChars?: number
   traeMaxToolSchemaChars?: number
+  /** M365 会话级多账号分摊（Account Spread） */
+  accountSpread?: boolean
 }
 
 /**
@@ -570,8 +576,12 @@ export interface Env {
   M365_SESSION: DurableObjectNamespace
   /** M365 账号级并发闸门 Durable Object（每 provider 一个，跨会话共享并发计数） */
   M365_FLUX: DurableObjectNamespace
-  /** M365 每账号最大并发对话数（默认 8） */
+  /** M365 每账号最大并发对话数（默认 1 = 同账号全局串行；设 >1 可放开并发） */
   M365_ACCOUNT_DEFAULT_CONCURRENCY?: string
+  /** M365 同账号两次调用之间的最小间隔（毫秒，默认 1000；设 0 关闭节流） */
+  M365_ACCOUNT_MIN_INTERVAL_MS?: string
+  /** M365 账号轮转开关（'true' 开启）：按会话指纹轮转全部健康账号（默认关闭 = 单活为主） */
+  M365_ACCOUNT_SPREAD?: string
   /** M365 会话签名/绑定 TTL（小时，默认 2） */
   M365_SESSION_TTL_HOURS?: string
   /** M365 上下文内容复用 TTL（小时，默认 2） */
@@ -583,6 +593,11 @@ export interface Env {
   M365_CONTEXT_WINDOW_TOKENS?: string
   /** M365 单次对话最大工具轮数（默认 32，可用 M365_MAX_TOOL_ROUNDS 覆盖，上限 512） */
   M365_MAX_TOOL_ROUNDS?: string
+  /**
+   * M365 单个逻辑请求总截止时间（毫秒，默认 600000 = 10 分钟）。
+   * 工具路由、主回答、纠正、证据恢复共享同一预算，不会因多段重试叠加成无限任务。
+   */
+  M365_LOGICAL_REQUEST_TIMEOUT_MS?: string
   /** M365 SSE 调试日志开关（'true' 开启）：记录 ChatHub 原始文本 / OpenAI delta / 最终聚合三层，排查换行与格式来源 */
   M365_DEBUG_SSE?: string
   /** M365 SSE 调试日志单条采样字符数（默认 2000），防止长文档/长回答写爆日志 */

@@ -12,3 +12,7 @@ docs/
 # 本地调试日志，绝不提交
 debug.log
 *.log
+# pnpm 本地缓存/工作区产物（本仓库使用 npm，勿提交）
+.pnpm-store/
+pnpm-lock.yaml
+pnpm-workspace.yaml

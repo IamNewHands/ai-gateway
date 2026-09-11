@@ -1,5 +1,5 @@
 import { Context } from 'hono'
-import { getProvider, getProviders, getModelsListCache, setModelsListCache, getUnimodel, getUnimodels, resolveProviderBaseUrl, getResponseHistory, saveResponseHistory } from './storage'
+import { getProvider, getProviders, getModelsListCache, setModelsListCache, getUnimodel, getUnimodels, resolveProviderBaseUrl, getResponseHistory, saveResponseHistory, saveResponseAlias, getResponseAlias, consumeResponseCallId } from './storage'
 import { KV_KEYS, KEY_HEALTH_COOLDOWN_MS, KEY_HEALTH_MAX_FAILURES, OAUTH_TOKEN_REFRESH_MARGIN_MS, UNIMODEL_PROVIDER_ID } from './config'
 import type { AppEnv, Env, ProxyRequestBody } from './types'
 import { createAnalyticsContext, normalizeAnthropicUsage, normalizeChatUsage, normalizeResponsesUsage, summarizeError } from './analytics/types'
@@ -3328,7 +3328,30 @@ export async function handleResponses(c: Context<AppEnv>) {
 
     // M365 Copilot：OAuth 授权码转发（OpenAI 格式），再转回 Responses 格式。
     if (isM365Provider(provider)) {
-      return await handleResponsesM365(c, provider, model, openaiBody, originalStream, g5Base, g5Save)
+      // Responses 别名强约束：校验本次提交的 tool 结果 call_id 是否已被消费（防重复执行有副作用工具），
+      // 并在完成后把新建的 response.id 注册为不可变别名，供后续 previous_response_id 派生分支。
+      const prevId = responsesBody['previous_response_id'] ? String(responsesBody['previous_response_id']) : ''
+      const consumedCheck = await validateConsumedCallIds(c.env, prevId, responsesReq)
+      if (!consumedCheck.ok) {
+        return c.json({ error: { message: consumedCheck.message, type: 'tool_output_already_consumed' } }, 409)
+      }
+      const m365AliasSave = (respId: string, fullHistory: unknown[]) => {
+        g5Save?.(respId, fullHistory)
+        try {
+          c.executionCtx.waitUntil((async () => {
+            await saveResponseAlias(c.env, respId, {
+              sourceResponseId: prevId || respId,
+              createdAt: Date.now(),
+              consumedCallIds: consumedCheck.callIds,
+            })
+            // 把本请求提交的 call_id 标记为已消费（写在被引用的别名上），防止重复回填执行结果
+            for (const callId of consumedCheck.callIds) {
+              await consumeResponseCallId(c.env, prevId, callId)
+            }
+          })())
+        } catch { /* 别名保存失败不影响响应 */ }
+      }
+      return await handleResponsesM365(c, provider, model, openaiBody, originalStream, g5Base, m365AliasSave)
     }
 
     // TRAE SOLO：账号池 + SOLO 协议转发（proxyTraeChatRequest 返回 OpenAI SSE），再转回 Responses 格式。
@@ -4041,6 +4064,38 @@ async function handleResponsesCnb(
   g5Save?: (respId: string, fullHistory: unknown[]) => void
 ): Promise<Response> {
   return handleResponsesSpecial(c, provider, model, openaiBody, originalStream, proxyCnbChatRequest, 'CNB', g5Base, g5Save)
+}
+
+/**
+ * 校验本次 Responses 请求提交的 tool 结果 call_id 是否已被消费（同原版 tool_output_already_consumed）。
+ * 返回 { ok, callIds }：callIds 为本请求涉及的 call_id 列表，供完成后写入别名消费表。
+ */
+async function validateConsumedCallIds(
+  env: Env,
+  previousResponseId: string,
+  responsesReq: Record<string, unknown>,
+): Promise<{ ok: true; callIds: string[] } | { ok: false; message: string }> {
+  const callIds: string[] = []
+  const input = responsesReq['input']
+  if (Array.isArray(input)) {
+    for (const item of input) {
+      if (!item || typeof item !== 'object') continue
+      const rec = item as Record<string, unknown>
+      // function_call_output 项携带 call_id，代表客户端执行完某工具并回填结果
+      const callId = typeof rec['call_id'] === 'string' ? rec['call_id'] : ''
+      if (rec['type'] === 'function_call_output' && callId) callIds.push(callId)
+    }
+  }
+  if (!previousResponseId || callIds.length === 0) return { ok: true, callIds }
+  const alias = await getResponseAlias(env, previousResponseId)
+  if (alias) {
+    for (const callId of callIds) {
+      if (alias.consumedCallIds.includes(callId)) {
+        return { ok: false, message: `tool output for call_id "${callId}" has already been consumed` }
+      }
+    }
+  }
+  return { ok: true, callIds }
 }
 
 /**
