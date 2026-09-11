@@ -88,6 +88,80 @@ export interface ChatHubResult {
 
 export type ChatHubStreamHandler = (ev: ChatHubStreamEvent) => void
 
+// 所有文本缓冲区都需明显低于 Worker 隔离区内存上限：每个 JS 字符串可能占 2 字节/字符，
+// 且解析器、重试包装与响应渲染可能同时持有数份副本。
+// 单帧字符上限：解码前/后拒绝超大帧。
+const MAX_FRAME_CHARACTERS = 1_500_000
+// 最终输出字符上限：流式文本 / 快照 / 完成消息统一约束，防止异常上游撑爆内存。
+const MAX_OUTPUT_CHARACTERS = 2_000_000
+// 队列积压字符上限：读循环来不及消费、积压超过上限即快速失败。
+const MAX_QUEUED_SOCKET_CHARACTERS = 2_000_000
+// SignalR 通常每个 WS 消息只携带少量记录；设一个有界总数，
+// 避免畸形的小记录流把整个请求的 CPU 预算耗在 JSON.parse 上，同时为合法长回合留足空间。
+const MAX_SIGNALR_RECORDS_PER_REQUEST = 16_384
+// 上游图片 URL / data URL 的字符总量上限（含 base64 的 6MiB 量级）。
+const MAX_UPSTREAM_IMAGE_URL_CHARACTERS = 6 * 1024 * 1024
+
+export const CHAT_HUB_PAYLOAD_LIMITS = Object.freeze({
+  frameCharacters: MAX_FRAME_CHARACTERS,
+  frameRecords: MAX_SIGNALR_RECORDS_PER_REQUEST,
+  outputCharacters: MAX_OUTPUT_CHARACTERS,
+  queuedSocketCharacters: MAX_QUEUED_SOCKET_CHARACTERS,
+  upstreamImageURLCharacters: MAX_UPSTREAM_IMAGE_URL_CHARACTERS,
+})
+
+/** 有界负载失败的封闭机器标签（子类型） */
+export type BoundedPayloadSubtype =
+  | 'WS_FRAME_TOO_LARGE'
+  | 'WS_FRAME_TOO_MANY_RECORDS'
+  | 'WS_BUFFER_TOO_LARGE'
+  | 'CHAT_OUTPUT_TOO_LARGE'
+  | 'CHAT_IMAGE_OUTPUT_TOO_LARGE'
+
+/** 有界负载失败发生的处理阶段 */
+export type BoundedPayloadPhase =
+  | 'websocket_frame'
+  | 'websocket_queue'
+  | 'streamed_text'
+  | 'update_snapshot'
+  | 'completion_snapshot'
+  | 'completion_message'
+  | 'image_output'
+
+export interface BoundedPayloadMetadata {
+  subtype: BoundedPayloadSubtype
+  observed: number
+  limit: number
+  phase: BoundedPayloadPhase
+}
+
+/** 隐私安全的体积失败错误：只保留数值边界与封闭机器标签；
+ * 负载文本、URL 与工具结果绝不进入错误对象或其诊断记录。 */
+export class BoundedPayloadError extends Error implements BoundedPayloadMetadata {
+  readonly subtype: BoundedPayloadSubtype
+  readonly observed: number
+  readonly limit: number
+  readonly phase: BoundedPayloadPhase
+
+  constructor(subtype: BoundedPayloadSubtype, observed: number, limit: number, phase: BoundedPayloadPhase) {
+    super(subtype)
+    this.name = 'BoundedPayloadError'
+    this.subtype = subtype
+    this.observed = observed
+    this.limit = limit
+    this.phase = phase
+  }
+}
+
+export function assertBoundedPayload(
+  subtype: BoundedPayloadSubtype,
+  observed: number,
+  limit: number,
+  phase: BoundedPayloadPhase,
+): void {
+  if (observed > limit) throw new BoundedPayloadError(subtype, observed, limit, phase)
+}
+
 export interface ChatHubOptions {
   /** 会话/请求总超时（ms），默认 300_000 */
   timeoutMs?: number
@@ -610,19 +684,121 @@ export function isRetryableChatConnectError(err: unknown): boolean {
 }
 
 /**
+ * 从失败原因提取闭合纯文本消息（同 B failureMessage）。
+ * string 原样保留（兼容旧构造签名），其余按 Error/String/兜底标记处理。
+ */
+function failureMessage(cause: unknown): string {
+  if (typeof cause === 'string') return cause
+  return cause instanceof Error ? cause.message : String(cause ?? 'UNKNOWN_CHAT_ERROR')
+}
+
+/**
+ * 同一账号重连仅在一次 invocation 尚未提交给 ChatHub 时安全。
+ * 一旦 chatPayload() 已发出，上游可能已执行搜索等副作用（即使尚无文本增量到达客户端），
+ * 重放该 invocation 会重复执行工作并构成实质性的账号风险信号。
+ */
+export function mayReconnectChatHubFailure(cause: unknown, invocationSubmitted: boolean): boolean {
+  if (invocationSubmitted) return false
+  // 适配点：源使用固定传输码（WS_DIAL_FAILED:5xx / WS_DIAL_ERROR / WS_READ_TIMEOUT 等），
+  // 而 ai-gateway 的拨号失败消息格式为 `ws dial failed: HTTP {status}`。因此这里复用目标既有、
+  // 已测试的传输类白名单 isRetryableChatConnectError（语义等价：pre-submit 且有界可重连的传输故障），
+  // 并补齐源侧额外的完成前错误码。cause 可能为 string（构造签名兼容），故先归一为 Error。
+  const raw = failureMessage(cause)
+  const upper = raw.toUpperCase()
+  if (upper === 'WS_ERROR_BEFORE_COMPLETION') return true
+  if (upper.startsWith('WS_CLOSED_BEFORE_COMPLETION:')) return true
+  // isRetryableChatConnectError 的传输白名单含大小写混用的字面量（如 `ws dial failed`），
+  // 故用原始大小写消息构造等价 Error，而非大写形式。
+  const normalized = cause instanceof Error ? cause : new Error(raw)
+  return isRetryableChatConnectError(normalized)
+}
+
+/**
  * ChatHub 调用失败（移植自 M365-Gateway ChatHubAttemptError）：
  * `invocationSubmitted` 为真表示 chat payload 已发出，微软可能已产生副作用。
  * 此时**任何**重连/重试/跨账号失败转移都必须被拒绝，否则会重复执行用户任务。
+ * `terminalEmptyQuota` 标记上游终态配额耗尽（如 CHAT_THROTTLED_QUOTA_EXHAUSTED），
+ * `boundedPayload` 携带体积失败的数值边界（不保留被拒负载本身）。
+ *
+ * 构造签名向后兼容：`new ChatHubAttemptError(message:string, submitted:boolean)` 与
+ * `new ChatHubAttemptError(cause:unknown, submitted:boolean, terminalEmptyQuota?:boolean)` 均可。
  */
 export class ChatHubAttemptError extends Error {
-  readonly invocationSubmitted: boolean
   readonly reconnectSafe: boolean
-  constructor(message: string, invocationSubmitted: boolean) {
-    super(message)
+  readonly invocationSubmitted: boolean
+  readonly terminalEmptyQuota: boolean
+  readonly boundedPayload: BoundedPayloadMetadata | null
+
+  constructor(causeOrMessage: unknown, invocationSubmitted: boolean, terminalEmptyQuota = false) {
+    super(failureMessage(causeOrMessage))
     this.name = 'ChatHubAttemptError'
     this.invocationSubmitted = invocationSubmitted
-    this.reconnectSafe = !invocationSubmitted
+    this.terminalEmptyQuota = terminalEmptyQuota
+    this.reconnectSafe = mayReconnectChatHubFailure(causeOrMessage, invocationSubmitted)
+    this.boundedPayload = boundedPayloadMetadata(causeOrMessage)
   }
+}
+
+/** 跨 ChatHubAttemptError 包装保留体积元数据，但不保留被拒负载或任意上游 Error 对象。 */
+export function boundedPayloadMetadata(cause: unknown): BoundedPayloadMetadata | null {
+  const metadata = cause instanceof BoundedPayloadError
+    ? cause
+    : cause instanceof ChatHubAttemptError
+      ? cause.boundedPayload
+      : null
+  if (!metadata) return null
+  return {
+    subtype: metadata.subtype,
+    observed: metadata.observed,
+    limit: metadata.limit,
+    phase: metadata.phase,
+  }
+}
+
+export interface BoundedPayloadDiagnostic {
+  event: 'chathub_bounded_payload_rejected'
+  subtype: BoundedPayloadSubtype
+  phase: BoundedPayloadPhase
+  observed_characters: number
+  limit_characters: number
+}
+
+export function boundedPayloadDiagnostic(cause: unknown): BoundedPayloadDiagnostic | null {
+  const metadata = boundedPayloadMetadata(cause)
+  if (!metadata) return null
+  return {
+    event: 'chathub_bounded_payload_rejected',
+    subtype: metadata.subtype,
+    phase: metadata.phase,
+    observed_characters: metadata.observed,
+    limit_characters: metadata.limit,
+  }
+}
+
+function logBoundedPayloadFailure(cause: unknown): void {
+  const diagnostic = boundedPayloadDiagnostic(cause)
+  if (diagnostic) console.error(JSON.stringify(diagnostic))
+}
+
+/** 有界同账号重试之间保留最强提交事实：第二次 pre-submit 失败
+ * 不得抹去第一次已被接受的事实，否则调用方会在另一账号重放逻辑 invocation。
+ */
+export function preserveChatHubSubmissionHistory(cause: unknown, invocationSubmitted: boolean): unknown {
+  if (!invocationSubmitted) return cause
+  if (cause instanceof ChatHubAttemptError && cause.invocationSubmitted) return cause
+  return new ChatHubAttemptError(
+    cause,
+    true,
+    cause instanceof ChatHubAttemptError && cause.terminalEmptyQuota,
+  )
+}
+
+export function chatHubInvocationWasSubmitted(cause: unknown): boolean {
+  return cause instanceof ChatHubAttemptError && cause.invocationSubmitted
+}
+
+export function isTerminalEmptyQuotaFailure(cause: unknown): boolean {
+  return cause instanceof ChatHubAttemptError && cause.terminalEmptyQuota
 }
 
 /**

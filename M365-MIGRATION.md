@@ -155,7 +155,33 @@ Select-String -Path "D:\GitHub_Clone\M365-Gateway\src\*.ts" `
 
 - `createStreamCancellation`、`adoptToolRouterResult` / `isolatedToolRouterCoordinates`、`chatDeliversPublicReasoning` / `chatReasoningContent` —— 这些与 Responses/推理投递路径耦合，归入批次三统一评估。
 
+### 批次二复核与移植结论（已完成）
 
+**已移植并接线**：
+
+| 符号 | 目标落地 | 验证 |
+|---|---|---|
+| `RequestBodyError` / `readTextLimited` / `readJSONLimited` | 新建 `src/request-body.ts`，逐行等价 | `request-body.test.ts` 12 例 |
+| `MAX_AI_REQUEST_BYTES`(8MiB) / `MAX_RESPONSES_REQUEST_BYTES` / `MAX_COMPACTION_REQUEST_BYTES`(16MiB) | 同上 | 同上 |
+| 入站请求体上界接线 | `proxy.ts` 三个入口（`handleProxy`/`handleAnthropicMessages`/`handleResponses`）改用 `readBoundedJSON`（读流累计计数，超限即 cancel）；`index.ts` 全局 `onError` 映射 `RequestBodyError`→413/400 | 新增守卫逻辑 |
+| `CHAT_HUB_PAYLOAD_LIMITS` / `BoundedPayloadSubtype` / `BoundedPayloadPhase` / `BoundedPayloadMetadata` / `BoundedPayloadError` / `assertBoundedPayload` | `src/m365/chathub.ts` | `payload-guardrails.test.ts` 19 例 |
+| `boundedPayloadMetadata` / `BoundedPayloadDiagnostic` / `boundedPayloadDiagnostic`（+私有 `logBoundedPayloadFailure`） | `src/m365/chathub.ts`，隐私安全：仅数值+机器标签 | 同上 |
+| `ChatHubAttemptError` 增 `terminalEmptyQuota` / `boundedPayload` 字段 | 构造签名向后兼容（string 或 unknown cause 均可） | 同上 |
+| `mayReconnectChatHubFailure` | ✅ 已移植；**适配点**：源用固定传输码（`WS_DIAL_FAILED:5xx`），目标消息为 `ws dial failed: HTTP {status}`，故复用目标既有 `isRetryableChatConnectError` 白名单并补 `WS_ERROR_BEFORE_COMPLETION`/`WS_CLOSED_BEFORE_COMPLETION` | 同上 + 既有 `chat-reconnect.test.ts` |
+| `preserveChatHubSubmissionHistory` / `chatHubInvocationWasSubmitted` / `isTerminalEmptyQuotaFailure` | `src/m365/chathub.ts` | `payload-guardrails.test.ts` |
+
+**复核后判定为"目标已等价实现/不同架构模型"，不重复移植**：
+
+| 符号 | 结论 |
+|---|---|
+| `quotaExhausted` | 已存在于 `account-health.ts`（`isSelectableAccount` 内 `values.every(v => v <= 0)`），批次零已确认 |
+| `appendChatSnapshot` / `chooseChatHubText` | 目标以 `emitSnapshot`（`chathub.ts:1134`）内联实现"前缀命中才补发尾部 + 保留更长快照"，语义等价 |
+| `appendUpstreamImageURLs` | 目标 `multimodal.ts extractUpstreamImageURLs` + `chathub.ts` 内联去重/上限（`imageLimitDetected`、`MAX_ATTACHMENTS`），语义等价但未单列导出函数 |
+| `chatHubAttachments` | 目标用 `ChatHubAttachment` + `uploadAttachments`（含 image-only 计数上限 `MAX_ATTACHMENTS`），不同数据模型，功能覆盖 |
+| `normalizeClientFunctionCall` | 目标 `normalizeClientArgumentKeys`（键归一）+ `validateDetectedToolCalls`（schema 校验），语义等价 |
+| `parseToolDecisionAnswer` / `isOrdinaryToolDecisionAnswer` / `parseFunctionCall` | 属 AGT 决策协议/超大函数解析，目标走 `parseModelToolDecision`/`fencedToolCalls`/`nativeToolCalls` 路线，设计差异，不做 1:1 搬运 |
+
+### 未移植 ❌（按批次）
 
 #### 批次一：长任务稳定性（✅ 已完成，见上方"批次一复核与移植结论"）
 
@@ -170,25 +196,9 @@ Select-String -Path "D:\GitHub_Clone\M365-Gateway\src\*.ts" `
 | `adoptToolRouterResult` / `isolatedToolRouterCoordinates` | 归入批次三评估 |
 | `chatDeliversPublicReasoning` / `chatReasoningContent` | 归入批次三评估 |
 
-#### 批次二：安全护栏
+#### 批次二：安全护栏（✅ 已完成，见上方"批次二复核与移植结论"）
 
-| 符号 | 说明 |
-|---|---|
-| `RequestBodyError` / `readTextLimited` / `readJSONLimited` | 入站请求体大小上界（8MiB） |
-| `MAX_AI_REQUEST_BYTES` / `MAX_COMPACTION_REQUEST_BYTES` | 请求体上限常量 |
-| `CHAT_HUB_PAYLOAD_LIMITS` | 5 类负载上限 |
-| `assertBoundedPayload` / `BoundedPayloadError` | 有界负载断言 |
-| `quotaExhausted` | 配额耗尽判定（`remainingAllowance ≤ 0`） |
-| `preserveChatHubSubmissionHistory` | 跨重试保留已提交事实 |
-| `mayReconnectChatHubFailure` | 重连白名单判定 |
-| `chatHubInvocationWasSubmitted` | 已提交事实提取 |
-| `isTerminalEmptyQuotaFailure` | 终态空配额判定 |
-| `appendUpstreamImageURLs` | 上游图片 URL 去重 + 上限 |
-| `chatHubAttachments` | image-only 附件校验 |
-| `appendChatSnapshot` / `chooseChatHubText` | 快照/文本裁定 |
-| `normalizeClientFunctionCall` | 工具调用最终归一 |
-| `parseToolDecisionAnswer` / `isOrdinaryToolDecisionAnswer` | AGT 决策协议（路线差异） |
-| `parseFunctionCall` | 超大函数调用解析（fenced/envelope） |
+> 本批次全部项已落地或复核为等价实现，无遗留。
 
 #### 批次三：会话模型
 
@@ -226,10 +236,11 @@ Select-String -Path "D:\GitHub_Clone\M365-Gateway\src\*.ts" `
 |---|---|---|---|
 | 批次零 | 复核 🔍 项，修复现有实现（改名/内联/有bug/未接线） | 高 | ✅ 已完成 |
 | 批次一 | 长任务稳定性：工具路由确定性恢复 + Fable 拒绝恢复 + 续接审计 + 未完成结局 | 高 | ✅ 已完成 |
-| 批次二 | 安全护栏：请求体限制 + 有界负载 + 配额判定 + 重连护栏 | 高 | 🔄 进行中 |
-| 批次三 | 会话模型：可移植状态 + 分支隔离 + 检查点 hydrate | 中 | ⬜ 待开始 |
+| 批次二 | 安全护栏：请求体限制 + 有界负载 + 配额判定 + 重连护栏 | 高 | ✅ 已完成 |
+| 批次三 | 会话模型：可移植状态 + 分支隔离 + 检查点 hydrate | 中 | 🔄 进行中 |
 | 批次四 | 运维：请求指标追踪 + R2 归档 + 账号迁移 API | 中 | ⬜ 待开始 |
 
 **每批次统一验收**：`npx tsc --noEmit` + `npx vitest run` 全量通过 + 新增针对性测试。
 
 **进度快照**：批次零/一完成时全量回归 = 41 文件 / 559 测试全部通过，tsc 零错误。
+批次二完成时全量回归 = 43 文件 / 590 测试全部通过，tsc 零错误（新增 `src/request-body.test.ts` 12 项、`src/m365/payload-guardrails.test.ts` 19 项）。

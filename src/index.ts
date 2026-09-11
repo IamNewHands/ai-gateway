@@ -3,6 +3,7 @@ import { cors } from 'hono/cors'
 import { logger } from 'hono/logger'
 import { adminAuthMiddleware, cloudflareAccessMiddleware, proxyKeyAuthMiddleware, managementAuthMiddleware, handleLogin, handleLogout } from './auth'
 import { handleProxy, handleModels, handleAnthropicMessages, handleResponses } from './proxy'
+import { RequestBodyError } from './request-body'
 import { handleImageGeneration, handleImageFile } from './m365/images'
 import { isM365Provider } from './m365/proxy'
 import { handleProxyWebSocket } from './ws'
@@ -431,6 +432,13 @@ app.onError((err, c) => {
   // 覆盖 admin/auth 等所有 `await c.req.json()` 无 try/catch 的路径（R6）。
   if (err instanceof SyntaxError && /Unexpected (end of JSON input|token)/i.test(err.message)) {
     return c.json({ error: { message: '请求体 JSON 格式错误', type: 'bad_request' } }, 400)
+  }
+  // 入站请求体有界读取错误（移植 M365-Gateway request-body.ts）：超限 413，非法 JSON 400。
+  if (err instanceof RequestBodyError) {
+    if (err.code === 'REQUEST_TOO_LARGE') {
+      return c.json({ error: { message: 'request body exceeds configured limit', type: 'invalid_request_error', code: 'REQUEST_TOO_LARGE' } }, 413)
+    }
+    return c.json({ error: { message: '请求体 JSON 格式错误', type: 'invalid_request_error', code: 'INVALID_JSON' } }, 400)
   }
   console.error('未捕获的错误:', err)
   return c.json({ error: { message: '服务器内部错误', type: 'server_error' } }, 500)

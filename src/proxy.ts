@@ -2,6 +2,7 @@ import { Context } from 'hono'
 import { getProvider, getProviders, getModelsListCache, setModelsListCache, getUnimodel, getUnimodels, resolveProviderBaseUrl, getResponseHistory, saveResponseHistory, saveResponseAlias, getResponseAlias, consumeResponseCallId } from './storage'
 import { KV_KEYS, KEY_HEALTH_COOLDOWN_MS, KEY_HEALTH_MAX_FAILURES, OAUTH_TOKEN_REFRESH_MARGIN_MS, UNIMODEL_PROVIDER_ID } from './config'
 import type { AppEnv, Env, ProxyRequestBody } from './types'
+import { RequestBodyError, readJSONLimited, MAX_AI_REQUEST_BYTES, MAX_RESPONSES_REQUEST_BYTES } from './request-body'
 import { createAnalyticsContext, normalizeAnthropicUsage, normalizeChatUsage, normalizeResponsesUsage, summarizeError } from './analytics/types'
 import type { AnalyticsContext, UsageMetrics } from './analytics/types'
 import { createStreamUsageProbe, writeAnalyticsEvent } from './analytics/usage-logger'
@@ -951,6 +952,25 @@ export async function testModelConnection(
   }
 }
 
+/**
+ * 有界读取入站 JSON 请求体（移植 M365-Gateway request-body.ts）。
+ * 与直接 `c.req.json()` 的差异：在读流过程中累计字节数，超限即取消并抛 RequestBodyError，
+ * 保证 Worker 隔离区不会先缓冲一个超大请求体再解析（对齐 128MiB 内存上限的防护）。
+ * 超限 → REQUEST_TOO_LARGE（调用方映射 413）；非法 JSON → INVALID_JSON（映射 400）。
+ */
+async function readBoundedJSON<T>(c: Context<AppEnv>, maxBytes: number = MAX_AI_REQUEST_BYTES): Promise<T> {
+  return readJSONLimited<T>(c.req.raw, maxBytes)
+}
+
+/** 把 RequestBodyError 映射为对外 JSON 错误响应（413/400），其余错误返回 null 交由调用方处理 */
+function requestBodyErrorResponse(c: Context<AppEnv>, err: unknown): Response | null {
+  if (!(err instanceof RequestBodyError)) return null
+  if (err.code === 'REQUEST_TOO_LARGE') {
+    return c.json({ error: { message: 'request body exceeds configured limit', type: 'invalid_request_error', code: 'REQUEST_TOO_LARGE' } }, 413)
+  }
+  return c.json({ error: { message: '请求体 JSON 格式错误', type: 'invalid_request_error', code: 'INVALID_JSON' } }, 400)
+}
+
 /** 处理 /v1/chat/completions 等 API 转发（HTTP 路径） */
 export async function handleProxy(c: Context<AppEnv>): Promise<Response> {
   const url = new URL(c.req.url)
@@ -960,12 +980,14 @@ export async function handleProxy(c: Context<AppEnv>): Promise<Response> {
   let context = createAnalyticsContext(c, proxyKey, proxyKeyHash, route, '', 'sync')
 
   try {
-    const body = await c.req.json<ProxyRequestBody>()
+    const body = await readBoundedJSON<ProxyRequestBody>(c)
     const model = body.model || ''
     context = createAnalyticsContext(c, proxyKey, proxyKeyHash, route, model, isStreamRequest(body) ? 'stream' : 'sync')
     const response = await forwardProxy(c, body, c.req.method)
     return finalizeProxyResponse(c, response, context, route)
   } catch (err) {
+    const bodyErr = requestBodyErrorResponse(c, err)
+    if (bodyErr) return bodyErr
     const error = err as Error
     writeAnalyticsEvent(c, { context, result: 'failure', errorSummary: summarizeError(error) })
     return c.json({
@@ -2108,7 +2130,7 @@ export async function handleModels(c: Context<AppEnv>) {
 
 export async function handleAnthropicMessages(c: Context<AppEnv>) {
   try {
-    const anthropicBody = await c.req.json<Record<string, unknown>>()
+    const anthropicBody = await readBoundedJSON<Record<string, unknown>>(c)
     const model = anthropicBody['model'] as string
 
     if (!model) {
@@ -3235,7 +3257,7 @@ async function handleAnthropicM365(
 
 export async function handleResponses(c: Context<AppEnv>) {
   try {
-    const responsesBody = await c.req.json<Record<string, unknown>>()
+    const responsesBody = await readBoundedJSON<Record<string, unknown>>(c, MAX_RESPONSES_REQUEST_BYTES)
     const model = responsesBody['model'] as string
 
     if (!model) {
