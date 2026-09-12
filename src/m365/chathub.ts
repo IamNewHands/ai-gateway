@@ -489,6 +489,37 @@ export function finalizeText(streamed: string, final: string, emit?: (delta: str
   return final
 }
 
+/**
+ * 合并 ChatHub 的"权威全量快照"（原版 appendChatSnapshot 移植，导出以便单测）。
+ *
+ * ChatHub 以"全量快照 + 光标重写"方式送文本，快照多数是当前文本的前缀扩展。
+ * 但某些 rollouts 会送入前缀不匹配的分歧快照（例如插入引用标记后重新对齐）。
+ * 此时**必须采纳更长的那一份**：已发出的字节无法撤回，所以分歧部分不透出，
+ * 但把累计文本推进到更长的版本，否则后续增量会以陈旧偏移做差集，
+ * 表现为段落开头文字被吞掉（log4）。原版此处 return 更长者；A 原先只计数丢弃，
+ * 导致累计文本停留在更短的陈旧版本 → 截断。
+ *
+ * 返回 [新文本, 是否发生了被跳过的分歧重写]。
+ */
+export function appendChatSnapshot(
+  current: string,
+  snapshot: string,
+  emit?: (delta: string) => void,
+): { text: string; skipped: boolean } {
+  if (!snapshot) return { text: current, skipped: false }
+  if (!current) {
+    emit?.(snapshot)
+    return { text: snapshot, skipped: false }
+  }
+  if (snapshot.startsWith(current)) {
+    const tail = snapshot.substring(current.length)
+    if (tail) emit?.(tail)
+    return { text: snapshot, skipped: false }
+  }
+  // 分歧重写：采纳更长者，但不透出无法撤回的分歧部分
+  return { text: snapshot.length > current.length ? snapshot : current, skipped: true }
+}
+
 export interface ChatHubTextReconciliation {
   text: string
   divergent: boolean
@@ -1317,18 +1348,9 @@ export async function chatWithHandlers(
       if (syntheticUpstreamFailureCode(snapshot)) throw new Error('upstream rate-limit notice')
       if (contentPolicyDetected(snapshot)) throw new Error('upstream content policy flagged as offensive')
       const cur = streamedText
-      if (cur === '') {
-        streamedText = snapshot
-        onDelta?.(snapshot)
-        return
-      }
-      if (snapshot.startsWith(cur)) {
-        const tail = snapshot.substring(cur.length)
-        if (tail) { streamedText = snapshot; onDelta?.(tail) }
-        return
-      }
-      // 非前缀重写：原版跳过（仅记录），这里不做任何透出
-      skippedSnapshots++
+      const merged = appendChatSnapshot(cur, snapshot, onDelta ?? undefined)
+      streamedText = merged.text
+      if (merged.skipped) skippedSnapshots++
     }
 
     while (Date.now() < deadline) {

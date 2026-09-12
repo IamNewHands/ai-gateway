@@ -3,6 +3,7 @@ import {
   finalizeText,
   collapseExcessBlankLines,
   appendChatHubDelta,
+  appendChatSnapshot,
   scrubNarration,
   syntheticUpstreamFailureCode,
   reconcileChatHubText,
@@ -215,6 +216,50 @@ describe('chatHubUpdateHasSemanticProgress', () => {
   it('普通空消息返回 false', () => {
     expect(chatHubUpdateHasSemanticProgress({})).toBe(false)
     expect(chatHubUpdateHasSemanticProgress({ messages: [] })).toBe(false)
+  })
+})
+
+describe('appendChatSnapshot（log4 段落开头被吞回归）', () => {
+  it('current 为空 → 返回快照并透出', () => {
+    const emit = vi.fn()
+    expect(appendChatSnapshot('', 'hello', emit)).toEqual({ text: 'hello', skipped: false })
+    expect(emit).toHaveBeenCalledWith('hello')
+  })
+
+  it('快照是前缀扩展 → 只透出尾部', () => {
+    const emit = vi.fn()
+    expect(appendChatSnapshot('hello', 'hello world', emit)).toEqual({
+      text: 'hello world',
+      skipped: false,
+    })
+    expect(emit).toHaveBeenCalledWith(' world')
+  })
+
+  it('快照更长的分歧重写 → 采纳更长者（不得停在陈旧短文本）', () => {
+    const emit = vi.fn()
+    // 偏移对齐后的权威重写：前缀不匹配但更长
+    const res = appendChatSnapshot('TacReader> 主要通过', 'SangTacReader> 主要通过 WKWebView', emit)
+    expect(res.skipped).toBe(true)
+    expect(res.text).toBe('SangTacReader> 主要通过 WKWebView')
+    // 已发出的"TacReader> 主要通过"无法撤回，但也不能再透出分歧部分造成错乱
+    expect(emit).not.toHaveBeenCalled()
+  })
+
+  it('快照更短的分歧重写 → 保留当前文本', () => {
+    const emit = vi.fn()
+    const res = appendChatSnapshot('hello world', 'hello', emit)
+    expect(res).toEqual({ text: 'hello world', skipped: true })
+    expect(emit).not.toHaveBeenCalled()
+  })
+
+  it('采纳更长分歧快照后，后续增量以正确偏移做差集（log4 截断根因）', () => {
+    // 复现 log4：分歧快照被丢弃时，累计文本停留在更短版本，
+    // 后续 writeAtCursor 增量便以错误偏移做差集 → 段落开头文字被吞。
+    const stale = appendChatSnapshot('际架构', '实际架构') // 旧行为会丢弃 "实"
+    expect(stale.text).toBe('实际架构')
+    // 以推进后的文本为基准，下一段增量可完整拼接
+    const next = appendChatHubDelta(stale.text, `${stale.text}\n\n1. 原生外壳`)
+    expect(next).toBe('实际架构\n\n1. 原生外壳')
   })
 })
 
