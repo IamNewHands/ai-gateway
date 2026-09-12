@@ -102,7 +102,7 @@ type LifecycleStore = {
   releaseLease: ReturnType<typeof vi.fn>
 }
 
-function createEnv() {
+function createEnv(overrides: Record<string, unknown> = {}) {
   return {
     KV: {
       get: vi.fn(async () => null),
@@ -110,6 +110,7 @@ function createEnv() {
       delete: vi.fn(async () => undefined),
       list: vi.fn(async () => ({ keys: [], list_complete: true })),
     },
+    ...overrides,
   }
 }
 
@@ -120,7 +121,11 @@ function createSession(store: LifecycleStore): M365Session {
       rowsWritten: 0,
     })),
   }
-  const session = new M365Session({ storage: { sql } } as unknown as DurableObjectState, createEnv() as never)
+  return createSessionWithEnv(store, sql, {})
+}
+
+function createSessionWithEnv(store: LifecycleStore, sql: unknown, env: Record<string, unknown>): M365Session {
+  const session = new M365Session({ storage: { sql } } as unknown as DurableObjectState, createEnv(env) as never)
   ;(session as unknown as { sessionStore: LifecycleStore }).sessionStore = store
   return session
 }
@@ -258,6 +263,40 @@ describe('M365Session SQL request lifecycle', () => {
     expect(store.loadOrCreate).not.toHaveBeenCalled()
     expect(store.acquireLease).not.toHaveBeenCalled()
     expect(store.commitWithLease).not.toHaveBeenCalled()
+  })
+
+  it('仅超工具轮数（非死循环）时返回可协商 checkpoint 收尾而非 409 掐死整个回合', async () => {
+    const calls: LifecycleCall[] = []
+    const store = createStore(calls)
+
+    // 只超轮数上限（M365_MAX_TOOL_ROUNDS=2），两个工具调用各自独立、无重复失败/死循环。
+    const roundLimitMessages = [
+      { role: 'user', content: 'task' },
+      { role: 'assistant', content: '', tool_calls: [{ id: 'c1', type: 'function', function: { name: 'toolAlpha', arguments: '{}' } }] },
+      { role: 'tool', tool_call_id: 'c1', content: 'result-1' },
+      { role: 'assistant', content: '', tool_calls: [{ id: 'c2', type: 'function', function: { name: 'toolBeta', arguments: '{}' } }] },
+      { role: 'tool', tool_call_id: 'c2', content: 'result-2' },
+    ]
+    const env = { M365_MAX_TOOL_ROUNDS: '2' }
+    const sql = { exec: vi.fn(() => ({ toArray: () => [], rowsWritten: 0 })) }
+    const session = createSessionWithEnv(store, sql, env)
+
+    const response = await session.fetch(request(false, 'gpt-5.6', { messages: roundLimitMessages }))
+    const body = await response.json() as Record<string, unknown>
+
+    // 成功完成 + checkpoint（而非 409 error finish）→ 客户端可保留上下文继续同一任务
+    expect(response.status).toBe(200)
+    expect(body['object']).toBe('chat.completion')
+    const m365gateway = body['m365_gateway'] as Record<string, unknown>
+    expect(m365gateway).toBeTruthy()
+    expect(m365gateway['checkpoint']).toBe(true)
+    expect(m365gateway['continuation_required']).toBe(true)
+    expect(m365gateway['checkpoint_reason']).toBe('tool_round_limit')
+    expect(m365gateway['continuation_token']).toBeTruthy()
+    // 不执行上游、不获取租约——纯本地检查点
+    expect(chatWithHandlersMock).not.toHaveBeenCalled()
+    expect(calls).not.toContain('acquire-lease')
+    expect(calls).not.toContain('commit')
   })
 
   it('loads, leases, locks, executes, commits the expected generation, then releases on success', async () => {

@@ -230,13 +230,33 @@ export class M365Session {
     const evidenceLedger: AgentLedger = await buildAgentLedger(selectCompletionEvidenceMessages(messages as OaiMsgLite[]))
     const maxToolRounds = resolveMaxToolRounds(this.env.M365_MAX_TOOL_ROUNDS)
     if (!canContinue(ledger, maxToolRounds)) {
-      try { await writeLog(this.env, 'warn', `[m365-chat] provider=${providerId} → tool loop gate blocked`, `stuckLoop=${ledger.stuckLoop} repeatedFailure=${ledger.repeatedFailure} toolRounds=${ledger.toolRounds}/${maxToolRounds} sig=${ledger.repetitionSignature || ''}`) } catch { /* ignore */ }
-      return cjson({
-        error: {
-          message: ledger.stuckLoop || ledger.repeatedFailure ? 'tool loop detected' : 'tool round limit exceeded',
-          type: 'tool_round_limit',
-        },
-      }, 409)
+      const hardLock = ledger.stuckLoop || ledger.repeatedFailure || ledger.repeatedCall
+      if (hardLock) {
+        try { await writeLog(this.env, 'warn', `[m365-chat] provider=${providerId} → tool loop gate blocked`, `stuckLoop=${ledger.stuckLoop} repeatedFailure=${ledger.repeatedFailure} repeatedCall=${ledger.repeatedCall} toolRounds=${ledger.toolRounds}/${maxToolRounds} sig=${ledger.repetitionSignature || ''}`) } catch { /* ignore */ }
+        return cjson({
+          error: {
+            message: ledger.stuckLoop || ledger.repeatedFailure ? 'tool loop detected' : 'tool round limit exceeded',
+            type: 'tool_round_limit',
+          },
+        }, 409)
+      }
+      // 仅超轮数：可协商检查点收尾（对齐原版 B：tool_round_limit 提示客户端保留上下文继续同一任务），
+      // 而不是纯 409 error finish 把整个 turn 掐死。返回 200 + checkpoint，客户端据此判定
+      // "任务未完成、需基于 continuation_token 续接"，可在下一请求继续，而非放弃当前任务。
+      try { await writeLog(this.env, 'warn', `[m365-chat] provider=${providerId} → tool round checkpoint`, `toolRounds=${ledger.toolRounds}/${maxToolRounds}`) } catch { /* ignore */ }
+      const checkpointId = 'chatcmpl-' + crypto.randomUUID()
+      const checkpointReason = 'tool_round_limit'
+      const continuationToken = `toolround:${maxToolRounds}:${sha256Hex(ledger.repetitionSignature || String(ledger.toolRounds))}`
+      const checkpointText = '本轮执行已到达工具轮安全阈值（tool_round_limit）。任务尚未完成；请保留前序工具证据与上下文，在下一轮继续完成同一任务，而不是重新开始或放弃。如果剩余工作无需更多工具调用，请直接给出结论。'
+      const checkpointOutcome: ChatOutcome = {
+        text: checkpointText,
+        reasoning: '',
+        sessionId: resolved.sessionId || '',
+        conversationId: '',
+        toolCalls: [],
+        checkpoint: { continuationRequired: true, reason: checkpointReason, continuationToken },
+      }
+      return stream ? buildSSE(checkpointId, model, checkpointOutcome, payload) : buildJSON(checkpointId, model, checkpointOutcome)
     }
     const ledgerCtx = ledger.toolRounds > 0 ? ledgerRouterContext(ledger) : ''
 
