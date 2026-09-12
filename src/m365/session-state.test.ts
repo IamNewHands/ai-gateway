@@ -78,6 +78,7 @@ describe('M365 persisted session state contract', () => {
       generation: 7,
       accountId: 'account-1',
       expiresAt: 123456,
+      renewedAt: 123000,
     }
     snapshot.checkpoint = {
       reason: 'tool_round_limit',

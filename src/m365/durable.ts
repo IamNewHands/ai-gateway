@@ -96,6 +96,35 @@ export function estimateTokens(s: string): number {
 const SEGMENT_TIMEOUT_MS = 300_000
 /** 单个逻辑请求默认总截止时间（毫秒，10 分钟），可用 M365_LOGICAL_REQUEST_TIMEOUT_MS 覆盖 */
 const DEFAULT_LOGICAL_REQUEST_TIMEOUT_MS = 600_000
+/**
+ * 会话租约 TTL（毫秒）。配合下方心跳（TTL/3，上限 15s）续约；
+ * 取 60s 使"持有者彻底消失"后最长阻塞时间有界，而不是旧实现的 10 分钟。
+ */
+const LEASE_TTL_MS = 60 * 1000
+/**
+ * 遇到 lease_conflict 时的有界等待（毫秒）：给正当持有者"只差最后一次提交/释放"的窗口，
+ * 避免瞬时竞争被直接判成失败。对齐 B 的 CONVERSATION_BUSY_GRACE_MS 取向（B 为 250ms）。
+ */
+const LEASE_BUSY_GRACE_MS = 400
+/**
+ * 判定租约持有者"心跳停摆"的阈值（毫秒）。超过该时长未续约即视为孤儿租约，可被抢占。
+ * 必须显著大于心跳间隔（15s），否则会把正常长思考（reasoning 阶段）的活跃持有者误判为死亡。
+ */
+const LEASE_STALE_MS = 45 * 1000
+
+/** 可中止的短等待：客户端取消时立刻返回，不拖住收尾 */
+function boundedLeaseRetryDelay(ms: number, signal?: AbortSignal): Promise<void> {
+  if (ms <= 0 || signal?.aborted) return Promise.resolve()
+  return new Promise<void>((resolve) => {
+    const timer = setTimeout(done, ms)
+    function done(): void {
+      clearTimeout(timer)
+      signal?.removeEventListener('abort', done)
+      resolve()
+    }
+    signal?.addEventListener('abort', done, { once: true })
+  })
+}
 
 /** 逻辑请求总预算：排队 + 重连 + 上游读取共享同一 deadline，不因多段重试叠加成无限任务 */
 function logicalRequestTimeoutMs(env: Env): number {
@@ -229,7 +258,7 @@ export class M365Session {
     const snapshot = this.sessionStore.loadOrCreate(effectiveSessionId)
     const expectedGeneration = snapshot.generation
     const leaseToken = crypto.randomUUID()
-    const leaseTtlMs = 60 * 1000
+    const leaseTtlMs = LEASE_TTL_MS
     let lease = this.sessionStore.acquireLease({
       sessionId: snapshot.sessionId,
       accountId: acc.oid,
@@ -239,16 +268,33 @@ export class M365Session {
       ttlMs: leaseTtlMs,
     })
     if (!lease.ok && lease.reason === 'lease_conflict') {
-      const authoritative = this.sessionStore.loadOrCreate(snapshot.sessionId)
-      if (authoritative.lease && authoritative.lease.expiresAt <= Date.now()) {
-        lease = this.sessionStore.acquireLease({
+      // 孤儿租约抢占：持有者崩溃/isolate 回收/客户端断连未走 finally 时，
+      // 租约会被一直占到 TTL 结束，期间所有重试都拿到 409（本轮 log2 复现的正是该场景）。
+      // 先做一次极短的有界等待（给"正当持有者只差最后一次提交"的窗口留余地），
+      // 再按心跳停摆/过期条件原子抢占。
+      await boundedLeaseRetryDelay(LEASE_BUSY_GRACE_MS, requestSignal)
+      const retry = this.sessionStore.acquireLease({
+        sessionId: snapshot.sessionId,
+        accountId: acc.oid,
+        token: leaseToken,
+        expectedGeneration,
+        now: Date.now(),
+        ttlMs: leaseTtlMs,
+      })
+      if (retry.ok) {
+        lease = retry
+      } else if (retry.reason === 'lease_conflict') {
+        lease = this.sessionStore.supersedeLease({
           sessionId: snapshot.sessionId,
           accountId: acc.oid,
           token: leaseToken,
-          expectedGeneration: authoritative.generation,
+          expectedGeneration,
           now: Date.now(),
           ttlMs: leaseTtlMs,
+          staleMs: LEASE_STALE_MS,
         })
+      } else {
+        lease = retry
       }
     }
     if (!lease.ok) {
@@ -380,13 +426,19 @@ export class M365Session {
 
     // 流式：增量透传主回答文本/推理，随事件实时推送，客户端断连可中止上游（同原版真实流式）
     if (stream) {
-      lifecycleTransferredToStream = true
-      return await this.streamMainAnswer({
+      // 生命周期移交只能在 streamMainAnswer 真正建好流并接管收尾之后成立。
+      // 若它在中途抛错（账号/ledger/SSE 组装失败），流从未创建、cancel() 也不会被调用，
+      // 此时必须由外层 finally 释放租约，否则锁会占到 TTL 结束 → 后续重试全部 409。
+      const streamed = await this.streamMainAnswer({
         providerId, model, tone, ordered, resolved,
         mainPrompt, attachments, mainTools, mainChoice,
         toolDefs, toolChoice, ledger, messages, ctx, requestSignal, mcpServerUrl, sysHash,
         snapshot, expectedGeneration, leaseToken, lifecycleHeartbeat, stopLifecycleHeartbeat, deadline,
+        onLifecycleOwned: () => { lifecycleTransferredToStream = true },
       })
+      // owned=false（如无可用账号）时 lifecycleTransferredToStream 仍为 false，
+      // 由外层 finally 释放租约与会话锁。
+      return streamed.response
     }
 
     let streamedText = ''
@@ -808,8 +860,10 @@ export class M365Session {
     }
     stopLifecycleHeartbeat: () => void
     deadline: number
-  }): Promise<Response> {
-    const { providerId, model, tone, ordered, resolved, mainPrompt, attachments, mainTools, mainChoice, toolDefs, toolChoice, ledger, messages, ctx, requestSignal, mcpServerUrl, sysHash, snapshot, expectedGeneration, leaseToken, lifecycleHeartbeat, stopLifecycleHeartbeat, deadline } = a
+    /** 流已建成并接管收尾时回调：调用方据此确认生命周期已移交，外层不再重复释放 */
+    onLifecycleOwned: () => void
+  }): Promise<{ response: Response; owned: boolean }> {
+    const { providerId, model, tone, ordered, resolved, mainPrompt, attachments, mainTools, mainChoice, toolDefs, toolChoice, ledger, messages, ctx, requestSignal, mcpServerUrl, sysHash, snapshot, expectedGeneration, leaseToken, lifecycleHeartbeat, stopLifecycleHeartbeat, deadline, onLifecycleOwned } = a
     const encoder = new TextEncoder()
     const aborter = new AbortController()
     // 客户端断连（requestSignal）或响应体被取消（cancel）都中止上游 ChatHub
@@ -819,10 +873,11 @@ export class M365Session {
     const id = 'chatcmpl-' + crypto.randomUUID()
     let usedAcc = ordered[0]
     if (!usedAcc || !usedAcc.oid) {
-      return cjson({ error: { message: 'no available M365 account', type: 'rate_limit_error' } }, 429, { 'Retry-After': '5' })
+      // 流尚未创建：生命周期仍归调用方，外层 finally 负责释放租约
+      return { response: cjson({ error: { message: 'no available M365 account', type: 'rate_limit_error' } }, 429, { 'Retry-After': '5' }), owned: false }
     }
     let lockedAccountId = usedAcc.oid
-    const leaseTtlMs = 60 * 1000
+    const leaseTtlMs = LEASE_TTL_MS
 
     // 流式终态三分（同对方 request-metrics.ts 的 trackStreamingResponse 判定）：
     // complete=自然 EOF 正常收尾 / error=上游失败走了错误收尾 / canceled=客户端取消 ReadableStream。
@@ -834,6 +889,19 @@ export class M365Session {
     let closed = false
     // 恰到一次收尾：心跳 interval 与 controller.close() 只执行一次
     let sseHeartbeat: ReturnType<typeof setInterval> | undefined
+    // 生命周期收尾幂等闸门：start() 的 finally 与 cancel() 都可能触发，
+    // 保证 stopLifecycleHeartbeat / releaseAccountLock / releaseLease 只执行一次且一定执行。
+    let lifecycleReleased = false
+    const releaseLifecycle = (origin: string): void => {
+      if (lifecycleReleased) return
+      lifecycleReleased = true
+      stopLifecycleHeartbeat()
+      this.sessionStore.releaseAccountLock(lockedAccountId, snapshot.sessionId, leaseToken)
+      this.sessionStore.releaseLease(snapshot.sessionId, leaseToken)
+      if (origin === 'client-cancel') {
+        try { void writeLog(this.env, 'info', `[m365-chat] provider=${providerId} → lease released on client cancel (pre-start window) session=${snapshot.sessionId}`) } catch { /* ignore */ }
+      }
+    }
 
     const stream = new ReadableStream<Uint8Array>({
       start: async (controller) => {
@@ -1116,9 +1184,7 @@ export class M365Session {
           push(usageSSE(0, 0, 'stop', ''))
           push('data: [DONE]\n\n')
         } finally {
-          stopLifecycleHeartbeat()
-          this.sessionStore.releaseAccountLock(lockedAccountId, snapshot.sessionId, leaseToken)
-          this.sessionStore.releaseLease(snapshot.sessionId, leaseToken)
+          releaseLifecycle('stream-final')
           // 流式终态三分诊断：canceled 说明客户端主动掐断（中止上游成功），其余为自然 EOF / 上游失败
           if (streamState !== 'complete') {
             const reason = streamState === 'canceled'
@@ -1133,12 +1199,22 @@ export class M365Session {
         // 客户端断连 / 响应体被取消：即刻标记 canceled（终态三分），并中止上游 ChatHub 对话（同原版 r.Context().Done()）
         streamState = 'canceled'
         aborter.abort()
+        // 客户端可能在 start() 尚未走到内层 try/finally 之前就断开（例如路由/首包阶段被取消）。
+        // 此时 start() 的 finally 不保证会执行，租约与会话锁会被一直占到 TTL 结束，
+        // 导致后续所有重试拿到 409 lease_conflict（log2 复现的正是该形态）。
+        // releaseLifecycle 幂等，因此这里无条件再收尾一次，确保锁一定归还。
+        releaseLifecycle('client-cancel')
       },
     })
 
-    return new Response(stream, {
-      headers: { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', 'Connection': 'keep-alive', 'X-Accel-Buffering': 'no' },
-    })
+    // 流已创建并持有 controller：从这里开始收尾权归 streamMainAnswer（start/cancel 内的 releaseLifecycle）。
+    onLifecycleOwned()
+    return {
+      response: new Response(stream, {
+        headers: { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', 'Connection': 'keep-alive', 'X-Accel-Buffering': 'no' },
+      }),
+      owned: true,
+    }
   }
 
   /**

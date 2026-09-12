@@ -31,6 +31,14 @@ export interface SessionLeaseState {
   generation: number
   accountId: string
   expiresAt: number
+  /**
+   * 持有者最后一次证明"我还活着"的时间戳（acquire/heartbeat 时刷新）。
+   * 用于识别孤儿租约：进程崩溃 / isolate 被回收 / 客户端断连未走 finally 时，
+   * 该值会停在过去，即使 expiresAt 因 TTL 尚未到点也能据此安全抢占，
+   * 避免整段 TTL 内所有重试都拿到 409 lease_conflict。
+   * 0 表示旧版本写入的租约（无该字段），此时退化为仅按 expiresAt 判定。
+   */
+  renewedAt: number
 }
 
 export interface CompactionCheckpoint {
@@ -168,6 +176,7 @@ function normalizeLease(value: unknown): SessionLeaseState | null {
     generation: nonNegativeInteger(raw.generation),
     accountId,
     expiresAt: finiteNumber(raw.expiresAt),
+    renewedAt: finiteNumber(raw.renewedAt),
   }
 }
 

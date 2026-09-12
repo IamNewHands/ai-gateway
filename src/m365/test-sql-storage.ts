@@ -8,6 +8,7 @@ interface SessionRow {
   lease_token: string | null
   lease_account_id: string | null
   lease_expires_at: number | null
+  lease_renewed_at: number
   updated_at: number
 }
 
@@ -106,6 +107,36 @@ export class FaithfulSqlStorage {
       return cursor<T>([])
     }
 
+    // 列探测/加法迁移：模拟"表已存在且已含 lease_renewed_at"，因此无需 ALTER。
+    if (/^PRAGMA table_info\(m365_sessions\)$/i.test(sql)) {
+      return cursor<T>([
+        { name: 'session_id' } as unknown as T,
+        { name: 'generation' } as unknown as T,
+        { name: 'snapshot_json' } as unknown as T,
+        { name: 'lease_token' } as unknown as T,
+        { name: 'lease_account_id' } as unknown as T,
+        { name: 'lease_expires_at' } as unknown as T,
+        { name: 'lease_renewed_at' } as unknown as T,
+        { name: 'updated_at' } as unknown as T,
+      ])
+    }
+
+    if (/^ALTER TABLE m365_sessions ADD COLUMN lease_renewed_at /i.test(sql)) {
+      return cursor<T>([], 0)
+    }
+
+    if (/^SELECT snapshot_json, generation, lease_token, lease_account_id, lease_expires_at, lease_renewed_at FROM m365_sessions WHERE session_id = \?$/i.test(sql)) {
+      const row = this.state.sessions.get(String(bindings[0]))
+      return cursor<T>(row ? [{
+        snapshot_json: row.snapshot_json,
+        generation: row.generation,
+        lease_token: row.lease_token,
+        lease_account_id: row.lease_account_id,
+        lease_expires_at: row.lease_expires_at,
+        lease_renewed_at: row.lease_renewed_at,
+      } as unknown as T] : [])
+    }
+
     if (/^SELECT snapshot_json, generation, lease_token, lease_account_id, lease_expires_at FROM m365_sessions WHERE session_id = \?$/i.test(sql)) {
       const row = this.state.sessions.get(String(bindings[0]))
       return cursor<T>(row ? [{
@@ -132,6 +163,7 @@ export class FaithfulSqlStorage {
         lease_token: null,
         lease_account_id: null,
         lease_expires_at: null,
+        lease_renewed_at: 0,
         updated_at: Number(bindings[3]),
       })
       return cursor<T>([], 1)
@@ -160,6 +192,17 @@ export class FaithfulSqlStorage {
       return cursor<T>([], 1)
     }
 
+    if (/^UPDATE m365_sessions SET lease_token = \?, lease_account_id = \?, lease_expires_at = \?, lease_renewed_at = \? WHERE session_id = \? AND generation = \?$/i.test(sql)) {
+      const sessionId = String(bindings[4])
+      const row = this.state.sessions.get(sessionId)
+      if (!row || row.generation !== Number(bindings[5])) return cursor<T>([], 0)
+      row.lease_token = String(bindings[0])
+      row.lease_account_id = String(bindings[1])
+      row.lease_expires_at = Number(bindings[2])
+      row.lease_renewed_at = Number(bindings[3])
+      return cursor<T>([], 1)
+    }
+
     if (/^UPDATE m365_sessions SET lease_token = \?, lease_account_id = \?, lease_expires_at = \? WHERE session_id = \? AND generation = \?$/i.test(sql)) {
       const sessionId = String(bindings[3])
       const row = this.state.sessions.get(sessionId)
@@ -167,6 +210,30 @@ export class FaithfulSqlStorage {
       row.lease_token = String(bindings[0])
       row.lease_account_id = String(bindings[1])
       row.lease_expires_at = Number(bindings[2])
+      return cursor<T>([], 1)
+    }
+
+    // supersede：条件 UPDATE，额外校验旧 lease_token（CAS），保证与续约/释放竞争时只有一个赢家
+    if (/^UPDATE m365_sessions SET lease_token = \?, lease_account_id = \?, lease_expires_at = \?, lease_renewed_at = \? WHERE session_id = \? AND generation = \? AND lease_token = \?$/i.test(sql)) {
+      const sessionId = String(bindings[4])
+      const row = this.state.sessions.get(sessionId)
+      if (
+        !row
+        || row.generation !== Number(bindings[5])
+        || row.lease_token !== String(bindings[6])
+      ) return cursor<T>([], 0)
+      row.lease_token = String(bindings[0])
+      row.lease_account_id = String(bindings[1])
+      row.lease_expires_at = Number(bindings[2])
+      row.lease_renewed_at = Number(bindings[3])
+      return cursor<T>([], 1)
+    }
+
+    if (/^UPDATE m365_sessions SET lease_expires_at = \?, lease_renewed_at = \? WHERE session_id = \? AND lease_token = \?$/i.test(sql)) {
+      const row = this.state.sessions.get(String(bindings[2]))
+      if (!row || row.lease_token !== String(bindings[3])) return cursor<T>([], 0)
+      row.lease_expires_at = Number(bindings[0])
+      row.lease_renewed_at = Number(bindings[1])
       return cursor<T>([], 1)
     }
 
@@ -185,6 +252,16 @@ export class FaithfulSqlStorage {
         || row.lease_account_id !== String(bindings[3])
       ) return cursor<T>([], 0)
       row.lease_account_id = String(bindings[0])
+      return cursor<T>([], 1)
+    }
+
+    if (/^UPDATE m365_sessions SET lease_token = NULL, lease_account_id = NULL, lease_expires_at = NULL, lease_renewed_at = 0 WHERE session_id = \? AND lease_token = \?$/i.test(sql)) {
+      const row = this.state.sessions.get(String(bindings[0]))
+      if (!row || row.lease_token !== String(bindings[1])) return cursor<T>([], 0)
+      row.lease_token = null
+      row.lease_account_id = null
+      row.lease_expires_at = null
+      row.lease_renewed_at = 0
       return cursor<T>([], 1)
     }
 

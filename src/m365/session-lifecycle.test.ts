@@ -85,6 +85,7 @@ import { M365Session } from './durable'
 type LifecycleCall =
   | 'load'
   | 'acquire-lease'
+  | 'supersede-lease'
   | 'acquire-account-lock'
   | 'heartbeat-lease'
   | 'heartbeat-account-lock'
@@ -97,6 +98,7 @@ type LifecycleCall =
 type LifecycleStore = {
   loadOrCreate: ReturnType<typeof vi.fn>
   acquireLease: ReturnType<typeof vi.fn>
+  supersedeLease: ReturnType<typeof vi.fn>
   acquireAccountLock: ReturnType<typeof vi.fn>
   heartbeatLease: ReturnType<typeof vi.fn>
   heartbeatAccountLock: ReturnType<typeof vi.fn>
@@ -138,6 +140,12 @@ function createStore(calls: LifecycleCall[], snapshot: SessionSnapshotV1 = creat
     acquireLease: vi.fn(() => {
       calls.push('acquire-lease')
       return { ok: true, expiresAt: Date.now() + 60_000 }
+    }),
+    // 默认：租约仍被正当持有（未过期、心跳新鲜），拒绝抢占。
+    // 需要验证抢占路径的用例自行 mockImplementation 覆盖。
+    supersedeLease: vi.fn(() => {
+      calls.push('supersede-lease')
+      return { ok: false, reason: 'lease_conflict', expiresAt: Date.now() + 60_000 }
     }),
     acquireAccountLock: vi.fn(() => {
       calls.push('acquire-account-lock')
@@ -597,6 +605,29 @@ describe('M365Session SQL request lifecycle', () => {
     expect(store.acquireAccountLock).not.toHaveBeenCalled()
     expect(store.commitWithLease).not.toHaveBeenCalled()
     expect(store.releaseLease).not.toHaveBeenCalled()
+    // 租约确实被正当持有：应经有界重试后尝试抢占，但抢占被拒绝（未过期且心跳新鲜）
+    expect(store.supersedeLease).toHaveBeenCalledTimes(1)
+  })
+
+  it('steals an abandoned lease so a retry after a crashed owner can proceed', async () => {
+    const calls: LifecycleCall[] = []
+    const store = createStore(calls)
+    // 首次获取冲突（孤儿租约），有界重试仍冲突，抢占成功 → 请求应继续执行
+    store.acquireLease.mockImplementation(() => {
+      calls.push('acquire-lease')
+      return { ok: false, reason: 'lease_conflict', expiresAt: Date.now() + 60_000 }
+    })
+    store.supersedeLease.mockImplementation(() => {
+      calls.push('supersede-lease')
+      return { ok: true, expiresAt: Date.now() + 60_000 }
+    })
+
+    const response = await createSession(store).fetch(request())
+
+    expect(store.supersedeLease).toHaveBeenCalledTimes(1)
+    // 抢占成功后必须继续走完生命周期，而不是把 409 抛给客户端
+    expect(store.acquireAccountLock).toHaveBeenCalledTimes(1)
+    expect(response.status).not.toBe(409)
   })
 
   it('releases the session lease without executing upstream or committing after an account-lock conflict', async () => {

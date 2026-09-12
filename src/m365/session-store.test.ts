@@ -186,7 +186,7 @@ describe('M365 Durable Object SQL session store', () => {
         previousResponseId: 'resp-committed',
       },
     })
-    expect(restartedSql.statements.some(({ query }) => /SELECT\s+snapshot_json,\s*generation,\s*lease_token,\s*lease_account_id,\s*lease_expires_at\s+FROM\s+m365_sessions/i.test(query))).toBe(true)
+    expect(restartedSql.statements.some(({ query }) => /SELECT\s+snapshot_json,\s*generation,\s*lease_token,\s*lease_account_id,\s*lease_expires_at,\s*lease_renewed_at\s+FROM\s+m365_sessions/i.test(query))).toBe(true)
   })
 
   it('releases an account lock only for its owning session and lease token', () => {
@@ -323,5 +323,111 @@ describe('M365 Durable Object SQL session store', () => {
     expect(snapshot1.sessionId).not.toBe('')
     expect(snapshot2.sessionId).not.toBe('')
     expect(snapshot1.sessionId).not.toBe(snapshot2.sessionId)
+  })
+
+  // 回归：log2 会话中"首次请求失败后 3 秒重试仍拿到 409 lease_conflict"的形态。
+  // 根因是孤儿租约（持有者崩溃/isolate 回收/客户端断连未走 finally）把会话行一直占到 TTL 结束。
+  describe('orphaned lease supersede (log2 regression)', () => {
+    function acquiredLease(store: M365SessionStore, sessionId: string, now: number, ttlMs: number) {
+      const snapshot = store.loadOrCreate(sessionId)
+      const acquired = store.acquireLease({
+        sessionId,
+        accountId: 'account-1',
+        token: 'lease-owner',
+        expectedGeneration: snapshot.generation,
+        now,
+        ttlMs,
+      })
+      expect(acquired.ok).toBe(true)
+      return snapshot
+    }
+
+    it('refuses to steal a lease whose owner is still heartbeating', () => {
+      const sql = new MemorySqlStorage()
+      const store = new M365SessionStore(({ sql, transactionSync: sql.transactionSync.bind(sql) } as unknown as DurableObjectStorage))
+      acquiredLease(store, 's-live', 1_000, 60_000)
+
+      // 持有者在 40s 处续约（心跳新鲜），此时租约远未过期
+      expect(store.heartbeatLease('s-live', 'lease-owner', 41_000, 60_000).ok).toBe(true)
+
+      const stolen = store.supersedeLease({
+        sessionId: 's-live',
+        accountId: 'account-1',
+        token: 'lease-retry',
+        expectedGeneration: store.loadOrCreate('s-live').generation,
+        now: 50_000,
+        ttlMs: 60_000,
+        staleMs: 45_000,
+      })
+      expect(stolen).toEqual({ ok: false, reason: 'lease_conflict', expiresAt: 101_000 })
+    })
+
+    it('steals a lease whose owner stopped heartbeating even before TTL expiry', () => {
+      const sql = new MemorySqlStorage()
+      const store = new M365SessionStore(({ sql, transactionSync: sql.transactionSync.bind(sql) } as unknown as DurableObjectStorage))
+      acquiredLease(store, 's-dead', 1_000, 60_000)
+
+      // 持有者在 1s 处取得租约后再无心跳（进程死亡）；租约要到 61_000 才过期
+      const stolen = store.supersedeLease({
+        sessionId: 's-dead',
+        accountId: 'account-1',
+        token: 'lease-retry',
+        expectedGeneration: store.loadOrCreate('s-dead').generation,
+        now: 50_000,
+        ttlMs: 60_000,
+        staleMs: 45_000,
+      })
+
+      expect(stolen).toEqual({ ok: true, expiresAt: 110_000 })
+      // 抢占后新持有者可正常续约与释放
+      expect(store.loadOrCreate('s-dead').lease?.token).toBe('lease-retry')
+      expect(store.releaseLease('s-dead', 'lease-retry')).toEqual({ ok: true })
+    })
+
+    it('steals a lease that already expired regardless of heartbeat age', () => {
+      const sql = new MemorySqlStorage()
+      const store = new M365SessionStore(({ sql, transactionSync: sql.transactionSync.bind(sql) } as unknown as DurableObjectStorage))
+      acquiredLease(store, 's-expired', 1_000, 5_000)
+
+      const stolen = store.supersedeLease({
+        sessionId: 's-expired',
+        accountId: 'account-1',
+        token: 'lease-retry',
+        expectedGeneration: store.loadOrCreate('s-expired').generation,
+        now: 10_000,
+        ttlMs: 60_000,
+        staleMs: 45_000,
+      })
+      expect(stolen).toEqual({ ok: true, expiresAt: 70_000 })
+    })
+
+    it('does not steal when the original owner released the lease first', () => {
+      const sql = new MemorySqlStorage()
+      const store = new M365SessionStore(({ sql, transactionSync: sql.transactionSync.bind(sql) } as unknown as DurableObjectStorage))
+      acquiredLease(store, 's-released', 1_000, 60_000)
+      expect(store.releaseLease('s-released', 'lease-owner')).toEqual({ ok: true })
+
+      // 已释放：走普通获取路径，直接成功而非"抢占"
+      const next = store.supersedeLease({
+        sessionId: 's-released',
+        accountId: 'account-1',
+        token: 'lease-retry',
+        expectedGeneration: store.loadOrCreate('s-released').generation,
+        now: 2_000,
+        ttlMs: 60_000,
+        staleMs: 45_000,
+      })
+      expect(next).toEqual({ ok: true, expiresAt: 62_000 })
+    })
+
+    it('reports renewedAt through the snapshot lease after acquire and heartbeat', () => {
+      const sql = new MemorySqlStorage()
+      const store = new M365SessionStore(({ sql, transactionSync: sql.transactionSync.bind(sql) } as unknown as DurableObjectStorage))
+      acquiredLease(store, 's-renewed', 1_000, 60_000)
+      expect(store.loadOrCreate('s-renewed').lease?.renewedAt).toBe(1_000)
+
+      store.heartbeatLease('s-renewed', 'lease-owner', 20_000, 60_000)
+      expect(store.loadOrCreate('s-renewed').lease?.renewedAt).toBe(20_000)
+    })
   })
 })

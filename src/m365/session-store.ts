@@ -53,9 +53,21 @@ export class M365SessionStore {
         lease_token TEXT,
         lease_account_id TEXT,
         lease_expires_at INTEGER,
+        lease_renewed_at INTEGER NOT NULL DEFAULT 0,
         updated_at INTEGER NOT NULL DEFAULT 0
       )
     `)
+    // 既有 DO 实例（表已存在、无 lease_renewed_at 列）的加法迁移：探测到缺列时补一次 ALTER。
+    // 探测能力不可用时静默跳过：新表一定带该列；旧表在补列前 renewedAt 退化为 0，
+    // 抢占判定自动回退到"仅按 expiresAt"，不会导致错误抢占。
+    try {
+      const columns = new Set(
+        this.sql.exec(`PRAGMA table_info(m365_sessions)`).toArray().map((r) => String(r['name'])),
+      )
+      if (!columns.has('lease_renewed_at')) {
+        this.sql.exec(`ALTER TABLE m365_sessions ADD COLUMN lease_renewed_at INTEGER NOT NULL DEFAULT 0`)
+      }
+    } catch { /* 探测不可用：见上 */ }
     this.sql.exec(`
       CREATE TABLE IF NOT EXISTS m365_account_locks (
         account_id TEXT PRIMARY KEY,
@@ -100,8 +112,9 @@ export class M365SessionStore {
       lease_token: string | null
       lease_account_id: string | null
       lease_expires_at: number | null
+      lease_renewed_at: number | null
     }>(
-      `SELECT snapshot_json, generation, lease_token, lease_account_id, lease_expires_at
+      `SELECT snapshot_json, generation, lease_token, lease_account_id, lease_expires_at, lease_renewed_at
        FROM m365_sessions
        WHERE session_id = ?`,
       validSessionId,
@@ -116,6 +129,7 @@ export class M365SessionStore {
           generation: rows[0].generation,
           accountId: rows[0].lease_account_id,
           expiresAt: rows[0].lease_expires_at,
+          renewedAt: rows[0].lease_renewed_at ?? 0,
         }
       : null
     return snapshot
@@ -239,11 +253,12 @@ export class M365SessionStore {
     const expiresAt = input.now + input.ttlMs
     const cursor = this.sql.exec(
       `UPDATE m365_sessions
-       SET lease_token = ?, lease_account_id = ?, lease_expires_at = ?
+       SET lease_token = ?, lease_account_id = ?, lease_expires_at = ?, lease_renewed_at = ?
        WHERE session_id = ? AND generation = ?`,
       input.token,
       input.accountId,
       expiresAt,
+      input.now,
       input.sessionId,
       input.expectedGeneration,
     )
@@ -273,14 +288,91 @@ export class M365SessionStore {
 
     const expiresAt = now + ttlMs
     const cursor = this.sql.exec(
-      `UPDATE m365_sessions SET lease_expires_at = ?
+      `UPDATE m365_sessions SET lease_expires_at = ?, lease_renewed_at = ?
        WHERE session_id = ? AND lease_token = ?`,
       expiresAt,
+      now,
       sessionId,
       token,
     )
     if (cursor.rowsWritten !== 1) {
       return { ok: false, reason: 'lease_conflict' }
+    }
+    return { ok: true, expiresAt }
+  }
+
+  /**
+   * 原子抢占（supersede）一个孤儿/过期租约。
+   *
+   * 触发条件（保守，必须满足其一）：
+   *   1) lease_expires_at <= now —— 租约已自然过期；
+   *   2) lease_renewed_at <= now - staleMs —— 心跳已停摆超过 staleMs，持有者实际已死
+   *      （进程崩溃 / isolate 回收 / 客户端断连未走 finally），即使 TTL 尚未到点。
+   *
+   * 抢占以单条条件 UPDATE 完成（WHERE 仍然校验旧 token 与 generation），
+   * 因此与持有者的 heartbeatLease / releaseLease 竞争时只有一个赢家：
+   * 若持有者其实还活着并刚好续约成功，本次 UPDATE 的 rowsWritten 为 0，抢占自然失败，
+   * 不会出现两个请求同时持有同一会话锁的情况。
+   *
+   * 被抢占时旧租约的 pendingCall/protocolTail 保留在 snapshot 中（不丢检查点），
+   * 新持有者继续在同一个会话行上推进，避免整段 TTL 内所有重试都拿到 409。
+   */
+  supersedeLease(input: {
+    sessionId: string
+    accountId: string
+    token: string
+    expectedGeneration: number
+    now: number
+    ttlMs: number
+    staleMs: number
+  }): LeaseResult {
+    const snapshot = this.loadOrCreate(input.sessionId)
+    if (snapshot.generation !== input.expectedGeneration) {
+      return { ok: false, reason: 'generation_conflict', generation: snapshot.generation }
+    }
+    const current = snapshot.lease
+    if (!current) {
+      // 无租约（已被释放）：按普通获取处理
+      return this.acquireLease({
+        sessionId: input.sessionId,
+        accountId: input.accountId,
+        token: input.token,
+        expectedGeneration: input.expectedGeneration,
+        now: input.now,
+        ttlMs: input.ttlMs,
+      })
+    }
+    if (current.token === input.token) {
+      return { ok: true, expiresAt: current.expiresAt }
+    }
+    const renewedAt = current.renewedAt
+    const expired = current.expiresAt <= input.now
+    const abandoned = renewedAt > 0 && renewedAt <= input.now - input.staleMs
+    if (!expired && !abandoned) {
+      return { ok: false, reason: 'lease_conflict', expiresAt: current.expiresAt }
+    }
+
+    const expiresAt = input.now + input.ttlMs
+    const cursor = this.sql.exec(
+      `UPDATE m365_sessions
+       SET lease_token = ?, lease_account_id = ?, lease_expires_at = ?, lease_renewed_at = ?
+       WHERE session_id = ? AND generation = ? AND lease_token = ?`,
+      input.token,
+      input.accountId,
+      expiresAt,
+      input.now,
+      input.sessionId,
+      input.expectedGeneration,
+      current.token,
+    )
+    if (cursor.rowsWritten !== 1) {
+      // 持有者在我们判断与写入之间成功续约/释放：让调用方重新评估，不强行夺锁
+      const authoritative = this.loadOrCreate(input.sessionId)
+      return {
+        ok: false,
+        reason: 'lease_conflict',
+        ...(authoritative.lease ? { expiresAt: authoritative.lease.expiresAt } : {}),
+      }
     }
     return { ok: true, expiresAt }
   }
@@ -314,7 +406,7 @@ export class M365SessionStore {
 
     const cursor = this.sql.exec(
       `UPDATE m365_sessions
-       SET lease_token = NULL, lease_account_id = NULL, lease_expires_at = NULL
+       SET lease_token = NULL, lease_account_id = NULL, lease_expires_at = NULL, lease_renewed_at = 0
        WHERE session_id = ? AND lease_token = ?`,
       sessionId,
       token,
