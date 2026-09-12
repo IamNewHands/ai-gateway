@@ -21,15 +21,6 @@ export type ReleaseResult =
   | { ok: true }
   | { ok: false; reason: 'lease_conflict' }
 
-export type AccountLockResult =
-  | { ok: true; expiresAt: number }
-  | {
-      ok: false
-      reason: 'account_locked'
-      ownerSessionId: string
-      expiresAt: number
-    }
-
 function cloneSnapshot(snapshot: SessionSnapshotV1): SessionSnapshotV1 {
   return decodeSessionSnapshot(encodeSessionSnapshot(snapshot))
 }
@@ -68,14 +59,11 @@ export class M365SessionStore {
         this.sql.exec(`ALTER TABLE m365_sessions ADD COLUMN lease_renewed_at INTEGER NOT NULL DEFAULT 0`)
       }
     } catch { /* 探测不可用：见上 */ }
-    this.sql.exec(`
-      CREATE TABLE IF NOT EXISTS m365_account_locks (
-        account_id TEXT PRIMARY KEY,
-        session_id TEXT NOT NULL,
-        lease_token TEXT NOT NULL,
-        expires_at INTEGER NOT NULL
-      )
-    `)
+    // 注意：这里**不应**再创建任何"账号级"独占锁表。
+    // 账号级串行由 AccountFlux（M365_FLUX，每 provider 一个共享 DO）统一负责；
+    // 本 store 挂在"每个会话各自的 DO"上，其 SQLite 表天然无法跨会话协调，
+    // 所以放在这里的账号锁只可能造成"同一会话自锁"的假冲突（log3 的 account_locked）。
+    // 会话与账号的绑定关系属于会话租约（m365_sessions.lease_account_id），与此无关，保持独立。
     this.sql.exec(`
       CREATE TABLE IF NOT EXISTS m365_response_index (
         response_id TEXT PRIMARY KEY,
@@ -408,85 +396,6 @@ export class M365SessionStore {
       `UPDATE m365_sessions
        SET lease_token = NULL, lease_account_id = NULL, lease_expires_at = NULL, lease_renewed_at = 0
        WHERE session_id = ? AND lease_token = ?`,
-      sessionId,
-      token,
-    )
-    if (cursor.rowsWritten !== 1) {
-      return { ok: false, reason: 'lease_conflict' }
-    }
-    return { ok: true }
-  }
-
-  acquireAccountLock(
-    accountId: string,
-    sessionId: string,
-    token: string,
-    now: number,
-    ttlMs: number,
-  ): AccountLockResult {
-    const expiresAt = now + ttlMs
-    const cursor = this.sql.exec(
-      `INSERT INTO m365_account_locks (account_id, session_id, lease_token, expires_at)
-       VALUES (?, ?, ?, ?)
-       ON CONFLICT(account_id) DO UPDATE SET
-         session_id = excluded.session_id,
-         lease_token = excluded.lease_token,
-         expires_at = excluded.expires_at
-       WHERE m365_account_locks.expires_at <= ?
-          OR (m365_account_locks.session_id = ? AND m365_account_locks.lease_token = ?)`,
-      accountId,
-      sessionId,
-      token,
-      expiresAt,
-      now,
-      sessionId,
-      token,
-    )
-    if (cursor.rowsWritten === 1) return { ok: true, expiresAt }
-
-    const rows = this.sql.exec<{ session_id: string; expires_at: number }>(
-      `SELECT session_id, expires_at
-       FROM m365_account_locks
-       WHERE account_id = ?`,
-      accountId,
-    ).toArray()
-    if (rows.length !== 1) throw new Error('M365_ACCOUNT_LOCK_ROW_MISSING_AFTER_CONFLICT')
-    return {
-      ok: false,
-      reason: 'account_locked',
-      ownerSessionId: rows[0].session_id,
-      expiresAt: rows[0].expires_at,
-    }
-  }
-
-  heartbeatAccountLock(
-    accountId: string,
-    sessionId: string,
-    token: string,
-    now: number,
-    ttlMs: number,
-  ): LeaseResult {
-    const expiresAt = now + ttlMs
-    const cursor = this.sql.exec(
-      `UPDATE m365_account_locks
-       SET expires_at = ?
-       WHERE account_id = ? AND session_id = ? AND lease_token = ?`,
-      expiresAt,
-      accountId,
-      sessionId,
-      token,
-    )
-    if (cursor.rowsWritten !== 1) {
-      return { ok: false, reason: 'lease_conflict' }
-    }
-    return { ok: true, expiresAt }
-  }
-
-  releaseAccountLock(accountId: string, sessionId: string, token: string): ReleaseResult {
-    const cursor = this.sql.exec(
-      `DELETE FROM m365_account_locks
-       WHERE account_id = ? AND session_id = ? AND lease_token = ?`,
-      accountId,
       sessionId,
       token,
     )

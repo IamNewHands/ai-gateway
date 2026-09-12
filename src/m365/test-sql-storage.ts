@@ -12,13 +12,6 @@ interface SessionRow {
   updated_at: number
 }
 
-interface AccountLockRow {
-  account_id: string
-  session_id: string
-  lease_token: string
-  expires_at: number
-}
-
 interface ResponseIndexRow {
   response_id: string
   session_id: string
@@ -27,14 +20,12 @@ interface ResponseIndexRow {
 
 export interface FaithfulSqlState {
   sessions: Map<string, SessionRow>
-  accountLocks: Map<string, AccountLockRow>
   responseIndex: Map<string, ResponseIndexRow>
 }
 
 export function createFaithfulSqlState(): FaithfulSqlState {
   return {
     sessions: new Map(),
-    accountLocks: new Map(),
     responseIndex: new Map(),
   }
 }
@@ -79,9 +70,6 @@ export class FaithfulSqlStorage {
     const sessions = new Map(
       [...this.state.sessions].map(([key, value]) => [key, { ...value }]),
     )
-    const accountLocks = new Map(
-      [...this.state.accountLocks].map(([key, value]) => [key, { ...value }]),
-    )
     const responseIndex = new Map(
       [...this.state.responseIndex].map(([key, value]) => [key, { ...value }]),
     )
@@ -91,8 +79,6 @@ export class FaithfulSqlStorage {
     } catch (error) {
       this.state.sessions.clear()
       for (const [key, value] of sessions) this.state.sessions.set(key, value)
-      this.state.accountLocks.clear()
-      for (const [key, value] of accountLocks) this.state.accountLocks.set(key, value)
       this.state.responseIndex.clear()
       for (const [key, value] of responseIndex) this.state.responseIndex.set(key, value)
       throw error
@@ -274,47 +260,6 @@ export class FaithfulSqlStorage {
       return cursor<T>([], 1)
     }
 
-    if (/^INSERT INTO m365_account_locks /i.test(sql)) {
-      const accountId = String(bindings[0])
-      const existing = this.state.accountLocks.get(accountId)
-      const mayWrite = !existing
-        || existing.expires_at <= Number(bindings[4])
-        || (existing.session_id === String(bindings[5]) && existing.lease_token === String(bindings[6]))
-      if (!mayWrite) return cursor<T>([], 0)
-      this.state.accountLocks.set(accountId, {
-        account_id: accountId,
-        session_id: String(bindings[1]),
-        lease_token: String(bindings[2]),
-        expires_at: Number(bindings[3]),
-      })
-      return cursor<T>([], 1)
-    }
-
-    if (/^SELECT session_id, expires_at FROM m365_account_locks WHERE account_id = \?$/i.test(sql)) {
-      const row = this.state.accountLocks.get(String(bindings[0]))
-      return cursor<T>(row ? [{ session_id: row.session_id, expires_at: row.expires_at } as unknown as T] : [])
-    }
-
-    if (/^UPDATE m365_account_locks SET expires_at = \? WHERE account_id = \? AND session_id = \? AND lease_token = \?$/i.test(sql)) {
-      const row = this.state.accountLocks.get(String(bindings[1]))
-      if (
-        !row
-        || row.session_id !== String(bindings[2])
-        || row.lease_token !== String(bindings[3])
-      ) return cursor<T>([], 0)
-      row.expires_at = Number(bindings[0])
-      return cursor<T>([], 1)
-    }
-
-    if (/^DELETE FROM m365_account_locks WHERE account_id = \? AND session_id = \? AND lease_token = \?$/i.test(sql)) {
-      const accountId = String(bindings[0])
-      const row = this.state.accountLocks.get(accountId)
-      if (!row || row.session_id !== String(bindings[1]) || row.lease_token !== String(bindings[2])) {
-        return cursor<T>([], 0)
-      }
-      this.state.accountLocks.delete(accountId)
-      return cursor<T>([], 1)
-    }
 
     if (/^INSERT INTO m365_response_index /i.test(sql)) {
       const responseId = String(bindings[0])

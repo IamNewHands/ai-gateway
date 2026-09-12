@@ -53,21 +53,19 @@ describe('M365 SQL session contention', () => {
     })).not.toEqual({ ok: true, expiresAt: 200 })
   })
 
-  it('does not report account-lock acquisition success when the conditional upsert writes zero rows', () => {
-    const state = createFaithfulSqlState()
-    const first = new M365SessionStore(asDurableStorage(new FaithfulSqlStorage(state)))
-    const second = new M365SessionStore(asDurableStorage(new FaithfulSqlStorage(state)))
-
-    expect(first.acquireAccountLock('account-1', 'session-a', 'lease-a', 100, 100)).toEqual({
-      ok: true,
-      expiresAt: 200,
-    })
-    expect(second.acquireAccountLock('account-1', 'session-b', 'lease-b', 150, 100)).toEqual({
-      ok: false,
-      reason: 'account_locked',
-      ownerSessionId: 'session-a',
-      expiresAt: 200,
-    })
+  it('owns no cross-session account lock: account serialization belongs to AccountFlux', () => {
+    // 回归护栏（log3）：账号级独占曾以 SQLite 表形式实现在"按会话分片"的 store 里，
+    // 天然无法跨会话协调，只会在同一会话内自锁 → 首次发起的会话也可能报 account_locked。
+    // 账号级串行现由 AccountFlux（M365_FLUX 共享 DO）统一负责，store 不得再暴露任何账号锁 API/表。
+    const sql = new FaithfulSqlStorage(createFaithfulSqlState())
+    const store = new M365SessionStore(asDurableStorage(sql)) as unknown as Record<string, unknown>
+    for (const name of ['acquireAccountLock', 'heartbeatAccountLock', 'releaseAccountLock']) {
+      expect(store[name]).toBeUndefined()
+    }
+    const schema = sql.statements.map((s) => s.query).join('\n')
+    expect(schema).not.toMatch(/m365_account_locks/i)
+    // 会话租约本身仍在（它是"会话↔账号"归属绑定，与账号锁是两件事）
+    expect(schema).toMatch(/CREATE TABLE IF NOT EXISTS m365_sessions/i)
   })
 
   it('resolves a response index through a fresh SQL storage instance', () => {

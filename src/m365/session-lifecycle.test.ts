@@ -86,25 +86,19 @@ type LifecycleCall =
   | 'load'
   | 'acquire-lease'
   | 'supersede-lease'
-  | 'acquire-account-lock'
   | 'heartbeat-lease'
-  | 'heartbeat-account-lock'
   | 'migrate-lease-account'
   | 'upstream'
   | 'commit'
-  | 'release-account-lock'
   | 'release-lease'
 
 type LifecycleStore = {
   loadOrCreate: ReturnType<typeof vi.fn>
   acquireLease: ReturnType<typeof vi.fn>
   supersedeLease: ReturnType<typeof vi.fn>
-  acquireAccountLock: ReturnType<typeof vi.fn>
   heartbeatLease: ReturnType<typeof vi.fn>
-  heartbeatAccountLock: ReturnType<typeof vi.fn>
   migrateLeaseAccount: ReturnType<typeof vi.fn>
   commitWithLease: ReturnType<typeof vi.fn>
-  releaseAccountLock: ReturnType<typeof vi.fn>
   releaseLease: ReturnType<typeof vi.fn>
 }
 
@@ -147,16 +141,8 @@ function createStore(calls: LifecycleCall[], snapshot: SessionSnapshotV1 = creat
       calls.push('supersede-lease')
       return { ok: false, reason: 'lease_conflict', expiresAt: Date.now() + 60_000 }
     }),
-    acquireAccountLock: vi.fn(() => {
-      calls.push('acquire-account-lock')
-      return { ok: true, expiresAt: Date.now() + 60_000 }
-    }),
     heartbeatLease: vi.fn(() => {
       calls.push('heartbeat-lease')
-      return { ok: true, expiresAt: Date.now() + 60_000 }
-    }),
-    heartbeatAccountLock: vi.fn(() => {
-      calls.push('heartbeat-account-lock')
       return { ok: true, expiresAt: Date.now() + 60_000 }
     }),
     migrateLeaseAccount: vi.fn(() => {
@@ -166,10 +152,6 @@ function createStore(calls: LifecycleCall[], snapshot: SessionSnapshotV1 = creat
     commitWithLease: vi.fn(({ expectedGeneration }) => {
       calls.push('commit')
       return { ok: true, generation: expectedGeneration + 1 }
-    }),
-    releaseAccountLock: vi.fn(() => {
-      calls.push('release-account-lock')
-      return { ok: true }
     }),
     releaseLease: vi.fn(() => {
       calls.push('release-lease')
@@ -257,7 +239,6 @@ describe('M365Session SQL request lifecycle', () => {
     expect(chatWithHandlersMock).not.toHaveBeenCalled()
     expect(store.loadOrCreate).not.toHaveBeenCalled()
     expect(store.acquireLease).not.toHaveBeenCalled()
-    expect(store.acquireAccountLock).not.toHaveBeenCalled()
     expect(store.commitWithLease).not.toHaveBeenCalled()
   })
 
@@ -276,7 +257,6 @@ describe('M365Session SQL request lifecycle', () => {
     expect(chatWithHandlersMock).not.toHaveBeenCalled()
     expect(store.loadOrCreate).not.toHaveBeenCalled()
     expect(store.acquireLease).not.toHaveBeenCalled()
-    expect(store.acquireAccountLock).not.toHaveBeenCalled()
     expect(store.commitWithLease).not.toHaveBeenCalled()
   })
 
@@ -303,10 +283,8 @@ describe('M365Session SQL request lifecycle', () => {
     expect(calls).toEqual([
       'load',
       'acquire-lease',
-      'acquire-account-lock',
       'upstream',
       'commit',
-      'release-account-lock',
       'release-lease',
     ])
     expect(store.acquireLease).toHaveBeenCalledWith(expect.objectContaining({
@@ -347,7 +325,7 @@ describe('M365Session SQL request lifecycle', () => {
     }))
   })
 
-  it('renews the session lease and held account lock during a long request', async () => {
+  it('renews the session lease during a long request', async () => {
     vi.useFakeTimers()
     const calls: LifecycleCall[] = []
     const store = createStore(calls)
@@ -368,13 +346,6 @@ describe('M365Session SQL request lifecycle', () => {
 
     const leaseToken = store.acquireLease.mock.calls[0]?.[0].token
     expect(store.heartbeatLease).toHaveBeenCalledWith('session-1', leaseToken, expect.any(Number), 60_000)
-    expect(store.heartbeatAccountLock).toHaveBeenCalledWith(
-      'account-1',
-      'session-1',
-      leaseToken,
-      expect.any(Number),
-      60_000,
-    )
 
     upstream.resolve({
       text: 'done',
@@ -422,7 +393,6 @@ describe('M365Session SQL request lifecycle', () => {
 
     expect(response.status).toBe(409)
     expect(store.commitWithLease).not.toHaveBeenCalled()
-    expect(store.releaseAccountLock).toHaveBeenCalledTimes(1)
     expect(store.releaseLease).toHaveBeenCalledTimes(1)
     expect(vi.getTimerCount()).toBe(0)
   })
@@ -585,7 +555,6 @@ describe('M365Session SQL request lifecycle', () => {
 
     expect(response.status).toBe(409)
     expect(chatWithHandlersMock).not.toHaveBeenCalled()
-    expect(store.acquireAccountLock).not.toHaveBeenCalled()
     expect(store.commitWithLease).not.toHaveBeenCalled()
     expect(store.releaseLease).not.toHaveBeenCalled()
   })
@@ -602,7 +571,6 @@ describe('M365Session SQL request lifecycle', () => {
 
     expect(response.status).toBe(409)
     expect(chatWithHandlersMock).not.toHaveBeenCalled()
-    expect(store.acquireAccountLock).not.toHaveBeenCalled()
     expect(store.commitWithLease).not.toHaveBeenCalled()
     expect(store.releaseLease).not.toHaveBeenCalled()
     // 租约确实被正当持有：应经有界重试后尝试抢占，但抢占被拒绝（未过期且心跳新鲜）
@@ -626,70 +594,10 @@ describe('M365Session SQL request lifecycle', () => {
 
     expect(store.supersedeLease).toHaveBeenCalledTimes(1)
     // 抢占成功后必须继续走完生命周期，而不是把 409 抛给客户端
-    expect(store.acquireAccountLock).toHaveBeenCalledTimes(1)
     expect(response.status).not.toBe(409)
   })
 
-  it('releases the session lease and returns a retryable 429 when every candidate account is busy', async () => {
-    const calls: LifecycleCall[] = []
-    const store = createStore(calls)
-    // 单活模式最多返回 2 个候选：两个都被占用才算"全忙"
-    listM365AccountsMock.mockResolvedValue([
-      { accessToken: 'token-1', oid: 'account-1', tid: 'tenant-1', expiresAt: Date.now() + 60_000 },
-      { accessToken: 'token-2', oid: 'account-2', tid: 'tenant-2', expiresAt: Date.now() + 60_000 },
-    ])
-    store.acquireAccountLock.mockImplementation(() => {
-      calls.push('acquire-account-lock')
-      return {
-        ok: false,
-        reason: 'account_locked',
-        ownerSessionId: 'other-session',
-        expiresAt: Date.now() + 60_000,
-      }
-    })
-
-    const response = await createSession(store).fetch(request())
-
-    // 所有候选账号都被其它会话占用属于"稍后重试"，不是永久失败：
-    // 必须返回 429 + Retry-After，且必须归还会话租约（不得泄漏）。
-    expect(response.status).toBe(429)
-    expect(response.headers.get('Retry-After')).toBeTruthy()
-    expect(chatWithHandlersMock).not.toHaveBeenCalled()
-    expect(store.commitWithLease).not.toHaveBeenCalled()
-    expect(store.releaseLease).toHaveBeenCalledTimes(1)
-    // 两个候选账号都要试过，而不是首个冲突就放弃
-    expect(store.acquireAccountLock).toHaveBeenCalledTimes(2)
-  })
-
-  it('falls through to the next candidate account when the first one is busy', async () => {
-    const calls: LifecycleCall[] = []
-    const store = createStore(calls)
-    listM365AccountsMock.mockResolvedValue([
-      { accessToken: 'token-1', oid: 'account-1', tid: 'tenant-1', expiresAt: Date.now() + 60_000 },
-      { accessToken: 'token-2', oid: 'account-2', tid: 'tenant-2', expiresAt: Date.now() + 60_000 },
-    ])
-    let attempt = 0
-    store.acquireAccountLock.mockImplementation(() => {
-      calls.push('acquire-account-lock')
-      attempt += 1
-      // 第一个候选被占用，第二个可用
-      return attempt === 1
-        ? { ok: false, reason: 'account_locked', ownerSessionId: 'other-session', expiresAt: Date.now() + 60_000 }
-        : { ok: true, expiresAt: Date.now() + 60_000 }
-    })
-
-    const response = await createSession(store).fetch(request())
-
-    // 首个候选忙不应让整轮失败：应接棒到第二个候选并正常执行（锁最终由收尾释放）
-    expect(response.status).not.toBe(429)
-    expect(response.status).not.toBe(409)
-    expect(chatWithHandlersMock).toHaveBeenCalled()
-    // 入口接棒时先试 account-1（忙）再试 account-2（成功）
-    expect(store.acquireAccountLock.mock.calls[0]?.[0]).toBe('account-1')
-    expect(store.acquireAccountLock.mock.calls[1]?.[0]).toBe('account-2')
-  })
-
-  it('commits streamed assistant output before releasing the account lock and session lease', async () => {
+  it('commits streamed assistant output before releasing the session lease', async () => {
     const calls: LifecycleCall[] = []
     const store = createStore(calls)
     chatWithHandlersMock.mockImplementation(async (_account, _input, _options, onDelta) => {
@@ -723,10 +631,8 @@ describe('M365Session SQL request lifecycle', () => {
     expect(calls).toEqual([
       'load',
       'acquire-lease',
-      'acquire-account-lock',
       'upstream',
       'commit',
-      'release-account-lock',
       'release-lease',
     ])
   })
@@ -778,15 +684,13 @@ describe('M365Session SQL request lifecycle', () => {
     expect(calls).toEqual([
       'load',
       'acquire-lease',
-      'acquire-account-lock',
       'upstream',
-      'release-account-lock',
       'release-lease',
     ])
     expect(vi.getTimerCount()).toBe(0)
   })
 
-  it('transfers the account lock to the actual account during non-streaming failover', async () => {
+  it('migrates the session lease to the actual account during non-streaming failover', async () => {
     const calls: LifecycleCall[] = []
     const store = createStore(calls)
     listM365AccountsMock.mockResolvedValue([
@@ -811,19 +715,13 @@ describe('M365Session SQL request lifecycle', () => {
 
     expect(response.status).toBe(200)
     expect(chatWithHandlersMock.mock.calls.map((call) => call[0].oid)).toEqual(['account-1', 'account-2'])
-    expect(store.acquireAccountLock.mock.calls.map((call) => call[0])).toEqual(['account-1', 'account-2'])
+    // 切号时必须把租约的账号绑定一起迁走，否则会话会跑在租约未记录的账号上
     expect(store.migrateLeaseAccount).toHaveBeenCalledWith(
       'session-1',
       leaseToken,
       'account-1',
       'account-2',
     )
-    const newLockOrder = store.acquireAccountLock.mock.invocationCallOrder[1]
-    const migrateOrder = store.migrateLeaseAccount.mock.invocationCallOrder[0]
-    const oldLockReleaseOrder = store.releaseAccountLock.mock.invocationCallOrder[0]
-    expect(newLockOrder).toBeLessThan(migrateOrder)
-    expect(migrateOrder).toBeLessThan(oldLockReleaseOrder)
-    expect(store.releaseAccountLock.mock.calls.map((call) => call[0])).toEqual(['account-1', 'account-2'])
     expect(bindSessionMock).toHaveBeenCalledWith(
       expect.anything(),
       'm365-provider',
@@ -836,7 +734,7 @@ describe('M365Session SQL request lifecycle', () => {
     )
   })
 
-  it('releases the attempted lock and moves on when failover lease migration fails', async () => {
+  it('fails hard when failover lease migration fails instead of running on an unbound account', async () => {
     const calls: LifecycleCall[] = []
     const store = createStore(calls)
     listM365AccountsMock.mockResolvedValue([
@@ -849,14 +747,14 @@ describe('M365Session SQL request lifecycle', () => {
 
     const response = await createSession(store).fetch(request())
 
-    // 迁移失败属于内部租约协调问题：归还刚拿到的账号锁并继续下一个候选，
-    // 不应把 lease_conflict 当作客户端 409 抛出。两个候选都迁移失败后以 502 收尾。
-    expect(response.status).toBe(502)
+    // 迁移失败 = 租约与账号不一致。必须硬失败：若继续跑，请求会落在租约未记录的账号上，
+    // 破坏"已绑定会话不换号"的归属约束（不能被换号掩盖）。
+    expect(response.status).toBe(409)
     expect(store.commitWithLease).not.toHaveBeenCalled()
-    // account-2 的锁被归还（迁移失败），account-1 的锁由 finally 归还
-    expect(store.releaseAccountLock.mock.calls.map((call) => call[0])).toEqual(['account-2', 'account-1'])
-    expect(store.releaseLease).toHaveBeenCalledTimes(1)
+    // 只尝试过 account-1；迁移失败后不再在 account-2 上执行上游
     expect(chatWithHandlersMock).toHaveBeenCalledTimes(1)
+    expect(chatWithHandlersMock.mock.calls.map((call) => call[0].oid)).toEqual(['account-1'])
+    expect(store.releaseLease).toHaveBeenCalledTimes(1)
   })
 
   it('does not fail over after the first streaming account has emitted partial output', async () => {
@@ -879,13 +777,11 @@ describe('M365Session SQL request lifecycle', () => {
     expect(body).toContain('partial from account 1')
     expect(body).not.toContain('streamed from account 2')
     expect(chatWithHandlersMock.mock.calls.map((call) => call[0].oid)).toEqual(['account-1'])
-    expect(store.acquireAccountLock.mock.calls.map((call) => call[0])).toEqual(['account-1'])
-    expect(store.releaseAccountLock.mock.calls.map((call) => call[0])).toEqual(['account-1'])
     expect(store.commitWithLease).not.toHaveBeenCalled()
     expect(bindSessionMock).not.toHaveBeenCalled()
   })
 
-  it('fails over a new streaming session and transfers the account lock to the successful account', async () => {
+  it('fails over a new streaming session and migrates the lease to the successful account', async () => {
     vi.useFakeTimers()
     const calls: LifecycleCall[] = []
     const store = createStore(calls)
@@ -916,19 +812,12 @@ describe('M365Session SQL request lifecycle', () => {
     expect(response.status).toBe(200)
     expect(body).toContain('streamed from account 2')
     expect(chatWithHandlersMock.mock.calls.map((call) => call[0].oid)).toEqual(['account-1', 'account-2'])
-    expect(store.acquireAccountLock.mock.calls.map((call) => call[0])).toEqual(['account-1', 'account-2'])
     expect(store.migrateLeaseAccount).toHaveBeenCalledWith(
       'session-1',
       leaseToken,
       'account-1',
       'account-2',
     )
-    const newLockOrder = store.acquireAccountLock.mock.invocationCallOrder[1]
-    const migrateOrder = store.migrateLeaseAccount.mock.invocationCallOrder[0]
-    const oldLockReleaseOrder = store.releaseAccountLock.mock.invocationCallOrder[0]
-    expect(newLockOrder).toBeLessThan(migrateOrder)
-    expect(migrateOrder).toBeLessThan(oldLockReleaseOrder)
-    expect(store.releaseAccountLock.mock.calls.map((call) => call[0])).toEqual(['account-1', 'account-2'])
     expect(store.commitWithLease).toHaveBeenCalledTimes(1)
     expect(bindSessionMock).toHaveBeenCalledWith(
       expect.anything(),

@@ -301,37 +301,11 @@ export class M365Session {
       return cjson({ error: { message: lease.reason, type: lease.reason } }, 409)
     }
 
-    // 账号锁既不是会话级独占、也不代表账号"被禁用"：它只表示该账号此刻正被另一个会话使用。
-    // 因此候选账号池里有其它可用账号时，必须按序接棒而不是把 account_locked 直接抛给客户端
-    // （log3 中"实际账号根本没锁却报 account_locked"的来源）。
-    let lockedAccountId = ''
-    let lockFailureExpiresAt = 0
-    for (const candidate of ordered) {
-      const attemptLock = this.sessionStore.acquireAccountLock(
-        candidate.oid,
-        snapshot.sessionId,
-        leaseToken,
-        Date.now(),
-        leaseTtlMs,
-      )
-      if (attemptLock.ok) {
-        lockedAccountId = candidate.oid
-        acc = candidate
-        break
-      }
-      lockFailureExpiresAt = attemptLock.expiresAt
-    }
-    if (lockedAccountId === '') {
-      this.sessionStore.releaseLease(snapshot.sessionId, leaseToken)
-      // 所有候选账号都在被其它会话占用：属于限流/稍后重试语义，不是"账号被锁死"。
-      // 返回 429 + Retry-After 提示调用方退避，避免被当成永久失败。
-      const retryAfterSec = Math.max(1, Math.ceil((lockFailureExpiresAt - Date.now()) / 1000))
-      return cjson(
-        { error: { message: 'account_locked', type: 'account_locked' } },
-        429,
-        { 'Retry-After': String(Math.min(retryAfterSec, 60)) },
-      )
-    }
+    // 账号级串行完全交给 AccountFlux（M365_FLUX 共享 DO，见下方各上游调用的 acquireSlot）。
+    // 这里**不再**有任何"账号锁"：M365SessionStore 挂在按会话分片的 DO 上，其表无法跨会话协调，
+    // 放在那里的账号锁只会在同一会话内自锁（log3 的 account_locked 假冲突）。
+    // 会话当前绑定的账号（随切号一起迁移到租约；不再是任何形式的锁）。
+    let lockedAccountId = acc.oid
 
     let lifecycleTransferredToStream = false
     const lifecycleHeartbeat = {
@@ -346,21 +320,10 @@ export class M365Session {
     }
     lifecycleHeartbeat.timer = setInterval(() => {
       const now = Date.now()
+      // 只续租会话租约；账号级串行由 AccountFlux 的在途计数负责，无需心跳续期。
       const leaseHeartbeat = this.sessionStore.heartbeatLease(snapshot.sessionId, leaseToken, now, leaseTtlMs)
       if (!leaseHeartbeat.ok) {
         lifecycleHeartbeat.failed = leaseHeartbeat.reason
-        stopLifecycleHeartbeat()
-        return
-      }
-      const accountHeartbeat = this.sessionStore.heartbeatAccountLock(
-        lockedAccountId,
-        snapshot.sessionId,
-        leaseToken,
-        now,
-        leaseTtlMs,
-      )
-      if (!accountHeartbeat.ok) {
-        lifecycleHeartbeat.failed = accountHeartbeat.reason
         stopLifecycleHeartbeat()
       }
     }, Math.min(15_000, Math.max(1000, Math.floor(leaseTtlMs / 3))))
@@ -481,18 +444,9 @@ export class M365Session {
     for (let i = 0; i < ordered.length; i++) {
       usedAcc = ordered[i]
       if (usedAcc.oid !== lockedAccountId) {
-        const nextAccountLock = this.sessionStore.acquireAccountLock(
-          usedAcc.oid,
-          snapshot.sessionId,
-          leaseToken,
-          Date.now(),
-          leaseTtlMs,
-        )
-        if (!nextAccountLock.ok) {
-          // 该账号正被其它会话占用：换下一个候选账号继续，而不是让整轮请求失败
-          // （account_locked 只表示"此账号忙"，不代表账号不可用）。
-          continue
-        }
+        // 切号时把会话租约的账号绑定一起迁移（m365_sessions.lease_account_id）。
+        // 迁移失败说明租约与账号不一致，必须硬失败：继续跑会让请求落在租约未记录的账号上，
+        // 破坏"已绑定会话不换号"的归属约束，也不能靠换下一个候选掩盖。
         const migrated = this.sessionStore.migrateLeaseAccount(
           snapshot.sessionId,
           leaseToken,
@@ -500,12 +454,8 @@ export class M365Session {
           usedAcc.oid,
         )
         if (!migrated.ok) {
-          // 账号身份迁移失败（会话与租约不一致）：归还刚拿到的锁并换下一个候选，
-          // 保持当前 lockedAccountId 不变，避免把内部冲突暴露成客户端 409。
-          this.sessionStore.releaseAccountLock(usedAcc.oid, snapshot.sessionId, leaseToken)
-          continue
+          return cjson({ error: { message: migrated.reason, type: migrated.reason } }, 409)
         }
-        this.sessionStore.releaseAccountLock(lockedAccountId, snapshot.sessionId, leaseToken)
         lockedAccountId = usedAcc.oid
       }
       // 并发闸门：占用该账号一个并发位；满则轮询等待，超时后该账号视为"忙"试下一个
@@ -846,7 +796,6 @@ export class M365Session {
     } finally {
       if (!lifecycleTransferredToStream) {
         stopLifecycleHeartbeat()
-        this.sessionStore.releaseAccountLock(lockedAccountId, snapshot.sessionId, leaseToken)
         this.sessionStore.releaseLease(snapshot.sessionId, leaseToken)
       }
     }
@@ -884,7 +833,7 @@ export class M365Session {
     }
     stopLifecycleHeartbeat: () => void
     deadline: number
-    /** 调用方实际持有账号锁的账号 id（不一定是 ordered[0]，见入口的候选接棒逻辑） */
+    /** 调用方会话租约当前绑定的账号 id（切号时与之同步迁移） */
     lockedAccountId: string
     /** 流已建成并接管收尾时回调：调用方据此确认生命周期已移交，外层不再重复释放 */
     onLifecycleOwned: () => void
@@ -897,8 +846,7 @@ export class M365Session {
     else requestSignal?.addEventListener('abort', () => aborter.abort(), { once: true })
     const created = Math.floor(Date.now() / 1000)
     const id = 'chatcmpl-' + crypto.randomUUID()
-    // 从"调用方已持锁的账号"开始尝试：该账号一定在 ordered 中（入口接棒时锁定）。
-    // 若不在（防御性），退回首候选以免丢失请求。
+    // 从租约已绑定的账号开始尝试（它一定在 ordered 中，否则退回首候选以免丢失请求）。
     const lockedIndex = ordered.findIndex((x) => x.oid === a.lockedAccountId)
     let lockedAccountId = lockedIndex >= 0 ? a.lockedAccountId : (ordered[0]?.oid ?? '')
     let usedAcc = ordered[lockedIndex >= 0 ? lockedIndex : 0]
@@ -919,13 +867,12 @@ export class M365Session {
     // 恰到一次收尾：心跳 interval 与 controller.close() 只执行一次
     let sseHeartbeat: ReturnType<typeof setInterval> | undefined
     // 生命周期收尾幂等闸门：start() 的 finally 与 cancel() 都可能触发，
-    // 保证 stopLifecycleHeartbeat / releaseAccountLock / releaseLease 只执行一次且一定执行。
+    // 保证 stopLifecycleHeartbeat / releaseLease 只执行一次且一定执行。
     let lifecycleReleased = false
     const releaseLifecycle = (origin: string): void => {
       if (lifecycleReleased) return
       lifecycleReleased = true
       stopLifecycleHeartbeat()
-      this.sessionStore.releaseAccountLock(lockedAccountId, snapshot.sessionId, leaseToken)
       this.sessionStore.releaseLease(snapshot.sessionId, leaseToken)
       if (origin === 'client-cancel') {
         try { void writeLog(this.env, 'info', `[m365-chat] provider=${providerId} → lease released on client cancel (pre-start window) session=${snapshot.sessionId}`) } catch { /* ignore */ }
@@ -985,28 +932,14 @@ export class M365Session {
           for (let i = 0; i < ordered.length; i++) {
             usedAcc = ordered[i]
             if (usedAcc.oid !== lockedAccountId) {
-              const nextAccountLock = this.sessionStore.acquireAccountLock(
-                usedAcc.oid,
-                snapshot.sessionId,
-                leaseToken,
-                Date.now(),
-                leaseTtlMs,
-              )
-              if (!nextAccountLock.ok) {
-                // 该账号被其它会话占用：换下一个候选，不要中断整条流
-                continue
-              }
+              // 同非流式路径：迁移失败必须硬失败，避免流跑在租约未记录的账号上。
               const migrated = this.sessionStore.migrateLeaseAccount(
                 snapshot.sessionId,
                 leaseToken,
                 lockedAccountId,
                 usedAcc.oid,
               )
-              if (!migrated.ok) {
-                this.sessionStore.releaseAccountLock(usedAcc.oid, snapshot.sessionId, leaseToken)
-                continue
-              }
-              this.sessionStore.releaseAccountLock(lockedAccountId, snapshot.sessionId, leaseToken)
+              if (!migrated.ok) throw new Error(migrated.reason)
               lockedAccountId = usedAcc.oid
             }
 

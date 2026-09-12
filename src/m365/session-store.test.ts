@@ -41,9 +41,10 @@ describe('M365 Durable Object SQL session store', () => {
 
     const schema = sql.statements.map((statement) => statement.query).join('\n')
     expect(schema).toMatch(/CREATE TABLE IF NOT EXISTS m365_sessions/i)
-    expect(schema).toMatch(/CREATE TABLE IF NOT EXISTS m365_account_locks/i)
     expect(schema).toMatch(/CREATE TABLE IF NOT EXISTS m365_response_index/i)
     expect(schema).toMatch(/CREATE INDEX IF NOT EXISTS/i)
+    // 账号级独占不在这里：本 store 按会话分片，账号锁必须由 AccountFlux 共享 DO 承担
+    expect(schema).not.toMatch(/CREATE TABLE IF NOT EXISTS m365_account_locks/i)
     expect(schema).not.toMatch(/\bDROP\b|\bDELETE\b/i)
   })
 
@@ -88,52 +89,6 @@ describe('M365 Durable Object SQL session store', () => {
       expiresAt: 170,
     })
     expect(store.releaseLease('session-lease', 'lease-1')).toEqual({ ok: true })
-  })
-
-  it('rejects account-lock contention until the current lock expires', () => {
-    const sql = new MemorySqlStorage()
-    const store = new M365SessionStore(({ sql, transactionSync: sql.transactionSync.bind(sql) } as unknown as DurableObjectStorage))
-
-    expect(store.acquireAccountLock('account-1', 'session-a', 'lease-a', 100, 50)).toEqual({
-      ok: true,
-      expiresAt: 150,
-    })
-    expect(store.acquireAccountLock('account-1', 'session-b', 'lease-b', 120, 50)).toEqual({
-      ok: false,
-      reason: 'account_locked',
-      ownerSessionId: 'session-a',
-      expiresAt: 150,
-    })
-    expect(store.acquireAccountLock('account-1', 'session-b', 'lease-b', 151, 50)).toEqual({
-      ok: true,
-      expiresAt: 201,
-    })
-  })
-
-  it('heartbeats an account lock only for its exact session and lease owner', () => {
-    const sql = new MemorySqlStorage()
-    const store = new M365SessionStore(({ sql, transactionSync: sql.transactionSync.bind(sql) } as unknown as DurableObjectStorage))
-
-    expect(store.acquireAccountLock('account-1', 'session-owner', 'lease-owner', 100, 50)).toEqual({
-      ok: true,
-      expiresAt: 150,
-    })
-    expect(store.heartbeatAccountLock('account-1', 'session-owner', 'lease-owner', 120, 50)).toEqual({
-      ok: true,
-      expiresAt: 170,
-    })
-    expect(store.heartbeatAccountLock('account-1', 'session-other', 'lease-owner', 130, 50)).toEqual({
-      ok: false,
-      reason: 'lease_conflict',
-    })
-    expect(store.heartbeatAccountLock('account-1', 'session-owner', 'lease-other', 130, 50)).toEqual({
-      ok: false,
-      reason: 'lease_conflict',
-    })
-    expect(store.heartbeatAccountLock('account-2', 'session-owner', 'lease-owner', 130, 50)).toEqual({
-      ok: false,
-      reason: 'lease_conflict',
-    })
   })
 
   it('migrates lease account identity only for the exact current owner', () => {
@@ -187,32 +142,6 @@ describe('M365 Durable Object SQL session store', () => {
       },
     })
     expect(restartedSql.statements.some(({ query }) => /SELECT\s+snapshot_json,\s*generation,\s*lease_token,\s*lease_account_id,\s*lease_expires_at,\s*lease_renewed_at\s+FROM\s+m365_sessions/i.test(query))).toBe(true)
-  })
-
-  it('releases an account lock only for its owning session and lease token', () => {
-    const sql = new MemorySqlStorage()
-    const store = new M365SessionStore(({ sql, transactionSync: sql.transactionSync.bind(sql) } as unknown as DurableObjectStorage))
-
-    expect(store.acquireAccountLock('account-1', 'session-owner', 'lease-owner', 100, 50)).toEqual({
-      ok: true,
-      expiresAt: 150,
-    })
-
-    expect(store.releaseAccountLock('account-1', 'session-owner', 'wrong-lease')).toEqual({
-      ok: false,
-      reason: 'lease_conflict',
-    })
-    expect(store.acquireAccountLock('account-1', 'session-other', 'lease-other', 120, 50)).toMatchObject({
-      ok: false,
-      reason: 'account_locked',
-      ownerSessionId: 'session-owner',
-    })
-
-    expect(store.releaseAccountLock('account-1', 'session-owner', 'lease-owner')).toEqual({ ok: true })
-    expect(store.acquireAccountLock('account-1', 'session-other', 'lease-other', 120, 50)).toEqual({
-      ok: true,
-      expiresAt: 170,
-    })
   })
 
   it('atomically commits canonical state and response index only for the active lease token', () => {
