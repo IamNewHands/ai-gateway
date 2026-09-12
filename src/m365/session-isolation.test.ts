@@ -61,4 +61,19 @@ describe('#57 会话租户隔离', () => {
     expect(res.isNew).toBe(true)
     expect(res.matchedBy).toBe('explicit_new')
   })
+
+  it('无显式 id 且为新会话时返回空 sessionId（并发新会话用唯一 uuid，不共用租约行）', async () => {
+    const { resolveSession } = await import('./session')
+    const msgs = [
+      { role: 'system', content: 'sys' },
+      { role: 'user', content: '<openviking-context>' },
+    ]
+    const ctx = { explicitSessionId: '', tenant: 'tenantA' }
+    const res = await resolveSession(kv.env, 'm365-p', msgs as never[], ctx)
+    expect(res.isNew).toBe(true)
+    expect(res.sessionId).toBe('') // 空 → durable 端 effectiveSessionId = crypto.randomUUID()
+    // 两个内容相同的并行新会话不会被"内容推导指纹"绑到同一 sessionId
+    const res2 = await resolveSession(kv.env, 'm365-p', msgs as never[], { ...ctx, explicitSessionId: '' })
+    expect(res2.sessionId).toBe('')
+  })
 })

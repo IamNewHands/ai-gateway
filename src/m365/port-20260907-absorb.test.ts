@@ -15,8 +15,10 @@ import {
   normalizeInstructionText,
   rootConversationFingerprint,
   stableSessionCandidateBody,
+  explicitSessionIdFromBody,
   sessionCandidateFromRequest,
 } from './session-candidates'
+import { sessionKey } from './durable'
 import { imageURLs } from './events'
 
 describe('P1: isChainOfThoughtMessage（移植 C chathub.ts:1759-1762）', () => {
@@ -121,6 +123,34 @@ describe('P2c: session-candidates（移植 C session-resolver.ts）', () => {
       const id = stableSessionCandidateBody({ user: 'u1', messages: [{ role: 'user', content: 'hello' }] })
       expect(id).toContain('u1::')
       expect(id).toContain('user:hello')
+    })
+  })
+
+  describe('explicitSessionIdFromBody（会话隔离回归，log7 lease_conflict 根因）', () => {
+    it('真实显式字段优先，与 stableSessionCandidateBody 一致', () => {
+      expect(explicitSessionIdFromBody({ m365_session_id: 'a', session_key: 'b' })).toBe('a')
+      expect(explicitSessionIdFromBody({ metadata: { thread_id: 't1' } })).toBe('t1')
+    })
+    it('无显式字段时不回退内容推导根指纹', () => {
+      // DSH 场景：所有会话首条 user 都是通用 openviking/system 注入，根指纹趋同。
+      // 若把它当显式会话 id，两个并行新会话会命中同一 DO/同一租约行 → lease_conflict。
+      const body = { user: 'u1', messages: [{ role: 'system', content: 'sys' }, { role: 'user', content: '<openviking-context>...' }] }
+      expect(stableSessionCandidateBody(body)).toContain('u1::')
+      expect(stableSessionCandidateBody(body)).toContain('user:<openviking-context>...')
+      expect(explicitSessionIdFromBody(body)).toBe('')
+    })
+  })
+
+  describe('sessionKey 并发新会话隔离', () => {
+    it('无显式 id 时两个内容相同的请求得到不同 DO 分片键（配合 KV 内容匹配保持粘性）', () => {
+      const msgs = [
+        [{ role: 'system', content: 'sys' }, { role: 'user', content: 'u' }, { role: 'assistant', content: 'a' }, { role: 'user', content: '<openviking-context>' }],
+        [{ role: 'system', content: 'sys' }, { role: 'user', content: 'u' }, { role: 'assistant', content: 'a' }, { role: 'user', content: '<openviking-context>' }],
+      ]
+      // 无显式 id、末尾 3 条完全相同时……实际走 messages 指纹仍会落入同一 DO 分片，
+      // 但 effectiveSessionId（resolveSession 返回）+租约行不依赖它。此处断言根指纹不进入 sessionKey。
+      const id = sessionKey('m365-p', undefined, msgs[0], 'tenantA')
+      expect(id).toContain(':ctx:')
     })
   })
 

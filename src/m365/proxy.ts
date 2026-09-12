@@ -17,7 +17,7 @@
 import type { Env, Provider } from '../types'
 import { sessionKey } from './durable'
 import type { M365ChatPayload } from './durable'
-import { stableSessionCandidateBody } from './session-candidates'
+import { explicitSessionIdFromBody } from './session-candidates'
 import { canonicalModel, MODELS } from './models'
 
 /**
@@ -59,13 +59,14 @@ export interface M365ProxyContext {
 const TENANT_BODY_FIELD = '__m365_tenant'
 
 /**
- * 从请求体提取客户端指定的会话 ID。
- * 扩展候选链（移植自 M365-2api session-resolver，2026-09-06）：
- * m365_session_id / session_id（A 原有）→ session_key / conversation_id / chat_id /
- * prompt_cache_key → metadata.* → 会话根指纹（system+首条 user，先剥 IDE 动态日期噪声）。
+ * 从请求体提取客户端真实指定的会话 ID。
+ * 仅接受 body 显式字段 / metadata.*（客户端明确传的稳定 id）——绝不回退到内容推导的
+ * 根指纹（system+首条 user）。根指纹对并发新会话不具区分度（DSH 首条 user 为通用注入），
+ * 用作互斥租约键会导致并行会话互相 lease_conflict（log7 复现）。会话复用交给 resolveSession
+ * 的 KV 内容前缀/suffix 匹配（session.ts）。
  */
 function extractExplicitSession(body: Record<string, unknown>): string | undefined {
-  const id = stableSessionCandidateBody(body)
+  const id = explicitSessionIdFromBody(body)
   return id !== '' ? id : undefined
 }
 

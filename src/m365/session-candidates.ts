@@ -86,6 +86,36 @@ export function stableSessionCandidateBody(body: Record<string, unknown>): strin
   return ''
 }
 
+/**
+ * 仅取"客户端真实显式"的会话 ID（body 显式字段 + metadata），**不含**内容推导的根指纹。
+ * 用途：作为互斥租约/DO 分片键时，必须只用客户端明确提供的稳定 id——内容推导的根指纹
+ * （system+首条 user）对并发新会话不具区分度：DSH 等客户端首条 user 是通用 openviking/
+ * system 注入，不同会话根指纹趋同，若把它当租约键，两个并行新会话会命中同一 DO/同一条
+ * m365_sessions 行而互相 lease_conflict（log7 复现的正是该形态）。
+ * 会话复用仍由 resolveSession 的 KV 内容前缀/suffix 匹配负责（见 session.ts），
+ * 因此去掉根指纹回退不会丢失同一会话的后续粘性——只在"无真实显式 id"时交给内容匹配。
+ */
+export function explicitSessionIdFromBody(body: Record<string, unknown>): string {
+  const bodyCandidates: unknown[] = [
+    body['m365_session_id'],
+    body['session_id'],
+    body['session_key'],
+    body['conversation_id'],
+    body['chat_id'],
+    body['prompt_cache_key'],
+  ]
+  const metadata = body['metadata']
+  if (metadata && typeof metadata === 'object' && !Array.isArray(metadata)) {
+    const meta = metadata as Record<string, unknown>
+    bodyCandidates.push(meta['session_id'], meta['conversation_id'], meta['chat_id'], meta['thread_id'], meta['user_id'], meta['prompt_cache_key'])
+  }
+  for (const c of bodyCandidates) {
+    const id = optionalSessionIdentifier(c)
+    if (id) return id
+  }
+  return ''
+}
+
 /** 请求头侧候选链（顺序即优先级；调用点在 A 自有 header 之后拼接） */
 export const SESSION_CANDIDATE_HEADERS = [
   'X-Session-Key',
