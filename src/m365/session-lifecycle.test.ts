@@ -630,9 +630,14 @@ describe('M365Session SQL request lifecycle', () => {
     expect(response.status).not.toBe(409)
   })
 
-  it('releases the session lease without executing upstream or committing after an account-lock conflict', async () => {
+  it('releases the session lease and returns a retryable 429 when every candidate account is busy', async () => {
     const calls: LifecycleCall[] = []
     const store = createStore(calls)
+    // 单活模式最多返回 2 个候选：两个都被占用才算"全忙"
+    listM365AccountsMock.mockResolvedValue([
+      { accessToken: 'token-1', oid: 'account-1', tid: 'tenant-1', expiresAt: Date.now() + 60_000 },
+      { accessToken: 'token-2', oid: 'account-2', tid: 'tenant-2', expiresAt: Date.now() + 60_000 },
+    ])
     store.acquireAccountLock.mockImplementation(() => {
       calls.push('acquire-account-lock')
       return {
@@ -645,10 +650,43 @@ describe('M365Session SQL request lifecycle', () => {
 
     const response = await createSession(store).fetch(request())
 
-    expect(response.status).toBe(409)
+    // 所有候选账号都被其它会话占用属于"稍后重试"，不是永久失败：
+    // 必须返回 429 + Retry-After，且必须归还会话租约（不得泄漏）。
+    expect(response.status).toBe(429)
+    expect(response.headers.get('Retry-After')).toBeTruthy()
     expect(chatWithHandlersMock).not.toHaveBeenCalled()
     expect(store.commitWithLease).not.toHaveBeenCalled()
-    expect(calls).toEqual(['load', 'acquire-lease', 'acquire-account-lock', 'release-lease'])
+    expect(store.releaseLease).toHaveBeenCalledTimes(1)
+    // 两个候选账号都要试过，而不是首个冲突就放弃
+    expect(store.acquireAccountLock).toHaveBeenCalledTimes(2)
+  })
+
+  it('falls through to the next candidate account when the first one is busy', async () => {
+    const calls: LifecycleCall[] = []
+    const store = createStore(calls)
+    listM365AccountsMock.mockResolvedValue([
+      { accessToken: 'token-1', oid: 'account-1', tid: 'tenant-1', expiresAt: Date.now() + 60_000 },
+      { accessToken: 'token-2', oid: 'account-2', tid: 'tenant-2', expiresAt: Date.now() + 60_000 },
+    ])
+    let attempt = 0
+    store.acquireAccountLock.mockImplementation(() => {
+      calls.push('acquire-account-lock')
+      attempt += 1
+      // 第一个候选被占用，第二个可用
+      return attempt === 1
+        ? { ok: false, reason: 'account_locked', ownerSessionId: 'other-session', expiresAt: Date.now() + 60_000 }
+        : { ok: true, expiresAt: Date.now() + 60_000 }
+    })
+
+    const response = await createSession(store).fetch(request())
+
+    // 首个候选忙不应让整轮失败：应接棒到第二个候选并正常执行（锁最终由收尾释放）
+    expect(response.status).not.toBe(429)
+    expect(response.status).not.toBe(409)
+    expect(chatWithHandlersMock).toHaveBeenCalled()
+    // 入口接棒时先试 account-1（忙）再试 account-2（成功）
+    expect(store.acquireAccountLock.mock.calls[0]?.[0]).toBe('account-1')
+    expect(store.acquireAccountLock.mock.calls[1]?.[0]).toBe('account-2')
   })
 
   it('commits streamed assistant output before releasing the account lock and session lease', async () => {
@@ -798,7 +836,7 @@ describe('M365Session SQL request lifecycle', () => {
     )
   })
 
-  it('keeps the original lock ownership when failover lease migration fails', async () => {
+  it('releases the attempted lock and moves on when failover lease migration fails', async () => {
     const calls: LifecycleCall[] = []
     const store = createStore(calls)
     listM365AccountsMock.mockResolvedValue([
@@ -811,8 +849,11 @@ describe('M365Session SQL request lifecycle', () => {
 
     const response = await createSession(store).fetch(request())
 
-    expect(response.status).toBe(409)
+    // 迁移失败属于内部租约协调问题：归还刚拿到的账号锁并继续下一个候选，
+    // 不应把 lease_conflict 当作客户端 409 抛出。两个候选都迁移失败后以 502 收尾。
+    expect(response.status).toBe(502)
     expect(store.commitWithLease).not.toHaveBeenCalled()
+    // account-2 的锁被归还（迁移失败），account-1 的锁由 finally 归还
     expect(store.releaseAccountLock.mock.calls.map((call) => call[0])).toEqual(['account-2', 'account-1'])
     expect(store.releaseLease).toHaveBeenCalledTimes(1)
     expect(chatWithHandlersMock).toHaveBeenCalledTimes(1)
