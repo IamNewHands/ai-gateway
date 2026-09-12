@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest'
 import { classifyChatHubNotice } from './chathub'
-import { markAccountFailure } from './account-health'
+import { markAccountFailure, markAccountTokenRefreshed, markAccountSuccess } from './account-health'
 import type { Env } from '../types'
 
 /** 内存版 KV 桩，供 markAccountFailure 落盘测试 */
@@ -69,5 +69,41 @@ describe('markAccountFailure：metering 节流固定 15min 冷却', () => {
     expect(remaining).toBeLessThanOrEqual(30 * 1000)
     expect(remaining).toBeGreaterThan(29 * 1000)
     expect(s.rlFailures).toBe(1)
+  })
+})
+
+describe('markAccountTokenRefreshed：token 刷新成功只清鉴权标记，保留限流冷却', () => {
+  it('刷新成功清除 authFailed 但保留未到期的 rate-limit 冷却与退避计数', async () => {
+    const { env } = makeEnv()
+    await markAccountFailure(env, 'acc-t1', 'too many requests')
+    // 叠加鉴权失败标记（模拟过期 token 触发的 401 误判）
+    await env.KV.put('m365:health:acc-t1', JSON.stringify({ ...JSON.parse((await env.KV.get('m365:health:acc-t1'))!), authFailed: true }))
+    const before = JSON.parse((await env.KV.get('m365:health:acc-t1'))!)
+    expect(before.cooldownUntil).toBeGreaterThan(Date.now())
+    expect(before.rlFailures).toBe(1)
+
+    await markAccountTokenRefreshed(env, 'acc-t1')
+    const after = JSON.parse((await env.KV.get('m365:health:acc-t1'))!)
+    expect(after.authFailed).toBe(false)
+    // 冷却到期时间与退避计数必须保留，避免 selectAccounts 刷新后把限流冷却"瞬移消除"
+    expect(after.cooldownUntil).toBeCloseTo(before.cooldownUntil, -1)
+    expect(after.rlFailures).toBe(1)
+  })
+
+  it('与 markAccountSuccess 不同：markAccountSuccess 会清冷却，token 刷新保留', async () => {
+    const { env } = makeEnv()
+    const acc = 'acc-t2'
+    await markAccountFailure(env, acc, 'too many requests')
+    const before = JSON.parse((await env.KV.get(`m365:health:${acc}`))!)
+
+    await markAccountTokenRefreshed(env, acc)
+    const afterRefresh = JSON.parse((await env.KV.get(`m365:health:${acc}`))!)
+    expect(afterRefresh.cooldownUntil).toBeCloseTo(before.cooldownUntil, -1)
+
+    // markAccountSuccess 才是"硬清冷却"，两者语义必须不同
+    await markAccountSuccess(env, acc)
+    const afterSuccess = JSON.parse((await env.KV.get(`m365:health:${acc}`))!)
+    expect(afterSuccess.cooldownUntil).toBe(0)
+    expect(afterSuccess.rlFailures).toBe(0)
   })
 })

@@ -1082,10 +1082,12 @@ export interface AgentLedger {
   repetitionSignature?: string
 }
 
-/** 单次对话允许的最大工具轮数（对齐原版 maxToolRounds 默认 32；可用 M365_MAX_TOOL_ROUNDS 覆盖，上限 512） */
-export const MAX_TOOL_ROUNDS_DEFAULT = 32
+/** 单次对话允许的最大工具轮数（对齐原版 M365-Gateway DEFAULT_MAX_TOOL_ROUNDS=128；
+ * 可用 M365_MAX_TOOL_ROUNDS 覆盖，上限 512）。原移植误抄成 32，长调查/python 复现类任务
+ * 常被 409 tool_round_limit 掐断（log6 复现的正是该形态），故对齐原版 128。 */
+export const MAX_TOOL_ROUNDS_DEFAULT = 128
 
-/** 解析最大工具轮数：env 合法（1..512）用 env，否则默认 32（同原版 maxToolRounds()） */
+/** 解析最大工具轮数：env 合法（1..512）用 env，否则默认 128（对齐原版 maxToolRounds()） */
 export function resolveMaxToolRounds(raw?: string): number {
   if (raw != null && raw.trim() !== '') {
     const n = parseInt(raw.trim(), 10)

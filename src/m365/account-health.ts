@@ -268,6 +268,29 @@ export async function markAccountSuccess(env: Env, accountId: string): Promise<v
   })
 }
 
+/**
+ * 标记"token 刷新成功"（区分于普通对话成功）。
+ * 目的：刷新成功只能证明 access_token 已续期（可清除"过期 token 触发 401 被误判的鉴权失败"），
+ * 但**不能**证明上游的限流已解除——因此保留未到期的 rate-limit 冷却与熔断，避免冷却被刷新静默抹掉
+ * （selectAccounts 在 isAccountAvailable 之前先刷新，若在这里清冷却，重发时冷却就"瞬移消失"）。
+ * 图片额度封禁同样保留至自然到期。
+ */
+export async function markAccountTokenRefreshed(env: Env, accountId: string): Promise<void> {
+  const state = await readHealth(env, accountId)
+  // 仅清除鉴权失败标记；cooldownUntil / rlFailures / trippedUntil / imageLimitedUntil 均保留
+  await writeHealth(env, accountId, {
+    cooldownUntil: state.cooldownUntil,
+    authFailed: false,
+    rlFailures: state.rlFailures,
+    breakerStart: state.breakerStart,
+    breakerFailures: state.breakerFailures,
+    breakerTotal: state.breakerTotal,
+    trippedUntil: state.trippedUntil,
+    imageLimitedUntil: state.imageLimitedUntil > Date.now() ? state.imageLimitedUntil : 0,
+    updatedAt: Date.now(),
+  })
+}
+
 /** 记录上游配额余量观测（移植自 M365-2api updateAccountAllowance，2026-09-06）。
  * 供账号选择避开已耗尽（全部 capability 余量 ≤0）的账号；观测随时间老化（ALLOWANCE_STALE_MS）失效。 */
 const ALLOWANCE_STALE_MS = 6 * 60 * 60 * 1000

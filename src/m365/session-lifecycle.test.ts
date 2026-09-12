@@ -575,6 +575,8 @@ describe('M365Session SQL request lifecycle', () => {
     expect(store.releaseLease).not.toHaveBeenCalled()
     // 租约确实被正当持有：应经有界重试后尝试抢占，但抢占被拒绝（未过期且心跳新鲜）
     expect(store.supersedeLease).toHaveBeenCalledTimes(1)
+    // 409 lease_conflict 应给出基于租约到期时间的 Retry-After，让客户端按它退避重试而非立刻硬失败
+    expect(response.headers.get('Retry-After')).toBeTruthy()
   })
 
   it('steals an abandoned lease so a retry after a crashed owner can proceed', async () => {

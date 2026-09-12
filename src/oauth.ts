@@ -1381,16 +1381,18 @@ async function refreshAllM365PoolTokens(env: Env, p: ProviderLike): Promise<{ ok
   // 闲置阈值：账号超过 20 天未被使用则刷新一次，重置 30 天池 KV TTL 保活
   const IDLE_MS = 20 * 24 * 60 * 60 * 1000
   for (const info of infos) {
-    if (!info.connected || !info.oid) continue
+    if (!info.connected) continue
     const nearExpiry = typeof info.expiresAt === 'number' && info.expiresAt - now <= NEAR_EXPIRY_MS
     const idle = typeof info.lastUsedAt === 'number' && now - info.lastUsedAt >= IDLE_MS
     if (!nearExpiry && !idle) continue
-    const success = await refreshM365Token(env, p.id, p.oauth!, info.oid)
+    // 历史账号可能缺少 oid，使用规范化 email 作为稳定后备标识，避免被 Cron 静默跳过。
+    // oid/email 均缺失时刷新函数只允许单账号池回退，防止多账号池刷新错误账号。
+    const success = await refreshM365Token(env, p.id, p.oauth!, info.oid, info.email)
     if (success) {
       ok++
     } else {
       fail++
-      console.error(`[oauth] M365 账号刷新失败，可能需要重新登录 provider=${p.id} oid=${info.oid} email=${info.email || '无'} ${new Date().toISOString()}`)
+      console.error(`[oauth] M365 账号刷新失败，可能需要重新登录 provider=${p.id} oid=${info.oid || '无'} email=${info.email || '无'} ${new Date().toISOString()}`)
     }
   }
   return { ok, fail }

@@ -591,7 +591,7 @@ export interface Env {
    * 预算 B = 该值 - maxOutput - 512（同原版 B = ContextWindow - MaxOutput - 512）。
    */
   M365_CONTEXT_WINDOW_TOKENS?: string
-  /** M365 单次对话最大工具轮数（默认 32，可用 M365_MAX_TOOL_ROUNDS 覆盖，上限 512） */
+  /** M365 单次对话最大工具轮数（默认 128，对齐原版 M365-Gateway；可用 M365_MAX_TOOL_ROUNDS 覆盖，上限 512） */
   M365_MAX_TOOL_ROUNDS?: string
   /**
    * M365 单个逻辑请求总截止时间（毫秒，默认 600000 = 10 分钟）。

@@ -133,7 +133,8 @@ export async function autoCleanupAll(env: Env): Promise<{ total: number; provide
  * 目的：解决闲置/临期账号长期不用后，access_token 过期被 401 误判为"账号禁用"而长期不可用的问题。
  * 对每个 M365 账号逐个调用 refreshM365AccountIfNeeded：
  * - access_token 已过期或临期（< 刷新余量）且存在 refresh_token → 自动刷新换新 token；
- * - 刷新成功会自动清除该账号此前被误标记的鉴权失败/冷却健康状态（markAccountSuccess），实现"复活"；
+ * - 刷新成功会清除该账号此前被误标记的**鉴权失败**健康状态（markAccountTokenRefreshed，仅清 authFailed，
+ *   保留未到期的限流冷却/熔断），实现"复活"；
  * - 限定条件的刷新不会对仍然新鲜的 token 无意义刷线上游，限流/图片额度类冷却不受影响。
  */
 export interface M365HealthCheckResult {
@@ -156,20 +157,21 @@ export async function healthCheckM365Provider(env: Env, provider: Provider): Pro
     return result
   }
   for (const acc of accounts) {
-    if (!acc.oid) continue
     result.accounts++
-    const wasUnavailable = !(await isAccountAvailable(env, acc.oid))
-    const fresh = await refreshM365AccountIfNeeded(env, provider.id, acc.oid)
+    // 历史账号可能缺少 oid。健康检查仍须覆盖这些账号，由刷新层使用 email
+    // 进行稳定定位；只有具备 oid 时才读写以 oid 为键的账号健康状态。
+    const wasUnavailable = acc.oid ? !(await isAccountAvailable(env, acc.oid)) : false
+    const fresh = await refreshM365AccountIfNeeded(env, provider.id, acc.oid || undefined, acc.email)
     if (fresh) {
       result.ok++
       // 此前不可用但刷新后拿到了可用 token → 恢复（清除误判的鉴权失败/冷却）
-      if (wasUnavailable && (await isAccountAvailable(env, acc.oid))) {
+      if (acc.oid && wasUnavailable && (await isAccountAvailable(env, acc.oid))) {
         result.recovered++
         console.log(`[m365-health] provider=${provider.id} account=${acc.oid} RECOVERED email=${acc.email || '无'}`)
       }
     } else {
       result.failed++
-      console.error(`[m365-health] provider=${provider.id} account=${acc.oid} refresh failed, may need re-auth email=${acc.email || '无'}`)
+      console.error(`[m365-health] provider=${provider.id} account=${acc.oid || '无'} refresh failed, may need re-auth email=${acc.email || '无'}`)
     }
   }
   console.log(`[m365-health] provider=${provider.id} accounts=${result.accounts} ok=${result.ok} recovered=${result.recovered} failed=${result.failed}`)

@@ -1044,7 +1044,10 @@ function m365Render(providerId) {
           var exp = '—'
           if (a.tokenExpiresAt) {
             exp = new Date(a.tokenExpiresAt).toLocaleString()
-            if (a.tokenExpiresAt <= Date.now()) exp += ' <span class="bd bd-danger">已过期</span>'
+            if (a.tokenExpiresAt <= Date.now()) {
+              // 有有效 refresh_token：只是 access_token 临期，唤醒/下次请求会自动续期，非硬过期
+              exp += (a.hasRefreshToken ? ' <span class="bd bd-warn">已过期·可自动续期</span>' : ' <span class="bd bd-danger">已过期</span>')
+            }
             else exp += ' <span class="mu">· 自动续期</span>'
           }
           var last = a.lastUsedAt ? new Date(a.lastUsedAt).toLocaleString() : '<span class="mu">从未使用</span>'
@@ -1053,7 +1056,7 @@ function m365Render(providerId) {
             (a.state === 'cooldown' ? '<button class="btn btn-gh btn-xs" onclick="m365ClearCooldown(\\'' + m365Esc(providerId) + '\\',\\'' + m365Esc(a.oid || '') + '\\',this)" title="清除该账号冷却"><i class="fas fa-fire-extinguisher"></i>清除冷却</button> ' : '') +
             '<button class="btn btn-d btn-xs" onclick="m365Remove(\\'' + m365Esc(providerId) + '\\',\\'' + m365Esc(a.oid || '') + '\\',this)"><i class="fas fa-trash"></i>移除</button></td></tr>';
         }).join('') + '</tbody></table>' +
-        '<p class="mu" style="margin-top:8px">状态说明：使用中=当前有请求在途；空闲=健康可立即接单；休眠=超过 24h 未使用（唤醒时自动续期）；冷却=被上游限流/熔断，到期自动恢复。</p>';
+        '<p class="mu" style="margin-top:8px">状态说明：使用中=当前有请求在途；空闲=健康可立即接单；休眠=超过 24h 未使用（唤醒时自动续期）；冷却=被上游限流/熔断，到期自动恢复。令牌「已过期·可自动续期」表示仅 access_token 临期但 refresh_token 仍在，下次使用/刷新会自动续期；只有 refresh_token 失效才显示红色「已过期」。</p>';
     })
     .catch(function (e) { root.innerHTML = '<p class="c-d">请求异常：' + m365Esc(String(e && e.message || e)) + '</p>'; });
 }

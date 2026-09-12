@@ -2473,6 +2473,7 @@ export async function handleM365Accounts(c: Context<AppEnv>) {
         tid: info.tid ?? null,
         tokenExpiresAt: info.expiresAt ?? null,
         lastUsedAt: info.lastUsedAt ?? null,
+        hasRefreshToken: !!info.hasRefreshToken,
         inflight,
         state,
         available,

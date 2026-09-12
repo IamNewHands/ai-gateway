@@ -240,13 +240,19 @@ export class M365Session {
     }
     const ledgerCtx = ledger.toolRounds > 0 ? ledgerRouterContext(ledger) : ''
 
-    // 3) 账号池选择：见 selectAccounts 注释。返回按尝试顺序排好的候选账号。
-    const ordered = await this.selectAccounts(providerId, resolved, explicitAccountId)
+    // 3) 账号池选择：见 selectAccounts 注释。返回按尝试顺序排好的候选账号 + 空集诊断（忙/冷却）。
+    const orderedSel = await this.selectAccounts(providerId, resolved, explicitAccountId)
+    const ordered = orderedSel.accounts
     if (ordered.length === 0) {
       if (explicitAccountId) {
         return cjson({ error: { message: '指定的 M365 账号（m365_account_id）不存在或不可用', type: 'account_error' } }, 404)
       }
-      // 全部账号处于冷却/不可用：对齐原版返回 429 + Retry-After（戴避账号被打爆），而非 401
+      // 全部账号不可用。区分两种情形，避免把"瞬时并发占满（忙）"误报成"持久冷却"：
+      // - 忙（仅并发闸门打满）：短退避即可重试，Retry-After 用 2-5s，提示"使用中"
+      // - 冷却/熔断（真不可用）：Retry-After 60s，提示"冷却"
+      if (orderedSel.emptyBusy && !orderedSel.emptyCooling) {
+        return cjson({ error: { message: 'M365 所有账号当前占用中（并发使用中），请稍后重试', type: 'rate_limit_error' } }, 429, { 'Retry-After': '5' })
+      }
       return cjson({ error: { message: 'M365 所有账号繁忙或冷却中，请稍后重试或先在后台添加/授权账号', type: 'rate_limit_error' } }, 429, { 'Retry-After': '60' })
     }
     let acc = ordered[0]
@@ -298,6 +304,13 @@ export class M365Session {
       }
     }
     if (!lease.ok) {
+      // 409 lease_conflict 时若已知租约到期时间，附上 Retry-After 让客户端按它退避重试，
+      // 而不是立刻硬失败（log7 两个并行 DSH 会话解析到同一会话行、对方心跳新鲜时即触发）。
+      const expiresAt = (lease as { expiresAt?: number }).expiresAt
+      if (lease.reason === 'lease_conflict' && typeof expiresAt === 'number' && expiresAt > Date.now()) {
+        const retryAfter = Math.ceil((expiresAt - Date.now()) / 1000)
+        return cjson({ error: { message: lease.reason, type: lease.reason } }, 409, { 'Retry-After': String(retryAfter) })
+      }
       return cjson({ error: { message: lease.reason, type: lease.reason } }, 409)
     }
 
@@ -1191,33 +1204,36 @@ export class M365Session {
    *   新会话按持久化游标在全部健康账号间均匀轮转（复刻原版 accountSpread）；每账号仍串行 + 1s 间隔。
    * 返回按尝试顺序排列的 ChatHubAccount 候选数组（单活模式 <= 2，分摊模式为全部健康账号）。
    */
-  private async selectAccounts(providerId: string, resolved: ResolveResult, explicitAccountId?: string): Promise<ChatHubAccount[]> {
+  private async selectAccounts(providerId: string, resolved: ResolveResult, explicitAccountId?: string): Promise<{ accounts: ChatHubAccount[]; emptyBusy: boolean; emptyCooling: boolean }> {
     const accounts = await listM365Accounts(this.env, providerId)
-    if (accounts.length === 0) return []
+    if (accounts.length === 0) return { accounts: [], emptyBusy: false, emptyCooling: false }
     const snapshot: { limit: number; inflight: Record<string, number> } =
       await fluxSnapshot(this.env, providerId).catch(() => ({ limit: 1, inflight: {} }))
     const healthy: ChatHubAccount[] = []
+    // 诊断：结果为空时区分"并发占满（忙）" vs "冷却/熔断（不可用）"，避免把瞬时忙误报成持久冷却 429
+    let sawConcurrencyBusy = false
+    let sawCooldownBlocked = false
     for (const a of accounts) {
       if (!a.accessToken || !a.oid) continue
       // 惰性刷新：access_token 临近过期/已过期时自动刷新（刷新成功会恢复健康标记），
       // 避免用过期 token 触发 ws dial 401 后被误判为账号禁用（authFailed 24h 冷却）
       const fresh = await refreshM365AccountIfNeeded(this.env, providerId, a.oid)
       if (!fresh || Date.now() >= fresh.expiresAt) continue
-      if (!(await isAccountAvailable(this.env, fresh.oid))) continue
+      if (!(await isAccountAvailable(this.env, fresh.oid))) { sawCooldownBlocked = true; continue }
       // 并发闸门：已打满（inflight >= limit）的账号视为不可用，避免选到忙号
       const inflight = snapshot.inflight[fresh.oid] || 0
-      if (inflight >= snapshot.limit) continue
+      if (inflight >= snapshot.limit) { sawConcurrencyBusy = true; continue }
       healthy.push({ accessToken: fresh.accessToken, oid: fresh.oid, tid: fresh.tid, refreshToken: fresh.refreshToken })
     }
     // 客户端显式指定账号：仅用该账号（须在池中且健康）
     if (explicitAccountId && explicitAccountId !== '') {
       const target = healthy.find((a) => a.oid === explicitAccountId)
-      return target ? [target] : []
+      return { accounts: target ? [target] : [], emptyBusy: false, emptyCooling: false }
     }
     if (!resolved.isNew && resolved.accountId) {
       // 已绑定会话：仅允许使用绑定账号（云端对话归属它）
       const pinned = healthy.find((a) => a.oid === resolved.accountId)
-      return pinned ? [pinned] : []
+      return { accounts: pinned ? [pinned] : [], emptyBusy: false, emptyCooling: false }
     }
 
     // 会话级多账号分摊（Account Spread）：
@@ -1232,12 +1248,12 @@ export class M365Session {
       const offset = cursor % healthy.length
       const rotated = [...healthy.slice(offset), ...healthy.slice(0, offset)]
       // 分摊模式下允许在多个健康账号间轮转，候选数放宽到全部健康账号（仍按顺序尝试）
-      return rotated
+      return { accounts: rotated, emptyBusy: sawConcurrencyBusy, emptyCooling: sawCooldownBlocked }
     }
 
     // 单活为主：固定第一个健康账号；仅在分类故障时按序接棒，因此最多返回 2 个候选
-    if (healthy.length === 0) return []
-    return healthy.slice(0, 2)
+    if (healthy.length === 0) return { accounts: [], emptyBusy: sawConcurrencyBusy, emptyCooling: sawCooldownBlocked }
+    return { accounts: healthy.slice(0, 2), emptyBusy: sawConcurrencyBusy, emptyCooling: sawCooldownBlocked }
   }
 
   /**
