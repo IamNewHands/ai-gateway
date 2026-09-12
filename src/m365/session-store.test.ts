@@ -310,4 +310,18 @@ describe('M365 Durable Object SQL session store', () => {
     })
     expect(store.resolvePreviousResponse('resp-tx')).toBeNull()
   })
+
+  it('assigns unique non-empty sessionId when loadOrCreate receives empty or whitespace string', () => {
+    const sql = new MemorySqlStorage()
+    const store = new M365SessionStore(({ sql, transactionSync: sql.transactionSync.bind(sql) } as unknown as DurableObjectStorage))
+
+    const snapshot1 = store.loadOrCreate('')
+    const snapshot2 = store.loadOrCreate('   ')
+
+    expect(snapshot1.sessionId).toBeTruthy()
+    expect(snapshot2.sessionId).toBeTruthy()
+    expect(snapshot1.sessionId).not.toBe('')
+    expect(snapshot2.sessionId).not.toBe('')
+    expect(snapshot1.sessionId).not.toBe(snapshot2.sessionId)
+  })
 })

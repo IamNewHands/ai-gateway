@@ -296,7 +296,7 @@ export async function resolveSession(env: Env, providerId: string, msgs: OaiMsgL
     }
   }
 
-  return { sessionId: '', conversationId: '', accountId: '', matchedBy: 'new', isNew: true, historyLen: 0 }
+  return { sessionId: explicitID, conversationId: '', accountId: '', matchedBy: explicitID ? 'explicit_new' : 'new', isNew: true, historyLen: 0 }
 }
 
 /**

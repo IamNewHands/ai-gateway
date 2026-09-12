@@ -223,12 +223,14 @@ export class M365Session {
     const acc = ordered[0]
 
     // SQL Durable Object 是 M365 请求生命周期的 canonical owner。
-    // 先锁定当前 generation，再获取账号锁；任一冲突都必须在上游执行前终止。
-    const snapshot = this.sessionStore.loadOrCreate(resolved.sessionId)
+    // 确保会话 ID 具有确定性非空有效值，杜绝空字符串碰撞同一行 SQLite 锁
+    const effectiveSessionId = resolved.sessionId || explicitSessionId || crypto.randomUUID()
+    resolved = { ...resolved, sessionId: effectiveSessionId }
+    const snapshot = this.sessionStore.loadOrCreate(effectiveSessionId)
     const expectedGeneration = snapshot.generation
     const leaseToken = crypto.randomUUID()
-    const leaseTtlMs = 10 * 60 * 1000
-    const lease = this.sessionStore.acquireLease({
+    const leaseTtlMs = 60 * 1000
+    let lease = this.sessionStore.acquireLease({
       sessionId: snapshot.sessionId,
       accountId: acc.oid,
       token: leaseToken,
@@ -236,6 +238,19 @@ export class M365Session {
       now: Date.now(),
       ttlMs: leaseTtlMs,
     })
+    if (!lease.ok && lease.reason === 'lease_conflict') {
+      const authoritative = this.sessionStore.loadOrCreate(snapshot.sessionId)
+      if (authoritative.lease && authoritative.lease.expiresAt <= Date.now()) {
+        lease = this.sessionStore.acquireLease({
+          sessionId: snapshot.sessionId,
+          accountId: acc.oid,
+          token: leaseToken,
+          expectedGeneration: authoritative.generation,
+          now: Date.now(),
+          ttlMs: leaseTtlMs,
+        })
+      }
+    }
     if (!lease.ok) {
       return cjson({ error: { message: lease.reason, type: lease.reason } }, 409)
     }
@@ -283,7 +298,7 @@ export class M365Session {
         lifecycleHeartbeat.failed = accountHeartbeat.reason
         stopLifecycleHeartbeat()
       }
-    }, Math.max(1000, Math.floor(leaseTtlMs / 3)))
+    }, Math.min(15_000, Math.max(1000, Math.floor(leaseTtlMs / 3))))
     try {
     // convCache 复用层：新会话且无工具时，命中 account+model+systemPromptHash+tenant 则沿用云端对话（同原版第三层复用，租户隔离对齐 #57）
     const sysHash = model ? systemPromptHash(messages as never[]) : ''
@@ -332,7 +347,7 @@ export class M365Session {
           text: '',
           reasoning: route.res.reasoning || '',
           conversationId: route.res.conversationId,
-          sessionId: route.res.sessionId,
+          sessionId: route.res.sessionId || effectiveSessionId,
           toolCalls: route.calls,
         }
         const id = 'chatcmpl-' + crypto.randomUUID()
@@ -807,7 +822,7 @@ export class M365Session {
       return cjson({ error: { message: 'no available M365 account', type: 'rate_limit_error' } }, 429, { 'Retry-After': '5' })
     }
     let lockedAccountId = usedAcc.oid
-    const leaseTtlMs = 10 * 60 * 1000
+    const leaseTtlMs = 60 * 1000
 
     // 流式终态三分（同对方 request-metrics.ts 的 trackStreamingResponse 判定）：
     // complete=自然 EOF 正常收尾 / error=上游失败走了错误收尾 / canceled=客户端取消 ReadableStream。

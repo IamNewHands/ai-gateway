@@ -53,4 +53,12 @@ describe('#57 会话租户隔离', () => {
     const all = await listSessions(kv.env, 'm365-p')
     expect(all.map((s) => s.sessionId).sort()).toEqual(['sess-a', 'sess-b'])
   })
+
+  it('resolveSession retains explicitSessionId when session is new', async () => {
+    const { resolveSession } = await import('./session')
+    const res = await resolveSession(kv.env, 'm365-p', [], { explicitSessionId: 'new-explicit-1', tenant: 'tenantA' })
+    expect(res.sessionId).toBe('new-explicit-1')
+    expect(res.isNew).toBe(true)
+    expect(res.matchedBy).toBe('explicit_new')
+  })
 })

@@ -82,12 +82,13 @@ export class M365SessionStore {
   }
 
   loadOrCreate(sessionId: string): SessionSnapshotV1 {
-    const emptySnapshot = createEmptySessionSnapshot(sessionId)
+    const validSessionId = sessionId && sessionId.trim() !== '' ? sessionId : crypto.randomUUID()
+    const emptySnapshot = createEmptySessionSnapshot(validSessionId)
     this.sql.exec(
       `INSERT OR IGNORE INTO m365_sessions
        (session_id, generation, snapshot_json, updated_at)
        VALUES (?, ?, ?, ?)`,
-      sessionId,
+      validSessionId,
       emptySnapshot.generation,
       encodeSessionSnapshot(emptySnapshot),
       Date.now(),
@@ -103,7 +104,7 @@ export class M365SessionStore {
       `SELECT snapshot_json, generation, lease_token, lease_account_id, lease_expires_at
        FROM m365_sessions
        WHERE session_id = ?`,
-      sessionId,
+      validSessionId,
     ).toArray()
     if (rows.length !== 1) throw new Error('M365_SESSION_ROW_MISSING_AFTER_INSERT')
 

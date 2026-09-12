@@ -359,13 +359,13 @@ describe('M365Session SQL request lifecycle', () => {
     await vi.advanceTimersByTimeAsync(200_000)
 
     const leaseToken = store.acquireLease.mock.calls[0]?.[0].token
-    expect(store.heartbeatLease).toHaveBeenCalledWith('session-1', leaseToken, expect.any(Number), 600_000)
+    expect(store.heartbeatLease).toHaveBeenCalledWith('session-1', leaseToken, expect.any(Number), 60_000)
     expect(store.heartbeatAccountLock).toHaveBeenCalledWith(
       'account-1',
       'session-1',
       leaseToken,
       expect.any(Number),
-      600_000,
+      60_000,
     )
 
     upstream.resolve({
