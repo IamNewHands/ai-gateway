@@ -205,12 +205,84 @@ export async function writeOauthPool(env: Env, providerId: string, pool: OAuthPo
   } catch { /* KV 写失败不阻断主流程 */ }
 }
 
-/** 账号是否健康：启用、未禁用、不在冷却期。无状态（新账号）视为健康。 */
-export function isOauthAccountHealthy(acc: OAuthPoolAccount, now: number): boolean {
+/** 账号是否健康：启用、未禁用、不在冷却期。无状态（新账号）视为健康。reqModel 可选支持 6004 模型级豁免。 */
+export function isOauthAccountHealthy(acc: OAuthPoolAccount, now: number, reqModel?: string): boolean {
   if (!acc || acc.enabled === false) return false
   if (acc.state?.disabled) return false
-  if (acc.state?.until && acc.state.until > now) return false
+  if (acc.state?.until && acc.state.until > now) {
+    // 6004 模型级软冷却豁免（对齐 workbuddy2api issue #31 / healthyForModel）：
+    // 账号在软限流模型（softRateModel）上受限，但请求的是其他模型且未被禁用、未全局熔断时依然可用
+    if (acc.state.softRateModel && reqModel && acc.state.softRateModel !== reqModel) {
+      return true
+    }
+    return false
+  }
   return true
+}
+
+// ===== 成本优先分层挑号（对齐 workbuddy2api pick.go costTier） =====
+interface ModelCostRecord {
+  costPer1k: number
+  updatedAt: number
+  samples: number
+}
+const modelCosts = new Map<string, ModelCostRecord>()
+const costKey = (providerId: string, uid: string, model: string) => `${providerId}:${uid}:${model}`
+
+export const COST_OBSERVATION_TTL_MS = 6 * 60 * 60 * 1000 // 6 小时观测有效期
+
+/**
+ * 记录实测模型扣费成本（EMA 平滑，alpha=0.3）。
+ * 由每次成功响应的 usage.credit 折算而来；tokens<=0 不记录。
+ */
+export function recordOauthModelCost(
+  providerId: string,
+  uid: string,
+  model: string,
+  credit: number,
+  tokens: number
+): void {
+  if (!providerId || !uid || !model || tokens <= 0) return
+  const per1k = credit <= 0 ? 0 : (credit / tokens) * 1000
+  const k = costKey(providerId, uid, model)
+  const prev = modelCosts.get(k)
+  const now = Date.now()
+  const alpha = 0.3
+  if (!prev) {
+    modelCosts.set(k, { costPer1k: per1k, updatedAt: now, samples: 1 })
+  } else {
+    modelCosts.set(k, {
+      costPer1k: prev.costPer1k * (1 - alpha) + per1k * alpha,
+      updatedAt: now,
+      samples: prev.samples + 1,
+    })
+  }
+}
+
+/**
+ * 获取 (账号, 模型) 的成本分层：
+ *   0 = 实测免费（限免期/夜间免费的号，最强偏好）
+ *   1 = 无观测（含观测过期，给新号实测机会）
+ *   2 = 已实测收费
+ */
+export function getOauthModelCost(
+  providerId: string,
+  uid: string,
+  model: string,
+  now = Date.now()
+): { tier: number; costPer1k: number } {
+  const rec = modelCosts.get(costKey(providerId, uid, model))
+  if (!rec || now - rec.updatedAt > COST_OBSERVATION_TTL_MS) {
+    return { tier: 1, costPer1k: 0 }
+  }
+  if (rec.costPer1k <= 0) {
+    return { tier: 0, costPer1k: 0 }
+  }
+  return { tier: 2, costPer1k: rec.costPer1k }
+}
+
+export function __resetOauthModelCostsForTests(): void {
+  modelCosts.clear()
 }
 
 /** 兼容迁移：池为空时把单 token（oauth:token:<id>）种子成池账号；返回是否迁移。 */
@@ -271,13 +343,15 @@ export interface PickOauthOptions {
    * 尊重 tried 集合（失败轮转时逐个换下一个最早到期的冷却号）。默认 false（返回 null）。
    */
   allowCoolingFallback?: boolean
+  /** 客户端请求的模型 ID（供 6004 模型级冷却豁免与成本优先分层）。 */
+  reqModel?: string
 }
 
 /**
  * 挑号（三因子加权随机，对齐 workbuddy2api pool.go pick）：
  *   1. preferUid（面板手工指定）且 healthy 且未 tried → 直接采用（显式指定最优先）；
- *   2. healthy + 未 tried 候选按权重降序取 Top5，防惊群过滤后在 Top5 内加权随机；
- *      Top5 全部刚被用过 → LRU 兜底（维持发散且不饿死任一候选）；
+ *   2. healthy + 未 tried 候选按成本分层（0 免费 > 1 未观测 > 2 收费），仅在最优层取 Top5；
+ *      Top5 防惊群过滤后加权随机，全部刚被用过时退回 LRU 兜底；
  *   3. 无健康候选且 allowCoolingFallback → 冷却账号中选最早到期者顶班。
  * 被选中的账号会记录运行态 lastUsed（防惊群 + 闲置补偿），不写 KV。
  */
@@ -290,18 +364,37 @@ export async function pickOauthAccount(
 ): Promise<OAuthPoolAccount | null> {
   const pool = await readOauthPool(env, providerId)
   const now = Date.now()
+  const reqModel = opts?.reqModel
 
   let chosen: OAuthPoolAccount | null = null
 
   // 手工指定优先：精确匹配首选 uid，只在 healthy 且未 tried 时采用
   if (preferUid) {
-    const preferred = pool.find((a) => a.uid === preferUid && !tried.has(a.uid) && isOauthAccountHealthy(a, now))
+    const preferred = pool.find((a) => a.uid === preferUid && !tried.has(a.uid) && isOauthAccountHealthy(a, now, reqModel))
     if (preferred) chosen = preferred
   }
 
   if (!chosen) {
-    const candidates = pool.filter((a) => !tried.has(a.uid) && isOauthAccountHealthy(a, now))
+    let candidates = pool.filter((a) => !tried.has(a.uid) && isOauthAccountHealthy(a, now, reqModel))
     if (candidates.length > 0) {
+      // 成本分层：reqModel 非空时，按实测扣费分层只保留最优层
+      if (reqModel) {
+        let bestTier = 2
+        for (const c of candidates) {
+          const { tier } = getOauthModelCost(providerId, c.uid, reqModel, now)
+          if (tier < bestTier) bestTier = tier
+        }
+        const inTier = candidates.filter((c) => getOauthModelCost(providerId, c.uid, reqModel, now).tier === bestTier)
+        if (bestTier === 2) {
+          // 同层收费时：单价低的在前
+          inTier.sort((a, b) => {
+            const ca = getOauthModelCost(providerId, a.uid, reqModel, now).costPer1k
+            const cb = getOauthModelCost(providerId, b.uid, reqModel, now).costPer1k
+            return ca - cb
+          })
+        }
+        candidates = inTier
+      }
       chosen = pickWeightedTop5(providerId, candidates, now, opts?.rng)
     } else if (opts?.allowCoolingFallback) {
       chosen = pickEarliestCoolingFallback(pool, tried, now)
@@ -413,7 +506,7 @@ export async function refreshOauthPoolAccount(
   return acc
 }
 
-/** 冷却账号至 now+ms（清零 errCount）。 */
+/** 冷却账号至 now+ms（清零 errCount 与单模型限流痕迹）。 */
 export async function cooldownOauthAccount(
   env: Env,
   providerId: string,
@@ -424,7 +517,41 @@ export async function cooldownOauthAccount(
   const pool = await readOauthPool(env, providerId)
   const acc = pool.find((a) => a.uid === uid)
   if (!acc) return
-  acc.state = { ...(acc.state || {}), until: Date.now() + ms, reason, errCount: 0 }
+  acc.state = {
+    ...(acc.state || {}),
+    until: Date.now() + ms,
+    reason,
+    errCount: 0,
+    softRateModel: undefined,
+    softRateResetAt: undefined,
+  }
+  await writeOauthPool(env, providerId, pool)
+}
+
+/**
+ * 429 6004 模型级软冷却（对齐 workbuddy2api issue #31 / CooldownSoftForModel）。
+ * 当上游 6004 明确说明「将在 … 重置」时，把冷却截止设为 resetAt，
+ * 并记录受限模型 softRateModel。请求其他模型时账号依然可用。
+ */
+export async function cooldownOauthAccountSoftForModel(
+  env: Env,
+  providerId: string,
+  uid: string,
+  model: string,
+  untilMs: number,
+  reason: string
+): Promise<void> {
+  const pool = await readOauthPool(env, providerId)
+  const acc = pool.find((a) => a.uid === uid)
+  if (!acc) return
+  acc.state = {
+    ...(acc.state || {}),
+    until: untilMs,
+    reason,
+    errCount: 0,
+    softRateModel: model,
+    softRateResetAt: untilMs,
+  }
   await writeOauthPool(env, providerId, pool)
 }
 
@@ -438,7 +565,53 @@ export async function cooldownOauthAccountUntilTomorrow4AM(
   await cooldownOauthAccount(env, providerId, uid, Math.max(60_000, nextDay4AMMs() - Date.now()), reason)
 }
 
-/** 永久禁用（session 失效，需重新登录）。 */
+/**
+ * 记录一次 ErrSessionDead（12153）。
+ * 对齐 workbuddy2api state.go NoteSessionDead：连续 3 次才真正永久禁用，
+ * 前 1~2 次仅加计数并施加短冷却防惊群重试，避免临时网络闪断/抖动误杀健康账号。
+ * 返回 boolean：是否已达到 3 次阈值并真正禁用了该账号。
+ */
+export async function noteOauthSessionDead(
+  env: Env,
+  providerId: string,
+  uid: string,
+  cd?: OAuthCooldownConfig
+): Promise<boolean> {
+  const pool = await readOauthPool(env, providerId)
+  const acc = pool.find((a) => a.uid === uid)
+  if (!acc) return false
+  const st = acc.state || { credits: 0, disabled: false, until: 0, errCount: 0 }
+  const fails = (st.sessionDeadFails || 0) + 1
+  if (fails >= 3) {
+    acc.state = { ...st, disabled: true, reason: 'session dead (12153 3-strikes)', sessionDeadFails: 0 }
+    acc.updatedAt = Date.now()
+    await writeOauthPool(env, providerId, pool)
+    return true
+  }
+  const softMs = cd?.softMs || 60_000
+  acc.state = {
+    ...st,
+    sessionDeadFails: fails,
+    until: Date.now() + softMs,
+    reason: `session dead jitter (${fails}/3)`,
+  }
+  acc.updatedAt = Date.now()
+  await writeOauthPool(env, providerId, pool)
+  return false
+}
+
+/** 清除 12153 连续失败计数（Token 刷新成功 / 请求成功调用，对齐 workbuddy2api ClearSessionDead）。 */
+export async function clearOauthSessionDead(env: Env, providerId: string, uid: string): Promise<void> {
+  const pool = await readOauthPool(env, providerId)
+  const acc = pool.find((a) => a.uid === uid)
+  if (acc && acc.state && acc.state.sessionDeadFails) {
+    acc.state.sessionDeadFails = 0
+    acc.updatedAt = Date.now()
+    await writeOauthPool(env, providerId, pool)
+  }
+}
+
+/** 永久禁用（需重新登录）。 */
 export async function disableOauthAccount(env: Env, providerId: string, uid: string, reason: string): Promise<void> {
   const pool = await readOauthPool(env, providerId)
   const acc = pool.find((a) => a.uid === uid)
@@ -470,6 +643,7 @@ export async function noteOauthError(env: Env, providerId: string, uid: string, 
 /**
  * 成功请求记账：成功计数入内存运行态（成功率因子用），并按节流规则落盘 KV——
  *  - 错误→成功转变（errCount>0，既有行为：清零连续错误计数）
+ *  - 清零 sessionDeadFails（证明 session 未死）
  *  - 每 SUCCESS_FLUSH_EVERY 次成功摊销一次 KV 写（避免每请求一次写超 KV 配额）
  * 运行态在隔离重启后从 KV 快照种子（touchRuntimeStats 的 seed），误差有限可接受。
  */
@@ -482,8 +656,15 @@ export async function noteOauthSuccess(env: Env, providerId: string, uid: string
   const st = acc.state || { credits: 0, disabled: false, until: 0, errCount: 0 }
   const rt = touchRuntimeStats(providerId, uid, st.successCount || 0)
   rt.successCount++
-  if ((st.errCount || 0) > 0 || rt.successCount % SUCCESS_FLUSH_EVERY === 0) {
-    acc.state = { ...st, errCount: 0, successCount: rt.successCount, lastSuccess: Date.now() }
+  const hadErr = (st.errCount || 0) > 0 || (st.sessionDeadFails || 0) > 0
+  if (hadErr || rt.successCount % SUCCESS_FLUSH_EVERY === 0) {
+    acc.state = {
+      ...st,
+      errCount: 0,
+      sessionDeadFails: 0,
+      successCount: rt.successCount,
+      lastSuccess: Date.now(),
+    }
     await writeOauthPool(env, providerId, pool)
   }
 }
