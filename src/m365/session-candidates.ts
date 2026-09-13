@@ -72,7 +72,7 @@ export function stableSessionCandidateBody(body: Record<string, unknown>): strin
   const metadata = body['metadata']
   if (metadata && typeof metadata === 'object' && !Array.isArray(metadata)) {
     const meta = metadata as Record<string, unknown>
-    bodyCandidates.push(meta['session_id'], meta['conversation_id'], meta['chat_id'], meta['thread_id'], meta['user_id'], meta['prompt_cache_key'])
+    bodyCandidates.push(meta['session_id'], meta['conversation_id'], meta['chat_id'], meta['thread_id'], meta['user_id'], meta['prompt_cache_key'], meta['task_id'])
   }
   for (const c of bodyCandidates) {
     const id = optionalSessionIdentifier(c)
@@ -107,7 +107,7 @@ export function explicitSessionIdFromBody(body: Record<string, unknown>): string
   const metadata = body['metadata']
   if (metadata && typeof metadata === 'object' && !Array.isArray(metadata)) {
     const meta = metadata as Record<string, unknown>
-    bodyCandidates.push(meta['session_id'], meta['conversation_id'], meta['chat_id'], meta['thread_id'], meta['user_id'], meta['prompt_cache_key'])
+    bodyCandidates.push(meta['session_id'], meta['conversation_id'], meta['chat_id'], meta['thread_id'], meta['user_id'], meta['prompt_cache_key'], meta['task_id'])
   }
   for (const c of bodyCandidates) {
     const id = optionalSessionIdentifier(c)

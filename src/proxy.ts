@@ -22,6 +22,12 @@ import { isGeminiProvider, proxyGeminiChatRequest } from './gemini/proxy'
 import { isCnbProvider, proxyCnbChatRequest, CnbStreamDiag } from './cnb/proxy'
 import { isM365Provider, proxyM365ChatRequest } from './m365/proxy'
 import { sessionCandidateFromRequest } from './m365/session-candidates'
+import {
+  filterSubagentTools,
+  isFirstLevelSubagent,
+  toolChoiceSelectsRemovedTool,
+  validateM365ClientMetadata,
+} from './m365/responses-guardrails'
 import { isTraeProvider, proxyTraeChatRequest } from './trae/proxy'
 import { isZcodeProvider, buildZcodeHeaders } from './zcode/proxy'
 import { writeLog } from './admin'
@@ -212,6 +218,7 @@ function sanitizeBlockedTemplates(body: Record<string, unknown>): void {
  * - 空 content 数组 → 空字符串
  */
 function sanitizeUpstreamBody(body: Record<string, unknown>): void {
+  delete body['__responses_parallel_tool_calls']
   // 删除 reasoning_effort
   delete body['reasoning_effort']
   // 删除 thinking（Anthropic 专用字段；Procedural/OpenAI 兼容上游（如 Google Gemini OpenAI 端点）
@@ -3351,6 +3358,50 @@ export async function handleResponses(c: Context<AppEnv>) {
 
     // M365 Copilot：OAuth 授权码转发（OpenAI 格式），再转回 Responses 格式。
     if (isM365Provider(provider)) {
+      const metadataCheck = validateM365ClientMetadata(responsesBody['client_metadata'])
+      if (!metadataCheck.ok) {
+        return c.json({
+          error: {
+            message: metadataCheck.message,
+            type: 'invalid_request_error',
+            code: metadataCheck.code,
+          },
+        }, 400)
+      }
+
+      if (metadataCheck.metadata?.task_id) {
+        const metadata = (openaiBody['metadata'] && typeof openaiBody['metadata'] === 'object' && !Array.isArray(openaiBody['metadata']))
+          ? { ...(openaiBody['metadata'] as Record<string, unknown>) }
+          : {}
+        metadata['task_id'] = metadataCheck.metadata.task_id
+        openaiBody['metadata'] = metadata
+      }
+
+      if (isFirstLevelSubagent(metadataCheck.metadata, c.req.header('X-Parent-Session-Id'))) {
+        const rawFiltered = filterSubagentTools(responsesBody['tools'])
+        if (toolChoiceSelectsRemovedTool(responsesBody['tool_choice'], rawFiltered.removedNames)) {
+          return c.json({
+            error: {
+              message: 'tool_choice refers to a tool unavailable to first-level subagents',
+              type: 'invalid_tool_choice',
+              code: 'invalid_tool_choice',
+            },
+          }, 400)
+        }
+
+        const convertedFiltered = filterSubagentTools(openaiBody['tools'])
+        if (toolChoiceSelectsRemovedTool(openaiBody['tool_choice'], convertedFiltered.removedNames)) {
+          return c.json({
+            error: {
+              message: 'tool_choice refers to a tool unavailable to first-level subagents',
+              type: 'invalid_tool_choice',
+              code: 'invalid_tool_choice',
+            },
+          }, 400)
+        }
+        if (Array.isArray(openaiBody['tools'])) openaiBody['tools'] = convertedFiltered.tools
+      }
+
       // Responses 别名强约束：校验本次提交的 tool 结果 call_id 是否已被消费（防重复执行有副作用工具），
       // 并在完成后把新建的 response.id 注册为不可变别名，供后续 previous_response_id 派生分支。
       const prevId = responsesBody['previous_response_id'] ? String(responsesBody['previous_response_id']) : ''

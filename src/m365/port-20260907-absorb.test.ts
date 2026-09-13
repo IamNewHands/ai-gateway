@@ -119,6 +119,11 @@ describe('P2c: session-candidates（移植 C session-resolver.ts）', () => {
     it('取 metadata 内会话字段', () => {
       expect(stableSessionCandidateBody({ metadata: { thread_id: 't1' } })).toBe('t1')
     })
+    it('task_id 是 metadata 候选链末项，不覆盖已有会话字段', () => {
+      expect(stableSessionCandidateBody({ metadata: { session_id: 's1', prompt_cache_key: 'p1', task_id: 'task1' } })).toBe('s1')
+      expect(stableSessionCandidateBody({ metadata: { prompt_cache_key: 'p1', task_id: 'task1' } })).toBe('p1')
+      expect(stableSessionCandidateBody({ metadata: { task_id: 'task1' } })).toBe('task1')
+    })
     it('无显式字段时回退根指纹，并可用 user 前缀隔离', () => {
       const id = stableSessionCandidateBody({ user: 'u1', messages: [{ role: 'user', content: 'hello' }] })
       expect(id).toContain('u1::')

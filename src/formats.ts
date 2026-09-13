@@ -51,6 +51,7 @@ interface AnthropicRequest {
   stream?: boolean
   temperature?: number
   top_p?: number
+  parallel_tool_calls?: boolean
   top_k?: number
   tools?: AnthropicTool[]
   tool_choice?: { type: 'auto' | 'any' | 'tool' | 'none'; name?: string; disable_parallel_tool_use?: boolean }
@@ -1050,6 +1051,7 @@ export function responsesToOpenAI(responsesReq: ResponsesRequest): Record<string
   if (responsesReq.max_output_tokens) body['max_completion_tokens'] = responsesReq.max_output_tokens
   if (responsesReq.temperature !== undefined) body['temperature'] = responsesReq.temperature
   if (responsesReq.top_p !== undefined) body['top_p'] = responsesReq.top_p
+  body['__responses_parallel_tool_calls'] = responsesReq.parallel_tool_calls ?? true
 
   // tools（合并顶层 tools 与 input 内 additional_tools 声明）
   const toolDecls = [
