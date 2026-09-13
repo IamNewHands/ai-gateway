@@ -257,6 +257,11 @@ export interface OAuthDeviceConfig {
    * 上游 models 端点实测 404 无法动态发现，故由运营者按需配置。
    */
   effortPolicy?: Record<string, string[]>
+  /**
+   * WorkBuddy 设备风控 Token（X-Device-Token 头，对齐 workbuddy2api device_token）。
+   * 可选。配置后请求上游注入 X-Device-Token，模拟桌面端 Turing Shield SDK 生成的设备指纹。
+   */
+  deviceToken?: string
 }
 
 /** KV 中保存的 OAuth token 状态 */
@@ -284,6 +289,8 @@ export interface OAuthTokenState {
   tid?: string
   /** qoder/browser 模式：token 所属域（cn 默认 / global），决定推理与轮询/刷新端点 */
   realm?: 'cn' | 'global'
+  /** WorkBuddy 设备风控 Token（X-Device-Token 头，对齐 workbuddy2api device_token） */
+  device_token?: string
 }
 
 /** 进行中的设备码/浏览器/Qoder 登录流程状态 */

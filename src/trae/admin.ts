@@ -535,5 +535,40 @@ export async function handleTraeAccountRemove(c: Context<AppEnv>) {
   return c.json<ApiResponse>({ success: true, message: '已删除账号 ' + uid })
 }
 
+/** POST /admin/api/trae/:id/credits/refresh：主动探测并刷新所有账号的双通道积分（通用与 Work 积分）。 */
+export async function handleTraeCreditsRefresh(c: Context<AppEnv>) {
+  const id = c.req.param('id') || ''
+  if (!id) return c.json<ApiResponse>({ success: false, message: '缺少 id 参数' }, 400)
+  const provider = await getProvider(c.env, id)
+  if (!provider) return c.json<ApiResponse>({ success: false, message: '提供商不存在' }, 404)
+  const accounts = getTraeAccounts(provider)
+  const results: Array<{ uid: string; ideRemain?: number; workRemain?: number; success: boolean; error?: string }> = []
+  for (const a of accounts) {
+    try {
+      let ideRemain = 0
+      let workRemain = 0
+      const probe = await probeTraeCredits(a)
+      if (probe) {
+        ideRemain = probe.ideCredits
+        workRemain = probe.workCredits
+      } else {
+        const details = await fetchUserEntUsageDetails(a)
+        ideRemain = details.ideCredits
+        workRemain = details.workCredits
+      }
+      await reenableTraeIfCredits(c.env, id, a.uid, ideRemain, workRemain)
+      results.push({ uid: a.uid, ideRemain, workRemain, success: true })
+    } catch (e) {
+      results.push({ uid: a.uid, success: false, error: (e as Error).message })
+    }
+  }
+  return c.json<ApiResponse>({
+    success: true,
+    message: `已刷新 ${results.length} 个账号的通用与 Work 积分`,
+    data: results,
+  })
+}
+
 /** 静态模型 id 表（面板预设下拉用，避免 UI 硬编码）。 */
 export const TRAE_UI_MODEL_IDS = TRAE_STATIC_MODEL_IDS
+

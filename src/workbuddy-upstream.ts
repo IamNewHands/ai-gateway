@@ -20,12 +20,15 @@
 
 /** 上游错误分类（对齐 workbuddy2api ErrKind）。 */
 export type WorkbuddyErrorKind =
-  | 'hard_credit'   // 余额/权益耗尽 → 长冷却（次日 04:00）
-  | 'soft_rate'     // 429 限流 → 短冷却
-  | 'session_dead'  // session 失效 → 永久禁用
-  | 'not_found'     // 404 上游偶发 → 短冷却，不累计错误
-  | 'server'        // 5xx → 累计错误计数
-  | 'client'        // 其他 4xx → 不处罚，仅换号
+  | 'hard_credit'      // 余额/权益耗尽 → 长冷却（次日 04:00）
+  | 'soft_rate'        // 429 限流 → 短冷却
+  | 'model_rate'       // 429 code 6004 → 模型级限流（切模型立即可用）
+  | 'session_dead'     // session 失效 → 连续 3 次才永久禁用
+  | 'not_found'        // 404 上游偶发 → 短冷却，不累计错误
+  | 'server'           // 5xx → 累计错误计数
+  | 'bad_params'       // 400 Unmarshal 11101 → 客户端参数错，不罚号，仅换号
+  | 'content_blocked'  // 400 审核拦截 → 不罚号
+  | 'client'           // 其他 4xx → 不处罚，仅换号
 
 /**
  * 余额不足关键词（小写比较 + 原文比较双通道，对齐 workbuddy2api hardMarkers）。
@@ -44,9 +47,41 @@ const HARD_MARKERS = [
 /** session 失效关键词（对齐 workbuddy2api sessionDeadMarkers）。 */
 const SESSION_DEAD_MARKERS = ['Offline user session not found', '12153']
 
+/** 内容策略拦截关键词（对齐 workbuddy2api contentBlockedMarkers）。 */
+const CONTENT_BLOCKED_MARKERS = [
+  'blocked by security policy',
+  'unapproved channel',
+  'illegal api invocation',
+]
+
+/**
+ * 判断是否为模型级 429 限流（业务 code 6004，对齐 workbuddy2api IsModelRateLimit）。
+ * 用于区分"账号级软限流"与"该模型用量限流"（其他模型依然可用）。
+ */
+export function isModelRateLimit(bodyText: string): boolean {
+  return /"code"\s*:\s*"?6004"?/.test(bodyText)
+}
+
+/**
+ * 从 429 6004 body 解析「将在 … 重置」时间（上游 UTC+8 文案，对齐 workbuddy2api ParseSoftRateReset）。
+ * 成功返回 epoch ms 墙钟时刻，解析失败或非 6004 返回 null。
+ */
+export function parseSoftRateReset(bodyText: string): number | null {
+  if (!isModelRateLimit(bodyText)) return null
+  const m = bodyText.match(/将在\s*([\d\-:\s]+)(?:\s*UTC\+8)?\s*重置/)
+  if (!m || !m[1]) return null
+  const ts = m[1].trim().replace(/\s*UTC\+8$/, '')
+  const parts = ts.split(/\s+/)
+  if (parts.length !== 2) return null
+  const [d, t] = parts
+  const iso = `${d}T${t}+08:00`
+  const ms = new Date(iso).getTime()
+  return Number.isNaN(ms) ? null : ms
+}
+
 /**
  * 按 HTTP 状态码 + 响应体判定错误类别（对齐 workbuddy2api Classify 的判定顺序）：
- * 402 → 余额关键词 → session 死亡关键词 → 429 → 404 → 5xx → 其他 4xx。
+ * 402 → 余额关键词 → session 死亡关键词 → 6004 模型限流 → 429 软限流 → 404 → 5xx → 内容策略拦截 → 11101 参数错 → 其他 4xx。
  * 关键词优先于状态码：上游偶发把业务错误包在 5xx 里时，按真实原因分类。
  */
 export function classifyWorkbuddyUpstreamError(status: number, bodyText: string): WorkbuddyErrorKind {
@@ -58,10 +93,19 @@ export function classifyWorkbuddyUpstreamError(status: number, bodyText: string)
   for (const m of SESSION_DEAD_MARKERS) {
     if (bodyText.includes(m)) return 'session_dead'
   }
+  if (isModelRateLimit(bodyText)) return 'model_rate'
   if (status === 429) return 'soft_rate'
   if (status === 404) return 'not_found'
   if (status >= 500) return 'server'
-  if (status >= 400) return 'client'
+  if (status >= 400) {
+    for (const m of CONTENT_BLOCKED_MARKERS) {
+      if (lower.includes(m)) return 'content_blocked'
+    }
+    if (bodyText.includes('Unmarshal chat params failed') || /"code"\s*:\s*"?11101"?/.test(bodyText)) {
+      return 'bad_params'
+    }
+    return 'client'
+  }
   return 'client'
 }
 
@@ -162,4 +206,95 @@ export function applyWorkbuddyReasoningEffort(
 export function nextDay4AMMs(from: number = Date.now()): number {
   const d = new Date(from)
   return new Date(d.getFullYear(), d.getMonth(), d.getDate() + 1, 4, 0, 0, 0).getTime()
+}
+
+// ===== DeepSeek 思维链注入与历史消息回填 =====
+
+/** 模型名是否以 deepseek 开头（忽略大小写与首尾空格，对齐 workbuddy2api isDeepSeekModel）。 */
+export function isDeepSeekModel(model: string): boolean {
+  return model.trim().toLowerCase().startsWith('deepseek')
+}
+
+/** 缺省思维链 effort 档位（对齐 workbuddy2api defaultDeepSeekEffort）。 */
+export const DEFAULT_DEEPSEEK_EFFORT = 'high'
+
+/**
+ * 为 DeepSeek 系模型出站请求注入 thinking:{type:"enabled"} 与默认 effort。
+ * 对齐官方客户端 codebuddy.js 逆向与 workbuddy2api thinking.go injectThinking：
+ *  - 非 deepseek 模型零改动；
+ *  - thinking.type 为 disabled 时显式尊重，删除 reasoning_effort 与 reasoningEffort；
+ *  - 显式 enabled 缺 effort 补默认档；
+ *  - 无 thinking 或 type 为空：注入 { type: 'enabled' } 并补默认档（已有 effort 则保留不覆盖）。
+ */
+export function injectDeepSeekThinking(body: Record<string, unknown>): void {
+  const model = typeof body['model'] === 'string' ? body['model'] : ''
+  if (!isDeepSeekModel(model)) return
+
+  const th = body['thinking']
+  if (th && typeof th === 'object' && !Array.isArray(th)) {
+    const thObj = th as Record<string, unknown>
+    const typ = typeof thObj['type'] === 'string' ? thObj['type'].trim().toLowerCase() : ''
+    if (typ === 'disabled') {
+      delete body['reasoning_effort']
+      delete body['reasoningEffort']
+      return
+    }
+    ensureDeepSeekEffort(body)
+    return
+  }
+
+  // 无 thinking 或非法非对象值
+  body['thinking'] = { type: 'enabled' }
+  ensureDeepSeekEffort(body)
+}
+
+function ensureDeepSeekEffort(body: Record<string, unknown>): void {
+  if (body['reasoning_effort'] !== undefined || body['reasoningEffort'] !== undefined) {
+    return
+  }
+  body['reasoning_effort'] = DEFAULT_DEEPSEEK_EFFORT
+}
+
+/**
+ * DeepSeek 多轮一致性回填（对齐 workbuddy2api thinking.go backfillReasoningContent）：
+ * 官方客户端规则 requiresReasoningContentOnAssistantMessages：
+ * 若会话内任一 assistant 消息含有 reasoning 痕迹（非空 reasoning 字符串或已有 reasoning_content），
+ * 上游要求后续请求中所有 assistant 消息都带 reasoning_content（string，无则补空串 ""），
+ * 否则直接以 HTTP 400 拒绝请求。
+ */
+export function backfillReasoningContent(body: Record<string, unknown>): void {
+  const model = typeof body['model'] === 'string' ? body['model'] : ''
+  if (!isDeepSeekModel(model)) return
+
+  const msgs = body['messages']
+  if (!Array.isArray(msgs) || msgs.length === 0) return
+
+  // 第一遍：检测是否有任何 reasoning 痕迹
+  let hasTrace = false
+  for (const item of msgs) {
+    if (!item || typeof item !== 'object') continue
+    const m = item as Record<string, unknown>
+    if (typeof m['reasoning'] === 'string' && m['reasoning'].trim() !== '') {
+      hasTrace = true
+      break
+    }
+    if (m['reasoning_content'] !== undefined) {
+      hasTrace = true
+      break
+    }
+  }
+  if (!hasTrace) return
+
+  // 第二遍：为所有 assistant 补齐 reasoning_content 字段
+  for (const item of msgs) {
+    if (!item || typeof item !== 'object') continue
+    const m = item as Record<string, unknown>
+    if (m['role'] !== 'assistant') continue
+    if (m['reasoning_content'] !== undefined) continue // 已有不覆盖
+    if (typeof m['reasoning'] === 'string') {
+      m['reasoning_content'] = m['reasoning']
+    } else {
+      m['reasoning_content'] = ''
+    }
+  }
 }

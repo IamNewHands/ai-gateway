@@ -583,10 +583,11 @@ ${H('管理')}
               <fieldset class="form-group ${p.authType==='oauth-device'?'hd':''}" id="keys-fs-${escapePageHtml(p.id)}"><legend id="key-legend-${escapePageHtml(p.id)}">${isTraeProviderUI(p)?'TRAE 账号凭证（每个账号一行 JSON）':(p.id==='cline'?'Cline RefreshTokens（每个账号一行）':'上游 API Keys')}</legend><div id="keys-${escapePageHtml(p.id)}">${p.apiKeys.map((k, ki)=>`<div class="fc mb-3 field-row" data-kidx="${ki}"><input type="password" value="${escapePageHtml(k.key)}" class="fx1" id="k-${escapePageHtml(p.id)}-${ki}" placeholder="API Key" aria-label="API Key"><button class="icon-btn" onclick="toggleKeyText(this)" title="显示/隐藏 Key"><i class="fas fa-eye" aria-hidden="true"></i></button><label class="tg"><input type="checkbox" ${k.enabled?'checked':''} id="ken-${escapePageHtml(p.id)}-${ki}" aria-label="启用 Key"><span class="sl"></span></label><button class="btn btn-gh btn-xs" onclick="testKeyRow('${escapePageJsx(p.id)}',${ki})" title="测试 Key"><i class="fas fa-plug" aria-hidden="true"></i><span>测试</span></button><button class="icon-btn" onclick="rmKeyRow('${escapePageJsx(p.id)}',${ki})" aria-label="移除 Key"><i class="fas fa-times" aria-hidden="true"></i></button></div>`).join('')}</div><div class="fc mt-1 field-row"><input type="password" id="nk-${escapePageHtml(p.id)}" placeholder="${isTraeProviderUI(p)?'新的 TRAE 凭证 JSON（或点「登录账号」自动写入）':(p.id==='cline'?'新的 RefreshToken（一个账号一行）':'新的 API Key')}" class="fx1"><button class="btn btn-s btn-xs" onclick="addKeyRow('${escapePageJsx(p.id)}')"><i class="fas fa-plus" aria-hidden="true"></i>添加</button></div><span id="key-hint-${escapePageHtml(p.id)}" class="form-helper">${isTraeProviderUI(p)?'TRAE SOLO 账号凭证为登录后自动写入的 JSON（也可粘贴 trae 登录脚本落盘的 trae-*.json 内容）。每行一个账号、按剩余积分自动挑选，额度用尽自动冷却轮换；禁用该 Key 即停用账号。':(p.id==='cline'?'Cline 使用 Cline 账号的 refreshToken（长期钥匙）。每个账号一行，额度用完自动切换；留空禁用某个账号。':' ')}</span></fieldset>
               <fieldset class="form-group" id="models-fs-${escapePageHtml(p.id)}"><legend>模型</legend><div id="ml-${escapePageHtml(p.id)}">${p.models.map((m,mi)=>{ const pol=((p.oauth&&p.oauth.effortPolicy)||{})[m.id]||[]; return `<div class="fc mb-3 field-row" data-idx="${mi}"><input type="text" value="${escapePageHtml(m.id)}" class="fx1" id="mid-${escapePageHtml(p.id)}-${mi}" placeholder="模型 ID"><label class="tg" title="启用模型"><input type="checkbox" ${m.enabled?'checked':''} id="men-${escapePageHtml(p.id)}-${mi}" aria-label="启用模型"><span class="sl"></span></label><label class="tg" title="启用思维引导注入"><input type="checkbox" ${(p.thinkingInject||[]).includes(m.id)?'checked':''} id="mit-${escapePageHtml(p.id)}-${mi}" aria-label="启用思维引导注入"><span class="sl"></span></label><label class="tg" title="启用缓存前缀注入"><input type="checkbox" ${(p.cachePrefixInject||[]).includes(m.id)?'checked':''} id="mcp-${escapePageHtml(p.id)}-${mi}" aria-label="启用缓存前缀注入"><span class="sl"></span></label>${effDdEditHtml(p.id, mi, pol)}<button class="btn btn-gh btn-xs" onclick="testMdl('${escapePageJsx(p.id)}','${escapePageJsx(m.id)}',${mi})" title="测试模型"><i class="fas fa-plug" aria-hidden="true"></i><span>测试</span></button><button class="icon-btn" onclick="rmMdl('${escapePageJsx(p.id)}',${mi})" aria-label="移除模型"><i class="fas fa-times" aria-hidden="true"></i></button></div>`}).join('')}</div><div class="fc mt-1 field-row"><input type="text" id="nmid-${escapePageHtml(p.id)}" placeholder="新的模型 ID" class="fx1"><button class="btn btn-s btn-xs" onclick="addMdl('${escapePageJsx(p.id)}')"><i class="fas fa-plus" aria-hidden="true"></i>添加</button></div><span class="form-helper">每个模型行「启用模型」开关旁的开关依次为「思维引导注入」「缓存前缀注入」，勾选后该模型转发前会被注入对应固定提示词；不勾选则原样转发。「effort」下拉声明该模型的 reasoning_effort 支持档位（多选，仅 WorkBuddy/CodeBuddy 上游生效），留空 = 不启用。</span></fieldset>
               ${isTraeProviderUI(p)?`
-              <fieldset class="form-group" id="trae-fs-${escapePageHtml(p.id)}"><legend>TRAE SOLO 账号池</legend><span class="form-helper">免费积分多账号反代：登录成功后凭证自动写入上方账号列表；转发时默认按剩余积分自动挑选账号，也可在下方「首选账号」下拉框中手工指定固定账号（被冷却/禁用/失败时才回退其他账号），额度用尽自动冷却轮换（1005/429/401 各按策略冷却/禁用），每日 01:00/13:00 自动签到补积分并解冻。</span>
+              <fieldset class="form-group" id="trae-fs-${escapePageHtml(p.id)}"><legend>TRAE 账号池（SOLO / Work 双通道）</legend><span class="form-helper">多账号双积分反代：自动隔离通用积分 (SOLO) 与 Work 专属积分。正常调用优先消耗通用积分；当遇到 4008 额度耗尽或 429 限流时，系统自动无缝降级到 Work 专有通道。支持一键刷新双通道积分与每日自动签到补积分。</span>
                 <div class="fc mt-1 field-row">
                   <button class="btn btn-s" onclick="traeLogin('${escapePageJsx(p.id)}')"><i class="fas fa-sign-in-alt" aria-hidden="true"></i>登录账号</button>
                   <button class="btn btn-s" onclick="traeCheckin('${escapePageJsx(p.id)}')"><i class="fas fa-calendar-check" aria-hidden="true"></i>全部签到</button>
+                  <button class="btn btn-s" onclick="traeRefreshCredits('${escapePageJsx(p.id)}')"><i class="fas fa-coins" aria-hidden="true"></i>刷新积分</button>
                   <button class="btn btn-s" onclick="traeModels('${escapePageJsx(p.id)}')"><i class="fas fa-cloud-download-alt" aria-hidden="true"></i>拉取模型</button>
                   <button class="btn btn-gh" onclick="traeStatus('${escapePageJsx(p.id)}')"><i class="fas fa-sync" aria-hidden="true"></i>刷新状态</button>
                 </div>
@@ -2156,7 +2157,8 @@ function traeLoginSubmit(id) {
     if (!d.success) { toast(d.message || '登录失败', 'error'); if (st) showResult(st, false, d.message || '登录失败'); return }
     closeM()
     const dd = d.data || {}
-    if (st) showResult(st, true, '登录成功 uid=' + (dd.uid || '') + ' 积分=' + (dd.credits || 0))
+    const credTxt = '通用=' + (dd.credits || 0) + ' Work=' + (dd.workCredits !== undefined ? dd.workCredits : 0)
+    if (st) showResult(st, true, '登录成功 uid=' + (dd.uid || '') + ' ' + credTxt)
     traeStatus(id)
     setTimeout(function () { reloadAdmin() }, 1500)
   }).catch(() => { if (st) showResult(st, false, '网络错误，请重试') })
@@ -2168,6 +2170,16 @@ function traeCheckin(id) {
     if (!d.success) { if (st) showResult(st, false, d.message || '签到失败'); return }
     const results = d.data || []
     if (st) showResult(st, true, '签到完成：' + results.length + ' 个账号')
+    traeStatus(id)
+  }).catch(() => { if (st) showResult(st, false, '网络错误，请重试') })
+}
+function traeRefreshCredits(id) {
+  const st = document.getElementById('trae-st-' + id)
+  if (st) { st.textContent = '正在探测通用与 Work 积分…'; showSpinner(st) }
+  fetch('/admin/api/trae/' + encodeURIComponent(id) + '/credits/refresh', { method: 'POST' }).then(r => r.json()).then(d => {
+    if (!d.success) { if (st) showResult(st, false, d.message || '刷新积分失败'); return }
+    const results = d.data || []
+    if (st) showResult(st, true, '积分刷新成功：共 ' + results.length + ' 个账号')
     traeStatus(id)
   }).catch(() => { if (st) showResult(st, false, '网络错误，请重试') })
 }
@@ -2221,7 +2233,7 @@ function traeStatus(id) {
       box.innerHTML = '<p class="form-helper">暂无账号。点击「登录账号」添加第一个 TRAE 账号。</p>'
     } else {
       const preferUid = d.data.preferTraeUid || ''
-      const opts = ['<option value="">自动挑选（按积分）</option>'].concat(accs.map(function (a) {
+      const opts = ['<option value="">自动挑选（按可用积分）</option>'].concat(accs.map(function (a) {
         const sel = a.uid === preferUid ? ' selected' : ''
         return '<option value="' + escapeHtml(a.uid) + '"' + sel + '>' + escapeHtml((a.nickname || a.uid)) + '</option>'
       })).join('')
@@ -2233,18 +2245,46 @@ function traeStatus(id) {
       const ciOk = accs.filter(function (a) { const r = ciByUid[a.uid]; return r && (r.success || r.checkedIn) }).length
       box.innerHTML = preferBar +
         '<div style="max-height:260px;overflow:auto"><table class="usage-log-table" style="margin:0">' +
-        '<thead><tr><th>UID</th><th>昵称</th><th>积分</th><th>今日签到</th><th>状态</th><th>冷却至</th><th>操作</th></tr></thead><tbody>' +
+        '<thead><tr><th>UID</th><th>昵称</th><th>通用积分 (SOLO)</th><th>Work 积分</th><th>今日签到</th><th>通道状态</th><th>冷却至</th><th>操作</th></tr></thead><tbody>' +
         accs.map(function (a) {
-          const stTxt = a.disabled ? '<span style="color:var(--color-danger,#ef4444)">已禁用</span>' : a.cooling ? '<span style="color:var(--color-warn,#d97706)">冷却中</span>' : '<span style="color:var(--color-success,#16a34a)">正常</span>'
-          const until = a.cooling && a.until ? new Date(a.until).toLocaleString() : ''
-          const reason = a.reason ? '<small>' + escapeHtml(a.reason) + '</small>' : ''
+          const isDis = a.disabled
+          const soloCool = a.cooling
+          const workCool = a.workCooling
+          let stTxt = '<span style="color:var(--color-success,#16a34a)">正常</span>'
+          if (isDis) {
+            stTxt = '<span style="color:var(--color-danger,#ef4444)">已禁用</span>'
+          } else if (soloCool && workCool) {
+            stTxt = '<span style="color:var(--color-warn,#d97706)">双通道冷却</span>'
+          } else if (soloCool) {
+            stTxt = '<span style="color:var(--color-warn,#d97706)" title="SOLO 冷却，自动降级至 Work 通道">SOLO 冷却 (Work 可用)</span>'
+          } else if (workCool) {
+            stTxt = '<span style="color:var(--color-warn,#d97706)" title="Work 通道冷却">Work 冷却</span>'
+          }
+
+          const untilParts = []
+          if (soloCool && a.until) untilParts.push('SOLO: ' + new Date(a.until).toLocaleTimeString())
+          if (workCool && a.workUntil) untilParts.push('Work: ' + new Date(a.workUntil).toLocaleTimeString())
+          const until = untilParts.join('<br>')
+
+          const reasons = []
+          if (a.reason) reasons.push('SOLO: ' + escapeHtml(a.reason))
+          if (a.workReason) reasons.push('Work: ' + escapeHtml(a.workReason))
+          const reasonHtml = reasons.length ? '<br><small>' + reasons.join('; ') + '</small>' : ''
+
           const ci = ciByUid[a.uid]
           const ciTxt = !ci ? '<span class="bd bd-off">未签</span>'
             : ci.success ? (ci.checkedIn ? '<span class="bd bd-on">已签到</span>' : '<span class="bd bd-on">成功</span>')
             : '<span class="bd bd-danger">失败</span>'
           const ciTip = ci && ci.message ? ' title="' + escapeHtml(ci.message) + '"' : ''
+
+          const soloCredits = typeof a.credits === 'number' ? a.credits : 0
+          const hasWork = typeof a.workCredits === 'number'
+          const workVal = hasWork ? a.workCredits : '未探测'
+          const soloBadge = '<span class="bd ' + (soloCredits > 0 ? 'bd-on' : 'bd-off') + '" title="通用积分 (SOLO 通道)">' + soloCredits + '</span>'
+          const workBadge = '<span class="bd ' + (hasWork && a.workCredits > 0 ? 'bd-on' : 'bd-off') + '" title="' + (hasWork ? 'Work 专属通道可用额度' : '点击「刷新积分」或「全部签到」探测') + '">' + workVal + '</span>'
+
           return '<tr><td><code>' + escapeHtml(a.uid) + '</code></td><td>' + escapeHtml(a.nickname || '-') + '</td>' +
-            '<td>' + (a.credits || 0) + '</td><td' + ciTip + '>' + ciTxt + '</td><td>' + stTxt + (reason ? '<br>' + reason : '') + '</td><td>' + escapeHtml(until) + '</td>' +
+            '<td>' + soloBadge + '</td><td>' + workBadge + '</td><td' + ciTip + '>' + ciTxt + '</td><td>' + stTxt + reasonHtml + '</td><td>' + until + '</td>' +
             '<td><button class="btn btn-d btn-xs" onclick="traeRemoveAccount(\\'' + escapeJsAttr(id) + '\\',\\'' + escapeJsAttr(a.uid) + '\\')">删除</button></td></tr>'
         }).join('') + '</tbody></table></div>' +
         '<p class="form-helper">共 ' + accs.length + ' 个账号；今日已签 ' + ciOk + ' / ' + accs.length + '</p>'

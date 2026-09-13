@@ -44,6 +44,15 @@ export interface OAuthPoolState {
   lastSuccess?: number
   /** 最近错误时间（epoch ms） */
   lastErr?: number
+
+  // ===== 6004 模型级限流隔离（对齐 workbuddy2api issue #31） =====
+  /** 触发 6004 模型级限流的模型名，请求其他模型时豁免 */
+  softRateModel?: string
+  /** 上游 6004 重置时刻（epoch ms） */
+  softRateResetAt?: number
+
+  // ===== 12153 session dead 连续失败防抖（对齐 workbuddy2api sessionDeadThreshold = 3） =====
+  sessionDeadFails?: number
 }
 
 /** 池内账号（凭证 + 状态），存于 KV oauth:pool:<providerId> */

@@ -87,7 +87,7 @@ describe('Trae Work: 提示词提取 (extractLastUserPrompt)', () => {
 describe('Trae Work: 载荷构造 (buildNativeTaskPayload)', () => {
   const account: TraeAccount = {
     uid: 'test_uid',
-    token: 'token_123',
+    accessToken: 'token_123',
     refreshToken: 'ref_123',
     expiresAt: Date.now() + 3600_000,
     deviceId: 'device_abc',
@@ -187,14 +187,14 @@ describe('Trae Work: 账号池与状态机调度 (pool.ts)', () => {
 
   const accountA: TraeAccount = {
     uid: 'user_a',
-    token: 'token_a',
+    accessToken: 'token_a',
     refreshToken: 'ref_a',
     expiresAt: Date.now() + 3600_000,
   }
 
   const accountB: TraeAccount = {
     uid: 'user_b',
-    token: 'token_b',
+    accessToken: 'token_b',
     refreshToken: 'ref_b',
     expiresAt: Date.now() + 3600_000,
   }
@@ -202,22 +202,33 @@ describe('Trae Work: 账号池与状态机调度 (pool.ts)', () => {
   it('isTraeWorkHealthy 正确判定 Work 通道健康状况', () => {
     const now = Date.now()
     const healthyState: TraeAccountState = {
+      credits: 10,
       workCredits: 50,
+      disabled: false,
+      until: 0,
+      errCount: 0,
       workUntil: 0,
     }
     expect(isTraeWorkHealthy(healthyState, now)).toBe(true)
 
     // 冷却中不可用
     const coolingState: TraeAccountState = {
+      credits: 10,
       workCredits: 50,
+      disabled: false,
+      until: 0,
+      errCount: 0,
       workUntil: now + 60_000,
     }
     expect(isTraeWorkHealthy(coolingState, now)).toBe(false)
 
     // 禁用不可用
     const disabledState: TraeAccountState = {
-      disabled: true,
+      credits: 10,
       workCredits: 50,
+      disabled: true,
+      until: 0,
+      errCount: 0,
     }
     expect(isTraeWorkHealthy(disabledState, now)).toBe(false)
   })

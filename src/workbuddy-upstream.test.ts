@@ -4,6 +4,11 @@ import {
   captureWorkbuddyReasoningEffort,
   applyWorkbuddyReasoningEffort,
   nextDay4AMMs,
+  isModelRateLimit,
+  parseSoftRateReset,
+  isDeepSeekModel,
+  injectDeepSeekThinking,
+  backfillReasoningContent,
 } from './workbuddy-upstream'
 
 describe('classifyWorkbuddyUpstreamError 错误分类（移植 workbuddy2api Classify）', () => {
@@ -152,5 +157,108 @@ describe('nextDay4AMMs 次日 04:00（对齐 workbuddy2api CooldownUntilTomorrow
 
   it('默认参数（当前时间）结果在未来', () => {
     expect(nextDay4AMMs()).toBeGreaterThan(Date.now())
+  })
+})
+
+describe('isModelRateLimit & parseSoftRateReset 6004 限流解析（移植 workbuddy2api）', () => {
+  it('识别 6004 模型级限流', () => {
+    expect(isModelRateLimit('{"code": 6004, "msg": "error"}')).toBe(true)
+    expect(isModelRateLimit('{"code":6004,"msg":"将在 2026-09-11 18:33:27 UTC+8 重置"}')).toBe(true)
+    expect(isModelRateLimit('{"code":"6004"}')).toBe(true)
+    expect(isModelRateLimit('{"code": 429}')).toBe(false)
+  })
+
+  it('从 6004 body 解析重置墙钟（UTC+8）', () => {
+    const body = '{"code":6004,"msg":"将在 2026-09-11 18:33:27 UTC+8 重置"}'
+    const resetMs = parseSoftRateReset(body)
+    expect(resetMs).not.toBeNull()
+    const expected = new Date('2026-09-11T18:33:27+08:00').getTime()
+    expect(resetMs).toBe(expected)
+
+    const bodyNoSuffix = '{"code":6004,"msg":"将在 2026-09-11 18:33:27 重置"}'
+    expect(parseSoftRateReset(bodyNoSuffix)).toBe(expected)
+  })
+
+  it('非 6004 即使带重置字样也不返回重置时间', () => {
+    const body = '{"code":11140,"msg":"将在 2026-09-11 18:33:27 UTC+8 重置"}'
+    expect(parseSoftRateReset(body)).toBeNull()
+  })
+
+  it('classifyWorkbuddyUpstreamError 分类 6004 / bad_params / content_blocked', () => {
+    expect(classifyWorkbuddyUpstreamError(429, '{"code":6004,"msg":"将在 2026-09-11 18:33:27 重置"}')).toBe('model_rate')
+    expect(classifyWorkbuddyUpstreamError(400, 'Unmarshal chat params failed')).toBe('bad_params')
+    expect(classifyWorkbuddyUpstreamError(400, '{"code":11101,"msg":"Unmarshal error"}')).toBe('bad_params')
+    expect(classifyWorkbuddyUpstreamError(400, 'blocked by security policy')).toBe('content_blocked')
+  })
+})
+
+describe('DeepSeek 思维链注入与历史消息回填（移植 workbuddy2api thinking.go）', () => {
+  it('isDeepSeekModel 判定', () => {
+    expect(isDeepSeekModel('deepseek-v4-flash')).toBe(true)
+    expect(isDeepSeekModel('DeepSeek-R1')).toBe(true)
+    expect(isDeepSeekModel('  deepseek-v3  ')).toBe(true)
+    expect(isDeepSeekModel('claude-3-5-sonnet')).toBe(false)
+    expect(isDeepSeekModel('qwen-max')).toBe(false)
+  })
+
+  it('injectDeepSeekThinking：非 DeepSeek 零改动', () => {
+    const body: Record<string, unknown> = { model: 'gpt-4o', messages: [] }
+    injectDeepSeekThinking(body)
+    expect(body['thinking']).toBeUndefined()
+    expect(body['reasoning_effort']).toBeUndefined()
+  })
+
+  it('injectDeepSeekThinking：无 thinking 自动注入 enabled + 默认 effort high', () => {
+    const body: Record<string, unknown> = { model: 'deepseek-v4-flash' }
+    injectDeepSeekThinking(body)
+    expect(body['thinking']).toEqual({ type: 'enabled' })
+    expect(body['reasoning_effort']).toBe('high')
+  })
+
+  it('injectDeepSeekThinking：已有 effort 则保留不被覆盖', () => {
+    const body: Record<string, unknown> = { model: 'deepseek-v4-flash', reasoning_effort: 'medium' }
+    injectDeepSeekThinking(body)
+    expect(body['thinking']).toEqual({ type: 'enabled' })
+    expect(body['reasoning_effort']).toBe('medium')
+  })
+
+  it('injectDeepSeekThinking：thinking.type 为 disabled 时删除 effort', () => {
+    const body: Record<string, unknown> = {
+      model: 'deepseek-v4-flash',
+      thinking: { type: 'disabled' },
+      reasoning_effort: 'high',
+    }
+    injectDeepSeekThinking(body)
+    expect(body['thinking']).toEqual({ type: 'disabled' })
+    expect(body['reasoning_effort']).toBeUndefined()
+  })
+
+  it('backfillReasoningContent：会话无 reasoning 痕迹时不修改', () => {
+    const body: Record<string, unknown> = {
+      model: 'deepseek-v4-flash',
+      messages: [
+        { role: 'user', content: 'hello' },
+        { role: 'assistant', content: 'hi' },
+      ],
+    }
+    backfillReasoningContent(body)
+    const msgs = body['messages'] as any[]
+    expect(msgs[1].reasoning_content).toBeUndefined()
+  })
+
+  it('backfillReasoningContent：有 assistant 带 reasoning 痕迹时，所有 assistant 补齐 reasoning_content', () => {
+    const body: Record<string, unknown> = {
+      model: 'deepseek-v4-flash',
+      messages: [
+        { role: 'user', content: 'q1' },
+        { role: 'assistant', content: 'a1', reasoning: 'think1' },
+        { role: 'user', content: 'q2' },
+        { role: 'assistant', content: 'a2' }, // 缺少 reasoning
+      ],
+    }
+    backfillReasoningContent(body)
+    const msgs = body['messages'] as any[]
+    expect(msgs[1].reasoning_content).toBe('think1')
+    expect(msgs[3].reasoning_content).toBe('')
   })
 })
