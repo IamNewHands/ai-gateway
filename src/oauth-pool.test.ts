@@ -236,3 +236,91 @@ describe('全冷却兜底（allowCoolingFallback，对齐 workbuddy2api pickEarl
     expect(acc!.uid).toBe('healthy')
   })
 })
+
+describe('6004 模型级限流隔离测试（对齐 workbuddy2api issue #31）', () => {
+  it('处于 6004 模型级冷却的账号对其他模型豁免', () => {
+    const now = Date.now()
+    const acc = makeAccount('acc-1', {
+      state: {
+        credits: 100,
+        disabled: false,
+        until: now + 60000,
+        errCount: 0,
+        softRateModel: 'deepseek-v4-flash',
+        softRateResetAt: now + 60000,
+      },
+    })
+    // 请求相同模型时：仍不健康
+    expect(isOauthAccountHealthy(acc, now, 'deepseek-v4-flash')).toBe(false)
+    // 未带模型参数时：保守判定为不健康
+    expect(isOauthAccountHealthy(acc, now)).toBe(false)
+    // 请求其他模型时：豁免健康
+    expect(isOauthAccountHealthy(acc, now, 'claude-3-5-sonnet')).toBe(true)
+  })
+})
+
+describe('12153 Session Dead 3 次防抖测试（对齐 workbuddy2api sessionDeadThreshold）', () => {
+  it('前 1~2 次 12153 只施加短冷却不永久杀号，第 3 次才禁用', async () => {
+    const pid = PROVIDER + '-sd'
+    const kv = makeKV(pid, [makeAccount('u1')])
+    // 第一次
+    const dis1 = await noteOauthSessionDead(kv.env, pid, 'u1')
+    expect(dis1).toBe(false)
+    let pool = await readOauthPool(kv.env, pid)
+    expect(pool[0].state.disabled).toBe(false)
+    expect(pool[0].state.sessionDeadFails).toBe(1)
+    expect(pool[0].state.until).toBeGreaterThan(Date.now())
+
+    // 第二次
+    const dis2 = await noteOauthSessionDead(kv.env, pid, 'u1')
+    expect(dis2).toBe(false)
+    pool = await readOauthPool(kv.env, pid)
+    expect(pool[0].state.disabled).toBe(false)
+    expect(pool[0].state.sessionDeadFails).toBe(2)
+
+    // 第三次
+    const dis3 = await noteOauthSessionDead(kv.env, pid, 'u1')
+    expect(dis3).toBe(true)
+    pool = await readOauthPool(kv.env, pid)
+    expect(pool[0].state.disabled).toBe(true)
+    expect(pool[0].state.sessionDeadFails).toBe(0)
+  })
+
+  it('clearOauthSessionDead 可清空计数', async () => {
+    const pid = PROVIDER + '-sd2'
+    const kv = makeKV(pid, [makeAccount('u1')])
+    await noteOauthSessionDead(kv.env, pid, 'u1')
+    let pool = await readOauthPool(kv.env, pid)
+    expect(pool[0].state.sessionDeadFails).toBe(1)
+
+    await clearOauthSessionDead(kv.env, pid, 'u1')
+    pool = await readOauthPool(kv.env, pid)
+    expect(pool[0].state.sessionDeadFails).toBe(0)
+  })
+})
+
+describe('成本优先分层挑号测试（对齐 workbuddy2api pick.go costTier）', () => {
+  beforeEach(() => {
+    __resetOauthModelCostsForTests()
+    __resetOauthPoolRuntimeForTests()
+  })
+
+  it('实测免费账号优先被挑中（Tier 0 优于 Tier 2 收费号）', async () => {
+    const pid = PROVIDER + '-cost1'
+    const kv = makeKV(pid, [
+      makeAccount('free-acc', { state: { credits: 10, disabled: false, until: 0, errCount: 0 } }),
+      makeAccount('paid-acc', { state: { credits: 1000, disabled: false, until: 0, errCount: 0 } }),
+    ])
+    // 记录 free-acc 为 0 扣费，paid-acc 为 2.0 credit / 1000 tokens
+    recordOauthModelCost(pid, 'free-acc', 'deepseek-v4-flash', 0, 1000)
+    recordOauthModelCost(pid, 'paid-acc', 'deepseek-v4-flash', 2.0, 1000)
+
+    // 即使 paid-acc 的 credits 远高于 free-acc，因 free-acc 属于 Tier 0，恒优先选择 free-acc
+    const picked = await pickOauthAccount(kv.env, pid, new Set(), undefined, {
+      reqModel: 'deepseek-v4-flash',
+      rng: RNG_ZERO,
+    })
+    expect(picked).not.toBeNull()
+    expect(picked!.uid).toBe('free-acc')
+  })
+})
