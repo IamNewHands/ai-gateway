@@ -298,3 +298,92 @@ export function backfillReasoningContent(body: Record<string, unknown>): void {
     }
   }
 }
+
+// ===== 协议归属头与身份头注入 =====
+
+/**
+ * 解码 WorkBuddy access_token (JWT) 的 uid / enterpriseId / nickname / domain（不验签）。
+ */
+export function parseJwtClaims(token: string): { uid: string; enterpriseId: string; nickname: string; domain: string } {
+  let claims: Record<string, unknown> | null = null
+  try {
+    const parts = token.split('.')
+    if (parts.length >= 2) {
+      let b64 = parts[1].replace(/-/g, '+').replace(/_/g, '/')
+      while (b64.length % 4) b64 += '='
+      claims = JSON.parse(atob(b64))
+    }
+  } catch { claims = null }
+  const out = { uid: '', enterpriseId: '', nickname: '', domain: '' }
+  if (!claims || typeof claims !== 'object') return out
+  const pick = (...keys: string[]): string => {
+    for (const k of keys) {
+      const v = claims![k]
+      if (v !== undefined && v !== null && String(v).trim() !== '') return String(v).trim()
+    }
+    return ''
+  }
+  out.uid = pick('uid', 'user_id', 'userId', 'sub', 'UserID')
+  out.enterpriseId = pick('enterprise_id', 'enterpriseId', 'tenant_id', 'tenantId', 'TenantID', 'EnterpriseID')
+  out.nickname = pick('nickname', 'name', 'username', 'nick', 'ScreenName')
+  out.domain = pick('domain', 'Domain', 'org', 'tenantDomain')
+  return out
+}
+
+/**
+ * 注入 WorkBuddy/CodeBuddy 官方出站协议头（对齐 workbuddy2api internal/upstream/headers.go）：
+ * 1. 归属头（白名单头组）：X-Agent-Purpose="conversation", X-IDE-Name="WorkBuddy", X-IDE-Type="WorkBuddy", X-IDE-Version="2.63.2", X-Product="WorkBuddy"
+ * 2. 身份标识头：X-User-Id（空则 X-No-User-Id: 1）, X-Enterprise-Id（空则 X-No-Enterprise-Id: 1）
+ * 3. 动态领域头：X-Domain（Global 默认为 workbuddy.ai，CN 有则填，无则 X-No-Department-Info: 1）
+ * 4. 设备风控头：X-Device-Token（accountTokenState.device_token || cfg.deviceToken）
+ * 5. 安全红线：绝不在 chat 请求携带 X-Refresh-Token
+ */
+export function injectWorkbuddyChatHeaders(
+  headers: Record<string, string>,
+  token: string,
+  realm: 'cn' | 'global',
+  accountTokenState?: { uid?: string; enterprise_id?: string; domain?: string; device_token?: string },
+  cfg?: { deviceToken?: string; extraHeaders?: Record<string, string> }
+): void {
+  headers['X-Agent-Purpose'] = 'conversation'
+  headers['X-IDE-Name'] = 'WorkBuddy'
+  headers['X-IDE-Type'] = 'WorkBuddy'
+  headers['X-IDE-Version'] = '2.63.2'
+  headers['X-Product'] = 'WorkBuddy'
+
+  const claims = parseJwtClaims(token)
+  const uid = accountTokenState?.uid || claims.uid
+  if (uid) {
+    headers['X-User-Id'] = uid
+    delete headers['X-No-User-Id']
+  } else {
+    headers['X-No-User-Id'] = '1'
+  }
+
+  const entId = accountTokenState?.enterprise_id || claims.enterpriseId
+  if (entId) {
+    headers['X-Enterprise-Id'] = entId
+    delete headers['X-No-Enterprise-Id']
+  } else {
+    headers['X-No-Enterprise-Id'] = '1'
+  }
+
+  let domain = accountTokenState?.domain || claims.domain
+  if (!domain && realm === 'global') {
+    domain = 'workbuddy.ai'
+  }
+  if (domain) {
+    headers['X-Domain'] = domain
+    delete headers['X-No-Department-Info']
+  } else {
+    headers['X-No-Department-Info'] = '1'
+  }
+
+  const devToken = accountTokenState?.device_token || cfg?.deviceToken
+  if (devToken) {
+    headers['X-Device-Token'] = devToken
+  }
+
+  delete headers['X-Refresh-Token']
+}
+

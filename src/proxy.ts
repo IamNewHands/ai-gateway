@@ -37,20 +37,29 @@ import { applyCachePrefixInjection } from './cache-prefix'
 import { getOauthAccessToken, readOauthToken, refreshOauthToken, detectTokenRealm, buildOauthHeaders } from './oauth'
 import {
   cooldownOauthAccount,
+  cooldownOauthAccountSoftForModel,
   cooldownOauthAccountUntilTomorrow4AM,
   disableOauthAccount,
   isOAuthPoolProvider,
   noteOauthError,
   noteOauthSuccess,
+  noteOauthSessionDead,
+  clearOauthSessionDead,
+  recordOauthModelCost,
   pickOauthAccount,
   refreshOauthPoolAccount,
   resolveOauthCooldown,
   seedOauthPoolFromSingle,
+  type OAuthPoolAccount,
 } from './oauth-pool'
 import {
   applyWorkbuddyReasoningEffort,
   captureWorkbuddyReasoningEffort,
   classifyWorkbuddyUpstreamError,
+  parseSoftRateReset,
+  injectDeepSeekThinking,
+  backfillReasoningContent,
+  injectWorkbuddyChatHeaders,
 } from './workbuddy-upstream'
 import {
   anthropicToOpenAI,
@@ -515,7 +524,11 @@ function cleanWorkbuddyChunk(chunk: string): string {
  * - 添加 X-Accel-Buffering: no 防止中间代理缓冲 SSE 流
  * - 保留上游的 Transfer-Encoding 相关行为（Workers 自动处理 chunked）
  */
-function passthroughResponse(response: Response, cleanFn?: (chunk: string) => string): Response {
+function passthroughResponse(
+  response: Response,
+  cleanFn?: (chunk: string) => string,
+  onLine?: (line: string) => void
+): Response {
   const headers: Record<string, string> = {
     'Cache-Control': 'no-store',
     'X-Accel-Buffering': 'no',
@@ -577,12 +590,14 @@ function passthroughResponse(response: Response, cleanFn?: (chunk: string) => st
         // 最后一行可能不完整，保留到缓冲区
         lineBuffer = lines.pop() || ''
         for (const line of lines) {
+          try { onLine?.(line) } catch { /* ignore */ }
           // 空行也要传递（SSE 事件分隔符），不能过滤
           await writer.write(line)
         }
       }
       // 流结束后，处理缓冲区中剩余的最后一行
       if (lineBuffer.trim()) {
+        try { onLine?.(lineBuffer) } catch { /* ignore */ }
         await writer.write(lineBuffer)
       }
     } catch { /* 流异常，忽略 */ }
@@ -1710,9 +1725,12 @@ async function proxyOAuthRequestPooledCore(
   search: string,
   forwardBody: object,
   method: string = c.req.method
-): Promise<{ response: Response; originalStream: boolean }> {
+): Promise<{ response: Response; originalStream: boolean; account?: OAuthPoolAccount }> {
   const cfg = provider.oauth!
   const cd = resolveOauthCooldown(provider)
+  const reqModel = typeof (forwardBody as Record<string, unknown>)?.['model'] === 'string'
+    ? (forwardBody as Record<string, unknown>)['model'] as string
+    : undefined
 
   // 兼容迁移：池空时把既有单 token 种子进池
   try { await seedOauthPoolFromSingle(c.env, provider.id) } catch { /* ignore */ }
@@ -1733,7 +1751,7 @@ async function proxyOAuthRequestPooledCore(
     return 'cn'
   }
 
-  const doFetch = (token: string, cookies: string | undefined, realm?: 'cn' | 'global') => {
+  const doFetch = (token: string, cookies: string | undefined, realm?: 'cn' | 'global', account?: OAuthPoolAccount) => {
     const r = realm || resolveRealm(token)
     const body = { ...forwardBody } as Record<string, unknown>
     // 捕获客户端原始 stream 意图（force 前），供非流式聚合判断
@@ -1750,21 +1768,28 @@ async function proxyOAuthRequestPooledCore(
         const model = typeof body['model'] === 'string' ? body['model'] : ''
         applyWorkbuddyReasoningEffort(body, capturedEffort, model ? effortPolicy?.[model] : undefined)
       }
+      // DeepSeek 思维链注入与历史消息一致性回填（对齐 workbuddy2api thinking.go）
+      injectDeepSeekThinking(body)
+      backfillReasoningContent(body)
+    }
+    const headers = buildOauthHeaders(cfg, token, { origin: buildOrigin(r), apiType: provider.apiType, cookies })
+    if (isWorkbuddyProvider(provider)) {
+      injectWorkbuddyChatHeaders(headers, token, r, account?.token, cfg)
     }
     return fetchUpstream(c.env, buildForwardUrl(r), {
       method,
-      headers: buildOauthHeaders(cfg, token, { origin: buildOrigin(r), apiType: provider.apiType, cookies }),
+      headers,
       body: method === 'GET' || method === 'HEAD' ? undefined : JSON.stringify(body),
     }, (body as Record<string, unknown>).stream === true || isWorkbuddyProvider(provider)).then(resp => ({ resp, originalStream }))
   }
 
-  const doFetchWithRetry = async (token: string, cookies: string | undefined, realm?: 'cn' | 'global') => {
-    let result = await doFetch(token, cookies, realm)
+  const doFetchWithRetry = async (token: string, cookies: string | undefined, realm?: 'cn' | 'global', account?: OAuthPoolAccount) => {
+    let result = await doFetch(token, cookies, realm, account)
     let transientRetries = 0
     while (isTransientStatus(result.resp.status) && transientRetries < TRANSIENT_RETRY_MAX) {
       transientRetries++
       await new Promise((r) => setTimeout(r, TRANSIENT_RETRY_DELAY_MS * transientRetries))
-      result = await doFetch(token, cookies, realm)
+      result = await doFetch(token, cookies, realm, account)
     }
     return result
   }
@@ -1775,7 +1800,7 @@ async function proxyOAuthRequestPooledCore(
   for (let i = 0; i < MAX_OAUTH_ROTATE; i++) {
     // 挑号（三因子加权随机）+ 全冷却兜底：无健康账号时从冷却账号选最早到期者顶班
     //（对齐 workbuddy2api pickEarliestExpiry；禁用与余额耗尽号永不参与兜底）
-    const account = await pickOauthAccount(c.env, provider.id, tried, i === 0 ? provider.preferOauthUid : undefined, { allowCoolingFallback: true })
+    const account = await pickOauthAccount(c.env, provider.id, tried, i === 0 ? provider.preferOauthUid : undefined, { allowCoolingFallback: true, reqModel })
     if (!account) break
     tried.add(account.uid)
 
@@ -1793,7 +1818,7 @@ async function proxyOAuthRequestPooledCore(
     }
 
     const primaryRealm = resolveRealm(token)
-    let { resp: response, originalStream } = await doFetchWithRetry(token, account.token.cookies)
+    let { resp: response, originalStream } = await doFetchWithRetry(token, account.token.cookies, undefined, account)
 
     // 401/403：先刷新一次（仍 401 则尝试备用域；再失败禁用换号）
     if (response.status === 401 || response.status === 403) {
@@ -1803,7 +1828,7 @@ async function proxyOAuthRequestPooledCore(
         if (refreshed) refreshedToken = refreshed.token.access_token
       }
       if (refreshedToken) {
-        const retry = await doFetchWithRetry(refreshedToken, account.token.cookies)
+        const retry = await doFetchWithRetry(refreshedToken, account.token.cookies, undefined, account)
         if (retry.resp.ok || retry.resp.status !== 401) {
           response = retry.resp
           originalStream = retry.originalStream
@@ -1813,7 +1838,7 @@ async function proxyOAuthRequestPooledCore(
       if (response.status === 401) {
         const alt = altRealm(primaryRealm)
         if (alt) {
-          const altResult = await doFetchWithRetry(refreshedToken || token, account.token.cookies, alt)
+          const altResult = await doFetchWithRetry(refreshedToken || token, account.token.cookies, alt, account)
           if (altResult.resp.ok || altResult.resp.status !== 401) {
             response = altResult.resp
             originalStream = altResult.originalStream
@@ -1834,6 +1859,13 @@ async function proxyOAuthRequestPooledCore(
           // 余额/权益耗尽 → 硬冷却到次日 04:00（等签到恢复，签到后 credits>0 自动解冻）
           await cooldownOauthAccountUntilTomorrow4AM(c.env, provider.id, account.uid, '余额不足')
           break
+        case 'model_rate': {
+          // 429 6004 模型级限流（切模型立即可用，对齐 workbuddy2api issue #31）
+          const resetAt = parseSoftRateReset(text)
+          const cdMs = resetAt ? Math.max(0, resetAt - Date.now()) : cd.softMs
+          await cooldownOauthAccountSoftForModel(c.env, provider.id, account.uid, reqModel || '', cdMs, '429 model rate limit (6004)')
+          break
+        }
         case 'soft_rate':
           // 429 限流 → 短冷却
           await cooldownOauthAccount(c.env, provider.id, account.uid, cd.softMs, '429 rate limit')
@@ -1843,13 +1875,16 @@ async function proxyOAuthRequestPooledCore(
           await cooldownOauthAccount(c.env, provider.id, account.uid, cd.softMs, 'upstream 404')
           break
         case 'session_dead':
-          // session 失效（12153/offline）→ 永久禁用，需重新登录
-          await disableOauthAccount(c.env, provider.id, account.uid, 'session dead (12153)')
+          // session 失效（12153/offline）→ 连续 3 次防抖：前 2 次短冷却，第 3 次永久禁用（对齐 workbuddy2api noteSessionDead）
+          await noteOauthSessionDead(c.env, provider.id, account.uid, cd)
           break
         case 'server':
           // 5xx 上游故障 → 累计错误计数（达阈值自动冷却）
           await noteOauthError(c.env, provider.id, account.uid, cd)
           break
+        case 'bad_params':
+        case 'content_blocked':
+        case 'client':
         default:
           // client（其他 4xx，如 400 参数错）：客户端请求问题，不处罚账号（防雪崩），仅换号
           break
@@ -1858,9 +1893,10 @@ async function proxyOAuthRequestPooledCore(
       continue
     }
 
-    // 成功：记账成功，返回原始上游响应
+    // 成功：记账成功，重置 session dead 计数，返回原始上游响应
     await noteOauthSuccess(c.env, provider.id, account.uid)
-    return { response, originalStream }
+    await clearOauthSessionDead(c.env, provider.id, account.uid)
+    return { response, originalStream, account }
   }
 
   throw new Error('no healthy account (cooling/disabled)' + (lastErr ? ': ' + lastErr.message : ''))
@@ -1877,11 +1913,23 @@ async function proxyOAuthRequestPooled(
 ): Promise<Response> {
   const model = (forwardBody as Record<string, unknown>).model as string
   try {
-    const { response, originalStream } = await proxyOAuthRequestPooledCore(c, provider, subPath, search, forwardBody, method)
+    const { response, originalStream, account } = await proxyOAuthRequestPooledCore(c, provider, subPath, search, forwardBody, method)
+    const uid = account?.uid || ''
     // WorkBuddy 非流式请求：收集 SSE 流并聚合成非流式 chat.completion 返回
     if (response.ok && originalStream !== true && isWorkbuddyProvider(provider) && response.body) {
       try {
         const aggregated = await aggregateWorkbuddySSE(response.body, model)
+        if (uid && model) {
+          try {
+            const parsedAgg = JSON.parse(aggregated)
+            if (parsedAgg.usage && typeof parsedAgg.usage.credit === 'number') {
+              const pt = typeof parsedAgg.usage.prompt_tokens === 'number' ? parsedAgg.usage.prompt_tokens : 0
+              const ct = typeof parsedAgg.usage.completion_tokens === 'number' ? parsedAgg.usage.completion_tokens : 0
+              const total = pt + ct
+              recordOauthModelCost(provider.id, uid, model, parsedAgg.usage.credit, total > 0 ? total : 1)
+            }
+          } catch { /* ignore parse error */ }
+        }
         logOAuthRequest(c, provider, model, subPath, forwardBody, 200)
         return new Response(aggregated, {
           status: 200,
@@ -1893,7 +1941,23 @@ async function proxyOAuthRequestPooled(
       }
     }
     logOAuthRequest(c, provider, model, subPath, forwardBody, response.status)
-    return passthroughResponse(response, cleanWorkbuddyChunk)
+    const onLine = (line: string) => {
+      if (uid && model && isWorkbuddyProvider(provider) && line.startsWith('data:') && line.includes('"usage"') && line.includes('"credit"')) {
+        try {
+          const chunkData = line.slice(5).trim()
+          if (chunkData && chunkData !== '[DONE]') {
+            const obj = JSON.parse(chunkData)
+            if (obj.usage && typeof obj.usage.credit === 'number') {
+              const pt = typeof obj.usage.prompt_tokens === 'number' ? obj.usage.prompt_tokens : 0
+              const ct = typeof obj.usage.completion_tokens === 'number' ? obj.usage.completion_tokens : 0
+              const total = pt + ct
+              recordOauthModelCost(provider.id, uid, model, obj.usage.credit, total > 0 ? total : 1)
+            }
+          }
+        } catch { /* ignore parse error */ }
+      }
+    }
+    return passthroughResponse(response, cleanWorkbuddyChunk, onLine)
   } catch (err) {
     logOAuthRequest(c, provider, model, subPath, forwardBody, 503)
     return c.json({
@@ -1960,10 +2024,17 @@ async function proxyOAuthRequest(
         const m = typeof body['model'] === 'string' ? body['model'] : ''
         applyWorkbuddyReasoningEffort(body, capturedEffort, m ? cfg.effortPolicy?.[m] : undefined)
       }
+      // DeepSeek 思维链注入与历史消息一致性回填
+      injectDeepSeekThinking(body)
+      backfillReasoningContent(body)
+    }
+    const headers = buildOauthHeaders(cfg, token, { origin: buildOrigin(r), apiType: provider.apiType, cookies: tokenState?.cookies })
+    if (isWorkbuddyProvider(provider)) {
+      injectWorkbuddyChatHeaders(headers, token, r, tokenState ? { uid: tokenState.uid, enterprise_id: tokenState.enterprise_id, domain: tokenState.domain, device_token: tokenState.device_token } : undefined, cfg)
     }
     return fetchUpstream(c.env, buildForwardUrl(r), {
       method,
-      headers: buildOauthHeaders(cfg, token, { origin: buildOrigin(r), apiType: provider.apiType, cookies: tokenState?.cookies }),
+      headers,
       body: method === 'GET' || method === 'HEAD' ? undefined : JSON.stringify(body),
     }, (body as Record<string, unknown>).stream === true || isWorkbuddyProvider(provider)).then(resp => ({ resp, originalStream }))
   }
@@ -2269,6 +2340,9 @@ export async function handleAnthropicMessages(c: Context<AppEnv>) {
           const m = typeof upstreamBody['model'] === 'string' ? upstreamBody['model'] : ''
           applyWorkbuddyReasoningEffort(upstreamBody, wbCapturedEffort, m ? provider.oauth?.effortPolicy?.[m] : undefined)
         }
+        // DeepSeek 思维链注入与历史消息一致性回填
+        injectDeepSeekThinking(upstreamBody)
+        backfillReasoningContent(upstreamBody)
       }
 
       // WorkBuddy 多账号池：browser 登录流提供商走池化转发（挑号 + 冷却/禁用 + 轮转）
@@ -2318,6 +2392,9 @@ export async function handleAnthropicMessages(c: Context<AppEnv>) {
           origin,
           cookies: tokenState.cookies,
         })
+        if (isWorkbuddyProvider(provider)) {
+          injectWorkbuddyChatHeaders(headers, tokenState.access_token, isGlobal ? 'global' : 'cn', { uid: tokenState.uid, enterprise_id: tokenState.enterprise_id, domain: tokenState.domain, device_token: tokenState.device_token }, cfg)
+        }
 
         response = await fetchUpstream(c.env, upstreamUrl, {
           method: 'POST',
@@ -2335,6 +2412,9 @@ export async function handleAnthropicMessages(c: Context<AppEnv>) {
                 origin,
                 cookies: freshState.cookies,
               })
+              if (isWorkbuddyProvider(provider)) {
+                injectWorkbuddyChatHeaders(retryHeaders, freshState.access_token, isGlobal ? 'global' : 'cn', { uid: freshState.uid, enterprise_id: freshState.enterprise_id, domain: freshState.domain, device_token: freshState.device_token }, cfg)
+              }
               response = await fetchUpstream(c.env, upstreamUrl, {
                 method: 'POST',
                 headers: retryHeaders,

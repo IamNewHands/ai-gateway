@@ -562,7 +562,7 @@ ${H('管理')}
                   <div class="fc mt-1 field-row"><button class="btn btn-s" onclick="oauthConnect('${escapePageJsx(p.id)}')"><i class="fas fa-plug" aria-hidden="true"></i>发起连接</button><button class="btn btn-gh" onclick="fetchOauthModels('${escapePageJsx(p.id)}')"><i class="fas fa-cloud-download-alt" aria-hidden="true"></i>获取模型</button><button class="btn btn-gh" onclick="oauthStatus('${escapePageJsx(p.id)}')"><i class="fas fa-sync" aria-hidden="true"></i>状态</button><button class="btn btn-gh" onclick="oauthDisconnect('${escapePageJsx(p.id)}')"><i class="fas fa-unlink" aria-hidden="true"></i>断开</button><span id="oauth-st-${escapePageHtml(p.id)}" class="oauth-status"></span></div>
                   ${(p.oauth&&p.oauth.flowType==='browser')?`
                   <fieldset class="form-group" id="wbp-fs-${escapePageHtml(p.id)}"><legend>WorkBuddy 多账号池</legend><span class="form-helper">浏览器登录流每次成功登录都会把该账号加入账号池（按 uid 去重，多登一个 = 多个账号）。转发按三因子加权自动挑选账号（积分 / 闲置补偿 / 成功率），429/404/余额耗尽/401 等按策略冷却或禁用并轮换其他账号；无健康账号时从冷却账号选最早到期者顶班；每日签到后积分恢复自动解冻。冷却参数留空 = 默认（plan 12h / 429 60s / 连续 5 次错误冷却 10m）。reasoning_effort 透传/降级支持档位在下方「模型」列表每行的「effort」下拉里配置。</span>
-                    <div class="fc mt-1 field-row"><button class="btn btn-s" onclick="oauthPoolStatus('${escapePageJsx(p.id)}')"><i class="fas fa-sync" aria-hidden="true"></i>刷新账号池</button><button class="btn btn-s" onclick="oauthConnect('${escapePageJsx(p.id)}')"><i class="fas fa-sign-in-alt" aria-hidden="true"></i>登录新账号</button><button class="btn btn-p" onclick="triggerCheckin('${escapePageJsx(p.id)}')"><i class="fas fa-calendar-check" aria-hidden="true"></i>立即签到</button><span id="wbp-st-${escapePageHtml(p.id)}" class="oauth-status"></span></div>
+                    <div class="fc mt-1 field-row" style="flex-wrap:wrap;gap:6px"><button class="btn btn-s" onclick="oauthPoolStatus('${escapePageJsx(p.id)}')"><i class="fas fa-sync" aria-hidden="true"></i>刷新账号池</button><button class="btn btn-s" onclick="oauthConnect('${escapePageJsx(p.id)}')"><i class="fas fa-sign-in-alt" aria-hidden="true"></i>登录新账号</button><button class="btn btn-p" onclick="triggerDailyTasks('${escapePageJsx(p.id)}')"><i class="fas fa-tasks" aria-hidden="true"></i>一键日常（签到+活跃+旅行）</button><button class="btn btn-gh btn-xs" onclick="triggerActivityReport('${escapePageJsx(p.id)}')"><i class="fas fa-comments" aria-hidden="true"></i>活跃上报</button><button class="btn btn-gh btn-xs" onclick="triggerCatTravel('${escapePageJsx(p.id)}')"><i class="fas fa-cat" aria-hidden="true"></i>猫猫旅行</button><span id="wbp-st-${escapePageHtml(p.id)}" class="oauth-status"></span></div>
                     <div id="wbp-acc-${escapePageHtml(p.id)}" class="mt-1"></div>
                     <div class="fc mt-1 field-row" style="gap:8px"><input type="number" id="cd-plan-${escapePageHtml(p.id)}" value="${p.cooldown&&p.cooldown.planMs?Math.round(p.cooldown.planMs/60000):''}" style="width:88px" placeholder="plan冷却(分)"><input type="number" id="cd-soft-${escapePageHtml(p.id)}" value="${p.cooldown&&p.cooldown.softMs?Math.round(p.cooldown.softMs/1000):''}" style="width:88px" placeholder="429冷却(秒)"><input type="number" id="cd-err-${escapePageHtml(p.id)}" value="${p.cooldown&&p.cooldown.errThreshold?p.cooldown.errThreshold:''}" style="width:76px" placeholder="错误阈值"><input type="number" id="cd-errms-${escapePageHtml(p.id)}" value="${p.cooldown&&p.cooldown.errMs?Math.round(p.cooldown.errMs/60000):''}" style="width:88px" placeholder="错误冷却(分)"><span class="mu" style="font-size:12px">冷却参数（保存后生效）</span></div>
                   </fieldset>`:''}
@@ -1883,6 +1883,26 @@ function renderOauthPoolAccounts(id, accs, ciByUid, ciByNick, ciAccounts, prefer
         : ' <span class="bd bd-danger">签到失败</span>'
       // 成功时 message 是纯状态文案（如「签到成功」）会与徽章重复，仅失败时展示错误原因
       if (ci.message && !ci.success) ciBadge += ' <span style="color:var(--muted)">' + escapeHtml(ci.message) + '</span>'
+      // 连登徽章
+      if (typeof ci.streakDays === 'number' && ci.streakDays > 0) {
+        ciBadge += ' <span class="bd bd-on" title="连续签到/活跃天数">🔥 连登 ' + ci.streakDays + ' 天</span>'
+      }
+      // 猫猫旅行徽章
+      if (ci.catTravel) {
+        const ct = ci.catTravel
+        let ctText = ''
+        if (ct.state === 'traveling') ctText = '🐱 旅行中'
+        else if (ct.state === 'claimed') ctText = '🐱 领奖+' + (ct.reward || '')
+        else if (ct.state === 'departed') ctText = '🐱 已出发'
+        else if (ct.state === 'adopted') ctText = '🐱 领养+300'
+        else if (ct.state === 'idle' || ct.state === 'idle_limit') ctText = '🐱 休息中'
+        else if (ct.state === 'error') ctText = '🐱 异常'
+        else if (ct.state) ctText = '🐱 ' + ct.state
+        if (ctText) {
+          const ctTip = ct.message ? ' title="' + escapeHtml(ct.message) + '"' : ''
+          ciBadge += ' <span class="bd bd-info"' + ctTip + '>' + escapeHtml(ctText) + '</span>'
+        }
+      }
     } else {
       ciBadge = ' <span class="bd bd-off">未签</span>'
     }
@@ -1919,7 +1939,12 @@ function renderOauthPoolAccounts(id, accs, ciByUid, ciByNick, ciAccounts, prefer
     if (isOff) coolDetail = a.reason ? '（' + escapeHtml(a.reason) + '）' : ''
     else if (a.cooling && a.until) coolDetail = ' 冷却至 ' + new Date(a.until).toLocaleString() + (a.reason ? '（' + escapeHtml(a.reason) + '）' : '')
     else if (a.reason) coolDetail = '（上次：' + escapeHtml(a.reason) + '）'
-    line += ' ' + coolBadge + '<span class="mu">' + coolDetail + '</span>'
+    let modelRateBadge = ''
+    if (a.softRateModel && a.softRateResetAt && a.softRateResetAt > Date.now()) {
+      const resetTimeStr = new Date(a.softRateResetAt).toLocaleTimeString()
+      modelRateBadge = ' <span class="bd bd-warn" title="模型 ' + escapeHtml(a.softRateModel) + ' 限流至 ' + resetTimeStr + '">模型限流(' + escapeHtml(a.softRateModel) + ')</span>'
+    }
+    line += ' ' + coolBadge + modelRateBadge + '<span class="mu">' + coolDetail + '</span>'
     return '<div class="fc mb-2 field-row" style="align-items:flex-start"><div class="fx1" style="font-size:12px;min-width:0"><div>' + line + ' ' + ciBadge + '</div>' + creditLine + pkgHtml + '</div><button class="btn btn-gh btn-xs" onclick="oauthPoolRemove(\\'' + escapeJsAttr(id) + '\\',\\'' + escapeJsAttr(a.uid) + '\\')"><i class="fas fa-trash" aria-hidden="true"></i>移除</button></div>'
   }).join('')
   // 绑定权益包折叠按钮（与签到区相同的 toggleCollapse 交互）
@@ -3369,6 +3394,60 @@ async function triggerCheckin(id) {
     }
   } catch(e) {
     toast('签到请求失败', 'error')
+  }
+}
+
+// ===== WorkBuddy 生态增值与日常任务客户端触发 =====
+async function triggerDailyTasks(id) {
+  toast('正在执行一键日常（签到+活跃+旅行）…', 'info')
+  try {
+    const r = await fetch('/admin/api/oauth/' + encodeURIComponent(id) + '/daily', { method: 'POST' })
+    const d = await r.json()
+    if (d.success) {
+      toast(d.message || '一键日常任务完成', 'success')
+      if (document.getElementById('wbp-st-' + id)) oauthPoolStatus(id)
+    } else {
+      toast(d.message || '日常任务执行失败', 'error')
+    }
+  } catch (e) {
+    toast('日常任务请求失败', 'error')
+  }
+}
+async function triggerActivityReport(id) {
+  toast('正在上报活跃度…', 'info')
+  try {
+    const r = await fetch('/admin/api/oauth/' + encodeURIComponent(id) + '/activity', { method: 'POST' })
+    const d = await r.json()
+    if (d.success) {
+      toast(d.message || '活跃度上报完成', 'success')
+      if (document.getElementById('wbp-st-' + id)) oauthPoolStatus(id)
+    } else {
+      toast(d.message || '活跃度上报失败', 'error')
+    }
+  } catch (e) {
+    toast('活跃度上报请求失败', 'error')
+  }
+}
+async function triggerCatTravel(id) {
+  toast('正在检查猫猫旅行…', 'info')
+  try {
+    const r = await fetch('/admin/api/oauth/' + encodeURIComponent(id) + '/travel', { method: 'POST' })
+    const d = await r.json()
+    if (d.success) {
+      var msg = d.message || '猫猫旅行巡检完成'
+      if (Array.isArray(d.data) && d.data.length > 0) {
+        var summary = d.data.map(function (item) {
+          return (item.nickname || item.uid) + ': ' + (item.message || item.state)
+        }).join('; ')
+        msg += ' (' + summary + ')'
+      }
+      toast(msg, 'success')
+      if (document.getElementById('wbp-st-' + id)) oauthPoolStatus(id)
+    } else {
+      toast(d.message || '猫猫旅行巡检失败', 'error')
+    }
+  } catch (e) {
+    toast('猫猫旅行请求失败', 'error')
   }
 }
 // 页面加载后初始化识图模型顺序序号（处理编辑表单预勾选的模型）

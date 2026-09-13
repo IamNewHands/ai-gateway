@@ -1,0 +1,784 @@
+#!/usr/bin/env python3
+"""school_open_day_2026 —— WorkBuddy/CodeBuddy 微信小程序「开学季活动」任务中心
+只读盘点 + 事件上报自动化脚本（默认只读，--run 才发写请求）。
+
+本脚本打通了小程序开学季任务中心 5 个任务中的 4 个非人工任务（2026-09-13 实测）。
+
+============================================================
+实测打通的任务与上报链路（2026-09-13，多账号实测验证）
+============================================================
+任务中心的完成判据分三类：
+
+【A 类：school 活动专属 HTTP 端点】（share_invite，纯 HTTP 诚实点亮）
+  - POST /portal/activity/school/tasks/share-complete   body {channel:"wechat"}
+    -> share_invite 0/1 -> completed 1/1（H5 bundle events/school-season-*.js 里
+       zs=(e="wechat")=>ge("/tasks/share-complete",{channel:e})）
+  - 任务需先 Pending 状态激活：POST /tasks/{code}/viewed（= H5「接任务」动作，
+    pending -> in_progress，H5 bundle Ht() 里 pending 先调 Ys=viewed 再跳转）
+  - 完成后领奖：POST /tasks/{code}/claim （completed -> claimed，发抽奖机会）
+  实测：2026-09-13 双账号 share_invite 均 claimed 1/1，
+        claim 返回 chance_granted:1。
+
+【B 类：/v2/report 事件 + activityId 限定】（chat_3_times / desktop_chat_1_time）
+  - 关键字段：事件必须带 activityId:"school_open_day_2026"（H5 bundle
+    activity_code=school_open_day_2026；不带则服务端不关联 school 任务）
+  - chat_3_times（与 AI 对话 3 次）：POST /v2/report 发一条 chat_request_send
+    事件，shape 必须是小程序域（source=mini_program / ideName=wx_app_cloud /
+    ideType=WorkBuddy_MP / extName=workbuddy-mp / extVersion=SaaS / mode=chat）
+    + activityId + userId（=账号 uid），一次事件 = 一次对话，逐条 +1。
+    实测：逐条上报 0->1->2->3 与批量 0->3 两种节奏均点亮 completed。
+  - desktop_chat_1_time（桌面端对话）：POST /v2/report 发【桌面指纹 6 连事件链】
+    （agent_task_created->chat_message_send->chat_request_send->chat_message_response
+    ->chat_message_status->chat_request_response，照抄 fork workbuddy2api-panel
+    desktop.go 的 DesktopChatSequence）+ 桌面指纹（ideName=WorkBuddy /
+    extName=workbuddy-desktop / os=win32 / machineId 稳定派生）+ activityId
+    + userId，发往 copilot 域 /v2/report。一次 6 连 = 一次桌面对话。
+    实测：双账号 0->1 均点亮 completed。
+  - 桌面指纹差异说明：与 chat_3_times 的 mini 形状相比，desktop 用
+    ideName=WorkBuddy + extName=workbuddy-desktop + os=win32 + arch=x64 +
+    osVersion=10.x + UA="WorkBuddy/5.5.6 CLI/2.137.1"，且发往 copilot
+    tencent.com 域（发向 codebuddy.cn 域不点亮，2026-09-13 实测）。
+    该指纹同时点亮 growth 域 RichMeow_Chat（M14 fork 吸收）。
+
+【C 类：/v2/report 的 expert_actual_use 事件 + BackToSchool 分类专家】（expert_use）
+  - expert_use（召唤开学季专家并对话，每日 1 次）：POST /v2/report 发一条
+    expert_actual_use 事件，id 必须用【BackToSchool 分类】下的 real 专家
+    （类别可用 /v2/operation-platform/market/expert/list 以 categories=["16-BackToSchool"]
+    动态拉取），加 conversationId（无需真实会话，服务端不校验真实性）、
+    activityId=school_open_day_2026、userId。
+    实测 2026-09-13：五个账号
+    全部 completed 1/1（含 ex_jB0dyFIQJEWa 论小舟 与 ex_lQjkerakvIex 英语
+    学习教练两个不同 BackToSchool 专家）。
+  - 【上轮失败的根因】上一轮踩坑用 ex_u62qHKzKqLtC（公益专家，不在
+    BackToSchool 分类）——expert_actual_use 全形状照发却恒 0/1。本轮对照
+    实验（2026-09-13）：同一事件形状、同 fake conversationId，仅把 expert id
+    换成 BackToSchool 分类的专家即点亮，换回公益专家又不亮。判定在
+    「expert id 是否属于 BackToSchool 分类」，与真实会话/多事件链无关。
+
+【未打通】
+  - task_student_verify（学生认证）：人工环节（微信学生认证/验证码/录取通知书
+    人工审核），--run 一律跳过。
+
+============================================================
+逆向依据（解包 ~/analysis/wxapp/wx907c65e5e107ddcf_unpacked/ +
+      H5 bundle https://download.codebuddy.cn/web/website/<hash>/assets/
+      events/school-season-CYeXjFHI.js）
+============================================================
+  1) 请求封装与鉴权头 —— app-service-1.js 模块 34049（export request=w）：
+       token 从本地存储读（模块 78982：TOKEN="codebuddy_token"）后
+       `D.Authorization="Bearer ".concat(N)`；仅企业账号再带 X-Enterprise-Id/
+       X-Tenant-Id。无 X-User-Id（但 /v2/report 需 X-User-Id 头与 body userId）。
+  2) 端点 —— 模块 79623 cloudAgentEndpoint="https://www.codebuddy.cn"：
+       任务中心    GET/POST {endpoint}/portal/activity/school/tasks
+                 POST {endpoint}/portal/activity/school/tasks/{code}/viewed（激活）
+                 POST {endpoint}/portal/activity/school/tasks/{code}/claim（领奖）
+                 POST {endpoint}/portal/activity/school/tasks/share-complete（分享完成）
+       学生认证    POST /portal/activity/school/student-verify  body {wx_studentcheck_code}
+       开学季福利  GET/POST /portal/activity/freshman/{profile|claim}
+       教师福利    GET/POST /portal/activity/teacher/{profile|claim}
+  3) 事件上报通道 POST /v2/report（模块 35192 z()，body=[事件对象]）：
+       - 小程序公共字段（模块 22015 wQ/Ao + 25439）：
+         {eventCode,timestamp,reportDelay,ideType:"WorkBuddy_MP",ideVersion,
+          extName:"workbuddy-mp",extVersion:"SaaS",machineId,os,osVersion,arch,
+          timezone,...,userId,userNickname}
+       - chat_request_send 形状（模块 86692 d()）：source=mini_program，
+         ideName=wx_app_cloud, mode, conversationId, requestId, inputLength,
+         mentionContexts, mentionContextCount, command, traceId。
+       - desktop 桌面指纹（fork desktop.go）：ideName=WorkBuddy/extName=
+         workbuddy-desktop/os=win32/arch=x64/osVersion/machineId 稳定派生。
+       - activityId 关联：chat_request_send 支持 activityId 字段（模块 86692
+         对有会话活动标记的会话附加 activityId）；school 活动 code=
+         school_open_day_2026（H5 bundle activity_code 常量）。
+  4) 任务中心 H5（school-season bundle）业务逻辑：kind 映射
+       Ns={task_student_verify:"student",desktop_chat_1_time:"desktop",
+           expert_use:"expert",chat_3_times:"chat",share_invite:"share"}；
+       无 chat/expert/desktop 完成专用端点（仅 share-complete），这三个任务
+       完成判据依赖真实客户端行为上报。
+  5) expert 事件源（小程序模块 62501，服务端计数判据侧）：
+       expert_summoned / expert_actual_use / expert_summon_click 三个事件，
+       均走 {cloudAgent}/v2/report。expert_actual_use 所需的 id 必须是
+       BackToSchool 分类专家 id（分类专家列表 API 见脚本 fetch_school_expert）。
+  6) 会话创建差异（本轮实验揭示）：/v2/as/conversations/ 的 agentId 必须是
+       内部合法 agent（普通用户不可伪造），但 expert 对象参数可创建会话——
+       对判据不是必需。判据只在事件侧，conversationId 无需真实（实测 fake
+       即可，服务端仅作关联锚点不校验）。
+
+风险提示
+  - 活动接口/任务集为服务端下发，随时可能变更；脚本按字段寻址，未知 task_code
+    保守跳过。
+  - share-complete/claim/viewed/event 上报均属写操作，可能触发频控/风控；写动作
+    默认间隔 ≥1s，实测间隔 2s 无异常。
+  - claim 会给账号加抽奖机会（chance_balance），属于真实收益，勿频繁重复。
+  - student-verify 需人工验证码产物（wx_studentcheck_code），脚本不碰、不伪造。
+"""
+import sys, os, json, time, hashlib, argparse, glob, urllib.request, urllib.error
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import task_common as tc  # 仅复用 load_auth / AUTHS 常量，不复用其 _headers（头不同源）
+
+# --------------------------------------------------------------------------
+# 常量（逆向：模块 79623 cloudAgentEndpoint + 模块 34049 请求封装 + H5 bundle）
+# --------------------------------------------------------------------------
+CLOUD_AGENT = "https://www.codebuddy.cn"          # getCloudAgentEndpoint()
+COPILOT     = "https://copilot.tencent.com"       # growth/chat 域（desktop 上报用）
+SCHOOL      = CLOUD_AGENT + "/portal/activity/school"
+FRESHMAN    = CLOUD_AGENT + "/portal/activity/freshman"
+TEACHER     = CLOUD_AGENT + "/portal/activity/teacher"
+
+# school 开学季活动 code（H5 bundle activity_code=school_open_day_2026）
+ACTIVITY_ID = "school_open_day_2026"
+
+# 小程序 UA 由微信原生注入；桌面 UA 来自 fork desktop.go（DesktopChatSequence 用）
+MP_UA = ("Mozilla/5.0 (Linux; Android 14; MicroMessenger/8.0.49 WeChat/0.8.0 "
+         "MiniProgramEnv/android; wkbrowser xweb)")
+DESKTOP_UA = "WorkBuddy/5.5.6 WorkBuddy/5.5.6 CLI/2.137.1"
+
+# 任务分类表（task_code -> 处理方式）。mode 语义：
+#   manual  人工环节（学生认证/验证码/审核），--run 一律跳过
+#   share   school 专属 HTTP 端点 share-complete 点亮（实测打通）
+#   report  /v2/report 事件上报点亮（实测打通：chat_3_times 用 mini chat 形状，
+#            desktop_chat_1_time 用桌面指纹 6 连，expert_use 用 BackToSchool
+#            专家 expert_actual_use）
+# 未在表内（服务端新增任务）保守按 unknown 跳过。
+KNOWN_TASKS = {
+    "task_student_verify": {"mode": "manual",  "note": "微信学生认证（人工，不碰）"},
+    "share_invite":        {"mode": "share",   "note": "分享活动给好友；share-complete 点亮（已实测）"},
+    "chat_3_times":        {"mode": "report",  "note": "与 AI 对话 3 次；mini chat_request_send+activityId 点亮（已实测）",
+                            "report_kind": "mini_chat"},
+    "desktop_chat_1_time": {"mode": "report",  "note": "桌面端对话 1 次；桌面指纹 6 连+activityId 点亮（已实测）",
+                            "report_kind": "desktop_seq"},
+    "expert_use":          {"mode": "report",  "note": "召唤开学季专家并对话；BackToSchool 分类专家 + expert_actual_use 点亮（已实测）",
+                            "report_kind": "expert"},
+}
+
+# 活动任务中心成功 code（模块 34049：code===0 成功）
+OK_CODES = (0,)
+
+
+class AuthError(RuntimeError):
+    """鉴权/未绑定微信类硬错误（不重试）。"""
+
+
+class TransientError(RuntimeError):
+    """网络/5xx 可重试错误。"""
+
+
+def derive_id(auth, salt):
+    """由 uid 稳定派生一个 36 位 hex 设备标识（桌面指纹 machineId 用，幂等）。"""
+    return hashlib.md5(f"{salt}:{auth['uid']}".encode()).hexdigest()[:36]
+
+
+def mask(token):
+    """脱敏 token，仅留首 8 位。"""
+    return (token[:8] + "...") if token else "(none)"
+
+
+def _build_headers(token, extra=None):
+    """组装小程序域请求头（Authorization Bearer + 可选 extra 覆盖）。"""
+    h = {
+        "Authorization": "Bearer " + token,
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+        "User-Agent": MP_UA,
+    }
+    if extra:
+        h.update(extra)
+    return h
+
+
+def _parse_response(status, raw_bytes):
+    try:
+        return status, json.loads(raw_bytes.decode("utf-8", "replace"))
+    except Exception:
+        return status, {"raw": raw_bytes.decode("utf-8", "replace")[:300]}
+
+
+def _request(token, method, url, body=None, headers=None, timeout=30):
+    data = json.dumps(body).encode() if body is not None else None
+    req = urllib.request.Request(url, data=data, headers=_build_headers(token, headers),
+                                 method=method)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return _parse_response(r.status, r.read())
+    except urllib.error.HTTPError as e:
+        return _parse_response(e.code, e.read())
+    except urllib.error.URLError as e:
+        raise TransientError(repr(e.reason))
+    except Exception as e:
+        raise TransientError(repr(e))
+
+
+def request_retry(token, method, url, body=None, headers=None, retries=3, gap=1.0):
+    last = None
+    for i in range(1, retries + 1):
+        try:
+            st, r = _request(token, method, url, body, headers)
+        except TransientError as e:
+            last = e
+            print(f"  [warn] 网络错误重试 {i}/{retries}: {e}")
+            if i < retries:
+                time.sleep(gap * i)
+            continue
+        if 500 <= st < 600 and i < retries:
+            last = TransientError(f"http {st}")
+            print(f"  [warn] 5xx={st} 重试 {i}/{retries}")
+            time.sleep(gap * i)
+            continue
+        return st, r
+    if last is not None:
+        raise last
+    return st, r
+
+
+def _interpret_failure(st, r):
+    code = r.get("code") if isinstance(r, dict) else None
+    msg = (r.get("message") or r.get("msg") or (r.get("raw") if r else "") or "") \
+        if isinstance(r, dict) else str(r)
+    if st == 401 or code in ("401", 401, "40100", 40100):
+        return f"401/40100 未绑微信或 token 失效（小程序会静默刷新，本脚本不刷新）", True
+    if st == 403:
+        return "403 forbidden", True
+    if st == 404:
+        return "404 路由不存在", False
+    if code in ("41000", 41000):
+        return "41000 活动未开始或已结束", False
+    if code in ("40901", 40901):
+        return "40901 任务暂不可领取（未完成或已领）", False
+    if code in ("83400", 83400):
+        return "83400 验证码已过期", False
+    if code in ("50300", 50300):
+        return "50300 学生认证服务暂不可用", False
+    return f"http={st} code={code} {str(msg)[:120]}", False
+
+
+# --------------------------------------------------------------------------
+# 只读盘点
+# --------------------------------------------------------------------------
+def fetch_school_tasks(token):
+    """GET /portal/activity/school/tasks -> (tasks, in_period)。只读。"""
+    st, r = request_retry(token, "GET", SCHOOL + "/tasks")
+    if st != 200 or (isinstance(r, dict) and r.get("code") not in OK_CODES):
+        msg, is_auth = _interpret_failure(st, r)
+        raise (AuthError if is_auth else RuntimeError)(f"school/tasks {msg}")
+    data = (r or {}).get("data") or {}
+    return data.get("tasks") or [], bool(data.get("in_period"))
+
+
+def fetch_profile(token, which):
+    base = FRESHMAN if which == "freshman" else TEACHER
+    st, r = request_retry(token, "GET", base + "/profile")
+    if st != 200 or (isinstance(r, dict) and r.get("code") not in OK_CODES):
+        msg, is_auth = _interpret_failure(st, r)
+        raise (AuthError if is_auth else RuntimeError)(f"{which}/profile {msg}")
+    return (r or {}).get("data") or None
+
+
+def list_account(auth, stats):
+    """只读盘点单个账号 + 实测打通状态标注。"""
+    uid8 = (auth.get("uid") or "")[:8] or "?"
+    print(f"== {uid8} ({auth.get('nick') or '-'}) ==")
+    try:
+        tasks, in_period = fetch_school_tasks(auth["token"])
+    except (AuthError, RuntimeError) as e:
+        print(f"[school2026] {uid8} school/tasks 拉取失败: {e}")
+        stats["fail"] += 1
+        tasks, in_period = [], False
+
+    print(f"[school2026] {uid8} school/tasks in_period={in_period} tasks={len(tasks)}")
+    for t in tasks:
+        code = t.get("task_code") or "?"
+        status = t.get("status") or "?"
+        prog = t.get("progress") or 0
+        target = t.get("target_count") or 1
+        kinds = {"single": "单次", "recurring": "每日"}.get(t.get("task_type"), t.get("task_type"))
+        spec = KNOWN_TASKS.get(code, {})
+        mode = spec.get("mode", "unknown")
+        reward = t.get("reward_credit") or 0
+        title = t.get("title") or ""
+        print(f"  - {code:<20} status={status:<10} {prog}/{target} reward={reward:>3} "
+              f"[{kinds}/{mode}] {title}")
+        desc = (t.get("description") or "").strip()
+        if desc:
+            print(f"      desc: {desc}")
+        if spec.get("note"):
+            print(f"      note: {spec['note']}")
+    if not tasks:
+        print("  (无任务 / 未登录或活动未开启)")
+
+    for which in ("freshman", "teacher"):
+        try:
+            d = fetch_profile(auth["token"], which)
+        except (AuthError, RuntimeError) as e:
+            print(f"[school2026] {uid8} {which}/profile 拉取失败: {e}")
+            stats["fail"] += 1
+            continue
+        if d is None:
+            print(f"[school2026] {uid8} {which}/profile -> 空")
+            continue
+        print(f"[school2026] {uid8} {which}/profile claimed={d.get('claimed')} "
+              f"enabled={d.get('enabled')}")
+    stats["accounts"] += 1
+
+
+# --------------------------------------------------------------------------
+# school 专属 HTTP 端点（实测打通动作）
+# --------------------------------------------------------------------------
+def post_viewed(token, code):
+    """POST /tasks/{code}/viewed —— H5「接任务」动作（pending -> in_progress）。
+    实测 2026-09-13：能激活 chat_3_times/desktop_chat_1_time/expert_use/share_invite。"""
+    st, r = request_retry(token, "POST", f"{SCHOOL}/tasks/{code}/viewed")
+    if st != 200 or (isinstance(r, dict) and r.get("code") not in OK_CODES):
+        msg, is_auth = _interpret_failure(st, r)
+        raise (AuthError if is_auth else RuntimeError)(f"viewed {code} {msg}")
+    return st, r
+
+
+def post_share_complete(token):
+    """POST /tasks/share-complete {channel:"wechat"} —— share_invite 完成判据。
+    实测 2026-09-13：分享 0/1 -> completed 1/1。"""
+    st, r = request_retry(token, "POST", f"{SCHOOL}/tasks/share-complete",
+                          {"channel": "wechat"})
+    if st != 200 or (isinstance(r, dict) and r.get("code") not in OK_CODES):
+        msg, is_auth = _interpret_failure(st, r)
+        raise (AuthError if is_auth else RuntimeError)(f"share-complete {msg}")
+    return st, r
+
+
+def post_claim(token, code):
+    """POST /tasks/{code}/claim —— 领奖（completed -> claimed）。
+    实测 2026-09-13：发抽奖机会 chance_granted:1；重复 claim 返回 40901。"""
+    st, r = request_retry(token, "POST", f"{SCHOOL}/tasks/{code}/claim")
+    if st != 200 or (isinstance(r, dict) and r.get("code") not in OK_CODES):
+        msg, is_auth = _interpret_failure(st, r)
+        raise (AuthError if is_auth else RuntimeError)(f"claim {code} {msg}")
+    return st, r
+
+
+# --------------------------------------------------------------------------
+# /v2/report 事件上报（实测打通形状）
+# --------------------------------------------------------------------------
+def report_events(auth, events, host=CLOUD_AGENT, extra_headers=None):
+    """POST {host}/v2/report，body=[event,...]。返回 (http_status, resp_dict)。"""
+    st, r = request_retry(auth["token"], "POST", host + "/v2/report", events,
+                          headers=extra_headers)
+    return st, r
+
+
+# --------------------------------------------------------------------------
+# school 开学季专家（BackToSchool 分类）——expert_use 判据载体
+# --------------------------------------------------------------------------
+SCHOOL_EXPERT_CATEGORY = "16-BackToSchool"   # 分类 id（带数字前缀，list API 不做归一化）
+SCHOOL_EXPERT_FALLBACK = {                    # 若分类专家列表拉取失败，回落已知实测专家
+    "ex_jB0dyFIQJEWa": {"name": "论小舟", "title": "论文写作导师"},
+    "ex_lQjkerakvIex": {"name": "英语学习教练", "title": "大学英语学习教练"},
+}
+
+
+def fetch_school_expert(token):
+    """拉取一个 BackToSchool 分类的真实开学季专家。
+
+    端点：POST {cloudAgent}/v2/operation-platform/market/expert/list
+      body {page:1,page_size:20,sort_by:"use_count",sort_order:"desc",
+            categories:["16-BackToSchool"],expert_type:"agent",
+            edition_mode:"all,domestic"}
+    返回 (expert_id, display_name, profession) 元组；列表空/失败回落已知专家。
+    2026-09-13 实测：该分类下 14 个专家，任一 expert_actual_use 均可点亮。"""
+    body = {"edition_mode": "all,domestic", "page": 1, "page_size": 20,
+            "sort_by": "use_count", "sort_order": "desc",
+            "categories": [SCHOOL_EXPERT_CATEGORY], "expert_type": "agent"}
+    try:
+        st, r = request_retry(token, "POST", CLOUD_AGENT + "/v2/operation-platform/market/expert/list", body)
+        if st != 200 or (isinstance(r, dict) and r.get("code") not in OK_CODES):
+            raise RuntimeError(f"expert/list {r.get('code') if isinstance(r, dict) else r}")
+        exps = ((r or {}).get("data", {}) or {}).get("experts") or []
+        for e in exps:
+            eid = e.get("expert_id")
+            if not eid:
+                continue
+            _dn = e.get("display_name_zh") or {}
+            dn = (_dn.get("zh") if isinstance(_dn, dict) else _dn) or eid
+            _pf = e.get("profession_zh") or {}
+            pf = (_pf.get("zh") if isinstance(_pf, dict) else _pf) or ""
+            return eid, dn, pf
+    except (AuthError, RuntimeError) as e:
+        print(f"  [warn] 拉取 BackToSchool 专家失败，回落已知专家: {e}")
+    for eid, info in SCHOOL_EXPERT_FALLBACK.items():
+        return eid, info["name"], info["title"]
+    raise RuntimeError("无可用开学季专家")
+
+
+def expert_actual_use_event(auth, expert_id, expert_name, conversation_id):
+    """expert_actual_use 事件（点亮 expert_use）。
+
+    形状照抄小程序模块 62501 u()（id/name/expertTitle/type/characterCount/
+    expertType）+ 小程序公共字段（模块 22015 wQ/Ao）+ 必须 activityId +
+    conversationId（fake 即可，服务端不校验真实性）。"""
+    now = int(time.time() * 1000)
+    return {
+        "eventCode": "expert_actual_use", "timestamp": now, "reportDelay": 0,
+        "source": "mini_program", "ideName": "wx_app_cloud", "ideType": "WorkBuddy_MP",
+        "extName": "workbuddy-mp", "extVersion": "SaaS",
+        "machineId": derive_id(auth, "machine"), "os": "android", "osVersion": "14",
+        "arch": "arm64", "timezone": "Asia/Shanghai",
+        "userId": auth["uid"], "userNickname": auth.get("nick", ""),
+        "id": expert_id, "name": expert_id, "expertTitle": expert_name,
+        "type": "send_message", "characterCount": 12, "expertType": "agent",
+        "conversationId": conversation_id,
+        "activityId": ACTIVITY_ID,
+    }
+
+
+def make_expert_event(auth):
+    """构造一条 expert_actual_use 上报。返回 (events, host, extra_headers)。"""
+    eid, name, _ = fetch_school_expert(auth["token"])
+    conv = f"wbexp-{int(time.time() * 1000)}"
+    return [expert_actual_use_event(auth, eid, name, conv)], CLOUD_AGENT, None
+
+
+def mini_chat_event(auth, conversation_id):
+    """小程序域 chat_request_send 事件（点亮 chat_3_times）。
+    形状照抄模块 86692 d() + 必须 activityId=school_open_day_2026（实测关键）。"""
+    now = int(time.time() * 1000)
+    return {
+        "eventCode": "chat_request_send", "timestamp": now, "reportDelay": 0,
+        "source": "mini_program", "ideName": "wx_app_cloud", "ideType": "WorkBuddy_MP",
+        "extName": "workbuddy-mp", "extVersion": "SaaS", "mode": "chat",
+        "conversationId": conversation_id, "requestId": conversation_id,
+        "inputLength": 12,
+        "activityId": ACTIVITY_ID, "mentionContexts": [], "mentionContextCount": 0,
+        "userId": auth["uid"],
+    }
+
+
+def desktop_fingerprint(auth):
+    """桌面指纹（fork desktop.go）：注入每个桌面事件。与 mini 形状的差异：
+    ideName=WorkBuddy / extName=workbuddy-desktop / os=win32 / arch=x64 /
+    osVersion=10.0.26220 / machineId/sessionId 稳定派生。"""
+    now = int(time.time() * 1000)
+    return {
+        "timezone": "Asia/Shanghai", "reportDelay": 2000,
+        "userId": auth["uid"], "username": auth.get("nick", ""),
+        "userNickname": auth.get("nick", ""),
+        "product": "SaaS", "releaseDate": 1789036585355,
+        "commit": "5f9692923c93033111c51ad7b003eb80204a9b75",
+        "ideName": "WorkBuddy", "ideType": "WorkBuddy", "ideVersion": "5.5.6",
+        "machineId": derive_id(auth, "machine"), "sessionId": derive_id(auth, "session"),
+        "extName": "workbuddy-desktop", "extVersion": "5.5.6",
+        "os": "win32", "arch": "x64", "osVersion": "10.0.26220",
+        "cpuCores": 20, "memorySize": 24,
+        "timestamp": now, "presentAt": now,
+    }
+
+
+def desktop_chat_sequence(auth, conversation_id, request_id, message_id):
+    """桌面端成功对话 6 连事件链（fork DesktopChatSequence）：
+    agent_task_created -> chat_message_send -> chat_request_send ->
+    chat_message_response -> chat_message_status -> chat_request_response。
+    必须整体上报（一次 6 连 = 一次桌面对话）+ activityId。"""
+    now = int(time.time() * 1000)
+    ev = []
+
+    def mk(code, extra):
+        e = {"eventCode": code}
+        e.update(extra)
+        ev.append(e)
+
+    mk("agent_task_created", {
+        "source": "LOCAL", "name": "working", "task_target": "local", "mode": "craft",
+        "requestModelId": "fast-model", "requestModelName": "fast-model",
+        "has_repo": False, "repo_type": "none", "workspace_type": "empty",
+        "has_connector": False, "connector_types": [],
+        "has_mention": False, "mention_types": [],
+        "has_template": False, "action": "", "template_name": "",
+        "has_expert": False, "expert_id": "", "expert_name": "", "expert_industry_id": "",
+        "has_skill": False, "skill_names": [],
+        "conversationId": conversation_id, "messageId": message_id,
+        "buddyId": "", "buddyName": "",
+    })
+    mk("chat_message_send", {
+        "messageId": message_id + "-assistant", "historyCount": 0,
+        "isContextTruncated": False, "currentStepCount": 1,
+        "traceId": request_id, "rootRequestId": request_id,
+        "parentConversationId": conversation_id,
+        "agentName": "cli", "agentType": "main",
+    })
+    mk("chat_request_send", {
+        "inputLength": 24, "isPlan": False, "isAutoExecuteTerminal": False,
+        "isAutoModify": False, "codebaseEnable": False, "maxToken": 0,
+        "maxSteps": 500, "temperature": 0, "maxRetries": 0,
+        "mentionContexts": [], "knowledgeId": [], "knowledgeName": [],
+        "codebaseId": "", "mentionContextCount": 0, "command": "",
+        "recommendId": "", "skillId": "", "skillCount": 0, "totalCount": 0,
+        "traceId": request_id, "rootRequestId": request_id,
+        "parentConversationId": conversation_id,
+        "agentName": "cli", "agentType": "main",
+        "codebuddy.session_id": conversation_id,
+        "codebuddy.conversation_request_id": request_id,
+    })
+    mk("chat_message_response", {
+        "messageId": message_id + "-assistant", "responseModelId": "fast-model",
+        "inputToken": 120, "outputToken": 80, "totalToken": 200,
+        "cachedTokens": 0, "cachedWriteTokens": 0, "cachedMissTokens": 0,
+        "isSuccessful": True, "messageErrorCode": "", "finishReason": "stop",
+        "firstTokenAt": now, "traceId": request_id,
+        "conversationId": conversation_id,
+        "rootRequestId": request_id, "parentConversationId": conversation_id,
+        "agentName": "cli", "agentType": "main",
+        "codebuddy.session_id": conversation_id,
+        "codebuddy.conversation_request_id": request_id,
+    })
+    mk("chat_message_status", {
+        "messageId": message_id + "-assistant", "messageErrorCode": "0",
+        "traceId": request_id, "rootRequestId": request_id,
+        "parentConversationId": conversation_id,
+        "agentName": "cli", "agentType": "main",
+    })
+    mk("chat_request_response", {
+        "mode": "craft", "toolCallCount": 0,
+        "inputToken": 120, "outputToken": 80, "totalToken": 200,
+        "cachedTokens": 0, "cachedWriteTokens": 0, "cachedMissTokens": 0,
+        "isSuccessful": True, "messageErrorCode": "", "finishReason": "stop",
+        "rootRequestId": request_id, "parentConversationId": conversation_id,
+    })
+    return ev
+
+
+def make_report_events(auth, kind):
+    """按任务 kind 构造上报事件数组（含 activityId）。返回 (events, host)。"""
+    now = int(time.time() * 1000)
+    if kind == "mini_chat":
+        return [mini_chat_event(auth, f"wbmp-{now}")], CLOUD_AGENT, None
+    if kind == "expert":
+        return make_expert_event(auth)
+    if kind == "desktop_seq":
+        conv = f"wbdesk-{now}"
+        seq = desktop_chat_sequence(auth, conv, conv, conv)
+        fp = desktop_fingerprint(auth)
+        events = []
+        for e in seq:
+            m = dict(e)
+            m.update(fp)
+            m["activityId"] = ACTIVITY_ID
+            events.append(m)
+        # 桌面上报走 copilot 域（实测：发 codebuddy.cn 域不点亮桌面任务）
+        return events, COPILOT, {"X-Product": "SaaS", "User-Agent": DESKTOP_UA}
+    raise ValueError(f"未知 report_kind: {kind}")
+
+
+# --------------------------------------------------------------------------
+# 执行模式
+# --------------------------------------------------------------------------
+def run_account(auth, opts, stats):
+    """--run：viewed 激活 -> 执行判据（share-complete/report 事件）-> 轮询 -> claim。"""
+    uid8 = (auth.get("uid") or "")[:8] or "?"
+    stats["accounts"] += 1
+    try:
+        tasks, in_period = fetch_school_tasks(auth["token"])
+    except (AuthError, RuntimeError) as e:
+        print(f"[school2026] {uid8} run 拉取任务失败: {e}")
+        stats["fail"] += 1
+        return
+    if not in_period:
+        print(f"[school2026] {uid8} 活动非进行期（in_period=false），跳过")
+        return
+
+    by_code = {t.get("task_code"): t for t in tasks}
+
+    def refetch(code):
+        try:
+            ts, _ = fetch_school_tasks(auth["token"])
+            return next((x for x in ts if x.get("task_code") == code), None)
+        except (AuthError, RuntimeError):
+            return None
+
+    for t in tasks:
+        code = t.get("task_code") or "?"
+        status = (t.get("status") or "?").lower()
+        spec = KNOWN_TASKS.get(code, {})
+        mode = spec.get("mode", "unknown")
+
+        if not t.get("task_code"):
+            continue
+        if status in ("completed", "claimed"):
+            print(f"[school2026] {uid8} {code}: {status} 已完成/已领，跳过")
+            stats["already"] += 1
+            continue
+        if mode == "manual":
+            print(f"[school2026] {uid8} {code}: {status} -> 人工环节（{spec.get('note')}），跳过")
+            stats["skip"] += 1
+        elif mode in ("share", "report"):
+            if not opts.yes:
+                print(f"[school2026] {uid8} {code}: {status} -> {mode} 动作（dry-run 不写）")
+                stats["pending"] += 1
+                continue
+            # 1) pending -> viewed 激活（接单，H5 行为）
+            if status == "pending":
+                try:
+                    post_viewed(auth["token"], code)
+                except (AuthError, RuntimeError) as e:
+                    print(f"[school2026] {uid8} {code}: viewed 激活失败: {e}")
+                    stats["fail"] += 1
+                    continue
+                print(f"[school2026] {uid8} {code}: viewed 激活 pending->in_progress")
+                time.sleep(opts.gap)
+            # 2) 触发完成判据。share 一次即完成；report 按 target-当前进度 循环触发
+            #    （每次事件独立 +1，实测 chat_3_times / desktop_chat_1_time 各次计数）。
+            cur_prog = t.get("progress") or 0
+            if mode == "share":
+                rounds = 1
+            elif spec.get("report_kind") == "desktop_seq":
+                rounds = 1  # 桌面 6 连一次 = 一次桌面对话；6 连内已有完整链
+            else:
+                rounds = max(1, (t.get("target_count") or 1) - cur_prog)
+            progress_changed = False
+            for ri in range(rounds):
+                try:
+                    if mode == "share":
+                        st, r = post_share_complete(auth["token"])
+                        print(f"[school2026] {uid8} {code}: share-complete {st} "
+                              f"code={r.get('code') if isinstance(r, dict) else r}")
+                    else:
+                        events, host, extra_h = make_report_events(auth, spec.get("report_kind"))
+                        st, r = report_events(auth, events, host=host, extra_headers=extra_h)
+                        print(f"[school2026] {uid8} {code}: report #{ri+1}/{rounds} "
+                              f"{len(events)} 事件 -> http={st} "
+                              f"code={r.get('code') if isinstance(r, dict) else r}")
+                except (AuthError, RuntimeError) as e:
+                    print(f"[school2026] {uid8} {code}: {mode} 触发 #{ri+1} 失败: {e}")
+                    break
+                time.sleep(opts.gap)
+                # 每轮回读一次，判断是否已到 target/completed，提早终止
+                t2 = refetch(code)
+                if not t2:
+                    continue
+                after_prog = t2.get("progress") or 0
+                after = (t2.get("status") or "?").lower()
+                if after_prog > cur_prog:
+                    cur_prog = after_prog
+                    progress_changed = True
+                if after in ("completed", "claimed") or after_prog >= (t.get("target_count") or 1):
+                    break
+            # 3) 最终回读确认
+            t2 = refetch(code)
+            if not t2:
+                print(f"[school2026] {uid8} {code}: 回读任务失败，跳过")
+                stats["fail"] += 1
+                continue
+            after = (t2.get("status") or "?").lower()
+            after_prog = t2.get("progress") or 0
+            if after in ("completed", "claimed") or progress_changed:
+                print(f"[school2026] {uid8} {code}: {status}/{t.get('progress')} -> "
+                      f"{after}/{after_prog}（点亮）")
+                stats["ok"] += 1
+            else:
+                print(f"[school2026] {uid8} {code}: {status} -> {after}（未变化）")
+                stats["pending"] += 1
+            # 4) 若 completed，claim 领奖（chance_granted）
+            if after == "completed":
+                try:
+                    stc, rc = post_claim(auth["token"], code)
+                    print(f"[school2026] {uid8} {code}: claim {stc} "
+                          f"code={rc.get('code') if isinstance(rc, dict) else rc}")
+                    time.sleep(opts.gap)
+                except (AuthError, RuntimeError) as e:
+                    print(f"[school2026] {uid8} {code}: claim 失败: {e}（可稍后手动补领）")
+                    stats["fail"] += 1
+        else:  # unknown
+            print(f"[school2026] {uid8} {code}: {status} -> 未知任务类型（{t.get('title') or ''}），"
+                  f"无分类证据，保守跳过")
+            stats["skip"] += 1
+
+
+def print_notes():
+    """打印实测状态与未打通说明（对应脚本头部注释，不编造）。"""
+    print("")
+    print("[school2026] 实测打通状态（2026-09-13，五账号验证）：")
+    for line in [
+        "1. share_invite      已点亮并领取（POST /tasks/share-complete {channel:wechat}）",
+        "2. chat_3_times      已点亮并领取（mini chat_request_send + activityId=school_open_day_2026）",
+        "3. desktop_chat_1_time 已点亮并领取（桌面指纹 6 连 + activityId，copilot 域）",
+        "4. expert_use        已点亮并领取（BackToSchool 分类专家 + expert_actual_use + activityId。",
+        "                     突破点：上轮用公益专家 ex_u62qHKzKqLtC 恒 0/1，本轮换用",
+        "                     BackToSchool 专家 ex_jB0dyFIQJEWa/ex_lQjkerakvIex 即点亮，",
+        "                     判据=expert id 必须属于 BackToSchool 分类，无需真实会话）",
+        "5. task_student_verify 人工环节（学生认证），--run 跳过",
+    ]:
+        print("    " + line)
+
+
+def main():
+    ap = argparse.ArgumentParser(description="小程序开学季任务中心：只读盘点 + 事件上报自动化")
+    ap.add_argument("accounts", nargs="*", help="uid 前缀（可多个）或 ALL；--token 时可不传")
+    ap.add_argument("--list", action="store_true", help="只读盘点（默认行为）")
+    ap.add_argument("--run", action="store_true", help="执行上报/领取动作（需 --yes 放行真实写）")
+    ap.add_argument("--yes", action="store_true", help="放行写操作（配合 --run）")
+    ap.add_argument("--token", default=None, help="显式覆盖 token（不同源凭证逃生门）")
+    ap.add_argument("--uid", default="", help="配合 --token 指定 uid（仅日志用）")
+    ap.add_argument("--gap", type=float, default=1.5, help="写动作间隔秒数（默认 1.5，最小 1.0）")
+    a = ap.parse_args()
+
+    if a.gap < 1.0:
+        a.gap = 1.0  # 写操作间隔 ≥1s
+
+    stats = {"accounts": 0, "ok": 0, "already": 0, "skip": 0,
+             "pending": 0, "fail": 0}
+
+    run_mode = bool(a.run)
+    mode = "RUN" if run_mode else "LIST"
+    if run_mode and not a.yes:
+        print(f"mode={mode} dry-run（写操作需 --yes 放行；--run 不带 --yes 只打印将发送的动作）")
+    else:
+        print(f"mode={mode} {'REAL' if a.yes else ''} gap={a.gap}")
+
+    auths = []
+    if a.token:
+        auths.append({"token": a.token, "uid": a.uid or "", "nick": "--token--", "file": "<cli>"})
+    else:
+        prefixes = []
+        if not a.accounts or (len(a.accounts) == 1 and a.accounts[0].upper() == "ALL"):
+            pattern1 = os.path.join(tc.AUTHS, "workbuddy-*.json")
+            pattern2 = os.path.join(tc.AUTHS, "*.json")
+            files = sorted(glob.glob(pattern1)) or sorted(glob.glob(pattern2))
+            for p in files:
+                base = os.path.basename(p)
+                if base.startswith("workbuddy-"):
+                    prefixes.append(base[10:].replace(".json", ""))
+                else:
+                    prefixes.append(base.replace(".json", ""))
+        else:
+            prefixes = a.accounts
+        seen, prefixes2 = set(), []
+        for p in prefixes:
+            if p not in seen:
+                seen.add(p)
+                prefixes2.append(p)
+        for p in prefixes2:
+            try:
+                auths.append(tc.load_auth(p))
+            except SystemExit as e:
+                print(f"ERR: {e}")
+
+    if not auths:
+        print("ERR: 无可用账号（检查 auths/ 或 --token）")
+        sys.exit(1)
+
+    for auth in auths:
+        try:
+            if run_mode:
+                run_account(auth, a, stats)
+            else:
+                list_account(auth, stats)
+        except (AuthError, RuntimeError) as e:
+            uid8 = (auth.get("uid") or "")[:8] or "?"
+            print(f"ERR: [school2026] {uid8} 处理失败: {e}")
+            stats["fail"] += 1
+
+    print(f"school2026 done: accounts={stats['accounts']} ok={stats['ok']} "
+          f"already={stats['already']} skipped={stats['skip']} pending={stats['pending']} "
+          f"fail={stats['fail']}")
+    print_notes()
+    sys.exit(2 if stats["fail"] > 0 else 0)
+
+
+if __name__ == "__main__":
+    main()

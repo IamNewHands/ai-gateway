@@ -9,6 +9,7 @@ import {
   isDeepSeekModel,
   injectDeepSeekThinking,
   backfillReasoningContent,
+  injectWorkbuddyChatHeaders,
 } from './workbuddy-upstream'
 
 describe('classifyWorkbuddyUpstreamError 错误分类（移植 workbuddy2api Classify）', () => {
@@ -262,3 +263,44 @@ describe('DeepSeek 思维链注入与历史消息回填（移植 workbuddy2api t
     expect(msgs[3].reasoning_content).toBe('')
   })
 })
+
+describe('WorkBuddy 归属头与身份头注入 injectWorkbuddyChatHeaders', () => {
+  it('注入四项归属头 + UID / EnterpriseID / Domain / DeviceToken', () => {
+    const headers: Record<string, string> = {}
+    const dummyToken = 'eyJhbGciOiJIUzI1NiJ9.eyJ1aWQiOiJ1MTIzIiwiZW50ZXJwcmlzZV9pZCI6ImUxMjMiLCJkb21haW4iOiJleGFtcGxlLmNvbSIsIm5pY2tuYW1lIjoidGVzdHVzZXIifQ.sig'
+    injectWorkbuddyChatHeaders(headers, dummyToken, 'cn', {
+      device_token: 'dt-abc-123',
+    })
+
+    expect(headers['X-Agent-Purpose']).toBe('conversation')
+    expect(headers['X-IDE-Name']).toBe('WorkBuddy')
+    expect(headers['X-IDE-Type']).toBe('WorkBuddy')
+    expect(headers['X-IDE-Version']).toBe('2.63.2')
+    expect(headers['X-Product']).toBe('WorkBuddy')
+    expect(headers['X-User-Id']).toBe('u123')
+    expect(headers['X-Enterprise-Id']).toBe('e123')
+    expect(headers['X-Domain']).toBe('example.com')
+    expect(headers['X-Device-Token']).toBe('dt-abc-123')
+    expect(headers['X-Refresh-Token']).toBeUndefined()
+  })
+
+  it('缺失信息时正确降级为 X-No-* 头并清除敏感 refresh token', () => {
+    const headers: Record<string, string> = { 'X-Refresh-Token': 'leak-me' }
+    injectWorkbuddyChatHeaders(headers, 'invalid-token', 'cn')
+
+    expect(headers['X-Agent-Purpose']).toBe('conversation')
+    expect(headers['X-No-User-Id']).toBe('1')
+    expect(headers['X-No-Enterprise-Id']).toBe('1')
+    expect(headers['X-No-Department-Info']).toBe('1')
+    expect(headers['X-Refresh-Token']).toBeUndefined()
+  })
+
+  it('Global 域默认回落 X-Domain: workbuddy.ai', () => {
+    const headers: Record<string, string> = {}
+    injectWorkbuddyChatHeaders(headers, 'invalid-token', 'global')
+
+    expect(headers['X-Domain']).toBe('workbuddy.ai')
+    expect(headers['X-No-Department-Info']).toBeUndefined()
+  })
+})
+

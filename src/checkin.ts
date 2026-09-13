@@ -49,6 +49,9 @@ import {
   decodeWorkbuddyClaims,
   fetchWorkbuddyCredits,
   fetchWorkbuddyPaymentType,
+  reportWorkbuddyChatActivity,
+  fetchWorkbuddyStreak,
+  runWorkbuddyCatTravel,
 } from './workbuddy-billing'
 import { queryUsageOverview } from './analytics/query'
 
@@ -431,19 +434,39 @@ async function checkinOauthPoolAccount(
       base.reason = 'already'
       base.message = '今日已签到'
       base.lastCheckinAt = now
-      await fillCredits(env, base, token, 'cn', uid, enterpriseId)
-      await syncPoolCredits(env, provider, account, base)
-      return base
     }
   }
 
-  // 执行签到
-  const res = await performCheckin(token, 'cn', env)
-  base.success = res.success
-  base.message = res.message
-  base.reason = res.success ? 'ok' : 'fail'
-  base.lastCheckinAt = now
-  if (res.success) base.todayCheckedIn = true
+  // 未签到则执行签到
+  if (!base.todayCheckedIn) {
+    const res = await performCheckin(token, 'cn', env)
+    base.success = res.success
+    base.message = res.message
+    base.reason = res.success ? 'ok' : 'fail'
+    base.lastCheckinAt = now
+    if (res.success) base.todayCheckedIn = true
+  }
+
+  // 生态增值与自动化任务（P2）：活跃上报（点亮连登/领猫门槛） + 回读 streak + 猫猫旅行
+  const devToken = account.token?.device_token || provider.oauth?.deviceToken
+  try {
+    const act = await reportWorkbuddyChatActivity(token, 'cn', uid, { enterpriseId, deviceToken: devToken, count: 5 })
+    base.activityReport = { success: act.success, message: act.message }
+  } catch (e) {
+    base.activityReport = { success: false, message: (e as Error).message }
+  }
+
+  try {
+    const streak = await fetchWorkbuddyStreak(token, 'cn', { uid, enterpriseId, deviceToken: devToken })
+    if (typeof streak === 'number') base.streakDays = streak
+  } catch { /* ignore */ }
+
+  try {
+    const travel = await runWorkbuddyCatTravel(token, 'cn', uid, { enterpriseId, deviceToken: devToken })
+    base.catTravel = travel
+  } catch (e) {
+    base.catTravel = { state: 'error', message: (e as Error).message }
+  }
 
   // 额度信息 + 解冻（签到就是为了解冻冷却账号，对齐 workbuddy-wild ReenableIfCredits）
   await fillCredits(env, base, token, 'cn', uid, enterpriseId)
@@ -587,31 +610,41 @@ export async function checkinOneAccount(env: Env, provider: Provider): Promise<C
       base.reason = 'already'
       base.message = '今日已签到'
       base.lastCheckinAt = now
-      await fillCredits(env, base, token, 'cn', uid, enterpriseId)
-      await writeCheckinResult(env, provider.id, base)
-      return base
     }
   }
 
   // 执行签到
-  const res = await performCheckin(token, 'cn', env)
-  base.success = res.success
-  base.message = res.message
-  base.reason = res.success ? 'ok' : 'fail'
-  base.lastCheckinAt = now
-  if (res.success) base.todayCheckedIn = true
-  // 本次签到获得积分（daily-checkin 返回 data.credit）
-  if (res.success && res.reward && typeof (res.reward as any).credit === 'number') {
-    base.checkinCredit = (res.reward as any).credit
+  if (!base.todayCheckedIn) {
+    const res = await performCheckin(token, 'cn', env)
+    base.success = res.success
+    base.message = res.message
+    base.reason = res.success ? 'ok' : 'fail'
+    base.lastCheckinAt = now
+    if (res.success) base.todayCheckedIn = true
+    if (res.success && res.reward && typeof (res.reward as any).credit === 'number') {
+      base.checkinCredit = (res.reward as any).credit
+    }
   }
 
-  // 签到后刷新一次状态拿最新积分
-  const status2 = await fetchCheckinStatus(token, 'cn')
-  if (status2) {
-    base.todayCheckedIn = status2.todayCheckedIn
-    base.streakDays = status2.streakDays
-    base.totalCredits = status2.totalCredits
-    base.dailyCredit = status2.dailyCredit
+  // 生态增值与自动化任务（P2）：活跃上报 + streak 回读 + 猫猫旅行
+  const devToken = provider.oauth?.deviceToken
+  try {
+    const act = await reportWorkbuddyChatActivity(token, 'cn', uid, { enterpriseId, deviceToken: devToken, count: 5 })
+    base.activityReport = { success: act.success, message: act.message }
+  } catch (e) {
+    base.activityReport = { success: false, message: (e as Error).message }
+  }
+
+  try {
+    const streak = await fetchWorkbuddyStreak(token, 'cn', { uid, enterpriseId, deviceToken: devToken })
+    if (typeof streak === 'number') base.streakDays = streak
+  } catch { /* ignore */ }
+
+  try {
+    const travel = await runWorkbuddyCatTravel(token, 'cn', uid, { enterpriseId, deviceToken: devToken })
+    base.catTravel = travel
+  } catch (e) {
+    base.catTravel = { state: 'error', message: (e as Error).message }
   }
 
   // 额度信息（可用/已用/额度池/包数 + 套餐类型）
@@ -785,3 +818,64 @@ export async function handleAdminOverview(c: Context<{ Bindings: Env }>) {
     },
   })
 }
+
+/** POST /admin/api/oauth/:id/activity：手动触发活跃上报。 */
+export async function handleOAuthActivity(c: Context<{ Bindings: Env }>) {
+  const id = c.req.param('id')?.trim()
+  const providers = (await getProviders(c.env)) as Provider[]
+  const p = providers.find((x) => x.id === id)
+  if (!p) return c.json<ApiResponse>({ success: false, message: '提供商不存在' }, 404)
+  const pool = await readOauthPool(c.env, p.id)
+  if (pool.length === 0) return c.json<ApiResponse>({ success: false, message: '账号池为空' }, 400)
+
+  const results: any[] = []
+  let ok = 0
+  for (const acc of pool) {
+    if (acc.state?.disabled) continue
+    const token = acc.token?.access_token || ''
+    if (!token) continue
+    const claims = decodeWorkbuddyClaims(token)
+    const uid = acc.uid || claims.uid
+    const enterpriseId = acc.token?.enterprise_id || claims.enterpriseId
+    const devToken = acc.token?.device_token || p.oauth?.deviceToken
+    const res = await reportWorkbuddyChatActivity(token, 'cn', uid, { enterpriseId, deviceToken: devToken, count: 5 })
+    if (res.success) ok++
+    results.push({ uid, nickname: acc.nickname, ...res })
+  }
+  return c.json<ApiResponse>({ success: true, message: `已完成活跃上报（成功 ${ok}/${pool.length}）`, data: results })
+}
+
+/** POST /admin/api/oauth/:id/travel：手动触发猫猫旅行巡检。 */
+export async function handleOAuthTravel(c: Context<{ Bindings: Env }>) {
+  const id = c.req.param('id')?.trim()
+  const providers = (await getProviders(c.env)) as Provider[]
+  const p = providers.find((x) => x.id === id)
+  if (!p) return c.json<ApiResponse>({ success: false, message: '提供商不存在' }, 404)
+  const pool = await readOauthPool(c.env, p.id)
+  if (pool.length === 0) return c.json<ApiResponse>({ success: false, message: '账号池为空' }, 400)
+
+  const results: any[] = []
+  for (const acc of pool) {
+    if (acc.state?.disabled) continue
+    const token = acc.token?.access_token || ''
+    if (!token) continue
+    const claims = decodeWorkbuddyClaims(token)
+    const uid = acc.uid || claims.uid
+    const enterpriseId = acc.token?.enterprise_id || claims.enterpriseId
+    const devToken = acc.token?.device_token || p.oauth?.deviceToken
+    const res = await runWorkbuddyCatTravel(token, 'cn', uid, { enterpriseId, deviceToken: devToken })
+    results.push({ uid, nickname: acc.nickname, ...res })
+  }
+  return c.json<ApiResponse>({ success: true, message: `已完成猫猫旅行巡检（共 ${results.length} 个账号）`, data: results })
+}
+
+/** POST /admin/api/oauth/:id/daily：一键日常任务（签到 + 活跃上报 + 猫猫旅行）。 */
+export async function handleOAuthDaily(c: Context<{ Bindings: Env }>) {
+  const id = c.req.param('id')?.trim()
+  const providers = (await getProviders(c.env)) as Provider[]
+  const p = providers.find((x) => x.id === id)
+  if (!p) return c.json<ApiResponse>({ success: false, message: '提供商不存在' }, 404)
+  const result = await checkinOneAccount(c.env, p)
+  return c.json<ApiResponse<CheckinResult>>({ success: true, message: '已完成一键日常任务', data: result })
+}
+

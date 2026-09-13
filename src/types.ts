@@ -289,6 +289,12 @@ export interface OAuthTokenState {
   tid?: string
   /** qoder/browser 模式：token 所属域（cn 默认 / global），决定推理与轮询/刷新端点 */
   realm?: 'cn' | 'global'
+  /** WorkBuddy 账号 uid */
+  uid?: string
+  /** WorkBuddy 租户/企业 ID */
+  enterprise_id?: string
+  /** WorkBuddy 域（copilot.tencent.com / workbuddy.cn / workbuddy.ai） */
+  domain?: string
   /** WorkBuddy 设备风控 Token（X-Device-Token 头，对齐 workbuddy2api device_token） */
   device_token?: string
 }
@@ -516,6 +522,10 @@ export interface CheckinResult {
   nickname?: string
   /** 权益包明细（每个包的名称 + 到期时间），来自 get-user-resource Accounts[] */
   packages?: PackageInfo[]
+  /** 对话活跃上报结果（P2） */
+  activityReport?: { success: boolean; message: string }
+  /** 猫猫旅行状态与收益（P2） */
+  catTravel?: { state: string; reward?: number; message: string; buddyName?: string }
   /**
    * WorkBuddy 多账号池：本 provider 下每个池账号的独立签到结果（池提供商才有）。
    * 面板可按账号逐条展示；汇总字段（success/credits 等）为池整体快照。
