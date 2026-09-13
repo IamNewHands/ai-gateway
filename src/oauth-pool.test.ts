@@ -1,5 +1,15 @@
 import { describe, it, expect, beforeEach } from 'vitest'
-import { pickOauthAccount, readOauthPool, __resetOauthPoolRuntimeForTests, type OAuthPool } from './oauth-pool'
+import {
+  pickOauthAccount,
+  readOauthPool,
+  isOauthAccountHealthy,
+  noteOauthSessionDead,
+  clearOauthSessionDead,
+  recordOauthModelCost,
+  __resetOauthPoolRuntimeForTests,
+  __resetOauthModelCostsForTests,
+  type OAuthPool,
+} from './oauth-pool'
 import type { Env, OAuthTokenState } from './types'
 import { OAUTH_POOL_KV_PREFIX } from './oauth'
 
