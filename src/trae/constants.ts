@@ -8,8 +8,8 @@ export const TRAE_CONSTANTS = {
   ConsoleHost: 'https://www.trae.cn',
   ClientID: 'en1oxy7wnw8j9n', // SOLO stable
   AppID: '6eefa01c-1036-4c7e-9ca5-d891f63bfcd8',
-  IdeVersion: '0.1.43',
-  IdeVersionCode: '20260716',
+  IdeVersion: '0.1.52',
+  IdeVersionCode: '20260811',
   DeviceBrand: '83DG',
   OSVersion: 'Windows 11 Pro',
   Function: 'solo_work_lite',
@@ -25,6 +25,35 @@ export const TRAE_CONSTANTS = {
 } as const
 
 export const TRAE_UA = `Trae/${TRAE_CONSTANTS.IdeVersion}`
+
+/**
+ * TRAE Work 专属通道常量（移植自 trae2api work_client.go）。
+ */
+export const TRAE_WORK_CONSTANTS = {
+  WorkTargetHost: 'https://api5-normal.mchost.guru',
+  WorkSoloHost: 'https://trae-api-cn.mchost.guru',
+  WorkAppID: '931506',
+  WorkAppIDChat: '6eefa01c-1036-4c7e-9ca5-d891f63bfcd8',
+  WorkIdeVersion: '0.1.63',
+  WorkIdeVersionCode: '20260901',
+  WorkAgentType: 'solo_work_lite',
+  DefaultWorkModel: 'DeepSeek-V4-Flash-Official',
+
+  // 端点
+  EpCreateAgentTask: '/api/agent/v3/create_agent_task',
+  EpWorkflowStart: '/api/agent/v3/workflow/start',
+  EpQueryHistory: '/api/agent/v3/query_history_state',
+  EpSyncHistory: '/api/agent/v3/sync_history_state',
+} as const
+
+export const TRAE_WORK_UA = `Trae/${TRAE_WORK_CONSTANTS.WorkIdeVersion}`
+
+/** 判断是否属于 Work 专属通道模型（包含 work 或以 -Official 结尾） */
+export function isWorkModel(model: string): boolean {
+  const m = (model || '').trim().toLowerCase()
+  if (m === 'work') return true
+  return m.includes('work') || m.includes('agent') || model.includes('Flash-Official') || model.toLowerCase().endsWith('-official')
+}
 
 /** 默认模型（实测可用） */
 export const TRAE_DEFAULT_MODEL = 'glm-5.2'

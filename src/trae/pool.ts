@@ -127,6 +127,14 @@ export function isTraeHealthy(state: TraeAccountState | undefined, now: number):
   return true
 }
 
+/** 账号在 Work 专属通道是否健康：未禁用且不在 Work 冷却期。 */
+export function isTraeWorkHealthy(state: TraeAccountState | undefined, now: number): boolean {
+  if (!state) return true
+  if (state.disabled) return false
+  if (state.workUntil && state.workUntil > now) return false
+  return true
+}
+
 // ===== 账号凭证存取（provider.apiKeys：每行一个 JSON 凭证） =====
 
 /** 解析 provider.apiKeys 中所有启用的账号凭证；非法行跳过。 */
@@ -202,7 +210,7 @@ export async function pickTraeAccount(
   env: Env,
   providerId: string,
   accounts: TraeAccount[],
-  tried: Set<string>,
+  tried: Set<string> = new Set(),
   preferUid?: string,
   concurrency?: number,
   idleMs?: number
@@ -253,6 +261,53 @@ export async function pickTraeAccount(
   return best
 }
 
+/**
+ * 挑选 Work 专有通道健康账号：
+ * 优先按可用 workCredits 降序挑选；若均未探测或为 0，返回首个未尝试的 Work 健康账号。
+ */
+export async function pickTraeWorkAccount(
+  env: Env,
+  providerId: string,
+  accounts: TraeAccount[],
+  tried: Set<string> = new Set(),
+  preferUid?: string
+): Promise<TraeAccount | null> {
+  if (accounts.length === 0) return null
+  const pool = await readTraePool(env, providerId)
+  const now = Date.now()
+
+  const usable = (uid: string): boolean => {
+    return isTraeWorkHealthy(pool[uid], now)
+  }
+
+  if (preferUid) {
+    const preferred = accounts.find(a => a.uid === preferUid && !tried.has(a.uid) && usable(a.uid))
+    if (preferred) return preferred
+  }
+
+  let best: TraeAccount | null = null
+  let bestCredits = -Infinity
+  for (const a of accounts) {
+    if (tried.has(a.uid)) continue
+    if (!usable(a.uid)) continue
+    const credits = pool[a.uid]?.workCredits ?? 0
+    if (credits > bestCredits) {
+      best = a
+      bestCredits = credits
+    }
+  }
+  if (!best) {
+    for (const a of accounts) {
+      if (tried.has(a.uid)) continue
+      if (usable(a.uid)) {
+        best = a
+        break
+      }
+    }
+  }
+  return best
+}
+
 /** 更新账号积分。 */
 export async function setTraeCredits(env: Env, providerId: string, uid: string, credits: number): Promise<void> {
   const pool = await readTraePool(env, providerId)
@@ -260,10 +315,24 @@ export async function setTraeCredits(env: Env, providerId: string, uid: string, 
   await writeTraePool(env, providerId, pool)
 }
 
+/** 更新账号 Work 专属积分。 */
+export async function setTraeWorkCredits(env: Env, providerId: string, uid: string, workCredits: number): Promise<void> {
+  const pool = await readTraePool(env, providerId)
+  pool[uid] = { ...(pool[uid] || {}), workCredits }
+  await writeTraePool(env, providerId, pool)
+}
+
 /** 冷却账号至 now+ms（清零 errCount，对齐 Go pool.Cooldown）。 */
 export async function cooldownTraeAccount(env: Env, providerId: string, uid: string, ms: number, reason: string): Promise<void> {
   const pool = await readTraePool(env, providerId)
   pool[uid] = { ...(pool[uid] || {}), until: Date.now() + ms, reason, errCount: 0 }
+  await writeTraePool(env, providerId, pool)
+}
+
+/** 冷却账号的 Work 专有通道至 now+ms。 */
+export async function cooldownTraeWorkAccount(env: Env, providerId: string, uid: string, ms: number, reason: string): Promise<void> {
+  const pool = await readTraePool(env, providerId)
+  pool[uid] = { ...(pool[uid] || {}), workUntil: Date.now() + ms, workReason: reason, workErrCount: 0 }
   await writeTraePool(env, providerId, pool)
 }
 
@@ -285,6 +354,29 @@ export async function noteTraeError(env: Env, providerId: string, uid: string, t
     pool[uid] = { ...st, errCount }
   }
   await writeTraePool(env, providerId, pool)
+}
+
+/** 记录一次 Work 通道错误；达到 threshold 自动冷却 Work 通道。 */
+export async function noteTraeWorkError(env: Env, providerId: string, uid: string, threshold: number, cooldownMs: number): Promise<void> {
+  const pool = await readTraePool(env, providerId)
+  const st = pool[uid] || {}
+  const workErrCount = (st.workErrCount || 0) + 1
+  if (workErrCount >= threshold) {
+    pool[uid] = { ...st, workErrCount: 0, workUntil: Date.now() + cooldownMs, workReason: 'consecutive work errors' }
+  } else {
+    pool[uid] = { ...st, workErrCount }
+  }
+  await writeTraePool(env, providerId, pool)
+}
+
+/** Work 通道成功请求重置错误计数。 */
+export async function noteTraeWorkSuccess(env: Env, providerId: string, uid: string): Promise<void> {
+  const pool = await readTraePool(env, providerId)
+  const st = pool[uid]
+  if (st && (st.workErrCount || 0) > 0) {
+    pool[uid] = { ...st, workErrCount: 0 }
+    await writeTraePool(env, providerId, pool)
+  }
 }
 
 /**
@@ -321,11 +413,25 @@ export async function noteTraeSuccess(env: Env, providerId: string, uid: string)
   }
 }
 
-/** 签到后解冻：仅当 remain > 0 且账号处于冷却（非禁用）时恢复。 */
-export async function reenableTraeIfCredits(env: Env, providerId: string, uid: string, remain: number): Promise<void> {
+/** 签到后解冻：仅当 remain > 0 且账号处于冷却（非禁用）时恢复。支持同时传入 workRemain。 */
+export async function reenableTraeIfCredits(
+  env: Env,
+  providerId: string,
+  uid: string,
+  remain: number,
+  workRemain?: number
+): Promise<void> {
   const pool = await readTraePool(env, providerId)
   const st = pool[uid] || {}
   pool[uid] = { ...st, credits: remain }
+  if (typeof workRemain === 'number') {
+    pool[uid].workCredits = workRemain
+    if (workRemain > 0 && !st.disabled) {
+      pool[uid].workUntil = 0
+      pool[uid].workReason = ''
+      pool[uid].workErrCount = 0
+    }
+  }
   if (remain > 0 && !st.disabled) {
     pool[uid] = { ...pool[uid], until: 0, reason: '', errCount: 0 }
   }
@@ -351,9 +457,13 @@ export async function listTraeStatus(env: Env, provider: Provider): Promise<Trae
       uid,
       nickname: a?.nickname || '',
       credits: st?.credits ?? 0,
+      workCredits: st?.workCredits,
       cooling: st ? st.until > now : false,
       until: st?.until,
       reason: st?.reason || '',
+      workCooling: st && typeof st.workUntil === 'number' ? st.workUntil > now : false,
+      workUntil: st?.workUntil,
+      workReason: st?.workReason || '',
       disabled: st?.disabled === true,
       errCount: st?.errCount || 0,
     })

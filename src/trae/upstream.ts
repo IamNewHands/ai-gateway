@@ -2,9 +2,9 @@
  * upstream.ts — SOLO 上游 HTTP 客户端（移植自 traework2api/internal/upstream/client.go + headers.go）。
  * llm_utils_chat / get_detail_param / ExchangeToken / checkin_credits / ide_user_ent_usage + 错误分类。
  */
-import { TRAE_CHAT_CONNECT_TIMEOUT_MS, TRAE_CONSTANTS, TRAE_UA } from './constants'
+import { TRAE_CHAT_CONNECT_TIMEOUT_MS, TRAE_CONSTANTS, TRAE_UA, TRAE_WORK_CONSTANTS, TRAE_WORK_UA } from './constants'
 import { prepareBody } from './payload'
-import type { TraeAccount, TraeErrKind, TraeModelInfo } from './types'
+import type { TraeAccount, TraeCreditsSnapshot, TraeErrKind, TraeModelInfo } from './types'
 
 // ===== 错误分类（SPEC §4.3） =====
 
@@ -13,8 +13,9 @@ const sessionDeadMarkers = ['login', 'token 失效', 'token invalid', 'session',
 /** 按 HTTP 状态码 + body 判定错误类别。 */
 export function classifyTraeError(status: number, body: string): TraeErrKind {
   const lower = body.toLowerCase()
-  // 1005 plan 权益不足
-  if (body.includes('"code":1005') || (body.includes('1005') && lower.includes('plan'))) return 'plan_limit'
+  // 1005 plan 权益不足 或 4008 配额耗尽
+  if (status === 4008 || status === 1005 || body.includes('"code":1005') || (body.includes('1005') && lower.includes('plan'))) return 'plan_limit'
+  if (body.includes('"code":4008') || body.includes('4008') || lower.includes('exceeded the quota')) return 'plan_limit'
   if (status === 401) {
     for (const m of sessionDeadMarkers) {
       if (lower.includes(m.toLowerCase())) return 'session_dead'
@@ -85,6 +86,33 @@ export function oauthHeaders(): Record<string, string> {
     Accept: 'application/json',
     'User-Agent': TRAE_UA,
   }
+}
+
+export function workHeaders(account: TraeAccount, stream: boolean, useChatAppId = false): Record<string, string> {
+  const h: Record<string, string> = {
+    'Content-Type': 'application/json',
+    Accept: stream ? 'text/event-stream, application/json' : 'application/json',
+    'User-Agent': TRAE_WORK_UA,
+    Authorization: `Cloud-IDE-JWT ${account.accessToken}`,
+    'X-Cloudide-Token': account.accessToken,
+    'X-Ide-Token': account.accessToken,
+    'X-App-Id': useChatAppId ? TRAE_WORK_CONSTANTS.WorkAppIDChat : TRAE_WORK_CONSTANTS.WorkAppID,
+    'X-Ide-Version': TRAE_WORK_CONSTANTS.WorkIdeVersion,
+    'X-Ide-Version-Code': TRAE_WORK_CONSTANTS.WorkIdeVersionCode,
+    'X-App-Version-Code': TRAE_WORK_CONSTANTS.WorkIdeVersionCode,
+    'X-Version-Code': TRAE_WORK_CONSTANTS.WorkIdeVersionCode,
+    'X-Device-Type': 'macos',
+    'X-Device-Platform': 'darwin',
+    'X-Platform': 'darwin',
+    'X-OS': 'darwin',
+    'X-OSType': 'darwin',
+    'X-System': 'darwin',
+    'Request-Traffic-Type': 'prod',
+  }
+  if (account.uid) h['X-Uid'] = account.uid
+  if (account.machineId) h['X-Machine-Id'] = account.machineId
+  if (account.deviceId) h['X-Device-Id'] = account.deviceId
+  return h
 }
 
 // ===== 凭证解析 / 序列化（auth.go + login.sh 落盘格式） =====
@@ -447,19 +475,34 @@ export async function performCheckinClaim(account: TraeAccount): Promise<void> {
 
 /** 聚合剩余积分（ide_user_ent_usage）：每包 credits_limit（总量）− credits_amount（已用），负值按 0。 */
 export async function fetchUserEntUsage(account: TraeAccount): Promise<number> {
+  const details = await fetchUserEntUsageDetails(account)
+  return details.total
+}
+
+/** 详细查询各权益包积分，区分 ideCredits 与 workCredits */
+export async function fetchUserEntUsageDetails(account: TraeAccount): Promise<{ ideCredits: number; workCredits: number; total: number }> {
   const raw = await doJsonText(TRAE_CONSTANTS.UgHost + TRAE_CONSTANTS.EpEntUsage, ugHeaders(account), {})
   let data: any
   try { data = JSON.parse(raw) } catch { data = null }
   const packs = data?.user_entitlement_pack_list
   if (!Array.isArray(packs)) throw new Error('ent usage parse: missing user_entitlement_pack_list')
-  let remain = 0
+  let total = 0
+  let workCredits = 0
+  let ideCredits = 0
   for (const p of packs) {
     const quota: Record<string, any> = p?.entitlement_base_info?.quota || {}
     const used = Number(p?.usage?.credits_amount) || 0
     const limit = Number(quota?.credits_limit) || 0
-    remain += Math.max(0, limit - used)
+    const rem = Math.max(0, limit - used)
+    total += rem
+    const packName = (p?.entitlement_base_info?.name || p?.pack_name || p?.entitlement_base_info?.pack_name || '').toLowerCase()
+    if (packName.includes('work')) {
+      workCredits += rem
+    } else {
+      ideCredits += rem
+    }
   }
-  return remain
+  return { ideCredits, workCredits, total }
 }
 
 // ===== 对话（llm_utils_chat） =====
@@ -504,4 +547,174 @@ export async function chatStream(account: TraeAccount, bodyObj: Record<string, a
     throw err
   }
   return response
+}
+
+// ===== Work 通道对话（create_agent_task）与双通道积分探测 =====
+
+/** 从 messages 列表中提取最后一条 user 输入文本 */
+export function extractLastUserPrompt(messages: any[]): string {
+  if (!Array.isArray(messages)) return '你好'
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const m = messages[i]
+    if (!m || typeof m !== 'object') continue
+    if (m.role === 'user') {
+      if (typeof m.content === 'string' && m.content.trim() !== '') {
+        return m.content
+      }
+      if (Array.isArray(m.content)) {
+        let text = ''
+        for (const part of m.content) {
+          if (part && typeof part === 'object' && typeof part.text === 'string') {
+            text += part.text
+          }
+        }
+        if (text.trim() !== '') return text
+      }
+    }
+  }
+  return '你好'
+}
+
+/** 构造 Work 通道 create_agent_task 原生上行载荷（对齐 trae2api BuildNativeTaskPayload） */
+export function buildNativeTaskPayload(
+  account: TraeAccount,
+  model: string,
+  prompt: string,
+  convId?: string,
+  sessId?: string
+): Record<string, any> {
+  const conversationId = convId || crypto.randomUUID()
+  const sessionId = sessId || crypto.randomUUID()
+  const msgId = crypto.randomUUID()
+
+  const rawModel = (model || TRAE_WORK_CONSTANTS.DefaultWorkModel).trim()
+  let internalModelName = rawModel
+  if (!internalModelName.endsWith('__dev')) {
+    internalModelName = rawModel + '__dev'
+  }
+
+  const queryJson = JSON.stringify([
+    {
+      type: 'text',
+      data: { content: prompt },
+    },
+  ])
+
+  return {
+    conversation_id: conversationId,
+    session_id: sessionId,
+    user_id: account.uid,
+    device_id: account.deviceId || '',
+    agent_type: TRAE_WORK_CONSTANTS.WorkAgentType,
+    model_name: internalModelName,
+    config_name: model,
+    ide_version: TRAE_WORK_CONSTANTS.WorkIdeVersion,
+    version_code: Number(TRAE_WORK_CONSTANTS.WorkIdeVersionCode) || 20260901,
+    mode_type: 1,
+    plugin_channel: 'stable',
+    history_id_list: [],
+    user_input: {
+      id: msgId,
+      query: queryJson,
+      messages: [
+        {
+          role: 'user',
+          content: prompt,
+        },
+      ],
+    },
+  }
+}
+
+/**
+ * 发送 Work 通道请求（create_agent_task，纯协议 HTTP/2 直连）。
+ */
+export async function chatWorkStream(
+  account: TraeAccount,
+  model: string,
+  prompt: string
+): Promise<Response> {
+  const payload = buildNativeTaskPayload(account, model, prompt)
+  const controller = new AbortController()
+  const connectTimer = setTimeout(() => controller.abort(), TRAE_CHAT_CONNECT_TIMEOUT_MS)
+  let response: Response
+  try {
+    response = await fetch(TRAE_WORK_CONSTANTS.WorkTargetHost + TRAE_WORK_CONSTANTS.EpCreateAgentTask, {
+      method: 'POST',
+      headers: workHeaders(account, true, true),
+      body: JSON.stringify(payload),
+      signal: controller.signal,
+    })
+  } catch (e) {
+    clearTimeout(connectTimer)
+    const err = new Error(`chat work transport error: ${(e as Error).message || String(e)}`) as Error & { kind?: TraeErrKind }
+    ;(err as any).kind = 'transport'
+    throw err
+  }
+  clearTimeout(connectTimer)
+  if (response.status >= 400) {
+    const raw = await response.text().catch(() => '')
+    const kind = classifyTraeError(response.status, raw)
+    const err = new Error(`upstream work ${kind} (http ${response.status}): ${raw.substring(0, 200)}`) as Error & { kind?: TraeErrKind; status?: number; msg?: string }
+    ;(err as any).kind = kind
+    ;(err as any).status = response.status
+    ;(err as any).msg = raw.substring(0, 200)
+    throw err
+  }
+  return response
+}
+
+/**
+ * 实时探测双通道积分余额 (ide_credits vs work_credits)。
+ * 发送轻量 ping 请求提取 cn_credits_remain_info。
+ */
+export async function probeTraeCredits(account: TraeAccount): Promise<TraeCreditsSnapshot | null> {
+  const pingPayload = {
+    function: TRAE_WORK_CONSTANTS.WorkAgentType,
+    config_name: TRAE_WORK_CONSTANTS.DefaultWorkModel,
+    model: TRAE_WORK_CONSTANTS.DefaultWorkModel,
+    stream: true,
+    messages: [
+      {
+        role: 'user',
+        content: [{ type: 'text', text: 'ping' }],
+      },
+    ],
+  }
+
+  const controller = new AbortController()
+  const timer = setTimeout(() => controller.abort(), 10000)
+  try {
+    const resp = await fetch(TRAE_CONSTANTS.AgentHost + TRAE_CONSTANTS.EpChat, {
+      method: 'POST',
+      headers: soloHeaders(account, true),
+      body: JSON.stringify(pingPayload),
+      signal: controller.signal,
+    })
+    clearTimeout(timer)
+    if (!resp.body) return null
+
+    const reader = resp.body.getReader()
+    const decoder = new TextDecoder()
+    let buffer = ''
+    for (let i = 0; i < 5; i++) {
+      const { done, value } = await reader.read()
+      if (done) break
+      buffer += decoder.decode(value, { stream: true })
+      const hit = /"cn_credits_remain_info"\s*:\s*\{([^}]+)\}/.exec(buffer)
+      if (hit) {
+        await reader.cancel().catch(() => {})
+        const ideHit = /"ide_credits"\s*:\s*([0-9.]+)/.exec(hit[1])
+        const workHit = /"work_credits"\s*:\s*([0-9.]+)/.exec(hit[1])
+        return {
+          ideCredits: ideHit ? Number(ideHit[1]) : 0,
+          workCredits: workHit ? Number(workHit[1]) : 0,
+        }
+      }
+    }
+    await reader.cancel().catch(() => {})
+  } catch {
+    clearTimeout(timer)
+  }
+  return null
 }

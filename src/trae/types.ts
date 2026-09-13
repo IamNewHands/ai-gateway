@@ -35,11 +35,19 @@ export interface TraeAccount {
 /** 账号池条目状态（存在 KV trae:pool:<providerId>，跨 isolate 共享冷却/禁用/积分） */
 export interface TraeAccountState {
   credits: number
+  /** TRAE Work 专属积分（work_credits） */
+  workCredits?: number
   disabled: boolean
   reason?: string
-  /** 冷却至 epoch ms；0 = 无冷却 */
+  /** SOLO 冷却至 epoch ms；0 = 无冷却 */
   until: number
   errCount: number
+  /** Work 专属通道冷却至 epoch ms；0 = 无冷却 */
+  workUntil?: number
+  /** Work 专属通道冷却原因 */
+  workReason?: string
+  /** Work 专属通道连续错误计数 */
+  workErrCount?: number
   /** 账号级并发占用会话数（特性A 并发信号量） */
   activeSessions?: number
   /** 最近一次活跃会话时刻 epoch ms（特性A 空闲回收用） */
@@ -49,14 +57,24 @@ export interface TraeAccountState {
 /** 账号池：uid → 状态 */
 export type TraePool = Record<string, TraeAccountState>
 
-/** 对外暴露的账号状态（脱敏，不含 token），供 /status 与面板展示 */
+/** 双通道积分实时快照（从 notify_usage 或 probe 提取） */
+export interface TraeCreditsSnapshot {
+  ideCredits: number
+  workCredits: number
+}
+
+/** 对对外暴露的账号状态（脱敏，不含 token），供 /status 与面板展示 */
 export interface TraeAccountStatus {
   uid: string
   nickname?: string
   credits: number
+  workCredits?: number
   cooling: boolean
   until?: number
   reason?: string
+  workCooling?: boolean
+  workUntil?: number
+  workReason?: string
   disabled: boolean
   errCount: number
 }
@@ -103,5 +121,6 @@ export interface TraeCheckinResult {
   message: string
   checkedIn: boolean
   credits?: number
+  workCredits?: number
   updatedAt: number
 }

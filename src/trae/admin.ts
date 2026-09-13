@@ -19,9 +19,11 @@ import {
   fetchCheckinStatus,
   fetchTraeModels,
   fetchUserEntUsage,
+  fetchUserEntUsageDetails,
   getUserInfo,
   needsTraeRefresh,
   performCheckinClaim,
+  probeTraeCredits,
 } from './upstream'
 import {
   disableTraeAccount,
@@ -32,6 +34,7 @@ import {
   removeTraeAccount,
   saveTraeAccount,
   setTraeCredits,
+  setTraeWorkCredits,
 } from './pool'
 import { isTraeProvider } from './proxy'
 import type { TraeAccount, TraeCheckinResult, TraeLoginState, TraeModelInfo, TraeAccountStatus } from './types'
@@ -223,20 +226,30 @@ export async function handleTraeLoginCallback(c: Context<AppEnv>) {
 
   // e. 初始积分（失败不阻塞登录）
   let credits = 0
+  let workCredits = 0
   try {
-    credits = await fetchUserEntUsage(account)
+    const probe = await probeTraeCredits(account)
+    if (probe) {
+      credits = probe.ideCredits
+      workCredits = probe.workCredits
+    } else {
+      const details = await fetchUserEntUsageDetails(account)
+      credits = details.ideCredits
+      workCredits = details.workCredits
+    }
     await setTraeCredits(c.env, id, uid, credits)
+    await setTraeWorkCredits(c.env, id, uid, workCredits)
   } catch (e) {
     console.warn(`[trae-login] ent usage failed: ${(e as Error).message}`)
   }
   try { await c.env.KV.delete(loginKey(id)) } catch { /* ignore */ }
   try {
-    await writeLog(c.env, 'info', `[trae] 登录成功 uid=${uid}（${nickname || '无昵称'}）`, `provider=${id} credits=${credits}`)
+    await writeLog(c.env, 'info', `[trae] 登录成功 uid=${uid}（${nickname || '无昵称'}）`, `provider=${id} ideCredits=${credits} workCredits=${workCredits}`)
   } catch { /* ignore */ }
 
   return c.json<ApiResponse>({
     success: true,
-    data: { uid, nickname, credits, expiresAt: account.expiresAt, domain: 'trae.cn' },
+    data: { uid, nickname, credits, workCredits, expiresAt: account.expiresAt, domain: 'trae.cn' },
   })
 }
 
@@ -304,9 +317,20 @@ async function checkinTraeAccount(env: Env, provider: Provider, account: TraeAcc
   }
   // 查积分 + 解冻（签到就是为了解冻冷却账号）
   try {
-    const remain = await fetchUserEntUsage(account)
-    await reenableTraeIfCredits(env, provider.id, account.uid, remain)
-    base.credits = remain
+    let ideRemain = 0
+    let workRemain = 0
+    const probe = await probeTraeCredits(account)
+    if (probe) {
+      ideRemain = probe.ideCredits
+      workRemain = probe.workCredits
+    } else {
+      const details = await fetchUserEntUsageDetails(account)
+      ideRemain = details.ideCredits
+      workRemain = details.workCredits
+    }
+    await reenableTraeIfCredits(env, provider.id, account.uid, ideRemain, workRemain)
+    base.credits = ideRemain
+    base.workCredits = workRemain
   } catch (e) {
     base.message += '；积分查询失败: ' + ((e as Error).message || String(e)).substring(0, 120)
   }

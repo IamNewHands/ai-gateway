@@ -435,3 +435,325 @@ function normalizeStreamToolCalls(raw: unknown): unknown[] | null {
   }
   return out.length > 0 ? out : null
 }
+
+// ===== Work 通道流式与非流式转换 (移植自 trae2api StreamWorkToOpenAI / AggregateWork) =====
+
+/**
+ * 将 Work 专有通道下行 SSE 事件流转换为标准 OpenAI chat.completion.chunk SSE 流。
+ */
+export function workStreamToOpenAIStream(
+  upstream: ReadableStream<Uint8Array>,
+  model: string,
+  onErr?: (se: SOLOStreamError) => void
+): ReadableStream<Uint8Array> {
+  return new ReadableStream({
+    async start(controller) {
+      const id = `chatcmpl-${Date.now()}`
+      let pendingUsage: Record<string, any> | null = null
+      let sawDone = false
+      let sentRole = false
+      let lineBuffer = ''
+      let currentEvent = ''
+      let fullText = ''
+
+      const handleDelta = (text: string): string => {
+        if (!text) return ''
+        if (text.startsWith(fullText) && text.length > fullText.length) {
+          const delta = text.slice(fullText.length)
+          fullText = text
+          return delta
+        } else if (!fullText.includes(text)) {
+          fullText += text
+          return text
+        }
+        return ''
+      }
+
+      const writeChunk = (delta: Record<string, any>, finish: string): void => {
+        if (!sentRole && Object.keys(delta).length > 0) {
+          delta['role'] = 'assistant'
+          sentRole = true
+        }
+        const chunk: Record<string, any> = {
+          id,
+          object: 'chat.completion.chunk',
+          created: Math.floor(Date.now() / 1000),
+          model,
+          choices: [{ index: 0, delta }],
+        }
+        if (finish !== '') chunk['choices'][0]['finish_reason'] = finish
+        if (pendingUsage) {
+          chunk['usage'] = pendingUsage
+          pendingUsage = null
+        }
+        controller.enqueue(encodeSse(JSON.stringify(chunk)))
+      }
+
+      const writeDone = (): void => {
+        controller.enqueue(encodeSse('[DONE]'))
+      }
+
+      const processLine = (line: string): void => {
+        const trimmed = line.trim()
+        if (!trimmed) return
+        if (trimmed.startsWith('event:')) {
+          currentEvent = trimmed.slice(6).trim()
+          return
+        }
+        if (!trimmed.startsWith('data:')) return
+
+        const dataContent = trimmed.slice(5).trim()
+        if (dataContent === '[DONE]') {
+          sawDone = true
+          writeDone()
+          return
+        }
+        if (dataContent.includes('"chat.completion.chunk"')) {
+          controller.enqueue(encodeSse(dataContent))
+          return
+        }
+
+        let evObj: any = null
+        try {
+          evObj = JSON.parse(dataContent)
+        } catch {
+          return
+        }
+        if (!evObj || typeof evObj !== 'object') return
+
+        const ev = evObj.event || (evObj.data && evObj.data.event) || currentEvent
+        const payload = evObj.payload || (evObj.data && evObj.data.payload) || evObj
+
+        switch (ev) {
+          case 'plan_item': {
+            const thoughtText = payload.reasoning_content || payload.thought || payload.plan_title
+            if (thoughtText) {
+              const d = handleDelta(String(thoughtText))
+              if (d) writeChunk({ reasoning_content: d }, '')
+            }
+            if (payload.tool_call_info?.params?.summary) {
+              const d = handleDelta(String(payload.tool_call_info.params.summary))
+              if (d) writeChunk({ content: d }, '')
+            }
+            break
+          }
+          case 'output': {
+            if (Array.isArray(payload.choices)) {
+              for (const choice of payload.choices) {
+                if (choice?.text && choice.text !== '[]') {
+                  const d = handleDelta(String(choice.text))
+                  if (d) writeChunk({ content: d }, '')
+                }
+              }
+            } else if (typeof payload.response === 'string') {
+              const d = handleDelta(payload.response)
+              if (d) writeChunk({ content: d }, '')
+            } else if (typeof payload.text === 'string') {
+              const d = handleDelta(payload.text)
+              if (d) writeChunk({ content: d }, '')
+            }
+            break
+          }
+          case 'token_usage': {
+            if (payload && typeof payload === 'object') {
+              pendingUsage = payload
+            }
+            break
+          }
+          case 'done': {
+            if (payload.last_assistant_response) {
+              try {
+                const arr = JSON.parse(payload.last_assistant_response)
+                if (Array.isArray(arr) && arr.length > 0 && typeof arr[0] === 'string') {
+                  const d = handleDelta(arr[0])
+                  if (d) writeChunk({ content: d }, '')
+                }
+              } catch {
+                const d = handleDelta(String(payload.last_assistant_response))
+                if (d) writeChunk({ content: d }, '')
+              }
+            }
+            writeChunk({}, 'stop')
+            writeDone()
+            sawDone = true
+            break
+          }
+          case 'error': {
+            const errMsg = evObj.message || payload.message || 'upstream work error'
+            const errCode = evObj.code || payload.code || 500
+            const se: SOLOStreamError = { code: errCode, msg: errMsg }
+            if (onErr) onErr(se)
+            const errFrame = { error: { message: `work error code=${errCode} msg=${errMsg}`, type: 'upstream_error', code: String(errCode) } }
+            controller.enqueue(new TextEncoder().encode(`data: ${JSON.stringify(errFrame)}\n\n`))
+            writeChunk({}, 'stop')
+            writeDone()
+            sawDone = true
+            break
+          }
+        }
+      }
+
+      const decoder = new TextDecoderStream()
+      const textReader = upstream.pipeThrough(decoder).getReader()
+
+      try {
+        while (true) {
+          const { done, value } = await textReader.read()
+          if (done) break
+          if (!value) continue
+          lineBuffer += value
+          const lines = lineBuffer.split('\n')
+          lineBuffer = lines.pop() || ''
+          for (const line of lines) {
+            processLine(line.replace(/\r$/, ''))
+          }
+        }
+        if (lineBuffer.trim()) {
+          processLine(lineBuffer.replace(/\r$/, ''))
+        }
+      } catch (e) {
+        if (!sawDone) {
+          const errFrame = { error: { message: (e as Error).message || 'stream read error', type: 'transport_error' } }
+          controller.enqueue(new TextEncoder().encode(`data: ${JSON.stringify(errFrame)}\n\n`))
+        }
+      } finally {
+        if (!sawDone) {
+          writeChunk({}, 'stop')
+          writeDone()
+        }
+        controller.close()
+      }
+    },
+  })
+}
+
+/**
+ * 将完整的 Work SSE 文本聚合成非流式 OpenAI chat.completion 响应。
+ */
+export function aggregateWorkSse(text: string, model: string): { resp: Record<string, any> | null; err: SOLOStreamError | null } {
+  const trimmed = text.trim()
+  if (trimmed.startsWith('{')) {
+    try {
+      const obj = JSON.parse(trimmed)
+      if (obj && Array.isArray(obj.choices)) {
+        return { resp: obj, err: null }
+      }
+    } catch { /* continue */ }
+  }
+
+  let fullContent = ''
+  let fullReasoning = ''
+  let usage: Record<string, any> | null = null
+  let upstreamErr: SOLOStreamError | null = null
+  let currentEvent = ''
+  let fullText = ''
+
+  const handleDelta = (t: string): string => {
+    if (!t) return ''
+    if (t.startsWith(fullText) && t.length > fullText.length) {
+      const delta = t.slice(fullText.length)
+      fullText = t
+      return delta
+    } else if (!fullText.includes(t)) {
+      fullText += t
+      return t
+    }
+    return ''
+  }
+
+  const lines = text.split('\n')
+  for (const rawLine of lines) {
+    const line = rawLine.replace(/\r$/, '').trim()
+    if (!line) continue
+    if (line.startsWith('event:')) {
+      currentEvent = line.slice(6).trim()
+      continue
+    }
+    if (!line.startsWith('data:')) continue
+    const dataContent = line.slice(5).trim()
+    if (dataContent === '[DONE]') break
+
+    let evObj: any = null
+    try {
+      evObj = JSON.parse(dataContent)
+    } catch {
+      continue
+    }
+    if (!evObj || typeof evObj !== 'object') continue
+
+    const ev = evObj.event || (evObj.data && evObj.data.event) || currentEvent
+    const payload = evObj.payload || (evObj.data && evObj.data.payload) || evObj
+
+    switch (ev) {
+      case 'plan_item': {
+        const thoughtText = payload.reasoning_content || payload.thought || payload.plan_title
+        if (thoughtText) {
+          const d = handleDelta(String(thoughtText))
+          if (d) fullReasoning += d
+        }
+        if (payload.tool_call_info?.params?.summary) {
+          const d = handleDelta(String(payload.tool_call_info.params.summary))
+          if (d) fullContent += d
+        }
+        break
+      }
+      case 'output': {
+        if (Array.isArray(payload.choices)) {
+          for (const choice of payload.choices) {
+            if (choice?.text && choice.text !== '[]') {
+              const d = handleDelta(String(choice.text))
+              if (d) fullContent += d
+            }
+          }
+        } else if (typeof payload.response === 'string') {
+          const d = handleDelta(payload.response)
+          if (d) fullContent += d
+        } else if (typeof payload.text === 'string') {
+          const d = handleDelta(payload.text)
+          if (d) fullContent += d
+        }
+        break
+      }
+      case 'token_usage': {
+        if (payload && typeof payload === 'object') usage = payload
+        break
+      }
+      case 'done': {
+        if (payload.last_assistant_response) {
+          try {
+            const arr = JSON.parse(payload.last_assistant_response)
+            if (Array.isArray(arr) && arr.length > 0 && typeof arr[0] === 'string') {
+              const d = handleDelta(arr[0])
+              if (d) fullContent += d
+            }
+          } catch {
+            const d = handleDelta(String(payload.last_assistant_response))
+            if (d) fullContent += d
+          }
+        }
+        break
+      }
+      case 'error': {
+        const errMsg = evObj.message || payload.message || 'upstream work error'
+        const errCode = evObj.code || payload.code || 500
+        upstreamErr = { code: errCode, msg: errMsg }
+        break
+      }
+    }
+  }
+
+  if (upstreamErr) return { resp: null, err: upstreamErr }
+
+  const message: Record<string, any> = { role: 'assistant', content: fullContent }
+  if (fullReasoning) message['reasoning_content'] = fullReasoning
+
+  const resp: Record<string, any> = {
+    id: `chatcmpl-${Date.now()}`,
+    object: 'chat.completion',
+    created: Math.floor(Date.now() / 1000),
+    model,
+    choices: [{ index: 0, message, finish_reason: 'stop' }],
+  }
+  if (usage) resp['usage'] = usage
+  return { resp, err: null }
+}

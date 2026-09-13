@@ -951,6 +951,7 @@ interface ResponsesRequest {
   temperature?: number
   top_p?: number
   tool_choice?: string | { type: string; function?: { name: string } }
+  parallel_tool_calls?: boolean
   reasoning?: { effort?: string }
 }
 

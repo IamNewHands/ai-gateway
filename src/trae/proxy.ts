@@ -13,23 +13,28 @@
 import type { Env, Provider } from '../types'
 import { withSSEKeepAlive } from '../opencode'
 import { getPerfSettings } from '../perf'
-import { TRAE_DEFAULT_MODEL, TRAE_KEEPALIVE_MS, TRAE_RAW_MAX_HISTORY_CHARS, TRAE_RAW_MAX_MESSAGES, TRAE_RAW_MAX_TOOL_SCHEMA_CHARS, TRAE_STATIC_MODEL_IDS, TRAE_STREAM_IDLE_TIMEOUT_MS, normalizeTraeModelName } from './constants'
-import { chatStream, exchangeToken, needsTraeRefresh, parseAuth } from './upstream'
+import { TRAE_DEFAULT_MODEL, TRAE_KEEPALIVE_MS, TRAE_RAW_MAX_HISTORY_CHARS, TRAE_RAW_MAX_MESSAGES, TRAE_RAW_MAX_TOOL_SCHEMA_CHARS, TRAE_STATIC_MODEL_IDS, TRAE_STREAM_IDLE_TIMEOUT_MS, TRAE_WORK_CONSTANTS, isWorkModel, normalizeTraeModelName } from './constants'
+import { chatStream, chatWorkStream, exchangeToken, extractLastUserPrompt, needsTraeRefresh, parseAuth, probeTraeCredits } from './upstream'
 import { isRemoteOnlyModel, type HistoryBudget } from './payload'
-import { aggregateSoloSse, soloStreamToOpenAIStream } from './sse'
+import { aggregateSoloSse, aggregateWorkSse, soloStreamToOpenAIStream, workStreamToOpenAIStream } from './sse'
 import type { SOLOStreamError } from './types'
 import { writeLog } from '../admin'
 import {
   acquireTraeSession,
   cooldownTraeAccount,
+  cooldownTraeWorkAccount,
   disableTraeAccount,
   getTraeAccounts,
   noteTraeError,
   noteTraeSuccess,
+  noteTraeWorkError,
+  noteTraeWorkSuccess,
   pickTraeAccount,
+  pickTraeWorkAccount,
   releaseTraeSession,
   resolveTraeCooldown,
   saveTraeAccount,
+  setTraeWorkCredits,
 } from './pool'
 import type { TraeCooldownConfig } from './pool'
 
@@ -53,13 +58,16 @@ export function isTraeProvider(provider: Provider): boolean {
 export function mapTraeModel(model: string, known: ReadonlySet<string>): string {
   const m = (model || '').trim()
   if (m === '' || m === 'auto') return TRAE_DEFAULT_MODEL
+  if (m.toLowerCase() === 'work') return TRAE_WORK_CONSTANTS.DefaultWorkModel
   let base = m
   const i = m.indexOf('__')
   if (i >= 0) base = m.substring(0, i)
   if (known.has(base)) return base
+  if (isWorkModel(base)) return base
   // 宽松匹配：下划线 → 横线，大小写不敏感（deepseek_v4_pro → DeepSeek-V4-Pro）
   const norm = normalizeTraeModelName(base)
   if (known.has(norm)) return norm
+  if (isWorkModel(norm)) return norm
   throw new Error(`unknown model ${model}`)
 }
 
@@ -67,7 +75,7 @@ export function mapTraeModel(model: string, known: ReadonlySet<string>): string 
  * 管理后台"测试连接"（handleTestModel 的 TRAE 分支）。
  * 不能像普通 OpenAI 提供商那样 POST baseUrl/chat/completions——TRAE 上游是 SOLO 私有协议，
  * 且账号凭证存于 provider.apiKeys（每个 key 是一个账号 JSON），Bearer 直发必然失败。
- * 这里走真实账号池发最小请求验证：挑健康账号 → llm_utils_chat → 读到首个字节即视为连接成功。
+ * 这里走真实账号池发最小请求验证：挑健康账号 → llm_utils_chat / Work 通道 → 读到首个字节即视为连接成功。
  */
 export async function testTraeModel(
   env: Env,
@@ -87,6 +95,33 @@ export async function testTraeModel(
   if (accounts.length === 0) {
     return { success: false, message: '未配置 TRAE 账号，请先「登录账号」后再测试' }
   }
+
+  // Work 专有通道模型测试
+  if (isWorkModel(configName)) {
+    const workAccount = await pickTraeWorkAccount(env, provider.id, accounts, new Set(), provider.preferTraeUid)
+    if (!workAccount) {
+      return { success: false, message: '没有可用 Work 账号（全部冷却/禁用）' }
+    }
+    try {
+      const resp = await chatWorkStream(workAccount, configName, 'hi')
+      if (!resp.body) return { success: false, message: '上游 Work 返回空响应体' }
+      const reader = resp.body.getReader()
+      const { value } = await reader.read()
+      await reader.cancel().catch(() => {})
+      if (!value || value.length === 0) {
+        return { success: false, message: '上游 Work 无输出' }
+      }
+      return { success: true, message: 'Work 连接成功', statusCode: resp.status }
+    } catch (e) {
+      const err = e as Error & { kind?: string; status?: number }
+      return {
+        success: false,
+        message: `Work 连接失败: ${(err.message || '未知错误').substring(0, 200)}`,
+        statusCode: err.status,
+      }
+    }
+  }
+
   const account = await pickTraeAccount(env, provider.id, accounts, new Set(), provider.preferTraeUid)
   if (!account) {
     return { success: false, message: '没有可用账号（全部冷却/禁用），请刷新状态或签到解冻' }
@@ -222,6 +257,160 @@ async function applyStreamError(env: Env, providerId: string, uid: string, se: S
 }
 
 /**
+ * 使用账号池多账号动态轮转调度执行 Work 通道请求（消费 work_credits）。
+ * 调度与容灾策略（对齐 trae2api executeWorkRequest）：
+ * 1. 优先按可用 workCredits 降序选取健康账号；
+ * 2. 检查并按需预刷新 token；
+ * 3. 发起 chatWorkStream 调用（原生 HTTP/2 直连）；
+ * 4. 故障时（429 限流/401 会话失效/400 额度不足）进入 Work 专属冷却并自动轮转下一账号；
+ * 5. 成功后触发异步探针更新账号真实 workCredits 与 ideCredits 余额；
+ * 6. 返回流式或非流式 OpenAI 兼容 Response。
+ */
+export async function executeWorkRequest(
+  env: Env,
+  provider: Provider,
+  body: Record<string, unknown>,
+  configName: string,
+  prompt: string,
+  stream: boolean
+): Promise<Response | null> {
+  const accounts = getTraeAccounts(provider)
+  if (accounts.length === 0) return null
+
+  const cd = resolveTraeCooldown(provider)
+  const tried = new Set<string>()
+  let lastErr: Error | null = null
+
+  // 默认使用请求模型；若非 Work 模型则回退 DefaultWorkModel
+  let workModel = configName
+  if (!isWorkModel(workModel)) {
+    workModel = TRAE_WORK_CONSTANTS.DefaultWorkModel
+  }
+
+  for (let i = 0; i < MAX_ROTATE; i++) {
+    const account = await pickTraeWorkAccount(env, provider.id, accounts, tried, provider.preferTraeUid)
+    if (!account) break
+    tried.add(account.uid)
+
+    // Token 预刷新
+    try {
+      if (needsTraeRefresh(account)) {
+        const res = await exchangeToken(account)
+        account.accessToken = res.accessToken
+        account.refreshToken = res.refreshToken
+        account.expiresAt = res.expiresAt
+        await saveTraeAccount(env, provider.id, account).catch(() => {})
+      }
+    } catch (e) {
+      lastErr = e as Error
+      const kind = (e as any).kind
+      if (kind === 'session_dead') {
+        await disableTraeAccount(env, provider.id, account.uid, 'refresh session dead')
+      } else {
+        await cooldownTraeWorkAccount(env, provider.id, account.uid, cd.errMs, 'refresh: ' + ((e as Error).message || '').substring(0, 120))
+      }
+      continue
+    }
+
+    let resp: Response
+    try {
+      resp = await chatWorkStream(account, workModel, prompt)
+    } catch (e) {
+      lastErr = e as Error
+      const status = (e as any).status || 0
+      const msg = (e as any).msg || (e as Error).message || ''
+      if (status === 429) {
+        await cooldownTraeWorkAccount(env, provider.id, account.uid, cd.softMs, 'work 429 rate limit')
+      } else if (status === 401 || status === 403) {
+        await disableTraeAccount(env, provider.id, account.uid, 'work session dead')
+      } else if (status === 400 && (msg.includes('credit') || msg.includes('1005') || msg.includes('4008'))) {
+        await cooldownTraeWorkAccount(env, provider.id, account.uid, cd.planMs, 'work_credits 余额不足')
+      } else {
+        await noteTraeWorkError(env, provider.id, account.uid, cd.errThreshold, cd.errMs)
+      }
+      continue
+    }
+
+    await noteTraeWorkSuccess(env, provider.id, account.uid)
+
+    // 异步探测更新该账号的真实双通道余额
+    void (async () => {
+      try {
+        const snap = await probeTraeCredits(account)
+        if (snap) {
+          await setTraeWorkCredits(env, provider.id, account.uid, snap.workCredits)
+          if (snap.workCredits <= 0) {
+            await cooldownTraeWorkAccount(env, provider.id, account.uid, cd.planMs, 'work_credits 余额不足')
+          }
+        }
+      } catch { /* ignore */ }
+    })()
+
+    if (stream) {
+      if (!resp.body) {
+        return openaiError(502, 'upstream_empty', 'upstream work returned empty body')
+      }
+      const perf = await getPerfSettings(env)
+      const keepAliveMs = perf.keepAliveMs > 0 ? perf.keepAliveMs : TRAE_KEEPALIVE_MS
+      const idleTimeoutMs = perf.idleTimeoutMs || TRAE_STREAM_IDLE_TIMEOUT_MS
+      const startedAt = Date.now()
+      let lastWorkErr: SOLOStreamError | null = null
+      const onErr = (se: SOLOStreamError) => {
+        lastWorkErr = se
+        if (se.code === 1005 || se.code === 4008) {
+          void cooldownTraeWorkAccount(env, provider.id, account.uid, cd.planMs, 'work_credits 余额不足')
+        } else {
+          void noteTraeWorkError(env, provider.id, account.uid, cd.errThreshold, cd.errMs)
+        }
+      }
+      const sseBody = withSSEKeepAlive(
+        workStreamToOpenAIStream(resp.body, workModel, onErr),
+        keepAliveMs,
+        idleTimeoutMs,
+        (reason) => {
+          const secs = Math.round((Date.now() - startedAt) / 1000)
+          const errInfo = lastWorkErr ? ` errCode=${lastWorkErr.code} errMsg=${lastWorkErr.msg}` : ''
+          const msg = `[trae-work-stream] provider=${provider.id} uid=${account.uid} model=${workModel} end=${reason} duration=${secs}s${errInfo}`
+          console.log(msg)
+          writeLog(env, 'info', msg).catch(() => {})
+        }
+      )
+      return new Response(sseBody, {
+        status: resp.status,
+        headers: {
+          'Content-Type': 'text/event-stream; charset=utf-8',
+          'Cache-Control': 'no-store',
+          'X-Accel-Buffering': 'no',
+          Connection: 'keep-alive',
+        },
+      })
+    }
+
+    // 非流式
+    const text = await resp.text().catch(() => '')
+    const agg = aggregateWorkSse(text, workModel)
+    if (agg.err) {
+      lastErr = new Error(`work stream error code=${agg.err.code} msg=${agg.err.msg}`)
+      if (agg.err.code === 1005 || agg.err.code === 4008) {
+        await cooldownTraeWorkAccount(env, provider.id, account.uid, cd.planMs, 'work_credits 余额不足')
+      } else {
+        await noteTraeWorkError(env, provider.id, account.uid, cd.errThreshold, cd.errMs)
+      }
+      continue
+    }
+
+    const out = agg.resp!
+    out['model'] = workModel
+    return new Response(JSON.stringify(out), {
+      status: 200,
+      headers: { 'Content-Type': 'application/json; charset=utf-8' },
+    })
+  }
+
+  return null
+}
+
+/**
  * TRAE 对话转发入口（在 src/proxy.ts 分发中调用）。
  * 返回 OpenAI 兼容 Response（流式 SSE / 非流式 JSON / 错误 JSON）。
  */
@@ -245,6 +434,15 @@ export async function proxyTraeChatRequest(
     return openaiError(400, 'invalid_request', (e as Error).message)
   }
   body['model'] = configName // setModelInBody：替换为 config_name
+
+  const prompt = extractLastUserPrompt(body['messages'] as any[])
+  const hasTools = Array.isArray(body['tools']) && (body['tools'] as unknown[]).length > 0
+
+  // 1. 若显式请求 Work 专属通道模型（且未携带外部自定义 tools），直接走 Work 通道
+  if (isWorkModel(model) && !hasTools) {
+    const workResp = await executeWorkRequest(env, provider, body, configName, prompt, stream)
+    if (workResp) return workResp
+  }
 
   // 特性C：模型级 remote 路由（省输入积分预算改写路径）。
   // 受 traeEnableRemoteBudget 开关控制（界面「省钱预算」开关）：开启且下方勾选了
@@ -302,8 +500,15 @@ export async function proxyTraeChatRequest(
       resp = await chatStream(account, body)
     } catch (e) {
       lastErr = e as Error
-      await applyChatError(env, provider.id, account.uid, (e as any).kind || 'client', cd)
+      const kind = (e as any).kind || 'client'
+      await applyChatError(env, provider.id, account.uid, kind, cd)
       await releaseTraeSession(env, provider.id, account.uid).catch(() => {})
+
+      // 核心容灾降级：若 SOLO 通道因额度耗尽（4008/1005 plan_limit）或限流（429 soft_rate）失败，且无自定义 tools，自动切换到 Work 通道！
+      if ((kind === 'plan_limit' || kind === 'soft_rate') && !hasTools) {
+        const fallbackResp = await executeWorkRequest(env, provider, body, configName, prompt, stream)
+        if (fallbackResp) return fallbackResp
+      }
       continue
     }
 
@@ -361,6 +566,11 @@ export async function proxyTraeChatRequest(
       lastErr = new Error(`solo stream error code=${agg.err.code} msg=${agg.err.msg}`)
       await applyStreamError(env, provider.id, account.uid, agg.err, cd)
       await releaseTraeSession(env, provider.id, account.uid).catch(() => {})
+      // 聚合发现 1005 或 4008 额度不足，自动尝试 Work 通道
+      if ((agg.err.code === 1005 || agg.err.code === 4008) && !hasTools) {
+        const fallbackResp = await executeWorkRequest(env, provider, body, configName, prompt, stream)
+        if (fallbackResp) return fallbackResp
+      }
       continue
     }
     await noteTraeSuccess(env, provider.id, account.uid)
@@ -371,6 +581,12 @@ export async function proxyTraeChatRequest(
       status: 200,
       headers: { 'Content-Type': 'application/json; charset=utf-8' },
     })
+  }
+
+  // 2. 所有 SOLO 账号均不可用（全部冷却/禁用/额度耗尽），最终尝试 Work 通道兜底
+  if (!hasTools) {
+    const fallbackResp = await executeWorkRequest(env, provider, body, configName, prompt, stream)
+    if (fallbackResp) return fallbackResp
   }
 
   const msg = 'all accounts unavailable (cooling/disabled)' + (lastErr ? ': ' + lastErr.message : '')
