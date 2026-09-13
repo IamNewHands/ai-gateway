@@ -720,5 +720,8 @@ export async function listOauthPoolStatus(env: Env, providerId: string): Promise
     successCount: pickRuntime.get(runtimeKey(providerId, a.uid))?.successCount ?? a.state?.successCount ?? 0,
     errTotal: a.state?.errTotal || 0,
     lastUsed: pickRuntime.get(runtimeKey(providerId, a.uid))?.lastUsed ?? 0,
+    // 6004 模型级限流隔离观测字段
+    softRateModel: a.state?.softRateModel || '',
+    softRateResetAt: a.state?.softRateResetAt || 0,
   }))
 }
