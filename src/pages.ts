@@ -562,13 +562,13 @@ ${H('管理')}
                   <div class="fc mt-1 field-row"><button class="btn btn-s" onclick="oauthConnect('${escapePageJsx(p.id)}')"><i class="fas fa-plug" aria-hidden="true"></i>发起连接</button><button class="btn btn-gh" onclick="fetchOauthModels('${escapePageJsx(p.id)}')"><i class="fas fa-cloud-download-alt" aria-hidden="true"></i>获取模型</button><button class="btn btn-gh" onclick="oauthStatus('${escapePageJsx(p.id)}')"><i class="fas fa-sync" aria-hidden="true"></i>状态</button><button class="btn btn-gh" onclick="oauthDisconnect('${escapePageJsx(p.id)}')"><i class="fas fa-unlink" aria-hidden="true"></i>断开</button><span id="oauth-st-${escapePageHtml(p.id)}" class="oauth-status"></span></div>
                   ${(p.oauth&&p.oauth.flowType==='browser')?`
                   <fieldset class="form-group" id="wbp-fs-${escapePageHtml(p.id)}"><legend>WorkBuddy 多账号池</legend><span class="form-helper">浏览器登录流每次成功登录都会把该账号加入账号池（按 uid 去重，多登一个 = 多个账号）。转发按三因子加权自动挑选账号（积分 / 闲置补偿 / 成功率），429/404/余额耗尽/401 等按策略冷却或禁用并轮换其他账号；无健康账号时从冷却账号选最早到期者顶班；每日签到后积分恢复自动解冻。冷却参数留空 = 默认（plan 12h / 429 60s / 连续 5 次错误冷却 10m）。reasoning_effort 透传/降级支持档位在下方「模型」列表每行的「effort」下拉里配置。</span>
-                    <div class="fc mt-1 field-row" style="flex-wrap:wrap;gap:6px"><button class="btn btn-s" onclick="oauthPoolStatus('${escapePageJsx(p.id)}')"><i class="fas fa-sync" aria-hidden="true"></i>刷新账号池</button><button class="btn btn-s" onclick="oauthConnect('${escapePageJsx(p.id)}')"><i class="fas fa-sign-in-alt" aria-hidden="true"></i>登录新账号</button><button class="btn btn-p" onclick="triggerDailyTasks('${escapePageJsx(p.id)}')"><i class="fas fa-tasks" aria-hidden="true"></i>一键日常（签到+活跃+旅行）</button><button class="btn btn-gh btn-xs" onclick="triggerActivityReport('${escapePageJsx(p.id)}')"><i class="fas fa-comments" aria-hidden="true"></i>活跃上报</button><button class="btn btn-gh btn-xs" onclick="triggerCatTravel('${escapePageJsx(p.id)}')"><i class="fas fa-cat" aria-hidden="true"></i>猫猫旅行</button><span id="wbp-st-${escapePageHtml(p.id)}" class="oauth-status"></span></div>
+                    <div class="fc mt-1 field-row" style="flex-wrap:wrap;gap:6px"><button class="btn btn-s" onclick="oauthPoolStatus('${escapePageJsx(p.id)}')"><i class="fas fa-sync" aria-hidden="true"></i>刷新账号池</button><button class="btn btn-s" onclick="oauthConnect('${escapePageJsx(p.id)}')"><i class="fas fa-sign-in-alt" aria-hidden="true"></i>登录新账号</button><button class="btn btn-gh btn-xs" onclick="oauthPoolExportModal('${escapePageJsx(p.id)}')"><i class="fas fa-file-export" aria-hidden="true"></i>导出凭证/Token</button><button class="btn btn-p" onclick="triggerDailyTasks('${escapePageJsx(p.id)}')"><i class="fas fa-tasks" aria-hidden="true"></i>一键日常（签到+活跃+旅行）</button><button class="btn btn-gh btn-xs" onclick="triggerActivityReport('${escapePageJsx(p.id)}')"><i class="fas fa-comments" aria-hidden="true"></i>活跃上报</button><button class="btn btn-gh btn-xs" onclick="triggerCatTravel('${escapePageJsx(p.id)}')"><i class="fas fa-cat" aria-hidden="true"></i>猫猫旅行</button><span id="wbp-st-${escapePageHtml(p.id)}" class="oauth-status"></span></div>
                     <div id="wbp-acc-${escapePageHtml(p.id)}" class="mt-1"></div>
                     <div class="fc mt-1 field-row" style="gap:8px"><input type="number" id="cd-plan-${escapePageHtml(p.id)}" value="${p.cooldown&&p.cooldown.planMs?Math.round(p.cooldown.planMs/60000):''}" style="width:88px" placeholder="plan冷却(分)"><input type="number" id="cd-soft-${escapePageHtml(p.id)}" value="${p.cooldown&&p.cooldown.softMs?Math.round(p.cooldown.softMs/1000):''}" style="width:88px" placeholder="429冷却(秒)"><input type="number" id="cd-err-${escapePageHtml(p.id)}" value="${p.cooldown&&p.cooldown.errThreshold?p.cooldown.errThreshold:''}" style="width:76px" placeholder="错误阈值"><input type="number" id="cd-errms-${escapePageHtml(p.id)}" value="${p.cooldown&&p.cooldown.errMs?Math.round(p.cooldown.errMs/60000):''}" style="width:88px" placeholder="错误冷却(分)"><span class="mu" style="font-size:12px">冷却参数（保存后生效）</span></div>
                   </fieldset>`:''}
                   ${(p.oauth&&p.oauth.flowType==='qoder')||p.id==='qoder'?`
                   <fieldset class="form-group" id="qdp-fs-${escapePageHtml(p.id)}"><legend>Qoder 多账号池</legend><span class="form-helper">设备授权流每次成功登录都会把该账号加入账号池（按 user_id 去重，多登一个 = 多个账号）。转发按剩余积分自动挑选账号，额度耗尽/429/鉴权失败按策略冷却或禁用并自动轮换下一个账号；每日签到后积分恢复自动解冻。冷却参数留空 = 默认（额度耗尽 12h / 429 60s / 连续 5 次错误冷却 10m）。</span>
-                    <div class="fc mt-1 field-row"><button class="btn btn-s" onclick="qoderPoolStatus('${escapePageJsx(p.id)}')"><i class="fas fa-sync" aria-hidden="true"></i>刷新账号池</button><button class="btn btn-s" onclick="oauthConnect('${escapePageJsx(p.id)}')"><i class="fas fa-sign-in-alt" aria-hidden="true"></i>登录新账号</button><button class="btn btn-p" onclick="triggerCheckin('${escapePageJsx(p.id)}')"><i class="fas fa-calendar-check" aria-hidden="true"></i>立即签到</button><span id="qdp-st-${escapePageHtml(p.id)}" class="oauth-status"></span></div>
+                    <div class="fc mt-1 field-row"><button class="btn btn-s" onclick="qoderPoolStatus('${escapePageJsx(p.id)}')"><i class="fas fa-sync" aria-hidden="true"></i>刷新账号池</button><button class="btn btn-s" onclick="oauthConnect('${escapePageJsx(p.id)}')"><i class="fas fa-sign-in-alt" aria-hidden="true"></i>登录新账号</button><button class="btn btn-gh btn-xs" onclick="oauthPoolExportModal('${escapePageJsx(p.id)}')"><i class="fas fa-file-export" aria-hidden="true"></i>导出凭证/Token</button><button class="btn btn-p" onclick="triggerCheckin('${escapePageJsx(p.id)}')"><i class="fas fa-calendar-check" aria-hidden="true"></i>立即签到</button><span id="qdp-st-${escapePageHtml(p.id)}" class="oauth-status"></span></div>
                     <div id="qdp-acc-${escapePageHtml(p.id)}" class="mt-1"></div>
                     <div class="fc mt-1 field-row" style="gap:8px"><input type="number" id="cd-plan-${escapePageHtml(p.id)}" value="${p.cooldown&&p.cooldown.planMs?Math.round(p.cooldown.planMs/60000):''}" style="width:88px" placeholder="额度耗尽冷却(分)"><input type="number" id="cd-soft-${escapePageHtml(p.id)}" value="${p.cooldown&&p.cooldown.softMs?Math.round(p.cooldown.softMs/1000):''}" style="width:88px" placeholder="429冷却(秒)"><input type="number" id="cd-err-${escapePageHtml(p.id)}" value="${p.cooldown&&p.cooldown.errThreshold?p.cooldown.errThreshold:''}" style="width:76px" placeholder="错误阈值"><input type="number" id="cd-errms-${escapePageHtml(p.id)}" value="${p.cooldown&&p.cooldown.errMs?Math.round(p.cooldown.errMs/60000):''}" style="width:88px" placeholder="错误冷却(分)"><span class="mu" style="font-size:12px">冷却参数（保存后生效）</span></div>
                   </fieldset>`:''}
@@ -1945,7 +1945,10 @@ function renderOauthPoolAccounts(id, accs, ciByUid, ciByNick, ciAccounts, prefer
       modelRateBadge = ' <span class="bd bd-warn" title="模型 ' + escapeHtml(a.softRateModel) + ' 限流至 ' + resetTimeStr + '">模型限流(' + escapeHtml(a.softRateModel) + ')</span>'
     }
     line += ' ' + coolBadge + modelRateBadge + '<span class="mu">' + coolDetail + '</span>'
-    return '<div class="fc mb-2 field-row" style="align-items:flex-start"><div class="fx1" style="font-size:12px;min-width:0"><div>' + line + ' ' + ciBadge + '</div>' + creditLine + pkgHtml + '</div><button class="btn btn-gh btn-xs" onclick="oauthPoolRemove(\\'' + escapeJsAttr(id) + '\\',\\'' + escapeJsAttr(a.uid) + '\\')"><i class="fas fa-trash" aria-hidden="true"></i>移除</button></div>'
+    if (a.tokenMask) {
+      line += ' · <code class="mu" style="font-size:11px" title="已存储于网关 KV">Token: ' + escapeHtml(a.tokenMask) + '</code>'
+    }
+    return '<div class="fc mb-2 field-row" style="align-items:flex-start"><div class="fx1" style="font-size:12px;min-width:0"><div>' + line + ' ' + ciBadge + '</div>' + creditLine + pkgHtml + '</div><div class="fc" style="gap:4px"><button class="btn btn-gh btn-xs" onclick="oauthPoolCopyToken(\\'' + escapeJsAttr(id) + '\\',\\'' + escapeJsAttr(a.uid) + '\\')" title="复制 Access Token"><i class="fas fa-copy" aria-hidden="true"></i>复制Token</button><button class="btn btn-gh btn-xs" onclick="oauthPoolRemove(\\'' + escapeJsAttr(id) + '\\',\\'' + escapeJsAttr(a.uid) + '\\')"><i class="fas fa-trash" aria-hidden="true"></i>移除</button></div></div>'
   }).join('')
   // 绑定权益包折叠按钮（与签到区相同的 toggleCollapse 交互）
   box.querySelectorAll('[data-pkg]').forEach(function(btn) {
@@ -1983,6 +1986,72 @@ function oauthPoolSetPrefer(id, forcedUid) {
     if (sel) sel.value = uid
     setTimeout(function () { oauthPoolStatus(id) }, 800)
   }).catch(function() { if (msg) { msg.textContent = '网络错误，请重试'; msg.style.color = 'var(--color-danger,#ef4444)' } })
+}
+
+// ===== 账号池 Token 复制与全量导出 =====
+function oauthPoolCopyToken(id, uid) {
+  fetch('/admin/api/oauth/' + encodeURIComponent(id) + '/pool/export?uid=' + encodeURIComponent(uid))
+    .then(r => r.json())
+    .then(function(d) {
+      if (!d.success || !Array.isArray(d.data) || !d.data[0] || !d.data[0].access_token) {
+        toast('未找到该账号的 Access Token', 'error')
+        return
+      }
+      const token = d.data[0].access_token
+      navigator.clipboard.writeText(token).then(function() {
+        toast('账号 ' + (d.data[0].nickname || uid) + ' 的 Token 已复制到剪贴板', 'success')
+      }).catch(function() {
+        toast('复制失败，请重试', 'error')
+      })
+    }).catch(function() { toast('网络错误，获取 Token 失败', 'error') })
+}
+function oauthPoolExportModal(id) {
+  showM('<h3><i class="fas fa-spinner fa-spin c-p"></i> 加载凭证与 Token…</h3><p class="mu">正在从网关 KV 读取完整凭证…</p>')
+  fetch('/admin/api/oauth/' + encodeURIComponent(id) + '/pool/export')
+    .then(r => r.json())
+    .then(function(d) {
+      if (!d.success || !Array.isArray(d.data) || d.data.length === 0) {
+        showM('<h3><i class="fas fa-exclamation-triangle c-d"></i> 暂无可导出的账号</h3><p>账号池为空或未登录任何账号。</p><div class="fa"><button class="btn btn-p" onclick="closeM()">关闭</button></div>')
+        return
+      }
+      const accs = d.data
+      const jsonStr = JSON.stringify(accs, null, 2)
+      let h = '<h3><i class="fas fa-file-export c-p"></i> 导出账号凭证与 Token</h3>'
+      h += '<p class="mu" style="font-size:12px;margin-bottom:8px">共 ' + accs.length + ' 个账号凭证。格式已自动适配 <code>scripts/workbuddy/</code> 脚本库，可直接保存至 <code>auths/</code> 目录使用。</p>'
+      h += '<div class="fc mb-2" style="gap:8px;flex-wrap:wrap">'
+      h += '<button class="btn btn-p btn-xs" onclick="copyText(window.__lastExportJson, this)"><i class="fas fa-copy" aria-hidden="true"></i> 复制全部 JSON</button>'
+      h += '<a class="btn btn-s btn-xs" href="/admin/api/oauth/' + encodeURIComponent(id) + '/pool/export?download=1" download><i class="fas fa-download" aria-hidden="true"></i> 下载完整 JSON 文件</a>'
+      h += '</div>'
+
+      h += '<div style="max-height:280px;overflow-y:auto;border:1px solid var(--color-rule);border-radius:6px;padding:8px;margin-bottom:10px;background:var(--color-paper-2)">'
+      accs.forEach(function(a, idx) {
+        const singleJson = JSON.stringify(a, null, 2)
+        window['__exportJson_' + idx] = singleJson
+        window['__exportTok_' + idx] = a.access_token || ''
+        h += '<div style="padding:6px 0;' + (idx > 0 ? 'border-top:1px dashed var(--color-rule);' : '') + '">'
+        h += '<div class="fc" style="justify-content:space-between;align-items:center;font-size:12px">'
+        h += '<strong>' + escapeHtml(a.nickname || a.uid) + '</strong><span class="mu">UID: ' + escapeHtml(a.uid) + '</span>'
+        h += '<div class="fc" style="gap:4px">'
+        h += '<button class="btn btn-gh btn-xs" onclick="copyText(window.__exportTok_' + idx + ', this)" title="复制 Token"><i class="fas fa-key"></i> 复制Token</button>'
+        h += '<a class="btn btn-gh btn-xs" href="/admin/api/oauth/' + encodeURIComponent(id) + '/pool/export?uid=' + encodeURIComponent(a.uid) + '&download=1" download title="下载此账号 JSON"><i class="fas fa-download"></i> 下载JSON</a>'
+        h += '</div>'
+        h += '</div>'
+        h += '<div class="fc mt-1 field-row" style="align-items:center;gap:6px">'
+        h += '<input type="password" id="exp-tok-' + idx + '" value="' + escapeHtml(a.access_token || '') + '" readonly style="font-size:11px;padding:2px 6px;flex:1;font-family:monospace">'
+        h += '<button class="icon-btn" onclick="toggleKeyText(this)" title="查看/隐藏 Token"><i class="fas fa-eye"></i></button>'
+        h += '</div>'
+        h += '</div>'
+      })
+      h += '</div>'
+
+      h += '<div class="fg" style="margin-bottom:8px"><label style="font-size:12px">全部账号 JSON 预览</label><textarea readonly rows="5" style="font-size:11px;font-family:monospace;width:100%">' + escapeHtml(jsonStr) + '</textarea></div>'
+      h += '<div class="fa"><button class="btn btn-p" onclick="closeM()">关闭</button></div>'
+
+      window.__lastExportJson = jsonStr
+      showM(h)
+    }).catch(function() {
+      showM('<h3><i class="fas fa-exclamation-triangle c-d"></i> 导出失败</h3><p>网络或服务错误，无法读取账号凭证。</p><div class="fa"><button class="btn btn-p" onclick="closeM()">关闭</button></div>')
+    })
 }
 
 // ===== Qoder 多账号池：状态 / 移除 =====
@@ -2045,7 +2114,10 @@ function renderQoderPoolAccounts(id, accs, ciByUid, ciAccounts) {
     else if (a.cooling && a.until) coolDetail = ' 冷却至 ' + new Date(a.until).toLocaleString() + (a.reason ? '（' + escapeHtml(a.reason) + '）' : '')
     else if (a.reason) coolDetail = '（上次：' + escapeHtml(a.reason) + '）'
     line += ' ' + coolBadge + '<span class="mu">' + coolDetail + '</span>'
-    return '<div class="fc mb-2 field-row" style="align-items:flex-start"><div class="fx1" style="font-size:12px;min-width:0"><div>' + line + ' ' + ciBadge + '</div>' + creditLine + '</div><button class="btn btn-gh btn-xs" onclick="oauthPoolRemove(\\'' + escapeJsAttr(id) + '\\',\\'' + escapeJsAttr(a.uid) + '\\')"><i class="fas fa-trash" aria-hidden="true"></i>移除</button></div>'
+    if (a.tokenMask) {
+      line += ' · <code class="mu" style="font-size:11px" title="已存储于网关 KV">Token: ' + escapeHtml(a.tokenMask) + '</code>'
+    }
+    return '<div class="fc mb-2 field-row" style="align-items:flex-start"><div class="fx1" style="font-size:12px;min-width:0"><div>' + line + ' ' + ciBadge + '</div>' + creditLine + '</div><div class="fc" style="gap:4px"><button class="btn btn-gh btn-xs" onclick="oauthPoolCopyToken(\\'' + escapeJsAttr(id) + '\\',\\'' + escapeJsAttr(a.uid) + '\\')" title="复制 Access Token"><i class="fas fa-copy" aria-hidden="true"></i>复制Token</button><button class="btn btn-gh btn-xs" onclick="oauthPoolRemove(\\'' + escapeJsAttr(id) + '\\',\\'' + escapeJsAttr(a.uid) + '\\')"><i class="fas fa-trash" aria-hidden="true"></i>移除</button></div></div>'
   }).join('')
 }
 /** 收集冷却参数（trae / workbuddy 池共用 cd-* 输入）；无输入框返回 undefined，全空返回 null（恢复默认）。 */

@@ -723,5 +723,6 @@ export async function listOauthPoolStatus(env: Env, providerId: string): Promise
     // 6004 模型级限流隔离观测字段
     softRateModel: a.state?.softRateModel || '',
     softRateResetAt: a.state?.softRateResetAt || 0,
+    tokenMask: a.token?.access_token ? `${a.token.access_token.slice(0, 8)}••••${a.token.access_token.slice(-6)}` : '',
   }))
 }

@@ -35,8 +35,8 @@ import { fetchGeminiQuota } from './gemini/quota'
 import { isCnbProvider, testCnbConnection, CNB_MODELS } from './cnb/proxy'
 import { PROXY_KEY_PREFIX, EXPIRY_OPTIONS, OPENCODE_DEFAULT_URL } from './config'
 import { startOauthDeviceFlow, pollOauthDeviceFlow, readOauthToken, deleteOauthToken, getOauthAccessToken, buildOauthHeaders, detectTokenRealm, submitOauthGeminiCallback, submitOauthM365Callback, submitOauthM365ROPC, OAUTH_POOL_KV_PREFIX } from './oauth'
-import { isOAuthPoolProvider, seedOauthPoolFromSingle, listOauthPoolStatus, removeOauthAccount } from './oauth-pool'
-import { seedQoderPoolFromSingle, listQoderPoolStatus, removeQoderAccount } from './qoder/pool'
+import { isOAuthPoolProvider, seedOauthPoolFromSingle, listOauthPoolStatus, removeOauthAccount, readOauthPool } from './oauth-pool'
+import { seedQoderPoolFromSingle, listQoderPoolStatus, removeQoderAccount, readQoderPool } from './qoder/pool'
 import { isM365Provider, M365_MODELS, testM365Model } from './m365/proxy'
 import { isZcodeProvider, testZcodeModel, buildZcodeHeaders, ZCODE_MODELS, fetchZcodeModels } from './zcode/proxy'
 import { listSessions as listM365Sessions, deleteSession as deleteM365Session } from './m365/session'
@@ -58,6 +58,7 @@ import type {
   CreateProxyKeyRequest,
   TestModelRequest,
   OAuthDeviceConfig,
+  OAuthTokenState,
   McpServer,
   UniModel,
 } from './types'
@@ -1336,6 +1337,97 @@ export async function handleOAuthPoolSetPrefer(c: Context<AppEnv>) {
   }
   await updateProvider(c.env, id, { preferOauthUid: uid || undefined })
   return c.json<ApiResponse>({ success: true, message: uid ? '已指定首选账号 ' + uid : '已恢复自动挑选' })
+}
+
+/** GET /admin/api/oauth/:id/pool/export：导出账号池完整凭证与 Token。
+ *  支持 query param ?uid=... 过滤单账号，?download=1 直接下发 JSON 附件。
+ *  输出数据同时兼容 scripts/workbuddy/ 脚本库读取与外部调用。
+ */
+export async function handleOAuthPoolExport(c: Context<AppEnv>) {
+  const id = c.req.param('id')
+  if (!id) return c.json<ApiResponse>({ success: false, message: '缺少 id 参数' }, 400)
+  const provider = await getProvider(c.env, id)
+  if (!provider) return c.json<ApiResponse>({ success: false, message: '提供商不存在' }, 404)
+
+  const isQoder = provider.oauth?.flowType === 'qoder' || isQoderProvider(provider.id)
+  const isWb = isOAuthPoolProvider(provider)
+
+  let rawList: Array<{ uid: string; nickname?: string; token?: OAuthTokenState }> = []
+
+  if (isWb) {
+    try { await seedOauthPoolFromSingle(c.env, id) } catch { /* ignore */ }
+    const pool = await readOauthPool(c.env, id)
+    for (const a of pool) {
+      rawList.push({ uid: a.uid, nickname: a.nickname, token: a.token })
+    }
+  } else if (isQoder) {
+    try { await seedQoderPoolFromSingle(c.env, id) } catch { /* ignore */ }
+    const pool = await readQoderPool(c.env, id)
+    for (const a of pool) {
+      rawList.push({ uid: a.uid, nickname: a.nickname, token: a.token })
+    }
+  }
+
+  // 若池为空，回退尝试读取单 token
+  if (rawList.length === 0) {
+    const single = await readOauthToken(c.env, id)
+    if (single) {
+      rawList.push({
+        uid: single.uid || id,
+        nickname: single.email || single.uid || id,
+        token: single,
+      })
+    }
+  }
+
+  const reqUid = c.req.query('uid')?.trim()
+  if (reqUid) {
+    rawList = rawList.filter(x => x.uid === reqUid)
+    if (rawList.length === 0) {
+      return c.json<ApiResponse>({ success: false, message: '未找到指定 UID 的账号凭证' }, 404)
+    }
+  }
+
+  const exported = rawList.map(item => {
+    const t = (item.token || {}) as OAuthTokenState
+    const tokenStr = t.access_token || ''
+    const domain = t.domain || ''
+    return {
+      uid: item.uid,
+      nickname: item.nickname || item.uid,
+      access_token: tokenStr,
+      refresh_token: t.refresh_token || '',
+      expires_at: t.expires_at || 0,
+      domain,
+      enterprise_id: t.enterprise_id || '',
+      device_token: t.device_token || '',
+      // workbuddy2api 格式
+      auth: {
+        accessToken: tokenStr,
+        refreshToken: t.refresh_token || '',
+        domain: domain,
+      },
+      account: {
+        uid: item.uid,
+        nickname: item.nickname || item.uid,
+      },
+      // ai-gateway 原始 token 结构
+      token: t,
+    }
+  })
+
+  if (c.req.query('download') === '1') {
+    const filename = reqUid ? `workbuddy-${reqUid}.json` : `${id}-accounts.json`
+    return new Response(JSON.stringify(reqUid && exported[0] ? exported[0] : exported, null, 2), {
+      status: 200,
+      headers: {
+        'Content-Type': 'application/json; charset=utf-8',
+        'Content-Disposition': `attachment; filename="${filename}"`,
+      },
+    })
+  }
+
+  return c.json<ApiResponse>({ success: true, data: exported })
 }
 
 /** GET /admin/api/oauth/:id/gemini-quota：Gemini（Antigravity 链路）账号额度（订阅档位 + 5h/周窗口 + 按模型剩余）。

@@ -252,6 +252,7 @@ export async function listQoderPoolStatus(env: Env, providerId: string): Promise
     errCount: a.state?.errCount || 0,
     tokenExpiresAt: a.token?.expires_at || 0,
     updatedAt: a.updatedAt || 0,
+    tokenMask: a.token?.access_token ? `${a.token.access_token.slice(0, 8)}••••${a.token.access_token.slice(-6)}` : '',
   }))
 }
 

@@ -27,6 +27,7 @@ import {
   handleOAuthDisconnect,
   handleOAuthPoolRemove,
   handleOAuthPoolSetPrefer,
+  handleOAuthPoolExport,
   handleOAuthModels,
   handleClineModelSync,
   handleZcodeModelSync,
@@ -215,6 +216,8 @@ app.post('/admin/api/oauth/:id/disconnect', handleOAuthDisconnect)
 app.post('/admin/api/oauth/:id/pool/remove', handleOAuthPoolRemove)
 // WorkBuddy 多账号池：设置首选账号（面板手工指定，留空恢复自动挑选）
 app.post('/admin/api/oauth/:id/pool/prefer', handleOAuthPoolSetPrefer)
+// 账号池凭证导出（Token / JSON）
+app.get('/admin/api/oauth/:id/pool/export', handleOAuthPoolExport)
 // WorkBuddy 生态任务：活跃上报、猫猫旅行巡检、一键日常（签到+活跃+旅行）
 app.post('/admin/api/oauth/:id/activity', handleOAuthActivity)
 app.post('/admin/api/oauth/:id/travel', handleOAuthTravel)
