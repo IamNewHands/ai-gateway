@@ -2302,11 +2302,13 @@ function traeStatus(id) {
             : '<span class="bd bd-danger">失败</span>'
           const ciTip = ci && ci.message ? ' title="' + escapeHtml(ci.message) + '"' : ''
 
-          const soloCredits = typeof a.credits === 'number' ? a.credits : 0
+          const rawSolo = typeof a.credits === 'number' ? a.credits : 0
+          const soloCredits = Math.round(rawSolo) === rawSolo ? rawSolo : Number(rawSolo.toFixed(2))
           const hasWork = typeof a.workCredits === 'number'
-          const workVal = hasWork ? a.workCredits : '未探测'
-          const soloBadge = '<span class="bd ' + (soloCredits > 0 ? 'bd-on' : 'bd-off') + '" title="通用积分 (SOLO 通道)">' + soloCredits + '</span>'
-          const workBadge = '<span class="bd ' + (hasWork && a.workCredits > 0 ? 'bd-on' : 'bd-off') + '" title="' + (hasWork ? 'Work 专属通道可用额度' : '点击「刷新积分」或「全部签到」探测') + '">' + workVal + '</span>'
+          const rawWork = hasWork ? a.workCredits : null
+          const workVal = hasWork && rawWork !== null ? (Math.round(rawWork) === rawWork ? rawWork : Number(rawWork.toFixed(2))) : '未探测'
+          const soloBadge = '<span class="bd ' + (rawSolo > 0 ? 'bd-on' : 'bd-off') + '" title="通用积分 (SOLO 通道): ' + rawSolo + '">' + soloCredits + '</span>'
+          const workBadge = '<span class="bd ' + (hasWork && (rawWork || 0) > 0 ? 'bd-on' : 'bd-off') + '" title="' + (hasWork ? 'Work 专属通道可用额度: ' + rawWork : '点击「刷新积分」或「全部签到」探测') + '">' + workVal + '</span>'
 
           return '<tr><td><code>' + escapeHtml(a.uid) + '</code></td><td>' + escapeHtml(a.nickname || '-') + '</td>' +
             '<td>' + soloBadge + '</td><td>' + workBadge + '</td><td' + ciTip + '>' + ciTxt + '</td><td>' + stTxt + reasonHtml + '</td><td>' + until + '</td>' +

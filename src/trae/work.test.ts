@@ -3,6 +3,9 @@ import {
   extractLastUserPrompt,
   buildNativeTaskPayload,
   classifyTraeError,
+  extractCreditsFromChunk,
+  probeTraeCredits,
+  fetchUserEntUsageDetails,
 } from './upstream'
 import {
   workStreamToOpenAIStream,
@@ -394,6 +397,179 @@ describe('Trae Work: 容灾降级与请求路由端到端 (proxyTraeChatRequest)
 
       const json = await resp.json() as any
       expect(json.choices[0].message.content).toBe('Answered via Work Failover')
+    } finally {
+      globalThis.fetch = originalFetch
+    }
+  })
+})
+
+describe('Trae Work: 积分块提取器 (extractCreditsFromChunk)', () => {
+  it('从标准 SSE 块中提取 cn_credits_remain_info', () => {
+    const chunk = 'data: {"cn_credits_remain_info":{"ide_credits":3487.3464,"work_credits":50.0}}\n\n'
+    const snap = extractCreditsFromChunk(chunk)
+    expect(snap).not.toBeNull()
+    expect(snap?.ideCredits).toBe(3487.3464)
+    expect(snap?.workCredits).toBe(50)
+  })
+
+  it('提取为 0 的 workCredits 并保留高精度 ideCredits', () => {
+    const chunk = 'data: {"cn_credits_remain_info":{"ide_credits":3047.4284,"work_credits":0}}\n\n'
+    const snap = extractCreditsFromChunk(chunk)
+    expect(snap).not.toBeNull()
+    expect(snap?.ideCredits).toBe(3047.4284)
+    expect(snap?.workCredits).toBe(0)
+  })
+
+  it('从转义 JSON 字符串中精准提取', () => {
+    const chunk = 'event: message\ndata: "{\\"cn_credits_remain_info\\":{\\"ide_credits\\":120.5,\\"work_credits\\":88.2}}"\n\n'
+    const snap = extractCreditsFromChunk(chunk)
+    expect(snap).not.toBeNull()
+    expect(snap?.ideCredits).toBe(120.5)
+    expect(snap?.workCredits).toBe(88.2)
+  })
+
+  it('无积分信息时返回 null', () => {
+    const chunk = 'data: {"choices":[{"delta":{"content":"hello"}}]}\n\n'
+    expect(extractCreditsFromChunk(chunk)).toBeNull()
+  })
+})
+
+describe('Trae Work: 权益包分类 (fetchUserEntUsageDetails)', () => {
+  const testAccount: TraeAccount = {
+    uid: 'u_ent_1',
+    accessToken: 'tok_ent',
+    refreshToken: 'ref_ent',
+    expiresAt: Date.now() + 10000,
+    deviceId: 'dev_ent',
+  }
+
+  it('正确识别包含中文工作台与 Agent 的专属包', async () => {
+    const originalFetch = globalThis.fetch
+    globalThis.fetch = async () => {
+      return new Response(JSON.stringify({
+        user_entitlement_pack_list: [
+          {
+            entitlement_base_info: { name: '通用日常包', quota: { credits_limit: 3000 } },
+            usage: { credits_amount: 100.5 },
+          },
+          {
+            entitlement_base_info: { name: 'Work工作台专属包', quota: { credits_limit: 500 } },
+            usage: { credits_amount: 50 },
+          },
+          {
+            entitlement_base_info: { name: '高级Agent特权', quota: { credits_limit: 200 } },
+            usage: { credits_amount: 10 },
+          },
+        ],
+      }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+    }
+
+    try {
+      const res = await fetchUserEntUsageDetails(testAccount)
+      // 通用包: 3000 - 100.5 = 2899.5
+      expect(res.ideCredits).toBe(2899.5)
+      // Work 包: (500 - 50) + (200 - 10) = 450 + 190 = 640
+      expect(res.workCredits).toBe(640)
+      expect(res.total).toBe(2899.5 + 640)
+    } finally {
+      globalThis.fetch = originalFetch
+    }
+  })
+})
+
+describe('Trae Work: 双通道实时探针 (probeTraeCredits)', () => {
+  const testAccount: TraeAccount = {
+    uid: 'u_probe_1',
+    accessToken: 'tok_probe',
+    refreshToken: 'ref_probe',
+    expiresAt: Date.now() + 10000,
+    deviceId: 'dev_probe',
+  }
+
+  it('优先在 api5-normal.mchost.guru 节点通过 Work 探针获取双通道积分', async () => {
+    const originalFetch = globalThis.fetch
+    let requestedHost = ''
+    let requestedAppId = ''
+
+    globalThis.fetch = async (input: any, init?: any) => {
+      requestedHost = String(input)
+      requestedAppId = (init?.headers as any)?.['X-App-Id'] || ''
+      const body = 'data: {"cn_credits_remain_info":{"ide_credits":3487.3464,"work_credits":100.0}}\n\n'
+      return new Response(body, {
+        status: 200,
+        headers: { 'Content-Type': 'text/event-stream' },
+      })
+    }
+
+    try {
+      const snap = await probeTraeCredits(testAccount)
+      expect(requestedHost).toContain('api5-normal.mchost.guru')
+      expect(requestedAppId).toBe('6eefa01c-1036-4c7e-9ca5-d891f63bfcd8')
+      expect(snap).not.toBeNull()
+      expect(snap?.ideCredits).toBe(3487.3464)
+      expect(snap?.workCredits).toBe(100)
+    } finally {
+      globalThis.fetch = originalFetch
+    }
+  })
+
+  it('首选节点网络异常时，平滑回退至备选节点探测', async () => {
+    const originalFetch = globalThis.fetch
+    let callCount = 0
+
+    globalThis.fetch = async (input: any) => {
+      callCount++
+      const url = String(input)
+      if (url.includes('api5-normal.mchost.guru')) {
+        throw new Error('Connection timeout')
+      }
+      if (url.includes('trae-api-cn.mchost.guru')) {
+        const body = 'data: {"cn_credits_remain_info":{"ide_credits":2500.0,"work_credits":60.0}}\n\n'
+        return new Response(body, {
+          status: 200,
+          headers: { 'Content-Type': 'text/event-stream' },
+        })
+      }
+      return new Response('not found', { status: 404 })
+    }
+
+    try {
+      const snap = await probeTraeCredits(testAccount)
+      expect(callCount).toBeGreaterThanOrEqual(2)
+      expect(snap).not.toBeNull()
+      expect(snap?.ideCredits).toBe(2500)
+      expect(snap?.workCredits).toBe(60)
+    } finally {
+      globalThis.fetch = originalFetch
+    }
+  })
+
+  it('当 Work 探针返回 4008 额度耗尽时，判定 workCredits 为 0 并拉取通用积分', async () => {
+    const originalFetch = globalThis.fetch
+
+    globalThis.fetch = async (input: any) => {
+      const url = String(input)
+      if (url.includes('/api/agent/v3/llm_utils_chat')) {
+        return new Response(JSON.stringify({ code: 4008, message: 'Work quota exhausted' }), { status: 400 })
+      }
+      if (url.includes('/trae/api/v2/pay/ide_user_ent_usage')) {
+        return new Response(JSON.stringify({
+          user_entitlement_pack_list: [
+            {
+              entitlement_base_info: { name: 'SOLO通用包', quota: { credits_limit: 3487.3464 } },
+              usage: { credits_amount: 0 },
+            },
+          ],
+        }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      }
+      return new Response('not found', { status: 404 })
+    }
+
+    try {
+      const snap = await probeTraeCredits(testAccount)
+      expect(snap).not.toBeNull()
+      expect(snap?.workCredits).toBe(0)
+      expect(snap?.ideCredits).toBe(3487.3464)
     } finally {
       globalThis.fetch = originalFetch
     }

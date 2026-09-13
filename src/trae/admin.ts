@@ -562,6 +562,9 @@ export async function handleTraeCreditsRefresh(c: Context<AppEnv>) {
       results.push({ uid: a.uid, success: false, error: (e as Error).message })
     }
   }
+  try {
+    await writeLog(c.env, 'info', `[trae] ${provider.name} 积分刷新完成: ${results.length} 个账号`, JSON.stringify(results))
+  } catch { /* ignore */ }
   return c.json<ApiResponse>({
     success: true,
     message: `已刷新 ${results.length} 个账号的通用与 Work 积分`,

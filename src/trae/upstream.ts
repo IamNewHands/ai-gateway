@@ -495,8 +495,23 @@ export async function fetchUserEntUsageDetails(account: TraeAccount): Promise<{ 
     const limit = Number(quota?.credits_limit) || 0
     const rem = Math.max(0, limit - used)
     total += rem
-    const packName = (p?.entitlement_base_info?.name || p?.pack_name || p?.entitlement_base_info?.pack_name || '').toLowerCase()
-    if (packName.includes('work')) {
+    const packName = (
+      p?.entitlement_base_info?.name ||
+      p?.entitlement_base_info?.pack_name ||
+      p?.pack_name ||
+      p?.pack_type_name ||
+      ''
+    ).toLowerCase()
+    const isWorkPack =
+      packName.includes('work') ||
+      packName.includes('agent') ||
+      packName.includes('工作') ||
+      packName.includes('专属') ||
+      packName.includes('专享') ||
+      p?.pack_type === 2 ||
+      p?.biz_type === 'work' ||
+      p?.entitlement_base_info?.biz_type === 'work'
+    if (isWorkPack) {
       workCredits += rem
     } else {
       ideCredits += rem
@@ -664,12 +679,60 @@ export async function chatWorkStream(
   return response
 }
 
+/** 从 SSE 数据块或 JSON 响应中提取 cn_credits_remain_info (双通道积分快照) */
+export function extractCreditsFromChunk(text: string): TraeCreditsSnapshot | null {
+  if (!text) return null
+  // 1. 正则匹配 cn_credits_remain_info 对象（兼容常规 JSON 与转义引号）
+  const hit = /\\?"cn_credits_remain_info\\?"\s*:\s*\\?\{([^}]+)\\?\}/.exec(text)
+  if (hit) {
+    const inner = hit[1]
+    const ideHit = /\\?"ide_credits\\?"\s*:\s*([0-9.]+)/.exec(inner)
+    const workHit = /\\?"work_credits\\?"\s*:\s*([0-9.]+)/.exec(inner)
+    if (ideHit || workHit) {
+      return {
+        ideCredits: ideHit ? Number(ideHit[1]) : 0,
+        workCredits: workHit ? Number(workHit[1]) : 0,
+      }
+    }
+  }
+
+  // 2. SSE data 行切分反序列化
+  const lines = text.split('\n')
+  for (const rawLine of lines) {
+    const trimmed = rawLine.trim()
+    if (!trimmed.startsWith('data:')) continue
+    const payload = trimmed.slice(5).trim()
+    if (!payload || payload === '[DONE]') continue
+    try {
+      const obj = JSON.parse(payload)
+      const info =
+        obj?.cn_credits_remain_info ||
+        obj?.data?.cn_credits_remain_info ||
+        obj?.payload?.cn_credits_remain_info
+      if (info && typeof info === 'object') {
+        const ide = Number(info.ide_credits)
+        const work = Number(info.work_credits)
+        return {
+          ideCredits: Number.isFinite(ide) ? ide : 0,
+          workCredits: Number.isFinite(work) ? work : 0,
+        }
+      }
+    } catch {
+      // 容错非标准 JSON
+    }
+  }
+
+  return null
+}
+
 /**
  * 实时探测双通道积分余额 (ide_credits vs work_credits)。
- * 发送轻量 ping 请求提取 cn_credits_remain_info。
+ * 1. 优先通过 Work 专有节点 (api5-normal.mchost.guru) 以 workHeaders 发送 ping 请求；
+ * 2. 次选备用节点 (trae-api-cn.mchost.guru) 探测；若返回 4008 则确认账号有效但 Work 额度为 0；
+ * 3. 若 Work 模型 ping 均受阻，平滑回退至 SOLO 免费通道模型 (glm-5.2) 提取 cn_credits_remain_info。
  */
 export async function probeTraeCredits(account: TraeAccount): Promise<TraeCreditsSnapshot | null> {
-  const pingPayload = {
+  const pingWorkPayload = {
     function: TRAE_WORK_CONSTANTS.WorkAgentType,
     config_name: TRAE_WORK_CONSTANTS.DefaultWorkModel,
     model: TRAE_WORK_CONSTANTS.DefaultWorkModel,
@@ -682,39 +745,112 @@ export async function probeTraeCredits(account: TraeAccount): Promise<TraeCredit
     ],
   }
 
-  const controller = new AbortController()
-  const timer = setTimeout(() => controller.abort(), 10000)
+  // 第一阶段：Work 专有通道节点探测 (带完整 Darwin 指纹与 WorkAppIDChat)
+  const workHosts = [TRAE_WORK_CONSTANTS.WorkTargetHost, TRAE_WORK_CONSTANTS.WorkSoloHost]
+  for (const host of workHosts) {
+    const controller = new AbortController()
+    const timer = setTimeout(() => controller.abort(), 8000)
+    try {
+      const resp = await fetch(host + TRAE_CONSTANTS.EpChat, {
+        method: 'POST',
+        headers: workHeaders(account, true, true),
+        body: JSON.stringify(pingWorkPayload),
+        signal: controller.signal,
+      })
+      clearTimeout(timer)
+
+      // 4008/1005: 账号凭证有效，但 Work 专属额度用尽 (归零)
+      if (resp.status === 4008 || resp.status === 1005) {
+        const ent = await fetchUserEntUsageDetails(account).catch(() => ({ ideCredits: 0, workCredits: 0, total: 0 }))
+        return {
+          ideCredits: ent.ideCredits,
+          workCredits: 0,
+        }
+      }
+
+      if (resp.status >= 400) {
+        const errText = await resp.text().catch(() => '')
+        if (errText.includes('4008') || errText.includes('1005') || errText.toLowerCase().includes('quota')) {
+          const ent = await fetchUserEntUsageDetails(account).catch(() => ({ ideCredits: 0, workCredits: 0, total: 0 }))
+          return {
+            ideCredits: ent.ideCredits,
+            workCredits: 0,
+          }
+        }
+        continue
+      }
+
+      if (!resp.body) continue
+
+      const reader = resp.body.getReader()
+      const decoder = new TextDecoder()
+      let buffer = ''
+      try {
+        while (buffer.length < 65536) {
+          const { done, value } = await reader.read()
+          if (done) break
+          buffer += decoder.decode(value, { stream: true })
+          const snap = extractCreditsFromChunk(buffer)
+          if (snap) {
+            await reader.cancel().catch(() => {})
+            return snap
+          }
+        }
+      } finally {
+        await reader.cancel().catch(() => {})
+      }
+    } catch {
+      clearTimeout(timer)
+    }
+  }
+
+  // 第二阶段：尝试 SOLO 通道标准模型 (glm-5.2) 提取 cn_credits_remain_info
+  const soloPingPayload = {
+    function: TRAE_CONSTANTS.Function,
+    config_name: 'glm-5.2',
+    model: 'glm-5.2',
+    stream: true,
+    messages: [
+      {
+        role: 'user',
+        content: [{ type: 'text', text: 'ping' }],
+      },
+    ],
+  }
+
+  const soloController = new AbortController()
+  const soloTimer = setTimeout(() => soloController.abort(), 8000)
   try {
     const resp = await fetch(TRAE_CONSTANTS.AgentHost + TRAE_CONSTANTS.EpChat, {
       method: 'POST',
       headers: soloHeaders(account, true),
-      body: JSON.stringify(pingPayload),
-      signal: controller.signal,
+      body: JSON.stringify(soloPingPayload),
+      signal: soloController.signal,
     })
-    clearTimeout(timer)
-    if (!resp.body) return null
+    clearTimeout(soloTimer)
 
-    const reader = resp.body.getReader()
-    const decoder = new TextDecoder()
-    let buffer = ''
-    for (let i = 0; i < 5; i++) {
-      const { done, value } = await reader.read()
-      if (done) break
-      buffer += decoder.decode(value, { stream: true })
-      const hit = /"cn_credits_remain_info"\s*:\s*\{([^}]+)\}/.exec(buffer)
-      if (hit) {
-        await reader.cancel().catch(() => {})
-        const ideHit = /"ide_credits"\s*:\s*([0-9.]+)/.exec(hit[1])
-        const workHit = /"work_credits"\s*:\s*([0-9.]+)/.exec(hit[1])
-        return {
-          ideCredits: ideHit ? Number(ideHit[1]) : 0,
-          workCredits: workHit ? Number(workHit[1]) : 0,
+    if (resp.ok && resp.body) {
+      const reader = resp.body.getReader()
+      const decoder = new TextDecoder()
+      let buffer = ''
+      try {
+        while (buffer.length < 65536) {
+          const { done, value } = await reader.read()
+          if (done) break
+          buffer += decoder.decode(value, { stream: true })
+          const snap = extractCreditsFromChunk(buffer)
+          if (snap) {
+            await reader.cancel().catch(() => {})
+            return snap
+          }
         }
+      } finally {
+        await reader.cancel().catch(() => {})
       }
     }
-    await reader.cancel().catch(() => {})
   } catch {
-    clearTimeout(timer)
+    clearTimeout(soloTimer)
   }
+
   return null
 }

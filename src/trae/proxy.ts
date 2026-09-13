@@ -34,6 +34,7 @@ import {
   releaseTraeSession,
   resolveTraeCooldown,
   saveTraeAccount,
+  setTraeCredits,
   setTraeWorkCredits,
 } from './pool'
 import type { TraeCooldownConfig } from './pool'
@@ -339,6 +340,7 @@ export async function executeWorkRequest(
         const snap = await probeTraeCredits(account)
         if (snap) {
           await setTraeWorkCredits(env, provider.id, account.uid, snap.workCredits)
+          await setTraeCredits(env, provider.id, account.uid, snap.ideCredits)
           if (snap.workCredits <= 0) {
             await cooldownTraeWorkAccount(env, provider.id, account.uid, cd.planMs, 'work_credits 余额不足')
           }
