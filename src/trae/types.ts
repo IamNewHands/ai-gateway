@@ -61,6 +61,26 @@ export type TraePool = Record<string, TraeAccountState>
 export interface TraeCreditsSnapshot {
   ideCredits: number
   workCredits: number
+  host?: string
+  status?: number
+  info?: string
+}
+
+export interface TraeEntPackInfo {
+  name: string
+  limit: number
+  used: number
+  rem: number
+  isWork: boolean
+  packType?: number | string
+  bizType?: string
+}
+
+export interface TraeEntUsageDetails {
+  ideCredits: number
+  workCredits: number
+  total: number
+  packs: TraeEntPackInfo[]
 }
 
 /** 对对外暴露的账号状态（脱敏，不含 token），供 /status 与面板展示 */

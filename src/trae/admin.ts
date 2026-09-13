@@ -30,6 +30,7 @@ import {
   getTraeAccounts,
   listTraeStatus,
   pickTraeAccount,
+  readTraePool,
   reenableTraeIfCredits,
   removeTraeAccount,
   saveTraeAccount,
@@ -37,7 +38,7 @@ import {
   setTraeWorkCredits,
 } from './pool'
 import { isTraeProvider } from './proxy'
-import type { TraeAccount, TraeCheckinResult, TraeLoginState, TraeModelInfo, TraeAccountStatus } from './types'
+import type { TraeAccount, TraeCheckinResult, TraeLoginState, TraeModelInfo, TraeAccountStatus, TraeEntPackInfo } from './types'
 import { writeLog } from '../admin'
 
 // ===== 工具 =====
@@ -228,14 +229,12 @@ export async function handleTraeLoginCallback(c: Context<AppEnv>) {
   let credits = 0
   let workCredits = 0
   try {
+    const details = await fetchUserEntUsageDetails(account)
+    credits = details.ideCredits
+    workCredits = details.workCredits
     const probe = await probeTraeCredits(account)
-    if (probe) {
-      credits = probe.ideCredits
+    if (probe && typeof probe.workCredits === 'number' && probe.workCredits > 0) {
       workCredits = probe.workCredits
-    } else {
-      const details = await fetchUserEntUsageDetails(account)
-      credits = details.ideCredits
-      workCredits = details.workCredits
     }
     await setTraeCredits(c.env, id, uid, credits)
     await setTraeWorkCredits(c.env, id, uid, workCredits)
@@ -317,16 +316,14 @@ async function checkinTraeAccount(env: Env, provider: Provider, account: TraeAcc
   }
   // 查积分 + 解冻（签到就是为了解冻冷却账号）
   try {
-    let ideRemain = 0
-    let workRemain = 0
-    const probe = await probeTraeCredits(account)
-    if (probe) {
-      ideRemain = probe.ideCredits
-      workRemain = probe.workCredits
-    } else {
-      const details = await fetchUserEntUsageDetails(account)
-      ideRemain = details.ideCredits
-      workRemain = details.workCredits
+    const details = await fetchUserEntUsageDetails(account)
+    const ideRemain = details.ideCredits
+    let workRemain = details.workCredits
+    // 签到不额外发送对话 ping，完全免扣费；若账号池已有 workCredits 记录且大于 0 则保持
+    const pool = await readTraePool(env, provider.id)
+    const prevWorkCredits = pool[account.uid]?.workCredits
+    if (typeof prevWorkCredits === 'number' && prevWorkCredits > 0 && workRemain === 0) {
+      workRemain = prevWorkCredits
     }
     await reenableTraeIfCredits(env, provider.id, account.uid, ideRemain, workRemain)
     base.credits = ideRemain
@@ -542,22 +539,47 @@ export async function handleTraeCreditsRefresh(c: Context<AppEnv>) {
   const provider = await getProvider(c.env, id)
   if (!provider) return c.json<ApiResponse>({ success: false, message: '提供商不存在' }, 404)
   const accounts = getTraeAccounts(provider)
-  const results: Array<{ uid: string; ideRemain?: number; workRemain?: number; success: boolean; error?: string }> = []
+  const results: Array<{
+    uid: string
+    ideRemain?: number
+    workRemain?: number
+    entPacks?: TraeEntPackInfo[]
+    workProbe?: { host?: string; status?: number; info?: string; workCredits?: number } | null
+    success: boolean
+    error?: string
+  }> = []
   for (const a of accounts) {
     try {
-      let ideRemain = 0
-      let workRemain = 0
+      const details = await fetchUserEntUsageDetails(a)
+      let ideRemain = details.ideCredits
+      let workRemain = details.workCredits
+
+      let workProbe: { host?: string; status?: number; info?: string; workCredits?: number } | null = null
       const probe = await probeTraeCredits(a)
       if (probe) {
-        ideRemain = probe.ideCredits
-        workRemain = probe.workCredits
-      } else {
-        const details = await fetchUserEntUsageDetails(a)
-        ideRemain = details.ideCredits
-        workRemain = details.workCredits
+        workProbe = {
+          host: probe.host,
+          status: probe.status,
+          info: probe.info,
+          workCredits: probe.workCredits,
+        }
+        if (typeof probe.workCredits === 'number' && probe.workCredits > 0) {
+          workRemain = probe.workCredits
+        }
+        if (typeof probe.ideCredits === 'number' && probe.ideCredits > 0) {
+          ideRemain = probe.ideCredits
+        }
       }
+
       await reenableTraeIfCredits(c.env, id, a.uid, ideRemain, workRemain)
-      results.push({ uid: a.uid, ideRemain, workRemain, success: true })
+      results.push({
+        uid: a.uid,
+        ideRemain,
+        workRemain,
+        entPacks: details.packs,
+        workProbe,
+        success: true,
+      })
     } catch (e) {
       results.push({ uid: a.uid, success: false, error: (e as Error).message })
     }

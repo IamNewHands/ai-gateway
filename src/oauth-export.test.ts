@@ -29,10 +29,13 @@ describe('handleOAuthPoolExport', () => {
       id: pid,
       name: 'WorkBuddy',
       authType: 'oauth-device',
+      baseUrl: '',
       apiKeys: [],
       models: [],
       enabled: true,
-      oauth: { flowType: 'browser' },
+      oauth: { flowType: 'browser' } as any,
+      createdAt: '2026-01-01T00:00:00Z',
+      updatedAt: '2026-01-01T00:00:00Z',
     }
     await env.KV.put('providers', JSON.stringify([provider]))
 
@@ -83,10 +86,13 @@ describe('handleOAuthPoolExport', () => {
       id: pid,
       name: 'WorkBuddy',
       authType: 'oauth-device',
+      baseUrl: '',
       apiKeys: [],
       models: [],
       enabled: true,
-      oauth: { flowType: 'browser' },
+      oauth: { flowType: 'browser' } as any,
+      createdAt: '2026-01-01T00:00:00Z',
+      updatedAt: '2026-01-01T00:00:00Z',
     }
     await env.KV.put('providers', JSON.stringify([provider]))
 
@@ -120,10 +126,13 @@ describe('handleOAuthPoolExport', () => {
       id: pid,
       name: 'WorkBuddy',
       authType: 'oauth-device',
+      baseUrl: '',
       apiKeys: [],
       models: [],
       enabled: true,
-      oauth: { flowType: 'browser' },
+      oauth: { flowType: 'browser' } as any,
+      createdAt: '2026-01-01T00:00:00Z',
+      updatedAt: '2026-01-01T00:00:00Z',
     }
     await env.KV.put('providers', JSON.stringify([provider]))
 

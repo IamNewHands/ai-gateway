@@ -4,7 +4,7 @@
  */
 import { TRAE_CHAT_CONNECT_TIMEOUT_MS, TRAE_CONSTANTS, TRAE_UA, TRAE_WORK_CONSTANTS, TRAE_WORK_UA } from './constants'
 import { prepareBody } from './payload'
-import type { TraeAccount, TraeCreditsSnapshot, TraeErrKind, TraeModelInfo } from './types'
+import type { TraeAccount, TraeCreditsSnapshot, TraeEntPackInfo, TraeEntUsageDetails, TraeErrKind, TraeModelInfo } from './types'
 
 // ===== 错误分类（SPEC §4.3） =====
 
@@ -480,7 +480,7 @@ export async function fetchUserEntUsage(account: TraeAccount): Promise<number> {
 }
 
 /** 详细查询各权益包积分，区分 ideCredits 与 workCredits */
-export async function fetchUserEntUsageDetails(account: TraeAccount): Promise<{ ideCredits: number; workCredits: number; total: number }> {
+export async function fetchUserEntUsageDetails(account: TraeAccount): Promise<TraeEntUsageDetails> {
   const raw = await doJsonText(TRAE_CONSTANTS.UgHost + TRAE_CONSTANTS.EpEntUsage, ugHeaders(account), {})
   let data: any
   try { data = JSON.parse(raw) } catch { data = null }
@@ -489,6 +489,7 @@ export async function fetchUserEntUsageDetails(account: TraeAccount): Promise<{ 
   let total = 0
   let workCredits = 0
   let ideCredits = 0
+  const packList: TraeEntPackInfo[] = []
   for (const p of packs) {
     const quota: Record<string, any> = p?.entitlement_base_info?.quota || {}
     const used = Number(p?.usage?.credits_amount) || 0
@@ -516,8 +517,18 @@ export async function fetchUserEntUsageDetails(account: TraeAccount): Promise<{ 
     } else {
       ideCredits += rem
     }
+    const rawName = p?.entitlement_base_info?.name || p?.entitlement_base_info?.pack_name || p?.pack_name || p?.pack_type_name || packName || 'unnamed'
+    packList.push({
+      name: rawName,
+      limit,
+      used,
+      rem,
+      isWork: isWorkPack,
+      packType: p?.pack_type ?? p?.entitlement_base_info?.pack_type,
+      bizType: p?.biz_type ?? p?.entitlement_base_info?.biz_type,
+    })
   }
-  return { ideCredits, workCredits, total }
+  return { ideCredits, workCredits, total, packs: packList }
 }
 
 // ===== 对话（llm_utils_chat） =====
@@ -729,7 +740,8 @@ export function extractCreditsFromChunk(text: string): TraeCreditsSnapshot | nul
  * 实时探测双通道积分余额 (ide_credits vs work_credits)。
  * 1. 优先通过 Work 专有节点 (api5-normal.mchost.guru) 以 workHeaders 发送 ping 请求；
  * 2. 次选备用节点 (trae-api-cn.mchost.guru) 探测；若返回 4008 则确认账号有效但 Work 额度为 0；
- * 3. 若 Work 模型 ping 均受阻，平滑回退至 SOLO 免费通道模型 (glm-5.2) 提取 cn_credits_remain_info。
+ * 3. 严格禁止发起普通 SOLO 模型 (glm-5.2) ping，彻底杜绝探针扣减用户通用积分；
+ * 4. 结合官方免扣费接口 fetchUserEntUsageDetails 获取权威通用积分与权益包详情。
  */
 export async function probeTraeCredits(account: TraeAccount): Promise<TraeCreditsSnapshot | null> {
   const pingWorkPayload = {
@@ -745,11 +757,16 @@ export async function probeTraeCredits(account: TraeAccount): Promise<TraeCredit
     ],
   }
 
-  // 第一阶段：Work 专有通道节点探测 (带完整 Darwin 指纹与 WorkAppIDChat)
+  let lastHost = ''
+  let lastStatus = 0
+  let lastErrInfo = ''
+
+  // 仅针对 Work 专有通道节点探测 (api5-normal.mchost.guru / trae-api-cn.mchost.guru)
+  // 严禁发送普通 SOLO 模型 (glm-5.2) ping，彻底杜绝探针额外消耗用户通用积分
   const workHosts = [TRAE_WORK_CONSTANTS.WorkTargetHost, TRAE_WORK_CONSTANTS.WorkSoloHost]
   for (const host of workHosts) {
     const controller = new AbortController()
-    const timer = setTimeout(() => controller.abort(), 8000)
+    const timer = setTimeout(() => controller.abort(), 6000)
     try {
       const resp = await fetch(host + TRAE_CONSTANTS.EpChat, {
         method: 'POST',
@@ -761,22 +778,31 @@ export async function probeTraeCredits(account: TraeAccount): Promise<TraeCredit
 
       // 4008/1005: 账号凭证有效，但 Work 专属额度用尽 (归零)
       if (resp.status === 4008 || resp.status === 1005) {
-        const ent = await fetchUserEntUsageDetails(account).catch(() => ({ ideCredits: 0, workCredits: 0, total: 0 }))
+        const ent = await fetchUserEntUsageDetails(account).catch(() => ({ ideCredits: 0, workCredits: 0, total: 0, packs: [] }))
         return {
           ideCredits: ent.ideCredits,
           workCredits: 0,
+          host,
+          status: resp.status,
+          info: 'Work 专属额度用尽 (4008/1005)',
         }
       }
 
       if (resp.status >= 400) {
         const errText = await resp.text().catch(() => '')
         if (errText.includes('4008') || errText.includes('1005') || errText.toLowerCase().includes('quota')) {
-          const ent = await fetchUserEntUsageDetails(account).catch(() => ({ ideCredits: 0, workCredits: 0, total: 0 }))
+          const ent = await fetchUserEntUsageDetails(account).catch(() => ({ ideCredits: 0, workCredits: 0, total: 0, packs: [] }))
           return {
             ideCredits: ent.ideCredits,
             workCredits: 0,
+            host,
+            status: resp.status,
+            info: 'Work 专属额度用尽 (quota exceeded)',
           }
         }
+        lastHost = host
+        lastStatus = resp.status
+        lastErrInfo = `HTTP ${resp.status}: ${errText.slice(0, 120)}`
         continue
       }
 
@@ -793,64 +819,31 @@ export async function probeTraeCredits(account: TraeAccount): Promise<TraeCredit
           const snap = extractCreditsFromChunk(buffer)
           if (snap) {
             await reader.cancel().catch(() => {})
-            return snap
+            return {
+              ...snap,
+              host,
+              status: resp.status,
+              info: '成功提取 cn_credits_remain_info',
+            }
           }
         }
       } finally {
         await reader.cancel().catch(() => {})
       }
-    } catch {
+    } catch (e) {
       clearTimeout(timer)
+      lastHost = host
+      lastErrInfo = `网络异常: ${(e as Error).message || String(e)}`
     }
   }
 
-  // 第二阶段：尝试 SOLO 通道标准模型 (glm-5.2) 提取 cn_credits_remain_info
-  const soloPingPayload = {
-    function: TRAE_CONSTANTS.Function,
-    config_name: 'glm-5.2',
-    model: 'glm-5.2',
-    stream: true,
-    messages: [
-      {
-        role: 'user',
-        content: [{ type: 'text', text: 'ping' }],
-      },
-    ],
+  // Work 端点不可达或未返回有效流时，回退到免扣费的官方权益包接口
+  const ent = await fetchUserEntUsageDetails(account).catch(() => ({ ideCredits: 0, workCredits: 0, total: 0, packs: [] }))
+  return {
+    ideCredits: ent.ideCredits,
+    workCredits: ent.workCredits,
+    host: lastHost || workHosts[0],
+    status: lastStatus,
+    info: lastErrInfo || 'Work 专属端点未响应有效流',
   }
-
-  const soloController = new AbortController()
-  const soloTimer = setTimeout(() => soloController.abort(), 8000)
-  try {
-    const resp = await fetch(TRAE_CONSTANTS.AgentHost + TRAE_CONSTANTS.EpChat, {
-      method: 'POST',
-      headers: soloHeaders(account, true),
-      body: JSON.stringify(soloPingPayload),
-      signal: soloController.signal,
-    })
-    clearTimeout(soloTimer)
-
-    if (resp.ok && resp.body) {
-      const reader = resp.body.getReader()
-      const decoder = new TextDecoder()
-      let buffer = ''
-      try {
-        while (buffer.length < 65536) {
-          const { done, value } = await reader.read()
-          if (done) break
-          buffer += decoder.decode(value, { stream: true })
-          const snap = extractCreditsFromChunk(buffer)
-          if (snap) {
-            await reader.cancel().catch(() => {})
-            return snap
-          }
-        }
-      } finally {
-        await reader.cancel().catch(() => {})
-      }
-    }
-  } catch {
-    clearTimeout(soloTimer)
-  }
-
-  return null
 }

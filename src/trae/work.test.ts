@@ -570,6 +570,50 @@ describe('Trae Work: 双通道实时探针 (probeTraeCredits)', () => {
       expect(snap).not.toBeNull()
       expect(snap?.workCredits).toBe(0)
       expect(snap?.ideCredits).toBe(3487.3464)
+      expect(snap?.status).toBe(400)
+      expect(snap?.info).toContain('Work 专属额度用尽')
+    } finally {
+      globalThis.fetch = originalFetch
+    }
+  })
+
+  it('fetchUserEntUsageDetails 能够精准提取各包明细与类型', async () => {
+    const originalFetch = globalThis.fetch
+
+    globalThis.fetch = async (input: any) => {
+      const url = String(input)
+      if (url.includes('/trae/api/v2/pay/ide_user_ent_usage')) {
+        return new Response(JSON.stringify({
+          user_entitlement_pack_list: [
+            {
+              entitlement_base_info: { name: '每日签到包', quota: { credits_limit: 3000 } },
+              usage: { credits_amount: 100 },
+              pack_type: 1,
+            },
+            {
+              entitlement_base_info: { name: 'Trae Work 专属包', quota: { credits_limit: 2000 } },
+              usage: { credits_amount: 50 },
+              biz_type: 'work',
+            },
+          ],
+        }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      }
+      return new Response('not found', { status: 404 })
+    }
+
+    try {
+      const details = await fetchUserEntUsageDetails(testAccount)
+      expect(details.ideCredits).toBe(2900)
+      expect(details.workCredits).toBe(1950)
+      expect(details.total).toBe(4850)
+      expect(details.packs.length).toBe(2)
+      expect(details.packs[0].name).toBe('每日签到包')
+      expect(details.packs[0].rem).toBe(2900)
+      expect(details.packs[0].isWork).toBe(false)
+      expect(details.packs[1].name).toBe('Trae Work 专属包')
+      expect(details.packs[1].rem).toBe(1950)
+      expect(details.packs[1].isWork).toBe(true)
+      expect(details.packs[1].bizType).toBe('work')
     } finally {
       globalThis.fetch = originalFetch
     }
