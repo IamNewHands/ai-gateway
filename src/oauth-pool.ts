@@ -45,10 +45,22 @@ export interface OAuthPoolState {
   /** 最近错误时间（epoch ms） */
   lastErr?: number
 
-  // ===== 6004 模型级限流隔离（对齐 workbuddy2api issue #31） =====
-  /** 触发 6004 模型级限流的模型名，请求其他模型时豁免 */
+  // ===== 6004 模型级限流隔离（对齐 workbuddy2api issue #31 / modelCooldowns 独立冷却表） =====
+  /**
+   * 每个模型的独立冷却记录：model → { until, resetAt, reason }。
+   *
+   * 为什么必须是**表**而不是单槽（对齐 workbuddy2api entry.go:92-97 的设计理由）：
+   * 6004 只写本表、不写 `until`（账号级），因此多个模型同时 6004 时各自独立计时，
+   * 互不覆盖——A 触发后 B 再触发，A 的冷却截止不被 B 覆盖。单槽（旧 softRateModel 字段）
+   * 做不到这点：B 触发会覆盖 A 的记录，导致 A 的请求错误地认为账号可用。
+   */
+  softRateModels?: Record<string, { until: number; resetAt: number; reason?: string }>
+  /**
+   * @deprecated 单槽遗留字段（v1 数据结构）。仅为读取旧 KV 数据保留，新代码一律用
+   * softRateModels。读取时经 migrateLegacySoftRate 迁移进表，写入时不再维护。
+   */
   softRateModel?: string
-  /** 上游 6004 重置时刻（epoch ms） */
+  /** @deprecated 单槽遗留字段（与 softRateModel 配对）。 */
   softRateResetAt?: number
 
   // ===== 12153 session dead 连续失败防抖（对齐 workbuddy2api sessionDeadThreshold = 3） =====
@@ -205,18 +217,83 @@ export async function writeOauthPool(env: Env, providerId: string, pool: OAuthPo
   } catch { /* KV 写失败不阻断主流程 */ }
 }
 
-/** 账号是否健康：启用、未禁用、不在冷却期。无状态（新账号）视为健康。reqModel 可选支持 6004 模型级豁免。 */
+/**
+ * 把单槽遗留字段（softRateModel / softRateResetAt）迁移进多模型表。
+ *
+ * 仅用于读取旧 KV 数据（v1 单槽结构）。迁移是**幂等**的：已有表时不再看遗留字段。
+ * 迁移条件：遗留模型名非空且遗留重置时刻仍在未来（过期记录没有保留价值）。
+ */
+function migrateLegacySoftRate(st: OAuthPoolState): void {
+  if (st.softRateModels && Object.keys(st.softRateModels).length > 0) return
+  const legacyModel = st.softRateModel
+  const legacyUntil = st.softRateResetAt
+  if (!legacyModel || typeof legacyUntil !== 'number' || legacyUntil <= Date.now()) return
+  st.softRateModels = {
+    [legacyModel]: { until: legacyUntil, resetAt: legacyUntil, reason: 'legacy single-slot' },
+  }
+}
+
+/**
+ * 该账号对指定模型是否正处 6004 模型级冷却（惰性清理过期项）。
+ * 空 reqModel / 无记录 → false（不因模型级维度限制账号）。
+ */
+export function isModelCooled(st: OAuthPoolState | undefined, now: number, reqModel?: string): boolean {
+  if (!st || !reqModel) return false
+  migrateLegacySoftRate(st)
+  const rec = st.softRateModels?.[reqModel]
+  if (!rec) return false
+  if (!rec.until || rec.until <= now) {
+    // 过期项惰性清理，防表无限膨胀（对齐 workbuddy2api pruneExpiredModelCooldowns）
+    delete st.softRateModels![reqModel]
+    return false
+  }
+  return true
+}
+
+/** 该账号是否处于「6004 模型级冷却」形态（存在任一未过期条目）。 */
+export function hasModelCooldown(st: OAuthPoolState | undefined, now: number): boolean {
+  if (!st?.softRateModels) return false
+  migrateLegacySoftRate(st)
+  for (const m of Object.keys(st.softRateModels)) {
+    if (st.softRateModels[m]?.until > now) return true
+  }
+  return false
+}
+
+/** 未过期的模型级冷却台账（供面板展示"哪些模型还在限额中"）。 */
+export function listModelCooldowns(st: OAuthPoolState | undefined, now: number): Array<{ model: string; until: number; resetAt: number; reason: string }> {
+  if (!st) return []
+  migrateLegacySoftRate(st)
+  if (!st.softRateModels) return []
+  const out: Array<{ model: string; until: number; resetAt: number; reason: string }> = []
+  for (const [model, rec] of Object.entries(st.softRateModels)) {
+    if (rec && rec.until > now) {
+      out.push({ model, until: rec.until, resetAt: rec.resetAt ?? rec.until, reason: rec.reason || '' })
+    }
+  }
+  return out.sort((a, b) => (a.model < b.model ? -1 : a.model > b.model ? 1 : 0))
+}
+
+/**
+ * 账号是否健康：启用、未禁用、不在（账号级）冷却期、且请求模型未被 6004 独立冷却。
+ * 无状态（新账号）视为健康。
+ *
+ * 判定优先级（对齐 workbuddy2api entry.go:181-189 healthyForModel 的注释）：
+ *  1. **全账号级先判**：disabled / 账号级 `until` —— 账号整体不可用时查模型级冷却没有意义；
+ *  2. 仅全账号健康时，才查该模型是否正处 6004 独立冷却 → 受限则不可选；
+ *  3. 否则可选。
+ *
+ * 关键语义：6004 **从不写账号级 `until`**（见 cooldownOauthAccountSoftForModel），
+ * 因此不存在"账号级冷却因病 6004 而起、应豁免其他模型"的形态——模型级豁免只在
+ * 本函数的第 2 步体现（其他模型不在 softRateModels 表内 → 放行）。
+ */
 export function isOauthAccountHealthy(acc: OAuthPoolAccount, now: number, reqModel?: string): boolean {
   if (!acc || acc.enabled === false) return false
   if (acc.state?.disabled) return false
-  if (acc.state?.until && acc.state.until > now) {
-    // 6004 模型级软冷却豁免（对齐 workbuddy2api issue #31 / healthyForModel）：
-    // 账号在软限流模型（softRateModel）上受限，但请求的是其他模型且未被禁用、未全局熔断时依然可用
-    if (acc.state.softRateModel && reqModel && acc.state.softRateModel !== reqModel) {
-      return true
-    }
-    return false
-  }
+  // 1. 账号级冷却先判（不因模型豁免而放行）
+  if (acc.state?.until && acc.state.until > now) return false
+  // 2. 账号级健康 → 再查该模型的 6004 独立冷却
+  if (isModelCooled(acc.state, now, reqModel)) return false
   return true
 }
 
@@ -345,6 +422,12 @@ export interface PickOauthOptions {
   allowCoolingFallback?: boolean
   /** 客户端请求的模型 ID（供 6004 模型级冷却豁免与成本优先分层）。 */
   reqModel?: string
+  /**
+   * 在途占满过滤（对齐 workbuddy2api pick.go:63-65 `p.inFlightFull(e)`）：
+   * 返回 true 表示该 uid 当前在途已满、应跳过。缺省 undefined = 不做该过滤（既有行为）。
+   * 由调用方注入（在途计数在 workbuddy-inflight.ts，避免 oauth-pool 反向依赖）。
+   */
+  isInFlightFull?: (uid: string) => boolean
 }
 
 /**
@@ -371,11 +454,16 @@ export async function pickOauthAccount(
   // 手工指定优先：精确匹配首选 uid，只在 healthy 且未 tried 时采用
   if (preferUid) {
     const preferred = pool.find((a) => a.uid === preferUid && !tried.has(a.uid) && isOauthAccountHealthy(a, now, reqModel))
-    if (preferred) chosen = preferred
+    // 在途占满的号也不采用（对齐源实现：Acquire 失败会换号）
+    if (preferred && !opts?.isInFlightFull?.(preferred.uid)) chosen = preferred
   }
 
   if (!chosen) {
-    let candidates = pool.filter((a) => !tried.has(a.uid) && isOauthAccountHealthy(a, now, reqModel))
+    let candidates = pool.filter((a) =>
+      !tried.has(a.uid) &&
+      isOauthAccountHealthy(a, now, reqModel) &&
+      !opts?.isInFlightFull?.(a.uid)
+    )
     if (candidates.length > 0) {
       // 成本分层：reqModel 非空时，按实测扣费分层只保留最优层
       if (reqModel) {
@@ -397,7 +485,7 @@ export async function pickOauthAccount(
       }
       chosen = pickWeightedTop5(providerId, candidates, now, opts?.rng)
     } else if (opts?.allowCoolingFallback) {
-      chosen = pickEarliestCoolingFallback(pool, tried, now)
+      chosen = pickEarliestCoolingFallback(pool, tried, now, opts?.isInFlightFull)
     }
   }
 
@@ -467,14 +555,21 @@ function pickWeightedTop5(
 /**
  * 全冷却兜底：在冷却账号中选「until 最早到期」的一个（对齐 workbuddy2api pickEarliestExpiryLocked）。
  * 分级排除：禁用（enabled=false / state.disabled）永不参与；余额耗尽类硬冷却号（HARD_COOL_REASON_RE）
- * 不参与——调了必 402，等签到恢复；尊重 tried（轮转时换下一个最早到期者）。
+ * 不参与——调了必 402，等签到恢复；尊重 tried（轮转时换下一个最早到期者）；
+ * 在途占满者同样跳过（源实现 pickEarliestExpiryLocked 也做 inFlightFull 过滤）。
  */
-function pickEarliestCoolingFallback(pool: OAuthPool, tried: Set<string>, now: number): OAuthPoolAccount | null {
+function pickEarliestCoolingFallback(
+  pool: OAuthPool,
+  tried: Set<string>,
+  now: number,
+  isInFlightFull?: (uid: string) => boolean
+): OAuthPoolAccount | null {
   let best: OAuthPoolAccount | null = null
   let bestUntil = 0
   for (const a of pool) {
     if (!a || tried.has(a.uid)) continue
     if (a.enabled === false) continue
+    if (isInFlightFull?.(a.uid)) continue
     const st = a.state
     if (!st || st.disabled) continue
     const until = st.until || 0
@@ -506,7 +601,7 @@ export async function refreshOauthPoolAccount(
   return acc
 }
 
-/** 冷却账号至 now+ms（清零 errCount 与单模型限流痕迹）。 */
+/** 冷却账号至 now+ms（清零 errCount 与模型级限流痕迹）。 */
 export async function cooldownOauthAccount(
   env: Env,
   providerId: string,
@@ -522,6 +617,9 @@ export async function cooldownOauthAccount(
     until: Date.now() + ms,
     reason,
     errCount: 0,
+    // 账号级冷却入口清空模型级冷却表：防上一次 6004 的模型豁免泄漏到本次**账号级**限流上
+    // （否则换模型请求会错误绕过本次冷却，对齐 workbuddy2api cooldown.go:38-41）。
+    softRateModels: undefined,
     softRateModel: undefined,
     softRateResetAt: undefined,
   }
@@ -529,9 +627,19 @@ export async function cooldownOauthAccount(
 }
 
 /**
- * 429 6004 模型级软冷却（对齐 workbuddy2api issue #31 / CooldownSoftForModel）。
- * 当上游 6004 明确说明「将在 … 重置」时，把冷却截止设为 resetAt，
- * 并记录受限模型 softRateModel。请求其他模型时账号依然可用。
+ * 429 6004 **模型级**软冷却（对齐 workbuddy2api pool/cooldown.go CooldownSoftForModel）。
+ *
+ * 核心语义：把该模型的冷却截止写进 `softRateModels[model]`（每模型独立计时），
+ * **不写账号级 `until`**——否则账号整体被冷却，请求其他模型也会被拦，
+ * 模型级豁免就形同虚设（这正是单槽实现 + 写 until 的组合缺陷）。
+ *
+ * 收窄规则（对齐源实现 cooldown.go:53-62,68-101）：
+ *  - 有模型名且有重置时间（`untilMs` 非零）→ 写该模型的独立冷却表；
+ *    重置时间已过（时钟偏移/文案过期）时取**极短冷却**（1ms，等价立即恢复），
+ *    但仍记录在表里——与源实现一致，不因"时间已过"退化成账号级冷却；
+ *  - 无模型名（reqModel 缺失，无法做模型豁免）→ 退回账号级软冷却并清空模型表。
+ *
+ * @param untilMs 该模型的冷却截止（epoch ms；调用方已按 soft_rate_max 封顶）
  */
 export async function cooldownOauthAccountSoftForModel(
   env: Env,
@@ -544,18 +652,44 @@ export async function cooldownOauthAccountSoftForModel(
   const pool = await readOauthPool(env, providerId)
   const acc = pool.find((a) => a.uid === uid)
   if (!acc) return
+  const st = acc.state || { credits: 0, disabled: false, until: 0, errCount: 0 }
+  const now = Date.now()
+
+  // 无模型名 → 无法做模型级豁免，退回账号级软冷却（清空模型表防豁免泄漏）
+  if (!model) {
+    acc.state = {
+      ...st,
+      until: now + Math.max(1, untilMs - now),
+      reason,
+      errCount: 0,
+      softRateModels: undefined,
+      softRateModel: undefined,
+      softRateResetAt: undefined,
+    }
+    await writeOauthPool(env, providerId, pool)
+    return
+  }
+
+  // 模型级：只写该模型的独立冷却，不动账号级 until（保留其他模型的可用性）。
+  // 重置时间已过 → 1ms 极短冷却（对齐源实现 cooldown.go:78-81）。
+  const effectiveUntil = untilMs > now ? untilMs : now + 1
+  migrateLegacySoftRate(st)
+  const table = { ...(st.softRateModels || {}) }
+  table[model] = { until: effectiveUntil, resetAt: untilMs, reason }
   acc.state = {
-    ...(acc.state || {}),
-    until: untilMs,
+    ...st,
+    // 注意：**不设 until**（账号级保持健康），仅记录模型表
     reason,
     errCount: 0,
-    softRateModel: model,
-    softRateResetAt: untilMs,
+    softRateModels: table,
+    // 清掉遗留单槽字段，避免与新表并存产生歧义
+    softRateModel: undefined,
+    softRateResetAt: undefined,
   }
   await writeOauthPool(env, providerId, pool)
 }
 
-/** 硬冷却（余额/权益耗尽）至次日 04:00 本地时区（对齐 workbuddy2api CooldownUntilTomorrow4AM，等签到恢复）。 */
+/** 硬冷却（余额/权益耗尽）至下一个 CST 04:00（对齐 workbuddy2api CooldownUntilTomorrow4AM，等签到恢复）。 */
 export async function cooldownOauthAccountUntilTomorrow4AM(
   env: Env,
   providerId: string,
@@ -720,9 +854,8 @@ export async function listOauthPoolStatus(env: Env, providerId: string): Promise
     successCount: pickRuntime.get(runtimeKey(providerId, a.uid))?.successCount ?? a.state?.successCount ?? 0,
     errTotal: a.state?.errTotal || 0,
     lastUsed: pickRuntime.get(runtimeKey(providerId, a.uid))?.lastUsed ?? 0,
-    // 6004 模型级限流隔离观测字段
-    softRateModel: a.state?.softRateModel || '',
-    softRateResetAt: a.state?.softRateResetAt || 0,
+    // 6004 模型级限流隔离观测字段（多模型表：透出全部未过期条目，供面板展示"哪些模型还在限额"）
+    modelCooldowns: listModelCooldowns(a.state, now),
     tokenMask: a.token?.access_token ? `${a.token.access_token.slice(0, 8)}••••${a.token.access_token.slice(-6)}` : '',
   }))
 }

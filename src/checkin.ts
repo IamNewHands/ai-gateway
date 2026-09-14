@@ -52,6 +52,11 @@ import {
   reportWorkbuddyChatActivity,
   fetchWorkbuddyStreak,
   runWorkbuddyCatTravel,
+  isAlreadyCheckin,
+  billingMeterPaths,
+  claimGlobalTrial,
+  delayMs,
+  ACTIVITY_ACCOUNT_DELAY_MS,
 } from './workbuddy-billing'
 import { queryUsageOverview } from './analytics/query'
 
@@ -60,11 +65,18 @@ async function fetchCheckinStatus(
   token: string,
   realm: 'cn' | 'global'
 ): Promise<{ active: boolean; todayCheckedIn: boolean; streakDays?: number; totalCredits?: number; dailyCredit?: number } | null> {
-  const paths = ['/v2/billing/meter/checkin-activity-status', '/v2/billing/meter/checkin-status']
+  // 状态端点候选序列：CN 用带 /v2 的两种拼写；global 另加无 /v2 前缀形态（源实现 R9：
+  // 国际版无 /v2 前缀，路径族按 realm 切）。仅 404 会换下一条（billingCall 的 paths 语义）。
+  const paths = realm === 'global'
+    ? [
+        '/billing/meter/checkin-activity-status', '/billing/meter/checkin-status',
+        '/v2/billing/meter/checkin-activity-status', '/v2/billing/meter/checkin-status',
+      ]
+    : ['/v2/billing/meter/checkin-activity-status', '/v2/billing/meter/checkin-status']
   let lastErr: Error | null = null
   for (const path of paths) {
     try {
-      const data = await billingCall(token, path, realm)
+      const data = await billingCall(token, path, realm, { paths: [path] })
       const m = (data || {}) as Record<string, any>
       return {
         active: pickBool(m, 'active', 'Active'),
@@ -89,16 +101,19 @@ async function performCheckin(
   env?: Env
 ): Promise<{ success: boolean; message: string; reward?: any }> {
   try {
-    const data = await billingCall(token, '/v2/billing/meter/daily-checkin', realm)
+    // 路径按 realm 切（global 无 /v2 前缀优先，404 时 fallback），对齐 workbuddy2api checkinMeterPaths。
+    // 当前 global 账号在上层已提前 return（不签到），此处保持按 realm 正确以便未来放开即生效。
+    const paths = billingMeterPaths('daily-checkin', realm)
+    const data = await billingCall(token, paths[0], realm, { paths })
     return { success: true, message: '签到成功', reward: data }
   } catch (e) {
-    const msg = (e as Error).message
-    // 业务软失败（已签到类）→ 视为成功已签
-    const low = msg.toLowerCase()
-    if (low.includes('already') || msg.includes('已签') || msg.includes('今日')) {
+    // 幂等判定走三段式（移植 workbuddy2api cmd/signin/main.go）：
+    // 结构化业务错误（BillingError）认业务码 10001/14001（带边界）+ 全量文案；
+    // 传输层/解析层裸错误只认中文文案，避免 "address already in use" 这类文本被误判为已签到。
+    if (isAlreadyCheckin(e)) {
       return { success: true, message: '今日已签到' }
     }
-    return { success: false, message: msg }
+    return { success: false, message: (e as Error).message }
   }
 }
 
@@ -108,9 +123,9 @@ async function performCheckin(
  * 拉取额度 + 套餐类型并填充到 base。额度拉取抛错时写日志（含 uid/eid 诊断）。
  * 在所有 return 前调用，确保"今日已签"也能拿到额度。
  */
-async function fillCredits(env: Env, base: CheckinResult, token: string, realm: 'cn' | 'global', uid: string, enterpriseId: string) {
+async function fillCredits(env: Env, base: CheckinResult, token: string, realm: 'cn' | 'global', uid: string, enterpriseId: string, deviceToken?: string) {
   try {
-    const credits = await fetchWorkbuddyCredits(token, realm, uid, enterpriseId)
+    const credits = await fetchWorkbuddyCredits(token, realm, uid, enterpriseId, deviceToken)
     base.totalRemain = credits.totalRemain
     base.totalUsed = credits.totalUsed
     base.totalSize = credits.totalSize
@@ -358,11 +373,14 @@ async function syncPoolCredits(env: Env, provider: Provider, account: OAuthPoolA
 /**
  * WorkBuddy 池内单账号签到 + 额度刷新 + 解冻。
  * 账号 credentials 来自池（oauth:pool:<id>），token 临近过期先刷新（写回池）。
+ *
+ * opts.interactive：交互式端点（用户等待）→ 活跃上报不做条间间隔。
  */
 async function checkinOauthPoolAccount(
   env: Env,
   provider: Provider,
-  account: OAuthPoolAccount
+  account: OAuthPoolAccount,
+  opts?: { interactive?: boolean }
 ): Promise<CheckinResult> {
   const now = Date.now()
   const base: CheckinResult = {
@@ -410,7 +428,39 @@ async function checkinOauthPoolAccount(
     base.reason = 'skipped_global'
     base.message = '国际版账号无签到功能'
     base.success = true
-    await fillCredits(env, base, token, 'global', uid, enterpriseId)
+    const devTokenGlobalEarly = account.token?.device_token || provider.oauth?.deviceToken
+    await fillCredits(env, base, token, 'global', uid, enterpriseId, devTokenGlobalEarly)
+
+    // 国际版**活跃上报**放开（移植 workbuddy2api a190252 / PR #45 实测）：
+    // global 账号无签到/任务中心体系（D4 门控，下面 checkin/travel 仍跳过），
+    // 但 `/v2/report` 在 workbuddy.ai 上可用（code=0），**同样点亮连登**。
+    // billingCall 已按 realm 切 base（workbuddy.ai/v2/report）与 Origin/UA，无需额外改动。
+    // 失败只记入结果，不改变 base.success（签到语义上 global 仍算"跳过"）。
+    const devTokenGlobal = account.token?.device_token || provider.oauth?.deviceToken
+    try {
+      const act = await reportWorkbuddyChatActivity(token, 'global', uid, { enterpriseId, deviceToken: devTokenGlobal, count: 5, gapMs: opts?.interactive ? 0 : undefined })
+      base.activityReport = { success: act.success, message: act.message }
+    } catch (e) {
+      base.activityReport = { success: false, message: (e as Error).message }
+    }
+    try {
+      const streak = await fetchWorkbuddyStreak(token, 'global', { uid, enterpriseId, deviceToken: devTokenGlobal })
+      if (typeof streak === 'number') base.streakDays = streak
+    } catch { /* ignore */ }
+
+    // 国际版一次性 trial 加油包（移植 workbuddy2api trial.go）：global 无签到/任务中心，
+    // trial 是其唯一天然积分增益动作。幂等（14051 = 已领过，视为正常）。
+    // 失败不影响 base.success（签到语义上 global 仍算"跳过"），只记录结果供面板展示。
+    try {
+      const tr = await claimGlobalTrial(token)
+      base.trialClaim = { success: tr.ok, already: tr.already, message: tr.msg }
+    } catch (e) {
+      base.trialClaim = { success: false, already: false, message: (e as Error).message }
+    }
+
+    // 注意：**不**做猫猫旅行（runWorkbuddyCatTravel）——global 无猫猫旅行体系
+    //（对齐 workbuddy2api travel.go:56-58 的 D4 门控）。
+
     await syncPoolCredits(env, provider, account, base)
     return base
   }
@@ -449,9 +499,12 @@ async function checkinOauthPoolAccount(
 
   // 生态增值与自动化任务（P2）：活跃上报（点亮连登/领猫门槛） + 回读 streak + 猫猫旅行
   const devToken = account.token?.device_token || provider.oauth?.deviceToken
+  let activityReportedOk = false
   try {
-    const act = await reportWorkbuddyChatActivity(token, 'cn', uid, { enterpriseId, deviceToken: devToken, count: 5 })
+    // gapMs：交互式端点跳过条间间隔（5×1.5s 会让手动操作卡 6s+）
+    const act = await reportWorkbuddyChatActivity(token, 'cn', uid, { enterpriseId, deviceToken: devToken, count: 5, gapMs: opts?.interactive ? 0 : undefined })
     base.activityReport = { success: act.success, message: act.message }
+    activityReportedOk = act.success
   } catch (e) {
     base.activityReport = { success: false, message: (e as Error).message }
   }
@@ -462,21 +515,44 @@ async function checkinOauthPoolAccount(
   } catch { /* ignore */ }
 
   try {
-    const travel = await runWorkbuddyCatTravel(token, 'cn', uid, { enterpriseId, deviceToken: devToken })
+    // 传 env/providerId 启用领养当日防抖（对齐 workbuddy2api adoptTriedToday）：
+    // 门槛未达时同日不再重试领养，避免对上游重试轰炸。
+    // forceAdopt：本流程刚完成 5 条活跃上报 → 对话量可能刚好补满（"门槛刚达成"的新状态，
+    // 不算对上游重试轰炸）→ 豁免当日防抖，就地闭环（对齐源实现 travelAdoptForce）。
+    const travel = await runWorkbuddyCatTravel(token, 'cn', uid, {
+      enterpriseId,
+      deviceToken: devToken,
+      env,
+      providerId: provider.id,
+      forceAdopt: activityReportedOk,
+    })
     base.catTravel = travel
   } catch (e) {
     base.catTravel = { state: 'error', message: (e as Error).message }
   }
 
   // 额度信息 + 解冻（签到就是为了解冻冷却账号，对齐 workbuddy-wild ReenableIfCredits）
-  await fillCredits(env, base, token, 'cn', uid, enterpriseId)
+  await fillCredits(env, base, token, 'cn', uid, enterpriseId, devToken)
   await syncPoolCredits(env, provider, account, base)
   return base
 }
 
 /** WorkBuddy 池全账号签到，返回带 accounts 的汇总 CheckinResult（存 KV 供面板展示）。 */
-async function checkinOauthPoolAccounts(env: Env, provider: Provider): Promise<CheckinResult> {
+/**
+ * WorkBuddy 池全账号签到。
+ *
+ * opts.interactive：调用方是否为**用户等待的交互式端点**（管理后台手动触发）。
+ * true 时跳过账号间限速与条间间隔——否则一次手动操作会因
+ * "N 账号 × (5 条 × 1.5s + 0.8s)" 而卡住数十秒（且接近 Workers 请求时限）。
+ * cron 后台路径保持 false（无客户端等待，防风控优先，对齐源实现后台调度语义）。
+ */
+async function checkinOauthPoolAccounts(
+  env: Env,
+  provider: Provider,
+  opts?: { interactive?: boolean }
+): Promise<CheckinResult> {
   const now = Date.now()
+  const interactive = opts?.interactive === true
   const base: CheckinResult = {
     providerId: provider.id,
     name: provider.name,
@@ -498,9 +574,15 @@ async function checkinOauthPoolAccounts(env: Env, provider: Provider): Promise<C
 
   const accounts: CheckinResult[] = []
   let success = 0, already = 0, fail = 0, skipped = 0
+  let firstAccount = true
   for (const acc of pool) {
+    // 账号间限速（对齐 workbuddy2api activityAccountDelay/travelAccountDelay = 800ms）：
+    // 每账号签到内含 5 条活跃上报 + 旅行巡检（多个上游请求），
+    // 池内账号连续无间隔处理会对上游形成突发压力。交互式端点跳过（用户等待）。
+    if (!firstAccount && !interactive) await delayMs(ACTIVITY_ACCOUNT_DELAY_MS)
+    firstAccount = false
     try {
-      const r = await checkinOauthPoolAccount(env, provider, acc)
+      const r = await checkinOauthPoolAccount(env, provider, acc, { interactive })
       accounts.push(r)
       if (r.success) {
         if (r.reason === 'already') already++
@@ -540,10 +622,19 @@ async function checkinOauthPoolAccounts(env: Env, provider: Provider): Promise<C
   return base
 }
 
-export async function checkinOneAccount(env: Env, provider: Provider): Promise<CheckinResult> {
+/**
+ * 单 provider 签到。
+ * opts.interactive：交互式端点（管理后台手动触发，用户等待 HTTP 响应）→ 跳过防风控延时；
+ * cron 后台路径保持缺省（false）。
+ */
+export async function checkinOneAccount(
+  env: Env,
+  provider: Provider,
+  opts?: { interactive?: boolean }
+): Promise<CheckinResult> {
   // WorkBuddy 多账号池：browser 登录流提供商遍历池内所有账号各自签到，返回带 accounts 的汇总结果
   if (isOAuthPoolProvider(provider)) {
-    return checkinOauthPoolAccounts(env, provider)
+    return checkinOauthPoolAccounts(env, provider, opts)
   }
 
   // QoderWork 多账号池：遍历池内所有账号各自签到，返回带 accounts 的汇总结果
@@ -586,7 +677,27 @@ export async function checkinOneAccount(env: Env, provider: Provider): Promise<C
     base.message = '国际版账号无签到功能'
     base.success = true
     // 国际版也拉额度信息（对齐 CPA 面板展示）
-    await fillCredits(env, base, token, 'global', uid, enterpriseId)
+    const devTokenGlobal = provider.oauth?.deviceToken
+    await fillCredits(env, base, token, 'global', uid, enterpriseId, devTokenGlobal)
+    // 国际版活跃上报放开（同池化路径，移植 workbuddy2api a190252 / PR #45）
+    try {
+      const act = await reportWorkbuddyChatActivity(token, 'global', uid, { enterpriseId, deviceToken: devTokenGlobal, count: 5, gapMs: opts?.interactive ? 0 : undefined })
+      base.activityReport = { success: act.success, message: act.message }
+    } catch (e) {
+      base.activityReport = { success: false, message: (e as Error).message }
+    }
+    try {
+      const streak = await fetchWorkbuddyStreak(token, 'global', { uid, enterpriseId, deviceToken: devTokenGlobal })
+      if (typeof streak === 'number') base.streakDays = streak
+    } catch { /* ignore */ }
+    // 国际版一次性 trial 加油包（同池化路径，移植 workbuddy2api trial.go）
+    try {
+      const tr = await claimGlobalTrial(token)
+      base.trialClaim = { success: tr.ok, already: tr.already, message: tr.msg }
+    } catch (e) {
+      base.trialClaim = { success: false, already: false, message: (e as Error).message }
+    }
+    // 不做猫猫旅行：global 无该体系（对齐 workbuddy2api travel.go:56-58 D4 门控）
     await writeCheckinResult(env, provider.id, base)
     return base
   }
@@ -628,9 +739,11 @@ export async function checkinOneAccount(env: Env, provider: Provider): Promise<C
 
   // 生态增值与自动化任务（P2）：活跃上报 + streak 回读 + 猫猫旅行
   const devToken = provider.oauth?.deviceToken
+  let activityReportedOk = false
   try {
-    const act = await reportWorkbuddyChatActivity(token, 'cn', uid, { enterpriseId, deviceToken: devToken, count: 5 })
+    const act = await reportWorkbuddyChatActivity(token, 'cn', uid, { enterpriseId, deviceToken: devToken, count: 5, gapMs: opts?.interactive ? 0 : undefined })
     base.activityReport = { success: act.success, message: act.message }
+    activityReportedOk = act.success
   } catch (e) {
     base.activityReport = { success: false, message: (e as Error).message }
   }
@@ -641,14 +754,21 @@ export async function checkinOneAccount(env: Env, provider: Provider): Promise<C
   } catch { /* ignore */ }
 
   try {
-    const travel = await runWorkbuddyCatTravel(token, 'cn', uid, { enterpriseId, deviceToken: devToken })
+    // 同池化路径：启用领养当日防抖 + 上报成功后豁免（对话量刚补满，就地闭环）
+    const travel = await runWorkbuddyCatTravel(token, 'cn', uid, {
+      enterpriseId,
+      deviceToken: devToken,
+      env,
+      providerId: provider.id,
+      forceAdopt: activityReportedOk,
+    })
     base.catTravel = travel
   } catch (e) {
     base.catTravel = { state: 'error', message: (e as Error).message }
   }
 
   // 额度信息（可用/已用/额度池/包数 + 套餐类型）
-  await fillCredits(env, base, token, 'cn', uid, enterpriseId)
+  await fillCredits(env, base, token, 'cn', uid, enterpriseId, provider.oauth?.deviceToken)
 
   await writeCheckinResult(env, provider.id, base)
   return base
@@ -665,7 +785,13 @@ function participatesInCheckin(p: Provider): boolean {
   return p.authType === 'oauth-device' && !!p.oauth && !CHECKIN_EXCLUDED_FLOWS.includes(p.oauth.flowType as never) && !isTraeProvider(p)
 }
 
-export async function runAllCheckins(env: Env, silent = false): Promise<{
+/**
+ * 全量签到（遍历所有参与签到的 provider）。
+ *
+ * opts.interactive：交互式端点（用户等待）→ 跳过防风控延时。
+ * 缺省 false（cron 后台路径，防风控优先）。
+ */
+export async function runAllCheckins(env: Env, silent = false, opts?: { interactive?: boolean }): Promise<{
   total: number
   success: number
   already: number
@@ -680,7 +806,7 @@ export async function runAllCheckins(env: Env, silent = false): Promise<{
   // 简单串行（账号数量通常很少，且避免并发刷新 token 冲突）
   for (const p of oauthProviders) {
     try {
-      const r = await checkinOneAccount(env, p)
+      const r = await checkinOneAccount(env, p, { interactive: opts?.interactive })
       results.push(r)
       // 写日志（silent 模式跳过，用于面板后台静默刷新，避免日志噪音）
       if (!silent) {
@@ -722,14 +848,17 @@ export async function handleCheckinTrigger(c: Context<{ Bindings: Env }>) {
       return c.json<ApiResponse>({ success: false, message: 'M365 账号不参与签到' }, 400)
     if (p.oauth?.flowType === 'gemini')
       return c.json<ApiResponse>({ success: false, message: 'Gemini 账号无签到功能' }, 400)
-    const result = await checkinOneAccount(c.env, p)
+    // interactive: true —— 管理后台手动触发，用户等待 HTTP 响应，
+    // 跳过防风控延时（否则多账号 × 6s+ 会让操作明显卡顿）
+    const result = await checkinOneAccount(c.env, p, { interactive: true })
     if (!body.silent) {
       try { await writeLog(c.env, 'info', `[checkin] ${p.name} → ${result.reason}（手动）`, JSON.stringify(result)) } catch { /* ignore */ }
     }
     return c.json<ApiResponse<CheckinResult>>({ success: true, data: result })
   }
 
-  const summary = await runAllCheckins(c.env, !!body.silent)
+  // interactive: true —— 手动全量签到（用户等待）
+  const summary = await runAllCheckins(c.env, !!body.silent, { interactive: true })
   // 统一调度入口：全量签到同时覆盖 TRAE SOLO，返回合并摘要
   let traeSummary: Awaited<ReturnType<typeof runTraeCheckins>> | null = null
   try {
@@ -838,9 +967,15 @@ export async function handleOAuthActivity(c: Context<{ Bindings: Env }>) {
     const uid = acc.uid || claims.uid
     const enterpriseId = acc.token?.enterprise_id || claims.enterpriseId
     const devToken = acc.token?.device_token || p.oauth?.deviceToken
-    const res = await reportWorkbuddyChatActivity(token, 'cn', uid, { enterpriseId, deviceToken: devToken, count: 5 })
+    // 按 token realm 决定上报域（global → workbuddy.ai/v2/report）：
+    // 国际版 /v2/report 可用并点亮连登（移植 workbuddy2api a190252 / PR #45）。
+    const accRealm = detectTokenRealm(token) === 'global' ? 'global' : 'cn'
+    // gapMs=0：这是**管理后台手动端点**，用户会等待 HTTP 响应；5 条 × 1.5s = 6s 会让
+    // 操作明显卡顿（且接近 Workers 请求时限）。防风控间隔仅在 cron 后台路径保留
+    //（那里没有客户端等待，且源实现本身就是后台调度）。
+    const res = await reportWorkbuddyChatActivity(token, accRealm, uid, { enterpriseId, deviceToken: devToken, count: 5, gapMs: 0 })
     if (res.success) ok++
-    results.push({ uid, nickname: acc.nickname, ...res })
+    results.push({ uid, nickname: acc.nickname, realm: accRealm, ...res })
   }
   return c.json<ApiResponse>({ success: true, message: `已完成活跃上报（成功 ${ok}/${pool.length}）`, data: results })
 }
@@ -859,11 +994,14 @@ export async function handleOAuthTravel(c: Context<{ Bindings: Env }>) {
     if (acc.state?.disabled) continue
     const token = acc.token?.access_token || ''
     if (!token) continue
+    // global 账号无猫猫旅行体系（对齐 workbuddy2api travel.go:56-58 D4 门控），跳过不发请求
+    if (detectTokenRealm(token) === 'global') continue
     const claims = decodeWorkbuddyClaims(token)
     const uid = acc.uid || claims.uid
     const enterpriseId = acc.token?.enterprise_id || claims.enterpriseId
     const devToken = acc.token?.device_token || p.oauth?.deviceToken
-    const res = await runWorkbuddyCatTravel(token, 'cn', uid, { enterpriseId, deviceToken: devToken })
+    // 传 env/providerId 启用领养当日防抖
+    const res = await runWorkbuddyCatTravel(token, 'cn', uid, { enterpriseId, deviceToken: devToken, env: c.env, providerId: p.id })
     results.push({ uid, nickname: acc.nickname, ...res })
   }
   return c.json<ApiResponse>({ success: true, message: `已完成猫猫旅行巡检（共 ${results.length} 个账号）`, data: results })
@@ -875,7 +1013,8 @@ export async function handleOAuthDaily(c: Context<{ Bindings: Env }>) {
   const providers = (await getProviders(c.env)) as Provider[]
   const p = providers.find((x) => x.id === id)
   if (!p) return c.json<ApiResponse>({ success: false, message: '提供商不存在' }, 404)
-  const result = await checkinOneAccount(c.env, p)
+  // interactive: true —— 一键日常是用户等待的交互式操作
+  const result = await checkinOneAccount(c.env, p, { interactive: true })
   return c.json<ApiResponse<CheckinResult>>({ success: true, message: '已完成一键日常任务', data: result })
 }
 

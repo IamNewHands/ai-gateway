@@ -51,6 +51,8 @@ import {
   refreshOauthPoolAccount,
   resolveOauthCooldown,
   seedOauthPoolFromSingle,
+  readOauthPool,
+  isOauthAccountHealthy,
   type OAuthPoolAccount,
 } from './oauth-pool'
 import {
@@ -61,7 +63,32 @@ import {
   injectDeepSeekThinking,
   backfillReasoningContent,
   injectWorkbuddyChatHeaders,
+  ensureWorkbuddyStreamOptions,
+  isAccountBanned,
+  ensureGlobalFallbackSystem,
+  sanitizeWorkbuddyMessages,
+  sanitizeFingerprintText,
+  ContentBlockedError,
+  WorkbuddyClientError,
+  formatWorkbuddyClientErrorMessage,
 } from './workbuddy-upstream'
+import {
+  buildChatMeta,
+  extractSessionKey,
+  type ChatMeta,
+} from './workbuddy-session-ids'
+import {
+  resolveSticky,
+  bindSticky,
+  unbindSticky,
+} from './workbuddy-sticky'
+import { createWorkbuddyChunkCleaner } from './workbuddy-sse'
+import {
+  acquireInFlight,
+  releaseInFlight,
+  isInFlightFull,
+  resolveMaxInFlight,
+} from './workbuddy-inflight'
 import {
   anthropicToOpenAI,
   openAIToAnthropic,
@@ -200,25 +227,28 @@ function sanitizeUpstreamError(text: string, max = 400): string {
 }
 
 /**
- * 清理被 Tencent CodeBuddy 内容过滤器屏蔽的 Claude Code 模板短语。
- * CPA 使用零宽空格 \u200B 插入到短语中来绕过精确匹配过滤。
+ * 清理被 Tencent CodeBuddy 内容过滤器屏蔽的模板短语。
+ *
+ * 已升级为 workbuddy2api 的**完整脱敏管线**（sanitizeWorkbuddyMessages）：
+ * 除 content（字符串与多模态 text part）外，还净化 `tool_calls[].function.arguments`
+ * ——后者长期是盲区（工具调用消息 content 常为 null，旧实现遇 null 会跳过整条消息，
+ * 使工具参数里的被拦字符串原样漏出）。
  */
 function sanitizeBlockedTemplates(body: Record<string, unknown>): void {
-  const messages = body['messages'] as any[]
-  if (!Array.isArray(messages)) return
-  for (const msg of messages) {
-    if (!msg || typeof msg !== 'object') continue
-    const content = msg.content
-    if (typeof content === 'string') {
-      msg.content = sanitizeText(content)
-    } else if (Array.isArray(content)) {
-      for (const part of content) {
-        if (part && typeof part.text === 'string') {
-          part.text = sanitizeText(part.text)
-        }
-      }
-    }
-  }
+  sanitizeWorkbuddyMessages(body)
+}
+
+/**
+ * 单段文本的模板短语净化。
+ *
+ * @deprecated 语义已被 `sanitizeFingerprintText`（workbuddy-upstream.ts）完整覆盖。
+ * 本包装保留以兼容既有调用点；新代码请直接用 `sanitizeFingerprintText`。
+ *
+ * 注意本函数此前用**零宽空格 `\u200B`** 打断匹配串，而 workbuddy2api 实测结论是
+ * "零宽空格无效（上游会归一化）"，对 `11128` 必须改用连字符。现委托给完整实现。
+ */
+function sanitizeText(s: string): string {
+  return sanitizeFingerprintText(s)
 }
 
 /**
@@ -250,21 +280,6 @@ function sanitizeUpstreamBody(body: Record<string, unknown>): void {
       msg.content = ''
     }
   }
-}
-
-/** 在匹配的屏蔽短语中插入零宽空格来绕过精确匹配过滤 */
-function sanitizeText(s: string): string {
-  // "You are Claude Code, Anthropic's official CLI tool for Claude." 中的 "Claude" 后插入 \u200B
-  s = s.replace(
-    /You are Claude Code, Anthropic's official CLI tool for Claude\./g,
-    'You are Claude\u200B Code, Anthropic\u200B\'s official CLI tool for Claude.'
-  )
-  // "Default branch (you will usually use this for PRs)" 中的 "Default" 后插入 \u200B
-  s = s.replace(
-    /Default branch \(you will usually use this for PRs\)/g,
-    'Default\u200B branch (you will usually use this for PRs)'
-  )
-  return s
 }
 
 /**
@@ -451,10 +466,11 @@ async function aggregateWorkbuddySSE(body: ReadableStream<Uint8Array>, model: st
 }
 
 /**
- * WorkBuddy SSE chunk 清洗：去掉空 tool_calls/function_call 等噪音字段。
- * 参考 cpa-plugin stream.go 的 cleanChunkJSON 实现。
- * 不清洗这些字段会导致 strict 客户端（如某些 OpenAI SDK）解码失败：
- * "SSE stream error: Transport error: error decoding response body"
+ * WorkBuddy SSE chunk 清洗（**纯函数版，无跨帧状态**）。
+ *
+ * @deprecated 池化与非池化 OAuth 路径已改用 `createWorkbuddyChunkCleaner()`（workbuddy-sse.ts）
+ * ——后者额外提供白名单重建、首帧 id 续传、tool_calls name 跨帧回填（移植 workbuddy2api sse.go），
+ * 这些能力必须有跨帧状态，纯函数无法表达。本函数保留仅供其他调用方/回归对比使用。
  */
 function cleanWorkbuddyChunk(chunk: string): string {
   // 只处理 SSE data: 行
@@ -1751,12 +1767,31 @@ async function proxyOAuthRequestPooledCore(
 ): Promise<{ response: Response; originalStream: boolean; account?: OAuthPoolAccount }> {
   const cfg = provider.oauth!
   const cd = resolveOauthCooldown(provider)
+  // 单账号在途上限（对齐 workbuddy2api pool.max_in_flight；0/未配置 → 默认 3）
+  const maxInFlight = resolveMaxInFlight(provider)
   const reqModel = typeof (forwardBody as Record<string, unknown>)?.['model'] === 'string'
     ? (forwardBody as Record<string, unknown>)['model'] as string
     : undefined
 
   // 兼容迁移：池空时把既有单 token 种子进池
   try { await seedOauthPoolFromSingle(c.env, provider.id) } catch { /* ignore */ }
+
+  // 会话头族（移植 workbuddy2api issue #35）：在**轮转循环外**生成一次，循环内每次出站复用
+  // → 换号/重试/降级全部同 X-Conversation-Request-ID，上游后台按对话轮聚合而非逐请求碎片化。
+  // 关键时序：必须在 body 改写（sanitize/tool_choice/thinking）之前取 turnKey——改写会动
+  // messages 内容，改写后取的键会随 step 漂移（对齐 workbuddy2api handler.go:406-414 的注释）。
+  // 非 chat 路径（如 models）无"对话轮"语义，不生成（传 undefined 即不注入头族）。
+  let chatMeta: ChatMeta | undefined
+  if (isWorkbuddyProvider(provider) && subPath === 'chat/completions') {
+    const bodyObj = forwardBody as Record<string, unknown>
+    const sessKey = extractSessionKey(bodyObj)
+    chatMeta = await buildChatMeta({
+      body: bodyObj,
+      sessionKey: sessKey,
+      inboundConversationRequestId: c.req.header('X-Conversation-Request-ID') || undefined,
+      inboundTraceId: c.req.header('X-Trace-ID') || undefined,
+    })
+  }
 
   const resolveRealm = (token: string): 'cn' | 'global' => {
     return detectTokenRealm(token) === 'global' ? 'global' : 'cn'
@@ -1785,7 +1820,11 @@ async function proxyOAuthRequestPooledCore(
       const capturedEffort = captureWorkbuddyReasoningEffort(body)
       const effortPolicy = cfg.effortPolicy
       if (body.stream !== true) body.stream = true
+      // stream_options 补 include_usage（移植 workbuddy2api D7）：上游据此在末帧回 usage，
+      // 成本账本（recordOauthModelCost）依赖它；未带才注入，显式带则尊重调用方
+      ensureWorkbuddyStreamOptions(body)
       sanitizeUpstreamBody(body)
+      sanitizeBlockedTemplates(body)
       normalizeOpenAIToolChoice(body)
       if (capturedEffort) {
         const model = typeof body['model'] === 'string' ? body['model'] : ''
@@ -1794,10 +1833,16 @@ async function proxyOAuthRequestPooledCore(
       // DeepSeek 思维链注入与历史消息一致性回填（对齐 workbuddy2api thinking.go）
       injectDeepSeekThinking(body)
       backfillReasoningContent(body)
+      // global 兜底 system 注入（对齐 workbuddy2api ensureConsoleSystem / PR #45）。
+      // 必须放在这里（per-account realm 已确定）：池内可能混有 CN 与 global 账号，
+      // 各自 realm 不同，不能在上层统一注入。仅 chat 路径（非 chat 无 messages 语义）。
+      if (r === 'global' && subPath === 'chat/completions') {
+        ensureGlobalFallbackSystem(body)
+      }
     }
     const headers = buildOauthHeaders(cfg, token, { origin: buildOrigin(r), apiType: provider.apiType, cookies })
     if (isWorkbuddyProvider(provider)) {
-      injectWorkbuddyChatHeaders(headers, token, r, account?.token, cfg)
+      injectWorkbuddyChatHeaders(headers, token, r, account?.token, cfg, { chatPath: subPath === 'chat/completions', chatMeta })
     }
     return fetchUpstream(c.env, buildForwardUrl(r), {
       method,
@@ -1820,13 +1865,54 @@ async function proxyOAuthRequestPooledCore(
   const tried = new Set<string>()
   let lastErr: Error | null = null
 
+  // 会话粘性（移植 workbuddy2api internal/session/session.go）：同一会话尽量绑定同一账号，
+  // 避免多轮跳号导致上游 prompt cache 失效与上下文不一致。
+  // 仅在首轮用粘性号（i === 0）；轮转失败后该号进 tried，自然换号。
+  // 注意：粘性命中校验带**模型维度**——绑定号若被 6004 模型级限额（对其他模型仍可用），
+  // 必须重分配，否则会话会被钉在"对当前模型不可用"的号上反复失败。
+  const sessKey = chatMeta ? extractSessionKey(forwardBody as Record<string, unknown>) : ''
+  let stickyUid = ''
+  if (sessKey) {
+    const poolNow = await readOauthPool(c.env, provider.id)
+    const availability = (uid: string): boolean => {
+      const acc = poolNow.find((a) => a.uid === uid)
+      return !!acc && isOauthAccountHealthy(acc, Date.now(), reqModel)
+    }
+    const resolved = await resolveSticky(c.env, provider.id, sessKey, availability)
+    if (resolved.hit) stickyUid = resolved.uid
+  }
+
   for (let i = 0; i < MAX_OAUTH_ROTATE; i++) {
     // 挑号（三因子加权随机）+ 全冷却兜底：无健康账号时从冷却账号选最早到期者顶班
     //（对齐 workbuddy2api pickEarliestExpiry；禁用与余额耗尽号永不参与兜底）
-    const account = await pickOauthAccount(c.env, provider.id, tried, i === 0 ? provider.preferOauthUid : undefined, { allowCoolingFallback: true, reqModel })
+    // 优先级：粘性命中号（仅首轮）> 面板手工指定 preferOauthUid（仅首轮）> 三因子加权
+    // 在途占满的号被排除（对齐源实现 pick.go:63-65 inFlightFull）
+    const preferUid = i === 0 ? (stickyUid || provider.preferOauthUid) : undefined
+    const account = await pickOauthAccount(c.env, provider.id, tried, preferUid, {
+      allowCoolingFallback: true,
+      reqModel,
+      isInFlightFull: (uid) => isInFlightFull(provider.id, uid, maxInFlight),
+    })
     if (!account) break
     tried.add(account.uid)
 
+    // 在途租约：占用一个名额。pick 已排除满号，此处是并发竞态的兜底（同 isolate 内
+    // JS 单线程使 acquire 天然原子，故竞态窗口极小；失败即换号）。
+    if (!acquireInFlight(provider.id, account.uid, maxInFlight)) {
+      continue
+    }
+    // 本账号的在途名额必须在本轮任何出口释放（成功 return / 各 continue / 抛错）。
+    // 用 try/finally 包裹"本轮处理"，避免遗漏任一分支导致名额泄漏（泄漏会让该号
+    // 永久被判满、不再被选中）。
+    let released = false
+    const releaseOnce = () => {
+      if (!released) {
+        released = true
+        releaseInFlight(provider.id, account.uid)
+      }
+    }
+
+    try {
     // 临近过期 → 先刷新（写回池）
     let token = account.token.access_token
     if (account.token.refresh_token && account.token.expires_at - Date.now() < OAUTH_TOKEN_REFRESH_MARGIN_MS) {
@@ -1870,6 +1956,11 @@ async function proxyOAuthRequestPooledCore(
       }
       if (response.status === 401 || response.status === 403) {
         await disableOauthAccount(c.env, provider.id, account.uid, 'session dead (401/403)')
+        // 粘性解绑：失败号若是本会话的绑定号，下次请求重新分配（对齐 session.go Unbind）
+        if (sessKey && account.uid === stickyUid) {
+          await unbindSticky(c.env, provider.id, sessKey)
+          stickyUid = ''
+        }
         lastErr = new Error(`account ${account.uid} session dead`)
         continue
       }
@@ -1901,16 +1992,47 @@ async function proxyOAuthRequestPooledCore(
           // session 失效（12153/offline）→ 连续 3 次防抖：前 2 次短冷却，第 3 次永久禁用（对齐 workbuddy2api noteSessionDead）
           await noteOauthSessionDead(c.env, provider.id, account.uid, cd)
           break
+        case 'account_fault':
+          // 账号级授权/配额故障（对齐 workbuddy2api handler.applyErrorPolicy 的 ErrAccountFault 分支）。
+          // 按 msg 分野，两条策略可恢复性不同：
+          //  - 11140 "request illegal"：账号级授权封禁，软冷却到期也不会自愈（需重新 OAuth 登录），
+          //    到期后重新选号只会再撞 403 浪费一次轮换 → 硬禁用（不再参与选号，需重登恢复）；
+          //  - 14017 "trial not activated"：register 未完成，补完 register 后可能自愈 →
+          //    保持软冷却（禁用会让用户补完 register 后仍无法用）。
+          if (isAccountBanned(text)) {
+            await disableOauthAccount(c.env, provider.id, account.uid, 'account banned by upstream (11140 request illegal), re-login required')
+          } else {
+            await cooldownOauthAccount(c.env, provider.id, account.uid, cd.softMs, 'account fault (14017)')
+          }
+          break
         case 'server':
           // 5xx 上游故障 → 累计错误计数（达阈值自动冷却）
           await noteOauthError(c.env, provider.id, account.uid, cd)
           break
-        case 'bad_params':
         case 'content_blocked':
+          // 内容命中网关防火墙：**立即终止本请求，不轮转**（对齐 workbuddy2api handler.go:571-582）。
+          // 理由：内容问题是**请求本身**的问题，换任何账号都会撞同一审核——轮转纯属浪费
+          // 上游请求并放大风控。且不罚账号（该号余额/会话都健康）。
+          // 抛出专用错误由外层入口转为 400 + 防火墙文案（避免暴露业务 code 与账号/冷却语义）。
+          if (sessKey && account.uid === stickyUid) {
+            await unbindSticky(c.env, provider.id, sessKey)
+          }
+          throw new ContentBlockedError(text)
+        case 'bad_params':
         case 'client':
         default:
-          // client（其他 4xx，如 400 参数错）：客户端请求问题，不处罚账号（防雪崩），仅换号
-          break
+          // 客户端请求问题（400 参数错/超长/畸形 JSON 等）：请求本身的问题，换任何账号都会撞同一错误。
+          // 不处罚账号（防雪崩），立即终止本请求，不轮转，直接向客户端透传 4xx 与上游原因，
+          // 避免轮空整个账号池后误报「503 OAuth 账号池无可用账号」。
+          if (sessKey && account.uid === stickyUid) {
+            await unbindSticky(c.env, provider.id, sessKey)
+          }
+          throw new WorkbuddyClientError(response.status, text)
+      }
+      // 粘性解绑：失败号若是本会话的绑定号，下次请求重新分配
+      if (sessKey && account.uid === stickyUid) {
+        await unbindSticky(c.env, provider.id, sessKey)
+        stickyUid = ''
       }
       lastErr = new Error(`account ${account.uid} http ${response.status} (${kind})`)
       continue
@@ -1919,7 +2041,21 @@ async function proxyOAuthRequestPooledCore(
     // 成功：记账成功，重置 session dead 计数，返回原始上游响应
     await noteOauthSuccess(c.env, provider.id, account.uid)
     await clearOauthSessionDead(c.env, provider.id, account.uid)
+    // 粘性跟随最终成功号（对齐 session.go:190-193）：本轮成功的账号成为该会话的绑定，
+    // 覆盖旧绑定。若粘性号失败后轮换到别的号成功，这里把会话重绑到新号，
+    // 多轮对话下一跳不再随机抽 → 保住新号上的 prompt cache。
+    if (sessKey && account.uid !== stickyUid) {
+      await bindSticky(c.env, provider.id, sessKey, account.uid)
+    }
+    // 释放本轮在途名额：上游已返回响应头，租约使命完成。
+    // 流式场景下 body 由外层 passthroughResponse 消费——源实现的 inFlight 同样在
+    // "拿到响应"后即释放（不覆盖整个 body 消费期），此处保持一致语义。
+    releaseOnce()
     return { response, originalStream, account }
+    } finally {
+      // 兜底：任何 continue / 抛错路径都必须释放，避免名额泄漏使该号永久被判满。
+      releaseOnce()
+    }
   }
 
   throw new Error('no healthy account (cooling/disabled)' + (lastErr ? ': ' + lastErr.message : ''))
@@ -1980,8 +2116,29 @@ async function proxyOAuthRequestPooled(
         } catch { /* ignore parse error */ }
       }
     }
-    return passthroughResponse(response, cleanWorkbuddyChunk, onLine)
+    // 有状态清洗器（每请求新实例）：跨帧维护首帧 id 续传与 tool_calls name 回填。
+    // onLine 在 cleanFn **之前**执行（见 passthroughResponse 的读取循环），故成本记账
+    // 读到的始终是上游**原始**帧，usage.credit 不会被重建逻辑影响。
+    return passthroughResponse(response, createWorkbuddyChunkCleaner(), onLine)
   } catch (err) {
+    // 内容拦截是**本请求的终态**：回 400 + 防火墙文案（不回 503，也不暴露账号/错误码）。
+    if (err instanceof ContentBlockedError) {
+      logOAuthRequest(c, provider, model, subPath, forwardBody, 400)
+      return c.json({
+        error: { message: err.clientMessage, type: 'content_blocked' },
+      }, 400)
+    }
+    // 客户端参数/格式错误是**本请求的终态**：透传 4xx + 上游具体原因（不轮转，避免误报 503 无可用账号）
+    if (err instanceof WorkbuddyClientError) {
+      logOAuthRequest(c, provider, model, subPath, forwardBody, err.status)
+      const formatted = formatWorkbuddyClientErrorMessage(err.status, err.upstreamText)
+      const errorObj: Record<string, unknown> = {
+        message: formatted.message,
+        type: 'invalid_request_error',
+      }
+      if (formatted.code !== undefined) errorObj.code = formatted.code
+      return c.json({ error: errorObj }, err.status as any)
+    }
     logOAuthRequest(c, provider, model, subPath, forwardBody, 503)
     return c.json({
       error: { message: `OAuth 账号池无可用账号：${(err as Error).message || '未知错误'}`, type: 'no_healthy_account' },
@@ -2005,6 +2162,17 @@ async function proxyOAuthRequest(
   }
 
   const model = (forwardBody as Record<string, unknown>).model as string
+
+  // 会话头族（workbuddy2api issue #35）：非池化 OAuth 路径同样注入。
+  // body 改写前取 turnKey（本函数不改写 forwardBody，但保持与池化路径同一时序约定）。
+  const chatMeta: ChatMeta | undefined = isWorkbuddyProvider(provider) && subPath === 'chat/completions'
+    ? await buildChatMeta({
+        body: forwardBody as Record<string, unknown>,
+        sessionKey: extractSessionKey(forwardBody as Record<string, unknown>),
+        inboundConversationRequestId: c.req.header('X-Conversation-Request-ID') || undefined,
+        inboundTraceId: c.req.header('X-Trace-ID') || undefined,
+      })
+    : undefined
 
   // 先从 KV 读取 token 状态（含 cookies）
   let tokenState = await readOauthToken(c.env, provider.id)
@@ -2041,7 +2209,10 @@ async function proxyOAuthRequest(
       if (body.stream !== true) {
         body.stream = true
       }
+      // stream_options 补 include_usage（移植 workbuddy2api D7），同池化路径
+      ensureWorkbuddyStreamOptions(body)
       sanitizeUpstreamBody(body)
+      sanitizeBlockedTemplates(body)
       normalizeOpenAIToolChoice(body)
       if (capturedEffort) {
         const m = typeof body['model'] === 'string' ? body['model'] : ''
@@ -2053,7 +2224,7 @@ async function proxyOAuthRequest(
     }
     const headers = buildOauthHeaders(cfg, token, { origin: buildOrigin(r), apiType: provider.apiType, cookies: tokenState?.cookies })
     if (isWorkbuddyProvider(provider)) {
-      injectWorkbuddyChatHeaders(headers, token, r, tokenState ? { uid: tokenState.uid, enterprise_id: tokenState.enterprise_id, domain: tokenState.domain, device_token: tokenState.device_token } : undefined, cfg)
+      injectWorkbuddyChatHeaders(headers, token, r, tokenState ? { uid: tokenState.uid, enterprise_id: tokenState.enterprise_id, domain: tokenState.domain, device_token: tokenState.device_token } : undefined, cfg, { chatPath: subPath === 'chat/completions', chatMeta })
     }
     return fetchUpstream(c.env, buildForwardUrl(r), {
       method,
@@ -2144,7 +2315,7 @@ async function proxyOAuthRequest(
     }
 
     logOAuthRequest(c, provider, model, subPath, forwardBody, response.status)
-    return passthroughResponse(response, cleanWorkbuddyChunk)
+    return passthroughResponse(response, createWorkbuddyChunkCleaner())
   } catch (err) {
     const error = err as Error
     logOAuthRequest(c, provider, model, subPath, forwardBody, 502)
@@ -2342,6 +2513,15 @@ export async function handleAnthropicMessages(c: Context<AppEnv>) {
       const cfg = provider.oauth
       // 强制流式（WorkBuddy 只支持流式）
       const upstreamBody: Record<string, unknown> = { ...openaiBody, stream: true }
+      // 会话头族（workbuddy2api issue #35）：body 改写前取 turnKey，整个请求复用同一聚合主键。
+      const wbChatMeta: ChatMeta | undefined = isWorkbuddyProvider(provider)
+        ? await buildChatMeta({
+            body: openaiBody as Record<string, unknown>,
+            sessionKey: extractSessionKey(openaiBody as Record<string, unknown>),
+            inboundConversationRequestId: c.req.header('X-Conversation-Request-ID') || undefined,
+            inboundTraceId: c.req.header('X-Trace-ID') || undefined,
+          })
+        : undefined
       // WorkBuddy reasoning_effort 捕获（sanitize 删除前抢救，仅 workbuddy 提供商恢复/降级）
       const wbCapturedEffort = isWorkbuddyProvider(provider) ? captureWorkbuddyReasoningEffort(upstreamBody) : null
       // 清理上游不支持的字段 + 被屏蔽的 Claude Code 模板短语
@@ -2357,6 +2537,9 @@ export async function handleAnthropicMessages(c: Context<AppEnv>) {
       // tool_choice 归一化：对象形式（如 Anthropic 转换后的 {type:function,function:{name}}）
       // 会被 WorkBuddy 上游以 400 code=11101 拒绝，需转字符串（对齐 workbuddy-wild PrepareBody 不变量）
       if (isWorkbuddyProvider(provider)) {
+        // stream_options 补 include_usage（移植 workbuddy2api D7）：上游据此在末帧回 usage，
+        // 成本账本（recordOauthModelCost）依赖它；未带才注入，显式带则尊重调用方
+        ensureWorkbuddyStreamOptions(upstreamBody)
         normalizeOpenAIToolChoice(upstreamBody)
         // reasoning_effort 降级（移植 workbuddy2api）：运营者声明 oauth.effortPolicy 才恢复/降级，未声明保持删除
         if (wbCapturedEffort) {
@@ -2376,6 +2559,21 @@ export async function handleAnthropicMessages(c: Context<AppEnv>) {
           const core = await proxyOAuthRequestPooledCore(c, provider, 'chat/completions', '', upstreamBody, 'POST')
           response = core.response
         } catch (e) {
+          // 内容拦截终态：回 400（Anthropic 错误形状）+ 防火墙文案
+          if (e instanceof ContentBlockedError) {
+            return c.json({
+              type: 'error',
+              error: { type: 'content_blocked', message: e.clientMessage },
+            }, 400)
+          }
+          // 客户端参数/格式错误终态：回 4xx（Anthropic 错误形状）+ 上游原因（不轮转，避免误报 503 无可用账号）
+          if (e instanceof WorkbuddyClientError) {
+            const formatted = formatWorkbuddyClientErrorMessage(e.status, e.upstreamText)
+            return c.json({
+              type: 'error',
+              error: { type: 'invalid_request_error', message: formatted.message },
+            }, e.status as any)
+          }
           return c.json({
             type: 'error',
             error: { type: 'no_healthy_account', message: 'OAuth 账号池无可用账号：' + ((e as Error).message || '') },
@@ -2403,12 +2601,10 @@ export async function handleAnthropicMessages(c: Context<AppEnv>) {
         const origin = isGlobal && cfg.globalOrigin ? cfg.globalOrigin : (cfg.extraHeaders?.Origin)
         upstreamUrl = `${realmBase}/chat/completions`
 
-        // Global 域需要 system message
+        // Global 域需要兜底 system message
         if (isGlobal) {
-          const msgs = upstreamBody['messages'] as any[]
-          if (msgs && !msgs.some((m: any) => m.role === 'system')) {
-            msgs.unshift({ role: 'system', content: 'You are a helpful assistant.' })
-          }
+          // global 兜底 system 注入（对齐 workbuddy2api ensureConsoleSystem：**首条**非 system 才注入）
+          ensureGlobalFallbackSystem(upstreamBody)
         }
 
         const headers = buildOauthHeaders(cfg, tokenState.access_token, {
@@ -2416,7 +2612,7 @@ export async function handleAnthropicMessages(c: Context<AppEnv>) {
           cookies: tokenState.cookies,
         })
         if (isWorkbuddyProvider(provider)) {
-          injectWorkbuddyChatHeaders(headers, tokenState.access_token, isGlobal ? 'global' : 'cn', { uid: tokenState.uid, enterprise_id: tokenState.enterprise_id, domain: tokenState.domain, device_token: tokenState.device_token }, cfg)
+          injectWorkbuddyChatHeaders(headers, tokenState.access_token, isGlobal ? 'global' : 'cn', { uid: tokenState.uid, enterprise_id: tokenState.enterprise_id, domain: tokenState.domain, device_token: tokenState.device_token }, cfg, { chatPath: true, chatMeta: wbChatMeta })
         }
 
         response = await fetchUpstream(c.env, upstreamUrl, {
@@ -2436,7 +2632,7 @@ export async function handleAnthropicMessages(c: Context<AppEnv>) {
                 cookies: freshState.cookies,
               })
               if (isWorkbuddyProvider(provider)) {
-                injectWorkbuddyChatHeaders(retryHeaders, freshState.access_token, isGlobal ? 'global' : 'cn', { uid: freshState.uid, enterprise_id: freshState.enterprise_id, domain: freshState.domain, device_token: freshState.device_token }, cfg)
+                injectWorkbuddyChatHeaders(retryHeaders, freshState.access_token, isGlobal ? 'global' : 'cn', { uid: freshState.uid, enterprise_id: freshState.enterprise_id, domain: freshState.domain, device_token: freshState.device_token }, cfg, { chatPath: true, chatMeta: wbChatMeta })
               }
               response = await fetchUpstream(c.env, upstreamUrl, {
                 method: 'POST',
@@ -3545,8 +3741,37 @@ export async function handleResponses(c: Context<AppEnv>) {
     if (provider.authType === 'oauth-device' && provider.oauth) {
       const cfg = provider.oauth
       const upstreamBody: Record<string, unknown> = { ...openaiBody, stream: true }
+      // 会话头族（workbuddy2api issue #35）：在 body 改写前取 turnKey（改写会动 messages 内容），
+      // 整个请求（含 401 重试）复用同一 conversationRequestId。
+      const wbChatMeta: ChatMeta | undefined = isWorkbuddyProvider(provider)
+        ? await buildChatMeta({
+            body: openaiBody as Record<string, unknown>,
+            sessionKey: extractSessionKey(openaiBody as Record<string, unknown>),
+            inboundConversationRequestId: c.req.header('X-Conversation-Request-ID') || undefined,
+            inboundTraceId: c.req.header('X-Trace-ID') || undefined,
+          })
+        : undefined
+      // WorkBuddy reasoning_effort 捕获（sanitize 删除前抢救，与 chat/Anthropic 路径一致）
+      const wbCapturedEffort = isWorkbuddyProvider(provider) ? captureWorkbuddyReasoningEffort(upstreamBody) : null
       // 清理上游不支持的字段（developer → system, 删除 reasoning_effort 等）
       sanitizeUpstreamBody(upstreamBody)
+      sanitizeBlockedTemplates(upstreamBody)
+      // WorkBuddy 专属改写（补齐此前 Responses 路径缺失的整块，对齐 chat/Anthropic 路径）：
+      // 否则 Responses 入口的 WorkBuddy 请求会带着上游拒绝的字段出站。
+      if (isWorkbuddyProvider(provider)) {
+        // stream_options 补 include_usage（D7）
+        ensureWorkbuddyStreamOptions(upstreamBody)
+        // tool_choice 归一（对象形式会被上游 400 code=11101 拒绝）
+        normalizeOpenAIToolChoice(upstreamBody)
+        // reasoning_effort 降级（按运营者声明的 effortPolicy）
+        if (wbCapturedEffort) {
+          const m = typeof upstreamBody['model'] === 'string' ? upstreamBody['model'] : ''
+          applyWorkbuddyReasoningEffort(upstreamBody, wbCapturedEffort, m ? cfg.effortPolicy?.[m] : undefined)
+        }
+        // DeepSeek 思维链注入与历史消息一致性回填
+        injectDeepSeekThinking(upstreamBody)
+        backfillReasoningContent(upstreamBody)
+      }
 
       // 读取 token 状态
       let tokenState = await readOauthToken(c.env, providerId)
@@ -3569,10 +3794,8 @@ export async function handleResponses(c: Context<AppEnv>) {
 
       // Global 域需要 system message
       if (isGlobal) {
-        const msgs = upstreamBody['messages'] as any[]
-        if (msgs && !msgs.some((m: any) => m.role === 'system')) {
-          msgs.unshift({ role: 'system', content: 'You are a helpful assistant.' })
-        }
+        // global 兜底 system 注入（对齐 workbuddy2api ensureConsoleSystem：**首条**非 system 才注入）
+        ensureGlobalFallbackSystem(upstreamBody)
       }
 
       const headers = buildOauthHeaders(cfg, tokenState.access_token, {
@@ -3580,6 +3803,10 @@ export async function handleResponses(c: Context<AppEnv>) {
         apiType: provider.apiType,
         cookies: tokenState.cookies,
       })
+      // WorkBuddy 协议头（此前 Responses 路径完全缺失，导致风控头/UA/Accept-Language 全无）
+      if (isWorkbuddyProvider(provider)) {
+        injectWorkbuddyChatHeaders(headers, tokenState.access_token, isGlobal ? 'global' : 'cn', { uid: tokenState.uid, enterprise_id: tokenState.enterprise_id, domain: tokenState.domain, device_token: tokenState.device_token }, cfg, { chatPath: true, chatMeta: wbChatMeta })
+      }
 
       let response = await fetchUpstream(c.env, upstreamUrl, {
         method: 'POST',
@@ -3598,6 +3825,9 @@ export async function handleResponses(c: Context<AppEnv>) {
               apiType: provider.apiType,
               cookies: freshState.cookies,
             })
+            if (isWorkbuddyProvider(provider)) {
+              injectWorkbuddyChatHeaders(retryHeaders, freshState.access_token, isGlobal ? 'global' : 'cn', { uid: freshState.uid, enterprise_id: freshState.enterprise_id, domain: freshState.domain, device_token: freshState.device_token }, cfg, { chatPath: true, chatMeta: wbChatMeta })
+            }
             response = await fetchUpstream(c.env, upstreamUrl, {
               method: 'POST',
               headers: retryHeaders,

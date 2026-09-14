@@ -1351,12 +1351,98 @@ export async function refreshAllOauthTokens(env: Env, providers: ProviderLike[])
       fail += r.fail
       continue
     }
+    // WorkBuddy（flowType=browser）：token 同样存于账号池（oauth:pool:{id}），
+    // 而非单 token key（oauth:token:{id}）。旧实现只读单 token key → **池内账号永不刷新**。
+    // 请求路径虽会对「被选中的账号」做临期刷新（proxy.ts 的 OAUTH_TOKEN_REFRESH_MARGIN_MS 兜底），
+    // 但低权重/长期冷却/已禁用的账号可能数周不被选中，其 access_token 长期处于过期状态、
+    // refresh_token 若上游有闲置失效策略则会丢失（届时只能重新登录）。
+    // 这里按池遍历做预防性保活，并对 12153 计数与 realm 做对齐维护。
+    if (flow === 'browser') {
+      const r = await refreshAllBrowserPoolTokens(env, p)
+      ok += r.ok
+      fail += r.fail
+      continue
+    }
     const state = await readOauthToken(env, p.id)
     if (!state?.refresh_token) continue
     if (state.expires_at - Date.now() > 5 * 60 * 1000) continue // 未临近过期，跳过
     const success = await refreshOauthToken(env, p.id, p.oauth)
     if (success) ok++
     else fail++
+  }
+  return { ok, fail }
+}
+
+/**
+ * WorkBuddy（browser 流）账号池保活刷新（Cron 专用）。
+ *
+ * 与 M365 池刷新的差异：WorkBuddy 的 refresh 端点是**账号级**的（用 refresh_token 换新），
+ * 没有 M365 的 oid/email 多账号标识问题，因此逐个账号独立刷新即可。
+ *
+ * 节流策略（对齐 M365 分支的「临期 + 闲置」双阈值，避免每 2 小时无条件全池打上游）：
+ *  - 临期：access_token 将在 NEAR_EXPIRY_MS 内过期 → 刷新；
+ *  - 闲置：updatedAt 距今超过 IDLE_MS → 刷新（保活，重置池 KV 存活时间）；
+ *  - 禁用账号：**跳过**（需人工重登，刷新必然失败，白打上游并产生噪音日志）。
+ *
+ * 为什么不用 oauth-pool.ts 的 refreshOauthPoolAccount：oauth.ts 是 oauth-pool.ts 的
+ * 上游依赖（oauth-pool 从本模块 import），反向 import 会形成循环依赖。这里用与
+ * browserPoolUpsert 同款的裸 KV 读写（OAUTH_POOL_KV_PREFIX + providerId），保持无环。
+ */
+async function refreshAllBrowserPoolTokens(env: Env, p: ProviderLike): Promise<{ ok: number; fail: number }> {
+  const cfg = p.oauth!
+  let ok = 0
+  let fail = 0
+  let pool: Array<{ uid: string; token: OAuthTokenState; enabled?: boolean; state?: { disabled?: boolean }; updatedAt?: number }> = []
+  try {
+    const raw = await env.KV.get(OAUTH_POOL_KV_PREFIX + p.id)
+    const parsed = raw ? JSON.parse(raw) : []
+    pool = Array.isArray(parsed) ? parsed : []
+  } catch {
+    return { ok: 0, fail: 0 } // 池损坏/不可读：不阻断其他 provider 的刷新
+  }
+  if (pool.length === 0) return { ok: 0, fail: 0 }
+
+  const now = Date.now()
+  // 临期阈值：access_token 过期前 10 分钟刷新（与请求路径 OAUTH_TOKEN_REFRESH_MARGIN_MS 同口径）
+  const NEAR_EXPIRY_MS = 10 * 60 * 1000
+  // 闲置阈值：超过 20 天未被刷新则保活一次（对齐 M365 分支的 IDLE_MS）
+  const IDLE_MS = 20 * 24 * 60 * 60 * 1000
+
+  let changed = false
+  for (const acc of pool) {
+    if (!acc || !acc.token?.refresh_token) continue
+    // 禁用账号需人工重登，刷新必然失败 → 跳过（不白打上游、不产生噪音）
+    if (acc.enabled === false || acc.state?.disabled) continue
+    const expiresAt = typeof acc.token.expires_at === 'number' ? acc.token.expires_at : 0
+    const nearExpiry = expiresAt - now <= NEAR_EXPIRY_MS
+    const idle = typeof acc.updatedAt === 'number' && now - acc.updatedAt >= IDLE_MS
+    if (!nearExpiry && !idle) continue
+
+    const fresh = await refreshBrowserTokenState(env, p.id, cfg, acc.token)
+    if (fresh) {
+      acc.token = fresh
+      acc.updatedAt = now
+      changed = true
+      ok++
+      // 刷新成功证明 session 未死 → 清零 12153 连续失败计数（对齐 workbuddy2api ClearSessionDead）。
+      // 注意仅清计数，不动 disabled（禁用号上面已跳过）。
+      if (acc.state && typeof acc.state === 'object' && 'sessionDeadFails' in acc.state) {
+        const st = acc.state as Record<string, unknown>
+        if (st['sessionDeadFails']) {
+          st['sessionDeadFails'] = 0
+          changed = true
+        }
+      }
+    } else {
+      fail++
+      console.error(`[oauth] WorkBuddy 池账号刷新失败，可能需要重新登录 provider=${p.id} uid=${(acc.uid || '').slice(0, 8)} ${new Date().toISOString()}`)
+    }
+  }
+  // 仅在确有变更时写回（避免无谓 KV 写放大）
+  if (changed) {
+    try {
+      await env.KV.put(OAUTH_POOL_KV_PREFIX + p.id, JSON.stringify(pool))
+    } catch { /* KV 写失败不阻断 Cron */ }
   }
   return { ok, fail }
 }

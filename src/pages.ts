@@ -1969,9 +1969,12 @@ function renderOauthPoolAccounts(id, accs, ciByUid, ciByNick, ciAccounts, prefer
     else if (a.cooling && a.until) coolDetail = ' 冷却至 ' + new Date(a.until).toLocaleString() + (a.reason ? '（' + escapeHtml(a.reason) + '）' : '')
     else if (a.reason) coolDetail = '（上次：' + escapeHtml(a.reason) + '）'
     let modelRateBadge = ''
-    if (a.softRateModel && a.softRateResetAt && a.softRateResetAt > Date.now()) {
-      const resetTimeStr = new Date(a.softRateResetAt).toLocaleTimeString()
-      modelRateBadge = ' <span class="bd bd-warn" title="模型 ' + escapeHtml(a.softRateModel) + ' 限流至 ' + resetTimeStr + '">模型限流(' + escapeHtml(a.softRateModel) + ')</span>'
+    // 6004 模型级限流徽章（多模型表）：逐条展示仍在限额中的模型与恢复时刻
+    const mcList = Array.isArray(a.modelCooldowns) ? a.modelCooldowns : []
+    for (const mc of mcList) {
+      if (!mc || !mc.model || !(mc.until > Date.now())) continue
+      const resetTimeStr = new Date(mc.resetAt || mc.until).toLocaleTimeString()
+      modelRateBadge += ' <span class="bd bd-warn" title="模型 ' + escapeHtml(mc.model) + ' 限流至 ' + resetTimeStr + '">模型限流(' + escapeHtml(mc.model) + ')</span>'
     }
     line += ' ' + coolBadge + modelRateBadge + '<span class="mu">' + coolDetail + '</span>'
     if (a.tokenMask) {

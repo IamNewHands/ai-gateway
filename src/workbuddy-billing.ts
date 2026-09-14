@@ -8,7 +8,7 @@
  * 协议（来源 cpa-plugin/workbuddy/billing.go）：
  *   统一 POST，Authorization: Bearer <access_token>，信封 { code, msg, data }，code=0 成功。
  */
-import type { PackageInfo } from './types'
+import type { Env, PackageInfo } from './types'
 
 export const CHECKIN_BASE_CN = 'https://www.codebuddy.cn'
 
@@ -50,11 +50,72 @@ export function pickNum(obj: Record<string, any>, ...keys: string[]): number | u
 }
 
 /**
+ * billing 域**结构化业务错误**：HTTP 非 2xx（带 status + 原始 body）或信封 code !== 0。
+ *
+ * 为什么要区分类型（对齐 workbuddy2api `*upstream.Error` 的设计）：签到幂等判定
+ * （`isAlreadyCheckin`）必须区分「上游真实业务回复」与「传输层/解析层抖动」——
+ * 前者里的 `already`/`inactive` 可信（是业务语义），后者里的 `already`（如
+ * "address already in use"）只是网络栈文案，误判会把停机抖动记成"今日已签到"。
+ * 故业务错误用本类承载结构化 code/status，传输层错误保持裸 Error。
+ */
+export class BillingError extends Error {
+  /** 业务码（信封 code；HTTP 非 2xx 时为从 body 尽力解析出的 code，解析不到为 null） */
+  readonly code: number | null
+  /** HTTP 状态码（网络层失败时为 null） */
+  readonly status: number | null
+  constructor(message: string, opts?: { code?: number | null; status?: number | null }) {
+    super(message)
+    this.name = 'BillingError'
+    this.code = opts?.code ?? null
+    this.status = opts?.status ?? null
+  }
+}
+
+/**
+ * billing 域 `/billing/meter/*` 族的**路径候选序列**（按 realm 切，移植 workbuddy2api
+ * client.go:502-519 billingMeterPaths / checkinMeterPaths）。
+ *
+ * 背景（源实现 R9 实测）：国际版（global）**无 `/v2` 前缀**——`/billing/meter/xxx` 是首选，
+ * 带 `/v2` 的形态作为 fallback（上游若返回 404 再试）。CN 则维持带 `/v2` 的现状（零回归）。
+ *
+ * 仅作用于 `/billing/meter/*` 族（get-user-resource / daily-checkin / get-payment-type）；
+ * `/v2/report` 与 growth 域端点**不参与**该 fallback（源实现明确限定范围）。
+ */
+export function billingMeterPaths(pathSuffix: string, realm: 'cn' | 'global'): string[] {
+  if (realm === 'global') return [`/billing/meter/${pathSuffix}`, `/v2/billing/meter/${pathSuffix}`]
+  return [`/v2/billing/meter/${pathSuffix}`]
+}
+
+/**
  * 发起一次 billing 请求。POST，带 Bearer + X-Domain。
  * opts.body 传入则序列化为请求体（否则默认 {}）；opts.extraHeaders 合并额外头（X-User-Id 等）。
  * code!==0 抛业务错误（含 msg）；5xx/网络错误抛 Error。
+ * opts.paths 传入多条候选路径时，仅在**404**（路径不存在）时换下一条（对齐 workbuddy2api
+ * billingMeterJSON 的 `ErrNotFound` 才 fallback 语义：其他错误不重试，避免掩盖真实故障）。
  */
 export async function billingCall(
+  token: string,
+  path: string,
+  realm: 'cn' | 'global',
+  opts?: { body?: any; extraHeaders?: Record<string, string>; paths?: string[] }
+): Promise<any> {
+  const candidates = opts?.paths && opts.paths.length > 0 ? opts.paths : [path]
+  let lastErr: unknown = null
+  for (let i = 0; i < candidates.length; i++) {
+    try {
+      return await billingCallOnce(token, candidates[i], realm, opts)
+    } catch (e) {
+      lastErr = e
+      // 仅 404 视为"该路径不存在"，值得换下一条候选；其他错误立即抛出（不掩盖真实故障）
+      const is404 = e instanceof BillingError && e.status === 404
+      if (!is404 || i === candidates.length - 1) throw e
+    }
+  }
+  throw lastErr instanceof Error ? lastErr : new Error(String(lastErr))
+}
+
+/** 单次 billing 请求（不做路径 fallback）。 */
+async function billingCallOnce(
   token: string,
   path: string,
   realm: 'cn' | 'global',
@@ -68,6 +129,11 @@ export async function billingCall(
     'X-Domain': realm === 'global' ? 'workbuddy.ai' : 'codebuddy.cn',
     // 网关要求带 Go HTTP 客户端 UA，否则对该站点计费面返回 http 403 非法请求（code=10085）。
     // 参照 Go 参考实现（cpa-plugin billing.go，http 默认注入 Go-http-client/1.1）与本仓 qoder/billing.ts 的 Go-http-client/2.0。
+    //
+    // 注意：这里**有意保留** Go-http-client UA，而不改为 workbuddy2api 的 WorkBuddy 客户端 UA
+    // （其 BillingHeaders 用 `WorkBuddy/<ver>`）。理由是 403/10085 是本仓在 Cloudflare Workers
+    // 出口上的**实测结论**（见上），而源实现在 Docker/宿主 Go 客户端下工作。UA 属风控敏感项，
+    // 未经本环境实测不应改动——避免"为对齐而引入回归"。
     'User-Agent': 'Go-http-client/2.0',
   }
   if (opts?.extraHeaders) Object.assign(headers, opts.extraHeaders)
@@ -81,21 +147,119 @@ export async function billingCall(
 
   const text = await res.text()
   if (!res.ok) {
-    throw new Error(`http ${res.status} ${path}: ${text.substring(0, 200)}`)
+    // HTTP 非 2xx：尽力从 body 解析业务 code（上游常在 4xx body 里带 code，
+    // 如签到幂等的 10001/14001），解析不到则 code=null。保留 status 供调用方分类。
+    let code: number | null = null
+    try {
+      const parsed = JSON.parse(text) as { code?: unknown }
+      if (typeof parsed?.code === 'number') code = parsed.code
+    } catch { /* 非 JSON body（网关/WAF 纯文本页）：code 保持 null */ }
+    throw new BillingError(`http ${res.status} ${path}: ${text.substring(0, 200)}`, { code, status: res.status })
   }
   let env: BillingEnvelope
   try {
     env = JSON.parse(text)
   } catch {
+    // 解析失败属传输/协议层，不是业务回复 → 裸 Error（不得被幂等判定消费）
     throw new Error(`parse failed ${path}: ${text.substring(0, 200)}`)
   }
   if (env.code !== 0) {
-    throw new Error(`code=${env.code} msg=${env.msg || ''}`)
+    throw new BillingError(`code=${env.code} msg=${env.msg || ''}`, { code: env.code, status: res.status })
   }
   return env.data
 }
 
 import { parseJwtClaims } from './workbuddy-upstream'
+
+// ===== 签到幂等判定（移植 workbuddy2api cmd/signin/main.go） =====
+
+/**
+ * 幂等/不适用**业务码**（对齐 workbuddy2api idempotentCodes）。
+ * 10001 = 实测 code=10001 "今天已签到"；14001 同义变体。
+ */
+export const CHECKIN_IDEMPOTENT_CODES = [10001, 14001]
+
+/**
+ * 幂等/不适用**文案关键词**（全量，仅对结构化业务错误生效）。
+ * 对齐 workbuddy2api idempotentMarkers：中文原文 + 英文 lowcase；
+ * global 无签到体系类（未开启/未开放/已过期/inactive）是兜底。
+ */
+const IDEMPOTENT_MARKERS = [
+  '今天已签到', '今日已签到', '已签到', 'already',
+  '未开启', '未开放', '已过期', 'inactive',
+]
+
+/**
+ * 裸错误（传输层/解析层）回退匹配用的**中文文案子集**（对齐 workbuddy2api bareMarkers）。
+ *
+ * 刻意排除英文短词 `already`/`inactive`：它们在传输层错误文本里太常见
+ * （`EADDRINUSE: address already in use`、proxy `session inactive`），
+ * 对裸错误启用会把停机抖动/端口占用误判成"今日已签到"。
+ */
+const BARE_MARKERS = ['今天已签到', '今日已签到', '已签到', '未开启', '未开放', '已过期']
+
+/** 字符是否属于「词内字符」（数字/字母/下划线）——用于幂等码的边界判定。 */
+function isCodeWordChar(ch: string): boolean {
+  return /[0-9a-zA-Z_]/.test(ch)
+}
+
+/**
+ * 在消息中查找幂等业务码，要求**前后字符都不是词内字符**（对齐 workbuddy2api isAlreadyCode）。
+ *
+ * 为什么需要边界判定：`code=10001` 与 `"code":10001` 都含子串 `10001`，
+ * 但 `12001` / `2010001` / `1_10001` 也含该子串——无边界判定会误判成"已签到"。
+ */
+export function hasCheckinIdempotentCode(message: string): boolean {
+  for (const code of CHECKIN_IDEMPOTENT_CODES) {
+    const needle = String(code)
+    let from = 0
+    for (;;) {
+      const idx = message.indexOf(needle, from)
+      if (idx < 0) break
+      const before = idx > 0 ? message[idx - 1] : ''
+      const after = idx + needle.length < message.length ? message[idx + needle.length] : ''
+      if (!isCodeWordChar(before) && !isCodeWordChar(after)) return true
+      from = idx + needle.length
+    }
+  }
+  return false
+}
+
+/**
+ * 判定一次签到调用抛出的错误是否表示「今天已签到 / 功能不适用」（幂等成功，不算失败）。
+ *
+ * 三段式（对齐 workbuddy2api cmd/signin/main.go 的 isAlready + bareMatch 双层设计）：
+ *  1. `BillingError`（结构化业务错误，带 code/status）→ 走**全量**判定：
+ *     业务码 10001/14001（带边界匹配）或全量文案关键词（含 already/inactive）；
+ *  2. 其他错误（传输层/解析层，如超时、DNS、端口占用、解析失败）→ 只走
+ *     **中文文案子集**，绝不认 `already`/`inactive`；
+ *  3. `null`/非 Error → false。
+ *
+ * 为什么必须区分：`billingCall` 的网络失败（AbortSignal 超时、EADDRINUSE 等）文本里
+ * 可能出现 `already`；若不区分就把它记成"今日已签到"，会让真实失败被静默吞掉，
+ * 账号还会被错误地认为已签到（并可能据此解冻冷却）。
+ */
+export function isAlreadyCheckin(err: unknown): boolean {
+  if (err === null || err === undefined) return false
+  const message = err instanceof Error ? err.message : String(err)
+
+  if (err instanceof BillingError) {
+    // 结构化业务错误：先看业务码（带边界），再看全量文案
+    if (err.code !== null && hasCheckinIdempotentCode(String(err.code))) return true
+    if (hasCheckinIdempotentCode(message)) return true
+    const lower = message.toLowerCase()
+    for (const m of IDEMPOTENT_MARKERS) {
+      if (lower.includes(m.toLowerCase())) return true
+    }
+    return false
+  }
+
+  // 传输层/解析层裸错误：只认中文专属文案（排除英文短词）
+  for (const m of BARE_MARKERS) {
+    if (message.includes(m)) return true
+  }
+  return false
+}
 
 /** 解码 WorkBuddy access_token (JWT) 的 uid / enterpriseId / nickname（不验签）。 */
 export function decodeWorkbuddyClaims(token: string): { uid: string; enterpriseId: string; nickname: string } {
@@ -158,7 +322,8 @@ export async function fetchWorkbuddyCredits(
   token: string,
   realm: 'cn' | 'global',
   uid: string,
-  enterpriseId: string
+  enterpriseId: string,
+  deviceToken?: string
 ): Promise<{ totalRemain: number; totalUsed: number; totalSize: number; packCount: number; packages: PackageInfo[] }> {
   const now = new Date()
   const end = new Date(now.getTime() + PACKAGE_END_HORIZON_MS)
@@ -176,7 +341,12 @@ export async function fetchWorkbuddyCredits(
     extraHeaders['X-Enterprise-Id'] = enterpriseId
     extraHeaders['X-Tenant-Id'] = enterpriseId
   }
-  const data = await billingCall(token, '/v2/billing/meter/get-user-resource', realm, { body, extraHeaders })
+  // 设备风控头：对齐 workbuddy2api BillingHeaders（billing 域同样注入 X-Device-Token）。
+  // 本仓此前只有 report 路径带该头，签到/额度查询缺失。
+  if (deviceToken) extraHeaders['X-Device-Token'] = deviceToken
+  // 路径按 realm 切（global 无 /v2 前缀优先，404 时 fallback），移植 workbuddy2api billingMeterPaths
+  const paths = billingMeterPaths('get-user-resource', realm)
+  const data = await billingCall(token, paths[0], realm, { body, extraHeaders, paths })
   const resp = data && data.Response && data.Response.Data ? data.Response.Data : null
   if (!resp) throw new Error('get-user-resource 响应缺 Response.Data')
   const accounts: any[] = Array.isArray(resp.Accounts) ? resp.Accounts : []
@@ -249,6 +419,215 @@ export async function fetchWorkbuddyPaymentType(
   }
 }
 
+// ===== 国际版（global）注册激活 / 地区完善 / trial 加油包 =====
+// 移植 workbuddy2api internal/upstream/trial.go + scripts/global_region.py。
+//
+// 为什么需要（对齐源实现 PLAN D4）：global 账号**无签到、无任务中心**，
+// 「一次性 trial 加油包」是其唯一天然的积分增益动作。且 trial 有前置条件——
+// 账号必须完成 register 激活与注册地区完善（否则上游返回 code 500 "region required"
+// 或 code 14017 "trial not activated"）。
+
+/** global 域 base（trial / region 端点所在域）。 */
+export const GLOBAL_BASE = 'https://www.workbuddy.ai'
+
+/** trial 幂等码：14051 = 已领取过（视为正常，非错误）。 */
+export const TRIAL_ALREADY_CODE = 14051
+
+/** 国际版 web 端地区白名单（顺序 = web 展示顺序，对齐源实现 INL_CODES）。 */
+export const INTL_REGION_CODES = ['HK', 'MO', 'SG', 'TH', 'PH', 'MY', 'ID'] as const
+
+/** 地区条目（对齐源实现 country dict）。 */
+export interface RegionCountry {
+  EnName: string
+  Name: string
+  IOS2: string
+  IOS3: string
+  Code: string
+}
+
+/**
+ * 国际版请求头（对齐源实现 `_headers`）：
+ * 用浏览器 UA（非 Go-http-client）——这是 global web 域端点的实测要求。
+ */
+function globalWebHeaders(token?: string, extra?: Record<string, string>): Record<string, string> {
+  const h: Record<string, string> = {
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+    'Accept': 'application/json, text/plain, */*',
+    'Content-Type': 'application/json',
+    'Origin': GLOBAL_BASE,
+    'Referer': GLOBAL_BASE + '/',
+  }
+  if (token) h['Authorization'] = `Bearer ${token}`
+  if (extra) Object.assign(h, extra)
+  return h
+}
+
+/**
+ * 拉取可选地区列表（POST /billing/area/get-country-code）。
+ *
+ * 注意：响应 `data` 是 **JSON 字符串**（需二次解析），内层形如
+ * `{"code":0,"data":{"list":[{EnName,Name,IOS2,IOS3,Code},...]}}`。
+ * intlOnly=true 时按国际版白名单过滤。
+ */
+export async function fetchIntlCountries(intlOnly = true): Promise<{ ok: boolean; list: RegionCountry[]; msg: string }> {
+  try {
+    const res = await fetch(GLOBAL_BASE + '/billing/area/get-country-code', {
+      method: 'POST',
+      headers: globalWebHeaders(),
+      body: JSON.stringify({ filterForbidden: 1 }),
+      signal: AbortSignal.timeout(20000),
+    })
+    const outer = await res.json() as { code?: number; msg?: string; data?: unknown }
+    if (outer?.code !== 0) return { ok: false, list: [], msg: outer?.msg || `code=${outer?.code}` }
+    const inner = typeof outer.data === 'string' ? JSON.parse(outer.data) : (outer.data as any) || {}
+    const all: RegionCountry[] = inner?.data?.list || []
+    if (!intlOnly) return { ok: true, list: all, msg: 'ok' }
+    const byIos2 = new Map(all.filter((c) => c?.IOS2 && (INTL_REGION_CODES as readonly string[]).includes(c.IOS2)).map((c) => [c.IOS2, c]))
+    const list = INTL_REGION_CODES.map((code) => byIos2.get(code)).filter((c): c is RegionCountry => !!c)
+    return { ok: true, list, msg: 'ok' }
+  } catch (e) {
+    return { ok: false, list: [], msg: (e as Error).message }
+  }
+}
+
+/** 检测当前注册地区（POST /billing/area/get-user-area-info）。返回 ios2 码。 */
+export async function detectUserRegion(token: string): Promise<{ ok: boolean; ios2: string; enName: string; msg: string }> {
+  try {
+    const res = await fetch(GLOBAL_BASE + '/billing/area/get-user-area-info', {
+      method: 'POST',
+      headers: globalWebHeaders(token),
+      body: JSON.stringify({ action: 'getUserAreaInfo' }),
+      signal: AbortSignal.timeout(20000),
+    })
+    const outer = await res.json() as { code?: number; msg?: string; data?: unknown }
+    if (outer?.code !== 0) return { ok: false, ios2: '', enName: '', msg: outer?.msg || `code=${outer?.code}` }
+    const inner = typeof outer.data === 'string' ? JSON.parse(outer.data) : (outer.data as any) || {}
+    const data = inner?.data || {}
+    return { ok: true, ios2: String(data.IOS2 || ''), enName: String(data.enName || ''), msg: 'ok' }
+  } catch (e) {
+    return { ok: false, ios2: '', enName: '', msg: (e as Error).message }
+  }
+}
+
+/** 提交注册地区（POST /console/login/account）。实测幂等。 */
+export async function submitUserRegion(token: string, country: RegionCountry): Promise<{ ok: boolean; msg: string }> {
+  try {
+    const attrs = {
+      countryCode: [String(country.Code)],
+      countryFullName: [String(country.EnName)],
+      countryName: [String(country.IOS2)],
+    }
+    const res = await fetch(GLOBAL_BASE + '/console/login/account', {
+      method: 'POST',
+      headers: globalWebHeaders(token),
+      body: JSON.stringify({ attributes: attrs }),
+      signal: AbortSignal.timeout(20000),
+    })
+    const body = await res.json() as { code?: number; msg?: string }
+    if (body?.code === 0) return { ok: true, msg: 'ok' }
+    return { ok: false, msg: body?.msg || `code=${body?.code}` }
+  } catch (e) {
+    return { ok: false, msg: (e as Error).message }
+  }
+}
+
+/**
+ * 注册激活/查询（GET /auth/realms/copilot/overseas/user/register?userId=<uid>）。
+ *
+ * 三态（对齐源实现 activate_region）：
+ *  - `code === 200` → 已激活；
+ *  - `code === 500` 或 msg 含 `region required` → **需补地区**；
+ *  - 其他 → 失败（非"需补地区"）。
+ * 携带 `X-User-Id` 与官方 web 对齐。
+ */
+export async function activateGlobalRegister(
+  token: string,
+  uid: string
+): Promise<{ ok: boolean; needsRegion: boolean; msg: string }> {
+  try {
+    const url = `${GLOBAL_BASE}/auth/realms/copilot/overseas/user/register?userId=${encodeURIComponent(uid)}`
+    const res = await fetch(url, {
+      method: 'GET',
+      headers: globalWebHeaders(token, { 'X-User-Id': uid }),
+      signal: AbortSignal.timeout(20000),
+    })
+    const body = await res.json() as { code?: number; msg?: string }
+    const code = body?.code
+    const msg = String(body?.msg || '')
+    if (code === 200) return { ok: true, needsRegion: false, msg: 'register success' }
+    if (code === 500 || msg.toLowerCase().includes('region required')) {
+      return { ok: false, needsRegion: true, msg: msg || `code=${code}` }
+    }
+    return { ok: false, needsRegion: false, msg: msg || `code=${code}` }
+  } catch (e) {
+    return { ok: false, needsRegion: false, msg: (e as Error).message }
+  }
+}
+
+/**
+ * 领取一次性 trial 加油包（POST /billing/ide/trial）。**仅 global 账号**。
+ *
+ * 返回 `{ ok, already, msg }`：
+ *  - 成功新领 → `{ ok: true, already: false }`；
+ *  - 幂等码 14051（已领过）→ `{ ok: true, already: true }`（**视为正常，非错误**）；
+ *  - 其他 → `{ ok: false }`。
+ *
+ * 幂等码的两种拼写都要覆盖（对齐源实现 trialAlreadyMarkers）：
+ * HTTP 200 + 业务 code 非 0 时是 `code=14051`；HTTP 4xx 时原始 body 里是 `"code":14051`。
+ */
+export async function claimGlobalTrial(token: string): Promise<{ ok: boolean; already: boolean; msg: string }> {
+  try {
+    const res = await fetch(GLOBAL_BASE + '/billing/ide/trial', {
+      method: 'POST',
+      headers: globalWebHeaders(token),
+      body: '{}',
+      signal: AbortSignal.timeout(20000),
+    })
+    const raw = await res.text()
+    let body: { code?: number; msg?: string } | null = null
+    try { body = JSON.parse(raw) } catch { body = null }
+
+    if (body?.code === 0) return { ok: true, already: false, msg: 'ok' }
+    // 幂等：业务码出现在 JSON 或原始文本里都算（覆盖两种拼写）
+    if (raw.includes('14051')) return { ok: true, already: true, msg: '已领取' }
+    if (!res.ok) {
+      // 非 JSON 4xx（网关/WAF 纯文本页）：按文本判幂等，否则报 http 状态
+      return { ok: false, already: false, msg: `http ${res.status}: ${raw.slice(0, 120)}` }
+    }
+    return { ok: false, already: false, msg: body?.msg || raw.slice(0, 150) }
+  } catch (e) {
+    return { ok: false, already: false, msg: (e as Error).message }
+  }
+}
+
+/**
+ * 完整完善流程（对齐源实现 complete_flow）：
+ *  1. register 查询 → 已激活则直接成功；
+ *  2. 需补地区 → 用 pick 提交地区 → **重新 register 验证**；
+ *  3. 非"需补地区"的失败 → 直接返回失败（不盲目提交地区）。
+ *
+ * pick 为地区条目（来自 fetchIntlCountries）；未提供且需补地区 → 失败（需人工选择）。
+ */
+export async function completeGlobalRegionFlow(
+  token: string,
+  uid: string,
+  pick?: RegionCountry
+): Promise<{ ok: boolean; msg: string }> {
+  const reg = await activateGlobalRegister(token, uid)
+  if (reg.ok) return { ok: true, msg: 'register success' }
+  if (!reg.needsRegion) return { ok: false, msg: `register 失败: ${reg.msg}` }
+  if (!pick) return { ok: false, msg: '需完善注册地区，但未提供选择' }
+
+  const sub = await submitUserRegion(token, pick)
+  if (!sub.ok) return { ok: false, msg: `提交地区失败: ${sub.msg}` }
+
+  const verify = await activateGlobalRegister(token, uid)
+  if (!verify.ok) {
+    return { ok: false, msg: `提交地区后 register 仍失败: ${verify.msg} (needs_region=${verify.needsRegion})` }
+  }
+  return { ok: true, msg: '地区已完善，register 成功' }
+}
+
 // ===== 生态增值与自动化任务（P2：活跃上报 / 连登天数 / 猫猫旅行） =====
 
 export const CHAT_BASE_CN = 'https://copilot.tencent.com'
@@ -297,18 +676,30 @@ export async function growthCall(
 }
 
 /** 对话活跃上报客户端完整事件形状（对齐 workbuddy2api probe_active.py / report.go）。 */
-export function buildChatRequestEvent(uid: string, cid: string, rid: string): Record<string, unknown> {
+/**
+ * 对话活跃上报客户端完整事件形状（对齐 workbuddy2api probe_active.py / report.go）。
+ *
+ * opts.mode / opts.modelId / opts.modelName 用于**夜猫子任务**（black_cat）等特殊场景：
+ * 源实现中 black_cat 用 `mode: "night"` + `glm-5.2`（普通 chat 用 `mode: "craft"` +
+ * `deepseek-v4-flash`）。缺省即普通形态（向后兼容）。
+ */
+export function buildChatRequestEvent(
+  uid: string,
+  cid: string,
+  rid: string,
+  opts?: { mode?: string; modelId?: string; modelName?: string }
+): Record<string, unknown> {
   const now = Date.now()
   return {
     eventCode: 'chat_request_send',
     timestamp: now,
     reportDelay: 0,
-    mode: 'craft',
+    mode: opts?.mode || 'craft',
     conversationId: cid,
     requestId: rid,
     inputLength: 12,
-    requestModelId: 'deepseek-v4-flash',
-    requestModelName: 'DeepSeek V4 Flash',
+    requestModelId: opts?.modelId || 'deepseek-v4-flash',
+    requestModelName: opts?.modelName || 'DeepSeek V4 Flash',
     isPlan: false,
     isAutoExecuteTerminal: false,
     isAutoModify: false,
@@ -340,17 +731,62 @@ export function buildChatRequestEvent(uid: string, cid: string, rid: string): Re
 }
 
 /**
+ * 同一账号内连续活跃上报之间的间隔（对齐 workbuddy2api `activityReportGap` = 1.5s）。
+ *
+ * 为什么需要：5 连发是在模拟"同一会话多轮对话"，**秒发易触发上游风控**
+ * （源实现注释原文）。缺省 1500ms；测试可注入 0 跳过等待。
+ */
+export const ACTIVITY_REPORT_GAP_MS = 1500
+
+/**
+ * 账号之间的限速间隔（对齐 workbuddy2api `activityAccountDelay` / `travelAccountDelay` = 800ms）。
+ * 用于"遍历池内账号"的场景，避免同一时刻连续打上游。
+ */
+export const ACTIVITY_ACCOUNT_DELAY_MS = 800
+
+/** 可注入的延时函数（测试传 () => Promise.resolve() 跳过真实等待）。 */
+export type DelayFn = (ms: number) => Promise<void>
+
+const defaultDelay: DelayFn = (ms) => new Promise((r) => setTimeout(r, ms))
+
+/**
+ * 真实延时（用于账号间限速等场景）。ms <= 0 时立即返回。
+ * 测试可通过注入 delay 参数绕过（见 reportWorkbuddyChatActivity 的 opts.delay）。
+ */
+export function delayMs(ms: number): Promise<void> {
+  if (ms <= 0) return Promise.resolve()
+  return defaultDelay(ms)
+}
+
+/**
  * 向上游发送对话活跃上报：POST /v2/report。
  * 一条上报同时点亮 growth 连登 + 解锁 first_buddy 任务（领养前置）。
- * 默认发送 count=5 条（同 conversationId、不同 requestId、每条间隔微秒），满足首次领猫对话量门槛。
+ * 默认发送 count=5 条（同 conversationId、不同 requestId），满足首次领猫对话量门槛。
+ *
+ * opts.mode / opts.modelId / opts.modelName 透传给事件构造（夜猫子任务用）。
+ * opts.delay / opts.gapMs 用于控制条间间隔（缺省 1.5s，对齐源实现 activityReportGap；
+ * 测试可传 delay=noop 跳过等待）。
  */
 export async function reportWorkbuddyChatActivity(
   token: string,
   realm: 'cn' | 'global',
   uid: string,
-  opts?: { enterpriseId?: string; deviceToken?: string; count?: number }
+  opts?: {
+    enterpriseId?: string
+    deviceToken?: string
+    count?: number
+    mode?: string
+    modelId?: string
+    modelName?: string
+    /** 条间间隔（ms）；缺省 ACTIVITY_REPORT_GAP_MS */
+    gapMs?: number
+    /** 注入延时实现（测试用）；缺省真实 setTimeout */
+    delay?: DelayFn
+  }
 ): Promise<{ success: boolean; reported: number; message: string }> {
   const count = typeof opts?.count === 'number' && opts.count > 0 ? opts.count : 5
+  const gapMs = typeof opts?.gapMs === 'number' ? opts.gapMs : ACTIVITY_REPORT_GAP_MS
+  const delay = opts?.delay || defaultDelay
   const cid = `wb2api-${Date.now()}`
   const extraHeaders: Record<string, string> = {}
   if (uid) extraHeaders['X-User-Id'] = uid
@@ -363,15 +799,75 @@ export async function reportWorkbuddyChatActivity(
   let ok = 0
   for (let i = 1; i <= count; i++) {
     const rid = `${cid}-r${i}`
-    const ev = buildChatRequestEvent(uid, cid, rid)
+    const ev = buildChatRequestEvent(uid, cid, rid, {
+      mode: opts?.mode,
+      modelId: opts?.modelId,
+      modelName: opts?.modelName,
+    })
     try {
       await billingCall(token, '/v2/report', realm, { body: [ev], extraHeaders })
       ok++
     } catch (e) {
       return { success: ok > 0, reported: ok, message: `第 ${i}/${count} 条上报失败: ${(e as Error).message}` }
     }
+    // 条间间隔（对齐源实现：`if i < count { time.Sleep(activityReportGap) }`）——
+    // 5 连发模拟同一会话多轮对话，秒发易触发上游风控。
+    if (i < count && gapMs > 0) await delay(gapMs)
   }
   return { success: true, reported: ok, message: `成功上报 ${ok} 条对话活跃事件` }
+}
+
+// ===== 夜猫子任务（black_cat）=====
+// 移植 workbuddy2api scripts/task_runner.py 的 black_cat 特殊分支 + scheduler/school.go RunCatNow。
+
+/** 夜猫窗口（CST）：23:00 – 次日 08:00（对齐源实现 within_night_window）。 */
+export const NIGHT_WINDOW_START_HOUR = 23
+export const NIGHT_WINDOW_END_HOUR = 8
+
+/**
+ * 当前是否处于夜猫窗口（CST 23:00–08:00）。
+ *
+ * 时区必须显式按 CST(+08:00) 计算：Workers 运行时本地时区是 UTC，
+ * 用本地 getHours() 会把窗口错位 8 小时。
+ */
+export function withinNightWindow(from: number = Date.now()): boolean {
+  const cst = new Date(from + 8 * 60 * 60 * 1000)
+  const hour = cst.getUTCHours()
+  return hour >= NIGHT_WINDOW_START_HOUR || hour < NIGHT_WINDOW_END_HOUR
+}
+
+/**
+ * 夜猫子任务：在夜猫窗口内补 1 次 `black_cat` 上报（`mode: "night"` + `glm-5.2`）。
+ *
+ * 语义（对齐源实现 task_runner.py:799-811）：
+ *  - 非窗口期 → 直接返回 `skipped`（**不发任何上游请求**）；
+ *  - 窗口内 → 发 **1 条**（cap=1，源实现明确"窗口内最多补 1 次"）。
+ *
+ * 为什么 mode 是 `night`：源实现 `build_event` 中 black_cat 用 `mode: "night"`，
+ * 普通 chat 用 `"craft"`——上游按 mode 区分任务归属。
+ */
+export async function runWorkbuddyNightCat(
+  token: string,
+  realm: 'cn' | 'global',
+  uid: string,
+  opts?: { enterpriseId?: string; deviceToken?: string; from?: number }
+): Promise<{ state: 'skipped' | 'reported' | 'error'; message: string }> {
+  if (!withinNightWindow(opts?.from)) {
+    return { state: 'skipped', message: '非夜猫窗口（23:00–08:00 CST），跳过' }
+  }
+  try {
+    const r = await reportWorkbuddyChatActivity(token, realm, uid, {
+      enterpriseId: opts?.enterpriseId,
+      deviceToken: opts?.deviceToken,
+      count: 1,
+      mode: 'night',
+      modelId: 'glm-5.2',
+      modelName: 'GLM-5.2',
+    })
+    return { state: r.success ? 'reported' : 'error', message: r.message }
+  } catch (e) {
+    return { state: 'error', message: (e as Error).message }
+  }
 }
 
 /** 查询连登天数（只读 oracle）：GET /activity/growth/streak。 */
@@ -518,27 +1014,92 @@ export async function claimWorkbuddyTravelReward(
 }
 
 /**
+ * 返回某时刻所属的 **CST 自然日**（`YYYY-MM-DD`）。
+ * 对齐 workbuddy2api `travelDay`：上游每日重置按 CST 00:00，中国无夏令时，
+ * 固定 +8 即可（Workers 运行时本地时区是 UTC，不能用本地日期）。
+ */
+export function cstDay(from: number = Date.now()): string {
+  const cst = new Date(from + 8 * 60 * 60 * 1000)
+  const p = (n: number) => String(n).padStart(2, '0')
+  return `${cst.getUTCFullYear()}-${p(cst.getUTCMonth() + 1)}-${p(cst.getUTCDate())}`
+}
+
+/**
+ * 领养当日防抖 KV 前缀（uid → CST 日期）。
+ *
+ * 为什么需要：领养（`buddy/first`）有对话量门槛，未达标时上游返回 400
+ * `first_buddy task not completed yet`。若不加防抖，每轮旅行巡检都会重试一次，
+ * 对上游形成无意义的重复请求（源实现 `adoptTriedToday` 明确"避免同日多趟对上游重试轰炸"）。
+ *
+ * 与源实现的差异：源实现用**进程内存 Map**（重启即清零，单机部署可接受）；
+ * Workers 多 isolate 无共享内存，故用 KV 按自然日记录，跨 isolate 一致。
+ */
+export const ADOPT_TRIED_KV_PREFIX = 'workbuddy:adopt-tried:'
+
+/** 该账号今日是否已判定领养门槛未达。 */
+export async function adoptTriedToday(env: Env, providerId: string, uid: string, from?: number): Promise<boolean> {
+  try {
+    const raw = await env.KV.get(`${ADOPT_TRIED_KV_PREFIX}${providerId}:${uid}`)
+    return raw === cstDay(from)
+  } catch {
+    return false // KV 不可读时不抑制（宁可多试一次，也不漏领养）
+  }
+}
+
+/** 记录该账号今日已尝试领养且未过门槛（TTL 2 天，跨日自动失效）。 */
+export async function markAdoptTried(env: Env, providerId: string, uid: string, from?: number): Promise<void> {
+  try {
+    await env.KV.put(`${ADOPT_TRIED_KV_PREFIX}${providerId}:${uid}`, cstDay(from), { expirationTtl: 2 * 24 * 60 * 60 })
+  } catch { /* KV 写失败不阻断主流程（退化为无防抖） */ }
+}
+
+/**
  * 推进一趟猫猫旅行状态机（对齐 workbuddy2api travel.go travelOne）：
  * 1. 查有无猫：无猫 → 同意协议 + 领养第一只猫（+300 分）；
  * 2. 有猫 → 查旅行状态：
  *    - arrived (到站) → 领奖 claim（带回 reward_credit 积分）
  *    - idle (空闲且未达当日上限) → 派出 depart（古镇客栈 location_id=4）
  *    - traveling (在途) → 保持在途
+ *
+ * opts.env / opts.providerId：提供时启用**领养当日防抖**（对齐源实现 adoptTriedToday）——
+ * 门槛未达（`first_buddy task not completed yet`）记一次当日已试，同日后续巡检直接跳过领养，
+ * 避免对上游重试轰炸。缺省不启用（保持既有调用方行为）。
+ * opts.forceAdopt：豁免当日防抖（对齐源实现 travelAdoptForce）——活跃上报把对话量
+ * 补满后是"门槛刚达成"的新状态，应就地闭环而非等下一轮。
  */
 export async function runWorkbuddyCatTravel(
   token: string,
   realm: 'cn' | 'global',
   uid: string,
-  opts?: { enterpriseId?: string; deviceToken?: string }
+  opts?: {
+    enterpriseId?: string
+    deviceToken?: string
+    env?: Env
+    providerId?: string
+    forceAdopt?: boolean
+    /** 注入"当前时刻"供测试（防抖按 CST 自然日） */
+    now?: number
+  }
 ): Promise<{ state: string; reward?: number; message: string; buddyName?: string }> {
   try {
     const buddy = await fetchWorkbuddyBuddyInfo(token, realm, { uid, ...opts })
     if (!buddy) {
+      // 领养当日防抖：门槛未达时同日不重试（forceAdopt 豁免）
+      const canDebounce = !!opts?.env && !!opts?.providerId
+      if (canDebounce && !opts?.forceAdopt) {
+        if (await adoptTriedToday(opts!.env!, opts!.providerId!, uid, opts?.now)) {
+          return { state: 'adopt_deferred', message: '今日领养门槛未达，已跳过（防抖）' }
+        }
+      }
       // 尝试同意协议 + 领养
       try { await agreeWorkbuddyBuddyAgreement(token, realm, { uid, ...opts }) } catch { /* ignore */ }
       const adoptRes = await adoptWorkbuddyFirstBuddy(token, realm, { uid, ...opts })
       if (adoptRes.success) {
         return { state: 'adopted', reward: 300, message: '领养成功 (+300 积分)', buddyName: '首只猫猫' }
+      }
+      // 门槛未达 → 记当日已试（仅该原因才防抖；其他失败下轮可重试）
+      if (canDebounce && adoptRes.message.includes('门槛未达标')) {
+        await markAdoptTried(opts!.env!, opts!.providerId!, uid, opts?.now)
       }
       return { state: 'no_buddy', message: adoptRes.message }
     }

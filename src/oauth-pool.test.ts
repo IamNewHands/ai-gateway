@@ -6,6 +6,10 @@ import {
   noteOauthSessionDead,
   clearOauthSessionDead,
   recordOauthModelCost,
+  cooldownOauthAccount,
+  cooldownOauthAccountSoftForModel,
+  listModelCooldowns,
+  hasModelCooldown,
   __resetOauthPoolRuntimeForTests,
   __resetOauthModelCostsForTests,
   type OAuthPool,
@@ -41,6 +45,22 @@ function makeAccount(uid: string, over: Partial<OAuthPool[number]> = {}): OAuthP
     updatedAt: Date.now(),
     ...over,
   }
+}
+
+/**
+ * 带 get/put 的 KV mock（供需要真实读写的用例使用，如 cooldown* 系列）。
+ * 注意：readOauthPool 有 1s 内存缓存，同一 provider 的多次写会命中缓存，
+ * 故断言前需经 readOauthPool 读回（它返回缓存里的同一对象引用）。
+ */
+function makeRealKV(provider: string, seedAccounts?: OAuthPool) {
+  const store = new Map<string, string>()
+  if (seedAccounts) store.set(poolKey(provider), JSON.stringify(seedAccounts))
+  const kv = {
+    get: async (k: string) => store.get(k) ?? null,
+    put: async (k: string, v: string) => { store.set(k, v) },
+    delete: async (k: string) => { store.delete(k) },
+  }
+  return { env: { KV: kv } as unknown as Env, store, kv }
 }
 
 /** 写入一个池（绕过缓存），返回匹配最健康账号的顺序。 */
@@ -237,25 +257,172 @@ describe('全冷却兜底（allowCoolingFallback，对齐 workbuddy2api pickEarl
   })
 })
 
-describe('6004 模型级限流隔离测试（对齐 workbuddy2api issue #31）', () => {
-  it('处于 6004 模型级冷却的账号对其他模型豁免', () => {
+describe('6004 模型级限流隔离（对齐 workbuddy2api issue #31 / modelCooldowns 多模型表）', () => {
+  it('多模型独立：A 触发后 B 再触发，A 的记录不被覆盖', async () => {
+    const pid = PROVIDER + '-mc1'
+    const kv = makeRealKV(pid, [makeAccount('u1')])
+    const until = Date.now() + 60000
+
+    await cooldownOauthAccountSoftForModel(kv.env, pid, 'u1', 'model-A', until, '6004 model rate limit')
+    await cooldownOauthAccountSoftForModel(kv.env, pid, 'u1', 'model-B', until, '6004 model rate limit')
+
+    const st = (await readOauthPool(kv.env, pid))[0].state
+    // 关键：两条记录同时存在（旧单槽实现只能留一条，A 会被 B 覆盖）
+    expect(st.softRateModels?.['model-A']?.until).toBe(until)
+    expect(st.softRateModels?.['model-B']?.until).toBe(until)
+  })
+
+  it('6004 只写模型表，不写账号级 until（否则其他模型也被拦，豁免形同虚设）', async () => {
+    const pid = PROVIDER + '-mc2'
+    const kv = makeRealKV(pid, [makeAccount('u1')])
+
+    await cooldownOauthAccountSoftForModel(kv.env, pid, 'u1', 'model-A', Date.now() + 60000, '6004')
+
+    const acc = (await readOauthPool(kv.env, pid))[0]
+    expect(acc.state.until).toBe(0)
+    // 账号级无冷却 → 账号整体仍健康
+    expect(isOauthAccountHealthy(acc, Date.now())).toBe(true)
+  })
+
+  it('受限模型不可选，其他模型可选（豁免生效）', async () => {
+    const pid = PROVIDER + '-mc3'
+    const kv = makeRealKV(pid, [makeAccount('u1')])
+    await cooldownOauthAccountSoftForModel(kv.env, pid, 'u1', 'model-A', Date.now() + 60000, '6004')
+
+    const acc = (await readOauthPool(kv.env, pid))[0]
+    expect(isOauthAccountHealthy(acc, Date.now(), 'model-A')).toBe(false)
+    expect(isOauthAccountHealthy(acc, Date.now(), 'model-B')).toBe(true)
+    // 未带模型参数 → 账号级健康（模型维度无从判定，不因此拦号）
+    expect(isOauthAccountHealthy(acc, Date.now())).toBe(true)
+  })
+
+  it('模型冷却到期后自动放行，且过期条目被惰性清理', async () => {
+    const pid = PROVIDER + '-mc4'
+    const kv = makeRealKV(pid, [makeAccount('u1')])
+    const until = Date.now() + 50000
+    await cooldownOauthAccountSoftForModel(kv.env, pid, 'u1', 'model-A', until, '6004')
+
+    const acc = (await readOauthPool(kv.env, pid))[0]
+    const after = until + 1
+    expect(isOauthAccountHealthy(acc, after, 'model-A')).toBe(true)
+    // 惰性清理：查询过期条目后应从表里删除
+    expect(acc.state.softRateModels?.['model-A']).toBeUndefined()
+  })
+
+  it('账号级冷却入口清空模型表（防豁免泄漏到账号级限流）', async () => {
+    const pid = PROVIDER + '-mc5'
+    const kv = makeRealKV(pid, [makeAccount('u1')])
+    await cooldownOauthAccountSoftForModel(kv.env, pid, 'u1', 'model-A', Date.now() + 60000, '6004')
+    // 随后账号级软冷却（如 429 非 6004）
+    await cooldownOauthAccount(kv.env, pid, 'u1', 60000, '429 rate limit')
+
+    const acc = (await readOauthPool(kv.env, pid))[0]
+    expect(acc.state.softRateModels).toBeUndefined()
+    // 账号级冷却生效：任何模型都被拦
+    expect(isOauthAccountHealthy(acc, Date.now(), 'model-A')).toBe(false)
+    expect(isOauthAccountHealthy(acc, Date.now(), 'model-B')).toBe(false)
+  })
+
+  it('账号级冷却优先于模型级豁免（全账号不可用时查模型无意义）', () => {
     const now = Date.now()
-    const acc = makeAccount('acc-1', {
+    const acc = makeAccount('acc-priority', {
       state: {
         credits: 100,
         disabled: false,
-        until: now + 60000,
+        until: now + 60000, // 账号级冷却中
+        errCount: 0,
+        softRateModels: { 'model-A': { until: now + 30000, resetAt: now + 30000, reason: '6004' } },
+      },
+    })
+    // 账号级冷却生效 → 即便请求的是"未被模型级限额"的 model-B 也应不可选
+    expect(isOauthAccountHealthy(acc, now, 'model-B')).toBe(false)
+    expect(isOauthAccountHealthy(acc, now, 'model-A')).toBe(false)
+  })
+
+  it('向后兼容：旧单槽数据（softRateModel/softRateResetAt）被迁移进表', () => {
+    const now = Date.now()
+    const acc = makeAccount('acc-legacy', {
+      state: {
+        credits: 100,
+        disabled: false,
+        until: 0,
         errCount: 0,
         softRateModel: 'deepseek-v4-flash',
         softRateResetAt: now + 60000,
       },
     })
-    // 请求相同模型时：仍不健康
     expect(isOauthAccountHealthy(acc, now, 'deepseek-v4-flash')).toBe(false)
-    // 未带模型参数时：保守判定为不健康
-    expect(isOauthAccountHealthy(acc, now)).toBe(false)
-    // 请求其他模型时：豁免健康
-    expect(isOauthAccountHealthy(acc, now, 'claude-3-5-sonnet')).toBe(true)
+    expect(isOauthAccountHealthy(acc, now, 'glm-5.2')).toBe(true)
+    // 迁移后表里有记录
+    expect(acc.state.softRateModels?.['deepseek-v4-flash']?.until).toBe(now + 60000)
+  })
+
+  it('向后兼容：旧单槽数据已过期 → 不迁移、不拦号', () => {
+    const now = Date.now()
+    const acc = makeAccount('acc-legacy-expired', {
+      state: {
+        credits: 100,
+        disabled: false,
+        until: 0,
+        errCount: 0,
+        softRateModel: 'deepseek-v4-flash',
+        softRateResetAt: now - 1000,
+      },
+    })
+    expect(isOauthAccountHealthy(acc, now, 'deepseek-v4-flash')).toBe(true)
+    expect(acc.state.softRateModels).toBeUndefined()
+  })
+
+  it('重置时间已过 → 1ms 极短冷却但仍记模型表（对齐源实现，不退化成账号级）', async () => {
+    const pid = PROVIDER + '-mc6'
+    const kv = makeRealKV(pid, [makeAccount('u1')])
+    const past = Date.now() - 1000
+    await cooldownOauthAccountSoftForModel(kv.env, pid, 'u1', 'model-A', past, '6004 stale')
+
+    const acc = (await readOauthPool(kv.env, pid))[0]
+    // 仍写模型表（源实现 hasReset 只看是否零值，不看是否已过期）
+    expect(acc.state.softRateModels?.['model-A']).toBeDefined()
+    // resetAt 保留上游原始墙钟（台账呈现真实恢复时刻）
+    expect(acc.state.softRateModels?.['model-A']?.resetAt).toBe(past)
+    // 但冷却极短 → 立即恢复可用
+    expect(isOauthAccountHealthy(acc, Date.now() + 10, 'model-A')).toBe(true)
+    // 不写账号级 until
+    expect(acc.state.until).toBe(0)
+  })
+
+  it('无模型名 → 退回账号级软冷却（无法做模型豁免）', async () => {
+    const pid2 = PROVIDER + '-mc7'
+    const kv2 = makeRealKV(pid2, [makeAccount('u1')])
+    await cooldownOauthAccountSoftForModel(kv2.env, pid2, 'u1', '', Date.now() + 60000, '6004 no model')
+    const acc2 = (await readOauthPool(kv2.env, pid2))[0]
+    expect(acc2.state.softRateModels).toBeUndefined()
+    expect(acc2.state.until).toBeGreaterThan(Date.now())
+  })
+
+  it('listModelCooldowns 只透出未过期条目且按模型名排序', () => {
+    const now = Date.now()
+    const st = {
+      credits: 0, disabled: false, until: 0, errCount: 0,
+      softRateModels: {
+        'z-model': { until: now + 1000, resetAt: now + 1000, reason: 'a' },
+        'a-model': { until: now + 2000, resetAt: now + 2000, reason: 'b' },
+        'expired': { until: now - 1, resetAt: now - 1, reason: 'c' },
+      },
+    }
+    expect(listModelCooldowns(st, now).map((x) => x.model)).toEqual(['a-model', 'z-model'])
+  })
+
+  it('hasModelCooldown 报告是否处于模型级冷却形态', () => {
+    const now = Date.now()
+    expect(hasModelCooldown({ credits: 0, disabled: false, until: 0, errCount: 0 }, now)).toBe(false)
+    expect(hasModelCooldown({
+      credits: 0, disabled: false, until: 0, errCount: 0,
+      softRateModels: { m: { until: now + 1000, resetAt: now + 1000 } },
+    }, now)).toBe(true)
+    expect(hasModelCooldown({
+      credits: 0, disabled: false, until: 0, errCount: 0,
+      softRateModels: { m: { until: now - 1, resetAt: now - 1 } },
+    }, now)).toBe(false)
   })
 })
 

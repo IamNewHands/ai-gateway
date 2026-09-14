@@ -111,7 +111,7 @@
   - claim 会给账号加抽奖机会（chance_balance），属于真实收益，勿频繁重复。
   - student-verify 需人工验证码产物（wx_studentcheck_code），脚本不碰、不伪造。
 """
-import sys, os, json, time, hashlib, argparse, glob, urllib.request, urllib.error
+import sys, os, json, time, hashlib, argparse, glob, uuid, urllib.request, urllib.error
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import task_common as tc  # 仅复用 load_auth / AUTHS 常量，不复用其 _headers（头不同源）
@@ -352,6 +352,163 @@ def post_claim(token, code):
         msg, is_auth = _interpret_failure(st, r)
         raise (AuthError if is_auth else RuntimeError)(f"claim {code} {msg}")
     return st, r
+
+
+# --------------------------------------------------------------------------
+# 抽奖（幸运大转盘）：移植自 workbuddy2api scripts/school_open_day_2026.py
+# --------------------------------------------------------------------------
+
+# 抽奖转盘奖品映射（/config prizes 返回的 prize_code -> 标签）
+LOTTERY_PRIZE_LABELS = {
+    "school_credit_6":      {"label": "6积分",   "type": "credit"},
+    "school_credit_66":     {"label": "66积分",  "type": "credit"},
+    "school_voucher_luckin": {"label": "瑞幸咖啡15元券", "type": "voucher"},
+    "school_voucher_kfc_ok": {"label": "肯德基OK餐券",   "type": "voucher"},
+    "school_voucher_kfc_ice": {"label": "肯德基冰淇淋券", "type": "voucher"},
+    "school_voucher_kugou":  {"label": "酷狗会员月卡券",  "type": "voucher"},
+}
+
+
+def fetch_lottery_config(token):
+    """GET /portal/activity/school/config —— 抽奖盘面 + 余额（只读）。
+
+    返回 (config, chance)：
+      config = data（含 start_at/end_at/in_period/prizes[]）
+      chance = data.chance = {balance, total_earned, voucher_won, lottery_limit}；
+      chance.balance 即抽奖次数余额。"""
+    st, r = request_retry(token, "GET", SCHOOL + "/config")
+    if st != 200 or (isinstance(r, dict) and r.get("code") not in OK_CODES):
+        msg, is_auth = _interpret_failure(st, r)
+        raise (AuthError if is_auth else RuntimeError)(f"config {msg}")
+    data = (r or {}).get("data") or {}
+    return data, (data.get("chance") or {})
+
+
+def post_lottery_draw(token, draw_uuid):
+    """POST /portal/activity/school/wheel/draw {draw_uuid} —— 抽一次转盘。
+
+    draw_uuid 每轮一次性（随机 UUID），抽后即弃。
+    返回 (st, resp)；resp.data={prize_code, credit_amount, chance_balance}。
+    边界：余额 0 时返回 HTTP 409 code=40900 "no chance"（不再扣，安全）。"""
+    body = {"draw_uuid": draw_uuid}
+    st, r = request_retry(token, "POST", f"{SCHOOL}/wheel/draw", body)
+    return st, r
+
+
+def lottery_prize_text(prize_code, credit_amount):
+    """把 prize_code 映射成语义化文本；未知码直接原样返回，不编造。"""
+    info = LOTTERY_PRIZE_LABELS.get(prize_code)
+    if not info:
+        return f"{prize_code}"
+    if info["type"] == "credit":
+        return f"{info['label']}（+{credit_amount} Credit）"
+    return info["label"]
+
+
+def lottery_account(auth, opts, stats, count_account=True):
+    """抽奖段：查余额 -> 循环抽到空 -> 汇总打印。
+
+    GET  /portal/activity/school/config      -> data.chance.balance（只读，抽前查余额）
+      POST /portal/activity/school/wheel/draw  {draw_uuid} -> data.prize_code/credit_amount/
+                                                              chance_balance（抽奖 + 扣次数）
+      余额 0 时再抽返回 HTTP 409 code=40900 "no chance"（安全边界，脚本借此优雅停）。
+    dry-run 只打印将执行的调用不发送。结果如实记录（含积分/实物券，不编造）。
+    count_account=False：供 --run 任务循环收尾复用（账号数已由 run_account 计入）。"""
+    uid8 = (auth.get("uid") or "")[:8] or "?"
+    if count_account:
+        stats["accounts"] += 1
+
+    # dry-run：只读查余额可做；写（draw）只打印不发送
+    if not opts.yes:
+        try:
+            _, chance = fetch_lottery_config(auth["token"])
+        except (AuthError, RuntimeError) as e:
+            print(f"[school2026] {uid8} lottery config 失败: {e}")
+            stats["fail"] += 1
+            return
+        bal = chance.get("balance") or 0
+        if bal <= 0:
+            print(f"[school2026] {uid8} lottery balance=0，无需抽奖")
+            return
+        print(f"[school2026] {uid8} lottery balance={bal}（dry-run：将 POST /wheel/draw 抽 "
+              f"{bal} 次，间隔 ≥1s，不发请求）")
+        stats["pending"] += 1
+        return
+
+    try:
+        cfg, chance = fetch_lottery_config(auth["token"])
+    except (AuthError, RuntimeError) as e:
+        print(f"[school2026] {uid8} lottery config 失败: {e}")
+        stats["fail"] += 1
+        return
+
+    if not cfg.get("in_period"):
+        print(f"[school2026] {uid8} 活动非进行期（in_period=false），抽奖跳过")
+        return
+
+    bal = chance.get("balance") or 0
+    total_earned = chance.get("total_earned") or 0
+    lottery_limit = chance.get("lottery_limit")
+    if bal <= 0:
+        print(f"[school2026] {uid8} lottery balance=0（累计获得 {total_earned} 次），无需抽奖")
+        return
+
+    print(f"[school2026] {uid8} lottery balance={bal} total_earned={total_earned} "
+          f"lottery_limit={lottery_limit}（开始抽奖，抽到空为止）")
+
+    results = []
+    total_credit = 0
+    prev_bal = bal
+    stall = 0
+    while bal > 0:
+        draw_uuid = str(uuid.uuid4())  # 每轮一次性，抽后即弃
+        try:
+            st, r = post_lottery_draw(auth["token"], draw_uuid)
+        except (AuthError, RuntimeError) as e:
+            print(f"[school2026] {uid8} draw 失败: {e}")
+            stats["fail"] += 1
+            break
+        if st != 200 or (isinstance(r, dict) and r.get("code") not in OK_CODES):
+            code = (r or {}).get("code") if isinstance(r, dict) else None
+            msg = (r or {}).get("message") if isinstance(r, dict) else r
+            if code == 40900:
+                print(f"[school2026] {uid8} draw http={st} code=40900（次数耗尽：no chance），"
+                      f"按边界正常结束")
+                bal = 0  # 「no chance」边界，如实结束
+                break
+            print(f"[school2026] {uid8} draw http={st} code={code} msg={msg}（未中奖，停）")
+            break
+        d = (r or {}).get("data") or {}
+        prize_code = d.get("prize_code") or "?"
+        credit = d.get("credit_amount") or 0
+        bal = d.get("chance_balance", bal)  # 服务端回读余额，驱动循环
+        if bal >= prev_bal:   # 余额未降：服务端异常，防死循环
+            stall += 1
+            if stall >= 3:
+                print(f"[school2026] {uid8} draw 余额未递减（服务端异常），提前停")
+                break
+        else:
+            stall = 0
+        prev_bal = bal
+        label = lottery_prize_text(prize_code, credit)
+        results.append({"prize_code": prize_code, "credit": credit, "label": label})
+        total_credit += credit
+        print(f"[school2026] {uid8} draw -> {label}（balance {bal}）")
+        if bal > 0:
+            time.sleep(opts.gap)
+
+    # 汇总（如实列出每个中奖物）
+    if results:
+        credit_detail = "+".join(str(x["credit"]) for x in results)
+        print(f"[school2026] {uid8} lottery 汇总: {len(results)} 抽，积分增量 {total_credit}"
+              f"（{credit_detail}）")
+        for x in results:
+            print(f"    - {x['label']}")
+        stats["ok"] += 1 if bal == 0 else 0   # 只有余额归零才算抽完
+        if bal > 0:
+            stats["pending"] += 1              # 中途被服务端打断，未抽完
+    else:
+        print(f"[school2026] {uid8} lottery 无一抽出奖（上次余额 {bal}）")
 
 
 # --------------------------------------------------------------------------
@@ -688,6 +845,10 @@ def run_account(auth, opts, stats):
                   f"无分类证据，保守跳过")
             stats["skip"] += 1
 
+    # 5) 任务循环收尾：抽奖段（claim 会发多次机会）。--yes 才真正 draw；
+    #    dry-run 下 lottery_account 也只读查余额并打印将执行的调用，不发写请求。
+    lottery_account(auth, opts, stats, count_account=False)
+
 
 def print_notes():
     """打印实测状态与未打通说明（对应脚本头部注释，不编造）。"""
@@ -711,7 +872,9 @@ def main():
     ap.add_argument("accounts", nargs="*", help="uid 前缀（可多个）或 ALL；--token 时可不传")
     ap.add_argument("--list", action="store_true", help="只读盘点（默认行为）")
     ap.add_argument("--run", action="store_true", help="执行上报/领取动作（需 --yes 放行真实写）")
-    ap.add_argument("--yes", action="store_true", help="放行写操作（配合 --run）")
+    ap.add_argument("--lottery-only", action="store_true",
+                    help="只抽奖不做任务（任务已全领时的日常补抽）")
+    ap.add_argument("--yes", action="store_true", help="放行写操作（配合 --run / --lottery-only）")
     ap.add_argument("--token", default=None, help="显式覆盖 token（不同源凭证逃生门）")
     ap.add_argument("--uid", default="", help="配合 --token 指定 uid（仅日志用）")
     ap.add_argument("--gap", type=float, default=1.5, help="写动作间隔秒数（默认 1.5，最小 1.0）")
@@ -723,10 +886,10 @@ def main():
     stats = {"accounts": 0, "ok": 0, "already": 0, "skip": 0,
              "pending": 0, "fail": 0}
 
-    run_mode = bool(a.run)
-    mode = "RUN" if run_mode else "LIST"
+    run_mode = bool(a.run or a.lottery_only)   # 抽奖也是执行性写动作（dry-run 保护 draw）
+    mode = "LOTTERY" if a.lottery_only else ("RUN" if a.run else "LIST")
     if run_mode and not a.yes:
-        print(f"mode={mode} dry-run（写操作需 --yes 放行；--run 不带 --yes 只打印将发送的动作）")
+        print(f"mode={mode} dry-run（写操作需 --yes 放行；{mode} 不带 --yes 只打印将发送的动作）")
     else:
         print(f"mode={mode} {'REAL' if a.yes else ''} gap={a.gap}")
 
@@ -763,8 +926,16 @@ def main():
         sys.exit(1)
 
     for auth in auths:
+        # global realm 不参与 CN 开学季/转盘，明确跳过
+        if tc.auth_is_global(auth):
+            uid8 = (auth.get("uid") or "")[:8] or "?"
+            print(f"[skip] {uid8} global realm 不参与 CN 活动")
+            stats["skip"] += 1
+            continue
         try:
-            if run_mode:
+            if a.lottery_only:
+                lottery_account(auth, a, stats)
+            elif run_mode:
                 run_account(auth, a, stats)
             else:
                 list_account(auth, stats)

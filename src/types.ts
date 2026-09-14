@@ -264,6 +264,13 @@ export interface OAuthDeviceConfig {
    * 可选。配置后请求上游注入 X-Device-Token，模拟桌面端 Turing Shield SDK 生成的设备指纹。
    */
   deviceToken?: string
+  /**
+   * 单账号最大在途请求数（对齐 workbuddy2api `pool.max_in_flight`，源默认 3）。
+   * 未配置 = 默认 3；<= 0 视为不限（仍计数供观测）。
+   * 用途：避免高并发把单个账号打爆（放大 429/5xx → 触发冷却）。
+   * 注意 Workers 多 isolate 下为 isolate 内近似，详见 workbuddy-inflight.ts。
+   */
+  maxInFlight?: number
 }
 
 /** KV 中保存的 OAuth token 状态 */
@@ -532,6 +539,11 @@ export interface CheckinResult {
   activityReport?: { success: boolean; message: string }
   /** 猫猫旅行状态与收益（P2） */
   catTravel?: { state: string; reward?: number; message: string; buddyName?: string }
+  /**
+   * 国际版一次性 trial 加油包领取结果（仅 global 账号）。
+   * global 无签到/任务中心，trial 是其唯一天然积分增益动作。
+   */
+  trialClaim?: { success: boolean; already: boolean; message: string }
   /**
    * WorkBuddy 多账号池：本 provider 下每个池账号的独立签到结果（池提供商才有）。
    * 面板可按账号逐条展示；汇总字段（success/credits 等）为池整体快照。
