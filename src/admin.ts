@@ -880,6 +880,21 @@ export async function handleTestModelNew(c: Context<AppEnv>) {
     return c.json<ApiResponse>({ success: false, message: 'url 必须是合法的 http/https 公网地址' }, 400)
   }
 
+  // Kuku uses a private Cookie-authenticated workflow. Its public host does not
+  // expose OpenAI-compatible /models or /chat/completions endpoints, so model
+  // testing must execute the provider adapter's minimal real chat request.
+  if (providerId) {
+    const storedProvider = await getProvider(c.env, providerId)
+    if (storedProvider && isKukuProvider(storedProvider)) {
+      const result = await testKukuModel({
+        ...storedProvider,
+        baseUrl: 'https://kuku.baidu.com',
+        apiKeys: [{ key: apiKey, enabled: true }],
+      }, model)
+      return c.json<ApiResponse>({ success: true, data: result })
+    }
+  }
+
   if (providerId && isOpenCodeProvider(providerId)) {
     const apiKeys = apiKey ? [{ key: apiKey, enabled: true }] : []
     const result = await testOpenCodeModel(url, apiKeys, model, resolveOpenCodeUrls(c.env))
