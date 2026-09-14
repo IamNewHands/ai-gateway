@@ -41,6 +41,7 @@ import { isM365Provider, M365_MODELS, testM365Model } from './m365/proxy'
 import { isZcodeProvider, testZcodeModel, buildZcodeHeaders, ZCODE_MODELS, fetchZcodeModels } from './zcode/proxy'
 import { isKukuProvider, isKukuRequest, testKukuModel } from './kuku/proxy'
 import { probeKukuNetwork } from './kuku/probe'
+import { startKukuQrLogin, pollKukuQrLogin } from './kuku/qr'
 import { listSessions as listM365Sessions, deleteSession as deleteM365Session } from './m365/session'
 import { listConversations as listM365Conversations, whitelistConversation, unwhitelistConversation, getCleanupMode, setCleanupMode, getCleanupConfig, setCleanupConfig, deleteConversationRecord } from './m365/conversation-manager'
 import { autoCleanupProvider } from './m365/auto-cleanup'
@@ -1587,6 +1588,34 @@ export async function handleOAuthDisconnect(c: Context<AppEnv>) {
     await c.env.KV.delete(`m365:sessions:${id}`).catch(() => {})
   }
   return c.json<ApiResponse>({ success: true, message: '已断开 OAuth 连接' })
+}
+
+/** 发起 Kuku 百度扫码登录：返回二维码图片地址（Kuku 无 OAuth，走 passport 扫码换取 Cookie）。 */
+export async function handleKukuQrConnect(c: Context<AppEnv>) {
+  const id = c.req.param('id')
+  if (!id) return c.json<ApiResponse>({ success: false, message: '缺少 id 参数' }, 400)
+
+  const result = await startKukuQrLogin(c.env, id)
+  if (!result.success) {
+    return c.json<ApiResponse>({ success: false, message: result.message }, 500)
+  }
+  return c.json<ApiResponse>({ success: true, data: result.qr })
+}
+
+/** 轮询 Kuku 扫码结果；确认后自动把 Cookie 写入 provider.apiKeys（已保存时）。 */
+export async function handleKukuQrPoll(c: Context<AppEnv>) {
+  const id = c.req.param('id')
+  if (!id) return c.json<ApiResponse>({ success: false, message: '缺少 id 参数' }, 400)
+
+  const result = await pollKukuQrLogin(c.env, id)
+  return c.json<ApiResponse>({
+    success: result.status === 'success',
+    message: result.message,
+    data: {
+      connected: result.status === 'success',
+      cookie: result.status === 'success' ? result.cookie : undefined,
+    },
+  })
 }
 
 /**

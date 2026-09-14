@@ -32,6 +32,8 @@ export const KV_KEYS = {
   DEFAULT_PROVIDERS_MIGRATION: 'migration:default-providers:v2',
   OAUTH_TOKEN_PREFIX: 'oauth:token:',
   OAUTH_DEVICE_PREFIX: 'oauth:device:',
+  /** Kuku 百度扫码登录的临时二维码会话状态 */
+  KUKU_QR_PREFIX: 'kuku:qr:',
   CHECKIN_RESULT_PREFIX: 'checkin:result:',
   LOGIN_RATE: 'login:rate:',
   MCPS: 'mcps',

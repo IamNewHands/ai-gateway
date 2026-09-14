@@ -501,6 +501,7 @@ ${H('管理')}
             </div>
             <fieldset class="form-group" id="akeys-fs"><legend id="akey-legend">上游 API Keys</legend><div id="akeys"><div class="fc mb-4 field-row"><input type="password" placeholder="sk-xxx" class="fx1 aki" aria-label="上游 API Key"><button class="icon-btn" onclick="toggleKeyText(this)" title="显示/隐藏 Key"><i class="fas fa-eye" aria-hidden="true"></i></button><label class="tg" title="启用 Key"><input type="checkbox" checked class="ake" aria-label="启用 Key"><span class="sl"></span></label><button class="btn btn-gh btn-xs" onclick="testNewAKey(this)" title="测试 Key"><i class="fas fa-plug" aria-hidden="true"></i><span>测试</span></button><button class="icon-btn" onclick="this.parentElement.remove()" aria-label="移除 Key"><i class="fas fa-times" aria-hidden="true"></i></button></div></div><button class="btn btn-s btn-xs" onclick="addAKeyRow()"><i class="fas fa-plus" aria-hidden="true"></i>添加 Key</button><span id="akey-hint" class="form-helper"></span></fieldset>
             <div class="fg hd" id="akuku-row"><label for="akuku-think">Kuku 思考模式</label><input type="number" id="akuku-think" min="0" max="10" value="3"><span class="form-helper">仅 Kuku GenFlow Pro 生效，允许 0 到 10。</span></div>
+            <div class="fg hd" id="akuku-qr"><button class="btn btn-p btn-sm" onclick="kukuQrLogin()" type="button"><i class="fas fa-qrcode" aria-hidden="true"></i> 扫码登录自动写 Cookie</button><span class="form-helper">用手机百度 App 扫下方二维码（App 需已登录目标百度账号），后台自动写入 BDUSS Cookie，无需手工粘贴。</span></div>
             <fieldset class="form-group" id="amodels-fs"><legend>模型 ID</legend><div id="amodels"><div class="fc mb-4 field-row"><input type="text" placeholder="deepseek-chat" class="fx1 ami" aria-label="模型 ID"><label class="tg" title="启用模型"><input type="checkbox" checked class="ame" aria-label="启用模型"><span class="sl"></span></label><label class="tg" title="对该模型启用思维引导注入（转发前注入固定思维引导 system 提示词）"><input type="checkbox" class="cti" aria-label="启用思维引导注入"><span class="sl"></span></label><label class="tg" title="对该模型启用缓存前缀注入（转发前注入固定缓存前缀以提升缓存命中率）"><input type="checkbox" class="ccp" aria-label="启用缓存前缀注入"><span class="sl"></span></label><script type="text/plain" id="eff-dd-tpl">${effDdNewHtml()}</script><button class="btn btn-gh btn-xs" onclick="testNewMdl(this)" title="测试模型"><i class="fas fa-plug" aria-hidden="true"></i><span>测试</span></button><button class="icon-btn" onclick="this.parentElement.remove()" aria-label="移除模型"><i class="fas fa-times" aria-hidden="true"></i></button></div></div><button class="btn btn-s btn-xs" onclick="addMdlRow()"><i class="fas fa-plus" aria-hidden="true"></i>添加模型</button><span class="form-helper">每个模型行上「启用模型」开关旁的开关依次为「思维引导注入」「缓存前缀注入」，勾选后该模型转发前会被注入对应固定提示词；不勾选则原样转发。「effort」下拉声明该模型的 reasoning_effort 支持档位（多选，仅 WorkBuddy/CodeBuddy 上游生效），留空 = 不启用。</span></fieldset>
             <div class="collapse-section">
               <button class="collapse-btn" onclick="toggleVbCollapse('avb-fs', this)" type="button" aria-expanded="false">
@@ -585,7 +586,8 @@ ${H('管理')}
                 </fieldset>
               </div>
               <fieldset class="form-group ${p.authType==='oauth-device'?'hd':''}" id="keys-fs-${escapePageHtml(p.id)}"><legend id="key-legend-${escapePageHtml(p.id)}">${isTraeProviderUI(p)?'TRAE 账号凭证（每个账号一行 JSON）':(p.id==='cline'?'Cline RefreshTokens（每个账号一行）':'上游 API Keys')}</legend><div id="keys-${escapePageHtml(p.id)}">${p.apiKeys.map((k, ki)=>`<div class="fc mb-3 field-row" data-kidx="${ki}"><input type="password" value="${escapePageHtml(k.key)}" class="fx1" id="k-${escapePageHtml(p.id)}-${ki}" placeholder="API Key" aria-label="API Key"><button class="icon-btn" onclick="toggleKeyText(this)" title="显示/隐藏 Key"><i class="fas fa-eye" aria-hidden="true"></i></button><label class="tg"><input type="checkbox" ${k.enabled?'checked':''} id="ken-${escapePageHtml(p.id)}-${ki}" aria-label="启用 Key"><span class="sl"></span></label><button class="btn btn-gh btn-xs" onclick="testKeyRow('${escapePageJsx(p.id)}',${ki})" title="测试 Key"><i class="fas fa-plug" aria-hidden="true"></i><span>测试</span></button><button class="icon-btn" onclick="rmKeyRow('${escapePageJsx(p.id)}',${ki})" aria-label="移除 Key"><i class="fas fa-times" aria-hidden="true"></i></button></div>`).join('')}</div><div class="fc mt-1 field-row"><input type="password" id="nk-${escapePageHtml(p.id)}" placeholder="${isTraeProviderUI(p)?'新的 TRAE 凭证 JSON（或点「登录账号」自动写入）':(p.id==='cline'?'新的 RefreshToken（一个账号一行）':'新的 API Key')}" class="fx1"><button class="btn btn-s btn-xs" onclick="addKeyRow('${escapePageJsx(p.id)}')"><i class="fas fa-plus" aria-hidden="true"></i>添加</button></div><span id="key-hint-${escapePageHtml(p.id)}" class="form-helper">${isTraeProviderUI(p)?'TRAE SOLO 账号凭证为登录后自动写入的 JSON（也可粘贴 trae 登录脚本落盘的 trae-*.json 内容）。每行一个账号、按剩余积分自动挑选，额度用尽自动冷却轮换；禁用该 Key 即停用账号。':(p.id==='cline'?'Cline 使用 Cline 账号的 refreshToken（长期钥匙）。每个账号一行，额度用完自动切换；留空禁用某个账号。':' ')}</span></fieldset>
-              ${p.type === 'kuku' ? `<div class="fg"><label for="kuku-think-${escapePageHtml(p.id)}">Kuku 思考模式</label><input type="number" id="kuku-think-${escapePageHtml(p.id)}" min="0" max="10" value="${p.kukuThinkMode ?? 3}"><span class="form-helper">允许 0 到 10，默认 3。</span></div>` : ''}
+              ${p.type === 'kuku' ? `<div class="fg"><label for="kuku-think-${escapePageHtml(p.id)}">Kuku 思考模式</label><input type="number" id="kuku-think-${escapePageHtml(p.id)}" min="0" max="10" value="${p.kukuThinkMode ?? 3}"><span class="form-helper">允许 0 到 10，默认 3。</span></div>
+              <div class="fg"><button class="btn btn-p btn-sm" onclick="kukuQrLogin('${escapePageJsx(p.id)}')" type="button"><i class="fas fa-qrcode" aria-hidden="true"></i> 扫码登录自动写 Cookie</button><span class="form-helper">用手机百度 App 扫码，后台自动写入 BDUSS Cookie（已保存的提供商将直接更新 Key）。</span></div>` : ''}
               <fieldset class="form-group" id="models-fs-${escapePageHtml(p.id)}"><legend>模型</legend><div id="ml-${escapePageHtml(p.id)}">${p.models.map((m,mi)=>{ const pol=((p.oauth&&p.oauth.effortPolicy)||{})[m.id]||[]; return `<div class="fc mb-3 field-row" data-idx="${mi}"><input type="text" value="${escapePageHtml(m.id)}" class="fx1" id="mid-${escapePageHtml(p.id)}-${mi}" placeholder="模型 ID"><label class="tg" title="启用模型"><input type="checkbox" ${m.enabled?'checked':''} id="men-${escapePageHtml(p.id)}-${mi}" aria-label="启用模型"><span class="sl"></span></label><label class="tg" title="启用思维引导注入"><input type="checkbox" ${(p.thinkingInject||[]).includes(m.id)?'checked':''} id="mit-${escapePageHtml(p.id)}-${mi}" aria-label="启用思维引导注入"><span class="sl"></span></label><label class="tg" title="启用缓存前缀注入"><input type="checkbox" ${(p.cachePrefixInject||[]).includes(m.id)?'checked':''} id="mcp-${escapePageHtml(p.id)}-${mi}" aria-label="启用缓存前缀注入"><span class="sl"></span></label>${effDdEditHtml(p.id, mi, pol)}<button class="btn btn-gh btn-xs" onclick="testMdl('${escapePageJsx(p.id)}','${escapePageJsx(m.id)}',${mi})" title="测试模型"><i class="fas fa-plug" aria-hidden="true"></i><span>测试</span></button><button class="icon-btn" onclick="rmMdl('${escapePageJsx(p.id)}',${mi})" aria-label="移除模型"><i class="fas fa-times" aria-hidden="true"></i></button></div>`}).join('')}</div><div class="fc mt-1 field-row"><input type="text" id="nmid-${escapePageHtml(p.id)}" placeholder="新的模型 ID" class="fx1"><button class="btn btn-s btn-xs" onclick="addMdl('${escapePageJsx(p.id)}')"><i class="fas fa-plus" aria-hidden="true"></i>添加</button></div><span class="form-helper">每个模型行「启用模型」开关旁的开关依次为「思维引导注入」「缓存前缀注入」，勾选后该模型转发前会被注入对应固定提示词；不勾选则原样转发。「effort」下拉声明该模型的 reasoning_effort 支持档位（多选，仅 WorkBuddy/CodeBuddy 上游生效），留空 = 不启用。</span></fieldset>
               ${isTraeProviderUI(p)?`
               <fieldset class="form-group" id="trae-fs-${escapePageHtml(p.id)}"><legend>TRAE 账号池（SOLO / Work 双通道）</legend><span class="form-helper">多账号双积分反代：自动隔离通用积分 (SOLO) 与 Work 专属积分。正常调用优先消耗通用积分；当遇到 4008 额度耗尽或 429 限流时，系统自动无缝降级到 Work 专有通道。支持一键刷新双通道积分与每日自动签到补积分。</span>
@@ -1663,6 +1665,8 @@ function applyProviderPreset(name) {
   applyClineKeyHint(false)
   const kukuRow = document.getElementById('akuku-row')
   if (kukuRow) kukuRow.classList.add('hd')
+  const kukuQrRow = document.getElementById('akuku-qr')
+  if (kukuQrRow) kukuQrRow.classList.add('hd')
   if (!p) return
   document.getElementById('anm').value = p.name
   document.getElementById('aid').value = p.id
@@ -1694,6 +1698,7 @@ function applyProviderPreset(name) {
     applyClineKeyHint(false)
   }
   if (kukuRow) kukuRow.classList.toggle('hd', p.type !== 'kuku')
+  if (kukuQrRow) kukuQrRow.classList.toggle('hd', p.type !== 'kuku')
   const kukuThink = document.getElementById('akuku-think')
   if (kukuThink && p.type === 'kuku') kukuThink.value = String(p.kukuThinkMode ?? 3)
   if (p.type === 'kuku') {
@@ -2243,6 +2248,43 @@ function oauthPoll(id) {
     if (st) st.textContent = d.message || '等待授权…'
     return false
   }).catch(() => { if (pollSt) pollSt.textContent = '轮询失败，请重试' })
+}
+
+// ===== Kuku：百度扫码登录（自动抓 Cookie）=====
+let _kukuQrTimer = null
+function kukuQrLogin(id) {
+  const providerId = (id != null && id !== '') ? id : ((document.getElementById('aid') || {}).value || '').trim() || 'kuku'
+  if (!providerId) { toast('请先填写提供商 ID', 'error'); return }
+  showM('<h3><i class="fas fa-qrcode c-p" aria-hidden="true"></i> Kuku 百度扫码登录</h3><p class="kuku-qr-status" id="kuku-qr-st">正在获取二维码…</p><div class="fa"><button class="btn btn-s" onclick="closeM()">取消</button></div>')
+  fetch('/admin/api/kuku/' + encodeURIComponent(providerId) + '/qr/connect', { method: 'POST' }).then(r => r.json()).then(d => {
+    const st = document.getElementById('kuku-qr-st')
+    if (!d.success || !d.data) { if (st) st.textContent = (d.message) || '获取二维码失败'; return }
+    if (st) st.innerHTML = '请用手机<strong>百度 App</strong>扫码（App 需已登录目标百度账号）：<br><img src="' + escapeHtml(d.data.imgUrl) + '" alt="登录二维码" style="width:220px;height:220px;border:1px solid #ddd;border-radius:8px"><br><span class="mu">等待扫码确认…</span>'
+    if (_kukuQrTimer) clearInterval(_kukuQrTimer)
+    _kukuQrTimer = setInterval(function() { kukuQrPoll(providerId) }, 3000)
+  }).catch(() => { const st = document.getElementById('kuku-qr-st'); if (st) st.textContent = '获取二维码失败，请重试' })
+}
+function kukuQrPoll(providerId) {
+  return fetch('/admin/api/kuku/' + encodeURIComponent(providerId) + '/qr/poll', { method: 'POST' }).then(r => r.json()).then(d => {
+    if (d.success) {
+      if (_kukuQrTimer) { clearInterval(_kukuQrTimer); _kukuQrTimer = null }
+      const st = document.getElementById('kuku-qr-st')
+      if (st) st.textContent = '扫码登录成功，Cookie 已写入！'
+      if (d.data && d.data.cookie) injectKukuCookie(providerId, d.data.cookie)
+      setTimeout(closeM, 1300)
+      toast('已获取 Kuku Cookie，请保存', 'success')
+      return true
+    }
+    const st = document.getElementById('kuku-qr-st')
+    if (st) st.textContent = d.message || '等待扫码…'
+    return false
+  }).catch(() => { const st = document.getElementById('kuku-qr-st'); if (st) st.textContent = '轮询失败，请重试' })
+}
+function injectKukuCookie(providerId, cookie) {
+  let inp = document.getElementById('k-' + providerId + '-0')   // 编辑表单已有 Key 行
+  if (!inp) inp = document.getElementById('nk-' + providerId)   // 编辑表单新增 Key 输入框
+  if (!inp) inp = document.querySelector('#akeys .aki')         // 新增表单
+  if (inp) inp.value = cookie
 }
 
 // ===== TRAE SOLO 账号池：登录 / 签到 / 模型 / 状态 =====

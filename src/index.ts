@@ -25,6 +25,8 @@ import {
   handleOAuthConnect,
   handleOAuthPoll,
   handleOAuthDisconnect,
+  handleKukuQrConnect,
+  handleKukuQrPoll,
   handleOAuthPoolRemove,
   handleOAuthPoolSetPrefer,
   handleOAuthPoolExport,
@@ -212,6 +214,9 @@ app.get('/admin/api/oauth/:id/status', handleOAuthStatus)
 app.post('/admin/api/oauth/:id/connect', handleOAuthConnect)
 app.post('/admin/api/oauth/:id/poll', handleOAuthPoll)
 app.post('/admin/api/oauth/:id/disconnect', handleOAuthDisconnect)
+// Kuku 百度扫码登录（自动抓 Cookie）
+app.post('/admin/api/kuku/:id/qr/connect', handleKukuQrConnect)
+app.post('/admin/api/kuku/:id/qr/poll', handleKukuQrPoll)
 // WorkBuddy 多账号池：删除池内指定 uid 账号
 app.post('/admin/api/oauth/:id/pool/remove', handleOAuthPoolRemove)
 // WorkBuddy 多账号池：设置首选账号（面板手工指定，留空恢复自动挑选）
