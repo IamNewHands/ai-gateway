@@ -23,7 +23,6 @@ import sys
 import time
 import json
 import urllib.parse
-import urllib.request
 
 from playwright.sync_api import sync_playwright
 
@@ -38,9 +37,13 @@ def _cookie_str(cookies: list) -> str:
     return "; ".join(f"{c['name']}={c['value']}" for c in cookies if c.get("name") and c.get("value"))
 
 
-def _kuku_logged_in(cookies: list) -> bool:
-    """用捕获的 Cookie 主动打 kuku userreport，errno==0 才算真正登录。
-    仅检测到 BDUSS 键但不校验，会导出无效 Cookie（百度有安全风控，BDUSS 存在≠有效）。"""
+def _kuku_logged_in(ctx, cookies: list) -> bool:
+    """用浏览器上下文自己的请求打 kuku userreport（走真正的 Chrome 网络栈/指纹，
+    并复用上下文 Cookie），errno==0 才算真正登录。
+
+    注意：不能用 urllib/requests 这类非浏览器 HTTP 客户端——kuku 的 WAF 会按
+    TLS/HTTP2 指纹识别并发风控，非 Chrome 指纹即使带有效 Cookie 也返回 未登录。
+    原仓库正是用 curl_cffi 的 Session(impersonate="chrome") 来规避这一点。"""
     raw = _cookie_str(cookies)
     if not raw:
         return False
@@ -49,17 +52,15 @@ def _kuku_logged_in(cookies: list) -> bool:
         "channel": "chunlei", "version": "1.4.4",
     })
     url = "https://kuku.baidu.com/api/genflowpro/common/userreport?" + query
-    req = urllib.request.Request(url, headers={
-        "Cookie": raw,
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36",
-        "Referer": "https://kuku.baidu.com/genflowpro",
-        "Origin": "https://kuku.baidu.com",
-        "Accept": "application/json, text/plain, */*",
-        "Accept-Language": "zh-CN,zh;q=0.9",
-    })
     try:
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            data = json.loads(resp.read().decode("utf-8", "replace"))
+        resp = ctx.request.get(url, headers={
+            "Cookie": raw,
+            "Referer": "https://kuku.baidu.com/genflowpro",
+            "Origin": "https://kuku.baidu.com",
+            "Accept": "application/json, text/plain, */*",
+            "Accept-Language": "zh-CN,zh;q=0.9",
+        }, timeout=15000)
+        data = resp.json()
         return isinstance(data, dict) and data.get("errno") == 0
     except Exception:
         return False
@@ -88,7 +89,7 @@ def main() -> int:
             except Exception:
                 cookies = []
             if any(c.get("name") == "BDUSS" and c.get("value") for c in cookies):
-                if _kuku_logged_in(cookies):
+                if _kuku_logged_in(ctx, cookies):
                     logged_in = True
                     break
                 print("[kuku-login] 已检测到 BDUSS，但 kuku userreport 仍未登录（可能是登录未完成需确认，正在等待…）")
