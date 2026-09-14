@@ -39,6 +39,8 @@ import { isOAuthPoolProvider, seedOauthPoolFromSingle, listOauthPoolStatus, remo
 import { seedQoderPoolFromSingle, listQoderPoolStatus, removeQoderAccount, readQoderPool } from './qoder/pool'
 import { isM365Provider, M365_MODELS, testM365Model } from './m365/proxy'
 import { isZcodeProvider, testZcodeModel, buildZcodeHeaders, ZCODE_MODELS, fetchZcodeModels } from './zcode/proxy'
+import { isKukuProvider, testKukuModel } from './kuku/proxy'
+import { probeKukuNetwork } from './kuku/probe'
 import { listSessions as listM365Sessions, deleteSession as deleteM365Session } from './m365/session'
 import { listConversations as listM365Conversations, whitelistConversation, unwhitelistConversation, getCleanupMode, setCleanupMode, getCleanupConfig, setCleanupConfig, deleteConversationRecord } from './m365/conversation-manager'
 import { autoCleanupProvider } from './m365/auto-cleanup'
@@ -149,6 +151,20 @@ function validateOAuthUrls(oauth?: OAuthDeviceConfig): string | null {
   return null
 }
 
+function validateKukuSettings(
+  type: Provider['type'] | null | undefined,
+  thinkMode: number | null | undefined,
+): string | null {
+  if (
+    type === 'kuku' &&
+    thinkMode != null &&
+    (!Number.isInteger(thinkMode) || thinkMode < 0 || thinkMode > 10)
+  ) {
+    return 'kukuThinkMode 必须是 0 到 10 的整数'
+  }
+  return null
+}
+
 export async function handleStatus(c: Context<AppEnv>) {
   const providers = await getProviders(c.env)
   const proxyKeys = await getProxyKeys(c.env)
@@ -202,6 +218,10 @@ export async function handleCreateProvider(c: Context<AppEnv>) {
   if (!body.id || !body.name || !body.baseUrl) {
     return c.json<ApiResponse>({ success: false, message: 'id、name、baseUrl 为必填项' }, 400)
   }
+  const kukuErr = validateKukuSettings(body.type, body.kukuThinkMode)
+  if (kukuErr) {
+    return c.json<ApiResponse>({ success: false, message: kukuErr }, 400)
+  }
   if (!isSafeHttpUrl(body.baseUrl)) {
     return c.json<ApiResponse>({ success: false, message: 'baseUrl 必须是合法的 http/https 公网地址' }, 400)
   }
@@ -227,6 +247,7 @@ export async function handleCreateProvider(c: Context<AppEnv>) {
     authType: body.authType || 'api-key',
     oauth: body.oauth,
     type: body.type,
+    kukuThinkMode: body.kukuThinkMode,
     visionBridge: body.visionBridge,
     toolBridge: body.toolBridge,
     cnbPool: body.cnbPool,
@@ -259,6 +280,18 @@ export async function handleUpdateProvider(c: Context<AppEnv>) {
   if (!id) return c.json<ApiResponse>({ success: false, message: '缺少 id 参数' }, 400)
   const body = await c.req.json<UpdateProviderRequest>()
 
+  const existing = await getProvider(c.env, id)
+  if (!existing) {
+    return c.json<ApiResponse>({ success: false, message: '提供商不存在' }, 404)
+  }
+  const kukuErr = validateKukuSettings(
+    body.type !== undefined ? body.type : existing.type,
+    body.kukuThinkMode,
+  )
+  if (kukuErr) {
+    return c.json<ApiResponse>({ success: false, message: kukuErr }, 400)
+  }
+
   const updates: Partial<Provider> = {}
   if (body.name !== undefined) updates.name = body.name
   if (body.baseUrl !== undefined) {
@@ -275,6 +308,7 @@ export async function handleUpdateProvider(c: Context<AppEnv>) {
     updates.oauth = body.oauth
   }
   if (body.type !== undefined) updates.type = body.type ?? undefined
+  if (body.kukuThinkMode !== undefined) updates.kukuThinkMode = body.kukuThinkMode ?? undefined
   if (body.visionBridge !== undefined) updates.visionBridge = body.visionBridge ?? undefined
   if (body.toolBridge !== undefined) updates.toolBridge = body.toolBridge ?? undefined
   if (body.cnbPool !== undefined) updates.cnbPool = body.cnbPool ?? undefined
@@ -342,6 +376,10 @@ export async function handleUpsertProvider(c: Context<AppEnv>) {
   )
 
   const existing = await getProvider(c.env, body.id)
+  const kukuErr = validateKukuSettings(body.type ?? existing?.type, body.kukuThinkMode)
+  if (kukuErr) {
+    return c.json<ApiResponse>({ success: false, message: kukuErr }, 400)
+  }
 
   // ===== 不存在 → 创建 =====
   if (!existing) {
@@ -364,6 +402,8 @@ export async function handleUpsertProvider(c: Context<AppEnv>) {
       apiKeys: incomingKeys,
       models: incomingModels,
       enabled: body.enabled !== undefined ? body.enabled : true,
+      type: body.type,
+      kukuThinkMode: body.kukuThinkMode,
       toolBridge: body.toolBridge,
       cnbPool: body.cnbPool,
       cooldown: body.cooldown,
@@ -394,6 +434,8 @@ export async function handleUpsertProvider(c: Context<AppEnv>) {
   }
   if (body.apiType !== undefined) updates.apiType = body.apiType
   if (body.authType !== undefined) updates.authType = body.authType
+  if (body.type !== undefined) updates.type = body.type
+  if (body.kukuThinkMode !== undefined) updates.kukuThinkMode = body.kukuThinkMode
   if (body.geminiBaseUrl !== undefined) {
     if (body.geminiBaseUrl && !isSafeHttpUrl(body.geminiBaseUrl)) {
       return c.json<ApiResponse>({ success: false, message: 'geminiBaseUrl 必须是合法的 http/https 公网地址' }, 400)
@@ -561,6 +603,22 @@ export async function handleTestModel(c: Context<AppEnv>) {
   // ZCode：标准 OpenAI 兼容 API，注入身份头后测试
   if (isZcodeProvider(provider.id)) {
     const result = await testZcodeModel(c.env, provider, modelId)
+    return c.json<ApiResponse>({ success: true, data: result })
+  }
+
+  if (isKukuProvider(provider)) {
+    const probe = await probeKukuNetwork(provider)
+    if (!probe.ok) {
+      return c.json<ApiResponse>({
+        success: true,
+        data: {
+          success: false,
+          statusCode: probe.status ?? 0,
+          message: `Kuku network probe failed at ${probe.stage}: ${probe.message}`,
+        },
+      })
+    }
+    const result = await testKukuModel(provider, modelId)
     return c.json<ApiResponse>({ success: true, data: result })
   }
 

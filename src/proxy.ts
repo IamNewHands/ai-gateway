@@ -30,6 +30,7 @@ import {
 } from './m365/responses-guardrails'
 import { isTraeProvider, proxyTraeChatRequest } from './trae/proxy'
 import { isZcodeProvider, buildZcodeHeaders } from './zcode/proxy'
+import { isKukuProvider, proxyKukuChatRequest } from './kuku/proxy'
 import { writeLog } from './admin'
 import { getPerfSettings } from './perf'
 import { applyThinkingInjection } from './thinking'
@@ -1402,6 +1403,28 @@ export async function forwardProxy(
           },
         })
       }
+      return response
+    }
+
+    if (isKukuProvider(provider)) {
+      if (subPath !== 'chat/completions') {
+        return c.json({
+          error: { message: 'Kuku currently supports only /v1/chat/completions', type: 'invalid_request_error' },
+        }, 400)
+      }
+      const response = await proxyKukuChatRequest(
+        provider,
+        forwardBody as Record<string, unknown>,
+        fetch,
+        c.req.raw.signal,
+      )
+      const logLevel = response.ok ? 'request' : (response.status >= 500 ? 'error' : 'warn')
+      try {
+        c.executionCtx.waitUntil(writeLog(c.env, logLevel,
+          `[${provider.name}] ${model} → ${response.status}`,
+          JSON.stringify({ providerId, subPath, body: summarizeRequestBody(forwardBody) }).substring(0, 4000)
+        ))
+      } catch { /* log failure must not break */ }
       return response
     }
 

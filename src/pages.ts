@@ -96,7 +96,7 @@ function effDdNewHtml(): string {
 // UX8：厂商预设与 OAuth 预置模板——单一数据源。
 // SSR 下拉 option 与客户端 applyProviderPreset / applyOauthPreset* 共用，
 // 注入为页面 script 常量，消除服务端/客户端两套重复预设表。
-const PROVIDER_PRESETS: Record<string, { name: string; id: string; baseUrl: string; apiType: string; authType?: string; oauthPreset?: string; models?: string[]; toolBridge?: boolean }> = {
+const PROVIDER_PRESETS: Record<string, { name: string; id: string; baseUrl: string; apiType: string; authType?: string; oauthPreset?: string; models?: string[]; toolBridge?: boolean; type?: 'kuku'; kukuThinkMode?: number }> = {
   deepseek:     { name: 'DeepSeek',           id: 'deepseek',     baseUrl: 'https://api.deepseek.com',                          apiType: 'openai' },
   openai:       { name: 'OpenAI',             id: 'openai',       baseUrl: 'https://api.openai.com/v1',                         apiType: 'openai' },
   anthropic:    { name: 'Anthropic',          id: 'anthropic',    baseUrl: 'https://api.anthropic.com',                         apiType: 'anthropic' },
@@ -109,6 +109,9 @@ const PROVIDER_PRESETS: Record<string, { name: string; id: string; baseUrl: stri
   siliconflow:  { name: '硅基流动',            id: 'siliconflow',  baseUrl: 'https://api.siliconflow.cn/v1',                     apiType: 'openai' },
   volcengine:   { name: '火山方舟',            id: 'volcengine',   baseUrl: 'https://ark.cn-beijing.volces.com/api/v3',          apiType: 'openai' },
   qianfan:      { name: '百度千帆',            id: 'qianfan',      baseUrl: 'https://qianfan.baidubce.com/v2',                   apiType: 'openai' },
+  kuku:         { name: 'Kuku GenFlow Pro',   id: 'kuku',         baseUrl: 'https://pan.baidu.com',                             apiType: 'openai', type: 'kuku', kukuThinkMode: 3,
+    models: ['auto', 'glm-5.3'],
+  },
   openrouter:   { name: 'OpenRouter',         id: 'openrouter',   baseUrl: 'https://openrouter.ai/api/v1',                      apiType: 'openai' },
   sensenova:    { name: '商汤日日新 (SenseNova)', id: 'sensenova', baseUrl: 'https://token.sensenova.cn/v1',                    apiType: 'openai',
     models: ['sensenova-6.8-flash-lite', 'deepseek-v4-flash', 'deepseek-v4-pro', 'glm-5.2', 'kimi-k3'],
@@ -497,6 +500,7 @@ ${H('管理')}
               </fieldset>
             </div>
             <fieldset class="form-group" id="akeys-fs"><legend id="akey-legend">上游 API Keys</legend><div id="akeys"><div class="fc mb-4 field-row"><input type="password" placeholder="sk-xxx" class="fx1 aki" aria-label="上游 API Key"><button class="icon-btn" onclick="toggleKeyText(this)" title="显示/隐藏 Key"><i class="fas fa-eye" aria-hidden="true"></i></button><label class="tg" title="启用 Key"><input type="checkbox" checked class="ake" aria-label="启用 Key"><span class="sl"></span></label><button class="btn btn-gh btn-xs" onclick="testNewAKey(this)" title="测试 Key"><i class="fas fa-plug" aria-hidden="true"></i><span>测试</span></button><button class="icon-btn" onclick="this.parentElement.remove()" aria-label="移除 Key"><i class="fas fa-times" aria-hidden="true"></i></button></div></div><button class="btn btn-s btn-xs" onclick="addAKeyRow()"><i class="fas fa-plus" aria-hidden="true"></i>添加 Key</button><span id="akey-hint" class="form-helper"></span></fieldset>
+            <div class="fg hd" id="akuku-row"><label for="akuku-think">Kuku 思考模式</label><input type="number" id="akuku-think" min="0" max="10" value="3"><span class="form-helper">仅 Kuku GenFlow Pro 生效，允许 0 到 10。</span></div>
             <fieldset class="form-group" id="amodels-fs"><legend>模型 ID</legend><div id="amodels"><div class="fc mb-4 field-row"><input type="text" placeholder="deepseek-chat" class="fx1 ami" aria-label="模型 ID"><label class="tg" title="启用模型"><input type="checkbox" checked class="ame" aria-label="启用模型"><span class="sl"></span></label><label class="tg" title="对该模型启用思维引导注入（转发前注入固定思维引导 system 提示词）"><input type="checkbox" class="cti" aria-label="启用思维引导注入"><span class="sl"></span></label><label class="tg" title="对该模型启用缓存前缀注入（转发前注入固定缓存前缀以提升缓存命中率）"><input type="checkbox" class="ccp" aria-label="启用缓存前缀注入"><span class="sl"></span></label><script type="text/plain" id="eff-dd-tpl">${effDdNewHtml()}</script><button class="btn btn-gh btn-xs" onclick="testNewMdl(this)" title="测试模型"><i class="fas fa-plug" aria-hidden="true"></i><span>测试</span></button><button class="icon-btn" onclick="this.parentElement.remove()" aria-label="移除模型"><i class="fas fa-times" aria-hidden="true"></i></button></div></div><button class="btn btn-s btn-xs" onclick="addMdlRow()"><i class="fas fa-plus" aria-hidden="true"></i>添加模型</button><span class="form-helper">每个模型行上「启用模型」开关旁的开关依次为「思维引导注入」「缓存前缀注入」，勾选后该模型转发前会被注入对应固定提示词；不勾选则原样转发。「effort」下拉声明该模型的 reasoning_effort 支持档位（多选，仅 WorkBuddy/CodeBuddy 上游生效），留空 = 不启用。</span></fieldset>
             <div class="collapse-section">
               <button class="collapse-btn" onclick="toggleVbCollapse('avb-fs', this)" type="button" aria-expanded="false">
@@ -581,6 +585,7 @@ ${H('管理')}
                 </fieldset>
               </div>
               <fieldset class="form-group ${p.authType==='oauth-device'?'hd':''}" id="keys-fs-${escapePageHtml(p.id)}"><legend id="key-legend-${escapePageHtml(p.id)}">${isTraeProviderUI(p)?'TRAE 账号凭证（每个账号一行 JSON）':(p.id==='cline'?'Cline RefreshTokens（每个账号一行）':'上游 API Keys')}</legend><div id="keys-${escapePageHtml(p.id)}">${p.apiKeys.map((k, ki)=>`<div class="fc mb-3 field-row" data-kidx="${ki}"><input type="password" value="${escapePageHtml(k.key)}" class="fx1" id="k-${escapePageHtml(p.id)}-${ki}" placeholder="API Key" aria-label="API Key"><button class="icon-btn" onclick="toggleKeyText(this)" title="显示/隐藏 Key"><i class="fas fa-eye" aria-hidden="true"></i></button><label class="tg"><input type="checkbox" ${k.enabled?'checked':''} id="ken-${escapePageHtml(p.id)}-${ki}" aria-label="启用 Key"><span class="sl"></span></label><button class="btn btn-gh btn-xs" onclick="testKeyRow('${escapePageJsx(p.id)}',${ki})" title="测试 Key"><i class="fas fa-plug" aria-hidden="true"></i><span>测试</span></button><button class="icon-btn" onclick="rmKeyRow('${escapePageJsx(p.id)}',${ki})" aria-label="移除 Key"><i class="fas fa-times" aria-hidden="true"></i></button></div>`).join('')}</div><div class="fc mt-1 field-row"><input type="password" id="nk-${escapePageHtml(p.id)}" placeholder="${isTraeProviderUI(p)?'新的 TRAE 凭证 JSON（或点「登录账号」自动写入）':(p.id==='cline'?'新的 RefreshToken（一个账号一行）':'新的 API Key')}" class="fx1"><button class="btn btn-s btn-xs" onclick="addKeyRow('${escapePageJsx(p.id)}')"><i class="fas fa-plus" aria-hidden="true"></i>添加</button></div><span id="key-hint-${escapePageHtml(p.id)}" class="form-helper">${isTraeProviderUI(p)?'TRAE SOLO 账号凭证为登录后自动写入的 JSON（也可粘贴 trae 登录脚本落盘的 trae-*.json 内容）。每行一个账号、按剩余积分自动挑选，额度用尽自动冷却轮换；禁用该 Key 即停用账号。':(p.id==='cline'?'Cline 使用 Cline 账号的 refreshToken（长期钥匙）。每个账号一行，额度用完自动切换；留空禁用某个账号。':' ')}</span></fieldset>
+              ${p.type === 'kuku' ? `<div class="fg"><label for="kuku-think-${escapePageHtml(p.id)}">Kuku 思考模式</label><input type="number" id="kuku-think-${escapePageHtml(p.id)}" min="0" max="10" value="${p.kukuThinkMode ?? 3}"><span class="form-helper">允许 0 到 10，默认 3。</span></div>` : ''}
               <fieldset class="form-group" id="models-fs-${escapePageHtml(p.id)}"><legend>模型</legend><div id="ml-${escapePageHtml(p.id)}">${p.models.map((m,mi)=>{ const pol=((p.oauth&&p.oauth.effortPolicy)||{})[m.id]||[]; return `<div class="fc mb-3 field-row" data-idx="${mi}"><input type="text" value="${escapePageHtml(m.id)}" class="fx1" id="mid-${escapePageHtml(p.id)}-${mi}" placeholder="模型 ID"><label class="tg" title="启用模型"><input type="checkbox" ${m.enabled?'checked':''} id="men-${escapePageHtml(p.id)}-${mi}" aria-label="启用模型"><span class="sl"></span></label><label class="tg" title="启用思维引导注入"><input type="checkbox" ${(p.thinkingInject||[]).includes(m.id)?'checked':''} id="mit-${escapePageHtml(p.id)}-${mi}" aria-label="启用思维引导注入"><span class="sl"></span></label><label class="tg" title="启用缓存前缀注入"><input type="checkbox" ${(p.cachePrefixInject||[]).includes(m.id)?'checked':''} id="mcp-${escapePageHtml(p.id)}-${mi}" aria-label="启用缓存前缀注入"><span class="sl"></span></label>${effDdEditHtml(p.id, mi, pol)}<button class="btn btn-gh btn-xs" onclick="testMdl('${escapePageJsx(p.id)}','${escapePageJsx(m.id)}',${mi})" title="测试模型"><i class="fas fa-plug" aria-hidden="true"></i><span>测试</span></button><button class="icon-btn" onclick="rmMdl('${escapePageJsx(p.id)}',${mi})" aria-label="移除模型"><i class="fas fa-times" aria-hidden="true"></i></button></div>`}).join('')}</div><div class="fc mt-1 field-row"><input type="text" id="nmid-${escapePageHtml(p.id)}" placeholder="新的模型 ID" class="fx1"><button class="btn btn-s btn-xs" onclick="addMdl('${escapePageJsx(p.id)}')"><i class="fas fa-plus" aria-hidden="true"></i>添加</button></div><span class="form-helper">每个模型行「启用模型」开关旁的开关依次为「思维引导注入」「缓存前缀注入」，勾选后该模型转发前会被注入对应固定提示词；不勾选则原样转发。「effort」下拉声明该模型的 reasoning_effort 支持档位（多选，仅 WorkBuddy/CodeBuddy 上游生效），留空 = 不启用。</span></fieldset>
               ${isTraeProviderUI(p)?`
               <fieldset class="form-group" id="trae-fs-${escapePageHtml(p.id)}"><legend>TRAE 账号池（SOLO / Work 双通道）</legend><span class="form-helper">多账号双积分反代：自动隔离通用积分 (SOLO) 与 Work 专属积分。正常调用优先消耗通用积分；当遇到 4008 额度耗尽或 429 限流时，系统自动无缝降级到 Work 专有通道。支持一键刷新双通道积分与每日自动签到补积分。</span>
@@ -1390,6 +1395,9 @@ async function createProv(opts) {
     return mid && inject ? mid : null
   }).filter(Boolean)
   const enabled = document.getElementById('aen').checked
+  const preset = PROVIDER_PRESETS[document.getElementById('apreset').value]
+  const providerType = preset && preset.type
+  const kukuThinkMode = providerType === 'kuku' ? numOrUndef((document.getElementById('akuku-think')||{}).value) : undefined
   if (!nm || !id || !url) { toast('请填写名称、ID 和 API 地址', 'error'); return }
   if (authType === 'oauth-device') {
     // 国际版必须带 Global 发起端点，否则保存后发起登录会静默走国内端点
@@ -1415,7 +1423,7 @@ async function createProv(opts) {
     const r = await fetch('/admin/api/providers', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ id, name: nm, baseUrl: url, apiType, authType, oauth: authType === 'oauth-device' ? oauth : undefined, apiKeys: keys, models, enabled, toolBridge: (document.getElementById('atb')||{}).checked === true, allowUnlistedModels: (document.getElementById('aum')||{}).checked === true, thinkingInject, cachePrefixInject, type: vb && vb.primary ? 'vision-bridge' : undefined, visionBridge: vb, geminiBaseUrl: ((document.getElementById('agbu')||{}).value || '').trim() || undefined })
+      body: JSON.stringify({ id, name: nm, baseUrl: url, apiType, authType, oauth: authType === 'oauth-device' ? oauth : undefined, apiKeys: keys, models, enabled, toolBridge: (document.getElementById('atb')||{}).checked === true, allowUnlistedModels: (document.getElementById('aum')||{}).checked === true, thinkingInject, cachePrefixInject, type: providerType || (vb && vb.primary ? 'vision-bridge' : undefined), kukuThinkMode, visionBridge: vb, geminiBaseUrl: ((document.getElementById('agbu')||{}).value || '').trim() || undefined })
     })
     const d = await r.json()
     if (d.success) {
@@ -1650,6 +1658,11 @@ function collectOauthEdit(id) {
 // ===== 厂商预设：单一数据源在文件顶部，页面 script 已注入 PROVIDER_PRESETS =====
 function applyProviderPreset(name) {
   const p = PROVIDER_PRESETS[name]
+  const keyInput = document.querySelector('#akeys .aki')
+  if (keyInput) keyInput.placeholder = 'sk-...'
+  applyClineKeyHint(false)
+  const kukuRow = document.getElementById('akuku-row')
+  if (kukuRow) kukuRow.classList.add('hd')
   if (!p) return
   document.getElementById('anm').value = p.name
   document.getElementById('aid').value = p.id
@@ -1679,6 +1692,17 @@ function applyProviderPreset(name) {
     if (p.models && p.models.length) fillPresetModels(p.models)
   } else {
     applyClineKeyHint(false)
+  }
+  if (kukuRow) kukuRow.classList.toggle('hd', p.type !== 'kuku')
+  const kukuThink = document.getElementById('akuku-think')
+  if (kukuThink && p.type === 'kuku') kukuThink.value = String(p.kukuThinkMode ?? 3)
+  if (p.type === 'kuku') {
+    const legend = document.getElementById('akey-legend')
+    const hint = document.getElementById('akey-hint')
+    if (legend) legend.textContent = '百度账号 Cookie'
+    if (hint) hint.textContent = '填写登录 pan.baidu.com 后的完整 Cookie。首阶段仅启用单账号文本对话。'
+    if (keyInput) keyInput.placeholder = 'BDUSS=...; STOKEN=...'
+    if (p.models && p.models.length) fillPresetModels(p.models)
   }
   const tb = document.getElementById('atb')
   if (tb) tb.checked = !!p.toolBridge
@@ -2819,6 +2843,9 @@ async function save(id) {
     }
   }
   const vb = collectVisionBridgeEdit(id) || null
+  const kukuThinkEl = document.getElementById('kuku-think-' + id)
+  const providerType = kukuThinkEl ? 'kuku' : (vb && vb.primary ? 'vision-bridge' : null)
+  const kukuThinkMode = kukuThinkEl ? numOrUndef(kukuThinkEl.value) : null
   const btn = document.querySelector('#dt-' + id + ' .detail-actions .btn-p')
   adminSubmitting = true
   busyBtn(btn)
@@ -2826,7 +2853,7 @@ async function save(id) {
     const r = await fetch('/admin/api/providers/' + encodeURIComponent(id), {
       method: 'PUT',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ name: nm, baseUrl: url, apiType, authType, oauth: authType === 'oauth-device' ? oauth : undefined, apiKeys: keys, models, enabled, toolBridge: (document.getElementById('atb-' + id)||{}).checked === true, allowUnlistedModels: (document.getElementById('aum-' + id)||{}).checked === true, thinkingInject, cachePrefixInject, cooldown: collectCooldown(id), type: vb && vb.primary ? 'vision-bridge' : null, visionBridge: vb, geminiBaseUrl: ((document.getElementById('gbu-' + id)||{}).value || '').trim() || null, traeEnableRemoteBudget, traeRemoteOnlyModels, traeMaxMessages, traeMaxHistoryChars, traeMaxToolSchemaChars, accountSpread: (document.getElementById('m365-spread-' + id)||{}).checked === true })
+      body: JSON.stringify({ name: nm, baseUrl: url, apiType, authType, oauth: authType === 'oauth-device' ? oauth : undefined, apiKeys: keys, models, enabled, toolBridge: (document.getElementById('atb-' + id)||{}).checked === true, allowUnlistedModels: (document.getElementById('aum-' + id)||{}).checked === true, thinkingInject, cachePrefixInject, cooldown: collectCooldown(id), type: providerType, kukuThinkMode, visionBridge: vb, geminiBaseUrl: ((document.getElementById('gbu-' + id)||{}).value || '').trim() || null, traeEnableRemoteBudget, traeRemoteOnlyModels, traeMaxMessages, traeMaxHistoryChars, traeMaxToolSchemaChars, accountSpread: (document.getElementById('m365-spread-' + id)||{}).checked === true })
     })
     const d = await r.json()
     if (d.success) { toast('已保存', 'success'); reloadAdmin() }

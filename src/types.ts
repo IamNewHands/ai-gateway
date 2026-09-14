@@ -61,7 +61,9 @@ export interface Provider {
    *   （visionBridge.vision）转写为文本，再连同原文本一起转发给主文本模型（visionBridge.primary）。
    *   对不支持图片输入的模型开放图片能力。
    */
-  type?: 'vision-bridge'
+  type?: 'vision-bridge' | 'kuku'
+  /** Kuku GenFlow Pro thinking mode. Defaults to 3. */
+  kukuThinkMode?: number
   /** type === 'vision-bridge' 时的桥配置 */
   visionBridge?: VisionBridgeConfig
   /**
@@ -397,7 +399,8 @@ export interface CreateProviderRequest {
   apiKeys?: Array<{ key: string; enabled: boolean }>
   models?: Array<{ id: string; enabled: boolean }> | string[]
   enabled?: boolean
-  type?: 'vision-bridge'
+  type?: 'vision-bridge' | 'kuku'
+  kukuThinkMode?: number
   visionBridge?: VisionBridgeConfig
   toolBridge?: boolean
   cnbPool?: { min?: number; max?: number; ttlMinutes?: number }
@@ -427,7 +430,8 @@ export interface UpdateProviderRequest {
   models?: Array<{ id: string; enabled: boolean }> | string[]
   enabled?: boolean
   /** 传 null 可清除已设置的 type（如从独立桥恢复为普通提供商） */
-  type?: 'vision-bridge' | null
+  type?: 'vision-bridge' | 'kuku' | null
+  kukuThinkMode?: number | null
   visionBridge?: VisionBridgeConfig | null
   /** 传 null 可清除工具桥开关 */
   toolBridge?: boolean | null
@@ -467,6 +471,8 @@ export interface UpsertProviderRequest {
   apiKeys?: Array<ApiKeyEntry | string>
   models?: Array<Model | string>
   enabled?: boolean
+  type?: 'vision-bridge' | 'kuku'
+  kukuThinkMode?: number
   toolBridge?: boolean
   cnbPool?: { min?: number; max?: number; ttlMinutes?: number }
   cooldown?: CooldownConfig
