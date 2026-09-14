@@ -517,7 +517,9 @@ export async function fetchUserEntUsageDetails(account: TraeAccount): Promise<Tr
     } else {
       ideCredits += rem
     }
-    const rawName = p?.entitlement_base_info?.name || p?.entitlement_base_info?.pack_name || p?.pack_name || p?.pack_type_name || packName || 'unnamed'
+    const idStr = p?.entitlement_base_info?.entitlement_id || p?.entitlement_id || p?.pack_id || ''
+    const fallbackName = limit === 150 ? '每日签到包(150)' : limit === 200 ? '每日签到包(200)' : limit === 500 ? '赠送通用包(500)' : '通用权益包'
+    const rawName = p?.entitlement_base_info?.name || p?.entitlement_base_info?.pack_name || p?.pack_name || p?.pack_type_name || (idStr ? `权益包(${idStr})` : fallbackName)
     packList.push({
       name: rawName,
       limit,
@@ -807,6 +809,10 @@ export async function probeTraeCredits(account: TraeAccount): Promise<TraeCredit
       }
 
       if (!resp.body) continue
+
+      lastHost = host
+      lastStatus = resp.status
+      lastErrInfo = `HTTP ${resp.status}: 上游未下发 Work 配额（账号在官方确无 Work 额度）`
 
       const reader = resp.body.getReader()
       const decoder = new TextDecoder()
