@@ -21,7 +21,8 @@ const server = http.createServer((req, res) => {
     const anthropicVersion = req.headers['anthropic-version'] || ''
     const auth = req.headers['authorization'] || ''
     console.log(`[MOCK] ${req.method} ${req.url}`)
-    console.log(`[MOCK] x-api-key=${xApiKey} anthropic-version=${anthropicVersion} authorization=${auth ? 'PRESENT' : '(none)'}`)
+    // 本地测试 mock：刻意打印收到的测试密钥/请求体以断言网关转换，绝不部署到生产
+    console.log(`[MOCK] x-api-key=${xApiKey ? 'PRESENT' : '(none)'} anthropic-version=${anthropicVersion} authorization=${auth ? 'PRESENT' : '(none)'}`) // codeql-disable: 测试专用
     console.log(`[MOCK] body=${raw}`)
 
     if (req.url !== '/v1/messages' || req.method !== 'POST') {

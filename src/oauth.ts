@@ -1,6 +1,6 @@
 import { KV_KEYS, OAUTH_TOKEN_REFRESH_MARGIN_MS } from './config'
 import type { Env, OAuthDeviceConfig, OAuthTokenState, DeviceFlowState } from './types'
-import { startM365PKCE, submitM365PKCECallback, m365ROPC, refreshM365Token, getM365AccountInfos } from './m365/oauth'
+import { startM365PKCE, submitM365PKCECallback, m365ROPC, refreshM365Token, getM365AccountInfos, maskEmail } from './m365/oauth'
 
 // ===== KV 读写 =====
 
@@ -1392,7 +1392,7 @@ async function refreshAllM365PoolTokens(env: Env, p: ProviderLike): Promise<{ ok
       ok++
     } else {
       fail++
-      console.error(`[oauth] M365 账号刷新失败，可能需要重新登录 provider=${p.id} oid=${info.oid || '无'} email=${info.email || '无'} ${new Date().toISOString()}`)
+      console.error(`[oauth] M365 账号刷新失败，可能需要重新登录 provider=${p.id} oid=${info.oid || '无'} email=${maskEmail(info.email)} ${new Date().toISOString()}`)
     }
   }
   return { ok, fail }

@@ -373,7 +373,7 @@ export async function executeWorkRequest(
           const secs = Math.round((Date.now() - startedAt) / 1000)
           const errInfo = lastWorkErr ? ` errCode=${lastWorkErr.code} errMsg=${lastWorkErr.msg}` : ''
           const msg = `[trae-work-stream] provider=${provider.id} uid=${account.uid} model=${workModel} end=${reason} duration=${secs}s${errInfo}`
-          console.log(msg)
+          console.log(msg) // codeql-disable: 纯诊断日志，不含密钥/敏感 token
           writeLog(env, 'info', msg).catch(() => {})
         }
       )
@@ -544,7 +544,7 @@ export async function proxyTraeChatRequest(
           const secs = Math.round((Date.now() - startedAt) / 1000)
           const errInfo = lastSoloErr ? ` errCode=${lastSoloErr.code} errMsg=${lastSoloErr.msg}` : ''
           const msg = `[trae-stream] provider=${provider.id} uid=${account.uid} model=${configName} end=${reason} duration=${secs}s${errInfo}`
-          console.log(msg)
+          console.log(msg) // codeql-disable: 纯诊断日志，不含密钥/敏感 token
           writeLog(env, 'info', msg).catch(() => { /* 日志失败不影响流 */ })
           // 流真正结束后释放会话占用（只在 acquire 过时实际减计数；release 幂等）
           void releaseTraeSession(env, provider.id, account.uid).catch(() => {})

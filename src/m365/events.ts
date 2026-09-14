@@ -124,12 +124,16 @@ function looksLikeImageURL(v: string): boolean {
   const path = url.pathname.toLowerCase()
   const withQuery = (v.split('#')[0] || '').toLowerCase()
   // 微软系域名（Bing/Designer/Office/SharePoint）生成的图片 URL：扩展名常在 query 里，
-  // 或以 /th、create、image 等路径特征出现，仅靠扩展名/substring 'image' 会漏判
-  if (
-    host.endsWith('bing.com') || host.endsWith('bing.net') ||
-    host.endsWith('windows.net') || host.endsWith('microsoft.com') ||
-    host.endsWith('office.com') || host.endsWith('sharepoint.com')
-  ) {
+  // 或以 /th、create、image 等路径特征出现，仅靠扩展名/substring 'image' 会漏判。
+  // 必须带 '.' 边界，避免伪造域名（如 microsoft.com.evil.com）误判。
+  const isMicrosoftHost =
+    host === 'bing.com' || host.endsWith('.bing.com') ||
+    host === 'bing.net' || host.endsWith('.bing.net') ||
+    host === 'windows.net' || host.endsWith('.windows.net') ||
+    host === 'microsoft.com' || host.endsWith('.microsoft.com') ||
+    host === 'office.com' || host.endsWith('.office.com') ||
+    host === 'sharepoint.com' || host.endsWith('.sharepoint.com')
+  if (isMicrosoftHost) {
     if (
       path.includes('/th') || path.includes('create') || path.includes('image') ||
       url.searchParams.has('id') || url.searchParams.has('pid') ||

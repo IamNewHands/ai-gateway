@@ -251,7 +251,7 @@ async function newCosySession(id: CosyIdentity): Promise<CosySession> {
     ['email', id.email],
   ])
   // 只记长度，绝不打印 identityJSON（含 refresh_token / oauth token）/ tempKey 原文
-  console.log('[cosy:session] identityJSON len=', identityJSON.length)
+  console.log('[cosy:session] identityJSON len=', identityJSON.length) // codeql-disable: 仅长度，不落敏感原文
   console.log('[cosy:session] tempKey len=', tempKey.length)
   const infoBytes = await aesCbcEncrypt(identityJSON, new TextEncoder().encode(tempKey))
   const info = base64Std(infoBytes)

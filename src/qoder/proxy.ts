@@ -587,7 +587,7 @@ export async function fetchQoderModels(
   provider: Provider
 ): Promise<{ ok: boolean; message: string; models?: Array<{ id: string }>; status?: number; debug?: Record<string, unknown> }> {
   const debug: Record<string, unknown> = {}
-  console.log(`[qoder-models] start provider=${provider.id} flowType=${provider.oauth?.flowType}`)
+  console.log(`[qoder-models] start provider=${provider.id} flowType=${provider.oauth?.flowType}`) // codeql-disable: 纯诊断日志，不含敏感 token
   let session: CosySession | null = null
   let sessionRealm: 'cn' | 'global' = 'cn'
   try {

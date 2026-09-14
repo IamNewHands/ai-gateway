@@ -72,7 +72,7 @@ async function readAccounts(env: Env, providerId: string): Promise<PooledAccount
       if (s && s.access_token) {
         const list = [{ ...s, lastUsedAt: Date.now() }]
         await env.KV.put(poolKey(providerId), JSON.stringify(list), { expirationTtl: 86400 * 30 })
-        console.log(`[m365:accpool] provider=${providerId} 从旧单 token 迁移 1 个账号进池 oid=${s.oid || '无'} email=${s.email || '无'}`)
+        console.log(`[m365:accpool] provider=${providerId} 从旧单 token 迁移 1 个账号进池 oid=${s.oid || '无'} email=${maskEmail(s.email)}`)
         return list
       }
     } catch { /* ignore */ }
@@ -238,6 +238,15 @@ function firstNonEmpty(...values: Array<string | undefined>): string {
   return ''
 }
 
+/** 日志脱敏：邮箱只保留 @ 前的 2 字符 + 完整域名，避免完整账号进日志。空值返回 '无'。 */
+export function maskEmail(email?: string): string {
+  if (!email) return '无'
+  const at = email.indexOf('@')
+  if (at <= 0) return email.length > 4 ? email.slice(0, 2) + '***' : email
+  const local = email.slice(0, at)
+  return (local.length > 2 ? local.slice(0, 2) + '***' : local) + email.slice(at)
+}
+
 function m365ClientConfig(cfg: OAuthDeviceConfig): { clientId: string; authority?: string; scope: string; redirectUri: string } {
   return {
     clientId: cfg.clientId || M365_OAUTH.clientId,
@@ -255,11 +264,25 @@ function tokenEndpointUrl(authority: string | undefined): string {
   return M365_OAUTH.tokenUrl
 }
 
+/** 从 alphabet 生成 n 个无偏随机字符（拒绝采样，避免取模偏倚：66 不整除 256）。 */
+function randomAlphabet(n: number, alphabet: string): string {
+  const max = alphabet.length
+  // 仅接受落在 [0, bound) 的字节，使 byte % max 均匀无偏
+  const bound = 256 - (256 % max)
+  const bytes = new Uint8Array(256)
+  let s = ''
+  while (s.length < n) {
+    crypto.getRandomValues(bytes)
+    for (let i = 0; i < bytes.length && s.length < n; i++) {
+      if (bytes[i] < bound) s += alphabet[bytes[i] % max]
+    }
+  }
+  return s
+}
+
 async function makePKCE(): Promise<{ verifier: string; challenge: string }> {
   const alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~'
-  const raw = crypto.getRandomValues(new Uint8Array(64))
-  let verifier = ''
-  for (let i = 0; i < 64; i++) verifier += alphabet[raw[i] % alphabet.length]
+  const verifier = randomAlphabet(64, alphabet)
   const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(verifier))
   const bytes = new Uint8Array(digest)
   let bin = ''

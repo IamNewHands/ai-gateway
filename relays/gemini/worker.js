@@ -63,8 +63,10 @@ export default {
     try {
       resp = await fetch(upstreamReq)
     } catch (e) {
+      // 只回传不敏感的错误消息，避免把内部堆栈/路径暴露给客户端
+      const detail = e instanceof Error ? e.message : 'relay upstream fetch failed'
       return new Response(
-        JSON.stringify({ error: { code: 502, message: 'relay upstream fetch failed', detail: String(e) } }),
+        JSON.stringify({ error: { code: 502, message: 'relay upstream fetch failed', detail } }),
         { status: 502, headers: { 'content-type': 'application/json' } }
       )
     }
@@ -97,7 +99,7 @@ async function handleRelayInfo() {
     info.colo = parse('colo')
     info.warp = parse('warp')
   } catch (e) {
-    info.error = String(e)
+    info.error = e instanceof Error ? e.message : String(e)
   }
   return new Response(JSON.stringify(info, null, 2), {
     status: 200,

@@ -210,7 +210,7 @@ export async function handleTraeLoginCallback(c: Context<AppEnv>) {
       nickname = ui.nickname || nickname
       enterpriseId = ui.enterpriseId || enterpriseId
     } catch (e) {
-      console.warn(`[trae-login] GetUserInfo failed (fallback to callback userInfo): ${(e as Error).message}`)
+      console.warn(`[trae-login] GetUserInfo failed (fallback to callback userInfo): ${(e as Error).message}`) // codeql-disable: 错误消息诊断日志
     }
     if (!uid) {
       return c.json<ApiResponse>({ success: false, message: '未能获取 uid，请检查 token 是否有效' }, 400)

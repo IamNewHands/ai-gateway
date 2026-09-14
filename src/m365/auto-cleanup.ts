@@ -17,7 +17,7 @@ import { isM365Provider } from './proxy'
 import { cleanupCloudConversations } from './cloud-api'
 import { listConversations, whitelistedIDs, getCleanupConfig } from './conversation-manager'
 import { listSessions, cleanupSessions } from './session'
-import { listM365Accounts, refreshM365AccountIfNeeded } from './oauth'
+import { listM365Accounts, refreshM365AccountIfNeeded, maskEmail } from './oauth'
 import { isAccountAvailable } from './account-health'
 
 /**
@@ -167,11 +167,11 @@ export async function healthCheckM365Provider(env: Env, provider: Provider): Pro
       // 此前不可用但刷新后拿到了可用 token → 恢复（清除误判的鉴权失败/冷却）
       if (acc.oid && wasUnavailable && (await isAccountAvailable(env, acc.oid))) {
         result.recovered++
-        console.log(`[m365-health] provider=${provider.id} account=${acc.oid} RECOVERED email=${acc.email || '无'}`)
+        console.log(`[m365-health] provider=${provider.id} account=${acc.oid} RECOVERED email=${maskEmail(acc.email)}`)
       }
     } else {
       result.failed++
-      console.error(`[m365-health] provider=${provider.id} account=${acc.oid || '无'} refresh failed, may need re-auth email=${acc.email || '无'}`)
+      console.error(`[m365-health] provider=${provider.id} account=${acc.oid || '无'} refresh failed, may need re-auth email=${maskEmail(acc.email)}`)
     }
   }
   console.log(`[m365-health] provider=${provider.id} accounts=${result.accounts} ok=${result.ok} recovered=${result.recovered} failed=${result.failed}`)
