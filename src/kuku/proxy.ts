@@ -51,6 +51,15 @@ export function isKukuProvider(provider: Pick<Provider, 'type'>): boolean {
   return provider.type === 'kuku'
 }
 
+/**
+ * 是否是一个需要走 Kuku 专用适配器处理的请求。
+ * 同时接受 providerId（id 固定为 kuku）与 kuku 域名，因此即便提供商尚未持久化，
+ * 在「测试 API Key」流程（前端新增表单直接点测试）中也能正确路由，避免落到通用 GET /models 404。
+ */
+export function isKukuRequest(providerId: unknown, baseUrl: unknown): boolean {
+  return providerId === 'kuku' || (typeof baseUrl === 'string' && baseUrl.includes('kuku.baidu.com'))
+}
+
 async function createSession(
   provider: Provider,
   body: ChatBody,

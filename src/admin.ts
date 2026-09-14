@@ -39,7 +39,7 @@ import { isOAuthPoolProvider, seedOauthPoolFromSingle, listOauthPoolStatus, remo
 import { seedQoderPoolFromSingle, listQoderPoolStatus, removeQoderAccount, readQoderPool } from './qoder/pool'
 import { isM365Provider, M365_MODELS, testM365Model } from './m365/proxy'
 import { isZcodeProvider, testZcodeModel, buildZcodeHeaders, ZCODE_MODELS, fetchZcodeModels } from './zcode/proxy'
-import { isKukuProvider, testKukuModel } from './kuku/proxy'
+import { isKukuProvider, isKukuRequest, testKukuModel } from './kuku/proxy'
 import { probeKukuNetwork } from './kuku/probe'
 import { listSessions as listM365Sessions, deleteSession as deleteM365Session } from './m365/session'
 import { listConversations as listM365Conversations, whitelistConversation, unwhitelistConversation, getCleanupMode, setCleanupMode, getCleanupConfig, setCleanupConfig, deleteConversationRecord } from './m365/conversation-manager'
@@ -712,23 +712,21 @@ export async function handleTestKeyNew(c: Context<AppEnv>) {
 
   // Kuku uses a browser Cookie credential and has no OpenAI-compatible /models endpoint.
   // Validate the selected credential through userreport without logging its contents.
-  if (providerId) {
-    const storedProvider = await getProvider(c.env, providerId)
-    if (storedProvider && isKukuProvider(storedProvider)) {
-      const probe = await probeKukuNetwork({
-        ...storedProvider,
-        baseUrl: 'https://kuku.baidu.com',
-        apiKeys: [{ key: apiKey, enabled: true }],
-      })
-      return c.json<ApiResponse>({
-        success: true,
-        data: {
-          success: probe.ok,
-          statusCode: probe.status ?? (probe.ok ? 200 : 0),
-          message: probe.message,
-        },
-      })
-    }
+  // 按 providerId / kuku 域名判定的 isKukuRequest 不依赖已持久化的提供商，
+  // 保证在「新增表单直接点测试」的未保存场景也能走 Kuku 适配器，而不是落到通用 GET /models 404。
+  if (isKukuRequest(providerId, url)) {
+    const probe = await probeKukuNetwork({
+      baseUrl: url,
+      apiKeys: [{ key: apiKey, enabled: true }],
+    } as Provider)
+    return c.json<ApiResponse>({
+      success: true,
+      data: {
+        success: probe.ok,
+        statusCode: probe.status ?? (probe.ok ? 200 : 0),
+        message: probe.message,
+      },
+    })
   }
 
   // CNB：CSRF 凭证连通性测试（免 Key）
@@ -883,16 +881,13 @@ export async function handleTestModelNew(c: Context<AppEnv>) {
   // Kuku uses a private Cookie-authenticated workflow. Its public host does not
   // expose OpenAI-compatible /models or /chat/completions endpoints, so model
   // testing must execute the provider adapter's minimal real chat request.
-  if (providerId) {
-    const storedProvider = await getProvider(c.env, providerId)
-    if (storedProvider && isKukuProvider(storedProvider)) {
-      const result = await testKukuModel({
-        ...storedProvider,
-        baseUrl: 'https://kuku.baidu.com',
-        apiKeys: [{ key: apiKey, enabled: true }],
-      }, model)
-      return c.json<ApiResponse>({ success: true, data: result })
-    }
+  // 同样按 isKukuRequest 判定，未持久化提供商也能测。
+  if (isKukuRequest(providerId, url)) {
+    const result = await testKukuModel({
+      baseUrl: url,
+      apiKeys: [{ key: apiKey, enabled: true }],
+    } as Provider, model)
+    return c.json<ApiResponse>({ success: true, data: result })
   }
 
   if (providerId && isOpenCodeProvider(providerId)) {
