@@ -109,7 +109,7 @@ const PROVIDER_PRESETS: Record<string, { name: string; id: string; baseUrl: stri
   siliconflow:  { name: '硅基流动',            id: 'siliconflow',  baseUrl: 'https://api.siliconflow.cn/v1',                     apiType: 'openai' },
   volcengine:   { name: '火山方舟',            id: 'volcengine',   baseUrl: 'https://ark.cn-beijing.volces.com/api/v3',          apiType: 'openai' },
   qianfan:      { name: '百度千帆',            id: 'qianfan',      baseUrl: 'https://qianfan.baidubce.com/v2',                   apiType: 'openai' },
-  kuku:         { name: 'Kuku GenFlow Pro',   id: 'kuku',         baseUrl: 'https://pan.baidu.com',                             apiType: 'openai', type: 'kuku', kukuThinkMode: 3,
+  kuku:         { name: 'Kuku GenFlow Pro',   id: 'kuku',         baseUrl: 'https://kuku.baidu.com',                            apiType: 'openai', type: 'kuku', kukuThinkMode: 3,
     models: ['auto', 'glm-5.3'],
   },
   openrouter:   { name: 'OpenRouter',         id: 'openrouter',   baseUrl: 'https://openrouter.ai/api/v1',                      apiType: 'openai' },
@@ -1700,7 +1700,7 @@ function applyProviderPreset(name) {
     const legend = document.getElementById('akey-legend')
     const hint = document.getElementById('akey-hint')
     if (legend) legend.textContent = '百度账号 Cookie'
-    if (hint) hint.textContent = '填写登录 pan.baidu.com 后的完整 Cookie。首阶段仅启用单账号文本对话。'
+    if (hint) hint.textContent = '填写登录 kuku.baidu.com 后导出的完整 Cookie，或 kuku_cookies.json 内容。首阶段仅启用单账号文本对话。'
     if (keyInput) keyInput.placeholder = 'BDUSS=...; STOKEN=...'
     if (p.models && p.models.length) fillPresetModels(p.models)
   }

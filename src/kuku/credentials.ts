@@ -10,12 +10,47 @@ export interface KukuCredentials {
 
 export type KukuFetch = typeof fetch
 
+interface ExportedCookie {
+  name?: unknown
+  value?: unknown
+}
+
 const USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36'
+
+export function normalizeKukuCookie(raw: string): string {
+  const credential = raw.trim()
+  if (!credential) throw new Error('Kuku provider has no enabled Cookie credential')
+
+  if (!credential.startsWith('{') && !credential.startsWith('[')) return credential
+
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(credential)
+  } catch {
+    return credential
+  }
+
+  const cookies = Array.isArray(parsed)
+    ? parsed
+    : parsed && typeof parsed === 'object' && Array.isArray((parsed as { cookies?: unknown }).cookies)
+      ? (parsed as { cookies: unknown[] }).cookies
+      : []
+  const parts = cookies.flatMap((entry) => {
+    if (!entry || typeof entry !== 'object') return []
+    const { name, value } = entry as ExportedCookie
+    if (typeof name !== 'string' || typeof value !== 'string' || !name.trim() || !value.trim()) return []
+    return [`${name.trim()}=${value.trim()}`]
+  })
+  if (parts.length === 0) {
+    throw new Error('Kuku credential JSON contains no valid cookies')
+  }
+  return parts.join('; ')
+}
 
 export function getKukuCookie(provider: Provider): string {
   const cookie = provider.apiKeys.find((entry) => entry.enabled && entry.key.trim())?.key.trim()
   if (!cookie) throw new Error('Kuku provider has no enabled Cookie credential')
-  return cookie
+  return normalizeKukuCookie(cookie)
 }
 
 export function buildKukuHeaders(cookie: string, sse = false): Headers {

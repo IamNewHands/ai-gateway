@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from 'vitest'
 import type { Provider } from '../types'
-import { buildKukuQuery, getKukuCookie, refreshKukuCredentials } from './credentials'
+import { buildKukuQuery, getKukuCookie, normalizeKukuCookie, refreshKukuCredentials } from './credentials'
 import { probeKukuNetwork } from './probe'
 
 function provider(cookie = 'BDUSS=secret; STOKEN=value'): Provider {
@@ -22,6 +22,34 @@ describe('Kuku credentials', () => {
     const item = provider()
     item.apiKeys.unshift({ key: 'disabled=value', enabled: false })
     expect(getKukuCookie(item)).toBe('BDUSS=secret; STOKEN=value')
+  })
+
+  it('keeps a raw Cookie string unchanged', () => {
+    expect(normalizeKukuCookie('BDUSS=secret; STOKEN=value')).toBe('BDUSS=secret; STOKEN=value')
+  })
+
+  it('converts a kuku_cookies.json object to a Cookie header', () => {
+    const exported = JSON.stringify({
+      cookies: [
+        { name: 'BDUSS', value: 'secret', domain: '.baidu.com' },
+        { name: 'STOKEN', value: 'value' },
+        { name: '', value: 'ignored' },
+      ],
+    })
+    expect(normalizeKukuCookie(exported)).toBe('BDUSS=secret; STOKEN=value')
+  })
+
+  it('converts a direct exported cookie array', () => {
+    const exported = JSON.stringify([
+      { name: 'BDUSS', value: 'secret' },
+      { name: 'STOKEN', value: 'value' },
+    ])
+    expect(normalizeKukuCookie(exported)).toBe('BDUSS=secret; STOKEN=value')
+  })
+
+  it('rejects parsed JSON without valid cookies', () => {
+    expect(() => normalizeKukuCookie('{"cookies":[]}')).toThrow('contains no valid cookies')
+    expect(() => normalizeKukuCookie('[]')).toThrow('contains no valid cookies')
   })
 
   it('encodes derived credentials in the query string', () => {

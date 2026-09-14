@@ -710,6 +710,27 @@ export async function handleTestKeyNew(c: Context<AppEnv>) {
     })
   }
 
+  // Kuku uses a browser Cookie credential and has no OpenAI-compatible /models endpoint.
+  // Validate the selected credential through userreport without logging its contents.
+  if (providerId) {
+    const storedProvider = await getProvider(c.env, providerId)
+    if (storedProvider && isKukuProvider(storedProvider)) {
+      const probe = await probeKukuNetwork({
+        ...storedProvider,
+        baseUrl: 'https://kuku.baidu.com',
+        apiKeys: [{ key: apiKey, enabled: true }],
+      })
+      return c.json<ApiResponse>({
+        success: true,
+        data: {
+          success: probe.ok,
+          statusCode: probe.status ?? (probe.ok ? 200 : 0),
+          message: probe.message,
+        },
+      })
+    }
+  }
+
   // CNB：CSRF 凭证连通性测试（免 Key）
   if (cnbProvider) {
     const result = await testCnbConnection(c.env, cnbProvider)
