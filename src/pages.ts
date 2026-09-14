@@ -73,16 +73,49 @@ const isTraeProviderUI = (p: { id?: string; baseUrl?: string }) =>
 const isSensenovaProviderUI = (p: { id?: string; baseUrl?: string }) =>
   p.id === 'sensenova' || (typeof p.baseUrl === 'string' && p.baseUrl.includes('token.sensenova.cn'))
 
+/** 是否 CNB 提供商（id 固定或用 cnb.cool 域，与 src/cnb/proxy.ts isCnbProvider 对齐）。仅 CNB 需要工具桥。 */
+const isCnbProviderUI = (p: { id?: string; baseUrl?: string }) =>
+  p.id === 'cnb' || (typeof p.baseUrl === 'string' && p.baseUrl.includes('cnb.cool'))
+
+/**
+ * 是否 WorkBuddy/CodeBuddy 提供商（browser 登录流，或 id 以 workbuddy 开头，
+ * 与 src/proxy.ts isWorkbuddyProvider 对齐）。
+ * 仅这类上游消费 oauth.effortPolicy（reasoning_effort 档位声明，见 applyWorkbuddyReasoningEffort），
+ * 其余提供商的模型行「effort」下拉不生效，故不展示。
+ */
+const isWorkbuddyProviderUI = (p: { id?: string; authType?: string; oauth?: { flowType?: string } }) =>
+  Boolean((p.authType === 'oauth-device' && p.oauth?.flowType === 'browser') ||
+    (typeof p.id === 'string' && p.id.startsWith('workbuddy')))
+
+/** OAuth 登录流程类型（未配置 oauth 时为空串） */
+const oauthFlowUI = (p: { oauth?: { flowType?: string } }) => (p.oauth && p.oauth.flowType) || ''
+
+/**
+ * 该提供商的 OAuth 是否使用 Global 域（海外账户）配置。
+ * 仅 browser（WorkBuddy）与 qoder（QoderWork）两条流程读取 globalBaseUrl / globalModelsUrl /
+ * globalOrigin / globalDeviceCodeUrl / globalDeviceTokenUrl / globalRefreshTokenUrl
+ * （见 src/oauth.ts browserCodeUrl/browserTokenUrl/browserRefreshUrl 与 qoder 分支；src/proxy.ts 域路由）。
+ */
+const usesGlobalRealmUI = (p: { oauth?: { flowType?: string } }) => {
+  const flow = oauthFlowUI(p)
+  return flow === 'browser' || flow === 'qoder'
+}
+
+/** Client Secret 唯一消费方是 Gemini OAuth（src/oauth.ts geminiClientCreds），其余流程不读取。 */
+const usesClientSecretUI = (p: { oauth?: { flowType?: string } }) => oauthFlowUI(p) === 'gemini'
+
 /** reasoning_effort 全部合法档位（与 src/workbuddy-upstream.ts EFFORT_RANK 对齐） */
 const EFFORT_LEVELS = ['off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'] as const
 
-/** 模型行内「reasoning_effort 支持档位」多选下拉（编辑表单 SSR 模型行用；pol = 该模型已保存档位） */
-function effDdEditHtml(pid: string, mi: number, pol: readonly string[]): string {
+/** 模型行内「reasoning_effort 支持档位」多选下拉（编辑表单 SSR 模型行用；pol = 该模型已保存档位）
+ *  hidden=true 时仅加 hd 类隐藏：仍保留在 DOM 中，collectEffortPolicyEdit 可继续读到已存档位，
+ *  避免「非 WorkBuddy 提供商保存后 effortPolicy 被静默清空」。 */
+function effDdEditHtml(pid: string, mi: number, pol: readonly string[], hidden = false): string {
   const sum = pol.length ? pol.join(' + ') : 'effort 不启用'
   const boxes = EFFORT_LEVELS.map((lv) =>
     `<label class="eff-item"><input type="checkbox" class="eff-cb" value="${lv}"${pol.includes(lv) ? ' checked' : ''} aria-label="${lv}">${lv}</label>`
   ).join('')
-  return `<details class="eff-dd" title="reasoning_effort 支持档位（多选；仅 WorkBuddy/CodeBuddy 上游生效）：请求档位在支持列表内透传，不支持则自动降级为 ≤请求档位的最高支持档"><summary class="eff-sum" id="effs-${escapePageHtml(pid)}-${mi}">${escapePageHtml(sum)}</summary><div class="eff-pop" id="eff-${escapePageHtml(pid)}-${mi}">${boxes}</div></details>`
+  return `<details class="eff-dd${hidden ? ' hd' : ''}" title="reasoning_effort 支持档位（多选；仅 WorkBuddy/CodeBuddy 上游生效）：请求档位在支持列表内透传，不支持则自动降级为 ≤请求档位的最高支持档"><summary class="eff-sum" id="effs-${escapePageHtml(pid)}-${mi}">${escapePageHtml(sum)}</summary><div class="eff-pop" id="eff-${escapePageHtml(pid)}-${mi}">${boxes}</div></details>`
 }
 
 /** 新建表单的 effort 下拉模板（注入 #eff-dd-tpl，浏览器 JS 克隆进每条模型行） */
@@ -471,29 +504,31 @@ ${H('管理')}
             <div class="fg"><label for="aat">认证方式</label><select id="aat" class="select-sm" onchange="toggleAuthType()"><option value="api-key">API Key</option><option value="oauth-device">OAuth 设备码登录</option></select></div>
             <div id="oauth-new" class="hd form-group">
               <fieldset class="form-group"><legend>OAuth 配置</legend>
-                <div class="fg"><label>登录流程类型</label><select id="ao8" class="select-sm"><option value="device">设备码（RFC 8628）</option><option value="browser">浏览器登录（WorkBuddy）</option><option value="qoder">Qoder 设备授权（QoderWork）</option><option value="gemini">Gemini 授权码（Gemini CLI）</option><option value="m365-pkce">M365 授权码（PKCE）</option><option value="m365-ropc">M365 账号密码（ROPC）</option></select></div>
+                <div class="fg"><label>登录流程类型</label><select id="ao8" class="select-sm" onchange="syncNewScopedFields()"><option value="device">设备码（RFC 8628）</option><option value="browser">浏览器登录（WorkBuddy）</option><option value="qoder">Qoder 设备授权（QoderWork）</option><option value="gemini">Gemini 授权码（Gemini CLI）</option><option value="m365-pkce">M365 授权码（PKCE）</option><option value="m365-ropc">M365 账号密码（ROPC）</option></select></div>
                 <div class="fg"><label>预置模板</label><select class="select-sm" onchange="applyOauthPreset(this.value)"><option value="">— 选择 —</option>${Object.entries(OAUTH_PRESETS).map(([k, pre]) => `<option value="${k}">${escapePageHtml(pre.label)}</option>`).join('')}</select><span class="form-helper">选好模板点「创建并发起连接」即可，端点等高级参数已由模板填充。</span></div>
                 <div class="collapse-section">
                   <button class="collapse-btn" onclick="toggleAdvOauth('ao-adv-fs', this)" type="button" aria-expanded="false"><i class="fas fa-chevron-right collapse-icon" aria-hidden="true"></i> 高级 OAuth 配置（端点 / 凭据 / Global 域，模板已填好，一般无需修改）</button>
                   <div id="ao-adv-fs" class="hd">
-                    <div class="fg"><label>登录域（browser 模式）</label><select id="ao15" class="select-sm" onchange="syncGlobalOauthNew()"><option value="cn">国内版（codebuddy.cn）</option><option value="global">国际版（workbuddy.ai）</option></select><span class="form-helper">国际版账号必须选「国际版」，登录链接与轮询将走 www.workbuddy.ai。</span></div>
+                    <div class="fg hd" id="ao15-row"><label>登录域（browser / qoder 模式）</label><select id="ao15" class="select-sm" onchange="syncGlobalOauthNew()"><option value="cn">国内版（codebuddy.cn）</option><option value="global">国际版（workbuddy.ai）</option></select><span class="form-helper">国际版账号必须选「国际版」，登录链接与轮询将走 www.workbuddy.ai。</span></div>
                     <div class="fg"><label>发起端点 (deviceCodeUrl)</label><input type="url" id="ao1" placeholder="https://.../auth/device/code"></div>
                     <div class="fg"><label>轮询端点 (deviceTokenUrl)</label><input type="url" id="ao2" placeholder="https://.../auth/device/token"></div>
                     <div class="fg"><label>Token 刷新端点 (refreshTokenUrl)</label><input type="url" id="ao3" placeholder="https://.../auth/oauth_token/refresh"></div>
                     <div class="fg"><label>Client ID</label><input type="text" id="ao4" placeholder="OAuth client_id（gemini 模式可留空走环境变量）"></div>
-                    <div class="fg"><label>Client Secret（可选）</label><input type="text" id="ao14" placeholder="OAuth client_secret（未配置环境变量时粘贴官方凭据）"></div>
+                    <div class="fg hd" id="ao14-row"><label>Client Secret（可选）</label><input type="text" id="ao14" placeholder="OAuth client_secret（未配置环境变量时粘贴官方凭据）"><span class="form-helper">仅「Gemini 授权码」流程使用；其余流程用不到 client_secret。</span></div>
                     <div class="fg"><label>Scope（可选）</label><input type="text" id="ao5" placeholder="如 user"></div>
                     <div class="fg"><label>Token 注入头（默认 x-api-key）</label><input type="text" id="ao6" placeholder="x-api-key"></div>
                     <div class="fg"><label>Token 注入前缀（可选，如 Bearer ）</label><input type="text" id="ao9" placeholder="如 Bearer （含尾空格）"></div>
                     <div class="fg"><label>额外请求头（JSON，可选）</label><textarea id="ao7" rows="3" placeholder='{"x-app-name":"my-app","x-app-version":"1.0.0"}'></textarea></div>
                     <div class="fg"><label>模型列表 URL（可选）</label><input type="url" id="ao10" placeholder="留空 = 用 baseUrl/models（OpenAI 标准）"><span class="form-helper">登录后从此地址动态拉取可用模型；WorkBuddy 等自定义 API 需填写。</span></div>
-                    <div class="fg"><label>Global 域配置（海外账户，可选）</label><span class="form-helper">Token 为 workbuddy.ai 域时使用以下端点，留空则不区分域。WorkBuddy 预设会自动填充。</span></div>
+                    <div id="ao-global-rows" class="hd">
+                    <div class="fg"><label>Global 域配置（海外账户，可选）</label><span class="form-helper">仅「浏览器登录（WorkBuddy）」与「Qoder 设备授权」两条流程使用：Token 为海外域时按以下端点路由，留空则不区分域。WorkBuddy 预设会自动填充。</span></div>
                     <div class="fg"><label>Global 域 baseUrl</label><input type="url" id="ao11" placeholder="https://www.workbuddy.ai/v2"></div>
                     <div class="fg"><label>Global 域模型 URL</label><input type="url" id="ao12" placeholder="https://www.workbuddy.ai/console/enterprises/personal/models"></div>
                     <div class="fg"><label>Global 域 Origin</label><input type="url" id="ao13" placeholder="https://www.workbuddy.ai"></div>
                     <div class="fg"><label>Global 域发起端点</label><input type="url" id="ao16" placeholder="https://www.workbuddy.ai/v2/plugin/auth/state?platform=CLI"><span class="form-helper">登录域选「国际版」时使用，留空回退国内端点。</span></div>
                     <div class="fg"><label>Global 域轮询端点</label><input type="url" id="ao17" placeholder="https://www.workbuddy.ai/v2/plugin/auth/token"></div>
                     <div class="fg"><label>Global 域刷新端点</label><input type="url" id="ao18" placeholder="https://www.workbuddy.ai/v2/plugin/auth/token/refresh"></div>
+                    </div>
                   </div>
                 </div>
                 <div class="fc mt-1 field-row"><button class="btn btn-p" onclick="createProv({afterCreate:function(id){location.href='/admin?connect='+encodeURIComponent(id)}})"><i class="fas fa-plug" aria-hidden="true"></i>创建并发起连接</button><span class="form-helper">先创建提供商，保存后自动弹出 OAuth 登录链接；登录成功会自动拉取模型。</span></div>
@@ -502,7 +537,7 @@ ${H('管理')}
             <fieldset class="form-group" id="akeys-fs"><legend id="akey-legend">上游 API Keys</legend><div id="akeys"><div class="fc mb-4 field-row"><input type="password" placeholder="sk-xxx" class="fx1 aki" aria-label="上游 API Key"><button class="icon-btn" onclick="toggleKeyText(this)" title="显示/隐藏 Key"><i class="fas fa-eye" aria-hidden="true"></i></button><label class="tg" title="启用 Key"><input type="checkbox" checked class="ake" aria-label="启用 Key"><span class="sl"></span></label><button class="btn btn-gh btn-xs" onclick="testNewAKey(this)" title="测试 Key"><i class="fas fa-plug" aria-hidden="true"></i><span>测试</span></button><button class="icon-btn" onclick="this.parentElement.remove()" aria-label="移除 Key"><i class="fas fa-times" aria-hidden="true"></i></button></div></div><button class="btn btn-s btn-xs" onclick="addAKeyRow()"><i class="fas fa-plus" aria-hidden="true"></i>添加 Key</button><span id="akey-hint" class="form-helper"></span></fieldset>
             <div class="fg hd" id="akuku-row"><label for="akuku-think">Kuku 思考模式</label><input type="number" id="akuku-think" min="0" max="10" value="3"><span class="form-helper">仅 Kuku GenFlow Pro 生效，允许 0 到 10。</span></div>
             <div class="fg hd" id="akuku-qr"><button class="btn btn-p btn-sm" onclick="kukuQrLogin()" type="button"><i class="fas fa-qrcode" aria-hidden="true"></i> 扫码登录自动写 Cookie</button><span class="form-helper">用手机百度 App 扫下方二维码（App 需已登录目标百度账号），后台自动写入 BDUSS Cookie，无需手工粘贴。</span></div>
-            <fieldset class="form-group" id="amodels-fs"><legend>模型 ID</legend><div id="amodels"><div class="fc mb-4 field-row"><input type="text" placeholder="deepseek-chat" class="fx1 ami" aria-label="模型 ID"><label class="tg" title="启用模型"><input type="checkbox" checked class="ame" aria-label="启用模型"><span class="sl"></span></label><label class="tg" title="对该模型启用思维引导注入（转发前注入固定思维引导 system 提示词）"><input type="checkbox" class="cti" aria-label="启用思维引导注入"><span class="sl"></span></label><label class="tg" title="对该模型启用缓存前缀注入（转发前注入固定缓存前缀以提升缓存命中率）"><input type="checkbox" class="ccp" aria-label="启用缓存前缀注入"><span class="sl"></span></label><script type="text/plain" id="eff-dd-tpl">${effDdNewHtml()}</script><button class="btn btn-gh btn-xs" onclick="testNewMdl(this)" title="测试模型"><i class="fas fa-plug" aria-hidden="true"></i><span>测试</span></button><button class="icon-btn" onclick="this.parentElement.remove()" aria-label="移除模型"><i class="fas fa-times" aria-hidden="true"></i></button></div></div><button class="btn btn-s btn-xs" onclick="addMdlRow()"><i class="fas fa-plus" aria-hidden="true"></i>添加模型</button><span class="form-helper">每个模型行上「启用模型」开关旁的开关依次为「思维引导注入」「缓存前缀注入」，勾选后该模型转发前会被注入对应固定提示词；不勾选则原样转发。「effort」下拉声明该模型的 reasoning_effort 支持档位（多选，仅 WorkBuddy/CodeBuddy 上游生效），留空 = 不启用。</span></fieldset>
+            <fieldset class="form-group" id="amodels-fs"><legend>模型 ID</legend><div id="amodels"><div class="fc mb-4 field-row"><input type="text" placeholder="deepseek-chat" class="fx1 ami" aria-label="模型 ID"><label class="tg" title="启用模型"><input type="checkbox" checked class="ame" aria-label="启用模型"><span class="sl"></span></label><label class="tg" title="对该模型启用思维引导注入（转发前注入固定思维引导 system 提示词）"><input type="checkbox" class="cti" aria-label="启用思维引导注入"><span class="sl"></span></label><label class="tg" title="对该模型启用缓存前缀注入（转发前注入固定缓存前缀以提升缓存命中率）"><input type="checkbox" class="ccp" aria-label="启用缓存前缀注入"><span class="sl"></span></label><script type="text/plain" id="eff-dd-tpl">${effDdNewHtml()}</script><button class="btn btn-gh btn-xs" onclick="testNewMdl(this)" title="测试模型"><i class="fas fa-plug" aria-hidden="true"></i><span>测试</span></button><button class="icon-btn" onclick="this.parentElement.remove()" aria-label="移除模型"><i class="fas fa-times" aria-hidden="true"></i></button></div></div><button class="btn btn-s btn-xs" onclick="addMdlRow()"><i class="fas fa-plus" aria-hidden="true"></i>添加模型</button><span class="form-helper">每个模型行上「启用模型」开关旁的开关依次为「思维引导注入」「缓存前缀注入」，勾选后该模型转发前会被注入对应固定提示词；不勾选则原样转发。「effort」下拉声明该模型的 reasoning_effort 支持档位（多选），仅对 WorkBuddy / CodeBuddy 提供商显示——其余上游不消费该配置。</span></fieldset>
             <div class="collapse-section">
               <button class="collapse-btn" onclick="toggleVbCollapse('avb-fs', this)" type="button" aria-expanded="false">
                 <i class="fas fa-chevron-right collapse-icon" aria-hidden="true"></i> 识图模型配置（可选）
@@ -513,8 +548,8 @@ ${H('管理')}
                 <div class="fg"><label>视觉转写失败策略</label><select id="avb-fail" class="select-sm"><option value="error">error（返回错误）</option><option value="text_only">text_only（丢弃图片仅转发文本）</option></select></div>
               </fieldset>
             </div>
-            <div class="fg" id="agbu-row"><label for="agbu">Gemini 推理中转地址（可选）</label><input type="url" id="agbu" placeholder="https://your-us-relay.example.com"><span class="form-helper">仅登录流程为「Gemini 授权码」的提供商生效。Google 对部分地区拒绝对 cloudcode-pa.googleapis.com 的推理调用（HTTP 400 User location is not supported）；配置美国中转地址后，网关把 generateContent / countTokens 推理请求经该节点中转。OAuth 认证端点不走此地址，仍直连 Google。留空 = 直连内置默认地址。</span></div>
-            <fieldset class="form-group" id="atb-fs"><legend>工具桥</legend><label class="switch-label"><span>启用工具桥（XYML 提示词注入 + 流式解析回 tool_calls，仅 CNB 需要）</span><span class="tg"><input type="checkbox" id="atb"><span class="sl"></span></span></label></fieldset>
+            <div class="fg hd" id="agbu-row"><label for="agbu">Gemini 推理中转地址（可选）</label><input type="url" id="agbu" placeholder="https://your-us-relay.example.com"><span class="form-helper">仅登录流程为「Gemini 授权码」的提供商生效。Google 对部分地区拒绝对 cloudcode-pa.googleapis.com 的推理调用（HTTP 400 User location is not supported）；配置美国中转地址后，网关把 generateContent / countTokens 推理请求经该节点中转。OAuth 认证端点不走此地址，仍直连 Google。留空 = 直连内置默认地址。</span></div>
+            <fieldset class="form-group hd" id="atb-fs"><legend>工具桥</legend><label class="switch-label"><span>启用工具桥（XYML 提示词注入 + 流式解析回 tool_calls，仅 CNB 需要）</span><span class="tg"><input type="checkbox" id="atb"><span class="sl"></span></span></label></fieldset>
             <fieldset class="form-group" id="aum-fs"><legend>模型策略</legend><label class="switch-label"><span>允许未配置模型透传——开启后请求该提供商的任意 modelId 都直接转发（跳过「未配置」校验），适合模型频繁上架、不想每次手动加模型的提供商（如 OpenRouter）。</span><span class="tg"><input type="checkbox" id="aum"><span class="sl"></span></span></label></fieldset>
             <div class="panel-actions"><label class="switch-label"><span>创建后立即启用</span><span class="tg"><input type="checkbox" checked id="aen"><span class="sl"></span></span></label><div><button class="btn btn-s" onclick="hideAdd()">取消</button><button class="btn btn-p" onclick="createProv()"><i class="fas fa-check" aria-hidden="true"></i>创建提供商</button></div></div>
             <div id="atestR" class="mt-1" aria-live="polite"></div>
@@ -540,28 +575,30 @@ ${H('管理')}
               <div class="fg"><label>认证方式</label><select id="auth-${escapePageHtml(p.id)}" class="select-sm" onchange="toggleAuthTypeEdit('${escapePageJsx(p.id)}')"><option value="api-key" ${(p.authType||'api-key')==='api-key'?'selected':''}>API Key</option><option value="oauth-device" ${p.authType==='oauth-device'?'selected':''}>OAuth 设备码登录</option></select></div>
               <div id="oauth-edit-${escapePageHtml(p.id)}" class="${p.authType==='oauth-device'?'form-group':'hd form-group'}">
                 <fieldset class="form-group"><legend>OAuth 配置</legend>
-                  <div class="fg"><label>登录流程类型</label><select id="eao8-${escapePageHtml(p.id)}" class="select-sm"><option value="device" ${((p.oauth&&p.oauth.flowType)||'device')==='device'?'selected':''}>设备码（RFC 8628）</option><option value="browser" ${(p.oauth&&p.oauth.flowType)==='browser'?'selected':''}>浏览器登录（WorkBuddy）</option><option value="qoder" ${(p.oauth&&p.oauth.flowType)==='qoder'?'selected':''}>Qoder 设备授权（QoderWork）</option><option value="gemini" ${(p.oauth&&p.oauth.flowType)==='gemini'?'selected':''}>Gemini 授权码（Gemini CLI）</option><option value="m365-pkce" ${(p.oauth&&p.oauth.flowType)==='m365-pkce'?'selected':''}>M365 授权码（PKCE）</option><option value="m365-ropc" ${(p.oauth&&p.oauth.flowType)==='m365-ropc'?'selected':''}>M365 账号密码（ROPC）</option></select></div>
+                  <div class="fg"><label>登录流程类型</label><select id="eao8-${escapePageHtml(p.id)}" class="select-sm" onchange="syncEditScopedFields('${escapePageJsx(p.id)}')"><option value="device" ${((p.oauth&&p.oauth.flowType)||'device')==='device'?'selected':''}>设备码（RFC 8628）</option><option value="browser" ${(p.oauth&&p.oauth.flowType)==='browser'?'selected':''}>浏览器登录（WorkBuddy）</option><option value="qoder" ${(p.oauth&&p.oauth.flowType)==='qoder'?'selected':''}>Qoder 设备授权（QoderWork）</option><option value="gemini" ${(p.oauth&&p.oauth.flowType)==='gemini'?'selected':''}>Gemini 授权码（Gemini CLI）</option><option value="m365-pkce" ${(p.oauth&&p.oauth.flowType)==='m365-pkce'?'selected':''}>M365 授权码（PKCE）</option><option value="m365-ropc" ${(p.oauth&&p.oauth.flowType)==='m365-ropc'?'selected':''}>M365 账号密码（ROPC）</option></select></div>
                   <div class="fg"><label>预置模板</label><select class="select-sm" onchange="applyOauthPresetEdit('${escapePageJsx(p.id)}',this.value)"><option value="" ${detectOauthPreset(p.oauth)===''?'selected':''}>— 选择 —</option>${Object.entries(OAUTH_PRESETS).map(([k, pre]) => `<option value="${k}" ${detectOauthPreset(p.oauth)===k?'selected':''}>${escapePageHtml(pre.label)}</option>`).join('')}</select></div>
                   <div class="collapse-section">
                     <button class="collapse-btn" onclick="toggleAdvOauth('eao-adv-${escapePageJsx(p.id)}', this)" type="button" aria-expanded="false"><i class="fas fa-chevron-right collapse-icon" aria-hidden="true"></i> 高级 OAuth 配置（端点 / 凭据 / Global 域，一般无需修改）</button>
                     <div id="eao-adv-${escapePageHtml(p.id)}" class="hd">
-                      <div class="fg"><label>登录域（browser 模式）</label><select id="eao15-${escapePageHtml(p.id)}" class="select-sm" onchange="syncGlobalOauthEdit('${escapePageJsx(p.id)}')"><option value="cn" ${(p.oauth&&p.oauth.loginRealm)!=='global'?'selected':''}>国内版（codebuddy.cn）</option><option value="global" ${(p.oauth&&p.oauth.loginRealm)==='global'?'selected':''}>国际版（workbuddy.ai）</option></select><span class="form-helper">国际版账号必须选「国际版」，登录链接与轮询将走 www.workbuddy.ai。</span></div>
+                      <div class="fg ${usesGlobalRealmUI(p)?'':'hd'}" id="eao15-row-${escapePageHtml(p.id)}"><label>登录域（browser / qoder 模式）</label><select id="eao15-${escapePageHtml(p.id)}" class="select-sm" onchange="syncGlobalOauthEdit('${escapePageJsx(p.id)}')"><option value="cn" ${(p.oauth&&p.oauth.loginRealm)!=='global'?'selected':''}>国内版（codebuddy.cn）</option><option value="global" ${(p.oauth&&p.oauth.loginRealm)==='global'?'selected':''}>国际版（workbuddy.ai）</option></select><span class="form-helper">国际版账号必须选「国际版」，登录链接与轮询将走 www.workbuddy.ai。</span></div>
                       <div class="fg"><label>发起端点</label><input type="url" id="eao1-${escapePageHtml(p.id)}" value="${escapePageHtml((p.oauth&&p.oauth.deviceCodeUrl)||'')}" placeholder="https://.../auth/device/code"></div>
                       <div class="fg"><label>轮询端点</label><input type="url" id="eao2-${escapePageHtml(p.id)}" value="${escapePageHtml((p.oauth&&p.oauth.deviceTokenUrl)||'')}" placeholder="https://.../auth/device/token"></div>
                       <div class="fg"><label>Token 刷新端点</label><input type="url" id="eao3-${escapePageHtml(p.id)}" value="${escapePageHtml((p.oauth&&p.oauth.refreshTokenUrl)||'')}" placeholder="https://.../auth/oauth_token/refresh"></div>
                       <div class="fg"><label>Client ID</label><input type="text" id="eao4-${escapePageHtml(p.id)}" value="${escapePageHtml((p.oauth&&p.oauth.clientId)||'')}" placeholder="OAuth client_id（gemini 模式可留空走环境变量）"></div>
-                      <div class="fg"><label>Client Secret（可选）</label><input type="text" id="eao14-${escapePageHtml(p.id)}" value="${escapePageHtml((p.oauth&&p.oauth.clientSecret)||'')}" placeholder="OAuth client_secret（未配置环境变量时粘贴官方凭据）"></div>
+                      <div class="fg ${usesClientSecretUI(p)?'':'hd'}" id="eao14-row-${escapePageHtml(p.id)}"><label>Client Secret（可选）</label><input type="text" id="eao14-${escapePageHtml(p.id)}" value="${escapePageHtml((p.oauth&&p.oauth.clientSecret)||'')}" placeholder="OAuth client_secret（未配置环境变量时粘贴官方凭据）"><span class="form-helper">仅「Gemini 授权码」流程使用；其余流程用不到 client_secret。</span></div>
                       <div class="fg"><label>Scope（可选）</label><input type="text" id="eao5-${escapePageHtml(p.id)}" value="${escapePageHtml((p.oauth&&p.oauth.scope)||'')}" placeholder="如 user"></div>
                       <div class="fg"><label>Token 注入头（默认 x-api-key）</label><input type="text" id="eao6-${escapePageHtml(p.id)}" value="${escapePageHtml((p.oauth&&p.oauth.tokenHeader)||'x-api-key')}" placeholder="x-api-key"></div>
                       <div class="fg"><label>Token 注入前缀（可选，如 Bearer ）</label><input type="text" id="eao9-${escapePageHtml(p.id)}" value="${escapePageHtml((p.oauth&&p.oauth.tokenHeaderPrefix)||'')}" placeholder="如 Bearer （含尾空格）"></div>
                       <div class="fg"><label>额外请求头（JSON，可选）</label><textarea id="eao7-${escapePageHtml(p.id)}" rows="3" placeholder='{"x-app-name":"my-app"}'>${escapePageHtml((p.oauth&&JSON.stringify(p.oauth.extraHeaders||{}))||'')}</textarea></div>
                       <div class="fg"><label>模型列表 URL（可选）</label><input type="url" id="eao10-${escapePageHtml(p.id)}" value="${escapePageHtml((p.oauth&&p.oauth.modelsUrl)||'')}" placeholder="留空 = 用 baseUrl/models（OpenAI 标准）"></div>
+                      <div id="eao-global-rows-${escapePageHtml(p.id)}" class="${usesGlobalRealmUI(p)?'':'hd'}">
                       <div class="fg"><label>Global 域 baseUrl（海外账户，可选）</label><input type="url" id="eao11-${escapePageHtml(p.id)}" value="${escapePageHtml((p.oauth&&p.oauth.globalBaseUrl)||'')}" placeholder="https://www.workbuddy.ai/v2"></div>
                       <div class="fg"><label>Global 域模型 URL（可选）</label><input type="url" id="eao12-${escapePageHtml(p.id)}" value="${escapePageHtml((p.oauth&&p.oauth.globalModelsUrl)||'')}" placeholder="https://www.workbuddy.ai/console/enterprises/personal/models"></div>
                       <div class="fg"><label>Global 域 Origin（可选）</label><input type="url" id="eao13-${escapePageHtml(p.id)}" value="${escapePageHtml((p.oauth&&p.oauth.globalOrigin)||'')}" placeholder="https://www.workbuddy.ai"></div>
                       <div class="fg"><label>Global 域发起端点（可选）</label><input type="url" id="eao16-${escapePageHtml(p.id)}" value="${escapePageHtml((p.oauth&&p.oauth.globalDeviceCodeUrl)||'')}" placeholder="https://www.workbuddy.ai/v2/plugin/auth/state?platform=CLI"><span class="form-helper">登录域选「国际版」时使用，留空回退国内端点。</span></div>
                       <div class="fg"><label>Global 域轮询端点（可选）</label><input type="url" id="eao17-${escapePageHtml(p.id)}" value="${escapePageHtml((p.oauth&&p.oauth.globalDeviceTokenUrl)||'')}" placeholder="https://www.workbuddy.ai/v2/plugin/auth/token"></div>
                       <div class="fg"><label>Global 域刷新端点（可选）</label><input type="url" id="eao18-${escapePageHtml(p.id)}" value="${escapePageHtml((p.oauth&&p.oauth.globalRefreshTokenUrl)||'')}" placeholder="https://www.workbuddy.ai/v2/plugin/auth/token/refresh"></div>
+                      </div>
                     </div>
                   </div>
                   <div class="fc mt-1 field-row"><button class="btn btn-s" onclick="oauthConnect('${escapePageJsx(p.id)}')"><i class="fas fa-plug" aria-hidden="true"></i>发起连接</button><button class="btn btn-gh" onclick="fetchOauthModels('${escapePageJsx(p.id)}')"><i class="fas fa-cloud-download-alt" aria-hidden="true"></i>获取模型</button><button class="btn btn-gh" onclick="oauthStatus('${escapePageJsx(p.id)}')"><i class="fas fa-sync" aria-hidden="true"></i>状态</button><button class="btn btn-gh" onclick="oauthDisconnect('${escapePageJsx(p.id)}')"><i class="fas fa-unlink" aria-hidden="true"></i>断开</button><span id="oauth-st-${escapePageHtml(p.id)}" class="oauth-status"></span></div>
@@ -588,7 +625,7 @@ ${H('管理')}
               <fieldset class="form-group ${p.authType==='oauth-device'?'hd':''}" id="keys-fs-${escapePageHtml(p.id)}"><legend id="key-legend-${escapePageHtml(p.id)}">${isTraeProviderUI(p)?'TRAE 账号凭证（每个账号一行 JSON）':(p.id==='cline'?'Cline RefreshTokens（每个账号一行）':'上游 API Keys')}</legend><div id="keys-${escapePageHtml(p.id)}">${p.apiKeys.map((k, ki)=>`<div class="fc mb-3 field-row" data-kidx="${ki}"><input type="password" value="${escapePageHtml(k.key)}" class="fx1" id="k-${escapePageHtml(p.id)}-${ki}" placeholder="API Key" aria-label="API Key"><button class="icon-btn" onclick="toggleKeyText(this)" title="显示/隐藏 Key"><i class="fas fa-eye" aria-hidden="true"></i></button><label class="tg"><input type="checkbox" ${k.enabled?'checked':''} id="ken-${escapePageHtml(p.id)}-${ki}" aria-label="启用 Key"><span class="sl"></span></label><button class="btn btn-gh btn-xs" onclick="testKeyRow('${escapePageJsx(p.id)}',${ki})" title="测试 Key"><i class="fas fa-plug" aria-hidden="true"></i><span>测试</span></button><button class="icon-btn" onclick="rmKeyRow('${escapePageJsx(p.id)}',${ki})" aria-label="移除 Key"><i class="fas fa-times" aria-hidden="true"></i></button></div>`).join('')}</div><div class="fc mt-1 field-row"><input type="password" id="nk-${escapePageHtml(p.id)}" placeholder="${isTraeProviderUI(p)?'新的 TRAE 凭证 JSON（或点「登录账号」自动写入）':(p.id==='cline'?'新的 RefreshToken（一个账号一行）':'新的 API Key')}" class="fx1"><button class="btn btn-s btn-xs" onclick="addKeyRow('${escapePageJsx(p.id)}')"><i class="fas fa-plus" aria-hidden="true"></i>添加</button></div><span id="key-hint-${escapePageHtml(p.id)}" class="form-helper">${isTraeProviderUI(p)?'TRAE SOLO 账号凭证为登录后自动写入的 JSON（也可粘贴 trae 登录脚本落盘的 trae-*.json 内容）。每行一个账号、按剩余积分自动挑选，额度用尽自动冷却轮换；禁用该 Key 即停用账号。':(p.id==='cline'?'Cline 使用 Cline 账号的 refreshToken（长期钥匙）。每个账号一行，额度用完自动切换；留空禁用某个账号。':' ')}</span></fieldset>
               ${p.type === 'kuku' ? `<div class="fg"><label for="kuku-think-${escapePageHtml(p.id)}">Kuku 思考模式</label><input type="number" id="kuku-think-${escapePageHtml(p.id)}" min="0" max="10" value="${p.kukuThinkMode ?? 3}"><span class="form-helper">允许 0 到 10，默认 3。</span></div>
               <div class="fg"><button class="btn btn-p btn-sm" onclick="kukuQrLogin('${escapePageJsx(p.id)}')" type="button"><i class="fas fa-qrcode" aria-hidden="true"></i> 扫码登录自动写 Cookie</button><span class="form-helper">用手机百度 App 扫码，后台自动写入 BDUSS Cookie（已保存的提供商将直接更新 Key）。</span></div>` : ''}
-              <fieldset class="form-group" id="models-fs-${escapePageHtml(p.id)}"><legend>模型</legend><div id="ml-${escapePageHtml(p.id)}">${p.models.map((m,mi)=>{ const pol=((p.oauth&&p.oauth.effortPolicy)||{})[m.id]||[]; return `<div class="fc mb-3 field-row" data-idx="${mi}"><input type="text" value="${escapePageHtml(m.id)}" class="fx1" id="mid-${escapePageHtml(p.id)}-${mi}" placeholder="模型 ID"><label class="tg" title="启用模型"><input type="checkbox" ${m.enabled?'checked':''} id="men-${escapePageHtml(p.id)}-${mi}" aria-label="启用模型"><span class="sl"></span></label><label class="tg" title="启用思维引导注入"><input type="checkbox" ${(p.thinkingInject||[]).includes(m.id)?'checked':''} id="mit-${escapePageHtml(p.id)}-${mi}" aria-label="启用思维引导注入"><span class="sl"></span></label><label class="tg" title="启用缓存前缀注入"><input type="checkbox" ${(p.cachePrefixInject||[]).includes(m.id)?'checked':''} id="mcp-${escapePageHtml(p.id)}-${mi}" aria-label="启用缓存前缀注入"><span class="sl"></span></label>${effDdEditHtml(p.id, mi, pol)}<button class="btn btn-gh btn-xs" onclick="testMdl('${escapePageJsx(p.id)}','${escapePageJsx(m.id)}',${mi})" title="测试模型"><i class="fas fa-plug" aria-hidden="true"></i><span>测试</span></button><button class="icon-btn" onclick="rmMdl('${escapePageJsx(p.id)}',${mi})" aria-label="移除模型"><i class="fas fa-times" aria-hidden="true"></i></button></div>`}).join('')}</div><div class="fc mt-1 field-row"><input type="text" id="nmid-${escapePageHtml(p.id)}" placeholder="新的模型 ID" class="fx1"><button class="btn btn-s btn-xs" onclick="addMdl('${escapePageJsx(p.id)}')"><i class="fas fa-plus" aria-hidden="true"></i>添加</button></div><span class="form-helper">每个模型行「启用模型」开关旁的开关依次为「思维引导注入」「缓存前缀注入」，勾选后该模型转发前会被注入对应固定提示词；不勾选则原样转发。「effort」下拉声明该模型的 reasoning_effort 支持档位（多选，仅 WorkBuddy/CodeBuddy 上游生效），留空 = 不启用。</span></fieldset>
+              <fieldset class="form-group" id="models-fs-${escapePageHtml(p.id)}" data-effort="${isWorkbuddyProviderUI(p)?'1':'0'}"><legend>模型</legend><div id="ml-${escapePageHtml(p.id)}">${p.models.map((m,mi)=>{ const pol=((p.oauth&&p.oauth.effortPolicy)||{})[m.id]||[]; return `<div class="fc mb-3 field-row" data-idx="${mi}"><input type="text" value="${escapePageHtml(m.id)}" class="fx1" id="mid-${escapePageHtml(p.id)}-${mi}" placeholder="模型 ID"><label class="tg" title="启用模型"><input type="checkbox" ${m.enabled?'checked':''} id="men-${escapePageHtml(p.id)}-${mi}" aria-label="启用模型"><span class="sl"></span></label><label class="tg" title="启用思维引导注入"><input type="checkbox" ${(p.thinkingInject||[]).includes(m.id)?'checked':''} id="mit-${escapePageHtml(p.id)}-${mi}" aria-label="启用思维引导注入"><span class="sl"></span></label><label class="tg" title="启用缓存前缀注入"><input type="checkbox" ${(p.cachePrefixInject||[]).includes(m.id)?'checked':''} id="mcp-${escapePageHtml(p.id)}-${mi}" aria-label="启用缓存前缀注入"><span class="sl"></span></label>${effDdEditHtml(p.id, mi, pol, !isWorkbuddyProviderUI(p))}<button class="btn btn-gh btn-xs" onclick="testMdl('${escapePageJsx(p.id)}','${escapePageJsx(m.id)}',${mi})" title="测试模型"><i class="fas fa-plug" aria-hidden="true"></i><span>测试</span></button><button class="icon-btn" onclick="rmMdl('${escapePageJsx(p.id)}',${mi})" aria-label="移除模型"><i class="fas fa-times" aria-hidden="true"></i></button></div>`}).join('')}</div><div class="fc mt-1 field-row"><input type="text" id="nmid-${escapePageHtml(p.id)}" placeholder="新的模型 ID" class="fx1"><button class="btn btn-s btn-xs" onclick="addMdl('${escapePageJsx(p.id)}')"><i class="fas fa-plus" aria-hidden="true"></i>添加</button></div><span class="form-helper">每个模型行「启用模型」开关旁的开关依次为「思维引导注入」「缓存前缀注入」，勾选后该模型转发前会被注入对应固定提示词；不勾选则原样转发。「effort」下拉声明该模型的 reasoning_effort 支持档位（多选），仅对 WorkBuddy / CodeBuddy 提供商显示——其余上游不消费该配置。</span></fieldset>
               ${isTraeProviderUI(p)?`
               <fieldset class="form-group" id="trae-fs-${escapePageHtml(p.id)}"><legend>TRAE 账号池（SOLO / Work 双通道）</legend><span class="form-helper">多账号双积分反代：自动隔离通用积分 (SOLO) 与 Work 专属积分。正常调用优先消耗通用积分；当遇到 4008 额度耗尽或 429 限流时，系统自动无缝降级到 Work 专有通道。支持一键刷新双通道积分与每日自动签到补积分。</span>
                 <div class="fc mt-1 field-row">
@@ -626,7 +663,7 @@ ${H('管理')}
                   <div class="fg"><label>视觉转写失败策略</label><select id="vb-fail-${escapePageHtml(p.id)}" class="select-sm"><option value="error" ${!p.visionBridge||p.visionBridge.onVisionFailure==='error'?'selected':''}>error（返回错误）</option><option value="text_only" ${p.visionBridge&&p.visionBridge.onVisionFailure==='text_only'?'selected':''}>text_only（丢弃图片仅转发文本）</option></select></div>
                 </fieldset>
               </div>
-              <fieldset class="form-group" id="atb-fs-${escapePageHtml(p.id)}"><legend>工具桥</legend><label class="switch-label"><span>启用工具桥（XYML 提示词注入 + 流式解析回 tool_calls，仅 CNB 需要）</span><span class="tg"><input type="checkbox" id="atb-${escapePageHtml(p.id)}" ${p.toolBridge?'checked':''}><span class="sl"></span></span></label></fieldset>
+              <fieldset class="form-group${isCnbProviderUI(p)?'':' hd'}" id="atb-fs-${escapePageHtml(p.id)}"><legend>工具桥</legend><label class="switch-label"><span>启用工具桥（XYML 提示词注入 + 流式解析回 tool_calls，仅 CNB 需要）</span><span class="tg"><input type="checkbox" id="atb-${escapePageHtml(p.id)}" ${p.toolBridge?'checked':''}><span class="sl"></span></span></label></fieldset>
               <fieldset class="form-group" id="aum-fs-${escapePageHtml(p.id)}"><legend>模型策略</legend><label class="switch-label"><span>允许未配置模型透传——开启后请求该提供商的任意 modelId 都直接转发（跳过「未配置」校验），适合模型频繁上架、不想每次手动加模型的提供商（如 OpenRouter）。</span><span class="tg"><input type="checkbox" id="aum-${escapePageHtml(p.id)}" ${p.allowUnlistedModels?'checked':''}><span class="sl"></span></span></label></fieldset>
               <div class="detail-actions"><div id="tr-${escapePageHtml(p.id)}" aria-live="polite"></div><div>${((p.id === 'cnb' || (p.baseUrl && p.baseUrl.indexOf('cnb.cool') !== -1)) || ((p.oauth && (p.oauth.flowType === 'm365-pkce' || p.oauth.flowType === 'm365-ropc')))) ? '<button class="btn btn-s" onclick="fetchOauthModels(\'' + escapePageJsx(p.id) + '\')"><i class="fas fa-download" aria-hidden="true"></i>获取模型</button>' : ((isSensenovaProviderUI(p) || p.apiType === 'openai' || p.id === 'cline' || p.id === 'opencode') && !isTraeProviderUI(p) && !(p.authType === 'oauth-device' && p.oauth)) ? '<button class="btn btn-s" onclick="fetchEditModels(\'' + escapePageJsx(p.id) + '\')"><i class="fas fa-download" aria-hidden="true"></i>获取模型</button>' : ''}${p.id === 'cline' ? '<button class="btn btn-s" onclick="clineOAuthConnect(\'' + escapePageJsx(p.id) + '\')"><i class="fas fa-sign-in-alt" aria-hidden="true"></i>一键授权获取 Token</button>' : ''}<button class="btn btn-d" onclick="del('${escapePageJsx(p.id)}')"><i class="fas fa-trash" aria-hidden="true"></i>删除</button><button class="btn btn-p" onclick="save('${escapePageJsx(p.id)}')"><i class="fas fa-save" aria-hidden="true"></i>保存更改</button></div></div>
             </div>
@@ -1276,7 +1313,12 @@ document.getElementById('aid').addEventListener('input', function() {
   if (this.value.trim() === 'opencode') {
     document.getElementById('aurl').value = '${OPENCODE_DEFAULT_URL}'
   }
+  syncNewScopedFields()
 })
+// API 地址影响 CNB 判定（cnb.cool 域），变更后同步专属配置块显隐
+document.getElementById('aurl').addEventListener('input', syncNewScopedFields)
+// 新建表单首次渲染后按默认值同步一次（工具桥 / Gemini / Global 域默认隐藏）
+syncNewScopedFields()
 
 // provider api keys (add form)
 function addAKeyRow() {
@@ -1470,9 +1512,31 @@ function syncGlobalOauthEdit(id) {
   fill('18', p._globalRefreshTokenUrl)
 }
 
+/**
+ * 该模型行是否应显示「effort」下拉。
+ * - 编辑表单（#ml-<id> 内）：由所在「模型」fieldset 的 data-effort 标记决定（仅 WorkBuddy/CodeBuddy）。
+ * - 新建表单（#amodels 内）：按当前填写的提供商 ID / 登录流程动态判断（见 newFormUsesEffort）。
+ */
+function effortScopeEnabled(row) {
+  if (!row) return false
+  if (row.closest('#amodels')) return newFormUsesEffort()
+  const fs = row.closest('[data-effort]')
+  return !!(fs && fs.getAttribute('data-effort') === '1')
+}
+
+/** 新建表单当前是否属于会消费 effortPolicy 的 WorkBuddy/CodeBuddy 提供商 */
+function newFormUsesEffort() {
+  const aid = ((document.getElementById('aid') || {}).value || '').trim()
+  if (aid.indexOf('workbuddy') === 0) return true
+  const at = (document.getElementById('aat') || {}).value
+  const flow = (document.getElementById('ao8') || {}).value
+  return at === 'oauth-device' && flow === 'browser'
+}
+
 /** reasoning_effort 支持档位多选下拉：从 SSR 模板 #eff-dd-tpl 克隆进缺少下拉的模型行（新建/编辑共用） */
 function effDdEnsure(row) {
   if (!row || row.querySelector('.eff-dd')) return
+  if (!effortScopeEnabled(row)) return
   const tpl = document.getElementById('eff-dd-tpl')
   if (!tpl || !tpl.textContent) return
   const holder = document.createElement('div')
@@ -1711,6 +1775,8 @@ function applyProviderPreset(name) {
   }
   const tb = document.getElementById('atb')
   if (tb) tb.checked = !!p.toolBridge
+  // 预设切换后同步专属配置块显隐（工具桥 / Gemini 中转 / Client Secret / Global 域 / effort 下拉）
+  syncNewScopedFields()
 }
 function applyVisionBridgePreset() {
   applyClineKeyHint(false)
@@ -1748,12 +1814,64 @@ function applyTraeKeyHint(on) {
   if (legend) legend.textContent = on ? 'TRAE 账号凭证（每个账号一行 JSON）' : '上游 API Keys'
 }
 
+/**
+ * 新建表单：按当前填写的提供商 ID / 登录流程，显隐只对特定提供商生效的配置块。
+ * 与编辑表单的 SSR 判定保持同一套规则（isCnbProviderUI / usesGlobalRealmUI / usesClientSecretUI / Gemini）。
+ */
+function syncNewScopedFields() {
+  const aid = ((document.getElementById('aid') || {}).value || '').trim()
+  const at = (document.getElementById('aat') || {}).value
+  const flow = (document.getElementById('ao8') || {}).value
+  const isOauth = at === 'oauth-device'
+  const setHidden = function (id, hidden) {
+    const el = document.getElementById(id)
+    if (el) el.classList.toggle('hd', !!hidden)
+  }
+  // 工具桥：仅 CNB（id 为 cnb 或用 cnb.cool 域）
+  const url = ((document.getElementById('aurl') || {}).value || '')
+  const isCnb = aid === 'cnb' || url.indexOf('cnb.cool') !== -1
+  setHidden('atb-fs', !isCnb)
+  // Gemini 推理中转地址：仅 Gemini 授权码流程
+  setHidden('agbu-row', !(isOauth && flow === 'gemini'))
+  // Client Secret：仅 Gemini OAuth 消费
+  setHidden('ao14-row', !(isOauth && flow === 'gemini'))
+  // 登录域 + Global 域端点：仅 browser / qoder 两条流程读取
+  const usesRealm = isOauth && (flow === 'browser' || flow === 'qoder')
+  setHidden('ao15-row', !usesRealm)
+  setHidden('ao-global-rows', !usesRealm)
+  // 模型行 effort 下拉：仅会消费 effortPolicy 的 WorkBuddy/CodeBuddy
+  Array.from(document.querySelectorAll('#amodels .field-row')).forEach(function (row) {
+    const has = !!row.querySelector('.eff-dd')
+    const want = newFormUsesEffort()
+    if (want && !has) effDdEnsure(row)
+    else if (!want && has) { const dd = row.querySelector('.eff-dd'); if (dd) dd.remove() }
+  })
+}
+
+/**
+ * 编辑表单：登录流程类型变化后，重新显隐只对特定流程生效的配置块
+ * （Client Secret / 登录域 / Global 域端点）。
+ * 仅切换 CSS 显隐，不删除 DOM——隐藏的输入框仍会被 collectOauthEdit 读取，已存值不会丢失。
+ */
+function syncEditScopedFields(id) {
+  const flow = ((document.getElementById('eao8-' + id) || {}).value) || 'device'
+  const setHidden = function (elId, hidden) {
+    const el = document.getElementById(elId)
+    if (el) el.classList.toggle('hd', !!hidden)
+  }
+  setHidden('eao14-row-' + id, flow !== 'gemini')
+  const usesRealm = flow === 'browser' || flow === 'qoder'
+  setHidden('eao15-row-' + id, !usesRealm)
+  setHidden('eao-global-rows-' + id, !usesRealm)
+}
+
 function toggleAuthType() {
   const v = document.getElementById('aat').value
   const isOauth = v === 'oauth-device'
   document.getElementById('oauth-new').classList.toggle('hd', !isOauth)
   document.getElementById('akeys-fs').classList.toggle('hd', isOauth)
   document.getElementById('amodels-fs').classList.toggle('hd', isOauth)
+  syncNewScopedFields()
 }
 function toggleAuthTypeEdit(id) {
   const v = document.getElementById('auth-' + id).value
@@ -1763,6 +1881,7 @@ function toggleAuthTypeEdit(id) {
   if (keysFs) keysFs.classList.toggle('hd', isOauth)
   const modelsFs = document.getElementById('models-fs-' + id)
   if (modelsFs) modelsFs.classList.toggle('hd', isOauth)
+  if (isOauth) syncEditScopedFields(id)
 }
 
 // OAuth 预置模板：单一数据源在文件顶部，页面 script 已注入 OAUTH_PRESETS
