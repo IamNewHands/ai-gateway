@@ -85,21 +85,43 @@ function collectCookies(response: Response, prev: string): string {
  * providerId 仅作为 KV 状态键；无需提供商已保存（新增表单未保存也能发起）。
  */
 export async function startKukuQrLogin(env: Env, providerId: string): Promise<{ success: boolean; message: string; qr?: KukuQrInfo }> {
-  try {
+  // 百度 passport 对数据中心出口 IP 有风控（常表现为吊起/黑洞而非快速报错），
+  // 超时放宽到 30s 并重试一次兜住偶发抖动。仍失败多为出口 IP 被拦，需换网络环境。
+  const QR_FETCH_TIMEOUT_MS = 30_000
+  const qrHeaders = {
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36',
+    'Accept': '*/*',
+    'Accept-Language': 'zh-CN,zh;q=0.9',
+    'Referer': 'https://www.baidu.com/',
+    'Origin': 'https://www.baidu.com',
+  }
+  const buildQrUrl = () => {
     const url = new URL(`${PASSPORT_TARGET}/v2/api/getqrcode`)
     url.searchParams.set('lp', 'pc')
     url.searchParams.set('qrloginfrom', 'pc')
     url.searchParams.set('apiver', 'v3')
     url.searchParams.set('gid', genGid())
-
-    const res = await fetch(url.toString(), {
+    return url
+  }
+  const tryFetch = async (): Promise<Response> => {
+    const res = await fetch(buildQrUrl().toString(), {
       method: 'GET',
-      headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)' },
-      signal: AbortSignal.timeout(15000),
+      headers: qrHeaders,
+      signal: AbortSignal.timeout(QR_FETCH_TIMEOUT_MS),
     })
-    if (!res.ok) {
-      return { success: false, message: `获取二维码失败 HTTP ${res.status}` }
+    if (!res.ok) throw new Error(`HTTP ${res.status}`)
+    return res
+  }
+
+  try {
+    let res: Response
+    try {
+      res = await tryFetch()
+    } catch (firstError) {
+      if (!(firstError instanceof Error && /timeout|abort/i.test(firstError.message))) throw firstError
+      res = await tryFetch() // 超时重试一次
     }
+
     const payload = JSON.parse(unwrapJsonp(await res.text())) as {
       errno?: number
       imgurl?: string
@@ -121,7 +143,11 @@ export async function startKukuQrLogin(env: Env, providerId: string): Promise<{ 
     await env.KV.put(qrKey(providerId), JSON.stringify(state), { expirationTtl: QR_TTL_SECONDS })
     return { success: true, message: '二维码已生成，请用手机百度 App 扫码', qr: { imgUrl: state.imgUrl, expiresAt: state.expiresAt } }
   } catch (error) {
-    return { success: false, message: `获取二维码异常: ${error instanceof Error ? error.message : String(error)}` }
+    const message = error instanceof Error ? error.message : String(error)
+    const hint = /timeout|abort/i.test(message)
+      ? '（百度 passport 疑似拦截了服务器出口 IP，请更换网络/节点后重试）'
+      : ''
+    return { success: false, message: `获取二维码异常: ${message}${hint}` }
   }
 }
 
