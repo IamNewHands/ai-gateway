@@ -11,6 +11,7 @@ import {
   injectConversationHeaders,
   extractSessionKey,
   __resetSessionIdsForTests,
+  __resetTurnSaltForTests,
 } from './workbuddy-session-ids'
 
 describe('newMessageId / isValidB3TraceId', () => {
@@ -226,6 +227,15 @@ describe('turnRequestId（轮级纯派生）', () => {
     const before = await turnRequestId('u0:stable')
     __resetSessionIdsForTests()
     expect(await turnRequestId('u0:stable')).toBe(before)
+  })
+
+  it('惰性盐重置后生成不同派生 ID（隔离校验）', async () => {
+    const before = await turnRequestId('u0:salt-test')
+    __resetTurnSaltForTests()
+    const after = await turnRequestId('u0:salt-test')
+    // 盐重置后重新惰性生成新盐，哈希不同
+    expect(after).not.toBe(before)
+    expect(after).toMatch(/^[0-9a-f]{32}$/)
   })
 })
 

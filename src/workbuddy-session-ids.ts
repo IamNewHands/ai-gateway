@@ -116,8 +116,22 @@ export function turnKey(body: Record<string, unknown> | null | undefined): strin
   return ''
 }
 
-/** 轮级派生盐：模块加载时随机生成，让派生 ID 无法按消息内容被外部预计算。 */
-const TURN_SALT = newMessageId()
+/**
+ * 轮级派生盐：惰性初始化（首次调用时生成）。
+ * 严禁在模块顶层（全局作用域）直接调用 newMessageId() / crypto.getRandomValues()，
+ * 否则触发 Cloudflare Workers 10021 校验错误（Disallowed operation called within global scope）。
+ */
+let turnSalt: string | null = null
+
+function getTurnSalt(): string {
+  if (!turnSalt) turnSalt = newMessageId()
+  return turnSalt
+}
+
+/** 仅供测试：清空轮级派生盐（供验证惰性初始化）。 */
+export function __resetTurnSaltForTests(): void {
+  turnSalt = null
+}
 
 /**
  * 会话级聚合主键缓存：会话键 → conversationRequestID。
@@ -160,7 +174,7 @@ export function requestIdForKey(key: string): string {
  */
 export async function turnRequestId(turnKeyValue: string): Promise<string> {
   if (!turnKeyValue) return newMessageId()
-  const data = new TextEncoder().encode(`${TURN_SALT}|${turnKeyValue}`)
+  const data = new TextEncoder().encode(`${getTurnSalt()}|${turnKeyValue}`)
   const digest = await crypto.subtle.digest('SHA-256', data)
   const bytes = new Uint8Array(digest).slice(0, 16)
   let out = ''
