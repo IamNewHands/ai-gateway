@@ -64,6 +64,7 @@ import {
   backfillReasoningContent,
   injectWorkbuddyChatHeaders,
   ensureWorkbuddyStreamOptions,
+  ensureWorkbuddyMaxTokens,
   isAccountBanned,
   ensureGlobalFallbackSystem,
   sanitizeWorkbuddyMessages,
@@ -549,7 +550,8 @@ function cleanWorkbuddyChunk(chunk: string): string {
 function passthroughResponse(
   response: Response,
   cleanFn?: (chunk: string) => string,
-  onLine?: (line: string) => void
+  onLine?: (line: string) => void,
+  stopSignal?: { aborted: boolean }
 ): Response {
   const headers: Record<string, string> = {
     'Cache-Control': 'no-store',
@@ -604,6 +606,10 @@ function passthroughResponse(
     let lineBuffer = ''
     try {
       while (true) {
+        if (stopSignal?.aborted) {
+          try { await reader.cancel() } catch { /* ignore */ }
+          break
+        }
         const { done, value } = await reader.read()
         if (done) break
         // 将缓冲区与当前 chunk 拼接
@@ -612,13 +618,18 @@ function passthroughResponse(
         // 最后一行可能不完整，保留到缓冲区
         lineBuffer = lines.pop() || ''
         for (const line of lines) {
+          if (stopSignal?.aborted) {
+            try { await reader.cancel() } catch { /* ignore */ }
+            break
+          }
           try { onLine?.(line) } catch { /* ignore */ }
           // 空行也要传递（SSE 事件分隔符），不能过滤
           await writer.write(line)
         }
+        if (stopSignal?.aborted) break
       }
-      // 流结束后，处理缓冲区中剩余的最后一行
-      if (lineBuffer.trim()) {
+      // 流结束后，处理缓冲区中剩余的最后一行（若未中止）
+      if (!stopSignal?.aborted && lineBuffer.trim()) {
         try { onLine?.(lineBuffer) } catch { /* ignore */ }
         await writer.write(lineBuffer)
       }
@@ -1834,6 +1845,7 @@ async function proxyOAuthRequestPooledCore(
       // stream_options 补 include_usage（移植 workbuddy2api D7）：上游据此在末帧回 usage，
       // 成本账本（recordOauthModelCost）依赖它；未带才注入，显式带则尊重调用方
       ensureWorkbuddyStreamOptions(body)
+      ensureWorkbuddyMaxTokens(body)
       sanitizeUpstreamBody(body)
       sanitizeBlockedTemplates(body)
       normalizeOpenAIToolChoice(body)
@@ -2127,10 +2139,22 @@ async function proxyOAuthRequestPooled(
         } catch { /* ignore parse error */ }
       }
     }
-    // 有状态清洗器（每请求新实例）：跨帧维护首帧 id 续传与 tool_calls name 回填。
+    // 有状态清洗器（每请求新实例）：跨帧维护首帧 id 续传、tool_calls name 回填、
+    // 以及推理空转死循环与超预算熔断防护（防 50 万字符刷屏失控）。
     // onLine 在 cleanFn **之前**执行（见 passthroughResponse 的读取循环），故成本记账
     // 读到的始终是上游**原始**帧，usage.credit 不会被重建逻辑影响。
-    return passthroughResponse(response, createWorkbuddyChunkCleaner(), onLine)
+    const stopSignal = { aborted: false }
+    const envMaxReasoning = c.env.WORKBUDDY_MAX_REASONING_CHARS !== undefined && c.env.WORKBUDDY_MAX_REASONING_CHARS.trim() !== ''
+      ? Number(c.env.WORKBUDDY_MAX_REASONING_CHARS)
+      : undefined
+    const cleaner = createWorkbuddyChunkCleaner({
+      stopSignal,
+      maxReasoningChars: envMaxReasoning,
+      onRunaway: (kind) => {
+        console.warn(`[proxy-oauth] WorkBuddy 流式防护触发: ${kind}, provider=${provider.id}, model=${model}`)
+      },
+    })
+    return passthroughResponse(response, cleaner, onLine, stopSignal)
   } catch (err) {
     // 内容拦截是**本请求的终态**：回 400 + 防火墙文案（不回 503，也不暴露账号/错误码）。
     if (err instanceof ContentBlockedError) {
@@ -2222,6 +2246,7 @@ async function proxyOAuthRequest(
       }
       // stream_options 补 include_usage（移植 workbuddy2api D7），同池化路径
       ensureWorkbuddyStreamOptions(body)
+      ensureWorkbuddyMaxTokens(body)
       sanitizeUpstreamBody(body)
       sanitizeBlockedTemplates(body)
       normalizeOpenAIToolChoice(body)
@@ -2326,7 +2351,18 @@ async function proxyOAuthRequest(
     }
 
     logOAuthRequest(c, provider, model, subPath, forwardBody, response.status)
-    return passthroughResponse(response, createWorkbuddyChunkCleaner())
+    const stopSignal = { aborted: false }
+    const envMaxReasoning = c.env.WORKBUDDY_MAX_REASONING_CHARS !== undefined && c.env.WORKBUDDY_MAX_REASONING_CHARS.trim() !== ''
+      ? Number(c.env.WORKBUDDY_MAX_REASONING_CHARS)
+      : undefined
+    const cleaner = createWorkbuddyChunkCleaner({
+      stopSignal,
+      maxReasoningChars: envMaxReasoning,
+      onRunaway: (kind) => {
+        console.warn(`[proxy-oauth] WorkBuddy 流式防护触发: ${kind}, provider=${provider.id}, model=${model}`)
+      },
+    })
+    return passthroughResponse(response, cleaner, undefined, stopSignal)
   } catch (err) {
     const error = err as Error
     logOAuthRequest(c, provider, model, subPath, forwardBody, 502)
@@ -2551,6 +2587,7 @@ export async function handleAnthropicMessages(c: Context<AppEnv>) {
         // stream_options 补 include_usage（移植 workbuddy2api D7）：上游据此在末帧回 usage，
         // 成本账本（recordOauthModelCost）依赖它；未带才注入，显式带则尊重调用方
         ensureWorkbuddyStreamOptions(upstreamBody)
+        ensureWorkbuddyMaxTokens(upstreamBody)
         normalizeOpenAIToolChoice(upstreamBody)
         // reasoning_effort 降级（移植 workbuddy2api）：运营者声明 oauth.effortPolicy 才恢复/降级，未声明保持删除
         if (wbCapturedEffort) {
@@ -3772,6 +3809,7 @@ export async function handleResponses(c: Context<AppEnv>) {
       if (isWorkbuddyProvider(provider)) {
         // stream_options 补 include_usage（D7）
         ensureWorkbuddyStreamOptions(upstreamBody)
+        ensureWorkbuddyMaxTokens(upstreamBody)
         // tool_choice 归一（对象形式会被上游 400 code=11101 拒绝）
         normalizeOpenAIToolChoice(upstreamBody)
         // reasoning_effort 降级（按运营者声明的 effortPolicy）

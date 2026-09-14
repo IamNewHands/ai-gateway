@@ -633,6 +633,8 @@ export interface Env {
    * 工具路由、主回答、纠正、证据恢复共享同一预算，不会因多段重试叠加成无限任务。
    */
   M365_LOGICAL_REQUEST_TIMEOUT_MS?: string
+  /** WorkBuddy 单次流式推理最大 reasoning 字符上限（默认 65536，设 0 表示不限字数硬上限，仅依靠行重复率死循环熔断） */
+  WORKBUDDY_MAX_REASONING_CHARS?: string
   /** M365 SSE 调试日志开关（'true' 开启）：记录 ChatHub 原始文本 / OpenAI delta / 最终聚合三层，排查换行与格式来源 */
   M365_DEBUG_SSE?: string
   /** M365 SSE 调试日志单条采样字符数（默认 2000），防止长文档/长回答写爆日志 */

@@ -427,6 +427,27 @@ export function ensureWorkbuddyStreamOptions(body: Record<string, unknown>): voi
   body['stream_options'] = { include_usage: true }
 }
 
+// ===== 出站请求体 max_tokens 安全护栏 =====
+
+/** 客户端未显式提供 max_tokens / max_completion_tokens 时的默认护栏上限（对齐 Cline CLINE_MAX_TOKENS = 32768）。 */
+export const WORKBUDDY_DEFAULT_MAX_TOKENS = 32768
+
+/**
+ * 为出站 WorkBuddy 请求体注入默认 max_tokens 护栏（防上游失控或死循环无限消耗算力/额度）。
+ * 规则：
+ *  - 若客户端已显式提供有效数字 max_tokens 或 max_completion_tokens（> 0）→ 原样保留，尊重调用方意图；
+ *  - 若未提供或为非正数/无效值 → 注入 WORKBUDDY_DEFAULT_MAX_TOKENS。
+ */
+export function ensureWorkbuddyMaxTokens(body: Record<string, unknown>, defaultTokens = WORKBUDDY_DEFAULT_MAX_TOKENS): void {
+  const mt = body['max_tokens']
+  const mct = body['max_completion_tokens']
+  const hasValidMt = typeof mt === 'number' && Number.isFinite(mt) && mt > 0
+  const hasValidMct = typeof mct === 'number' && Number.isFinite(mct) && mct > 0
+  if (hasValidMt || hasValidMct) return
+  body['max_tokens'] = defaultTokens
+}
+
+
 // ===== DeepSeek 思维链注入与历史消息回填 =====
 
 /** 模型名是否以 deepseek 开头（忽略大小写与首尾空格，对齐 workbuddy2api isDeepSeekModel）。 */

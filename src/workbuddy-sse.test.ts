@@ -6,6 +6,9 @@ import {
   backfillToolCallNames,
   createWorkbuddyChunkCleaner,
   WORKBUDDY_SENTINEL_ID,
+  isDegenerateReasoningWindow,
+  WorkbuddyDegeneracyDetector,
+  WORKBUDDY_DEFAULT_MAX_REASONING_CHARS,
 } from './workbuddy-sse'
 
 /**
@@ -264,3 +267,141 @@ describe('createWorkbuddyChunkCleaner（有状态清洗器）', () => {
     expect(JSON.parse(out.slice(5).trim()).id).toBe(WORKBUDDY_SENTINEL_ID)
   })
 })
+
+describe('isDegenerateReasoningWindow & WorkbuddyDegeneracyDetector 推理退化死循环检测', () => {
+  it('正常长推理思考与技术推导不会误判为退化', () => {
+    const normalReasoning = `
+Let me analyze the problem carefully.
+First, we need to inspect the file structure and verify types.
+In TypeScript, we have:
+\`\`\`ts
+interface Config {
+  apiKey: string
+  retryCount: number
+}
+\`\`\`
+Now let's check the test suite:
+1. Ensure all edge cases are covered.
+2. Check boundary conditions.
+3. Validate error mappings.
+The function returns true on success.
+`
+    expect(isDegenerateReasoningWindow(normalReasoning)).toBe(false)
+  })
+
+  it('典型死循环模式（log4/log3 模式："Writing. \\n\\n Let me output. \\n\\n Go."）准确判定为退化窗口', () => {
+    const phrases = ['Writing.', 'Let me output.', 'Go.', 'Now.', 'OK.']
+    const loopLines: string[] = []
+    for (let i = 0; i < 40; i++) {
+      loopLines.push(phrases[i % phrases.length])
+    }
+    const loopText = loopLines.join('\n\n')
+    expect(isDegenerateReasoningWindow(loopText)).toBe(true)
+  })
+
+  it('行数不足时（< 20 行）不触发窗口退化', () => {
+    const shortLoop = ['Writing.', 'Go.', 'OK.'].join('\n\n')
+    expect(isDegenerateReasoningWindow(shortLoop)).toBe(false)
+  })
+
+  it('独特行过多（> 10 种不同行）时不触发窗口退化', () => {
+    const diverseLines: string[] = []
+    for (let i = 0; i < 25; i++) {
+      diverseLines.push(`Step ${i}: checking condition`)
+    }
+    expect(isDegenerateReasoningWindow(diverseLines.join('\n'))).toBe(false)
+  })
+
+  it('WorkbuddyDegeneracyDetector 连续流式输入死循环达到阈值时触发 isDegenerate', () => {
+    const detector = new WorkbuddyDegeneracyDetector({
+      windowChars: 400,
+      stride: 100,
+      minLines: 10,
+      maxDistinct: 5,
+      minRepeatRatio: 0.8,
+      consecutiveTrips: 2,
+    })
+
+    const loopFragment = 'Writing.\n\nLet me output.\n\nGo.\n\nOK.\n\n'
+    let triggered = false
+    for (let i = 0; i < 25; i++) {
+      if (detector.feedDelta(loopFragment)) {
+        triggered = true
+        break
+      }
+    }
+    expect(triggered).toBe(true)
+    expect(detector.isDegenerate).toBe(true)
+    // 触发后再投喂依然保持 true
+    expect(detector.feedDelta('more junk')).toBe(true)
+  })
+})
+
+describe('WorkBuddy 流式推理退化抑制与预算熔断防护（createWorkbuddyChunkCleaner）', () => {
+  it('正常思考帧与正文内容正常透传', () => {
+    const clean = createWorkbuddyChunkCleaner()
+    const r1 = clean(`data: ${JSON.stringify(chunk({ choices: [{ index: 0, delta: { reasoning_content: 'thinking step 1' }, finish_reason: null }] }))}`)
+    const r2 = clean(`data: ${JSON.stringify(chunk({ choices: [{ index: 0, delta: { content: 'hello world' }, finish_reason: null }] }))}`)
+    expect(JSON.parse(r1.slice(5).trim()).choices[0].delta.reasoning_content).toBe('thinking step 1')
+    expect(JSON.parse(r2.slice(5).trim()).choices[0].delta.content).toBe('hello world')
+  })
+
+  it('超过 maxReasoningChars 预算后，抑制后续 reasoning_content 并标记 stopSignal', () => {
+    const stopSignal = { aborted: false }
+    let runawayReason = ''
+    const clean = createWorkbuddyChunkCleaner({
+      maxReasoningChars: 50,
+      stopSignal,
+      onRunaway: (reason) => {
+        runawayReason = reason
+      },
+    })
+
+    // 第一帧 30 字符（未超 50）
+    const r1 = clean(`data: ${JSON.stringify(chunk({ choices: [{ index: 0, delta: { reasoning_content: '123456789012345678901234567890' }, finish_reason: null }] }))}`)
+    expect(r1).not.toBe('')
+    expect(JSON.parse(r1.slice(5).trim()).choices[0].delta.reasoning_content).toBeDefined()
+    expect(stopSignal.aborted).toBe(false)
+
+    // 第二帧再来 30 字符（累计 60 字符，超预算）
+    const r2 = clean(`data: ${JSON.stringify(chunk({ choices: [{ index: 0, delta: { reasoning_content: '123456789012345678901234567890' }, finish_reason: null }] }))}`)
+    expect(stopSignal.aborted).toBe(true)
+    expect(runawayReason).toBe('budget_exhausted')
+    // 触发抑制后，因为全程没有正文，cleaner 会合成 finish_reason: "length" 终止帧
+    expect(r2).toContain('finish_reason')
+    expect(r2).toContain('length')
+    expect(r2).toContain('[DONE]')
+  })
+
+  it('严重死循环退化且全程无正文时，合成 finish_reason: "length" 并终止上游流', () => {
+    const stopSignal = { aborted: false }
+    let runawayReason = ''
+    const clean = createWorkbuddyChunkCleaner({
+      stopSignal,
+      onRunaway: (reason) => {
+        runawayReason = reason
+      },
+    })
+
+    const loopText = 'Writing.\n\nLet me output.\n\nGo.\n\nNow.\n\nOK.\n\n'.repeat(15)
+    // 模拟多次投喂大段重复行以触发连续退化
+    let lastOut = ''
+    for (let i = 0; i < 5; i++) {
+      const out = clean(`data: ${JSON.stringify(chunk({ choices: [{ index: 0, delta: { reasoning_content: loopText }, finish_reason: null }] }))}`)
+      if (out) lastOut = out
+      if (stopSignal.aborted) break
+    }
+
+    expect(stopSignal.aborted).toBe(true)
+    expect(runawayReason).toBe('degenerate_loop')
+    // 输出包含合成的完成帧和 [DONE]
+    expect(lastOut).toContain('finish_reason')
+    expect(lastOut).toContain('length')
+    expect(lastOut).toContain('[DONE]')
+
+    // 终态发出后，后续帧应被丢弃为空串
+    const afterDone = clean(`data: ${JSON.stringify(chunk({ choices: [{ index: 0, delta: { reasoning_content: 'more spam' }, finish_reason: null }] }))}`)
+    expect(afterDone).toBe('')
+  })
+})
+

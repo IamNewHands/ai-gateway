@@ -16,17 +16,149 @@
  * 纯函数 + 一个显式的跨帧状态对象：便于单测，也避免把状态藏在模块级变量里。
  */
 
-/** 帧重建的跨帧状态（一条 SSE 流一个实例）。 */
+/** 判定文本窗口是否呈现典型的短语/行重复推理退化（校准自 log3 与 log4 真实会话数据）。 */
+export function isDegenerateReasoningWindow(
+  text: string,
+  minLines = 20,
+  maxDistinct = 10,
+  minRepeatRatio = 0.85,
+  minOccurrence = 4,
+): boolean {
+  const lines = text.split('\n').map((l) => l.trim()).filter(Boolean)
+  if (lines.length < minLines) return false
+  const counts = new Map<string, number>()
+  for (const l of lines) {
+    counts.set(l, (counts.get(l) ?? 0) + 1)
+  }
+  if (counts.size > maxDistinct) return false
+  let repeated = 0
+  for (const c of counts.values()) {
+    if (c >= minOccurrence) repeated += c
+  }
+  return repeated / lines.length >= minRepeatRatio
+}
+
+/** 连续流式 reasoning delta 退化检测器。 */
+export class WorkbuddyDegeneracyDetector {
+  readonly windowChars: number
+  readonly stride: number
+  readonly minLines: number
+  readonly maxDistinct: number
+  readonly minRepeatRatio: number
+  readonly minOccurrence: number
+  readonly consecutiveTripsRequired: number
+
+  private buffer = ''
+  private lastEvaluatedPos = 0
+  private consecutiveTrips = 0
+  isDegenerate = false
+  totalReasoningChars = 0
+
+  constructor(opts?: {
+    windowChars?: number
+    stride?: number
+    minLines?: number
+    maxDistinct?: number
+    minRepeatRatio?: number
+    minOccurrence?: number
+    consecutiveTrips?: number
+  }) {
+    this.windowChars = opts?.windowChars ?? 2000
+    this.stride = opts?.stride ?? 500
+    this.minLines = opts?.minLines ?? 20
+    this.maxDistinct = opts?.maxDistinct ?? 10
+    this.minRepeatRatio = opts?.minRepeatRatio ?? 0.85
+    this.minOccurrence = opts?.minOccurrence ?? 4
+    this.consecutiveTripsRequired = opts?.consecutiveTrips ?? 3
+  }
+
+  feedDelta(delta: string): boolean {
+    if (this.isDegenerate) return true
+    this.totalReasoningChars += delta.length
+    this.buffer += delta
+
+    while (this.buffer.length - this.lastEvaluatedPos >= this.windowChars) {
+      const win = this.buffer.slice(this.lastEvaluatedPos, this.lastEvaluatedPos + this.windowChars)
+      const trip = isDegenerateReasoningWindow(
+        win,
+        this.minLines,
+        this.maxDistinct,
+        this.minRepeatRatio,
+        this.minOccurrence,
+      )
+      if (trip) {
+        this.consecutiveTrips++
+        if (this.consecutiveTrips >= this.consecutiveTripsRequired) {
+          this.isDegenerate = true
+          return true
+        }
+      } else {
+        this.consecutiveTrips = 0
+      }
+      this.lastEvaluatedPos += this.stride
+    }
+
+    if (this.lastEvaluatedPos > this.windowChars * 2) {
+      this.buffer = this.buffer.slice(this.lastEvaluatedPos)
+      this.lastEvaluatedPos = 0
+    }
+    return this.isDegenerate
+  }
+}
+
+/** 默认最大 reasoning 字符数（约 16k tokens），超过且未产生正文则熔断 */
+export const WORKBUDDY_DEFAULT_MAX_REASONING_CHARS = 65536
+
+/** 流式推理防护配置选项 */
+export interface WorkbuddyStreamOptions {
+  /** 单次请求最大 reasoning 字符上限，默认 65536（0 或负数表示不限） */
+  maxReasoningChars?: number
+  /** 是否启用退化死循环检测，默认 true */
+  enableDegeneracyDetection?: boolean
+  /** 发生严重退化或超预算时的回调通知 */
+  onRunaway?: (kind: 'degenerate_loop' | 'budget_exhausted') => void
+  /** 中止流控制信号 */
+  stopSignal?: { aborted: boolean }
+}
+
+/** 帧重建与推理防护的跨帧状态（一条 SSE 流一个实例）。 */
 export interface WorkbuddyStreamState {
   /** 首帧的真实 id（后续帧缺失/空时续用）；全流无真实 id 才出现哨兵。 */
   firstId: string
   /** tool_calls index → function.name 缓存（跨帧回填被上游清空的 name）。 */
   toolCallNames: Map<number, string>
+  /** 累计 reasoning 字符数 */
+  reasoningChars: number
+  /** 累计正文字符数 */
+  contentChars: number
+  /** 是否已出现 tool_calls */
+  hasToolCalls: boolean
+  /** 是否已触发抑制（一旦抑制，不再下发 reasoning_content） */
+  suppressed: boolean
+  /** 是否已发出合成的截断/完成帧 */
+  terminated: boolean
+  /** 上游模型名称 */
+  model: string
+  /** 退化检测器实例 */
+  detector: WorkbuddyDegeneracyDetector
+  /** 流选项 */
+  options?: WorkbuddyStreamOptions
 }
 
 /** 新建一条流的跨帧状态。 */
-export function newWorkbuddyStreamState(): WorkbuddyStreamState {
-  return { firstId: '', toolCallNames: new Map() }
+export function newWorkbuddyStreamState(options?: WorkbuddyStreamOptions): WorkbuddyStreamState {
+  return {
+    firstId: '',
+    toolCallNames: new Map(),
+    reasoningChars: 0,
+    contentChars: 0,
+    hasToolCalls: false,
+    suppressed: false,
+    terminated: false,
+    model: '',
+    detector: new WorkbuddyDegeneracyDetector(),
+    options,
+  }
 }
 
 /** 全流无真实 id 时使用的哨兵 id（对齐 workbuddy2api normalizeFrame）。 */
@@ -166,6 +298,11 @@ export function processWorkbuddyFrame(payload: string, state: WorkbuddyStreamSta
     return { payload, valid: false }
   }
 
+  // 记录上游 model
+  if (typeof frame['model'] === 'string' && frame['model'] !== '') {
+    state.model = frame['model']
+  }
+
   backfillToolCallNames(frame, state.toolCallNames)
 
   // 首帧 id 透传与哨兵兜底
@@ -174,6 +311,50 @@ export function processWorkbuddyFrame(payload: string, state: WorkbuddyStreamSta
     if (typeof rawId === 'string' && rawId !== '') state.firstId = rawId
   } else if (typeof rawId !== 'string' || rawId === '') {
     frame['id'] = state.firstId
+  }
+
+  // 统计正文与推理，执行退化与预算防护
+  const choices = frame['choices']
+  if (Array.isArray(choices)) {
+    for (const ci of choices) {
+      if (!isObj(ci)) continue
+      const delta = ci['delta']
+      if (!isObj(delta)) continue
+
+      if (typeof delta['content'] === 'string' && delta['content'] !== '') {
+        state.contentChars += delta['content'].length
+      }
+      if (Array.isArray(delta['tool_calls']) && delta['tool_calls'].length > 0) {
+        state.hasToolCalls = true
+      }
+
+      const reasoning = delta['reasoning_content']
+      if (typeof reasoning === 'string' && reasoning !== '') {
+        state.reasoningChars += reasoning.length
+
+        // 退化死循环检测
+        if (state.options?.enableDegeneracyDetection !== false && !state.suppressed) {
+          if (state.detector.feedDelta(reasoning)) {
+            state.suppressed = true
+            state.options?.onRunaway?.('degenerate_loop')
+            if (state.options?.stopSignal) state.options.stopSignal.aborted = true
+          }
+        }
+
+        // 字符预算上限检测
+        const maxChars = state.options?.maxReasoningChars ?? WORKBUDDY_DEFAULT_MAX_REASONING_CHARS
+        if (maxChars > 0 && state.reasoningChars >= maxChars && !state.suppressed) {
+          state.suppressed = true
+          state.options?.onRunaway?.('budget_exhausted')
+          if (state.options?.stopSignal) state.options.stopSignal.aborted = true
+        }
+
+        // 触发抑制后，彻底从输出 delta 中剔除 reasoning_content，防止 UI 刷屏/崩溃
+        if (state.suppressed) {
+          delete delta['reasoning_content']
+        }
+      }
+    }
   }
 
   try {
@@ -187,16 +368,17 @@ export function processWorkbuddyFrame(payload: string, state: WorkbuddyStreamSta
  * 创建一个**有状态**的 WorkBuddy SSE 行清洗器，供 passthroughResponse 的 cleanFn 使用。
  *
  * 与纯函数版 cleanWorkbuddyChunk 的差异：跨帧维护 firstId 与 toolCallNames，
- * 因此必须按流创建实例（不能复用同一函数引用跨请求）。
+ * 并在流式转发中执行推理退化监控、预算熔断、垃圾 reasoning 抑制与优雅截断。
  *
  * 行为：
  *  - 非 `data:` 行 / 空行 → 原样返回（保留 SSE 分隔语义）；
  *  - `[DONE]` → 原样返回（由上层保证只写一次）；
- *  - 有效 data 帧 → 白名单重建；
- *  - 重建后 `choices` 为空数组且无 `usage` → 丢弃该帧（纯噪声）。
+ *  - 有效 data 帧 → 白名单重建与退化/预算防护；
+ *  - 退化且未产出正文时 → 注入合成 finish_reason: "length" 截断帧并通知中止；
+ *  - 重建后 `choices` 为空数组且无 `usage`（或 delta 被抑制为空的帧）→ 丢弃（纯噪声）。
  */
-export function createWorkbuddyChunkCleaner(): (chunk: string) => string {
-  const state = newWorkbuddyStreamState()
+export function createWorkbuddyChunkCleaner(options?: WorkbuddyStreamOptions): (chunk: string) => string {
+  const state = newWorkbuddyStreamState(options)
   return (chunk: string): string => {
     const trimmed = chunk.trim()
     if (!trimmed) return chunk
@@ -207,15 +389,54 @@ export function createWorkbuddyChunkCleaner(): (chunk: string) => string {
     const { payload, valid } = processWorkbuddyFrame(data, state)
     if (!valid) return chunk
 
-    // 噪声帧丢弃：choices 为空且无 usage（上游偶发的空占位帧）
+    // 若触发抑制且全程未产出任何正文/工具调用，且尚未发送终态合成帧
+    if (state.suppressed && !state.terminated && state.contentChars === 0 && !state.hasToolCalls) {
+      state.terminated = true
+      const termObj = {
+        id: state.firstId || WORKBUDDY_SENTINEL_ID,
+        object: 'chat.completion.chunk',
+        created: Math.floor(Date.now() / 1000),
+        model: state.model || 'workbuddy',
+        choices: [
+          {
+            index: 0,
+            delta: {},
+            finish_reason: 'length',
+          },
+        ],
+      }
+      return `data: ${JSON.stringify(termObj)}\n\ndata: [DONE]`
+    }
+
+    // 终态发出后，丢弃后续上游帧
+    if (state.terminated) {
+      return ''
+    }
+
+    // 噪声帧丢弃：choices 为空且无 usage，或 reasoning 被抑制后 delta 完全为空且无 finish_reason
     try {
       const obj = JSON.parse(payload) as Record<string, unknown>
       const chs = obj['choices']
-      if (Array.isArray(chs) && chs.length === 0 && (obj['usage'] === null || obj['usage'] === undefined)) {
-        return ''
+      if (Array.isArray(chs)) {
+        if (chs.length === 0 && (obj['usage'] === null || obj['usage'] === undefined)) {
+          return ''
+        }
+        if (chs.length === 1 && isObj(chs[0])) {
+          const delta = (chs[0] as Record<string, unknown>)['delta']
+          const fr = (chs[0] as Record<string, unknown>)['finish_reason']
+          if (
+            isObj(delta) &&
+            Object.keys(delta).length === 0 &&
+            (fr === null || fr === undefined) &&
+            (obj['usage'] === null || obj['usage'] === undefined)
+          ) {
+            return ''
+          }
+        }
       }
     } catch { /* 保持原 payload */ }
 
     return `data: ${payload}`
   }
 }
+

@@ -11,6 +11,8 @@ import {
   backfillReasoningContent,
   injectWorkbuddyChatHeaders,
   ensureWorkbuddyStreamOptions,
+  ensureWorkbuddyMaxTokens,
+  WORKBUDDY_DEFAULT_MAX_TOKENS,
   CST_OFFSET_MS,
   isAccountBanned,
   WORKBUDDY_CLIENT_VERSION,
@@ -885,4 +887,54 @@ describe('WorkbuddyClientError 与 formatWorkbuddyClientErrorMessage 客户端�
     expect(res.message).toBe('上游请求参数错误 (HTTP 400)：INVALID_REQUEST')
   })
 })
+
+describe('ensureWorkbuddyMaxTokens（WorkBuddy 出站 max_tokens 安全护栏）', () => {
+  it('未提供 max_tokens 与 max_completion_tokens 时自动注入默认 32768', () => {
+    const body: Record<string, unknown> = { model: 'deepseek-v4-flash' }
+    ensureWorkbuddyMaxTokens(body)
+    expect(body['max_tokens']).toBe(WORKBUDDY_DEFAULT_MAX_TOKENS)
+    expect(body['max_tokens']).toBe(32768)
+  })
+
+  it('已提供有效正数 max_tokens 时原样保留不被覆盖', () => {
+    const body: Record<string, unknown> = { model: 'deepseek-v4-flash', max_tokens: 4096 }
+    ensureWorkbuddyMaxTokens(body)
+    expect(body['max_tokens']).toBe(4096)
+  })
+
+  it('已提供有效正数 max_completion_tokens 时不额外注入 max_tokens', () => {
+    const body: Record<string, unknown> = { model: 'deepseek-v4-flash', max_completion_tokens: 8192 }
+    ensureWorkbuddyMaxTokens(body)
+    expect(body['max_tokens']).toBeUndefined()
+    expect(body['max_completion_tokens']).toBe(8192)
+  })
+
+  it('非正数或无效 max_tokens 触发安全注入', () => {
+    const body1: Record<string, unknown> = { model: 'glm-5.2', max_tokens: 0 }
+    ensureWorkbuddyMaxTokens(body1)
+    expect(body1['max_tokens']).toBe(32768)
+
+    const body2: Record<string, unknown> = { model: 'glm-5.2', max_tokens: -100 }
+    ensureWorkbuddyMaxTokens(body2)
+    expect(body2['max_tokens']).toBe(32768)
+
+    const body3: Record<string, unknown> = { model: 'glm-5.2', max_tokens: null }
+    ensureWorkbuddyMaxTokens(body3)
+    expect(body3['max_tokens']).toBe(32768)
+  })
+
+  it('支持自定义 defaultTokens 参数', () => {
+    const body: Record<string, unknown> = { model: 'qwen-coder' }
+    ensureWorkbuddyMaxTokens(body, 16384)
+    expect(body['max_tokens']).toBe(16384)
+  })
+
+  it('幂等：连续调用两次结果完全一致', () => {
+    const body: Record<string, unknown> = { model: 'deepseek-v4-flash' }
+    ensureWorkbuddyMaxTokens(body)
+    ensureWorkbuddyMaxTokens(body)
+    expect(body['max_tokens']).toBe(32768)
+  })
+})
+
 
