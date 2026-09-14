@@ -540,6 +540,11 @@ function cleanWorkbuddyChunk(chunk: string): string {
  * - 不硬编码 application/json 作为 fallback（SSE 流的 Content-Type 是 text/event-stream）
  * - 添加 X-Accel-Buffering: no 防止中间代理缓冲 SSE 流
  * - 保留上游的 Transfer-Encoding 相关行为（Workers 自动处理 chunked）
+ *
+ * P2-4：带 cleanFn 的路径（WorkBuddy 池化 / WorkBuddy 非池化 SSE 重建）会在输出流外层套
+ * withSSEKeepAlive 空闲兜底（SSE_IDLE_TIMEOUT_MS = 180s）——上游超过该时长完全无数据时主动结束流，
+ * 防止长思考/挂死流无限占用。不注入心跳（keepAliveMs=0）：避免 `: keep-alive` 注释行被 cleanFn
+ * 误处理后破坏 SSE 帧结构。
  */
 function passthroughResponse(
   response: Response,
@@ -621,7 +626,13 @@ function passthroughResponse(
     try { await writer.close() } catch { /* already closed */ }
   })()
 
-  return new Response(readable, {
+  // P2-4 空闲监控断流：SSE（重建/清洗）路径包 idle 兜底。
+  // 上游（长思考/挂死）超过 SSE_IDLE_TIMEOUT_MS 无任何数据时主动结束流，防止无限挂起占资源。
+  // 与其它 SSE 路径（withSSEKeepAlive）共用同一 idle 阈值，保持行为一致。
+  // 心跳不在此注入（keepAliveMs=0）：避免 `: keep-alive` 注释行被上方 cleanFn 误处理后破坏
+  // SSE 帧结构——该路径核心是「上游空闲断流」而非「客户端防断流」（后者由更外层承担）。
+  const guardedBody = withSSEKeepAlive(readable, 0, SSE_IDLE_TIMEOUT_MS)
+  return new Response(guardedBody, {
     status: response.status,
     statusText: response.statusText,
     headers,
