@@ -60,7 +60,7 @@
     人工审核），--run 一律跳过。
 
 ============================================================
-逆向依据（解包 ~/analysis/wxapp/wx907c65e5e107ddcf_unpacked/ +
+逆向依据（解包 ~/analysis/wxapp/wx_codebuddy_mp_unpacked/ +
       H5 bundle https://download.codebuddy.cn/web/website/<hash>/assets/
       events/school-season-CYeXjFHI.js）
 ============================================================

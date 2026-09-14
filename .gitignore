@@ -21,3 +21,7 @@ pnpm-workspace.yaml
 # Python 缓存
 __pycache__/
 *.pyc
+# 本地凭证与环境配置文件，绝不提交
+*accounts*.json
+.env
+.env.*
