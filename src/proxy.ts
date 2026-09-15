@@ -2282,6 +2282,13 @@ async function proxyOAuthRequest(
       // DeepSeek 思维链注入与历史消息一致性回填
       injectDeepSeekThinking(body)
       backfillReasoningContent(body)
+      // global 兜底 system 注入（对齐 workbuddy2api ensureConsoleSystem / PR #45）：
+      // 非池化单账号路径此前缺失——global 账号首条非 system 时上游会 400
+      // code 11128「first message is not system prompt」。仅 global 且 chat 路径
+      //（与池化路径 1872 行同一时序：per-request realm 已确定）。
+      if (r === 'global' && subPath === 'chat/completions') {
+        ensureGlobalFallbackSystem(body)
+      }
     }
     const headers = buildOauthHeaders(cfg, token, { origin: buildOrigin(r), apiType: provider.apiType, cookies: tokenState?.cookies })
     if (isWorkbuddyProvider(provider)) {
