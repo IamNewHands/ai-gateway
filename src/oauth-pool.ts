@@ -117,21 +117,37 @@ const POOL_CACHE_TTL_MS = 1000
 
 // ===== 挑选运行态（内存态，不写 KV；隔离重启归零，多隔离实例各自记账） =====
 
-/** 单账号运行态：最近被选中时刻 + 成功计数（内存优先，成功率因子用）。 */
+/** 单账号运行态：最近被选中时刻 + 成功计数 + 成功率 EMA（内存优先，成功率因子用）。 */
 interface PickRuntimeStats {
   lastUsed: number
   successCount: number
+  /** 成功率 EMA（移植 workbuddy2api 180d807）：successEMA/(successEMA+errorEMA)。 */
+  successEMA: number
+  errorEMA: number
 }
 
 const pickRuntime = new Map<string, PickRuntimeStats>()
 const runtimeKey = (providerId: string, uid: string) => `${providerId}:${uid}`
 
-/** 取（或以 seed 初始化）账号运行态。 */
-function touchRuntimeStats(providerId: string, uid: string, seedSuccessCount = 0): PickRuntimeStats {
+/** 成功率 EMA 的衰减系数（与成本账本 cost EMA α=0.3 保持一致）。 */
+const SUCCESS_EMA_ALPHA = 0.3
+
+/**
+ * 取（或以 seed 初始化）账号运行态。
+ * EMA 播种为「历史成功/累计」比例（successEMA=sc/total, errorEMA=et/total），
+ * 令隔离重启后以观测到的最新 KV 快照为起点，行为与旧终身比例口径相互兼容。
+ */
+function touchRuntimeStats(providerId: string, uid: string, seedSuccessCount = 0, seedErrTotal = 0): PickRuntimeStats {
   const key = runtimeKey(providerId, uid)
   let rt = pickRuntime.get(key)
   if (!rt) {
-    rt = { lastUsed: 0, successCount: seedSuccessCount }
+    const total = seedSuccessCount + seedErrTotal
+    rt = {
+      lastUsed: 0,
+      successCount: seedSuccessCount,
+      successEMA: total > 0 ? seedSuccessCount / total : 0,
+      errorEMA: total > 0 ? seedErrTotal / total : 0,
+    }
     pickRuntime.set(key, rt)
   }
   return rt
@@ -157,11 +173,13 @@ const IDLE_WEIGHT_MAX = 5.0
 const HARD_COOL_REASON_RE = /余额|1005|plan|credit|402|insufficient|quota/i
 
 /**
- * 三因子权重（对齐 workbuddy2api weightOf）：
+ * 三因子权重（对齐 workbuddy2api weightOf，成功率项移植 180d807 EMA）：
  *   weight = credits 比例 ×10 + 闲置补偿 + 成功率 ×3
  *   - credits 比例 = 该号 credits / 候选集内最大 credits（避免量纲爆炸）
  *   - 闲置补偿 = min(距 lastUsed 小时数 × 0.5, 5.0)；从未使用给满分
- *   - 成功率 = successCount/(successCount+errTotal)；无记录给 1.5（中性偏信任）
+ *   - 成功率 = successEMA/(successEMA+errorEMA)（EMA 衰减口径，让近期行为主导——
+ *     旧终身累计口径下历史错误是分母的永久部分，上游修复后权重永久回不来）；
+ *     无请求记录给 1.5（中性偏信任）
  * credits 全 0 时仍按闲置 + 成功率加权（不退化均匀随机）。
  */
 function accountWeight(providerId: string, acc: OAuthPoolAccount, maxCredits: number, now: number): number {
@@ -183,12 +201,16 @@ function accountWeight(providerId: string, acc: OAuthPoolAccount, maxCredits: nu
     w += Math.max(0, idleW)
   }
 
-  // 3. 成功率 ×3（successCount 内存优先，回退 KV 快照；errTotal 以 KV 为准）
-  const successCount = rt?.successCount ?? st?.successCount ?? 0
-  const errTotal = st?.errTotal ?? 0
-  const totalReq = successCount + errTotal
-  if (totalReq > 0) {
-    w += (successCount / totalReq) * 3
+  // 3. 成功率 ×3（EMA 口径：运行态优先，回退用 KV 快照比例播种）
+  const rtEma = rt
+  const sc = st?.successCount ?? 0
+  const et = st?.errTotal ?? 0
+  const kTotal = sc + et
+  const successEMA = rtEma ? rtEma.successEMA : (kTotal > 0 ? sc / kTotal : 0)
+  const errorEMA = rtEma ? rtEma.errorEMA : (kTotal > 0 ? et / kTotal : 0)
+  const obs = successEMA + errorEMA
+  if (obs > 0) {
+    w += (successEMA / obs) * 3
   } else {
     w += 1.5
   }
@@ -795,6 +817,10 @@ export async function noteOauthError(env: Env, providerId: string, uid: string, 
   const st = acc.state || { credits: 0, disabled: false, until: 0, errCount: 0 }
   const errCount = (st.errCount || 0) + 1
   const errTotal = (st.errTotal || 0) + 1
+  // 成功率 EMA：错误事件抬高 errorEMA、衰减 successEMA（移植 workbuddy2api 180d807）。
+  const rt = touchRuntimeStats(providerId, uid, st.successCount || 0, st.errTotal || 0)
+  rt.errorEMA += (1 - rt.errorEMA) * SUCCESS_EMA_ALPHA
+  rt.successEMA *= (1 - SUCCESS_EMA_ALPHA)
   if (errCount >= cd.errThreshold) {
     acc.state = { ...st, errCount: 0, errTotal, lastErr: Date.now(), until: Date.now() + cd.errMs, reason: 'consecutive errors' }
   } else {
@@ -817,8 +843,11 @@ export async function noteOauthSuccess(env: Env, providerId: string, uid: string
   const acc = pool.find((a) => a.uid === uid)
   if (!acc) return
   const st = acc.state || { credits: 0, disabled: false, until: 0, errCount: 0 }
-  const rt = touchRuntimeStats(providerId, uid, st.successCount || 0)
+  const rt = touchRuntimeStats(providerId, uid, st.successCount || 0, st.errTotal || 0)
   rt.successCount++
+  // 成功率 EMA：成功事件抬高 successEMA、衰减 errorEMA（移植 180d807）。
+  rt.successEMA += (1 - rt.successEMA) * SUCCESS_EMA_ALPHA
+  rt.errorEMA *= (1 - SUCCESS_EMA_ALPHA)
   const hadErr = (st.errCount || 0) > 0 || (st.sessionDeadFails || 0) > 0
   if (hadErr || rt.successCount % SUCCESS_FLUSH_EVERY === 0) {
     acc.state = {

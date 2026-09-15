@@ -1035,6 +1035,25 @@ describe('global 模型目录动态探测解析 parseWorkbuddyGlobalModels（移
     expect(out!.map((m) => m.id)).toEqual(['a', 'b'])
   })
 
+  it('对象形态：解析积分倍率 credits / 中文描述 descriptionZh / tags（对齐源实现 ModelInfo）', () => {
+    const raw = JSON.stringify({
+      code: 0,
+      data: {
+        models: [
+          { id: 'hy3', credits: 'x0.05', descriptionZh: '混元思考模型', tags: ['badge:限时免费', 'thinking'] },
+          { id: 'free-model', credits: 'x0.00 credits' },
+          { id: 'no-meta' },
+        ],
+      },
+    })
+    const out = parseWorkbuddyGlobalModels(raw)
+    expect(out![0]).toMatchObject({ id: 'hy3', credits: 'x0.05', descriptionZh: '混元思考模型', tags: ['badge:限时免费', 'thinking'] })
+    expect(out![1].credits).toBe('x0.00 credits')
+    expect(out![1].descriptionZh).toBeUndefined()
+    expect(out![2]).toMatchObject({ id: 'no-meta' })
+    expect(out![2].credits).toBeUndefined()
+  })
+
   it('code!=0 / 非 JSON / data 缺 models / 空名单 → null（回落静态）', () => {
     expect(parseWorkbuddyGlobalModels(JSON.stringify({ code: 1, data: {} }))).toBeNull()
     expect(parseWorkbuddyGlobalModels('not-json')).toBeNull()

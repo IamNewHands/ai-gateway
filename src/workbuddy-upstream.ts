@@ -763,6 +763,12 @@ export interface WorkbuddyGlobalModelEntry {
   displayName?: string
   supportedEfforts?: string[]
   defaultEffort?: string
+  /** 积分倍率原文（对齐源实现 ModelInfo.Credits，如 "x0.05"），仅展示不参与选号。 */
+  credits?: string
+  /** 中文描述（对齐源实现 descriptionZh）。 */
+  descriptionZh?: string
+  /** 模型标签（对齐源实现 tags，含 badge:限时免费 等）。 */
+  tags?: string[]
 }
 
 /**
@@ -816,6 +822,14 @@ export function parseWorkbuddyGlobalModels(raw: string): WorkbuddyGlobalModelEnt
     const entry: WorkbuddyGlobalModelEntry = { id }
     const name = typeof rec['name'] === 'string' ? rec['name'].trim() : ''
     if (name !== '' && name !== id) entry.displayName = name
+    // 积分倍率 / 中文描述 / 标签（对齐源实现 ModelInfo.Credits/DescriptionZh/Tags，
+    // 仅展示透出，不参与选号）。
+    if (typeof rec['credits'] === 'string' && rec['credits'].trim() !== '') entry.credits = rec['credits'].trim()
+    if (typeof rec['descriptionZh'] === 'string' && rec['descriptionZh'].trim() !== '') entry.descriptionZh = rec['descriptionZh'].trim()
+    if (Array.isArray(rec['tags'])) {
+      const tags = rec['tags'].filter((t): t is string => typeof t === 'string' && t.trim() !== '')
+      if (tags.length > 0) entry.tags = tags
+    }
     const rz = rec['reasoning']
     if (rz && typeof rz === 'object') {
       const r = rz as Record<string, unknown>

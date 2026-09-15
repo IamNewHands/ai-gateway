@@ -66,6 +66,8 @@ import {
   injectWorkbuddyChatHeaders,
   ensureWorkbuddyStreamOptions,
   ensureWorkbuddyMaxTokens,
+  parseWorkbuddyGlobalModels,
+  WORKBUDDY_GLOBAL_MODELS_PROBE_PATHS,
   isAccountBanned,
   ensureGlobalFallbackSystem,
   sanitizeWorkbuddyMessages,
@@ -2404,6 +2406,75 @@ async function proxyOAuthRequest(
   }
 }
 
+/** 积分倍率展示前缀（对齐 workbuddy2api fmtCreditsPrefix）："x0.05 credits"/"x0.29" → "[x0.05 credit]"。 */
+function fmtWorkbuddyCreditsPrefix(raw: string): string {
+  const s = raw.trim().replace(/\s*credits$/i, '').trim()
+  return s !== '' ? `[${s} credit]` : ''
+}
+
+/** 模型倍率元数据缓存：providerId → modelId → { credits, descriptionZh }；null = 无可用元数据。 */
+const wbModelMetaCache = new Map<string, { meta: Map<string, { credits: string; descriptionZh: string }> | null; at: number; ok: boolean }>()
+const WB_MODEL_META_TTL_MS = 60 * 60 * 1000
+const WB_MODEL_META_FAIL_MS = 5 * 60 * 1000
+
+/**
+ * 探测 workbuddy（global）模型目录的积分倍率/描述元数据，供 /v1/models live-join 展示。
+ * 仅对象形态携带元数据（对齐源实现 ModelInfo）；窄表/失败/负缓存/非 global 账号 → null。
+ * 成功 1h 缓存、失败 5min 负缓存（与 admin 侧 global 模型探测同口径）。
+ */
+async function getWorkbuddyGlobalModelMeta(env: Env, provider: import('./types').Provider): Promise<Map<string, { credits: string; descriptionZh: string }> | null> {
+  if (!isWorkbuddyProvider(provider) || !provider.oauth) return null
+  const now = Date.now()
+  const cached = wbModelMetaCache.get(provider.id)
+  if (cached) {
+    const freshWindow = cached.ok ? WB_MODEL_META_TTL_MS : WB_MODEL_META_FAIL_MS
+    if (now - cached.at < freshWindow) return cached.meta
+  }
+  const cfg = provider.oauth
+  let token: string | null = null
+  try { token = await getOauthAccessToken(env, provider.id, cfg) } catch { token = null }
+  if (!token || detectTokenRealm(token) !== 'global') {
+    wbModelMetaCache.set(provider.id, { meta: null, at: now, ok: false })
+    return null
+  }
+  const tokenState = await readOauthToken(env, provider.id).catch(() => null)
+  const globalBase = (cfg.globalBaseUrl ? cfg.globalBaseUrl.replace(/\/$/, '') : provider.baseUrl.replace(/\/$/, ''))
+  for (const path of WORKBUDDY_GLOBAL_MODELS_PROBE_PATHS) {
+    try {
+      const headers = buildOauthHeaders(cfg, token, {
+        origin: cfg.globalOrigin,
+        apiType: provider.apiType,
+        cookies: tokenState?.cookies,
+      })
+      injectWorkbuddyChatHeaders(
+        headers,
+        token,
+        'global',
+        tokenState ? { uid: tokenState.uid, enterprise_id: tokenState.enterprise_id, domain: tokenState.domain, device_token: tokenState.device_token } : undefined,
+        cfg,
+        { chatPath: false },
+      )
+      const response = await fetch(globalBase + path, {
+        method: 'GET',
+        headers,
+        signal: AbortSignal.timeout(10000),
+      })
+      if (!response.ok) continue
+      const entries = parseWorkbuddyGlobalModels(await response.text())
+      if (entries && entries.length > 0) {
+        const meta = new Map<string, { credits: string; descriptionZh: string }>()
+        for (const e of entries) {
+          if (e.credits || e.descriptionZh) meta.set(e.id, { credits: e.credits || '', descriptionZh: e.descriptionZh || '' })
+        }
+        wbModelMetaCache.set(provider.id, { meta, at: now, ok: true })
+        return meta
+      }
+    } catch { /* 尝试下一个候选路径 */ }
+  }
+  wbModelMetaCache.set(provider.id, { meta: null, at: now, ok: false })
+  return null
+}
+
 /** 处理 /v1/models — 返回所有已启用的模型（含提供商前缀）。
  * 全量列表在内存中缓存（TTL 同 providers，可经管理后台「内存缓存」查看/清空），
  * 之后按转发 Key 的 allowedModels 逐请求过滤；并回写 Cache-Control 让客户端/CDN 缓存。 */
@@ -2423,6 +2494,9 @@ export async function handleModels(c: Context<AppEnv>) {
     object: string
     created: number
     owned_by: string
+    /** workbuddy global 积分倍率展示（live-join，可选） */
+    description?: string
+    credits?: string
   }> = cached ? JSON.parse(cached) : []
 
   if (!cached) {
@@ -2430,17 +2504,35 @@ export async function handleModels(c: Context<AppEnv>) {
     const nowTs = Math.floor(Date.now() / 1000)
     for (const provider of providers) {
       if (!provider.enabled) continue
+      // workbuddy 提供商：live-join 上游 global 目录的积分倍率/描述（非 workbuddy/无 global 账号 → null 零开销）。
+      const wbMeta = isWorkbuddyProvider(provider) ? await getWorkbuddyGlobalModelMeta(c.env, provider) : null
       for (const model of provider.models) {
         if (!model.enabled) continue
         const fullId = `${provider.id}/${model.id}`
-        models.push({
+        const entry: {
+          id: string
+          provider: string
+          provider_name: string
+          object: string
+          created: number
+          owned_by: string
+          description?: string
+          credits?: string
+        } = {
           id: fullId,
           provider: provider.id,
           provider_name: provider.name,
           object: 'model',
           created: nowTs,
           owned_by: provider.id,
-        })
+        }
+        const meta = wbMeta?.get(model.id)
+        if (meta && (meta.credits || meta.descriptionZh)) {
+          const prefix = fmtWorkbuddyCreditsPrefix(meta.credits)
+          entry.description = `${prefix} ${meta.descriptionZh}`.trim()
+          if (meta.credits) entry.credits = meta.credits
+        }
+        models.push(entry)
       }
     }
     // 注入联合模型（uni-model）条目（模型 ID 形如 unimodel/xxx）
