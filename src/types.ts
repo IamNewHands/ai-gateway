@@ -37,9 +37,10 @@ export interface Provider {
   models: Model[]
   enabled: boolean
   /**
-   * 工具桥开关（当前用于 CNB 提供商）。上游禁原生 tools（403 Agent calls not allowed），
-   * 开启后网关把客户端 tools 转成 XYML 提示词注入（见 src/cnb/xyml.ts），
-   * 并将模型输出的 XYML 文本流式解析回标准 tool_calls 返回客户端。
+   * 工具桥开关（当前用于 CNB 提供商）。开启后支持工具调用：
+   * 优先走原生工具路径（tools 加 cnb_ 前缀、丢弃 tool_choice，上游原生返回 delta.tool_calls），
+   * 若上游返回 403 "Agent calls not allowed" 则自动降级到 XYML 提示词注入
+   * （见 src/cnb/xyml.ts），模型文本流经 ToolSieve 流式解析回 tool_calls。
    */
   toolBridge?: boolean
   /**

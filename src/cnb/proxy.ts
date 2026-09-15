@@ -1,5 +1,5 @@
 /**
- * proxy.ts — CNB（cnb.cool）上游转发（移植自 lwjlwjlwjlwj/cnb2api，MIT）。
+ * proxy.ts — CNB（cnb.cool）上游转发（移植自 Mooling0602/cnb2api，MIT）。
  *
  * 核心链路：
  *   1. GET https://cnb.cool/ 首页 → 提取 Set-Cookie 里的 csrfkey（32hex）+
@@ -11,9 +11,15 @@
  *      provider.cnbPool 覆盖）；过期/连续失败自动淘汰、低于 min 后台补证；
  *      内存 + KV 双缓存（冷启动复用），401/403 含 csrf 关键字自动换证重试。
  *
- * 工具桥（provider.toolBridge）：上游禁原生 tools（403 Agent calls not allowed），
- * 开启后把客户端 tools 转成 XYML 提示词注入（见 ./xyml.ts），模型文本流经 ToolSieve
- * 流式解析回标准 tool_calls 返回客户端。
+ * 工具调用（provider.toolBridge）：
+ *   原生路径（移植自 cnb2api）：CNB 上游支持原生 tools，但工具名必须加 cnb_ 前缀
+ *   （白名单要求），且 tool_choice 字段触发 403 "Agent calls not allowed"。
+ *   网关自动加前缀、丢弃 tool_choice、响应时还原原名，上游原生返回 delta.tool_calls。
+ *   若上游仍返回 403 "Agent calls not allowed"（上游变更/不支持原生工具），自动降级到
+ *   XYML 提示词注入路径（见 ./xyml.ts），模型文本流经 ToolSieve 流式解析回 tool_calls。
+ *
+ * 内容清洗：上游对特定 emoji（🇹🇼 U+1F1F9 U+1F1FC）返回 500，转发前替换为 "tw"。
+ * 推理控制：默认注入 reasoning_effort=low；客户端未传 max_tokens 时默认 60000。
  */
 
 import type { Env, Provider } from '../types'
@@ -23,6 +29,7 @@ import {
   renderToolCall,
   openAIToolCalls,
   randomId,
+  randomCallId,
   scrubToolFragments,
   ToolSieve,
 } from './xyml'
@@ -234,11 +241,54 @@ function isCsrfErrorBody(body: string): boolean {
     lower.includes('csrf 校验失败')
 }
 
+// ===== 原生工具支持（移植自 cnb2api internal/toolconv/toolconv.go） =====
+
+/**
+ * 工具名重命名器：转发上游前加 cnb_ 前缀（上游白名单要求），响应时还原原名。
+ * 对应 cnb2api toolconv.Renamer。
+ */
+export class CnbToolRenamer {
+  private map = new Map<string, string>()
+  /** 加前缀并记录映射；已有 cnb_ 前缀则原样返回 */
+  forward(name: string): string {
+    if (!name || name.startsWith('cnb_')) return name
+    const up = 'cnb_' + name
+    this.map.set(up, name)
+    return up
+  }
+  /** 还原原名；未命中映射则原样返回 */
+  restore(name: string): string {
+    return this.map.get(name) ?? name
+  }
+}
+
+/**
+ * 清洗转发上游的请求体 JSON，规避上游已知 bug。
+ * 移植自 cnb2api internal/upstream/client.go 的 sanitizeUpstreamBody。
+ * 🇹🇼 (U+1F1F9 U+1F1FC) 会让上游返回 500，替换为 "tw"。
+ */
+export function sanitizeUpstreamBody(body: string): string {
+  // 🇹🇼 是 U+1F1F9 U+1F1FC（regional indicator T + W）
+  return body.replaceAll('\u{1F1F9}\u{1F1FC}', 'tw')
+}
+
+/** 判定 403 响应体是否 "Agent calls not allowed"（原生工具被拒，需降级 XYML）。 */
+function isAgentCallsNotAllowed(body: string): boolean {
+  const lower = body.toLowerCase()
+  return lower.includes('agent calls not allowed') ||
+    lower.includes('agent_calls_not_allowed')
+}
+
 // ===== 请求体构造 =====
 
-interface CnbMessage {
+/** CNB 上游消息格式（供测试引用） */
+export interface CnbMessage {
   role: string
   content: string
+  /** 原生工具调用（assistant 消息，nativeTools 模式下保留） */
+  tool_calls?: Array<{ id: string; type: string; function: { name: string; arguments: string } }>
+  /** 工具结果消息的关联 ID（tool 角色，nativeTools 模式下保留） */
+  tool_call_id?: string
 }
 
 interface UpstreamBodyInput {
@@ -249,6 +299,8 @@ interface UpstreamBodyInput {
   top_p?: unknown
   enable_thinking?: unknown
   presence_penalty?: unknown
+  max_tokens?: unknown
+  reasoning_effort?: unknown
 }
 
 function stripModelPrefix(model: string): string {
@@ -291,12 +343,20 @@ function jsonSafe(value: unknown): string {
 }
 
 /**
- * 消息转换：OpenAI 标准消息（含 tool_calls / tool 角色）→ CNB 可接受的 user/assistant 文本序列。
- * bridge=true 时：assistant 的 tool_calls 渲染成 XYML 文本、tool 结果转 [Tool Result id=...]。
+ * 消息转换：OpenAI 标准消息（含 tool_calls / tool 角色）→ CNB 可接受的消息序列。
+ *
+ * 三种模式：
+ * - nativeTools=true：assistant 的 tool_calls 原样保留（名称加 cnb_ 前缀），
+ *   tool 角色保留 role=tool + tool_call_id（上游要求配对）。
+ * - bridge=true（XYML 降级）：assistant 的 tool_calls 渲染成 XYML 文本、
+ *   tool 结果转 [Tool Result id=...]。
+ * - 都不开启：tool_calls / tool 转文本描述。
  */
-function convertMessages(
+export function convertMessages(
   rawMessages: unknown,
   bridge: boolean,
+  nativeTools: boolean,
+  renamer: CnbToolRenamer,
 ): CnbMessage[] {
   const msgs = Array.isArray(rawMessages) ? rawMessages : []
   const converted: CnbMessage[] = []
@@ -323,10 +383,14 @@ function convertMessages(
       appendUser('[工具执行结果] ' + (content || '(tool result)'))
       continue
     }
-    // tool 角色 → user（携带 id 信息）
+    // tool 角色：原生模式保留 role=tool + tool_call_id，否则降级为 user 文本
     if (role === 'tool') {
       const toolCallId = typeof msg.tool_call_id === 'string' ? msg.tool_call_id : ''
       const name = typeof msg.name === 'string' ? msg.name : ''
+      if (nativeTools) {
+        converted.push({ role: 'tool', content: content || '(tool result)', tool_call_id: toolCallId })
+        continue
+      }
       if (bridge) {
         const header = `[Tool Result id=${toolCallId || 'unknown'}${name ? ` name=${name}` : ''}]`
         appendUser(`${header}\n${content || '(tool result)'}`)
@@ -335,8 +399,30 @@ function convertMessages(
       }
       continue
     }
-    // assistant 带 tool_calls：bridge 渲染 XYML，否则转说明文本
+    // assistant 带 tool_calls
     if (role === 'assistant' && Array.isArray(msg.tool_calls) && msg.tool_calls.length) {
+      // 原生模式：保留 tool_calls 结构，名称加 cnb_ 前缀
+      if (nativeTools) {
+        const upCalls = msg.tool_calls
+          .filter((c): c is Record<string, unknown> => Boolean(c && typeof c === 'object'))
+          .map((call) => {
+            const fn = (call.function || {}) as Record<string, unknown>
+            const fnName = typeof fn.name === 'string' ? fn.name : ''
+            const fnArgs = typeof fn.arguments === 'string'
+              ? fn.arguments
+              : jsonSafe(fn.arguments ?? {})
+            return {
+              id: typeof call.id === 'string' ? call.id : randomCallId(),
+              type: 'function',
+              function: { name: renamer.forward(fnName), arguments: fnArgs },
+            }
+          })
+        if (upCalls.length) {
+          converted.push({ role: 'assistant', content: content || '', tool_calls: upCalls })
+          continue
+        }
+      }
+      // XYML / 文本降级
       const blocks: string[] = []
       if (content.trim()) blocks.push(content)
       if (bridge) {
@@ -369,7 +455,7 @@ function convertMessages(
     }
     converted.push({ role, content })
   }
-  // 清理空 user 消息与尾部空 user
+  // 清理空 user 消息与尾部空 user（原生 tool 消息不清理——content 可能为空但 tool_call_id 有意义）
   const cleaned: CnbMessage[] = []
   for (let i = 0; i < converted.length; i++) {
     const c = converted[i]
@@ -386,19 +472,66 @@ function safeParse(value: string): unknown {
   try { return JSON.parse(value) } catch { return value }
 }
 
-function buildUpstreamBody(input: UpstreamBodyInput, messages: CnbMessage[], tools: unknown, bridge: boolean): Record<string, unknown> {
+export function buildUpstreamBody(
+  input: UpstreamBodyInput,
+  messages: CnbMessage[],
+  tools: unknown[],
+  bridge: boolean,
+  nativeTools: boolean,
+  renamer: CnbToolRenamer,
+): Record<string, unknown> {
   const body: Record<string, unknown> = {
     model: stripModelPrefix(String(input.model || CNB_MODELS[0])),
     stream: true, // 上游强制流式
     messages,
-    // 强制 maxTokens 避免长上下文被截断（deepseek-v4 默认支持 65k 输出）
-    maxTokens: 60000,
   }
+  // 尊重客户端 max_tokens；未传时默认 60000（移植自 cnb2api）
+  const maxTokens = typeof input.max_tokens === 'number' && input.max_tokens > 0
+    ? input.max_tokens
+    : 60000
+  body.maxTokens = maxTokens
   for (const key of ['temperature', 'top_p', 'enable_thinking', 'presence_penalty'] as const) {
     if (input[key] !== undefined && input[key] !== null) body[key] = input[key]
   }
-  // 工具桥：注入 XYML 提示词、剥掉原生 tools（上游禁止）
-  if (bridge && Array.isArray(tools) && tools.length) {
+  // reasoning_effort：客户端未指定时默认 low（移植自 cnb2api，enable_thinking 单独不触发思考）
+  if (input.reasoning_effort !== undefined && input.reasoning_effort !== null) {
+    body.reasoning_effort = input.reasoning_effort
+  } else {
+    body.reasoning_effort = 'low'
+  }
+  // 原生工具：tools 数组加 cnb_ 前缀，丢弃 tool_choice（触发 403）
+  if (nativeTools && tools.length) {
+    body.tools = tools.map((t) => {
+      if (!t || typeof t !== 'object') return null
+      const raw = t as Record<string, unknown>
+      // OpenAI 格式 {type:'function', function:{name,...}}
+      if (raw.type === 'function' && raw.function && typeof raw.function === 'object') {
+        const fn = raw.function as Record<string, unknown>
+        return {
+          type: 'function',
+          function: {
+            name: renamer.forward(String(fn.name || '')),
+            description: fn.description || '',
+            parameters: fn.parameters || { type: 'object', properties: {} },
+          },
+        }
+      }
+      // 裸格式 {name, description, parameters}
+      if (typeof raw.name === 'string') {
+        return {
+          type: 'function',
+          function: {
+            name: renamer.forward(raw.name),
+            description: raw.description || '',
+            parameters: raw.parameters || { type: 'object', properties: {} },
+          },
+        }
+      }
+      return null
+    }).filter(Boolean)
+    // tool_choice 不转发（实测触发 403 "Agent calls not allowed"）
+  } else if (bridge && tools.length) {
+    // XYML 桥：注入提示词、剥掉原生 tools（上游禁止）
     let messages2 = messages
     const instructions = buildToolInstructions(tools)
     if (messages2.length && messages2[0].role === 'system') {
@@ -421,6 +554,8 @@ async function chatOnce(
   upBody: Record<string, unknown>,
   csrf: CnbCsrf,
 ): Promise<Response> {
+  // 清洗请求体：上游对特定 emoji（🇹🇼）返回 500（移植自 cnb2api）
+  const bodyStr = sanitizeUpstreamBody(JSON.stringify(upBody))
   const resp = await streamFetchWithTimeout(CNB_BASE_URL + CNB_CHAT_PATH, {
     method: 'POST',
     headers: {
@@ -432,7 +567,7 @@ async function chatOnce(
       'Csrftoken': csrf.token,
       'Cookie': `csrfkey=${csrf.key}`,
     },
-    body: JSON.stringify(upBody),
+    body: bodyStr,
   })
   // 凭证失效（401/403 且响应体含 csrf）：抛错由调用方上报（记错/淘汰）并换证重试
   if (resp.status === 401 || resp.status === 403) {
@@ -460,9 +595,17 @@ export async function proxyCnbChatRequest(
 ): Promise<Response> {
   const bridge = provider.toolBridge === true
   const tools = Array.isArray(clientBody.tools) ? clientBody.tools : []
-  const messages = convertMessages(clientBody.messages, bridge)
-  const upBody = buildUpstreamBody(clientBody as UpstreamBodyInput, messages, tools, bridge)
+  // 原生工具模式：有 tools 且 toolBridge 开启时优先走原生路径，
+  // 若上游返回 403 "Agent calls not allowed" 则自动降级到 XYML 桥。
+  let nativeTools = bridge && tools.length > 0
+  const renamer = new CnbToolRenamer()
   const isStream = clientBody.stream === true
+
+  const buildBody = () => {
+    const msgs = convertMessages(clientBody.messages, bridge, nativeTools, renamer)
+    return buildUpstreamBody(clientBody as UpstreamBodyInput, msgs, tools, bridge, nativeTools, renamer)
+  }
+  let upBody = buildBody()
 
   // 凭证池重试：每次尝试换下一个 round-robin 凭证；CSRF 失败上报（记错/淘汰）后重试。
   // 重试上限 = clamp(poolMax, 3, 6)：池小少试、池大多试，避免单个请求串太久。
@@ -491,9 +634,22 @@ export async function proxyCnbChatRequest(
     throw new Error('cnb: chat failed after retries')
   }
 
-  const resp = await chat(upBody)
-  if (isStream) return buildStreamResponse(resp, { bridge, tools, upBody, chat }, onFinish)
-  return await buildNonStreamResponse(resp, { bridge, tools })
+  let resp = await chat(upBody)
+
+  // 原生工具降级：上游返回 403 "Agent calls not allowed" → 降级到 XYML 桥重试
+  if (resp.status === 403 && nativeTools) {
+    try {
+      const text = await resp.clone().text()
+      if (isAgentCallsNotAllowed(text)) {
+        nativeTools = false
+        upBody = buildBody()
+        resp = await chat(upBody)
+      }
+    } catch { /* 读取失败忽略，原 403 透传 */ }
+  }
+
+  if (isStream) return buildStreamResponse(resp, { bridge, tools, nativeTools, renamer, upBody, chat }, onFinish)
+  return await buildNonStreamResponse(resp, { bridge, tools, nativeTools, renamer })
 }
 
 // ===== 流式响应 =====
@@ -501,6 +657,9 @@ export async function proxyCnbChatRequest(
 interface BridgeOptions {
   bridge: boolean
   tools: unknown[]
+  /** 原生工具模式：上游返回 delta.tool_calls，直接透传（还原 cnb_ 前缀） */
+  nativeTools?: boolean
+  renamer?: CnbToolRenamer
   // 自动续写所需：首轮上游 body（复用来构造续写 messages）与「再发一次上游请求」的能力
   upBody?: Record<string, unknown>
   chat?: (body: Record<string, unknown>) => Promise<Response>
@@ -634,9 +793,10 @@ function buildStreamResponse(upstream: Response, opts: BridgeOptions, onFinish?:
   let upstreamFinishReason: string | null = null
   // 流是否正常收尾（收到 [DONE]）；false=上游直接关流（可能中途断流）
   let cleanEnd = true
-  // bridge 模式下始终启用 ToolSieve：即使当前请求未携带 tools（多轮对话时客户端可能只在首轮传 tools，
-  // 但历史仍让模型按 XYML 输出），也要拦截并剥离原始 XYML 标记，避免泄漏给客户端。
-  const sieve = opts.bridge ? new ToolSieve(opts.tools) : null
+  // bridge 且非原生工具模式时启用 ToolSieve：拦截 XYML 文本标记。
+  // 原生工具模式（nativeTools）上游直接返回 delta.tool_calls，无需文本解析。
+  // bridge 模式即使无 tools 也启用 sieve：多轮对话历史可能让模型按 XYML 输出。
+  const sieve = (opts.bridge && !opts.nativeTools) ? new ToolSieve(opts.tools) : null
   let toolIdx = 0
   // 已透传的纯正文（含 flush 降级内容），用于自动续写时让模型接着往下写
   let allText = ''
@@ -718,6 +878,20 @@ function buildStreamResponse(upstream: Response, opts: BridgeOptions, onFinish?:
             if (choice.finish_reason) upstreamFinishReason = choice.finish_reason
             const content = delta.content || ''
             const reasoning = delta.reasoning_content || ''
+            // 原生工具调用：上游 delta.tool_calls 透传（还原 cnb_ 前缀）
+            if (opts.nativeTools && Array.isArray(delta.tool_calls) && delta.tool_calls.length) {
+              for (const tc of delta.tool_calls) {
+                if (!tc || typeof tc !== 'object') continue
+                const c = tc as Record<string, unknown>
+                const fn = c.function as Record<string, unknown> | undefined
+                const restored: Record<string, unknown> = { ...c }
+                if (fn && typeof fn.name === 'string' && opts.renamer) {
+                  restored.function = { ...fn, name: opts.renamer.restore(fn.name) }
+                }
+                emittedToolCalls = true
+                write(stdChunk(stdID || randomId(), stdModel, stdCreated, { tool_calls: [restored] }, null))
+              }
+            }
             // 推理内容与正文分开透传（bridge 模式 reasoning 不进 sieve，避免误判工具标记），
             // 但仍清洗混入推理的 XYML 工具标记残片（模型思考时常把计划执行的搜索/取数工具
             // XML 草案混进 reasoning，若不清理会以脏标签形式展示给客户端）。
@@ -791,9 +965,13 @@ async function buildNonStreamResponse(upstream: Response, opts: BridgeOptions): 
   let finish = 'stop'
   let sawUpstreamFinish = false
   let cleanEnd = true
-  // bridge 模式下始终启用 ToolSieve（理由同 buildStreamResponse：避免无 tools 请求时 XYML 泄漏）
-  const sieve = opts.bridge ? new ToolSieve(opts.tools) : null
+  // bridge 且非原生工具模式时启用 ToolSieve（理由同 buildStreamResponse）
+  const sieve = (opts.bridge && !opts.nativeTools) ? new ToolSieve(opts.tools) : null
+  // XYML 解析出的工具调用
   const toolCalls: Array<Record<string, unknown>> = []
+  // 原生工具调用聚合（按 index 累积 name + arguments）
+  const nativeTC = new Map<number, { id: string; type: string; name: string; arguments: string }>()
+  const nativeTCOrder: number[] = []
 
   await readUpstreamSSE(upstream.body, (obj, isDone, clean) => {
     if (isDone) { cleanEnd = clean; return }
@@ -805,6 +983,27 @@ async function buildNonStreamResponse(upstream: Response, opts: BridgeOptions): 
     for (const choice of obj.choices || []) {
       const delta = choice.delta || {}
       if (delta.reasoning_content) reasoning += delta.reasoning_content
+      // 原生工具调用聚合
+      if (opts.nativeTools && Array.isArray(delta.tool_calls)) {
+        for (const tc of delta.tool_calls) {
+          if (!tc || typeof tc !== 'object') continue
+          const c = tc as Record<string, unknown>
+          const idx = typeof c.index === 'number' ? c.index : 0
+          let agg = nativeTC.get(idx)
+          if (!agg) {
+            agg = { id: '', type: 'function', name: '', arguments: '' }
+            nativeTC.set(idx, agg)
+            nativeTCOrder.push(idx)
+          }
+          if (c.id) agg.id = String(c.id)
+          if (c.type) agg.type = String(c.type)
+          const fn = c.function as Record<string, unknown> | undefined
+          if (fn) {
+            if (fn.name) agg.name = opts.renamer ? opts.renamer.restore(String(fn.name)) : String(fn.name)
+            if (fn.arguments) agg.arguments += String(fn.arguments)
+          }
+        }
+      }
       const c = delta.content || ''
       if (c) {
         if (sieve) {
@@ -828,7 +1027,18 @@ async function buildNonStreamResponse(upstream: Response, opts: BridgeOptions): 
 
   const message: Record<string, unknown> = { role: 'assistant', content }
   if (reasoning) message['reasoning_content'] = scrubToolFragments(reasoning)
-  if (toolCalls.length) {
+  // 优先输出原生工具调用，其次 XYML 解析的
+  if (nativeTCOrder.length) {
+    message['tool_calls'] = nativeTCOrder.map((idx) => {
+      const agg = nativeTC.get(idx)!
+      return {
+        id: agg.id || `call_${randomId()}`,
+        type: agg.type,
+        function: { name: agg.name, arguments: agg.arguments || '{}' },
+      }
+    })
+    finish = 'tool_calls'
+  } else if (toolCalls.length) {
     message['tool_calls'] = toolCalls
     finish = 'tool_calls'
   } else if (!sawUpstreamFinish && !cleanEnd) {
