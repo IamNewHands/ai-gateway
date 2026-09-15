@@ -2028,16 +2028,32 @@ function renderOauthPoolAccounts(id, accs, ciByUid, ciByNick, ciAccounts, prefer
     // 签到状态徽章（今日已签 / 失败 / 未签）
     let ciBadge = ''
     if (ci) {
-      ciBadge = ci.success ? ' <span class="bd bd-on">' + (ci.reason === 'already' ? '今日已签' : '签到成功') + '</span>'
-        : ' <span class="bd bd-danger">签到失败</span>'
-      // 成功时 message 是纯状态文案（如「签到成功」）会与徽章重复，仅失败时展示错误原因
-      if (ci.message && !ci.success) ciBadge += ' <span style="color:var(--muted)">' + escapeHtml(ci.message) + '</span>'
-      // 连登徽章
+      if (ci.realm === 'global' || ci.reason === 'skipped_global') {
+        // 国际版：无每日签到 / 猫猫旅行 / 开学季 / 夜猫任务，积分仅一次性 trial；
+        // 活跃上报照常点亮连登（workbuddy.ai/v2/report 可用）。故不展示「签到成功」等 CN 专属标记。
+        ciBadge = ' <span class="bd bd-info" title="国际版账号无每日签到/猫猫旅行/开学季/夜猫任务，积分仅一次性 trial。活跃上报照常点亮连登。">🌐 国际版</span>'
+        if (ci.activityReport) {
+          ciBadge += ' <span class="bd ' + (ci.activityReport.success ? 'bd-on' : 'bd-warn') + '" title="' + escapeHtml(ci.activityReport.message || '') + '">📡 活跃' + (ci.activityReport.success ? '已报' : '失败') + '</span>'
+        }
+        if (ci.trialClaim) {
+          if (ci.trialClaim.already || ci.trialClaim.success) ciBadge += ' <span class="bd bd-on" title="国际版一次性 trial 加油包已领取">🎁 trial 已领</span>'
+          else ciBadge += ' <span class="bd bd-warn" title="' + escapeHtml(ci.trialClaim.message || '') + '">🎁 trial 失败</span>'
+        }
+        if (ci.globalActivation && !ci.globalActivation.ok) {
+          ciBadge += ' <span class="bd bd-danger" title="' + escapeHtml(ci.globalActivation.message || '') + '">⚠️ 激活失败</span>'
+        }
+      } else {
+        ciBadge = ci.success ? ' <span class="bd bd-on">' + (ci.reason === 'already' ? '今日已签' : '签到成功') + '</span>'
+          : ' <span class="bd bd-danger">签到失败</span>'
+        // 成功时 message 是纯状态文案（如「签到成功」）会与徽章重复，仅失败时展示错误原因
+        if (ci.message && !ci.success) ciBadge += ' <span style="color:var(--muted)">' + escapeHtml(ci.message) + '</span>'
+      }
+      // 连登徽章（CN 与 global 都有：活跃上报点亮连登）
       if (typeof ci.streakDays === 'number' && ci.streakDays > 0) {
         ciBadge += ' <span class="bd bd-on" title="连续签到/活跃天数">🔥 连登 ' + ci.streakDays + ' 天</span>'
       }
-      // 猫猫旅行徽章
-      if (ci.catTravel) {
+      // 猫猫旅行徽章（仅 CN：global 无此体系，natural 为空）
+      if (!(ci.realm === 'global' || ci.reason === 'skipped_global') && ci.catTravel) {
         const ct = ci.catTravel
         let ctText = ''
         if (ct.state === 'traveling') ctText = '🐱 旅行中'
