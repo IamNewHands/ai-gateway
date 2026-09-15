@@ -39,7 +39,7 @@ import { isOAuthPoolProvider, seedOauthPoolFromSingle, listOauthPoolStatus, remo
 import { seedQoderPoolFromSingle, listQoderPoolStatus, removeQoderAccount, readQoderPool } from './qoder/pool'
 import { isM365Provider, M365_MODELS, testM365Model } from './m365/proxy'
 import { isZcodeProvider, testZcodeModel, buildZcodeHeaders, ZCODE_MODELS, fetchZcodeModels } from './zcode/proxy'
-import { injectWorkbuddyChatHeaders, parseWorkbuddyGlobalModels, WORKBUDDY_GLOBAL_MODELS_PROBE_PATHS } from './workbuddy-upstream'
+import { injectWorkbuddyChatHeaders, ensureGlobalFallbackSystem, parseWorkbuddyGlobalModels, WORKBUDDY_GLOBAL_MODELS_PROBE_PATHS } from './workbuddy-upstream'
 import { isKukuProvider, isKukuRequest, testKukuModel } from './kuku/proxy'
 import { probeKukuNetwork } from './kuku/probe'
 import { startKukuQrLogin, pollKukuQrLogin } from './kuku/qr'
@@ -569,11 +569,21 @@ export async function handleTestModel(c: Context<AppEnv>) {
       if (isWorkbuddyPool) {
         injectWorkbuddyChatHeaders(headers, token, realm, tokenState ? { uid: tokenState.uid, enterprise_id: tokenState.enterprise_id, domain: tokenState.domain, device_token: tokenState.device_token } : undefined, cfg, { chatPath: true })
       }
+      // 此处**直连上游**，不走 forwardProxy，故缺失真实转发管线里的
+      // ensureGlobalFallbackSystem。global 域要求首条为 system，缺省会
+      // 400 code 11128「first message is not system prompt」（补丁仅对 global）。
+      const sendBody = realm === 'global'
+        ? (() => {
+            const obj = JSON.parse(testBody) as Record<string, unknown>
+            ensureGlobalFallbackSystem(obj)
+            return JSON.stringify(obj)
+          })()
+        : testBody
       try {
         const response = await fetch(url, {
           method: 'POST',
           headers,
-          body: testBody,
+          body: sendBody,
           signal: AbortSignal.timeout(20000),
         })
         // 401 且有备用域 → 自动切换重试
