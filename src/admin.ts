@@ -39,6 +39,7 @@ import { isOAuthPoolProvider, seedOauthPoolFromSingle, listOauthPoolStatus, remo
 import { seedQoderPoolFromSingle, listQoderPoolStatus, removeQoderAccount, readQoderPool } from './qoder/pool'
 import { isM365Provider, M365_MODELS, testM365Model } from './m365/proxy'
 import { isZcodeProvider, testZcodeModel, buildZcodeHeaders, ZCODE_MODELS, fetchZcodeModels } from './zcode/proxy'
+import { injectWorkbuddyChatHeaders, parseWorkbuddyGlobalModels, WORKBUDDY_GLOBAL_MODELS_PROBE_PATHS } from './workbuddy-upstream'
 import { isKukuProvider, isKukuRequest, testKukuModel } from './kuku/proxy'
 import { probeKukuNetwork } from './kuku/probe'
 import { startKukuQrLogin, pollKukuQrLogin } from './kuku/qr'
@@ -556,14 +557,22 @@ export async function handleTestModel(c: Context<AppEnv>) {
         ? ['cn']
         : ['cn', ...(cfg.globalBaseUrl ? ['global' as const] : [])]
     const testBody = JSON.stringify({ model: modelId, messages: [{ role: 'user', content: 'hi' }], max_tokens: 1, stream: true })
+    // WorkBuddy（browser 流）连通性测试必须补全官方协议头（X-CodeBuddy-Request / WorkBuddy UA /
+    // X-Domain / X-Machine-ID 等）——否则全球域 WAF/限流把请求判为"非官方客户端形态"而返 429/403，
+    // 与真实转发（proxy 侧注入同一套头）不一致，测出来的 429 是**假阴性**（实际 chat 可用）。
+    const isWorkbuddyPool = provider.oauth?.flowType === 'browser' || (typeof provider.id === 'string' && provider.id.startsWith('workbuddy'))
     for (const realm of realms) {
       const realmBase = (realm === 'global' && cfg.globalBaseUrl ? cfg.globalBaseUrl : provider.baseUrl).replace(/\/$/, '')
       const origin = realm === 'global' && cfg.globalOrigin ? cfg.globalOrigin : (cfg.extraHeaders?.Origin)
       const url = `${realmBase}/${endpoint}`
+      const headers = buildOauthHeaders(cfg, token, { origin, apiType: provider.apiType, cookies })
+      if (isWorkbuddyPool) {
+        injectWorkbuddyChatHeaders(headers, token, realm, tokenState ? { uid: tokenState.uid, enterprise_id: tokenState.enterprise_id, domain: tokenState.domain, device_token: tokenState.device_token } : undefined, cfg, { chatPath: true })
+      }
       try {
         const response = await fetch(url, {
           method: 'POST',
-          headers: buildOauthHeaders(cfg, token, { origin, apiType: provider.apiType, cookies }),
+          headers,
           body: testBody,
           signal: AbortSignal.timeout(20000),
         })
@@ -572,7 +581,16 @@ export async function handleTestModel(c: Context<AppEnv>) {
           console.log(`[test-model] ${realm} 域返回 401，自动切换到下一个域`)
           continue
         }
-        return c.json<ApiResponse>({ success: true, data: { success: response.ok, statusCode: response.status, message: response.ok ? '' : `HTTP ${response.status}` } })
+        // 非 2xx 时回显上游 body（截断），便于分辨 14017 未激活 / 6004 模型限流 / 普通 rate limit / 403 封禁
+        let diag = ''
+        if (!response.ok) {
+          try {
+            const raw = (await response.text()) || ''
+            diag = raw && raw.length > 200 ? `${raw.slice(0, 200)}…` : raw
+          } catch { /* 读 body 失败忽略 */ }
+        }
+        const message = response.ok ? '' : `HTTP ${response.status}${diag ? `：${diag}` : ''}`
+        return c.json<ApiResponse>({ success: true, data: { success: response.ok, statusCode: response.status, message } })
       } catch (err) {
         if (realms.length > 1 && realm !== realms[realms.length - 1]) continue
         return c.json<ApiResponse>({ success: true, data: { success: false, statusCode: 0, message: (err as Error).message || '连接失败' } })
@@ -1881,6 +1899,76 @@ const WORKBUDDY_GLOBAL_MODELS: string[] = [
   'kimi-k2.6',
 ]
 
+// ===== WorkBuddy 国际版 global 模型目录动态探测（移植 workbuddy2api FetchGlobalModels） =====
+// 目标：global 域静态清单只是兜底；有 global 账号时动态探测 /v2/enterprises/personal/models，
+// 结果 ∪ 静态清单（去重）返回，避免模型过期/漏项。仅探测**模型名**，不做倍率/成本推断。
+
+/** 探测结果缓存：providerId → { names, at }；success 1h，失败 5min 负缓存。 */
+const globalModelsCache = new Map<string, { merged: string[]; at: number; ok: boolean }>()
+const GLOBAL_MODELS_TTL_MS = 60 * 60 * 1000
+const GLOBAL_MODELS_FAIL_MS = 5 * 60 * 1000
+
+/** 供测试清空 global 模型探测缓存。 */
+export function __resetGlobalModelsCacheForTests(): void {
+  globalModelsCache.clear()
+}
+
+/**
+ * 探测 global 账号的模型目录（按 realm 切 base），探测失败回落静态清单。
+ * 语义对齐源实现：成功 1h 缓存 / 失败 5min 负缓存；探测结果与静态名单去重合并。
+ */
+async function probeGlobalWorkbuddyModels(
+  env: Env,
+  cfg: OAuthDeviceConfig,
+  token: string,
+  cookies: string | undefined,
+  provider: Provider
+): Promise<string[]> {
+  const now = Date.now()
+  const cached = globalModelsCache.get(provider.id)
+  if (cached) {
+    const freshWindow = cached.ok ? GLOBAL_MODELS_TTL_MS : GLOBAL_MODELS_FAIL_MS
+    if (now - cached.at < freshWindow) return cached.merged
+  }
+  const globalBase = cfg.globalBaseUrl ? cfg.globalBaseUrl.replace(/\/$/, '') : provider.baseUrl.replace(/\/$/, '')
+  const tokenState = await readOauthToken(env, provider.id)
+  for (const path of WORKBUDDY_GLOBAL_MODELS_PROBE_PATHS) {
+    let ok = false
+    try {
+      const headers = buildOauthHeaders(cfg, token, { origin: cfg.globalOrigin, apiType: provider.apiType, cookies })
+      injectWorkbuddyChatHeaders(headers, token, 'global', tokenState ? { uid: tokenState.uid, enterprise_id: tokenState.enterprise_id, domain: tokenState.domain, device_token: tokenState.device_token } : undefined, cfg, { chatPath: false })
+      const response = await fetch(`${globalBase}${path}`, {
+        method: 'GET',
+        headers,
+        signal: AbortSignal.timeout(10000),
+      })
+      if (!response.ok) continue
+      const entries = parseWorkbuddyGlobalModels(await response.text())
+      if (entries && entries.length > 0) {
+        // 探测 ∪ 静态清单（去重，静态为基底、探测独有追加，对齐源实现顺序）
+        const seen = new Set<string>(WORKBUDDY_GLOBAL_MODELS)
+        const merged = [...WORKBUDDY_GLOBAL_MODELS]
+        for (const e of entries) {
+          if (!seen.has(e.id)) {
+            seen.add(e.id)
+            merged.push(e.id)
+          }
+        }
+        if (merged.length > 0) {
+          globalModelsCache.set(provider.id, { merged, at: now, ok: true })
+          return merged
+        }
+      }
+      ok = true // 端点 2xx 但解析空名单 → 不再试 fallback，直接负缓存回落静态
+    } catch {
+      // 网络/超时：尝试下一个候选路径
+    }
+    if (ok) break
+  }
+  globalModelsCache.set(provider.id, { merged: WORKBUDDY_GLOBAL_MODELS, at: now, ok: false })
+  return WORKBUDDY_GLOBAL_MODELS
+}
+
 export async function handleOAuthModels(c: Context<AppEnv>) {
   const id = c.req.param('id')
   if (!id) return c.json<ApiResponse>({ success: false, message: '缺少 id 参数' }, 400)
@@ -1952,14 +2040,19 @@ export async function handleOAuthModels(c: Context<AppEnv>) {
     return c.json<ApiResponse>({ success: true, data: { data: models } })
   }
 
-  // WorkBuddy/CodeBuddy：无公开模型列表端点（实测 /console/…/models 等均返回 404），
-  // 与 gemini/cnb/m365 一致用内置静态清单；仅返回清单，用户手工「+」/保存后才入库。
-  // 按 token JWT realm 分流清单：global（iss 含 workbuddy.ai）→ 国际版 cli 白名单
-  // （对齐 WkBdy2api wb_v3config 快照）；未连接/token 缺失或 CN → 国内版清单。
+  // WorkBuddy/CodeBuddy：国内版仍用内置静态清单（CN 域 /console/…/models 实测 404，无公开端点）。
+  // 国际版（global，iss 含 workbuddy.ai）改走**动态目录探测**：/v2/enterprises/personal/models（对齐
+  // workbuddy2api FetchGlobalModels），失败负缓存后回落静态国际版清单。结果只返回清单，入库仍靠用户「+」/保存。
   if ((provider.authType === 'oauth-device' && provider.oauth?.flowType === 'browser') || provider.id.startsWith('workbuddy')) {
     const wbToken = await getOauthAccessToken(c.env, provider.id, cfg)
     const wbRealm = wbToken ? detectTokenRealm(wbToken) : null
-    const list = wbRealm === 'global' ? WORKBUDDY_GLOBAL_MODELS : WORKBUDDY_MODELS
+    if (wbRealm === 'global' && wbToken) {
+      // 有 global 账号 → 动态探测（探测失败自动回落静态国际版清单）
+      const probe = await probeGlobalWorkbuddyModels(c.env, cfg, wbToken, undefined, provider)
+      const models = probe.map((m) => ({ id: m }))
+      return c.json<ApiResponse>({ success: true, data: { data: models, realm: 'global' } })
+    }
+    const list = WORKBUDDY_MODELS
     const models = list.map((m) => ({ id: m }))
     return c.json<ApiResponse>({ success: true, data: { data: models, realm: wbRealm || 'cn' } })
   }

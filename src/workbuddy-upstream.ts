@@ -26,7 +26,8 @@ export type WorkbuddyErrorKind =
   | 'hard_credit'      // 余额/权益耗尽 → 长冷却（次日 04:00）
   | 'soft_rate'        // 429 限流 → 短冷却
   | 'model_rate'       // 429 code 6004 → 模型级限流（切模型立即可用）
-  | 'session_dead'     // session 失效 → 连续 3 次才永久禁用
+  | 'model_blocked'   // 400/404 code 11102「该后端无此模型」→ 模型级避让（指数退避，成功即解除）
+  | 'session_dead'    // session 失效 → 连续 3 次才永久禁用
   | 'account_fault'    // 账号级授权/配额故障（11140 / 14017）→ 换号并冷却或禁用
   | 'not_found'        // 404 上游偶发 → 短冷却，不累计错误
   | 'server'           // 5xx → 累计错误计数
@@ -40,7 +41,9 @@ export type WorkbuddyErrorKind =
  * 避免收窄既有检测面（既有实现对响应体含 'plan' 即长冷却）。
  */
 const HARD_MARKERS = [
-  'insufficient credit', 'no credit', 'credit exhausted', 'out of credit',
+  // 单数 + 复数双形态都收（对齐 workbuddy2api 0f49e290：上游可能以 `credits exhausted`
+  // 复数返回，漏判复数会让坏号只换号不硬冷却、反复刷计费失败）。
+  'insufficient credit', 'no credit', 'credit exhausted', 'credits exhausted', 'out of credit',
   'quota exceeded', 'quota exhaust', 'payment required', 'credit not enough',
   'not enough credit',
   '积分不足', '额度不足', '余额不足', '积分用完', '额度用尽', '没有积分',
@@ -257,6 +260,13 @@ export function classifyWorkbuddyUpstreamError(status: number, bodyText: string)
     if (lower.includes(m) || bodyText.includes(m)) return 'account_fault'
   }
   if (isModelRateLimit(bodyText)) return 'model_rate'
+  // 11102「该后端无此模型」/ "service info not found"：确定性"模型在后端不存在"（移植
+  // workbuddy2api IsModelBlocked）。只认 code==11102 或窄短语，且仅 400/404——
+  // 避免 11102 恰好撞在 body 的 requestId 字段（整段文本）被误判。
+  if ((status === 400 || status === 404) &&
+    (/"code"\s*:\s*"?11102"?/.test(bodyText) || lower.includes('service info not found'))) {
+    return 'model_blocked'
+  }
   if (status === 429) return 'soft_rate'
   if (status === 404) return 'not_found'
   if (status >= 500) return 'server'
@@ -737,6 +747,93 @@ export function ensureGlobalFallbackSystem(body: Record<string, unknown>): void 
   msgs.unshift({ role: 'system', content: GLOBAL_FALLBACK_SYSTEM })
 }
 
+// ===== global 模型目录动态探测解析（移植 workbuddy2api global_models.go） =====
+
+/** global 模型目录探测路径候选（对齐 workbuddy2api globalModelsProbePaths）：
+ *  /v2 家族优先（PR #20 实测 /v2/enterprises/personal/models 200 含完整模型表），
+ *  /console 作 fallback（同域旧路径）。 */
+export const WORKBUDDY_GLOBAL_MODELS_PROBE_PATHS = [
+  '/v2/enterprises/personal/models',
+  '/console/enterprises/personal/models',
+]
+
+/** 解析出的单条 global 模型条目（id/展示名 + reasoning 档位桶，仅元数据无倍率）。 */
+export interface WorkbuddyGlobalModelEntry {
+  id: string
+  displayName?: string
+  supportedEfforts?: string[]
+  defaultEffort?: string
+}
+
+/**
+ * 解析 global 模型目录响应（对齐 workbuddy2api parseGlobalModelNames）：
+ *  - 窄表形态：data 为字符串数组 → 每项即模型 id；
+ *  - 对象形态：data.models[].id/.name（id 优先），disabled 剔除，附带解析
+ *    reasoning.supportedEfforts（数组优先）/ effort（单档视作单元素表）/ defaultEffort。
+ * 解析失败 / 空名单 → 返回 null（调用方回落静态清单，等价"该端点没给全"）。
+ */
+export function parseWorkbuddyGlobalModels(raw: string): WorkbuddyGlobalModelEntry[] | null {
+  let env: { code?: unknown; data?: unknown }
+  try {
+    env = JSON.parse(raw) as { code?: unknown; data?: unknown }
+  } catch {
+    return null
+  }
+  if (env?.code !== 0 || env.data === undefined) return null
+  const trimmed = typeof env.data === 'string' ? env.data.trim() : ''
+
+  // 窄表形态：data 为字符串数组。两种承载：
+  //  - data 直接是 JSON 数组（`"data":["a","b"]` → 解析后为 Array）；
+  //  - data 是字符串化的数组（`"data":"[\"a\",\"b\"]"` → 解析后为以 "[" 开头的字符串）。
+  //  两种情况都判断（对齐 Go 侧对 json.RawMessage 起首字符 `[` 的判定）。
+  let narrowArr: unknown = null
+  if (Array.isArray(env.data)) {
+    narrowArr = env.data
+  } else if (typeof env.data === 'string' && trimmed.startsWith('[')) {
+    try { narrowArr = JSON.parse(env.data) } catch { /* 落到对象形态 */ }
+  }
+  if (Array.isArray(narrowArr)) {
+    const out: WorkbuddyGlobalModelEntry[] = []
+    for (const id of narrowArr) {
+      const s = typeof id === 'string' ? id.trim() : ''
+      if (s !== '') out.push({ id: s })
+    }
+    return out.length > 0 ? out : null
+  }
+
+  // 对象形态：data.models[]
+  const obj = env.data as { models?: unknown }
+  if (!obj || typeof obj !== 'object' || !Array.isArray(obj.models)) return null
+  const out: WorkbuddyGlobalModelEntry[] = []
+  for (const m of obj.models) {
+    if (!m || typeof m !== 'object') continue
+    const rec = m as Record<string, unknown>
+    const id = typeof rec['id'] === 'string' && rec['id'].trim() !== ''
+      ? rec['id'].trim()
+      : (typeof rec['name'] === 'string' ? rec['name'].trim() : '')
+    if (id === '') continue
+    if (rec['disabled'] === true) continue
+    const entry: WorkbuddyGlobalModelEntry = { id }
+    const name = typeof rec['name'] === 'string' ? rec['name'].trim() : ''
+    if (name !== '' && name !== id) entry.displayName = name
+    const rz = rec['reasoning']
+    if (rz && typeof rz === 'object') {
+      const r = rz as Record<string, unknown>
+      if (Array.isArray(r['supportedEfforts'])) {
+        entry.supportedEfforts = r['supportedEfforts'].filter((x): x is string => typeof x === 'string')
+        if (entry.supportedEfforts.length === 0) delete entry.supportedEfforts
+      } else if (typeof r['effort'] === 'string' && r['effort'].trim() !== '') {
+        entry.supportedEfforts = [r['effort'].trim()]
+      }
+      if (typeof r['defaultEffort'] === 'string' && r['defaultEffort'].trim() !== '') {
+        entry.defaultEffort = r['defaultEffort'].trim()
+      }
+    }
+    out.push(entry)
+  }
+  return out.length > 0 ? out : null
+}
+
 // ===== 协议归属头与身份头注入 =====
 
 /**
@@ -797,6 +894,30 @@ export function workbuddyAcceptLanguage(realm: 'cn' | 'global'): string {
  */
 export function workbuddyChatAccept(): string {
   return 'application/json, text/event-stream'
+}
+
+/**
+ * 账号稳定的机器/会话 ID 派生（对齐 workbuddy2api deriveAccountStableID：固定盐
+ * `wb2a:` + purpose + `:` + uid，跨账号维度稳定——区别于进程级随机盐）。
+ *
+ * 机器/会话 ID 不是密钥，无需密码学强度；目标仅是：同 uid 恒同值、异 uid 互异、
+ * purpose 盐隔离（machine 与 session 永不相等）。用确定性 FNV-1a 同步哈希拼接 36 hex，
+ * 保持 injectWorkbuddyChatHeaders 的同步签名（Web Crypto 的 subtle.digest 是异步的，
+ * 会让头部注入函数连锁异步化，无此必要）。
+ */
+export function deriveAccountStableID(purpose: 'machine' | 'session', uid: string): string {
+  const base = `wb2a:${purpose}:${uid}`
+  let out = ''
+  for (let i = 0; i < 5; i++) {
+    // FNV-1a 32-bit：输入逐字节 + 混合号种子，保证同输入跨次恒定、不同输入充分发散
+    let h = (0x811c9dc5 ^ i) >>> 0
+    for (let j = 0; j < base.length; j++) {
+      h ^= base.charCodeAt(j)
+      h = Math.imul(h, 0x01000193) >>> 0
+    }
+    out += (h >>> 0).toString(16).padStart(8, '0')
+  }
+  return out.slice(0, 36)
 }
 
 /**
@@ -879,8 +1000,16 @@ export function injectWorkbuddyChatHeaders(
   if (uid) {
     headers['X-User-Id'] = uid
     delete headers['X-No-User-Id']
+    // 账号稳定的机器/会话 ID 头（对齐 workbuddy2api 3b87c14e / X-Machine-ID / X-Session-ID）：
+    // 同账号跨重启/跨请求恒同值，供上游把全部出站请求归一为同一"机器指纹"。
+    // 缺失或每次漂移（随机/空）会被全球域风控判定为可疑客户端形态，放大限流（见 429 排查）。
+    // 仅在 uid 存在时注入；uid 缺失无稳定指纹源头，不注入也不 panic。
+    headers['X-Machine-ID'] = deriveAccountStableID('machine', uid)
+    headers['X-Session-ID'] = deriveAccountStableID('session', uid)
   } else {
     headers['X-No-User-Id'] = '1'
+    delete headers['X-Machine-ID']
+    delete headers['X-Session-ID']
   }
 
   const entId = accountTokenState?.enterprise_id || claims.enterpriseId

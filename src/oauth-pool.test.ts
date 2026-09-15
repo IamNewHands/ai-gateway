@@ -5,6 +5,7 @@ import {
   isOauthAccountHealthy,
   noteOauthSessionDead,
   clearOauthSessionDead,
+  clearOauthAccountModelCooldown,
   recordOauthModelCost,
   cooldownOauthAccount,
   cooldownOauthAccountSoftForModel,
@@ -397,6 +398,36 @@ describe('6004 模型级限流隔离（对齐 workbuddy2api issue #31 / modelCoo
     const acc2 = (await readOauthPool(kv2.env, pid2))[0]
     expect(acc2.state.softRateModels).toBeUndefined()
     expect(acc2.state.until).toBeGreaterThan(Date.now())
+  })
+
+  it('clearOauthAccountModelCooldown 只清指定模型、不碰账号级冷却（BlockModelClear）', async () => {
+    const pid = PROVIDER + '-mc8'
+    const kv = makeRealKV(pid, [makeAccount('u1')])
+    const now = Date.now()
+    await cooldownOauthAccountSoftForModel(kv.env, pid, 'u1', 'model-A', now + 600000, '11102 block')
+    await cooldownOauthAccountSoftForModel(kv.env, pid, 'u1', 'model-B', now + 600000, '6004')
+    // 清除前：两个模型都在独立冷却，账号级 until 未被写
+    let acc = (await readOauthPool(kv.env, pid))[0]
+    expect(acc.state.softRateModels?.['model-A']).toBeDefined()
+    expect(acc.state.until).toBe(0)
+    // 清除 model-B（6004 冷却）→ 只清 B，A 保留
+    await clearOauthAccountModelCooldown(kv.env, pid, 'u1', 'model-B')
+    acc = (await readOauthPool(kv.env, pid))[0]
+    expect(acc.state.softRateModels?.['model-B']).toBeUndefined()
+    expect(acc.state.softRateModels?.['model-A']).toBeDefined()
+    // 全部清空 → softRateModels 置为 undefined
+    await clearOauthAccountModelCooldown(kv.env, pid, 'u1', 'model-A')
+    acc = (await readOauthPool(kv.env, pid))[0]
+    expect(acc.state.softRateModels).toBeUndefined()
+    // 幂等：无记录时不报错
+    await expect(clearOauthAccountModelCooldown(kv.env, pid, 'u1', 'model-A')).resolves.toBeUndefined()
+  })
+
+  it('clearOauthAccountModelCooldown 空模型名/账号不存在 → no-op', async () => {
+    const pid = PROVIDER + '-mc9'
+    const kv = makeRealKV(pid, [makeAccount('u1')])
+    await expect(clearOauthAccountModelCooldown(kv.env, pid, 'u1', '')).resolves.toBeUndefined()
+    await expect(clearOauthAccountModelCooldown(kv.env, pid, 'ghost', 'model-A')).resolves.toBeUndefined()
   })
 
   it('listModelCooldowns 只透出未过期条目且按模型名排序', () => {

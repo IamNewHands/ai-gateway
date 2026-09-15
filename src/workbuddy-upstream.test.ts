@@ -10,6 +10,9 @@ import {
   injectDeepSeekThinking,
   backfillReasoningContent,
   injectWorkbuddyChatHeaders,
+  deriveAccountStableID,
+  parseWorkbuddyGlobalModels,
+  WORKBUDDY_GLOBAL_MODELS_PROBE_PATHS,
   ensureWorkbuddyStreamOptions,
   ensureWorkbuddyMaxTokens,
   WORKBUDDY_DEFAULT_MAX_TOKENS,
@@ -43,6 +46,9 @@ describe('classifyWorkbuddyUpstreamError 错误分类（移植 workbuddy2api Cla
     expect(classifyWorkbuddyUpstreamError(400, '额度用尽')).toBe('hard_credit')
     expect(classifyWorkbuddyUpstreamError(400, '余额不足')).toBe('hard_credit')
     expect(classifyWorkbuddyUpstreamError(503, 'quota exceeded for user')).toBe('hard_credit')
+    // 英文复数形态（对齐 workbuddy2api 0f49e290，漏判会让坏号只换号不硬冷却）
+    expect(classifyWorkbuddyUpstreamError(400, 'credits exhausted for this enterprise')).toBe('hard_credit')
+    expect(classifyWorkbuddyUpstreamError(502, 'all credits exhausted, please recharge')).toBe('hard_credit')
   })
 
   it('本仓既有检测保留：1005 / plan 关键词 → hard_credit（行为兼容）', () => {
@@ -321,6 +327,19 @@ describe('isModelRateLimit & parseSoftRateReset 6004 限流解析（移植 workb
     expect(classifyWorkbuddyUpstreamError(400, '{"code":11101,"msg":"Unmarshal error"}')).toBe('bad_params')
     expect(classifyWorkbuddyUpstreamError(400, 'blocked by security policy')).toBe('content_blocked')
   })
+
+  it('11102「后端无此模型」→ model_blocked（仅 400/404 + code==11102 或窄短语）', () => {
+    expect(classifyWorkbuddyUpstreamError(400, '{"code":11102,"msg":"service info not found"}')).toBe('model_blocked')
+    expect(classifyWorkbuddyUpstreamError(404, 'service info not found for this model')).toBe('model_blocked')
+    expect(classifyWorkbuddyUpstreamError(400, '该后端无此模型, service info not found')).toBe('model_blocked')
+    // 关键反例：
+    //  - code==11102 但状态码是 5xx → 不判（server 优先）
+    //  - 11102 撞在 requestId（非业务码位置）→ 不误判（窄匹配）
+    //  - 裸数字 1102 无 `"code":` 也无窄短语 → 不判（保守，宁可 404 短冷却）
+    expect(classifyWorkbuddyUpstreamError(500, '{"code":11102,"msg":"boom"}')).toBe('server')
+    expect(classifyWorkbuddyUpstreamError(400, '{"requestId":"xxx11102yyy","msg":"bad"}')).toBe('client')
+    expect(classifyWorkbuddyUpstreamError(404, '该后端无此模型')).toBe('not_found')
+  })
 })
 
 describe('DeepSeek 思维链注入与历史消息回填（移植 workbuddy2api thinking.go）', () => {
@@ -396,6 +415,11 @@ describe('DeepSeek 思维链注入与历史消息回填（移植 workbuddy2api t
 
 describe('WorkBuddy 归属头与身份头注入 injectWorkbuddyChatHeaders', () => {
   const dummyToken = 'eyJhbGciOiJIUzI1NiJ9.eyJ1aWQiOiJ1MTIzIiwiZW50ZXJwcmlzZV9pZCI6ImUxMjMiLCJkb21haW4iOiJleGFtcGxlLmNvbSIsIm5pY2tuYW1lIjoidGVzdHVzZXIifQ.sig'
+  // 构造带指定 uid 的合法 JWT（base64url），用于「不同 uid 派生不同稳定 ID」的对比
+  const uidToken = (uid: string): string => {
+    const b64url = (o: unknown) => btoa(JSON.stringify(o)).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '')
+    return `${b64url({ alg: 'HS256' })}.${b64url({ uid, enterprise_id: 'e123', domain: 'example.com' })}.sig`
+  }
 
   it('注入四项归属头 + UID / EnterpriseID / Domain / DeviceToken', () => {
     const headers: Record<string, string> = {}
@@ -504,6 +528,39 @@ describe('WorkBuddy 归属头与身份头注入 injectWorkbuddyChatHeaders', () 
     // dummyToken 的 domain claim 是 example.com，global 下应被覆盖为 workbuddy.ai
     injectWorkbuddyChatHeaders(headers, dummyToken, 'global')
     expect(headers['X-Domain']).toBe('workbuddy.ai')
+  })
+
+  it('注入账号稳定的 X-Machine-ID / X-Session-ID（对齐 workbuddy2api 3b87c14e）', () => {
+    const a: Record<string, string> = {}
+    injectWorkbuddyChatHeaders(a, dummyToken, 'cn')
+    const b: Record<string, string> = {}
+    injectWorkbuddyChatHeaders(b, dummyToken, 'cn')
+    // 同 uid 跨请求恒同值
+    expect(a['X-Machine-ID']).toEqual(b['X-Machine-ID'])
+    expect(a['X-Machine-ID']).toMatch(/^[0-9a-f]{36}$/)
+    expect(a['X-Session-ID']).toMatch(/^[0-9a-f]{36}$/)
+    // machine / session 盐隔离，互不相等
+    expect(a['X-Machine-ID']).not.toBe(a['X-Session-ID'])
+  })
+
+  it('不同 uid 派生不同稳定 ID；uid 缺失不注入', () => {
+    const h1: Record<string, string> = {}
+    injectWorkbuddyChatHeaders(h1, uidToken('u123'), 'cn')
+    const h2: Record<string, string> = {}
+    injectWorkbuddyChatHeaders(h2, uidToken('u999'), 'cn')
+    expect(h1['X-Machine-ID']).not.toBe(h2['X-Machine-ID'])
+    expect(h1['X-Session-ID']).not.toBe(h2['X-Session-ID'])
+    // uid 缺失（invalid token）→ 不注入、不 panic
+    const noUid: Record<string, string> = {}
+    injectWorkbuddyChatHeaders(noUid, 'invalid-token', 'cn')
+    expect(noUid['X-Machine-ID']).toBeUndefined()
+    expect(noUid['X-Session-ID']).toBeUndefined()
+  })
+
+  it('deriveAccountStableID：同输入恒同值、异 uid 互异、purpose 盐隔离', () => {
+    expect(deriveAccountStableID('machine', 'u1')).toBe(deriveAccountStableID('machine', 'u1'))
+    expect(deriveAccountStableID('machine', 'u1')).not.toBe(deriveAccountStableID('machine', 'u2'))
+    expect(deriveAccountStableID('machine', 'u1')).not.toBe(deriveAccountStableID('session', 'u1'))
   })
 })
 
@@ -934,6 +991,63 @@ describe('ensureWorkbuddyMaxTokens（WorkBuddy 出站 max_tokens 安全护栏）
     ensureWorkbuddyMaxTokens(body)
     ensureWorkbuddyMaxTokens(body)
     expect(body['max_tokens']).toBe(32768)
+  })
+})
+
+describe('global 模型目录动态探测解析 parseWorkbuddyGlobalModels（移植 workbuddy2api parseGlobalModelNames）', () => {
+  it('对象形态：data.models[].id 优先，disabled 剔除，剔除空 id', () => {
+    const raw = JSON.stringify({
+      code: 0,
+      data: {
+        models: [
+          { id: 'deep-model', name: 'Deep', reasoning: { supportedEfforts: ['off', 'high'] } },
+          { id: '', name: 'NoId' },
+          { id: 'disabled-x', disabled: true },
+          { id: 'fast-model' },
+        ],
+      },
+    })
+    const out = parseWorkbuddyGlobalModels(raw)
+    expect(out).not.toBeNull()
+    // id 缺失回退 name（{id:'',name:'NoId'} → id='NoId'）；disabled 剔除
+    expect(out!.map((m) => m.id)).toEqual(['deep-model', 'NoId', 'fast-model'])
+    expect(out![0].supportedEfforts).toEqual(['off', 'high'])
+  })
+
+  it('对象形态：无 supportedEfforts 时读 reasoning.effort 单档；id 缺失回退 name', () => {
+    const raw = JSON.stringify({
+      code: 0,
+      data: {
+        models: [
+          { name: 'balanced-model', reasoning: { effort: 'medium', defaultEffort: 'high' } },
+        ],
+      },
+    })
+    const out = parseWorkbuddyGlobalModels(raw)
+    expect(out!.map((m) => m.id)).toEqual(['balanced-model'])
+    expect(out![0].supportedEfforts).toEqual(['medium'])
+    expect(out![0].defaultEffort).toEqual('high')
+  })
+
+  it('窄表形态：data 为字符串数组', () => {
+    const raw = JSON.stringify({ code: 0, data: ['a', ' b ', ''] })
+    const out = parseWorkbuddyGlobalModels(raw)
+    expect(out!.map((m) => m.id)).toEqual(['a', 'b'])
+  })
+
+  it('code!=0 / 非 JSON / data 缺 models / 空名单 → null（回落静态）', () => {
+    expect(parseWorkbuddyGlobalModels(JSON.stringify({ code: 1, data: {} }))).toBeNull()
+    expect(parseWorkbuddyGlobalModels('not-json')).toBeNull()
+    expect(parseWorkbuddyGlobalModels(JSON.stringify({ code: 0, data: { noModels: [] } }))).toBeNull()
+    expect(parseWorkbuddyGlobalModels(JSON.stringify({ code: 0, data: { models: [] } }))).toBeNull()
+    expect(parseWorkbuddyGlobalModels(JSON.stringify({ code: 0, data: [] }))).toBeNull()
+  })
+
+  it('探测路径候选符合源实现顺序（/v2 优先，/console 兜底）', () => {
+    expect(WORKBUDDY_GLOBAL_MODELS_PROBE_PATHS).toEqual([
+      '/v2/enterprises/personal/models',
+      '/console/enterprises/personal/models',
+    ])
   })
 })
 

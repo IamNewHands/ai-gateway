@@ -689,6 +689,35 @@ export async function cooldownOauthAccountSoftForModel(
   await writeOauthPool(env, providerId, pool)
 }
 
+/**
+ * 清除指定模型的独立冷却（BlockModelClear，对齐 workbuddy2api）：
+ * 该模型实测成功后立即解除避让，只清 `softRateModels[model]` 条目，不碰账号级冷却。
+ * 幂等：无记录时 no-op。用于 11102「后端无此模型」避让之后，上游补上该模型时能即时恢复。
+ */
+export async function clearOauthAccountModelCooldown(
+  env: Env,
+  providerId: string,
+  uid: string,
+  model: string
+): Promise<void> {
+  if (!model) return
+  const pool = await readOauthPool(env, providerId)
+  const acc = pool.find((a) => a.uid === uid)
+  if (!acc) return
+  const st = acc.state || { credits: 0, disabled: false, until: 0, errCount: 0 }
+  if (!st.softRateModels || !st.softRateModels[model]) return
+  const table = { ...st.softRateModels }
+  delete table[model]
+  acc.state = {
+    ...st,
+    softRateModels: Object.keys(table).length > 0 ? table : undefined,
+    softRateModel: undefined,
+    softRateResetAt: undefined,
+  }
+  acc.updatedAt = Date.now()
+  await writeOauthPool(env, providerId, pool)
+}
+
 /** 硬冷却（余额/权益耗尽）至下一个 CST 04:00（对齐 workbuddy2api CooldownUntilTomorrow4AM，等签到恢复）。 */
 export async function cooldownOauthAccountUntilTomorrow4AM(
   env: Env,

@@ -46,6 +46,7 @@ import {
   noteOauthSuccess,
   noteOauthSessionDead,
   clearOauthSessionDead,
+  clearOauthAccountModelCooldown,
   recordOauthModelCost,
   pickOauthAccount,
   refreshOauthPoolAccount,
@@ -1779,6 +1780,11 @@ function logOAuthRequest(c: Context<AppEnv>, provider: import('./types').Provide
  *   12153/session 死亡 → 永久禁用；其他 4xx（客户端问题）→ 不处罚账号，仅换号。
  * 成功返回原始上游 Response（由调用方决定透传/聚合/转 Anthropic）；无可用账号抛错。
  */
+/** 11102「后端无此模型」指数退避命中计数（运行态，不落盘；重启归零，对齐 workbuddy2api）。 */
+const modelBlockHits = new Map<string, number>()
+const MODEL_BLOCK_BASE_MS = 6 * 60 * 60 * 1000 // 起点 6h
+const MODEL_BLOCK_MAX_MS = 24 * 60 * 60 * 1000 // 封顶 24h
+
 async function proxyOAuthRequestPooledCore(
   c: Context<AppEnv>,
   provider: import('./types').Provider,
@@ -1794,6 +1800,10 @@ async function proxyOAuthRequestPooledCore(
   const reqModel = typeof (forwardBody as Record<string, unknown>)?.['model'] === 'string'
     ? (forwardBody as Record<string, unknown>)['model'] as string
     : undefined
+
+  // 11102「后端无此模型」避让计数（运行态内存，重启归零；对齐 workbuddy2api 不落盘红线）：
+  // 指数退避用 hits 决定冷却时长，不写 KV（11102 天然是"该模型不存在"的稳定态，非计费状态）。
+  const modelBlockKey = `${provider.id}:${reqModel || ''}`
 
   // 兼容迁移：池空时把既有单 token 种子进池
   try { await seedOauthPoolFromSingle(c.env, provider.id) } catch { /* ignore */ }
@@ -2007,6 +2017,16 @@ async function proxyOAuthRequestPooledCore(
           // 429 限流 → 短冷却
           await cooldownOauthAccount(c.env, provider.id, account.uid, cd.softMs, '429 rate limit')
           break
+        case 'model_blocked': {
+          // 11102「该后端无此模型」→ 模型级避让（对齐 workbuddy2api BlockModelBackoff）：
+          // 只写 modelCooldowns[model] 独立冷却，指数退避（6h 起 ×2^min(hits-1,6) 封顶 24h），
+          // 不碰账号级 until → 其他模型/切账号仍可用；成功路径 BlockModelClear 即时解除。
+          const hits = (modelBlockHits.get(modelBlockKey) || 0) + 1
+          modelBlockHits.set(modelBlockKey, hits)
+          const backoffMs = Math.min(MODEL_BLOCK_BASE_MS * Math.pow(2, Math.min(hits - 1, 6)), MODEL_BLOCK_MAX_MS)
+          await cooldownOauthAccountSoftForModel(c.env, provider.id, account.uid, reqModel || '', Date.now() + backoffMs, 'model not found (11102)')
+          break
+        }
         case 'not_found':
           // 404 上游偶发 → 短冷却，不累计错误计数（防雪崩）
           await cooldownOauthAccount(c.env, provider.id, account.uid, cd.softMs, 'upstream 404')
@@ -2064,6 +2084,11 @@ async function proxyOAuthRequestPooledCore(
     // 成功：记账成功，重置 session dead 计数，返回原始上游响应
     await noteOauthSuccess(c.env, provider.id, account.uid)
     await clearOauthSessionDead(c.env, provider.id, account.uid)
+    // BlockModelClear：该模型实测成功 → 立即解除 11102 避让并重置命中计数（对齐 workbuddy2api）
+    if (reqModel) {
+      modelBlockHits.delete(modelBlockKey)
+      await clearOauthAccountModelCooldown(c.env, provider.id, account.uid, reqModel)
+    }
     // 粘性跟随最终成功号（对齐 session.go:190-193）：本轮成功的账号成为该会话的绑定，
     // 覆盖旧绑定。若粘性号失败后轮换到别的号成功，这里把会话重绑到新号，
     // 多轮对话下一跳不再随机抽 → 保住新号上的 prompt cache。
