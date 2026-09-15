@@ -1856,6 +1856,31 @@ const WORKBUDDY_MODELS: string[] = [
   'doubao-1.5-pro',
 ]
 
+/** WorkBuddy 国际版（workbuddy.ai）静态候选模型：对齐 LazyChara/WkBdy2api `wb_v3config.public.json`
+ *  中 `/v3/config` 载荷的 `cli` agent 白名单（顺序保持）。国际版模型集与国内版完全不同。 */
+const WORKBUDDY_GLOBAL_MODELS: string[] = [
+  'default-model',
+  'fast-model',
+  'balanced-model',
+  'primary-model',
+  'deep-model',
+  'hy4-preview-f',
+  'hy3',
+  'deepseek-v4.1-flash',
+  'gpt-6-astra',
+  'gpt-5.6-sol',
+  'gpt-5.6-terra',
+  'gpt-5.6-luna',
+  'gpt-5.5',
+  'gpt-5.4',
+  'gpt-5.3-codex',
+  'gemini-3.5-flash',
+  'glm-5.3',
+  'glm-5.2',
+  'kimi-k3',
+  'kimi-k2.6',
+]
+
 export async function handleOAuthModels(c: Context<AppEnv>) {
   const id = c.req.param('id')
   if (!id) return c.json<ApiResponse>({ success: false, message: '缺少 id 参数' }, 400)
@@ -1929,9 +1954,14 @@ export async function handleOAuthModels(c: Context<AppEnv>) {
 
   // WorkBuddy/CodeBuddy：无公开模型列表端点（实测 /console/…/models 等均返回 404），
   // 与 gemini/cnb/m365 一致用内置静态清单；仅返回清单，用户手工「+」/保存后才入库。
+  // 按 token JWT realm 分流清单：global（iss 含 workbuddy.ai）→ 国际版 cli 白名单
+  // （对齐 WkBdy2api wb_v3config 快照）；未连接/token 缺失或 CN → 国内版清单。
   if ((provider.authType === 'oauth-device' && provider.oauth?.flowType === 'browser') || provider.id.startsWith('workbuddy')) {
-    const models = WORKBUDDY_MODELS.map((m) => ({ id: m }))
-    return c.json<ApiResponse>({ success: true, data: { data: models } })
+    const wbToken = await getOauthAccessToken(c.env, provider.id, cfg)
+    const wbRealm = wbToken ? detectTokenRealm(wbToken) : null
+    const list = wbRealm === 'global' ? WORKBUDDY_GLOBAL_MODELS : WORKBUDDY_MODELS
+    const models = list.map((m) => ({ id: m }))
+    return c.json<ApiResponse>({ success: true, data: { data: models, realm: wbRealm || 'cn' } })
   }
 
   const token = await getOauthAccessToken(c.env, provider.id, cfg)
