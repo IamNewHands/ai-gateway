@@ -56,9 +56,51 @@ import {
   billingMeterPaths,
   claimGlobalTrial,
   delayMs,
+  completeGlobalRegionFlow,
+  fetchIntlCountries,
+  type RegionCountry,
   ACTIVITY_ACCOUNT_DELAY_MS,
 } from './workbuddy-billing'
 import { queryUsageOverview } from './analytics/query'
+
+/**
+ * 国际版注册地区默认兜底（取不到白名单时用，region 完善提交所需）。
+ * 与源实现 global_region.py 的默认选择对齐（新加坡）。
+ */
+const FALLBACK_GLOBAL_REGION: RegionCountry = {
+  EnName: 'Singapore',
+  Name: 'Singapore',
+  IOS2: 'SG',
+  IOS3: 'SGP',
+  Code: '65',
+}
+
+/**
+ * 取国际版注册地区：优先 `/billing/area/get-country-code` 白名单第一条
+ * （顺序 = web 展示顺序，HK 起），拉取失败回退默认地区。
+ */
+async function pickGlobalRegion(): Promise<RegionCountry> {
+  try {
+    const r = await fetchIntlCountries(true)
+    if (r.ok && r.list.length > 0) return r.list[0]
+  } catch { /* 回退默认 */ }
+  return FALLBACK_GLOBAL_REGION
+}
+
+/**
+ * global 账号注册激活自愈（移植 workbuddy2api activate_region / complete_flow）。
+ *
+ * 上游对「未完成注册激活」的试用账号，所有 chat/completions 请求都会返回
+ * 429 code 14017（"trial version is not yet activated"），换号/重试/退避均无效。
+ * 这里先补齐 register + 注册地区完善（幂等：已激活时仅一次 register 查询即返回），
+ * 再配合调用方领取一次性 trial 加油包，打通试用通道。
+ *
+ * 失败只返回结果、不抛出，由调用方记录面板展示；不影响 global 签到语义。
+ */
+async function ensureGlobalActivation(token: string, uid: string): Promise<{ ok: boolean; message: string }> {
+  const res = await completeGlobalRegionFlow(token, uid, await pickGlobalRegion())
+  return { ok: res.ok, message: res.msg }
+}
 
 /** 查询签到状态。依次试两个端点（CPA fallback 模式）。 */
 async function fetchCheckinStatus(
@@ -448,6 +490,16 @@ async function checkinOauthPoolAccount(
       if (typeof streak === 'number') base.streakDays = streak
     } catch { /* ignore */ }
 
+    // 国际版注册激活自愈（移植 workbuddy2api activate_region / complete_flow）：
+    // 补齐 register + 地区，解决上游 chat 429 code 14017「trial not activated」。
+    // 失败只记录，不改 base.success（global 签到语义仍算"跳过"）。uid 缺失则跳过。
+    if (uid) {
+      try {
+        base.globalActivation = await ensureGlobalActivation(token, uid)
+      } catch (e) {
+        base.globalActivation = { ok: false, message: (e as Error).message }
+      }
+    }
     // 国际版一次性 trial 加油包（移植 workbuddy2api trial.go）：global 无签到/任务中心，
     // trial 是其唯一天然积分增益动作。幂等（14051 = 已领过，视为正常）。
     // 失败不影响 base.success（签到语义上 global 仍算"跳过"），只记录结果供面板展示。
@@ -690,6 +742,15 @@ export async function checkinOneAccount(
       const streak = await fetchWorkbuddyStreak(token, 'global', { uid, enterpriseId, deviceToken: devTokenGlobal })
       if (typeof streak === 'number') base.streakDays = streak
     } catch { /* ignore */ }
+    // 国际版注册激活自愈（同池化路径，移植 workbuddy2api activate_region / complete_flow）：
+    // 补齐 register + 地区，解决上游 chat 429 code 14017「trial not activated」。
+    if (uid) {
+      try {
+        base.globalActivation = await ensureGlobalActivation(token, uid)
+      } catch (e) {
+        base.globalActivation = { ok: false, message: (e as Error).message }
+      }
+    }
     // 国际版一次性 trial 加油包（同池化路径，移植 workbuddy2api trial.go）
     try {
       const tr = await claimGlobalTrial(token)

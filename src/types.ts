@@ -546,6 +546,13 @@ export interface CheckinResult {
    */
   trialClaim?: { success: boolean; already: boolean; message: string }
   /**
+   * 国际版注册激活自愈结果（仅 global 账号）：补齐 register + 注册地区完善。
+   * 上游对「未完成注册激活」的试用账号，chat 请求会返回 429 code 14017
+   * （trial not activated），换号/重试均无效，必须先激活（workbuddy2api
+   * activate_region / complete_flow）。
+   */
+  globalActivation?: { ok: boolean; message: string }
+  /**
    * WorkBuddy 多账号池：本 provider 下每个池账号的独立签到结果（池提供商才有）。
    * 面板可按账号逐条展示；汇总字段（success/credits 等）为池整体快照。
    */
