@@ -25,6 +25,8 @@ import {
   workbuddyChatAccept,
   ensureGlobalFallbackSystem,
   GLOBAL_FALLBACK_SYSTEM,
+  rewriteWorkbuddySystemPrompt,
+  WORKBUDDY_DEGRADED_PROMPT,
   sanitizeFingerprintText,
   sanitizeWorkbuddyMessages,
   contentBlockedClientMessage,
@@ -640,6 +642,45 @@ describe('ensureGlobalFallbackSystem（移植 workbuddy2api ensureConsoleSystem�
     const msgs = body['messages'] as any[]
     expect(msgs.length).toBe(2)
     expect(msgs[0].role).toBe('system')
+  })
+})
+
+describe('rewriteWorkbuddySystemPrompt（移植 workbuddy2api prompt.Rewrite）', () => {
+  it('custom：删除所有 system/developer，头部插入自有提示词，其余消息不动', () => {
+    const body: Record<string, unknown> = {
+      messages: [
+        { role: 'system', content: 'client sys' },
+        { role: 'developer', content: 'client dev' },
+        { role: 'user', content: 'hi' },
+        { role: 'assistant', content: 'ok' },
+      ],
+    }
+    rewriteWorkbuddySystemPrompt(body, '[GW] 自有提示词')
+    const msgs = body['messages'] as any[]
+    expect(msgs.length).toBe(3)
+    expect(msgs[0]).toEqual({ role: 'system', content: '[GW] 自有提示词' })
+    expect(msgs[1].role).toBe('user')
+    expect(msgs[2].role).toBe('assistant')
+  })
+
+  it('覆盖 ensureGlobalFallbackSystem 注入的兜底 system（避免双 system）', () => {
+    const body: Record<string, unknown> = { messages: [{ role: 'user', content: 'hi' }] }
+    ensureGlobalFallbackSystem(body)
+    rewriteWorkbuddySystemPrompt(body, '[GW] 自有提示词')
+    const msgs = body['messages'] as any[]
+    expect(msgs.length).toBe(2)
+    expect(msgs[0]).toEqual({ role: 'system', content: '[GW] 自有提示词' })
+    expect(msgs[1].role).toBe('user')
+  })
+
+  it('空提示词为空操作；messages 缺失/非数组时兜底为单条 system', () => {
+    const nop = { messages: [{ role: 'system', content: 'keep' }] }
+    rewriteWorkbuddySystemPrompt(nop, '')
+    expect((nop['messages'] as any[])[0].content).toBe('keep')
+
+    const bare: Record<string, unknown> = {}
+    rewriteWorkbuddySystemPrompt(bare, WORKBUDDY_DEGRADED_PROMPT)
+    expect(bare['messages']).toEqual([{ role: 'system', content: WORKBUDDY_DEGRADED_PROMPT }])
   })
 })
 

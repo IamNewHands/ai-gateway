@@ -31,6 +31,16 @@ export interface Provider {
   apiType?: 'openai' | 'anthropic'
   /** 认证方式：api-key（普通 API Key） | oauth-device（OAuth 设备码登录） */
   authType?: 'api-key' | 'oauth-device'
+  /**
+   * 系统提示词体系（移植 workbuddy2api internal/prompt）：
+   *  - 'passthrough'（缺省）：透传客户端原始 system；遇内容拦截误报时自动换
+   *    WORKBUDDY_DEGRADED_PROMPT 中性提示词同请求重试一次（见 proxy 内容墙处理）。
+   *  - 'custom'：出站时用 promptText 整体替换 system/developer，从源头消除指纹误报。
+   *  未设置按 'passthrough' 处理。
+   */
+  promptMode?: 'passthrough' | 'custom'
+  /** custom 模式下注入的自有系统提示词文本（promptMode==='custom' 时生效）。 */
+  promptText?: string
   /** OAuth 设备码认证配置（authType === 'oauth-device' 时生效） */
   oauth?: OAuthDeviceConfig
   apiKeys: ApiKeyEntry[]
@@ -460,6 +470,10 @@ export interface UpdateProviderRequest {
   traeMaxToolSchemaChars?: number | null
   /** M365 会话级多账号分摊（Account Spread，传 false/null 关闭） */
   accountSpread?: boolean | null
+  /** 系统提示词体系：'passthrough'（传 null 恢复默认）| 'custom' */
+  promptMode?: 'passthrough' | 'custom' | null
+  /** custom 模式下注入的自有系统提示词（传 ''/null 清空） */
+  promptText?: string | null
 }
 
 /**
@@ -495,6 +509,9 @@ export interface UpsertProviderRequest {
   traeMaxToolSchemaChars?: number
   /** M365 会话级多账号分摊（Account Spread） */
   accountSpread?: boolean
+  /** 系统提示词体系：'passthrough'（缺省）| 'custom'；custom 用 promptText 替换 system/developer。 */
+  promptMode?: 'passthrough' | 'custom'
+  promptText?: string
 }
 
 /**

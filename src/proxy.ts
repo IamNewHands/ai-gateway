@@ -70,6 +70,8 @@ import {
   WORKBUDDY_GLOBAL_MODELS_PROBE_PATHS,
   isAccountBanned,
   ensureGlobalFallbackSystem,
+  rewriteWorkbuddySystemPrompt,
+  WORKBUDDY_DEGRADED_PROMPT,
   sanitizeWorkbuddyMessages,
   sanitizeFingerprintText,
   ContentBlockedError,
@@ -1843,7 +1845,7 @@ async function proxyOAuthRequestPooledCore(
     return 'cn'
   }
 
-  const doFetch = (token: string, cookies: string | undefined, realm?: 'cn' | 'global', account?: OAuthPoolAccount) => {
+  const doFetch = (token: string, cookies: string | undefined, realm?: 'cn' | 'global', account?: OAuthPoolAccount, systemOverride?: string) => {
     const r = realm || resolveRealm(token)
     const body = { ...forwardBody } as Record<string, unknown>
     // 捕获客户端原始 stream 意图（force 前），供非流式聚合判断
@@ -1874,6 +1876,14 @@ async function proxyOAuthRequestPooledCore(
       if (r === 'global' && subPath === 'chat/completions') {
         ensureGlobalFallbackSystem(body)
       }
+      // 系统提示词体系（移植 workbuddy2api internal/prompt）：
+      //  - custom：用自有提示词整体替换 system/developer（覆盖上面注入的兜底 system，避免双 system）；
+      //  - passthrough 降级重试：调用方传 systemOverride（中性提示词）时替换。
+      if (provider.promptMode === 'custom' && provider.promptText) {
+        rewriteWorkbuddySystemPrompt(body, provider.promptText)
+      } else if (systemOverride) {
+        rewriteWorkbuddySystemPrompt(body, systemOverride)
+      }
     }
     const headers = buildOauthHeaders(cfg, token, { origin: buildOrigin(r), apiType: provider.apiType, cookies })
     if (isWorkbuddyProvider(provider)) {
@@ -1886,19 +1896,21 @@ async function proxyOAuthRequestPooledCore(
     }, (body as Record<string, unknown>).stream === true || isWorkbuddyProvider(provider)).then(resp => ({ resp, originalStream }))
   }
 
-  const doFetchWithRetry = async (token: string, cookies: string | undefined, realm?: 'cn' | 'global', account?: OAuthPoolAccount) => {
-    let result = await doFetch(token, cookies, realm, account)
+  const doFetchWithRetry = async (token: string, cookies: string | undefined, realm?: 'cn' | 'global', account?: OAuthPoolAccount, systemOverride?: string) => {
+    let result = await doFetch(token, cookies, realm, account, systemOverride)
     let transientRetries = 0
     while (isTransientStatus(result.resp.status) && transientRetries < TRANSIENT_RETRY_MAX) {
       transientRetries++
       await new Promise((r) => setTimeout(r, TRANSIENT_RETRY_DELAY_MS * transientRetries))
-      result = await doFetch(token, cookies, realm, account)
+      result = await doFetch(token, cookies, realm, account, systemOverride)
     }
     return result
   }
 
   const tried = new Set<string>()
   let lastErr: Error | null = null
+  // 系统提示词降级：本请求内是否已用过中性提示词重试（仅统一应用一次）。
+  let degradedApplied = false
 
   // 会话粘性（移植 workbuddy2api internal/session/session.go）：同一会话尽量绑定同一账号，
   // 避免多轮跳号导致上游 prompt cache 失效与上下文不一致。
@@ -2059,6 +2071,30 @@ async function proxyOAuthRequestPooledCore(
           // 理由：内容问题是**请求本身**的问题，换任何账号都会撞同一审核——轮转纯属浪费
           // 上游请求并放大风控。且不罚账号（该号余额/会话都健康）。
           // 抛出专用错误由外层入口转为 400 + 防火墙文案（避免暴露业务 code 与账号/冷却语义）。
+          // —— 前置一步：系统提示词降级自愈（默认 passthrough，移植 workbuddy2api handler.go）：
+          //   content_blocked 很可能是 system 指纹误报（非 custom 且本请求尚未降级过），
+          //   换 WORKBUDDY_DEGRADED_PROMPT 中性提示词同账号重试一次；仍被拦才回内容墙。
+          if (provider.promptMode !== 'custom' && !degradedApplied) {
+            dedicatedDegrade: {
+              degradedApplied = true
+              const degraded = await doFetchWithRetry(token, account.token.cookies, undefined, account, WORKBUDDY_DEGRADED_PROMPT)
+              if (!degraded.resp.ok) break dedicatedDegrade
+              const dResp = degraded.resp
+              const dStream = degraded.originalStream
+              await noteOauthSuccess(c.env, provider.id, account.uid)
+              await clearOauthSessionDead(c.env, provider.id, account.uid)
+              if (reqModel) {
+                modelBlockHits.delete(modelBlockKey)
+                await clearOauthAccountModelCooldown(c.env, provider.id, account.uid, reqModel)
+              }
+              if (sessKey && account.uid !== stickyUid) {
+                await bindSticky(c.env, provider.id, sessKey, account.uid)
+              }
+              releaseOnce()
+              return { response: dResp, originalStream: dStream, account }
+            }
+            // 降级重试仍被拦 → 用户内容本身触发审核，回内容墙
+          }
           if (sessKey && account.uid === stickyUid) {
             await unbindSticky(c.env, provider.id, sessKey)
           }
@@ -2257,7 +2293,7 @@ async function proxyOAuthRequest(
     return null
   }
 
-  const doFetch = (token: string, realm?: 'cn' | 'global') => {
+  const doFetch = (token: string, realm?: 'cn' | 'global', systemOverride?: string) => {
     const r = realm || resolveRealm(token)
     const body = { ...forwardBody } as Record<string, unknown>
     // WorkBuddy 只支持流式请求，强制 stream: true（所有以 workbuddy 开头的 provider ID）
@@ -2291,6 +2327,12 @@ async function proxyOAuthRequest(
       if (r === 'global' && subPath === 'chat/completions') {
         ensureGlobalFallbackSystem(body)
       }
+      // 系统提示词体系（移植 workbuddy2api internal/prompt），同池化路径时序。
+      if (provider.promptMode === 'custom' && provider.promptText) {
+        rewriteWorkbuddySystemPrompt(body, provider.promptText)
+      } else if (systemOverride) {
+        rewriteWorkbuddySystemPrompt(body, systemOverride)
+      }
     }
     const headers = buildOauthHeaders(cfg, token, { origin: buildOrigin(r), apiType: provider.apiType, cookies: tokenState?.cookies })
     if (isWorkbuddyProvider(provider)) {
@@ -2305,14 +2347,14 @@ async function proxyOAuthRequest(
 
   // 瞬时错误自动重试：对同一 token 的瞬时 5xx / 网络抖动重试 1 次，
   // 消除"偶发 500，客户端重试一次又正常"的体验问题（复用 doFetch 的流式/非流式语义）。
-  const doFetchWithRetry = async (token: string, realm?: 'cn' | 'global') => {
-    let result = await doFetch(token, realm)
+  const doFetchWithRetry = async (token: string, realm?: 'cn' | 'global', systemOverride?: string) => {
+    let result = await doFetch(token, realm, systemOverride)
     let transientRetries = 0
     while (isTransientStatus(result.resp.status) && transientRetries < TRANSIENT_RETRY_MAX) {
       transientRetries++
       try { c.executionCtx.waitUntil(writeLog(c.env, 'warn', `[${provider.name}] ${model} → 瞬时 ${result.resp.status}，${transientRetries}/${TRANSIENT_RETRY_MAX} 次重试`)) } catch {}
       await new Promise((r) => setTimeout(r, TRANSIENT_RETRY_DELAY_MS * transientRetries))
-      result = await doFetch(token, realm)
+      result = await doFetch(token, realm, systemOverride)
     }
     return result
   }
@@ -2363,6 +2405,24 @@ async function proxyOAuthRequest(
         if (altResult.resp.ok || altResult.resp.status !== 401) {
           response = altResult.resp
           originalStream = altResult.originalStream
+        }
+      }
+    }
+
+    // 系统提示词降级自愈（非池化路径，默认 passthrough）：content_blocked 很可能是 system
+    // 指纹误报，换 WORKBUDDY_DEGRADED_PROMPT 中性提示词同请求重试一次（custom 模式已替换、不再降级）。
+    if (!response.ok && provider.promptMode !== 'custom') {
+      const blockText = await response.text().catch(() => '')
+      if (classifyWorkbuddyUpstreamError(response.status, blockText) === 'content_blocked') {
+        const degraded = await doFetchWithRetry(token, undefined, WORKBUDDY_DEGRADED_PROMPT)
+        if (degraded.resp.ok) {
+          response = degraded.resp
+          originalStream = degraded.originalStream
+        } else {
+          // 降级重试仍被拦 → 用户内容本身触发审核，回内容墙
+          const err = new ContentBlockedError(blockText)
+          logOAuthRequest(c, provider, model, subPath, forwardBody, 400)
+          return c.json({ error: { message: err.clientMessage, type: 'content_blocked' } }, 400)
         }
       }
     }

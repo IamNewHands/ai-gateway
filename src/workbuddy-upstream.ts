@@ -747,6 +747,47 @@ export function ensureGlobalFallbackSystem(body: Record<string, unknown>): void 
   msgs.unshift({ role: 'system', content: GLOBAL_FALLBACK_SYSTEM })
 }
 
+// ===== 系统提示词体系（移植 workbuddy2api internal/prompt） =====
+
+/** 降级中性提示词（对齐源实现 prompt.Degraded）：passthrough 模式遇内容拦截误报时换用。 */
+export const WORKBUDDY_DEGRADED_PROMPT =
+  "You are a helpful assistant. Respond in the user's language, follow the user's instructions, and be direct and concise."
+
+/**
+ * 用网关自有提示词替换 messages 里的 system/developer（对齐源实现 prompt.Rewrite）：
+ *   - 删除所有 role 为 system/developer 的消息；
+ *   - 在头部插入一条 {role:'system', content:systemPrompt}；
+ *   - 其余字段与 user/assistant/tool 消息逐字不动。
+ *
+ * 用途（两处）：
+ *   - custom 模式：用配置的自有提示词整体替换客户端 system/developer，从源头消除
+ *     system 来源的指纹误报（用户/assistant 消息内的指纹串另由 sanitize 清洗，两层叠加）；
+ *   - passthrough 降级重试：被内容拦截且判定为指纹误报时，换 WORKBUDDY_DEGRADED_PROMPT
+ *     同请求重试一次（不改用户指令合法性语义）。
+ *
+ * 调用于 ensureGlobalFallbackSystem **之后**：若已注入兜底 system 会被一并替换为自有提示词
+ * （语义一致，避免出现两条 system）。
+ */
+export function rewriteWorkbuddySystemPrompt(body: Record<string, unknown>, systemPrompt: string): void {
+  if (!systemPrompt) return
+  const msgs = body['messages']
+  if (Array.isArray(msgs)) {
+    const kept: unknown[] = []
+    for (const m of msgs) {
+      if (!m || typeof m !== 'object' || Array.isArray(m)) {
+        kept.push(m)
+        continue
+      }
+      const role = (m as Record<string, unknown>)['role']
+      if (role === 'system' || role === 'developer') continue
+      kept.push(m)
+    }
+    body['messages'] = [{ role: 'system', content: systemPrompt }, ...kept]
+  } else {
+    body['messages'] = [{ role: 'system', content: systemPrompt }]
+  }
+}
+
 // ===== global 模型目录动态探测解析（移植 workbuddy2api global_models.go） =====
 
 /** global 模型目录探测路径候选（对齐 workbuddy2api globalModelsProbePaths）：

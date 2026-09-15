@@ -39,7 +39,7 @@ function makeToken(uid: string): OAuthTokenState {
   } as OAuthTokenState
 }
 
-function makeProvider(): Provider {
+function makeProvider(overrides?: Partial<Provider>): Provider {
   return {
     id: PID,
     name: 'WorkBuddy E2E',
@@ -57,6 +57,7 @@ function makeProvider(): Provider {
       tokenHeaderPrefix: 'Bearer ',
       extraHeaders: { Origin: 'https://www.codebuddy.cn', Referer: 'https://www.codebuddy.cn/' },
     },
+    ...overrides,
   } as unknown as Provider
 }
 
@@ -409,7 +410,32 @@ describe('WorkBuddy 池化代理端到端（粘性 + 会话头族 + 协议头）
     expect(body.error.message).toContain('内容防火墙规则')
     expect(body.error.message).not.toContain('11128')
 
-    // **关键**：只打了 1 次上游（未轮转）
+    // **关键**：未轮转换号——passthrough 默认只对**同一账号**做 1 次中性提示词降级重试
+    //（先撞一次 content_blocked → 换 Degraded 提示词重试），仍被拦才回内容墙；不跨账号轮转。
+    expect(n).toBe(2)
+  })
+
+  it('内容拦截：custom 模式已替换自有提示词，不做降级重试（只打 1 次上游，不轮转）', async () => {
+    const { env, app } = makeEnv([makeProvider({ promptMode: 'custom', promptText: '[GW] 自有提示词' })])
+    // 3 个账号：若发生轮转，会打到多个账号
+    await seedPool(env, ['ua', 'ub', 'uc'])
+
+    let n = 0
+    vi.stubGlobal('fetch', vi.fn(async () => {
+      n++
+      return new Response(
+        JSON.stringify({ error: { data: { code: 11128, msg: 'blocked by security policy 色情' } } }),
+        { status: 400, headers: { 'Content-Type': 'application/json' } },
+      )
+    }))
+
+    const res = await app.post({
+      model: `${PID}/deepseek-v4-flash`,
+      messages: [{ role: 'user', content: 'bad content' }],
+      stream: false,
+    })
+    expect(res.status).toBe(400)
+    // custom 模式被拦 → 直接回内容墙（不降级重试），故只打 1 次上游
     expect(n).toBe(1)
   })
 

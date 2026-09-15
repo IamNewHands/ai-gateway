@@ -330,7 +330,9 @@ export async function handleUpdateProvider(c: Context<AppEnv>) {
   if (body.traeMaxHistoryChars !== undefined) updates.traeMaxHistoryChars = body.traeMaxHistoryChars ?? undefined
   if (body.traeMaxToolSchemaChars !== undefined) updates.traeMaxToolSchemaChars = body.traeMaxToolSchemaChars ?? undefined
   if (body.accountSpread !== undefined) updates.accountSpread = body.accountSpread ?? undefined
-if (body.apiKeys !== undefined) {
+  if (body.promptMode !== undefined) updates.promptMode = body.promptMode ?? undefined
+  if (body.promptText !== undefined) updates.promptText = body.promptText ?? undefined
+  if (body.apiKeys !== undefined) {
     updates.apiKeys = normalizeArray(body.apiKeys, (k) => ({ key: k, enabled: true }))
   }
   if (body.enabled !== undefined) updates.enabled = body.enabled
@@ -409,6 +411,8 @@ export async function handleUpsertProvider(c: Context<AppEnv>) {
       toolBridge: body.toolBridge,
       cnbPool: body.cnbPool,
       cooldown: body.cooldown,
+      promptMode: body.promptMode,
+      promptText: body.promptText,
       thinkingInject: body.thinkingInject,
       cachePrefixInject: body.cachePrefixInject,
       geminiBaseUrl: body.geminiBaseUrl?.replace(/\/$/, ''),
@@ -447,6 +451,8 @@ export async function handleUpsertProvider(c: Context<AppEnv>) {
   if (body.toolBridge !== undefined) updates.toolBridge = body.toolBridge
   if (body.cnbPool !== undefined) updates.cnbPool = body.cnbPool
   if (body.cooldown !== undefined) updates.cooldown = body.cooldown
+  if (body.promptMode !== undefined) updates.promptMode = body.promptMode
+  if (body.promptText !== undefined) updates.promptText = body.promptText
   if (body.thinkingInject !== undefined) updates.thinkingInject = body.thinkingInject
   if (body.cachePrefixInject !== undefined) updates.cachePrefixInject = body.cachePrefixInject
   if (body.enabled !== undefined) updates.enabled = body.enabled
