@@ -85,12 +85,32 @@ function responsesUserTexts(input: unknown): string[] {
 }
 
 function trimCandidate(value: string): string {
+  // 先截断再净化：正则只作用于有界输入，规避多项式回溯
   return value
+    .slice(0, MAX_TASK_ANCHOR_VALUE_CHARACTERS)
     .replace(/[\u0000-\u001f\u007f]/gu, '')
     .trim()
     .replace(/[\s,，。；;！!？?]+$/gu, '')
     .replace(/[)）\]】}]+$/gu, '')
-    .slice(0, MAX_TASK_ANCHOR_VALUE_CHARACTERS)
+}
+
+// 逐行有界扫描：被引路径/UNC 不会跨行，逐行跑正则并跳过超长行，规避多项式回溯
+const MAX_TASK_ANCHOR_LINE_CHARACTERS = 512
+
+function matchPerLine(text: string, pattern: RegExp): Array<RegExpMatchArray & { index: number }> {
+  const matches: Array<RegExpMatchArray & { index: number }> = []
+  const parts = text.split(/(\r\n|\r|\n)/)
+  let offset = 0
+  for (let i = 0; i < parts.length; i += 2) {
+    const line = parts[i]
+    if (line.length <= MAX_TASK_ANCHOR_LINE_CHARACTERS) {
+      for (const match of line.matchAll(pattern)) {
+        matches.push(Object.assign(match, { index: (match.index ?? 0) + offset }))
+      }
+    }
+    offset += line.length + (parts[i + 1]?.length ?? 0)
+  }
+  return matches
 }
 
 function safeURL(raw: string): string {
@@ -130,13 +150,13 @@ function candidatesFromText(text: string): Array<TaskAnchor & { offset: number }
     const value = safeURL(match[0])
     if (value) result.push({ kind: 'url', value, offset: match.index ?? 0 })
   }
-  for (const match of text.matchAll(QUOTED_WINDOWS_PATTERN)) add('windows_path', match[2], match.index ?? 0)
+  for (const match of matchPerLine(text, QUOTED_WINDOWS_PATTERN)) add('windows_path', match[2], match.index)
   for (const match of text.matchAll(WINDOWS_PATTERN)) {
     const offset = match.index ?? 0
     if (['"', "'"].includes(text[offset - 1] ?? '')) continue
     add('windows_path', match[0], offset)
   }
-  for (const match of text.matchAll(QUOTED_UNC_PATTERN)) add('unc_path', match[2], match.index ?? 0)
+  for (const match of matchPerLine(text, QUOTED_UNC_PATTERN)) add('unc_path', match[2], match.index)
   for (const match of text.matchAll(UNC_PATTERN)) {
     const offset = match.index ?? 0
     if (['"', "'"].includes(text[offset - 1] ?? '')) continue
