@@ -49,10 +49,11 @@ describe('提供商详情面板：仅相关提供商显示专属配置', () => {
     expect(p).toMatch(/id="atb-fs-deepseek"[^>]*class="[^"]*\bhd\b"|class="[^"]*\bhd\b"[^>]*id="atb-fs-deepseek"/)
     expect(p).not.toContain('gbu-row-deepseek')
     expect(p).toMatch(/class="eff-dd hd"/)
-    // 模型策略（未配置模型透传）对所有提供商有效，必须保留且可见（不带 hd）
+    // 模型策略（未配置模型透传）对所有提供商有效：折叠容器保留且可用，默认折叠（hd）
     expect(p).toContain('id="aum-deepseek"')
-    expect(p).toMatch(/class="form-group" id="aum-fs-deepseek"/)
-    expect(p).not.toMatch(/class="form-group hd" id="aum-fs-deepseek"/)
+    // 折叠容器可见（对所有提供商都显示按钮），fieldset 默认折叠
+    expect(p).toMatch(/class="form-group hd" id="aum-fs-deepseek"/)
+    expect(p).not.toMatch(/class="form-group" id="aum-fs-deepseek"/)
   })
 
   it('CNB 提供商：显示工具桥', async () => {

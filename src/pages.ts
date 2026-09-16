@@ -549,8 +549,18 @@ ${H('管理')}
               </fieldset>
             </div>
             <div class="fg hd" id="agbu-row"><label for="agbu">Gemini 推理中转地址（可选）</label><input type="url" id="agbu" placeholder="https://your-us-relay.example.com"><span class="form-helper">仅登录流程为「Gemini 授权码」的提供商生效。Google 对部分地区拒绝对 cloudcode-pa.googleapis.com 的推理调用（HTTP 400 User location is not supported）；配置美国中转地址后，网关把 generateContent / countTokens 推理请求经该节点中转。OAuth 认证端点不走此地址，仍直连 Google。留空 = 直连内置默认地址。</span></div>
-            <fieldset class="form-group hd" id="atb-fs"><legend>工具桥</legend><label class="switch-label"><span>启用工具桥（XYML 提示词注入 + 流式解析回 tool_calls，仅 CNB 需要）</span><span class="tg"><input type="checkbox" id="atb"><span class="sl"></span></span></label></fieldset>
-            <fieldset class="form-group" id="aum-fs"><legend>模型策略</legend><label class="switch-label"><span>允许未配置模型透传——开启后请求该提供商的任意 modelId 都直接转发（跳过「未配置」校验），适合模型频繁上架、不想每次手动加模型的提供商（如 OpenRouter）。</span><span class="tg"><input type="checkbox" id="aum"><span class="sl"></span></span></label></fieldset>
+            <div class="collapse-section hd" id="atb-cs">
+              <button class="collapse-btn" onclick="toggleAdvOauth('atb-fs', this)" type="button" aria-expanded="false">
+                <i class="fas fa-chevron-right collapse-icon" aria-hidden="true"></i> 工具桥（XYML 提示词注入，仅 CNB 需要，可选）
+              </button>
+              <fieldset class="form-group hd" id="atb-fs"><legend>工具桥</legend><label class="switch-label"><span>启用工具桥（XYML 提示词注入 + 流式解析回 tool_calls，仅 CNB 需要）</span><span class="tg"><input type="checkbox" id="atb"><span class="sl"></span></span></label></fieldset>
+            </div>
+            <div class="collapse-section">
+              <button class="collapse-btn" onclick="toggleAdvOauth('aum-fs', this)" type="button" aria-expanded="false">
+                <i class="fas fa-chevron-right collapse-icon" aria-hidden="true"></i> 模型策略（未配置模型透传，可选）
+              </button>
+              <fieldset class="form-group hd" id="aum-fs"><legend>模型策略</legend><label class="switch-label"><span>允许未配置模型透传——开启后请求该提供商的任意 modelId 都直接转发（跳过「未配置」校验），适合模型频繁上架、不想每次手动加模型的提供商（如 OpenRouter）。</span><span class="tg"><input type="checkbox" id="aum"><span class="sl"></span></span></label></fieldset>
+            </div>
             <div class="panel-actions"><label class="switch-label"><span>创建后立即启用</span><span class="tg"><input type="checkbox" checked id="aen"><span class="sl"></span></span></label><div><button class="btn btn-s" onclick="hideAdd()">取消</button><button class="btn btn-p" onclick="createProv()"><i class="fas fa-check" aria-hidden="true"></i>创建提供商</button></div></div>
             <div id="atestR" class="mt-1" aria-live="polite"></div>
           </div>
@@ -663,9 +673,23 @@ ${H('管理')}
                   <div class="fg"><label>视觉转写失败策略</label><select id="vb-fail-${escapePageHtml(p.id)}" class="select-sm"><option value="error" ${!p.visionBridge||p.visionBridge.onVisionFailure==='error'?'selected':''}>error（返回错误）</option><option value="text_only" ${p.visionBridge&&p.visionBridge.onVisionFailure==='text_only'?'selected':''}>text_only（丢弃图片仅转发文本）</option></select></div>
                 </fieldset>
               </div>
-              <fieldset class="form-group${isCnbProviderUI(p)?'':' hd'}" id="atb-fs-${escapePageHtml(p.id)}"><legend>工具桥</legend><label class="switch-label"><span>启用工具桥（XYML 提示词注入 + 流式解析回 tool_calls，仅 CNB 需要）</span><span class="tg"><input type="checkbox" id="atb-${escapePageHtml(p.id)}" ${p.toolBridge?'checked':''}><span class="sl"></span></span></label></fieldset>
-              <fieldset class="form-group" id="aum-fs-${escapePageHtml(p.id)}"><legend>模型策略</legend><label class="switch-label"><span>允许未配置模型透传——开启后请求该提供商的任意 modelId 都直接转发（跳过「未配置」校验），适合模型频繁上架、不想每次手动加模型的提供商（如 OpenRouter）。</span><span class="tg"><input type="checkbox" id="aum-${escapePageHtml(p.id)}" ${p.allowUnlistedModels?'checked':''}><span class="sl"></span></span></label></fieldset>
-              <fieldset class="form-group" id="psys-fs-${escapePageHtml(p.id)}"><legend>系统提示词体系</legend><div class="fc mt-1 field-row" style="align-items:flex-start"><label style="width:110px;font-size:13px;padding-top:6px">提示词模式</label><select id="pmode-${escapePageHtml(p.id)}" style="flex:1"><option value="passthrough" ${(p.promptMode||'passthrough')==='passthrough'?'selected':''}>passthrough（透传客户端 system，被拦自动降级重试）</option><option value="custom" ${p.promptMode==='custom'?'selected':''}>custom（用下方自有提示词替换）</option></select></div><div class="fc mt-1 field-row" style="align-items:flex-start"><label style="width:110px;font-size:13px;padding-top:6px">自有提示词</label><textarea id="ptext-${escapePageHtml(p.id)}" rows="4" placeholder="custom 模式下替换 system/developer 的提示词" style="flex:1">${escapePageHtml(p.promptText||'')}</textarea></div><span class="form-helper">passthrough：透传客户端原始 system；遇内容拦截误报自动换中性提示词重试一次。custom：出站时用上方提示词整体替换 system/developer，从源头消除指纹误报。</span></fieldset>
+              <div class="collapse-section${isCnbProviderUI(p)?'':' hd'}" id="atb-cs-${escapePageHtml(p.id)}">
+                <button class="collapse-btn" onclick="toggleAdvOauth('atb-fs-${escapePageJsx(p.id)}', this)" type="button" aria-expanded="false">
+                  <i class="fas fa-chevron-right collapse-icon" aria-hidden="true"></i> 工具桥（XYML 提示词注入，仅 CNB 需要，可选）
+                </button>
+                <fieldset class="form-group hd" id="atb-fs-${escapePageHtml(p.id)}"><legend>工具桥</legend><label class="switch-label"><span>启用工具桥（XYML 提示词注入 + 流式解析回 tool_calls，仅 CNB 需要）</span><span class="tg"><input type="checkbox" id="atb-${escapePageHtml(p.id)}" ${p.toolBridge?'checked':''}><span class="sl"></span></span></label></fieldset>
+              </div>
+              <div class="collapse-section">
+                <button class="collapse-btn" onclick="toggleAdvOauth('aum-fs-${escapePageJsx(p.id)}', this)" type="button" aria-expanded="false">
+                  <i class="fas fa-chevron-right collapse-icon" aria-hidden="true"></i> 模型策略（未配置模型透传，可选）${p.allowUnlistedModels?'<span class="bd bd-on" style="margin-left:6px">透传已启用</span>':''}
+                </button>
+                <fieldset class="form-group hd" id="aum-fs-${escapePageHtml(p.id)}"><legend>模型策略</legend><label class="switch-label"><span>允许未配置模型透传——开启后请求该提供商的任意 modelId 都直接转发（跳过「未配置」校验），适合模型频繁上架、不想每次手动加模型的提供商（如 OpenRouter）。</span><span class="tg"><input type="checkbox" id="aum-${escapePageHtml(p.id)}" ${p.allowUnlistedModels?'checked':''}><span class="sl"></span></span></label></fieldset>
+              </div>
+              <div class="collapse-section">
+                <button class="collapse-btn" onclick="toggleAdvOauth('psys-fs-${escapePageJsx(p.id)}', this)" type="button" aria-expanded="false">
+                  <i class="fas fa-chevron-right collapse-icon" aria-hidden="true"></i> 系统提示词体系（模式 / 自有提示词，可选）${p.promptMode==='custom'?'<span class="bd bd-on" style="margin-left:6px">custom 已启用</span>':''}
+                </button>
+                <fieldset class="form-group hd" id="psys-fs-${escapePageHtml(p.id)}"><legend>系统提示词体系</legend><div class="fc mt-1 field-row" style="align-items:flex-start"><label style="width:110px;font-size:13px;padding-top:6px">提示词模式</label><select id="pmode-${escapePageHtml(p.id)}" style="flex:1"><option value="passthrough" ${(p.promptMode||'passthrough')==='passthrough'?'selected':''}>passthrough（透传客户端 system，被拦自动降级重试）</option><option value="custom" ${p.promptMode==='custom'?'selected':''}>custom（用下方自有提示词替换）</option></select></div><div class="fc mt-1 field-row" style="align-items:flex-start"><label style="width:110px;font-size:13px;padding-top:6px">自有提示词</label><textarea id="ptext-${escapePageHtml(p.id)}" rows="4" placeholder="custom 模式下替换 system/developer 的提示词" style="flex:1">${escapePageHtml(p.promptText||'')}</textarea></div><span class="form-helper">passthrough：透传客户端原始 system；遇内容拦截误报自动换中性提示词重试一次。custom：出站时用上方提示词整体替换 system/developer，从源头消除指纹误报。</span></fieldset>
               <div class="detail-actions"><div id="tr-${escapePageHtml(p.id)}" aria-live="polite"></div><div>${((p.id === 'cnb' || (p.baseUrl && p.baseUrl.indexOf('cnb.cool') !== -1)) || ((p.oauth && (p.oauth.flowType === 'm365-pkce' || p.oauth.flowType === 'm365-ropc')))) ? '<button class="btn btn-s" onclick="fetchOauthModels(\'' + escapePageJsx(p.id) + '\')"><i class="fas fa-download" aria-hidden="true"></i>获取模型</button>' : ((isSensenovaProviderUI(p) || p.apiType === 'openai' || p.id === 'cline' || p.id === 'opencode') && !isTraeProviderUI(p) && !(p.authType === 'oauth-device' && p.oauth)) ? '<button class="btn btn-s" onclick="fetchEditModels(\'' + escapePageJsx(p.id) + '\')"><i class="fas fa-download" aria-hidden="true"></i>获取模型</button>' : ''}${p.id === 'cline' ? '<button class="btn btn-s" onclick="clineOAuthConnect(\'' + escapePageJsx(p.id) + '\')"><i class="fas fa-sign-in-alt" aria-hidden="true"></i>一键授权获取 Token</button>' : ''}<button class="btn btn-d" onclick="del('${escapePageJsx(p.id)}')"><i class="fas fa-trash" aria-hidden="true"></i>删除</button><button class="btn btn-p" onclick="save('${escapePageJsx(p.id)}')"><i class="fas fa-save" aria-hidden="true"></i>保存更改</button></div></div>
             </div>
           </article>`).join('') : `<div class="empty-state"><i class="fas fa-server" aria-hidden="true"></i><h3>还没有提供商</h3><p>添加第一个上游提供商，配置 API 地址、Key 和模型。</p><button class="btn btn-p" onclick="showAdd()">添加提供商</button></div>`}
@@ -1831,7 +1855,7 @@ function syncNewScopedFields() {
   // 工具桥：仅 CNB（id 为 cnb 或用 cnb.cool 域）
   const url = ((document.getElementById('aurl') || {}).value || '')
   const isCnb = aid === 'cnb' || url.indexOf('cnb.cool') !== -1
-  setHidden('atb-fs', !isCnb)
+  setHidden('atb-cs', !isCnb)
   // Gemini 推理中转地址：仅 Gemini 授权码流程
   setHidden('agbu-row', !(isOauth && flow === 'gemini'))
   // Client Secret：仅 Gemini OAuth 消费
