@@ -1303,6 +1303,9 @@ function scrubToolFragmentsOnce(t: string): string {
   t = t.replace(/<\/?(?:tool_call|tool_use|function|invoke|parameter)\b[^>]*>/gi, '')
   t = t.replace(/^=+\s*(?:XYML|QNML)\s+TOOL CALL PROTOCOL\s*=+$/gim, '')
   t = t.replace(/^Default protocol for new tool calls:.*$/gim, '')
+  // 显式清除 script 标签（含变体空白/斜杠），确保残片拼接也无法保留 <script
+  t = t.replace(/<\s*\/?\s*script\b[^>]*>/gi, '')
+  t = t.replace(/<\s*\/?\s*script/gi, '')
   return t
 }
 
