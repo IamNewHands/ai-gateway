@@ -130,6 +130,15 @@ export interface WorkbuddyStreamOptions {
    * 拿不到可判定的错误码）。
    */
   sanitizeErrorText?: (text: string) => string
+  /**
+   * 可选的在途用量（prompt/completion/total），用于护盾合成终态帧时填进 usage，
+   * 避免客户端把熔断截断计为零用量。未提供时用已投喂的 reasoning 字符数兜底估算。
+   */
+  usage?: {
+    promptTokens?: number
+    completionTokens?: number
+    totalTokens?: number
+  }
 }
 
 /** 帧重建与推理防护的跨帧状态（一条 SSE 流一个实例）。 */
@@ -154,6 +163,8 @@ export interface WorkbuddyStreamState {
   detector: WorkbuddyDegeneracyDetector
   /** 流选项 */
   options?: WorkbuddyStreamOptions
+  /** 触发抑制/熔断的原因（供合成终态帧标记，区分真实 token 上限与护盾截断）。 */
+  runawayKind?: 'degenerate_loop' | 'budget_exhausted'
   /** 流内最后一次收到的上游错误帧（已脱敏）；无错误帧则为 undefined */
   lastError?: WorkbuddyErrorFrame
 }
@@ -464,6 +475,7 @@ export function processWorkbuddyFrame(payload: string, state: WorkbuddyStreamSta
         if (state.options?.enableDegeneracyDetection !== false && !state.suppressed) {
           if (state.detector.feedDelta(reasoning)) {
             state.suppressed = true
+            state.runawayKind = 'degenerate_loop'
             state.options?.onRunaway?.('degenerate_loop')
             if (state.options?.stopSignal) state.options.stopSignal.aborted = true
           }
@@ -473,6 +485,7 @@ export function processWorkbuddyFrame(payload: string, state: WorkbuddyStreamSta
         const maxChars = state.options?.maxReasoningChars ?? WORKBUDDY_DEFAULT_MAX_REASONING_CHARS
         if (maxChars > 0 && state.reasoningChars >= maxChars && !state.suppressed) {
           state.suppressed = true
+          state.runawayKind = 'budget_exhausted'
           state.options?.onRunaway?.('budget_exhausted')
           if (state.options?.stopSignal) state.options.stopSignal.aborted = true
         }
@@ -532,11 +545,20 @@ export function createWorkbuddyChunkCleaner(options?: WorkbuddyStreamOptions): (
     // 若触发抑制且全程未产出任何正文/工具调用，且尚未发送终态合成帧
     if (state.suppressed && !state.terminated && state.contentChars === 0 && !state.hasToolCalls) {
       state.terminated = true
+      // 护盾截断帧：携带估算 usage（避免客户端计费/用量显示为全 0）以及非标准
+      // x_workbuddy_runaway 标记，让客户端能把「护盾熔断」与上游真实的 finish_reason
+      // "length"（真·token 上限）区分开，而不是把死循环熔断误报成输出 token 上限。
       const termObj = {
         id: state.firstId || WORKBUDDY_SENTINEL_ID,
         object: 'chat.completion.chunk',
         created: Math.floor(Date.now() / 1000),
         model: state.model || 'workbuddy',
+        usage: {
+          prompt_tokens: state.options?.usage?.promptTokens ?? 0,
+          completion_tokens: state.options?.usage?.completionTokens ?? state.detector.totalReasoningChars,
+          total_tokens: state.options?.usage?.totalTokens ?? state.detector.totalReasoningChars,
+        },
+        x_workbuddy_runaway: state.runawayKind ?? 'degenerate_loop',
         choices: [
           {
             index: 0,

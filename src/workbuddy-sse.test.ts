@@ -372,6 +372,12 @@ describe('WorkBuddy 流式推理退化抑制与预算熔断防护（createWorkbu
     expect(r2).toContain('finish_reason')
     expect(r2).toContain('length')
     expect(r2).toContain('[DONE]')
+
+    // 预算熔断合成帧同样应带 usage 与标记（标记为 budget_exhausted）。
+    const termData = r2.split('\n\n')[0].slice(5).trim()
+    const term = JSON.parse(termData)
+    expect(term.usage).toBeDefined()
+    expect(term.x_workbuddy_runaway).toBe('budget_exhausted')
   })
 
   it('严重死循环退化且全程无正文时，合成 finish_reason: "length" 并终止上游流', () => {
@@ -399,6 +405,13 @@ describe('WorkBuddy 流式推理退化抑制与预算熔断防护（createWorkbu
     expect(lastOut).toContain('finish_reason')
     expect(lastOut).toContain('length')
     expect(lastOut).toContain('[DONE]')
+
+    // 护盾合成终态帧应携带估算 usage 与退化标记，而非全 0 计费/无标记。
+    const termData = lastOut.split('\n\n')[0].slice(5).trim()
+    const term = JSON.parse(termData)
+    expect(term.usage).toBeDefined()
+    expect(term.usage.total_tokens).toBeGreaterThan(0)
+    expect(term.x_workbuddy_runaway).toBe('degenerate_loop')
 
     // 终态发出后，后续帧应被丢弃为空串
     const afterDone = clean(`data: ${JSON.stringify(chunk({ choices: [{ index: 0, delta: { reasoning_content: 'more spam' }, finish_reason: null }] }))}`)
