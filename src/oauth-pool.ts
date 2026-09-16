@@ -448,8 +448,9 @@ export interface PickOauthOptions {
    * 在途占满过滤（对齐 workbuddy2api pick.go:63-65 `p.inFlightFull(e)`）：
    * 返回 true 表示该 uid 当前在途已满、应跳过。缺省 undefined = 不做该过滤（既有行为）。
    * 由调用方注入（在途计数在 workbuddy-inflight.ts，避免 oauth-pool 反向依赖）。
+   * 第二参传入账号对象（供调用方按 token realm 取不同在途档，对齐 workbuddy2api 2680f4c）。
    */
-  isInFlightFull?: (uid: string) => boolean
+  isInFlightFull?: (uid: string, account?: OAuthPoolAccount) => boolean
 }
 
 /**
@@ -477,14 +478,14 @@ export async function pickOauthAccount(
   if (preferUid) {
     const preferred = pool.find((a) => a.uid === preferUid && !tried.has(a.uid) && isOauthAccountHealthy(a, now, reqModel))
     // 在途占满的号也不采用（对齐源实现：Acquire 失败会换号）
-    if (preferred && !opts?.isInFlightFull?.(preferred.uid)) chosen = preferred
+    if (preferred && !opts?.isInFlightFull?.(preferred.uid, preferred)) chosen = preferred
   }
 
   if (!chosen) {
     let candidates = pool.filter((a) =>
       !tried.has(a.uid) &&
       isOauthAccountHealthy(a, now, reqModel) &&
-      !opts?.isInFlightFull?.(a.uid)
+      !opts?.isInFlightFull?.(a.uid, a)
     )
     if (candidates.length > 0) {
       // 成本分层：reqModel 非空时，按实测扣费分层只保留最优层
@@ -584,14 +585,14 @@ function pickEarliestCoolingFallback(
   pool: OAuthPool,
   tried: Set<string>,
   now: number,
-  isInFlightFull?: (uid: string) => boolean
+  isInFlightFull?: (uid: string, account?: OAuthPoolAccount) => boolean
 ): OAuthPoolAccount | null {
   let best: OAuthPoolAccount | null = null
   let bestUntil = 0
   for (const a of pool) {
     if (!a || tried.has(a.uid)) continue
     if (a.enabled === false) continue
-    if (isInFlightFull?.(a.uid)) continue
+    if (isInFlightFull?.(a.uid, a)) continue
     const st = a.state
     if (!st || st.disabled) continue
     const until = st.until || 0

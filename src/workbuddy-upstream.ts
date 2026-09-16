@@ -31,6 +31,7 @@ export type WorkbuddyErrorKind =
   | 'account_fault'    // 账号级授权/配额故障（11140 / 14017）→ 换号并冷却或禁用
   | 'not_found'        // 404 上游偶发 → 短冷却，不累计错误
   | 'server'           // 5xx → 累计错误计数
+  | 'waf_block'        // 403 + 无业务信封（APISIX WAF 拦截页/空体）→ 软冷却 + 抖动退避，不禁用
   | 'bad_params'       // 400 Unmarshal 11101 → 客户端参数错，不罚号，仅换号
   | 'content_blocked'  // 400 审核拦截 → 不罚号
   | 'client'           // 其他 4xx → 不处罚，仅换号
@@ -236,7 +237,7 @@ export function parseSoftRateReset(bodyText: string): number | null {
 /**
  * 按 HTTP 状态码 + 响应体判定错误类别（对齐 workbuddy2api Classify 的判定顺序）：
  * 402 → 余额关键词 → session 死亡关键词 → **账号级故障（11140/14017）** → 6004 模型限流
- * → 429 软限流 → 404 → 5xx → 内容策略拦截 → 11101 参数错 → 其他 4xx。
+ * → 429 软限流 → 404 → 5xx → WAF 403（无业务信封）→ 内容策略拦截 → 11101 参数错 → 其他 4xx。
  * 关键词优先于状态码：上游偶发把业务错误包在 5xx 里时，按真实原因分类。
  *
  * 判定顺序的语义依据（对齐源实现 client.go:235-256 的注释）：
@@ -270,6 +271,10 @@ export function classifyWorkbuddyUpstreamError(status: number, bodyText: string)
   if (status === 429) return 'soft_rate'
   if (status === 404) return 'not_found'
   if (status >= 500) return 'server'
+  // WAF 403（无业务信封的拦截形态）：判在内容策略/参数错误/通用 4xx 之前——这些层只认带文案
+  // 的 body，WAF 空体/HTML 永远不会命中它们的 marker，但落 client 兜底的代价是「只换号不罚」。
+  // 带业务信封的 403（11140 request illegal 等）已被上方 account_fault 捕获，走不到本层。
+  if (isWafBlocked(status, bodyText)) return 'waf_block'
   if (status >= 400) {
     for (const m of CONTENT_BLOCKED_MARKERS) {
       if (lower.includes(m)) return 'content_blocked'
@@ -280,6 +285,144 @@ export function classifyWorkbuddyUpstreamError(status: number, bodyText: string)
     return 'client'
   }
   return 'client'
+}
+
+// ===== 轮转退避（对齐 workbuddy2api 64eb4aa backoff.go） =====
+
+/**
+ * 轮转退避的单一事实来源（移植 workbuddy2api internal/server/backoff.go）：
+ * java 指数基数/封顶/抖动比例一处定义，proxy 轮转循环与 WAF 软冷却共享。
+ *
+ * 语义对齐源实现：轮转换号前歇一下，让上游频控窗口滑过；正常单号请求（首轮成功）
+ * 不经过退避，零开销。测试用 `__setBackoffBaseForTests` 可把基数置 0 跳过等待。
+ */
+
+/** 轮转退避基数（对齐 workbuddy2api rotateBackoffBase = 500ms，官方 intl CLI 形态）。 */
+export const ROTATE_BACKOFF_BASE_MS = 500
+/** 轮转退避封顶（对齐源实现 8s；轮转默认 3 次，实际等待序列 500ms/1s）。 */
+export const ROTATE_BACKOFF_CAP_MS = 8000
+/** 抖动比例（±25%，对齐源实现 jitterFraction）。 */
+export const ROTATE_BACKOFF_JITTER = 0.25
+/** 超出该位数视为「秒口径」的 epoch（对齐源实现：≥12 位才当作毫秒）。 */
+export const ROTATE_EPOCH_MS_DIGITS = 12
+
+/** 测试可替换的基数（对齐源实现 TestMain 置 0 加速测试）。 */
+let rotateBackoffBaseMs = ROTATE_BACKOFF_BASE_MS
+export function __setBackoffBaseForTests(ms: number): void { rotateBackoffBaseMs = ms }
+
+/**
+ * 给时长施加 ±ROTATE_BACKOFF_JITTER 的均匀抖动（对齐源实现 jitterDur）。
+ * d<=0 原样返回（零等待不抖动）。
+ */
+export function jitterDurMs(ms: number): number {
+  if (ms <= 0) return ms
+  const f = 1 + (Math.random() * 2 - 1) * ROTATE_BACKOFF_JITTER
+  const out = ms * f
+  return out < 0 ? 0 : out
+}
+
+/**
+ * 第 n 次轮转（0 基：首次失败换号前 n=0）前应等待的退避时长：
+ * base·2^n 封顶 ROTATE_BACKOFF_CAP_MS，再施加 ±25% 抖动（对齐源实现 backoffAfter）。
+ * base 置 0（测试）时恒 0。
+ */
+export function rotateBackoffAfterMs(n: number): number {
+  const base = rotateBackoffBaseMs
+  if (base <= 0) return 0
+  let d = base
+  for (let k = 0; k < n && d < ROTATE_BACKOFF_CAP_MS; k++) {
+    d *= 2
+    if (d <= 0) return jitterDurMs(ROTATE_BACKOFF_CAP_MS) // 翻倍溢出：直接按封顶
+  }
+  if (d > ROTATE_BACKOFF_CAP_MS) d = ROTATE_BACKOFF_CAP_MS
+  return jitterDurMs(d)
+}
+
+/** 可取消的等待：aborted 时立即返回 false（客户端断连/优雅停机不必等退避睡醒）。 */
+export function isAbortCancelled(signal?: AbortSignal | { aborted?: boolean }): boolean {
+  return !!(signal && (signal as { aborted?: boolean }).aborted)
+}
+
+// ===== Retry-After 头族解析（对齐 workbuddy2api 76fafa6 ParseRetryAfter） =====
+
+/**
+ * 限流/拦截响应头候选人（对齐源实现 retryAfterHeaderCandidates）：
+ * retry-after（秒，RFC 7231）/ retry-after-ms（毫秒）/ x-ratelimit-reset（epoch 秒或毫秒）。
+ * 大小写不敏感（fetch 的 Headers.get 已归一为小写）。
+ */
+export const RETRY_AFTER_HEADER_CANDIDATES = ['retry-after', 'retry-after-ms', 'x-ratelimit-reset']
+
+/** 解析结果上限（超过视为上游异常值丢弃，回落本地计算）。与 soft_rate_max 默认 2h 同量级。 */
+export const RETRY_AFTER_SANITY_MS = 2 * 60 * 60 * 1000
+
+/** 纯数字判定（前置快筛）。 */
+export function isAllDigits(s: string): boolean {
+  if (s === '') return false
+  for (const r of s) if (r < '0' || r > '9') return false
+  return true
+}
+
+/**
+ * 按头名口径把纯数字串折算成时长（ms）。
+ * x-ratelimit-reset 是 epoch 时刻而非时长：秒口径（10 位）与毫秒口径（≥12 位）都按
+ * 「now + 该时刻的剩余量」折算，已在过去则返回非正（调用方按不合法丢弃）。
+ */
+export function parseRetryNumberMs(v: string, headerName: string, nowMs: number = Date.now()): number {
+  if (v.length > 16) return 0 // 防 int64 溢出（对齐源实现）
+  let n = 0
+  for (const r of v) {
+    n = n * 10 + (r.charCodeAt(0) - 48)
+    if (n > Number.MAX_SAFE_INTEGER) return 0
+  }
+  switch (headerName) {
+    case 'retry-after':
+      return n * 1000
+    case 'retry-after-ms':
+      return n
+    default: { // x-ratelimit-reset：epoch → 剩余量
+      let sec = n
+      if (v.length >= ROTATE_EPOCH_MS_DIGITS) sec = Math.floor(n / 1000) // ≥12 位当作毫秒
+      const remain = (sec * 1000) - nowMs
+      return remain
+    }
+  }
+}
+
+/**
+ * 从响应头解析上游明示的等待时长（对齐源实现 ParseRetryAfter）。
+ * 依次尝试 retry-after（秒）→ retry-after-ms（毫秒）→ x-ratelimit-reset（epoch）。
+ * 任一头缺失/非法/非正/超上限则尝试下一头；全部不可用返回 null（调用方回落既有计算值）。
+ */
+export function parseRetryAfterMs(headers: Headers, nowMs: number = Date.now()): number | null {
+  for (const name of RETRY_AFTER_HEADER_CANDIDATES) {
+    const v = (headers.get(name) || '').trim()
+    if (v === '') continue
+    if (!isAllDigits(v)) continue // 非纯数字（如 HTTP-Date）不解析，宁缺毋滥
+    const ms = parseRetryNumberMs(v, name, nowMs)
+    if (ms <= 0 || ms > RETRY_AFTER_SANITY_MS) continue
+    return ms
+  }
+  return null
+}
+
+// ===== WAF 403 判定（对齐 workbuddy2api 76fafa6 IsWafBlocked） =====
+
+/**
+ * body 是否携带上游业务信封形态（JSON 且含 `"code":` 或 `"msg":` 字段）。
+ * WAF 403 判定用「无业务信封」区分 APISIX WAF 拦截页（HTML/空体/纯文本）与上游业务层 403
+ * （带 code/msg 信封，正常走既有分类）。畸形 JSON 但含字段名仍按业务保守处理（宁漏 WAF 不误罚）。
+ */
+export function hasBusinessEnvelope(bodyText: string): boolean {
+  return bodyText.includes('"code":') || bodyText.includes('"msg":')
+}
+
+/**
+ * 403 响应是否为 WAF 拦截形态（对齐源实现 IsWafBlocked）：
+ * HTTP 403 且 body 无业务信封（HTML 拦截页、空体、纯文本均命中）。
+ * 带业务信封的 403（11140 request illegal / 11128 等）仍走既有分类链，不受影响。
+ */
+export function isWafBlocked(status: number, bodyText: string): boolean {
+  return status === 403 && !hasBusinessEnvelope(bodyText)
 }
 
 // ===== reasoning_effort 降级 =====

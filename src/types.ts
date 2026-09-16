@@ -282,6 +282,12 @@ export interface OAuthDeviceConfig {
    * 注意 Workers 多 isolate 下为 isolate 内近似，详见 workbuddy-inflight.ts。
    */
   maxInFlight?: number
+  /**
+   * global 域（intl/workbuddy.ai）单账号在途上限（对齐 workbuddy2api `pool.max_in_flight_global`）。
+   * 未配置/<=0 → 回落 maxInFlight（不分档，既有部署零回归）；>0 时 global 号按此档、
+   * cn 号仍按 maxInFlight。用途：global 域 WAF 风控更紧，单独压低其单号并发。
+   */
+  maxInFlightGlobal?: number
 }
 
 /** KV 中保存的 OAuth token 状态 */

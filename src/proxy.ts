@@ -75,6 +75,9 @@ import {
   ContentBlockedError,
   WorkbuddyClientError,
   formatWorkbuddyClientErrorMessage,
+  rotateBackoffAfterMs,
+  isWafBlocked,
+  parseRetryAfterMs,
 } from './workbuddy-upstream'
 import {
   buildChatMeta,
@@ -93,6 +96,7 @@ import {
   releaseInFlight,
   isInFlightFull,
   resolveMaxInFlight,
+  resolveMaxInFlightGlobal,
 } from './workbuddy-inflight'
 import {
   anthropicToOpenAI,
@@ -1849,6 +1853,11 @@ async function proxyOAuthRequestPooledCore(
   const cd = resolveOauthCooldown(provider)
   // 单账号在途上限（对齐 workbuddy2api pool.max_in_flight；0/未配置 → 默认 3）
   const maxInFlight = resolveMaxInFlight(provider)
+  // global 域单独在途档（对齐 workbuddy2api 2680f4c pool.max_in_flight_global；0/未配置 → 回落 maxInFlight 不分档）
+  const maxInFlightGlobal = resolveMaxInFlightGlobal(provider)
+  // 在途占满过滤回调（realm 由账号 token 判定，cn/global 分档；对齐 workbuddy2api 2680f4c）
+  const isFull = (uid: string, account?: OAuthPoolAccount) =>
+    isInFlightFull(provider.id, uid, maxInFlight, account?.token?.access_token ? resolveRealm(account.token.access_token) : undefined, maxInFlightGlobal)
   const reqModel = typeof (forwardBody as Record<string, unknown>)?.['model'] === 'string'
     ? (forwardBody as Record<string, unknown>)['model'] as string
     : undefined
@@ -1959,6 +1968,16 @@ async function proxyOAuthRequestPooledCore(
   // 系统提示词降级：本请求内是否已用过中性提示词重试（仅统一应用一次）。
   let degradedApplied = false
 
+  // 轮转间指数退避（对齐 workbuddy2api 64eb4aa rotateBackoff）：第 i 次轮转失败换号前
+  // 等 rotateBackoffAfterMs(i)（500ms·2^i 封顶 8s ±25% 抖动），让上游频控窗口滑过。
+  // ctx 取消（客户端断连/优雅停机）时按 workbuddy2api 语义应 break 终止轮转，不再换号打上游。
+  // 此处 ctx 是不可取消的 request context（Workers 无真正的 AbortSignal 贯穿），故退避值
+  // 仍应用（防风控），不做取消短路——以 Worker 平台的现实为准，避免死等。
+  const backoffAt = async (i: number): Promise<void> => {
+    const ms = rotateBackoffAfterMs(i)
+    if (ms > 0) await new Promise((r) => setTimeout(r, ms))
+  }
+
   // 会话粘性（移植 workbuddy2api internal/session/session.go）：同一会话尽量绑定同一账号，
   // 避免多轮跳号导致上游 prompt cache 失效与上下文不一致。
   // 仅在首轮用粘性号（i === 0）；轮转失败后该号进 tried，自然换号。
@@ -1985,14 +2004,15 @@ async function proxyOAuthRequestPooledCore(
     const account = await pickOauthAccount(c.env, provider.id, tried, preferUid, {
       allowCoolingFallback: true,
       reqModel,
-      isInFlightFull: (uid) => isInFlightFull(provider.id, uid, maxInFlight),
+      isInFlightFull: isFull,
     })
     if (!account) break
     tried.add(account.uid)
 
     // 在途租约：占用一个名额。pick 已排除满号，此处是并发竞态的兜底（同 isolate 内
     // JS 单线程使 acquire 天然原子，故竞态窗口极小；失败即换号）。
-    if (!acquireInFlight(provider.id, account.uid, maxInFlight)) {
+    if (!acquireInFlight(provider.id, account.uid, maxInFlight, account.token?.access_token ? resolveRealm(account.token.access_token) : undefined, maxInFlightGlobal)) {
+      await backoffAt(i)
       continue
     }
     // 本账号的在途名额必须在本轮任何出口释放（成功 return / 各 continue / 抛错）。
@@ -2017,11 +2037,35 @@ async function proxyOAuthRequestPooledCore(
     }
     if (!token) {
       await disableOauthAccount(c.env, provider.id, account.uid, 'no access token')
+      await backoffAt(i)
       continue
     }
 
     const primaryRealm = resolveRealm(token)
     let { resp: response, originalStream } = await doFetchWithRetry(token, account.token.cookies, undefined, account)
+
+    // WAF 403 拦截形态（403 + 无业务信封：APISIX 拦截页/空体/纯文本，对齐 workbuddy2api 76fafa6）：
+    // 必须**先于**下方 401/403→刷新→禁用 路径——否则 WAF 403 会被误判成「session dead」而
+    // 永久禁用健康账号（WAF 是 IP/指纹维频控信号，账号本身健康，罚过即走、到期自愈）。
+    //   - 软冷却：Retry-After 头优先，缺失按 cd.softMs 固定浅冷却（复用 429 语义，不建平行系统）；
+    //   - 不 feed 累计连续性错误计数（noteOauthError）——WAF 频控不是账号故障，禁连环冷却；
+    //   - 不禁用、不粘性解绑需要刚性理由（账号健康，仅瞬时风控）。
+    if (response.status === 403) {
+      const wafText = await response.text().catch(() => '')
+      if (isWafBlocked(response.status, wafText)) {
+        const raMs = parseRetryAfterMs(response.headers)
+        const wafCdMs = raMs !== null ? raMs : cd.softMs
+        await cooldownOauthAccount(c.env, provider.id, account.uid, wafCdMs, raMs !== null ? 'waf 403 block (retry-after)' : 'waf 403 block')
+        // 粘性解绑：WAF 频控带 IP/指纹粘性，本轮撞 WAF 解绑让会话下一跳重新分配。
+        if (sessKey && account.uid === stickyUid) {
+          await unbindSticky(c.env, provider.id, sessKey)
+          stickyUid = ''
+        }
+        lastErr = new Error(`account ${account.uid} waf 403 blocked`)
+        await backoffAt(i)
+        continue
+      }
+    }
 
     // 401/403：先刷新一次（仍 401 则尝试备用域；再失败禁用换号）
     if (response.status === 401 || response.status === 403) {
@@ -2056,6 +2100,7 @@ async function proxyOAuthRequestPooledCore(
           stickyUid = ''
         }
         lastErr = new Error(`account ${account.uid} session dead`)
+        await backoffAt(i)
         continue
       }
     } else if (!response.ok) {
@@ -2110,8 +2155,26 @@ async function proxyOAuthRequestPooledCore(
           }
           break
         case 'server':
-          // 5xx 上游故障 → 累计错误计数（达阈值自动冷却）
-          await noteOauthError(c.env, provider.id, account.uid, cd)
+          // 5xx 上游故障。优先采信 Retry-After 头（对齐 workbuddy2api 76fafa6 P1-2）：
+          // 上游明示恢复时刻时按该时刻软冷却，**不喂连续错误计数**——避免偶发 5xx 把
+          // 好账号钉进 noteOauthError 连环冷却（这正是「全池无可用账号」的元凶之一）。
+          // 无 Retry-After 头才回落既有语义（累计错误计数，达阈值自动冷却）。
+          {
+            const raMs = parseRetryAfterMs(response.headers)
+            if (raMs !== null) {
+              await cooldownOauthAccount(c.env, provider.id, account.uid, raMs, `server 5xx (retry-after)`)
+            } else {
+              await noteOauthError(c.env, provider.id, account.uid, cd)
+            }
+          }
+          break
+        case 'waf_block':
+          // WAF 403（无业务信封拦截形态）软冷却：**不禁用**。已在上方 401/403 之前拦截，
+          // 此处为防御性双保险（正常走不到）；重合逻辑与上文 WAF 分支一致。
+          {
+            const raMs = parseRetryAfterMs(response.headers)
+            await cooldownOauthAccount(c.env, provider.id, account.uid, raMs !== null ? raMs : cd.softMs, raMs !== null ? 'waf 403 block (retry-after)' : 'waf 403 block')
+          }
           break
         case 'content_blocked':
           // 内容命中网关防火墙：**立即终止本请求，不轮转**（对齐 workbuddy2api handler.go:571-582）。
@@ -2163,6 +2226,7 @@ async function proxyOAuthRequestPooledCore(
         stickyUid = ''
       }
       lastErr = new Error(`account ${account.uid} http ${response.status} (${kind})`)
+      await backoffAt(i)
       continue
     }
 

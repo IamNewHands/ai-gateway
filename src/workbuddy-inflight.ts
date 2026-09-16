@@ -9,6 +9,11 @@
  * 选号侧配合：`isInFlightFull(uid)` 为 true 的账号不参与挑号（源实现 pick.go:63-65），
  * 使并发请求自然发散到其他健康账号，而非全撞同一个高分号。
  *
+ * **realm 分档（对齐 workbuddy2api 2680f4c）**：global 域（intl）风控更紧，支持单独压低
+ * `maxInFlightGlobal` 档（默认回落 maxInFlight）。按账号的落地区域（cn/global）取不同
+ * 在途上限，global 号用 global 档、cn 号用 maxInFlight 档，互不影响。未配置（0/负数）
+ * 回落 maxInFlight，既有部署零回归。
+ *
  * ⚠️ **Workers 多 isolate 局限（诚实标注）**：本实现用模块级 Map 计数，
  * 只在**同一 isolate 内**有效。Cloudflare Workers 会把同一 isolate 复用于多个并发请求
  * （热 isolate），因此它能拦住"同 isolate 并发打爆单号"这一最常见形态；
@@ -41,25 +46,52 @@ export function inFlightOf(providerId: string, uid: string): number {
 }
 
 /**
- * 该账号是否已占满在途名额（源实现 pick.go:197-202 inFlightFull）。
- * maxInFlight <= 0 表示不限 → 恒 false。
+ * 解析某账号的生效在途上限：global 域账号按 RealmLimit 的 global 档，其余按 maxInFlight。
+ * maxInFlightGlobal <= 0（未配置）回落 maxInFlight——既有部署零回归（对齐 2680f4c）。
  */
-export function isInFlightFull(providerId: string, uid: string, maxInFlight: number = DEFAULT_MAX_IN_FLIGHT): boolean {
-  if (maxInFlight <= 0) return false
-  return inFlightOf(providerId, uid) >= maxInFlight
+function effectiveLimit(
+  realm: 'cn' | 'global' | undefined,
+  maxInFlight: number,
+  maxInFlightGlobal: number
+): number {
+  if (realm === 'global' && maxInFlightGlobal > 0) return maxInFlightGlobal
+  return maxInFlight
+}
+
+/**
+ * 该账号是否已占满在途名额（源实现 pick.go:197-202 inFlightFull）。
+ * maxInFlight（及 global 档）<= 0 表示不限 → 恒 false。
+ */
+export function isInFlightFull(
+  providerId: string,
+  uid: string,
+  maxInFlight: number = DEFAULT_MAX_IN_FLIGHT,
+  realm?: 'cn' | 'global',
+  maxInFlightGlobal: number = 0
+): boolean {
+  const limit = effectiveLimit(realm, maxInFlight, maxInFlightGlobal)
+  if (limit <= 0) return false
+  return inFlightOf(providerId, uid) >= limit
 }
 
 /**
  * 占用一个在途名额（源实现 Acquire）。
- * 返回 false 表示已满（调用方应换号）；maxInFlight <= 0 时不限但**仍计数**（供观测）。
+ * 返回 false 表示已满（调用方应换号）；对应上限 <= 0 时不限但**仍计数**（供观测）。
  *
  * 注意：Workers 的 JS 单线程模型使本函数天然原子（无 await 点），
  * 不需要源实现那种 CAS 循环。
  */
-export function acquireInFlight(providerId: string, uid: string, maxInFlight: number = DEFAULT_MAX_IN_FLIGHT): boolean {
+export function acquireInFlight(
+  providerId: string,
+  uid: string,
+  maxInFlight: number = DEFAULT_MAX_IN_FLIGHT,
+  realm?: 'cn' | 'global',
+  maxInFlightGlobal: number = 0
+): boolean {
+  const limit = effectiveLimit(realm, maxInFlight, maxInFlightGlobal)
   const k = keyOf(providerId, uid)
   const cur = inFlight.get(k) ?? 0
-  if (maxInFlight > 0 && cur >= maxInFlight) return false
+  if (limit > 0 && cur >= limit) return false
   inFlight.set(k, cur + 1)
   return true
 }
@@ -84,6 +116,16 @@ export function resolveMaxInFlight(provider: { oauth?: { maxInFlight?: number } 
   const v = provider.oauth?.maxInFlight
   if (typeof v !== 'number' || !Number.isFinite(v)) return DEFAULT_MAX_IN_FLIGHT
   return v
+}
+
+/**
+ * 解析 provider 上配置的 global 域在途上限（provider.oauth.maxInFlightGlobal）。
+ * 缺省/非有效数 → 0（回落 maxInFlight，不分档）；<= 0 视为"未配置"回落。
+ */
+export function resolveMaxInFlightGlobal(provider: { oauth?: { maxInFlightGlobal?: number } }): number {
+  const v = provider.oauth?.maxInFlightGlobal
+  if (typeof v !== 'number' || !Number.isFinite(v)) return 0
+  return v > 0 ? v : 0
 }
 
 /** 供运维/面板观测：当前所有账号的在途快照。 */

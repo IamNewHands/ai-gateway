@@ -35,6 +35,17 @@ import {
   ContentBlockedError,
   WorkbuddyClientError,
   formatWorkbuddyClientErrorMessage,
+  rotateBackoffAfterMs,
+  __setBackoffBaseForTests,
+  jitterDurMs,
+  ROTATE_BACKOFF_BASE_MS,
+  ROTATE_BACKOFF_CAP_MS,
+  parseRetryAfterMs,
+  parseRetryNumberMs,
+  isAllDigits,
+  RETRY_AFTER_SANITY_MS,
+  isWafBlocked,
+  hasBusinessEnvelope,
 } from './workbuddy-upstream'
 
 describe('classifyWorkbuddyUpstreamError 错误分类（移植 workbuddy2api Classify）', () => {
@@ -128,9 +139,11 @@ describe('account_fault 账号级故障分类（移植 workbuddy2api accountFaul
     expect(classifyWorkbuddyUpstreamError(403, '12153 request illegal')).toBe('session_dead')
   })
 
-  it('普通 4xx 不带账号故障文案时不受影响 → client', () => {
+  it('普通 4xx 不带账号故障文案时不受影响 → client（403 无信封属 WAF 拦截）', () => {
     expect(classifyWorkbuddyUpstreamError(400, 'bad request')).toBe('client')
-    expect(classifyWorkbuddyUpstreamError(403, 'forbidden')).toBe('client')
+    // 403 无业务信封（纯文本/空体/HTML）→ WAF 拦截形态，不再落 client（对齐 workbuddy2api 76fafa6）
+    expect(classifyWorkbuddyUpstreamError(403, 'forbidden')).toBe('waf_block')
+    expect(classifyWorkbuddyUpstreamError(403, '{"code":11128}')).toBe('client') // 带信封 → 既有 4xx 兜底
   })
 
   it('isAccountBanned 区分 11140（硬禁用）与 14017（软冷却）', () => {
@@ -1108,6 +1121,173 @@ describe('global 模型目录动态探测解析 parseWorkbuddyGlobalModels（移
       '/v2/enterprises/personal/models',
       '/console/enterprises/personal/models',
     ])
+  })
+})
+
+describe('rotateBackoffAfterMs（对齐 workbuddy2api 64eb4aa backoffAfter）', () => {
+  it('base 置 0（测试）→ 恒 0（跳过等待）', () => {
+    __setBackoffBaseForTests(0)
+    expect(rotateBackoffAfterMs(0)).toBe(0)
+    expect(rotateBackoffAfterMs(1)).toBe(0)
+    expect(rotateBackoffAfterMs(5)).toBe(0)
+    __setBackoffBaseForTests(ROTATE_BACKOFF_BASE_MS)
+  })
+
+  it('n=0 → base±25% 抖动落在 [375, 625]', () => {
+    let hits = 0
+    for (let i = 0; i < 200; i++) {
+      const ms = rotateBackoffAfterMs(0)
+      expect(ms).toBeGreaterThanOrEqual(375)
+      expect(ms).toBeLessThanOrEqual(625)
+      if (ms !== ROTATE_BACKOFF_BASE_MS) hits++
+    }
+    expect(hits).toBeGreaterThan(0) // 抖动确随机（同一输入多次）
+  })
+
+  it('指数翻倍：n=1 在 [750,1250]，封顶 ROTATE_BACKOFF_CAP_MS', () => {
+    __setBackoffBaseForTests(ROTATE_BACKOFF_BASE_MS)
+    for (let i = 0; i < 100; i++) {
+      const n1 = rotateBackoffAfterMs(1)
+      expect(n1).toBeGreaterThanOrEqual(750)
+      expect(n1).toBeLessThanOrEqual(1000 * 1.25)
+    }
+    // n 极大 → 封顶（基 500·2^n，n≥5 即超 8s → 封顶 ±25%）
+    for (let i = 0; i < 100; i++) {
+      const big = rotateBackoffAfterMs(20)
+      expect(big).toBeGreaterThanOrEqual(ROTATE_BACKOFF_CAP_MS * 0.75)
+      expect(big).toBeLessThanOrEqual(ROTATE_BACKOFF_CAP_MS * 1.25)
+    }
+  })
+})
+
+describe('jitterDurMs（对齐 workbuddy2api jitterDur）', () => {
+  it('d<=0 原样（不抖动）', () => {
+    expect(jitterDurMs(0)).toBe(0)
+    expect(jitterDurMs(-5)).toBe(-5)
+  })
+  it('正数落在 [0.75d, 1.25d]', () => {
+    for (let i = 0; i < 200; i++) {
+      const out = jitterDurMs(1000)
+      expect(out).toBeGreaterThanOrEqual(750)
+      expect(out).toBeLessThanOrEqual(1250)
+    }
+  })
+})
+
+describe('parseRetryAfterMs（对齐 workbuddy2api 76fafa6 ParseRetryAfter）', () => {
+  const h = (pairs: Array<[string, string]>) => new Headers(pairs)
+
+  it('Retry-After 整数秒 → ms', () => {
+    expect(parseRetryAfterMs(h([['retry-after', '30']]))).toBe(30000)
+    expect(parseRetryAfterMs(h([['Retry-After', '30']]))).toBe(30000) // 大小写不敏感
+  })
+
+  it('retry-after-ms → ms', () => {
+    expect(parseRetryAfterMs(h([['retry-after-ms', '1500']]))).toBe(1500)
+  })
+
+  it('x-ratelimit-reset：秒（10 位 epoch）→ now+剩余', () => {
+    const now = Date.now()
+    const epochSec = Math.floor(Date.now() - 90000) / 1000 // 已在接近过去（90s 前 epoch 秒）
+    // 用「未来 90s」构造，验证剩余量≈90s
+    const futureSec = Math.floor((Date.now() + 90000) / 1000)
+    const ms = parseRetryAfterMs(h([['x-ratelimit-reset', String(futureSec)]]), now)
+    expect(ms).not.toBeNull()
+    expect(ms!).toBeGreaterThanOrEqual(89000)
+    expect(ms!).toBeLessThanOrEqual(91000)
+    void epochSec
+  })
+
+  it('x-ratelimit-reset：毫秒（13 位 epoch）→ now+剩余', () => {
+    const futureMs = Date.now() + 45000
+    const ms = parseRetryAfterMs(h([['x-ratelimit-reset', String(futureMs)]]))
+    expect(ms!).toBeGreaterThanOrEqual(44000)
+    expect(ms!).toBeLessThanOrEqual(46000)
+  })
+
+  it('缺失 / 空 → null', () => {
+    expect(parseRetryAfterMs(new Headers())).toBeNull()
+    expect(parseRetryAfterMs(h([['retry-after', '']]))).toBeNull()
+  })
+
+  it('非纯数字（HTTP-Date）→ 不解析（宁缺毋滥）', () => {
+    expect(parseRetryAfterMs(h([['retry-after', 'Wed, 21 Oct 2015 07:28:00 GMT']]))).toBeNull()
+  })
+
+  it('非正 / 超上限（>2h）→ 丢弃', () => {
+    expect(parseRetryAfterMs(h([['retry-after', '0']]))).toBeNull()
+    expect(parseRetryAfterMs(h([['retry-after', '999999']]))).toBeNull()
+    expect(parseRetryAfterMs(h([['retry-after', String(Math.floor(RETRY_AFTER_SANITY_MS / 1000) + 1)]]))).toBeNull()
+  })
+
+  it('Retry-After 优先于 x-ratelimit-reset', () => {
+    const now = Date.now()
+    const futureSec = Math.floor((Date.now() + 300000) / 1000)
+    const ms = parseRetryAfterMs(h([
+      ['retry-after', '10'],
+      ['x-ratelimit-reset', String(futureSec)],
+    ]), now)
+    expect(ms).toBe(10000)
+  })
+
+  it('parseRetryNumberMs：位数≥12 当作毫秒、<12 当作秒', () => {
+    // 10 位秒口径 epoch → 折算成「now+剩余量」ms
+    const futureSec = Math.floor((Date.now() + 90000) / 1000)
+    const remain = parseRetryNumberMs(String(futureSec), 'x-ratelimit-reset', Date.now())
+    expect(remain).toBeGreaterThanOrEqual(89000)
+    expect(remain).toBeLessThanOrEqual(91000)
+    // 13 位毫秒口径 epoch → 同样折算「now+剩余量」（秒口径多算 1000 倍被位数判断纠正）
+    const futureMs = Math.floor(Date.now() + 90000)
+    const remainMs = parseRetryNumberMs(String(futureMs), 'x-ratelimit-reset', Date.now())
+    expect(remainMs).toBeGreaterThanOrEqual(89000)
+    expect(remainMs).toBeLessThanOrEqual(91000)
+  })
+
+  it('isAllDigits 快筛', () => {
+    expect(isAllDigits('123')).toBe(true)
+    expect(isAllDigits('')).toBe(false)
+    expect(isAllDigits('12a')).toBe(false)
+    expect(isAllDigits('-5')).toBe(false)
+  })
+})
+
+describe('isWafBlocked / hasBusinessEnvelope（对齐 workbuddy2api 76fafa6）', () => {
+  it('403 + 空体 → WAF', () => {
+    expect(isWafBlocked(403, '')).toBe(true)
+  })
+  it('403 + HTML 拦截页 → WAF', () => {
+    expect(isWafBlocked(403, '<html><body>forbidden by firewall</body></html>')).toBe(true)
+  })
+  it('403 + 纯文本 → WAF', () => {
+    expect(isWafBlocked(403, 'Forbidden')).toBe(true)
+  })
+  it('403 + 业务信封（"code": / "msg":）→ 非 WAF（走既有分类）', () => {
+    expect(isWafBlocked(403, '{"error":{"data":{"code":11140,"msg":"request illegal"}}}')).toBe(false)
+    expect(isWafBlocked(403, '{"msg":"rate limited"}')).toBe(false)
+  })
+  it('非 403 → 非 WAF（无论 body）', () => {
+    expect(isWafBlocked(500, '')).toBe(false)
+    expect(isWafBlocked(400, '<html></html>')).toBe(false)
+  })
+  it('hasBusinessEnvelope：含 "code": / "msg": 即信封', () => {
+    expect(hasBusinessEnvelope('{"code":0}')).toBe(true)
+    expect(hasBusinessEnvelope('{"msg":"x"}')).toBe(true)
+    expect(hasBusinessEnvelope('{"data":1}')).toBe(false)
+    expect(hasBusinessEnvelope('<html></html>')).toBe(false)
+  })
+})
+
+describe('classifyWorkbuddyUpstreamError → waf_block', () => {
+  it('403 空体 / HTML / 纯文本 → waf_block', () => {
+    expect(classifyWorkbuddyUpstreamError(403, '')).toBe('waf_block')
+    expect(classifyWorkbuddyUpstreamError(403, '<html>waf</html>')).toBe('waf_block')
+    expect(classifyWorkbuddyUpstreamError(403, 'Forbidden')).toBe('waf_block')
+  })
+  it('403 业务信封（11140 request illegal）→ account_fault（不被 WAF 劫持）', () => {
+    expect(classifyWorkbuddyUpstreamError(403, '{"error":{"data":{"code":11140,"msg":"request illegal"}}}')).toBe('account_fault')
+  })
+  it('403 业务信封（其它 code/msg）→ client（既有 4xx 兜底）', () => {
+    expect(classifyWorkbuddyUpstreamError(403, '{"code":11128,"msg":"no permission"}')).toBe('client')
   })
 })
 

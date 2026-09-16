@@ -7,6 +7,7 @@ import {
   inFlightOf,
   inFlightSnapshot,
   resolveMaxInFlight,
+  resolveMaxInFlightGlobal,
   __resetInFlightForTests,
 } from './workbuddy-inflight'
 
@@ -128,5 +129,52 @@ describe('resolveMaxInFlight', () => {
     expect(resolveMaxInFlight({ oauth: { maxInFlight: NaN } })).toBe(DEFAULT_MAX_IN_FLIGHT)
     expect(resolveMaxInFlight({ oauth: { maxInFlight: Infinity } })).toBe(DEFAULT_MAX_IN_FLIGHT)
     expect(resolveMaxInFlight({ oauth: { maxInFlight: '3' as unknown as number } })).toBe(DEFAULT_MAX_IN_FLIGHT)
+  })
+})
+
+describe('resolveMaxInFlightGlobal（对齐 workbuddy2api 2680f4c）', () => {
+  it('未配置 → 0（回落 maxInFlight，不分档）', () => {
+    expect(resolveMaxInFlightGlobal({})).toBe(0)
+    expect(resolveMaxInFlightGlobal({ oauth: {} })).toBe(0)
+    expect(resolveMaxInFlightGlobal({ oauth: { maxInFlightGlobal: undefined } })).toBe(0)
+  })
+
+  it('配置正数 → 原样返回', () => {
+    expect(resolveMaxInFlightGlobal({ oauth: { maxInFlightGlobal: 2 } })).toBe(2)
+  })
+
+  it('0 / 负数 / 非法 → 回落 0', () => {
+    expect(resolveMaxInFlightGlobal({ oauth: { maxInFlightGlobal: 0 } })).toBe(0)
+    expect(resolveMaxInFlightGlobal({ oauth: { maxInFlightGlobal: -1 } })).toBe(0)
+    expect(resolveMaxInFlightGlobal({ oauth: { maxInFlightGlobal: NaN } })).toBe(0)
+  })
+})
+
+describe('realm 分档在途（对齐 workbuddy2api 2680f4c global/CN 分档）', () => {
+  beforeEach(() => { __resetInFlightForTests() })
+
+  it('global 档 2 + CN 档 3：global 第 3 次被拒、cn 第 3 次成功', () => {
+    // global 档 2：前两次成功、第三次被拒
+    expect(acquireInFlight(PID, 'g1', 3, 'global', 2)).toBe(true)
+    expect(acquireInFlight(PID, 'g1', 3, 'global', 2)).toBe(true)
+    expect(acquireInFlight(PID, 'g1', 3, 'global', 2)).toBe(false)
+    // cn 档 3（未分档回落 maxInFlight）：第三次仍成功
+    expect(acquireInFlight(PID, 'cn1', 3, 'cn', 2)).toBe(true)
+    expect(acquireInFlight(PID, 'cn1', 3, 'cn', 2)).toBe(true)
+    expect(acquireInFlight(PID, 'cn1', 3, 'cn', 2)).toBe(true)
+    expect(acquireInFlight(PID, 'cn1', 3, 'cn', 2)).toBe(false)
+  })
+
+  it('maxInFlightGlobal 未配置（0）→ global 与 cn 同为 maxInFlight 档（零回归）', () => {
+    for (let i = 0; i < 3; i++) expect(acquireInFlight(PID, 'g1', 3, 'global', 0)).toBe(true)
+    expect(acquireInFlight(PID, 'g1', 3, 'global', 0)).toBe(false)
+  })
+
+  it('isInFlightFull 按 realm 分档判定', () => {
+    acquireInFlight(PID, 'g1', 3, 'global', 2)
+    acquireInFlight(PID, 'g1', 3, 'global', 2)
+    expect(isInFlightFull(PID, 'g1', 3, 'global', 2)).toBe(true)
+    // 同 uid 按 cn 档看：只有 2 在途 < 3，未满
+    expect(isInFlightFull(PID, 'g1', 3, 'cn', 2)).toBe(false)
   })
 })
