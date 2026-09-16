@@ -1278,8 +1278,9 @@ function firstClosedBlockEnd(text: string, config: ToolCallConfig): number {
  */
 export function scrubToolFragments(text: unknown): string {
   let t = canonicalizeMarkup(String(text ?? ''))
-  // 定点迭代：删除多字符序列可能拼出新残片（如 <script），反复应用直到不再变化（有界 8 轮）
-  for (let round = 0; round < 8; round++) {
+  // 定点迭代：删除多字符序列可能拼出新残片（如 <scr<script>ipt → <script），
+  // 反复应用直到不再变化。每轮要么严格缩短字符串要么收敛，循环必然终止（≤输入长度轮）。
+  for (;;) {
     const before = t
     t = scrubToolFragmentsOnce(t)
     if (t === before) break
