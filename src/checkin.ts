@@ -52,6 +52,9 @@ import {
   reportWorkbuddyChatActivity,
   fetchWorkbuddyStreak,
   runWorkbuddyCatTravel,
+  runWorkbuddyGrowthRewards,
+  fetchWorkbuddyRewardState,
+  type WorkbuddyRewardState,
   isAlreadyCheckin,
   billingMeterPaths,
   claimGlobalTrial,
@@ -561,9 +564,13 @@ async function checkinOauthPoolAccount(
     base.activityReport = { success: false, message: (e as Error).message }
   }
 
+  // 连登奖励 + 兑换状态**一次读完**（移植 workbuddy2api 91418c5 GrowthRewardState）：
+  // 上游设计该端点为"一次 GET 同时给出 streak.days 与 redemption_status（各档状态），免二次请求"。
+  // 故这里读一次，既回填面板展示的连登天数，又供下面的连登奖励兑换复用（避免同端点打两遍）。
+  let rewardState: WorkbuddyRewardState | null = null
   try {
-    const streak = await fetchWorkbuddyStreak(token, 'cn', { uid, enterpriseId, deviceToken: devToken })
-    if (typeof streak === 'number') base.streakDays = streak
+    rewardState = await fetchWorkbuddyRewardState(token, 'cn', { uid, enterpriseId, deviceToken: devToken })
+    if (rewardState) base.streakDays = rewardState.days
   } catch { /* ignore */ }
 
   try {
@@ -581,6 +588,23 @@ async function checkinOauthPoolAccount(
     base.catTravel = travel
   } catch (e) {
     base.catTravel = { state: 'error', message: (e as Error).message }
+  }
+
+  // 连登奖励兑换 + 连登抽奖（移植 workbuddy2api 91418c5）：在活跃上报 + streak 自检之后执行，
+  // 与源实现 scheduler.runActivity 的末段同序（活跃上报点亮连登 → 才有可领档位）。
+  // 幂等闸用 KV 日键（`redeemTriedToday`），多 isolate 一致；正常态（已领/未达标/无次数）静默，
+  // 失败只记录不改 base.success（与 catTravel 的失败口径一致）。
+  // state=rewardState：复用上面那次读取，不再打一遍 /activity/growth/streak。
+  try {
+    base.growthReward = await runWorkbuddyGrowthRewards(token, 'cn', uid, {
+      enterpriseId,
+      deviceToken: devToken,
+      env,
+      providerId: provider.id,
+      state: rewardState,
+    })
+  } catch (e) {
+    base.growthReward = { acted: false, message: (e as Error).message }
   }
 
   // 额度信息 + 解冻（签到就是为了解冻冷却账号，对齐 workbuddy-wild ReenableIfCredits）
@@ -809,9 +833,13 @@ export async function checkinOneAccount(
     base.activityReport = { success: false, message: (e as Error).message }
   }
 
+  // 连登奖励 + 兑换状态**一次读完**（移植 workbuddy2api 91418c5 GrowthRewardState）：
+  // 上游设计该端点为"一次 GET 同时给出 streak.days 与 redemption_status（各档状态），免二次请求"。
+  // 故这里读一次，既回填面板展示的连登天数，又供下面的连登奖励兑换复用（避免同端点打两遍）。
+  let rewardState: WorkbuddyRewardState | null = null
   try {
-    const streak = await fetchWorkbuddyStreak(token, 'cn', { uid, enterpriseId, deviceToken: devToken })
-    if (typeof streak === 'number') base.streakDays = streak
+    rewardState = await fetchWorkbuddyRewardState(token, 'cn', { uid, enterpriseId, deviceToken: devToken })
+    if (rewardState) base.streakDays = rewardState.days
   } catch { /* ignore */ }
 
   try {
@@ -826,6 +854,20 @@ export async function checkinOneAccount(
     base.catTravel = travel
   } catch (e) {
     base.catTravel = { state: 'error', message: (e as Error).message }
+  }
+
+  // 连登奖励兑换 + 连登抽奖（移植 workbuddy2api 91418c5，同池化路径）
+  // state=rewardState：复用上面那次读取，不再打一遍 /activity/growth/streak。
+  try {
+    base.growthReward = await runWorkbuddyGrowthRewards(token, 'cn', uid, {
+      enterpriseId,
+      deviceToken: devToken,
+      env,
+      providerId: provider.id,
+      state: rewardState,
+    })
+  } catch (e) {
+    base.growthReward = { acted: false, message: (e as Error).message }
   }
 
   // 额度信息（可用/已用/额度池/包数 + 套餐类型）

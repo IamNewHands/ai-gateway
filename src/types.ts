@@ -558,6 +558,19 @@ export interface CheckinResult {
   /** 猫猫旅行状态与收益（P2） */
   catTravel?: { state: string; reward?: number; message: string; buddyName?: string }
   /**
+   * 连登奖励兑换 + 连登抽奖结果（P2，移植 workbuddy2api 91418c5）。
+   * 仅 CN 账号执行；global 无该体系（门控跳过，不写此字段）。
+   */
+  growthReward?: {
+    acted: boolean
+    tier?: string
+    credit?: number
+    chances?: number
+    prize?: string
+    prizeCredit?: number
+    message: string
+  }
+  /**
    * 国际版一次性 trial 加油包领取结果（仅 global 账号）。
    * global 无签到/任务中心，trial 是其唯一天然积分增益动作。
    */

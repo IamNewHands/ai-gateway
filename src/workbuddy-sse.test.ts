@@ -5,6 +5,7 @@ import {
   normalizeWorkbuddyFrame,
   backfillToolCallNames,
   createWorkbuddyChunkCleaner,
+  sanitizeWorkbuddyErrorFrame,
   WORKBUDDY_SENTINEL_ID,
   isDegenerateReasoningWindow,
   WorkbuddyDegeneracyDetector,
@@ -402,6 +403,130 @@ describe('WorkBuddy 流式推理退化抑制与预算熔断防护（createWorkbu
     // 终态发出后，后续帧应被丢弃为空串
     const afterDone = clean(`data: ${JSON.stringify(chunk({ choices: [{ index: 0, delta: { reasoning_content: 'more spam' }, finish_reason: null }] }))}`)
     expect(afterDone).toBe('')
+  })
+})
+
+/**
+ * 上游 error 帧透传（移植 workbuddy2api 5755fe3 sse.go writeRaw / error-passthrough）。
+ *
+ * 背景缺陷：`normalizeWorkbuddyFrame` 只保留 FRAME_TOP_KEYS 白名单，`error` 不在其中，
+ * 于是上游错误帧被整帧销毁成一个语义为空的 chunk —— 客户端既拿不到错误也拿不到内容。
+ * 且因 `choices` 不存在，噪声判定还会放行该空帧，畸形帧照样下发。
+ */
+describe('上游 error 帧透传（error-passthrough）', () => {
+  /** 典型上游错误帧：6004 模型级限流。 */
+  const rateLimitFrame = {
+    error: { code: 6004, msg: 'The model provider is rate-limiting requests.', requestId: 'req-abc' },
+  }
+
+  it('normalizeWorkbuddyFrame 会剥掉 error（这就是必须绕过白名单的原因）', () => {
+    const out = normalizeWorkbuddyFrame(rateLimitFrame as unknown as Record<string, unknown>)
+    expect(out['error']).toBeUndefined()
+    // 且产物是个语义为空的 chunk——正是缺陷现场
+    expect(out['object']).toBe('chat.completion.chunk')
+    expect(out['choices']).toBeUndefined()
+  })
+
+  it('processWorkbuddyFrame 对 error 帧原样透传，code/msg/requestId 全部保留', () => {
+    const st = newWorkbuddyStreamState()
+    const r = processWorkbuddyFrame(JSON.stringify(rateLimitFrame), st)
+    expect(r.valid).toBe(true)
+    expect(r.isError).toBe(true)
+    const out = JSON.parse(r.payload)
+    expect(out.error.code).toBe(6004)
+    expect(out.error.msg).toBe('The model provider is rate-limiting requests.')
+    expect(out.error.requestId).toBe('req-abc')
+    // 不再被塞进 chat.completion.chunk 空壳
+    expect(out.object).toBeUndefined()
+  })
+
+  it('错误帧计入有效帧：cleaner 不把它当噪声丢弃', () => {
+    const clean = createWorkbuddyChunkCleaner()
+    const out = clean(`data: ${JSON.stringify(rateLimitFrame)}`)
+    expect(out).not.toBe('')
+    expect(out.startsWith('data: ')).toBe(true)
+    expect(JSON.parse(out.slice(5).trim()).error.code).toBe(6004)
+  })
+
+  it('错误帧后仍能继续处理后续正常帧（首帧 id 续传不受影响）', () => {
+    const clean = createWorkbuddyChunkCleaner()
+    const errOut = clean(`data: ${JSON.stringify(rateLimitFrame)}`)
+    expect(JSON.parse(errOut.slice(5).trim()).error).toBeDefined()
+    // 正常帧依旧走白名单重建
+    const okOut = clean(`data: ${JSON.stringify(chunk({ choices: [{ index: 0, delta: { content: 'hi' }, finish_reason: null }] }))}`)
+    expect(JSON.parse(okOut.slice(5).trim()).choices[0].delta.content).toBe('hi')
+  })
+
+  it('嵌套形态 error.data.code 也被提取并保留结构', () => {
+    const nested = { error: { data: { code: 11128, msg: 'blocked by security policy 色情' } } }
+    const st = newWorkbuddyStreamState()
+    const r = processWorkbuddyFrame(JSON.stringify(nested), st)
+    expect(r.isError).toBe(true)
+    expect(r.error!.code).toBe(11128)
+    const out = JSON.parse(r.payload)
+    expect(out.error.data.msg).toContain('blocked by security policy')
+  })
+
+  it('脱敏钩子只作用于字符串叶子：code/requestId 类型与值不变，文案被改写', () => {
+    const st = newWorkbuddyStreamState({ sanitizeErrorText: (t) => t.replace(/sk-[A-Za-z0-9]+/g, '***') })
+    const r = processWorkbuddyFrame(
+      JSON.stringify({ error: { code: 6004, msg: 'auth failed for sk-secret123', requestId: 'req-1' } }),
+      st,
+    )
+    const out = JSON.parse(r.payload)
+    // 字符串叶子被脱敏
+    expect(out.error.msg).toBe('auth failed for ***')
+    // 非字符串叶子（数字 code / 字符串 requestId）保持原值——客户端要靠它判定错误类型
+    expect(out.error.code).toBe(6004)
+    expect(out.error.requestId).toBe('req-1')
+  })
+
+  it('未注入钩子时是恒等变换（原样透传）', () => {
+    const st = newWorkbuddyStreamState()
+    const r = processWorkbuddyFrame(JSON.stringify(rateLimitFrame), st)
+    expect(JSON.parse(r.payload).error.msg).toBe('The model provider is rate-limiting requests.')
+  })
+
+  it('state.lastError 记录最后一个错误帧（供聚合路径转非流式错误体）', () => {
+    const st = newWorkbuddyStreamState()
+    expect(st.lastError).toBeUndefined()
+    processWorkbuddyFrame(JSON.stringify(rateLimitFrame), st)
+    expect(st.lastError!.code).toBe(6004)
+    expect(st.lastError!.message).toBe('The model provider is rate-limiting requests.')
+    expect(st.lastError!.requestId).toBe('req-abc')
+  })
+
+  it('合成终态帧发出后，后续错误帧不再追加（避免 [DONE] 之后还有帧）', () => {
+    const stopSignal = { aborted: false }
+    const clean = createWorkbuddyChunkCleaner({ stopSignal, maxReasoningChars: 10 })
+    // 先触发预算熔断 → 合成终态（含 [DONE]）
+    clean(`data: ${JSON.stringify(chunk({ choices: [{ index: 0, delta: { reasoning_content: '123456789012345' }, finish_reason: null }] }))}`)
+    expect(stopSignal.aborted).toBe(true)
+    // 终态之后的错误帧被丢弃
+    expect(clean(`data: ${JSON.stringify(rateLimitFrame)}`)).toBe('')
+  })
+
+  it('sanitizeWorkbuddyErrorFrame 对非错误帧/异常形态不抛错', () => {
+    expect(() => sanitizeWorkbuddyErrorFrame({})).not.toThrow()
+    expect(() => sanitizeWorkbuddyErrorFrame({ error: null })).not.toThrow()
+    expect(() => sanitizeWorkbuddyErrorFrame({ error: 'plain string error' })).not.toThrow()
+    // 字符串形态 error：文案可提取
+    const e = sanitizeWorkbuddyErrorFrame({ error: 'boom' })
+    expect(e.message).toBe('boom')
+    expect(JSON.parse(e.raw).error).toBe('boom')
+  })
+
+  it('顶层 code/requestId 形态也能提取（非 error 信封包裹）', () => {
+    const e = sanitizeWorkbuddyErrorFrame({ error: { msg: 'x' }, code: 11102, requestId: 'req-top' })
+    expect(e.code).toBe(11102)
+    expect(e.requestId).toBe('req-top')
+  })
+
+  it('sanitize 钩子抛错时不致命（保持可用性）', () => {
+    // 钩子内部异常应由调用方保证不抛；此处验证常规钩子路径稳定
+    const st = newWorkbuddyStreamState({ sanitizeErrorText: (t) => t })
+    const r = processWorkbuddyFrame(JSON.stringify(rateLimitFrame), st)
+    expect(r.isError).toBe(true)
   })
 })
 

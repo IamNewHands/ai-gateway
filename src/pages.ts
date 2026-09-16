@@ -2068,6 +2068,15 @@ function renderOauthPoolAccounts(id, accs, ciByUid, ciByNick, ciAccounts, prefer
           ciBadge += ' <span class="bd bd-info"' + ctTip + '>' + escapeHtml(ctText) + '</span>'
         }
       }
+      // 连登奖励/抽奖徽章（仅 CN：global 无该体系，见 runWorkbuddyGrowthRewards 门控）
+      // acted=false 时不展示——「今日已领/未达标/无次数」属正常态，不该在面板上刷存在感。
+      if (!(ci.realm === 'global' || ci.reason === 'skipped_global') && ci.growthReward && ci.growthReward.acted) {
+        const gr = ci.growthReward
+        let grText = '🎯 ' + (gr.tier || '奖励')
+        if (gr.prize) grText += ' + 抽奖'
+        const grTip = gr.message ? ' title="' + escapeHtml(gr.message) + '"' : ''
+        ciBadge += ' <span class="bd bd-on"' + grTip + '>' + escapeHtml(grText) + '</span>'
+      }
     } else {
       ciBadge = ' <span class="bd bd-off">未签</span>'
     }

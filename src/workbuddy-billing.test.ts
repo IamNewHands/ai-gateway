@@ -20,6 +20,17 @@ import {
   runWorkbuddyNightCat,
   NIGHT_WINDOW_START_HOUR,
   NIGHT_WINDOW_END_HOUR,
+  growthClientToken,
+  pickWorkbuddyRedeemTier,
+  isRedeemAlreadyClaimed,
+  isRedeemNotEnoughDays,
+  isLotteryNoChance,
+  isLotteryDisabled,
+  fetchWorkbuddyRewardState,
+  redeemWorkbuddyGrowth,
+  fetchWorkbuddyLotteryChances,
+  drawWorkbuddyLottery,
+  runWorkbuddyGrowthRewards,
 } from './workbuddy-billing'
 
 describe('夜猫子任务 black_cat（移植 task_runner.py black_cat 分支）', () => {
@@ -506,5 +517,333 @@ describe('WorkBuddy 生态增值与自动化（workbuddy-billing.ts P2）', () =
 
     const res = await runWorkbuddyCatTravel('test-token', 'cn', 'u123')
     expect(res.state).toBe('traveling')
+  })
+})
+
+/**
+ * 连登奖励兑换 + 连登抽奖（移植 workbuddy2api 91418c5 growth_reward.go）。
+ *
+ * 关键行为：里程碑挑档（高→低）、client_token 每次新生成、正常态静默
+ * （409 已领 / 403 天数不足 / 400 无次数 / 400 抽奖未开启）、KV 日键幂等、global 门控跳过。
+ */
+describe('连登奖励兑换 + 连登抽奖（growth_reward）', () => {
+  const originalFetch = globalThis.fetch
+
+  beforeEach(() => { vi.restoreAllMocks() })
+  afterEach(() => { globalThis.fetch = originalFetch })
+
+  /** 内存 KV，供幂等闸测试。 */
+  function makeEnv() {
+    const store = new Map<string, string>()
+    const kv = {
+      get: async (k: string) => store.get(k) ?? null,
+      put: async (k: string, v: string) => { store.set(k, v) },
+      delete: async (k: string) => { store.delete(k) },
+      list: async () => ({ keys: [], list_complete: true, cursor: '' }),
+    }
+    return { env: { KV: kv, GATEWAY_KV: kv, RATE_LIMIT_KV: kv, SESSION_KV: kv } as any, store }
+  }
+
+  it('growthClientToken 形态为 `<prefix>-<32hex>`，且每次调用不同', () => {
+    const a = growthClientToken('draw')
+    const b = growthClientToken('draw')
+    expect(a).toMatch(/^draw-[0-9a-f]{32}$/)
+    expect(a).not.toBe(b)
+  })
+
+  it('pickWorkbuddyRedeemTier：从高到低挑已达标且未领的最高档', () => {
+    // 连登 20 天：28d 未达标、14d 可领 → 挑 14d
+    expect(pickWorkbuddyRedeemTier({ days: 20, redemption: {} })).toBe('14d')
+    // 连登 30 天 → 挑 28d
+    expect(pickWorkbuddyRedeemTier({ days: 30, redemption: {} })).toBe('28d')
+    // 连登 7 天 → 挑 7d
+    expect(pickWorkbuddyRedeemTier({ days: 7, redemption: {} })).toBe('7d')
+    // 连登 6 天 → 无档可领
+    expect(pickWorkbuddyRedeemTier({ days: 6, redemption: {} })).toBeNull()
+  })
+
+  it('pickWorkbuddyRedeemTier：已领档位被跳过，回落到下一档', () => {
+    const st = { days: 30, redemption: { tier_28d_status: 'claimed' } }
+    expect(pickWorkbuddyRedeemTier(st)).toBe('14d')
+    const all = { days: 30, redemption: { tier_28d_status: 'claimed', tier_14d_status: 'claimed', tier_7d_status: 'claimed' } }
+    expect(pickWorkbuddyRedeemTier(all)).toBeNull()
+  })
+
+  it('pickWorkbuddyRedeemTier：优先用上游 tiers[].days 门槛（缺失才回落常量表）', () => {
+    // 上游声明 7d 档实际要 10 天 → 连登 8 天不该领
+    const st = { days: 8, redemption: { tiers: [{ tier: '7d', days: 10 }] } }
+    expect(pickWorkbuddyRedeemTier(st)).toBeNull()
+    const st2 = { days: 10, redemption: { tiers: [{ tier: '7d', days: 10 }] } }
+    expect(pickWorkbuddyRedeemTier(st2)).toBe('7d')
+  })
+
+  it('正常态判定：409 duplicate / 403 天数不足 / 400 无次数 / 400 disabled', () => {
+    expect(isRedeemAlreadyClaimed('http 409 /activity/growth/redeem: {"code":409,"msg":"duplicate"}')).toBe(true)
+    expect(isRedeemAlreadyClaimed('http 409 /x: {"msg":"该奖励已领取"}')).toBe(true)
+    expect(isRedeemAlreadyClaimed('http 403 /x: 连续登录天数不足')).toBe(false)
+
+    expect(isRedeemNotEnoughDays('http 403 /x: {"msg":"连续登录天数不足"}')).toBe(true)
+    expect(isRedeemNotEnoughDays('http 409 /x: duplicate')).toBe(false)
+
+    expect(isLotteryNoChance('http 400 /x: insufficient lottery chance balance')).toBe(true)
+    expect(isLotteryNoChance('http 400 /x: lottery disabled')).toBe(false)
+
+    expect(isLotteryDisabled('http 400 /x: lottery disabled')).toBe(true)
+    expect(isLotteryDisabled('http 400 /x: insufficient lottery chance balance')).toBe(false)
+  })
+
+  it('正常态判定：状态码不匹配时不误判（防宽匹配）', () => {
+    // 500 里出现 duplicate 文案不该当幂等正常态
+    expect(isRedeemAlreadyClaimed('http 500 /x: duplicate')).toBe(false)
+    expect(isRedeemNotEnoughDays('http 500 /x: 连续登录天数不足')).toBe(false)
+    expect(isLotteryNoChance('http 500 /x: insufficient lottery chance balance')).toBe(false)
+  })
+
+  it('fetchWorkbuddyRewardState 解析 streak.days 与 redemption_status', async () => {
+    globalThis.fetch = vi.fn().mockResolvedValue(new Response(JSON.stringify({
+      code: 0, msg: 'ok',
+      data: {
+        streak: { days: 14 },
+        redemption_status: { tier_7d_status: 'claimed', tier_14d_status: 'available', tier_28d_status: 'locked' },
+      },
+    }), { status: 200 }))
+
+    const st = await fetchWorkbuddyRewardState('tok', 'cn', { uid: 'u1' })
+    expect(st!.days).toBe(14)
+    expect(st!.redemption.tier_7d_status).toBe('claimed')
+    expect(st!.redemption.tier_14d_status).toBe('available')
+  })
+
+  it('fetchWorkbuddyRewardState：网络/解析失败返回 null', async () => {
+    globalThis.fetch = vi.fn().mockResolvedValue(new Response('boom', { status: 500 }))
+    expect(await fetchWorkbuddyRewardState('tok', 'cn')).toBeNull()
+  })
+
+  it('redeemWorkbuddyGrowth 成功：解析回执四类奖励', async () => {
+    let sentBody = ''
+    globalThis.fetch = vi.fn().mockImplementation(async (_url: string, init: any) => {
+      sentBody = init.body
+      return new Response(JSON.stringify({
+        code: 0, msg: 'ok',
+        data: { credit_granted: 100, energy_granted: 5, cards_granted: 1, chances_granted: 2, cards_overflow: 0 },
+      }), { status: 200 })
+    })
+
+    const out = await redeemWorkbuddyGrowth('tok', 'cn', '7d', { uid: 'u1' })
+    expect(out.success).toBe(true)
+    expect(out.result!.credit_granted).toBe(100)
+    expect(out.result!.chances_granted).toBe(2)
+    // client_token 形态 + tier 正确
+    const body = JSON.parse(sentBody)
+    expect(body.tier).toBe('7d')
+    expect(body.client_token).toMatch(/^redeem-7d-[0-9a-f]{32}$/)
+  })
+
+  it('redeemWorkbuddyGrowth 每次调用用新 client_token（复用会被幂等吞掉）', async () => {
+    const tokens: string[] = []
+    globalThis.fetch = vi.fn().mockImplementation(async (_url: string, init: any) => {
+      tokens.push(JSON.parse(init.body).client_token)
+      return new Response(JSON.stringify({ code: 0, msg: 'ok', data: {} }), { status: 200 })
+    })
+    await redeemWorkbuddyGrowth('tok', 'cn', '7d')
+    await redeemWorkbuddyGrowth('tok', 'cn', '7d')
+    expect(tokens[0]).not.toBe(tokens[1])
+  })
+
+  it('redeemWorkbuddyGrowth 正常态：409 已领 / 403 天数不足 → normal 标记且 success=false', async () => {
+    globalThis.fetch = vi.fn().mockResolvedValue(new Response(JSON.stringify({ code: 409, msg: 'duplicate' }), { status: 409 }))
+    const already = await redeemWorkbuddyGrowth('tok', 'cn', '7d')
+    expect(already.success).toBe(false)
+    expect(already.normal).toBe('already_claimed')
+
+    globalThis.fetch = vi.fn().mockResolvedValue(new Response(JSON.stringify({ code: 403, msg: '连续登录天数不足' }), { status: 403 }))
+    const notEnough = await redeemWorkbuddyGrowth('tok', 'cn', '28d')
+    expect(notEnough.success).toBe(false)
+    expect(notEnough.normal).toBe('not_enough_days')
+  })
+
+  it('redeemWorkbuddyGrowth 非正常态失败：不带 normal 标记（便于上层区分真错误）', async () => {
+    globalThis.fetch = vi.fn().mockResolvedValue(new Response('kaboom', { status: 500 }))
+    const out = await redeemWorkbuddyGrowth('tok', 'cn', '7d')
+    expect(out.success).toBe(false)
+    expect(out.normal).toBeUndefined()
+    expect(out.message).toContain('兑换失败')
+  })
+
+  it('fetchWorkbuddyLotteryChances 读 data.balance', async () => {
+    globalThis.fetch = vi.fn().mockResolvedValue(new Response(JSON.stringify({ code: 0, msg: 'ok', data: { balance: 3 } }), { status: 200 }))
+    expect(await fetchWorkbuddyLotteryChances('tok', 'cn')).toBe(3)
+  })
+
+  it('drawWorkbuddyLottery 成功解析奖品；正常态 no_chance/disabled', async () => {
+    globalThis.fetch = vi.fn().mockResolvedValue(new Response(JSON.stringify({
+      code: 0, msg: 'ok',
+      data: { prize_code: 'P1', prize_name: '50 积分', prize_type: 'credit', credit_amount: 50 },
+    }), { status: 200 }))
+    const win = await drawWorkbuddyLottery('tok', 'cn')
+    expect(win.success).toBe(true)
+    expect(win.result!.prize_name).toBe('50 积分')
+    expect(win.result!.credit_amount).toBe(50)
+
+    globalThis.fetch = vi.fn().mockResolvedValue(new Response('insufficient lottery chance balance', { status: 400 }))
+    const none = await drawWorkbuddyLottery('tok', 'cn')
+    expect(none.success).toBe(false)
+    expect(none.normal).toBe('no_chance')
+
+    globalThis.fetch = vi.fn().mockResolvedValue(new Response('lottery disabled', { status: 400 }))
+    const off = await drawWorkbuddyLottery('tok', 'cn')
+    expect(off.normal).toBe('disabled')
+  })
+
+  it('runWorkbuddyGrowthRewards 全链：挑档 → 兑换 → 用送出的次数抽奖', async () => {
+    const calls: string[] = []
+    globalThis.fetch = vi.fn().mockImplementation(async (url: string) => {
+      calls.push(url)
+      if (url.includes('/activity/growth/streak')) {
+        return new Response(JSON.stringify({ code: 0, msg: 'ok', data: { streak: { days: 20 }, redemption_status: {} } }), { status: 200 })
+      }
+      if (url.includes('/activity/growth/redeem')) {
+        return new Response(JSON.stringify({ code: 0, msg: 'ok', data: { credit_granted: 200, chances_granted: 1 } }), { status: 200 })
+      }
+      if (url.includes('/activity/growth/lottery/draw')) {
+        return new Response(JSON.stringify({ code: 0, msg: 'ok', data: { prize_name: '10 积分', credit_amount: 10 } }), { status: 200 })
+      }
+      return new Response(JSON.stringify({ code: 0, msg: 'ok', data: {} }), { status: 200 })
+    })
+
+    const { env } = makeEnv()
+    const res = await runWorkbuddyGrowthRewards('tok', 'cn', 'u1', { env, providerId: 'wb' })
+    expect(res.acted).toBe(true)
+    expect(res.tier).toBe('14d')
+    expect(res.credit).toBe(200)
+    expect(res.chances).toBe(1)
+    expect(res.prize).toBe('10 积分')
+    expect(res.prizeCredit).toBe(10)
+    // 未查 chances 端点（兑换已带回 chances=1）
+    expect(calls.some((u) => u.includes('lottery/chances'))).toBe(false)
+  })
+
+  it('runWorkbuddyGrowthRewards 无 chances 时查余额，余额 0 则不抽奖', async () => {
+    let drawCalled = false
+    globalThis.fetch = vi.fn().mockImplementation(async (url: string) => {
+      if (url.includes('/activity/growth/streak')) {
+        return new Response(JSON.stringify({ code: 0, msg: 'ok', data: { streak: { days: 7 }, redemption_status: {} } }), { status: 200 })
+      }
+      if (url.includes('/activity/growth/redeem')) {
+        return new Response(JSON.stringify({ code: 0, msg: 'ok', data: { credit_granted: 50, chances_granted: 0 } }), { status: 200 })
+      }
+      if (url.includes('lottery/chances')) {
+        return new Response(JSON.stringify({ code: 0, msg: 'ok', data: { balance: 0 } }), { status: 200 })
+      }
+      if (url.includes('lottery/draw')) { drawCalled = true }
+      return new Response(JSON.stringify({ code: 0, msg: 'ok', data: {} }), { status: 200 })
+    })
+
+    const res = await runWorkbuddyGrowthRewards('tok', 'cn', 'u1')
+    expect(res.acted).toBe(true)
+    expect(res.credit).toBe(50)
+    expect(drawCalled).toBe(false)
+  })
+
+  it('runWorkbuddyGrowthRewards 无可领档位 → acted=false', async () => {
+    globalThis.fetch = vi.fn().mockResolvedValue(new Response(JSON.stringify({
+      code: 0, msg: 'ok', data: { streak: { days: 3 }, redemption_status: {} },
+    }), { status: 200 }))
+    const res = await runWorkbuddyGrowthRewards('tok', 'cn', 'u1')
+    expect(res.acted).toBe(false)
+    expect(res.message).toContain('无可领档位')
+  })
+
+  it('runWorkbuddyGrowthRewards global 门控：整链跳过（不发任何请求）', async () => {
+    const fetchSpy = vi.fn()
+    globalThis.fetch = fetchSpy
+    const res = await runWorkbuddyGrowthRewards('tok', 'global', 'u1')
+    expect(res.acted).toBe(false)
+    expect(res.message).toContain('global')
+    expect(fetchSpy).not.toHaveBeenCalled()
+  })
+
+  it('KV 日键幂等：同日二次调用直接跳过（不打上游）', async () => {
+    const { env } = makeEnv()
+    const fetchSpy = vi.fn().mockImplementation(async (url: string) => {
+      if (url.includes('/activity/growth/streak')) {
+        return new Response(JSON.stringify({ code: 0, msg: 'ok', data: { streak: { days: 7 }, redemption_status: {} } }), { status: 200 })
+      }
+      return new Response(JSON.stringify({ code: 0, msg: 'ok', data: { credit_granted: 10 } }), { status: 200 })
+    })
+    globalThis.fetch = fetchSpy
+
+    const first = await runWorkbuddyGrowthRewards('tok', 'cn', 'u1', { env, providerId: 'wb' })
+    expect(first.acted).toBe(true)
+    const callsAfterFirst = fetchSpy.mock.calls.length
+
+    const second = await runWorkbuddyGrowthRewards('tok', 'cn', 'u1', { env, providerId: 'wb' })
+    expect(second.acted).toBe(false)
+    expect(second.message).toContain('防抖')
+    // 第二次没有再打上游
+    expect(fetchSpy.mock.calls.length).toBe(callsAfterFirst)
+  })
+
+  it('KV 日键跨日失效：次日可再领', async () => {
+    const { env } = makeEnv()
+    globalThis.fetch = vi.fn().mockImplementation(async (url: string) => {
+      if (url.includes('/activity/growth/streak')) {
+        return new Response(JSON.stringify({ code: 0, msg: 'ok', data: { streak: { days: 7 }, redemption_status: {} } }), { status: 200 })
+      }
+      return new Response(JSON.stringify({ code: 0, msg: 'ok', data: { credit_granted: 10 } }), { status: 200 })
+    })
+    const day1 = Date.UTC(2026, 8, 15, 4, 0) // CST 2026-09-15 12:00
+    const day2 = Date.UTC(2026, 8, 16, 4, 0) // CST 2026-09-16 12:00
+    expect((await runWorkbuddyGrowthRewards('tok', 'cn', 'u1', { env, providerId: 'wb', now: day1 })).acted).toBe(true)
+    expect((await runWorkbuddyGrowthRewards('tok', 'cn', 'u1', { env, providerId: 'wb', now: day1 })).acted).toBe(false)
+    // 次日：KV 里存的是 day1，与 day2 不等 → 可再领
+    expect((await runWorkbuddyGrowthRewards('tok', 'cn', 'u1', { env, providerId: 'wb', now: day2 })).acted).toBe(true)
+  })
+
+  it('天数不足（403）也记当日已试：同日不再反复探测上游', async () => {
+    const { env } = makeEnv()
+    const fetchSpy = vi.fn().mockImplementation(async (url: string) => {
+      if (url.includes('/activity/growth/streak')) {
+        return new Response(JSON.stringify({ code: 0, msg: 'ok', data: { streak: { days: 7 }, redemption_status: {} } }), { status: 200 })
+      }
+      if (url.includes('/activity/growth/redeem')) {
+        return new Response(JSON.stringify({ code: 403, msg: '连续登录天数不足' }), { status: 403 })
+      }
+      return new Response(JSON.stringify({ code: 0, msg: 'ok', data: {} }), { status: 200 })
+    })
+    globalThis.fetch = fetchSpy
+
+    const first = await runWorkbuddyGrowthRewards('tok', 'cn', 'u1', { env, providerId: 'wb' })
+    expect(first.acted).toBe(false)
+    const n = fetchSpy.mock.calls.length
+    const second = await runWorkbuddyGrowthRewards('tok', 'cn', 'u1', { env, providerId: 'wb' })
+    expect(second.acted).toBe(false)
+    expect(fetchSpy.mock.calls.length).toBe(n)
+  })
+
+  it('不同账号的幂等闸互不影响（key 含 uid）', async () => {
+    const { env } = makeEnv()
+    globalThis.fetch = vi.fn().mockImplementation(async (url: string) => {
+      if (url.includes('/activity/growth/streak')) {
+        return new Response(JSON.stringify({ code: 0, msg: 'ok', data: { streak: { days: 7 }, redemption_status: {} } }), { status: 200 })
+      }
+      return new Response(JSON.stringify({ code: 0, msg: 'ok', data: { credit_granted: 10 } }), { status: 200 })
+    })
+    expect((await runWorkbuddyGrowthRewards('tok', 'cn', 'ua', { env, providerId: 'wb' })).acted).toBe(true)
+    // 另一账号不受 ua 的闸影响
+    expect((await runWorkbuddyGrowthRewards('tok', 'cn', 'ub', { env, providerId: 'wb' })).acted).toBe(true)
+  })
+
+  it('uid 缺失 → 跳过（幂等键与身份头都依赖 uid）', async () => {
+    const res = await runWorkbuddyGrowthRewards('tok', 'cn', '')
+    expect(res.acted).toBe(false)
+    expect(res.message).toContain('uid')
+  })
+
+  it('streak 读不到 → acted=false（不误判为已领）', async () => {
+    globalThis.fetch = vi.fn().mockResolvedValue(new Response('down', { status: 500 }))
+    const res = await runWorkbuddyGrowthRewards('tok', 'cn', 'u1')
+    expect(res.acted).toBe(false)
+    expect(res.message).toContain('无法获取')
   })
 })

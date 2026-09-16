@@ -39,7 +39,8 @@ import { isOAuthPoolProvider, seedOauthPoolFromSingle, listOauthPoolStatus, remo
 import { seedQoderPoolFromSingle, listQoderPoolStatus, removeQoderAccount, readQoderPool } from './qoder/pool'
 import { isM365Provider, M365_MODELS, testM365Model } from './m365/proxy'
 import { isZcodeProvider, testZcodeModel, buildZcodeHeaders, ZCODE_MODELS, fetchZcodeModels } from './zcode/proxy'
-import { injectWorkbuddyChatHeaders, ensureGlobalFallbackSystem, parseWorkbuddyGlobalModels, WORKBUDDY_GLOBAL_MODELS_PROBE_PATHS } from './workbuddy-upstream'
+import { injectWorkbuddyChatHeaders, ensureGlobalFallbackSystem } from './workbuddy-upstream'
+import { probeWorkbuddyModelCatalogForProvider, __resetWorkbuddyCatalogCacheForTests } from './workbuddy-models'
 import { isKukuProvider, isKukuRequest, testKukuModel } from './kuku/proxy'
 import { probeKukuNetwork } from './kuku/probe'
 import { startKukuQrLogin, pollKukuQrLogin } from './kuku/qr'
@@ -1876,113 +1877,25 @@ export async function handleClineModelSync(c: Context<AppEnv>) {
  * - 参考 cpa-plugin/models.go 的 callModelsAPI 实现。
  */
 
-/** WorkBuddy/CodeBuddy 静态候选模型（上游无公开 models 端点，实测 /models 类路径均 404，与 cnb/gemini/m365 一致用静态清单）。 */
-const WORKBUDDY_MODELS: string[] = [
-  'glm-4.5',
-  'glm-4.6',
-  'glm-4.7',
-  'deepseek-v3',
-  'deepseek-r1',
-  'hunyuan-lite',
-  'hunyuan-turbo',
-  'kimi-k2',
-  'qwen-3',
-  'doubao-1.5-pro',
-]
+/** WorkBuddy/CodeBuddy 静态候选模型与目录探测：**统一 owner** = workbuddy-models.ts。
+ *
+ *  P1 修正：此处原为 `WORKBUDDY_MODELS`（`glm-4.5/glm-4.6/.../doubao-1.5-pro`，上一代模型名）
+ *  + `WORKBUDDY_GLOBAL_MODELS`，且注释称「上游无公开 models 端点，实测 /models 类路径均 404」
+ *  「CN 域 /console/…/models 实测 404，无公开端点」。这两条结论**都与事实不符**：
+ *  workbuddy2api 长期用同一 URL（与 pages.ts `_modelsUrl` 完全一致）做 CN 动态源且可用。
+ *  该"404"很可能是当初未带 WorkBuddy 三段式 UA / `CommonHeaders` 探测所致。
+ *
+ *  现在 CN 与 global **对称**走动态探测（主路 `/v3/config` + 企业端点补缺），静态清单
+ *  降级为"仅动态失败时的兜底"并标注 `stale`（见文件顶部 import 与 handleOAuthModels）。 */
 
-/** WorkBuddy 国际版（workbuddy.ai）静态候选模型：对齐 LazyChara/WkBdy2api `wb_v3config.public.json`
- *  中 `/v3/config` 载荷的 `cli` agent 白名单（顺序保持）。国际版模型集与国内版完全不同。 */
-const WORKBUDDY_GLOBAL_MODELS: string[] = [
-  'default-model',
-  'fast-model',
-  'balanced-model',
-  'primary-model',
-  'deep-model',
-  'hy4-preview-f',
-  'hy3',
-  'deepseek-v4.1-flash',
-  'gpt-6-astra',
-  'gpt-5.6-sol',
-  'gpt-5.6-terra',
-  'gpt-5.6-luna',
-  'gpt-5.5',
-  'gpt-5.4',
-  'gpt-5.3-codex',
-  'gemini-3.5-flash',
-  'glm-5.3',
-  'glm-5.2',
-  'kimi-k3',
-  'kimi-k2.6',
-]
+// ===== WorkBuddy 模型目录动态探测（移植 workbuddy2api 0adc345 v3-config-merge） =====
+// 目标：CN/global 对称走「/v3/config（主）+ 企业端点（补缺）」并发并集探测；
+// 静态清单只是兜底（动态全失败时使用，并在响应里标注 stale）。
+// 仅探测**模型名/元数据**，不做倍率/成本推断；结果只返回清单，入库仍靠用户「+」/保存。
 
-// ===== WorkBuddy 国际版 global 模型目录动态探测（移植 workbuddy2api FetchGlobalModels） =====
-// 目标：global 域静态清单只是兜底；有 global 账号时动态探测 /v2/enterprises/personal/models，
-// 结果 ∪ 静态清单（去重）返回，避免模型过期/漏项。仅探测**模型名**，不做倍率/成本推断。
-
-/** 探测结果缓存：providerId → { names, at }；success 1h，失败 5min 负缓存。 */
-const globalModelsCache = new Map<string, { merged: string[]; at: number; ok: boolean }>()
-const GLOBAL_MODELS_TTL_MS = 60 * 60 * 1000
-const GLOBAL_MODELS_FAIL_MS = 5 * 60 * 1000
-
-/** 供测试清空 global 模型探测缓存。 */
+/** 供测试清空模型目录探测缓存（转发到 workbuddy-models 的 owner）。 */
 export function __resetGlobalModelsCacheForTests(): void {
-  globalModelsCache.clear()
-}
-
-/**
- * 探测 global 账号的模型目录（按 realm 切 base），探测失败回落静态清单。
- * 语义对齐源实现：成功 1h 缓存 / 失败 5min 负缓存；探测结果与静态名单去重合并。
- */
-async function probeGlobalWorkbuddyModels(
-  env: Env,
-  cfg: OAuthDeviceConfig,
-  token: string,
-  cookies: string | undefined,
-  provider: Provider
-): Promise<string[]> {
-  const now = Date.now()
-  const cached = globalModelsCache.get(provider.id)
-  if (cached) {
-    const freshWindow = cached.ok ? GLOBAL_MODELS_TTL_MS : GLOBAL_MODELS_FAIL_MS
-    if (now - cached.at < freshWindow) return cached.merged
-  }
-  const globalBase = cfg.globalBaseUrl ? cfg.globalBaseUrl.replace(/\/$/, '') : provider.baseUrl.replace(/\/$/, '')
-  const tokenState = await readOauthToken(env, provider.id)
-  for (const path of WORKBUDDY_GLOBAL_MODELS_PROBE_PATHS) {
-    let ok = false
-    try {
-      const headers = buildOauthHeaders(cfg, token, { origin: cfg.globalOrigin, apiType: provider.apiType, cookies })
-      injectWorkbuddyChatHeaders(headers, token, 'global', tokenState ? { uid: tokenState.uid, enterprise_id: tokenState.enterprise_id, domain: tokenState.domain, device_token: tokenState.device_token } : undefined, cfg, { chatPath: false })
-      const response = await fetch(`${globalBase}${path}`, {
-        method: 'GET',
-        headers,
-        signal: AbortSignal.timeout(10000),
-      })
-      if (!response.ok) continue
-      const entries = parseWorkbuddyGlobalModels(await response.text())
-      if (entries && entries.length > 0) {
-        // 探测 ∪ 静态清单（去重，静态为基底、探测独有追加，对齐源实现顺序）
-        const seen = new Set<string>(WORKBUDDY_GLOBAL_MODELS)
-        const merged = [...WORKBUDDY_GLOBAL_MODELS]
-        for (const e of entries) {
-          if (!seen.has(e.id)) {
-            seen.add(e.id)
-            merged.push(e.id)
-          }
-        }
-        if (merged.length > 0) {
-          globalModelsCache.set(provider.id, { merged, at: now, ok: true })
-          return merged
-        }
-      }
-      ok = true // 端点 2xx 但解析空名单 → 不再试 fallback，直接负缓存回落静态
-    } catch {
-      // 网络/超时：尝试下一个候选路径
-    }
-    if (ok) break
-  }
-  globalModelsCache.set(provider.id, { merged: WORKBUDDY_GLOBAL_MODELS, at: now, ok: false })
-  return WORKBUDDY_GLOBAL_MODELS
+  __resetWorkbuddyCatalogCacheForTests()
 }
 
 export async function handleOAuthModels(c: Context<AppEnv>) {
@@ -2056,21 +1969,31 @@ export async function handleOAuthModels(c: Context<AppEnv>) {
     return c.json<ApiResponse>({ success: true, data: { data: models } })
   }
 
-  // WorkBuddy/CodeBuddy：国内版仍用内置静态清单（CN 域 /console/…/models 实测 404，无公开端点）。
-  // 国际版（global，iss 含 workbuddy.ai）改走**动态目录探测**：/v2/enterprises/personal/models（对齐
-  // workbuddy2api FetchGlobalModels），失败负缓存后回落静态国际版清单。结果只返回清单，入库仍靠用户「+」/保存。
+  // WorkBuddy/CodeBuddy：CN 与 global **对称**走动态目录探测
+  // （主路 /v3/config + 企业端点补缺，并发并集；移植 workbuddy2api 0adc345 v3-config-merge）。
+  //
+  // P1 修正：此处原为「国内版仍用内置静态清单（CN 域 /console/…/models 实测 404，无公开端点）」。
+  // 该结论与事实不符——workbuddy2api 长期用同一 URL 做 CN 动态源且可用（与本仓 pages.ts
+  // `_modelsUrl` 完全一致）；"404"很可能是当初未带三段式 UA 探测所致。而旧静态清单
+  // （glm-4.5/glm-4.6/deepseek-v3/…）与上游 CN 实际清单几乎完全不相交，用户据此入库后
+  // 每次调用都撞 11102。现在 CN 也走动态，静态只在动态全失败时兜底并标注 stale。
+  //
+  // 结果只返回清单，入库仍靠用户「+」/保存。
   if ((provider.authType === 'oauth-device' && provider.oauth?.flowType === 'browser') || provider.id.startsWith('workbuddy')) {
     const wbToken = await getOauthAccessToken(c.env, provider.id, cfg)
-    const wbRealm = wbToken ? detectTokenRealm(wbToken) : null
-    if (wbRealm === 'global' && wbToken) {
-      // 有 global 账号 → 动态探测（探测失败自动回落静态国际版清单）
-      const probe = await probeGlobalWorkbuddyModels(c.env, cfg, wbToken, undefined, provider)
-      const models = probe.map((m) => ({ id: m }))
-      return c.json<ApiResponse>({ success: true, data: { data: models, realm: 'global' } })
-    }
-    const list = WORKBUDDY_MODELS
-    const models = list.map((m) => ({ id: m }))
-    return c.json<ApiResponse>({ success: true, data: { data: models, realm: wbRealm || 'cn' } })
+    const wbRealm: 'cn' | 'global' = wbToken && detectTokenRealm(wbToken) === 'global' ? 'global' : 'cn'
+    const probe = await probeWorkbuddyModelCatalogForProvider(c.env, provider, wbRealm)
+    const models = probe.entries.map((m) => ({ id: m.id }))
+    return c.json<ApiResponse>({
+      success: true,
+      data: {
+        data: models,
+        realm: wbRealm,
+        // stale=true 表示两路动态探测全失败、这份清单是静态兜底（可能过期）
+        stale: probe.stale,
+        ...(probe.warnings.length > 0 ? { warnings: probe.warnings } : {}),
+      },
+    })
   }
 
   const token = await getOauthAccessToken(c.env, provider.id, cfg)

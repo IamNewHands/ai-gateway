@@ -66,8 +66,6 @@ import {
   injectWorkbuddyChatHeaders,
   ensureWorkbuddyStreamOptions,
   ensureWorkbuddyMaxTokens,
-  parseWorkbuddyGlobalModels,
-  WORKBUDDY_GLOBAL_MODELS_PROBE_PATHS,
   isAccountBanned,
   ensureGlobalFallbackSystem,
   rewriteWorkbuddySystemPrompt,
@@ -88,7 +86,8 @@ import {
   bindSticky,
   unbindSticky,
 } from './workbuddy-sticky'
-import { createWorkbuddyChunkCleaner } from './workbuddy-sse'
+import { createWorkbuddyChunkCleaner, sanitizeWorkbuddyErrorFrame, type WorkbuddyErrorFrame } from './workbuddy-sse'
+import { probeWorkbuddyModelCatalog, getCachedWorkbuddyEfforts } from './workbuddy-models'
 import {
   acquireInFlight,
   releaseInFlight,
@@ -353,8 +352,21 @@ function normalizeOpenAIToolChoice(body: Record<string, unknown>): void {
 /**
  * WorkBuddy SSE 流聚合：收集所有 chunk 拼接为非流式 chat.completion 响应。
  * 参考 cpa-plugin stream.go 的 aggregateCompletion 实现。
+ *
+ * 返回值是**判别联合**而非裸字符串：上游可在流中下发 `error` 帧（6004 限流 / 审核 /
+ * 会话失效）。此前该帧被 `chunk.choices` 为空的逻辑静默跳过，聚合结果是
+ * **200 + 空内容**——客户端既拿不到错误也拿不到内容，是最坏的失败形态。
+ * 现在显式区分：`ok:false` 时调用方按错误返回，不再产出假成功。
  */
-async function aggregateWorkbuddySSE(body: ReadableStream<Uint8Array>, model: string): Promise<string> {
+type WorkbuddyAggregateResult =
+  | { ok: true; body: string }
+  | { ok: false; error: WorkbuddyErrorFrame }
+
+async function aggregateWorkbuddySSE(
+  body: ReadableStream<Uint8Array>,
+  model: string,
+  sanitizeError?: (text: string) => string,
+): Promise<WorkbuddyAggregateResult> {
   const reader = body.getReader()
   const decoder = new TextDecoder()
   let content = '', reasoning = '', role = '', respModel = '', respID = '', finish = ''
@@ -362,6 +374,8 @@ async function aggregateWorkbuddySSE(body: ReadableStream<Uint8Array>, model: st
   let usage: Record<string, unknown> | null = null
   const toolCalls: Map<number, Record<string, unknown>> = new Map()
   const toolOrder: number[] = []
+  /** 流内首个上游错误帧（已脱敏）：聚合遇错即视为本请求失败 */
+  let streamError: WorkbuddyErrorFrame | undefined
 
   // 按 index 合并 tool_call delta
   function mergeToolCallDelta(merged: Record<string, unknown>, delta: Record<string, unknown>) {
@@ -384,6 +398,49 @@ async function aggregateWorkbuddySSE(body: ReadableStream<Uint8Array>, model: st
     }
   }
 
+  /** 消费一行 SSE 负载；返回 false 表示已确认上游错误，可提前停止聚合。 */
+  function consume(data: string): boolean {
+    try {
+      const chunk = JSON.parse(data)
+      // 上游错误帧：记录并终止（后续帧不再有意义）
+      if (chunk && typeof chunk === 'object' && chunk.error !== undefined && chunk.error !== null) {
+        streamError = sanitizeWorkbuddyErrorFrame(chunk as Record<string, unknown>, sanitizeError)
+        return false
+      }
+      if (chunk.id) respID = chunk.id
+      if (chunk.model) respModel = chunk.model
+      if (chunk.created) created = chunk.created
+      if (chunk.usage) usage = chunk.usage
+
+      const choices = chunk.choices as any[]
+      if (Array.isArray(choices)) {
+        for (const choice of choices) {
+          const delta = choice?.delta
+          if (delta && typeof delta === 'object') {
+            if (delta.role) role = delta.role
+            if (typeof delta.content === 'string') content += delta.content
+            if (typeof delta.reasoning_content === 'string') reasoning += delta.reasoning_content
+            if (Array.isArray(delta.tool_calls)) {
+              for (const tc of delta.tool_calls) {
+                if (!tc || typeof tc !== 'object') continue
+                const idx = typeof tc.index === 'number' ? tc.index : 0
+                if (!toolCalls.has(idx)) {
+                  toolCalls.set(idx, { index: idx })
+                  toolOrder.push(idx)
+                }
+                mergeToolCallDelta(toolCalls.get(idx)!, tc)
+              }
+            }
+          }
+          if (choice.finish_reason) finish = choice.finish_reason
+        }
+      }
+    } catch {
+      // 跳过无法解析的行
+    }
+    return true
+  }
+
   let buffer = ''
   while (true) {
     const { done, value } = await reader.read()
@@ -397,53 +454,19 @@ async function aggregateWorkbuddySSE(body: ReadableStream<Uint8Array>, model: st
       if (!data) continue
       if (data.startsWith('data:')) data = data.slice(5).trim()
       if (!data || data === '[DONE]') continue
-
-      try {
-        const chunk = JSON.parse(data)
-        if (chunk.id) respID = chunk.id
-        if (chunk.model) respModel = chunk.model
-        if (chunk.created) created = chunk.created
-        if (chunk.usage) usage = chunk.usage
-
-        const choices = chunk.choices as any[]
-        if (Array.isArray(choices)) {
-          for (const choice of choices) {
-            const delta = choice?.delta
-            if (delta && typeof delta === 'object') {
-              if (delta.role) role = delta.role
-              if (typeof delta.content === 'string') content += delta.content
-              if (typeof delta.reasoning_content === 'string') reasoning += delta.reasoning_content
-              if (Array.isArray(delta.tool_calls)) {
-                for (const tc of delta.tool_calls) {
-                  if (!tc || typeof tc !== 'object') continue
-                  const idx = typeof tc.index === 'number' ? tc.index : 0
-                  if (!toolCalls.has(idx)) {
-                    toolCalls.set(idx, { index: idx })
-                    toolOrder.push(idx)
-                  }
-                  mergeToolCallDelta(toolCalls.get(idx)!, tc)
-                }
-              }
-            }
-            if (choice.finish_reason) finish = choice.finish_reason
-          }
-        }
-      } catch {
-        // 跳过无法解析的行
-      }
+      if (!consume(data)) break
     }
+    if (streamError) break
   }
   // 处理 buffer 中剩余的行
-  if (buffer.trim()) {
+  if (!streamError && buffer.trim()) {
     let data = buffer.trim()
     if (data.startsWith('data:')) data = data.slice(5).trim()
-    if (data && data !== '[DONE]') {
-      try {
-        const chunk = JSON.parse(data)
-        if (chunk.usage) usage = chunk.usage
-      } catch { /* ignore */ }
-    }
+    if (data && data !== '[DONE]') consume(data)
   }
+
+  // 上游流内报错 → 交调用方按错误返回，绝不产出 200 + 空内容
+  if (streamError) return { ok: false, error: streamError }
 
   const message: Record<string, unknown> = {
     role: role || 'assistant',
@@ -468,7 +491,32 @@ async function aggregateWorkbuddySSE(body: ReadableStream<Uint8Array>, model: st
   }
   if (usage) result.usage = usage
 
-  return JSON.stringify(result)
+  return { ok: true, body: JSON.stringify(result) }
+}
+
+/**
+ * 把聚合到的上游错误帧转成对客户端的 HTTP 错误响应（非流式路径）。
+ *
+ * 口径（折中方案）：**语义透传 + 网关脱敏**——错误码/文案/requestId 都交给客户端
+ * （上游 commit 5755fe3 的 error-passthrough 意图），但文本已经过 `sanitizeUpstreamError`
+ * 脱敏（长度截断、控制字符剥离、内网地址与凭据脱敏），不违背本仓脱敏红线。
+ *
+ * 状态码按错误类别映射：模型级限流 6004 → 429（客户端应等待重试），其余 → 502
+ * （上游在流中报错，属上游侧失败）。
+ */
+function workbuddyStreamErrorResponse(error: WorkbuddyErrorFrame): Response {
+  const codeText = error.code !== undefined && error.code !== null ? String(error.code) : ''
+  const status = codeText === '6004' ? 429 : 502
+  const errorObj: Record<string, unknown> = {
+    message: error.message || '上游在流式响应中返回错误',
+    type: codeText === '6004' ? 'rate_limit_exceeded' : 'upstream_error',
+  }
+  if (error.code !== undefined) errorObj.code = error.code
+  if (error.requestId !== undefined) errorObj.request_id = error.requestId
+  return new Response(JSON.stringify({ error: errorObj }), {
+    status,
+    headers: { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' },
+  })
 }
 
 /**
@@ -1852,9 +1900,8 @@ async function proxyOAuthRequestPooledCore(
     const originalStream = body.stream === true
     if (isWorkbuddyProvider(provider)) {
       // reasoning_effort 降级（移植 workbuddy2api）：sanitize 删除前先捕获，
-      // 若运营者声明了该模型的能力表（oauth.effortPolicy）则按能力降级/透传，未声明保持删除（既有行为）
+      // 档位来源见 resolveWorkbuddyEfforts（运营者手填 effortPolicy 优先，其次探测缓存）
       const capturedEffort = captureWorkbuddyReasoningEffort(body)
-      const effortPolicy = cfg.effortPolicy
       if (body.stream !== true) body.stream = true
       // stream_options 补 include_usage（移植 workbuddy2api D7）：上游据此在末帧回 usage，
       // 成本账本（recordOauthModelCost）依赖它；未带才注入，显式带则尊重调用方
@@ -1865,7 +1912,7 @@ async function proxyOAuthRequestPooledCore(
       normalizeOpenAIToolChoice(body)
       if (capturedEffort) {
         const model = typeof body['model'] === 'string' ? body['model'] : ''
-        applyWorkbuddyReasoningEffort(body, capturedEffort, model ? effortPolicy?.[model] : undefined)
+        applyWorkbuddyReasoningEffort(body, capturedEffort, resolveWorkbuddyEfforts(cfg, provider.id, model))
       }
       // DeepSeek 思维链注入与历史消息一致性回填（对齐 workbuddy2api thinking.go）
       injectDeepSeekThinking(body)
@@ -2163,10 +2210,17 @@ async function proxyOAuthRequestPooled(
     // WorkBuddy 非流式请求：收集 SSE 流并聚合成非流式 chat.completion 返回
     if (response.ok && originalStream !== true && isWorkbuddyProvider(provider) && response.body) {
       try {
-        const aggregated = await aggregateWorkbuddySSE(response.body, model)
+        const aggregated = await aggregateWorkbuddySSE(response.body, model, sanitizeUpstreamError)
+        if (!aggregated.ok) {
+          // 上游在流内报错（6004 限流 / 审核 / 会话失效）：按错误返回，**不产出 200 + 空内容**。
+          // 口径 = 语义透传 + 网关脱敏（见 workbuddyStreamErrorResponse）。
+          const errResp = workbuddyStreamErrorResponse(aggregated.error)
+          logOAuthRequest(c, provider, model, subPath, forwardBody, errResp.status)
+          return errResp
+        }
         if (uid && model) {
           try {
-            const parsedAgg = JSON.parse(aggregated)
+            const parsedAgg = JSON.parse(aggregated.body)
             if (parsedAgg.usage && typeof parsedAgg.usage.credit === 'number') {
               const pt = typeof parsedAgg.usage.prompt_tokens === 'number' ? parsedAgg.usage.prompt_tokens : 0
               const ct = typeof parsedAgg.usage.completion_tokens === 'number' ? parsedAgg.usage.completion_tokens : 0
@@ -2176,7 +2230,7 @@ async function proxyOAuthRequestPooled(
           } catch { /* ignore parse error */ }
         }
         logOAuthRequest(c, provider, model, subPath, forwardBody, 200)
-        return new Response(aggregated, {
+        return new Response(aggregated.body, {
           status: 200,
           headers: { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' },
         })
@@ -2213,6 +2267,9 @@ async function proxyOAuthRequestPooled(
     const cleaner = createWorkbuddyChunkCleaner({
       stopSignal,
       maxReasoningChars: envMaxReasoning,
+      // 上游 error 帧透传时的脱敏钩子：语义原样（code/msg/requestId 可见），
+      // 文本经 sanitizeUpstreamError 截断与脱敏（本仓脱敏红线）。
+      sanitizeErrorText: sanitizeUpstreamError,
       onRunaway: (kind) => {
         console.warn(`[proxy-oauth] WorkBuddy 流式防护触发: ${kind}, provider=${provider.id}, model=${model}`)
       },
@@ -2315,7 +2372,7 @@ async function proxyOAuthRequest(
       normalizeOpenAIToolChoice(body)
       if (capturedEffort) {
         const m = typeof body['model'] === 'string' ? body['model'] : ''
-        applyWorkbuddyReasoningEffort(body, capturedEffort, m ? cfg.effortPolicy?.[m] : undefined)
+        applyWorkbuddyReasoningEffort(body, capturedEffort, resolveWorkbuddyEfforts(cfg, provider.id, m))
       }
       // DeepSeek 思维链注入与历史消息一致性回填
       injectDeepSeekThinking(body)
@@ -2432,9 +2489,19 @@ async function proxyOAuthRequest(
     // 所有以 workbuddy 开头的 provider ID 均需此处理（workbuddy, workbuddy2 等）。
     if (response.ok && originalStream !== true && isWorkbuddyProvider(provider) && response.body) {
       try {
-        const aggregated = await aggregateWorkbuddySSE(response.body, (forwardBody as Record<string, unknown>).model as string)
+        const aggregated = await aggregateWorkbuddySSE(
+          response.body,
+          (forwardBody as Record<string, unknown>).model as string,
+          sanitizeUpstreamError,
+        )
+        if (!aggregated.ok) {
+          // 上游在流内报错：按错误返回，不产出 200 + 空内容（对齐池化路径口径）
+          const errResp = workbuddyStreamErrorResponse(aggregated.error)
+          logOAuthRequest(c, provider, model, subPath, forwardBody, errResp.status)
+          return errResp
+        }
         logOAuthRequest(c, provider, model, subPath, forwardBody, 200)
-        return new Response(aggregated, {
+        return new Response(aggregated.body, {
           status: 200,
           headers: { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' },
         })
@@ -2452,6 +2519,8 @@ async function proxyOAuthRequest(
     const cleaner = createWorkbuddyChunkCleaner({
       stopSignal,
       maxReasoningChars: envMaxReasoning,
+      // 同池化路径：error 帧语义透传 + 网关脱敏
+      sanitizeErrorText: sanitizeUpstreamError,
       onRunaway: (kind) => {
         console.warn(`[proxy-oauth] WorkBuddy 流式防护触发: ${kind}, provider=${provider.id}, model=${model}`)
       },
@@ -2472,67 +2541,89 @@ function fmtWorkbuddyCreditsPrefix(raw: string): string {
   return s !== '' ? `[${s} credit]` : ''
 }
 
-/** 模型倍率元数据缓存：providerId → modelId → { credits, descriptionZh }；null = 无可用元数据。 */
-const wbModelMetaCache = new Map<string, { meta: Map<string, { credits: string; descriptionZh: string }> | null; at: number; ok: boolean }>()
+/** 模型元数据缓存：`${providerId}:${realm}` → modelId → { credits, descriptionZh, supportedEfforts, defaultEffort }；null = 无可用元数据。 */
+const wbModelMetaCache = new Map<string, { meta: Map<string, WorkbuddyModelMeta> | null; at: number; ok: boolean }>()
 const WB_MODEL_META_TTL_MS = 60 * 60 * 1000
 const WB_MODEL_META_FAIL_MS = 5 * 60 * 1000
 
 /**
- * 探测 workbuddy（global）模型目录的积分倍率/描述元数据，供 /v1/models live-join 展示。
- * 仅对象形态携带元数据（对齐源实现 ModelInfo）；窄表/失败/负缓存/非 global 账号 → null。
- * 成功 1h 缓存、失败 5min 负缓存（与 admin 侧 global 模型探测同口径）。
+ * 解析某模型可用的 reasoning 档位（P2-1：探测结果自动填充 effort 能力桶）。
+ *
+ * 优先级：**运营者手填 `oauth.effortPolicy` 优先**（显式配置是权威意图），
+ * 缺失时回落到探测缓存的 `supportedEfforts`（`/v3/config` 或企业端点声明的档位）。
+ *
+ * 为什么读缓存而非现场探测：转发路径是热路径，每次请求都打一次模型目录端点会
+ * 放大上游风控与延迟。缓存由 `/v1/models` 与管理后台「获取模型」填充；缓存未命中时
+ * 返回 undefined，`applyWorkbuddyReasoningEffort` 即保持"删除该字段"的既有行为（零回归）。
+ *
+ * 跨平台注意：`getCachedWorkbuddyEfforts` 是纯内存读取（模块级 Map，非 KV）——它只用于
+ * "本 isolate 恰好探测过"这一加速场景，读不到就退回既有行为，故多 isolate 下语义安全。
  */
-async function getWorkbuddyGlobalModelMeta(env: Env, provider: import('./types').Provider): Promise<Map<string, { credits: string; descriptionZh: string }> | null> {
+function resolveWorkbuddyEfforts(
+  cfg: import('./types').OAuthDeviceConfig,
+  providerId: string,
+  model: string,
+): string[] | undefined {
+  if (!model) return undefined
+  const declared = cfg.effortPolicy?.[model]
+  if (declared && declared.length > 0) return declared
+  const realm: 'cn' | 'global' = 'cn'
+  return getCachedWorkbuddyEfforts(providerId, realm, model)
+    ?? getCachedWorkbuddyEfforts(providerId, 'global', model)
+    ?? undefined
+}
+
+/** /v1/models 展示用 + effort 降级用的单模型元数据。 */interface WorkbuddyModelMeta {
+  credits: string
+  descriptionZh: string
+  /** 探测到的 reasoning 档位（P2-1：自动填充 effort 能力桶，减少运营者手填 effortPolicy） */
+  supportedEfforts?: string[]
+  defaultEffort?: string
+}
+
+/**
+ * 探测 workbuddy 模型目录的元数据（CN/global 对称），供 `/v1/models` live-join 展示
+ * **并**自动填充 reasoning effort 能力桶。
+ *
+ * 已改为复用 owner `workbuddy-models.ts` 的同一探测（主路 `/v3/config` + 企业端点补缺）：
+ * 此前 admin 侧与 proxy 侧各写一套探测，口径已分叉（admin 探企业端点、proxy 只探企业端点
+ * 且不带 nonChat 过滤）。现在两侧共用同一份缓存与合并逻辑。
+ *
+ * 无 token / 探测全失败 → null（调用方零开销跳过）。
+ */
+async function getWorkbuddyModelMeta(env: Env, provider: import('./types').Provider): Promise<Map<string, WorkbuddyModelMeta> | null> {
   if (!isWorkbuddyProvider(provider) || !provider.oauth) return null
+  const cfg = provider.oauth
+  let token: string | null = null
+  try { token = await getOauthAccessToken(env, provider.id, cfg) } catch { token = null }
+  if (!token) return null
+  const realm: 'cn' | 'global' = detectTokenRealm(token) === 'global' ? 'global' : 'cn'
+  const cacheKey = `${provider.id}:${realm}`
   const now = Date.now()
-  const cached = wbModelMetaCache.get(provider.id)
+  const cached = wbModelMetaCache.get(cacheKey)
   if (cached) {
     const freshWindow = cached.ok ? WB_MODEL_META_TTL_MS : WB_MODEL_META_FAIL_MS
     if (now - cached.at < freshWindow) return cached.meta
   }
-  const cfg = provider.oauth
-  let token: string | null = null
-  try { token = await getOauthAccessToken(env, provider.id, cfg) } catch { token = null }
-  if (!token || detectTokenRealm(token) !== 'global') {
-    wbModelMetaCache.set(provider.id, { meta: null, at: now, ok: false })
+  const tokenState = await readOauthToken(env, provider.id).catch(() => null)
+  const probe = await probeWorkbuddyModelCatalog(env, provider, realm, token, tokenState?.cookies)
+  if (probe.stale) {
+    // 动态全失败 → 不产出元数据（避免用静态兜底编造 credits/档位）
+    wbModelMetaCache.set(cacheKey, { meta: null, at: now, ok: false })
     return null
   }
-  const tokenState = await readOauthToken(env, provider.id).catch(() => null)
-  const globalBase = (cfg.globalBaseUrl ? cfg.globalBaseUrl.replace(/\/$/, '') : provider.baseUrl.replace(/\/$/, ''))
-  for (const path of WORKBUDDY_GLOBAL_MODELS_PROBE_PATHS) {
-    try {
-      const headers = buildOauthHeaders(cfg, token, {
-        origin: cfg.globalOrigin,
-        apiType: provider.apiType,
-        cookies: tokenState?.cookies,
-      })
-      injectWorkbuddyChatHeaders(
-        headers,
-        token,
-        'global',
-        tokenState ? { uid: tokenState.uid, enterprise_id: tokenState.enterprise_id, domain: tokenState.domain, device_token: tokenState.device_token } : undefined,
-        cfg,
-        { chatPath: false },
-      )
-      const response = await fetch(globalBase + path, {
-        method: 'GET',
-        headers,
-        signal: AbortSignal.timeout(10000),
-      })
-      if (!response.ok) continue
-      const entries = parseWorkbuddyGlobalModels(await response.text())
-      if (entries && entries.length > 0) {
-        const meta = new Map<string, { credits: string; descriptionZh: string }>()
-        for (const e of entries) {
-          if (e.credits || e.descriptionZh) meta.set(e.id, { credits: e.credits || '', descriptionZh: e.descriptionZh || '' })
-        }
-        wbModelMetaCache.set(provider.id, { meta, at: now, ok: true })
-        return meta
-      }
-    } catch { /* 尝试下一个候选路径 */ }
+  const meta = new Map<string, WorkbuddyModelMeta>()
+  for (const e of probe.entries) {
+    if (!e.credits && !e.descriptionZh && !e.supportedEfforts?.length && !e.defaultEffort) continue
+    meta.set(e.id, {
+      credits: e.credits || '',
+      descriptionZh: e.descriptionZh || '',
+      ...(e.supportedEfforts?.length ? { supportedEfforts: e.supportedEfforts } : {}),
+      ...(e.defaultEffort ? { defaultEffort: e.defaultEffort } : {}),
+    })
   }
-  wbModelMetaCache.set(provider.id, { meta: null, at: now, ok: false })
-  return null
+  wbModelMetaCache.set(cacheKey, { meta: meta.size > 0 ? meta : null, at: now, ok: true })
+  return meta.size > 0 ? meta : null
 }
 
 /** 处理 /v1/models — 返回所有已启用的模型（含提供商前缀）。
@@ -2564,8 +2655,8 @@ export async function handleModels(c: Context<AppEnv>) {
     const nowTs = Math.floor(Date.now() / 1000)
     for (const provider of providers) {
       if (!provider.enabled) continue
-      // workbuddy 提供商：live-join 上游 global 目录的积分倍率/描述（非 workbuddy/无 global 账号 → null 零开销）。
-      const wbMeta = isWorkbuddyProvider(provider) ? await getWorkbuddyGlobalModelMeta(c.env, provider) : null
+      // workbuddy 提供商：live-join 上游模型目录的积分倍率/描述（非 workbuddy → null 零开销）。
+      const wbMeta = isWorkbuddyProvider(provider) ? await getWorkbuddyModelMeta(c.env, provider) : null
       for (const model of provider.models) {
         if (!model.enabled) continue
         const fullId = `${provider.id}/${model.id}`
@@ -2776,7 +2867,7 @@ export async function handleAnthropicMessages(c: Context<AppEnv>) {
         // reasoning_effort 降级（移植 workbuddy2api）：运营者声明 oauth.effortPolicy 才恢复/降级，未声明保持删除
         if (wbCapturedEffort) {
           const m = typeof upstreamBody['model'] === 'string' ? upstreamBody['model'] : ''
-          applyWorkbuddyReasoningEffort(upstreamBody, wbCapturedEffort, m ? provider.oauth?.effortPolicy?.[m] : undefined)
+          applyWorkbuddyReasoningEffort(upstreamBody, wbCapturedEffort, resolveWorkbuddyEfforts(cfg, provider.id, m))
         }
         // DeepSeek 思维链注入与历史消息一致性回填
         injectDeepSeekThinking(upstreamBody)
@@ -3999,7 +4090,7 @@ export async function handleResponses(c: Context<AppEnv>) {
         // reasoning_effort 降级（按运营者声明的 effortPolicy）
         if (wbCapturedEffort) {
           const m = typeof upstreamBody['model'] === 'string' ? upstreamBody['model'] : ''
-          applyWorkbuddyReasoningEffort(upstreamBody, wbCapturedEffort, m ? cfg.effortPolicy?.[m] : undefined)
+          applyWorkbuddyReasoningEffort(upstreamBody, wbCapturedEffort, resolveWorkbuddyEfforts(cfg, provider.id, m))
         }
         // DeepSeek 思维链注入与历史消息一致性回填
         injectDeepSeekThinking(upstreamBody)

@@ -119,6 +119,17 @@ export interface WorkbuddyStreamOptions {
   onRunaway?: (kind: 'degenerate_loop' | 'budget_exhausted') => void
   /** 中止流控制信号 */
   stopSignal?: { aborted: boolean }
+  /**
+   * 上游 error 帧内**文本叶子**的脱敏钩子（默认恒等，即原样透传）。
+   *
+   * 为什么是钩子而非直接 import：proxy.ts 已 import 本模块，反向 import 会成环；
+   * 且脱敏是**网关侧策略**（本仓有 sanitizeUpstreamError 的脱敏红线），
+   * 由 proxy 层注入、本模块只负责"在哪里脱敏"。
+   *
+   * 只对字符串值生效：`code`/`requestId` 等非字符串叶子必须原样透出（否则客户端
+   * 拿不到可判定的错误码）。
+   */
+  sanitizeErrorText?: (text: string) => string
 }
 
 /** 帧重建与推理防护的跨帧状态（一条 SSE 流一个实例）。 */
@@ -143,6 +154,8 @@ export interface WorkbuddyStreamState {
   detector: WorkbuddyDegeneracyDetector
   /** 流选项 */
   options?: WorkbuddyStreamOptions
+  /** 流内最后一次收到的上游错误帧（已脱敏）；无错误帧则为 undefined */
+  lastError?: WorkbuddyErrorFrame
 }
 
 /** 新建一条流的跨帧状态。 */
@@ -278,10 +291,118 @@ export interface FrameProcessResult {
   payload: string
   /** 该帧是否为有效数据帧（JSON 解析成功） */
   valid: boolean
+  /**
+   * 该帧是否为**上游错误帧**（顶层带 `error` 键）。
+   *
+   * 语义：上游在流中/流首回报错误（6004 限流、审核拦截、会话失效等）。这类帧
+   * **不参与**白名单重建——重建会把 error 整键剥掉，客户端既看不到错误也拿不到
+   * 内容（只能干等到流结束）。见 `passthroughWorkbuddyErrorFrame`。
+   */
+  isError?: boolean
+  /** 错误帧的**已脱敏**文本（`isError` 为真时存在），供聚合路径转非流式错误体。 */
+  error?: WorkbuddyErrorFrame
+}
+
+/**
+ * 上游错误帧的提取结果（对齐 workbuddy2api sse.go 的 error-passthrough）。
+ *
+ * `raw` 是**已脱敏**后的 JSON 原文（不是上游原文）——本仓有 `sanitizeUpstreamError`
+ * 的脱敏红线，故折中为"透传语义 + 网关脱敏"，而非上游的裸透传。
+ */
+export interface WorkbuddyErrorFrame {
+  /** 上游业务错误码（6004/11102/11-128 等）；非字符串叶子原样保留以便客户端判定 */
+  code?: unknown
+  /** 上游错误文案（已脱敏、已截断） */
+  message?: string
+  /** 上游请求 id（便于对账；非字符串叶子原样保留） */
+  requestId?: unknown
+  /** 已脱敏的完整帧 JSON 文本 */
+  raw: string
+}
+
+/** 判断帧是否带 `error` 键（非 null/undefined）。 */
+function hasErrorKey(frame: Record<string, unknown>): boolean {
+  const e = frame['error']
+  return e !== undefined && e !== null
+}
+
+/**
+ * 递归脱敏错误帧中的**字符串叶子**（非字符串值——含 code/requestId——原样保留）。
+ *
+ * 为什么只脱敏字符串：`code` 常是数字（6004），`requestId` 是字符串。若把 code 也
+ * 当文本处理会破坏类型，客户端 `err.code === 6004` 判定即失效。脱敏的诉求是"别泄漏
+ * 凭据/内网地址"，那只可能出现在文案里。
+ */
+function sanitizeErrorLeaves(value: unknown, sanitize: (t: string) => string): unknown {
+  if (typeof value === 'string') return sanitize(value)
+  if (Array.isArray(value)) return value.map((v) => sanitizeErrorLeaves(v, sanitize))
+  if (isObj(value)) {
+    const out: Record<string, unknown> = {}
+    for (const [k, v] of Object.entries(value)) out[k] = sanitizeErrorLeaves(v, sanitize)
+    return out
+  }
+  return value
+}
+
+/** 从错误信封里取文案（`error.message` → `error.msg` → `msg` → `message`）。 */
+function errorMessageOf(err: unknown): string {
+  if (isObj(err)) {
+    for (const k of ['message', 'msg', 'error_description', 'detail']) {
+      const v = err[k]
+      if (typeof v === 'string' && v.trim() !== '') return v.trim()
+    }
+  }
+  if (typeof err === 'string' && err.trim() !== '') return err.trim()
+  return ''
+}
+
+/** 从错误信封里取业务码（`error.code` → `error.data.code` → 顶层 `code`）。 */
+function errorCodeOf(frame: Record<string, unknown>, err: unknown): unknown {
+  if (isObj(err)) {
+    if (err['code'] !== undefined) return err['code']
+    const data = err['data']
+    if (isObj(data) && data['code'] !== undefined) return data['code']
+  }
+  return frame['code']
+}
+
+/** 从错误信封里取 requestId（`error.requestId` → `error.data.requestId` → 顶层）。 */
+function errorRequestIdOf(frame: Record<string, unknown>, err: unknown): unknown {
+  if (isObj(err)) {
+    if (err['requestId'] !== undefined) return err['requestId']
+    const data = err['data']
+    if (isObj(data) && data['requestId'] !== undefined) return data['requestId']
+  }
+  return frame['requestId']
+}
+
+/**
+ * 把带 `error` 键的帧转成**已脱敏**的错误帧（对齐 workbuddy2api sse.go 的 writeRaw 语义，
+ * 但出口套本仓脱敏管线）。
+ *
+ * 与 `normalizeWorkbuddyFrame` 的分工：错误帧**不走白名单**——白名单只认
+ * id/object/created/model/system_fingerprint/service_tier 六个键，error 会被整键丢弃，
+ * 于是客户端收到一个语义为空的 chunk。这里改为：脱敏后原样序列化，键结构（含
+ * `error.data.code` 这类嵌套）完整保留。
+ */
+export function sanitizeWorkbuddyErrorFrame(
+  frame: Record<string, unknown>,
+  sanitize?: (text: string) => string,
+): WorkbuddyErrorFrame {
+  const fn = sanitize ?? ((t: string) => t)
+  const cleaned = sanitizeErrorLeaves(frame, fn) as Record<string, unknown>
+  const err = frame['error']
+  return {
+    code: errorCodeOf(frame, err),
+    message: errorMessageOf(cleaned['error'] !== undefined ? cleaned['error'] : cleaned),
+    requestId: errorRequestIdOf(frame, err),
+    raw: JSON.stringify(cleaned),
+  }
 }
 
 /**
  * 处理一条 `data: ` 负载（对齐 workbuddy2api Stream 的 writeFrame）：
+ *  0. **上游错误帧**（顶层带 `error`）→ 脱敏后**原样透传**（不参与白名单重建）；
  *  1. JSON 解析失败 → 原样返回（`valid: false`，不计入有效帧）；
  *  2. 回填 tool_calls name；
  *  3. **首帧 id 续传**：首个非空 id 缓存为 firstId；后续帧 id 缺失/空 → 用 firstId；
@@ -296,6 +417,13 @@ export function processWorkbuddyFrame(payload: string, state: WorkbuddyStreamSta
     frame = parsed
   } catch {
     return { payload, valid: false }
+  }
+
+  // 上游错误帧：原样透传（仅脱敏），且计入有效帧——否则会被误判为空流。
+  if (hasErrorKey(frame)) {
+    const err = sanitizeWorkbuddyErrorFrame(frame, state.options?.sanitizeErrorText)
+    state.lastError = err
+    return { payload: err.raw, valid: true, isError: true, error: err }
   }
 
   // 记录上游 model
@@ -373,6 +501,8 @@ export function processWorkbuddyFrame(payload: string, state: WorkbuddyStreamSta
  * 行为：
  *  - 非 `data:` 行 / 空行 → 原样返回（保留 SSE 分隔语义）；
  *  - `[DONE]` → 原样返回（由上层保证只写一次）；
+ *  - **上游错误帧**（顶层带 `error`）→ 脱敏后原样写出，**不参与**白名单重建与噪声丢弃，
+ *    并计入有效帧（对齐 workbuddy2api sse.go writeRaw 的 error-passthrough）；
  *  - 有效 data 帧 → 白名单重建与退化/预算防护；
  *  - 退化且未产出正文时 → 注入合成 finish_reason: "length" 截断帧并通知中止；
  *  - 重建后 `choices` 为空数组且无 `usage`（或 delta 被抑制为空的帧）→ 丢弃（纯噪声）。
@@ -386,8 +516,18 @@ export function createWorkbuddyChunkCleaner(options?: WorkbuddyStreamOptions): (
     const data = trimmed.slice(5).trim()
     if (!data || data === '[DONE]') return chunk
 
-    const { payload, valid } = processWorkbuddyFrame(data, state)
+    const { payload, valid, isError } = processWorkbuddyFrame(data, state)
     if (!valid) return chunk
+
+    // 上游错误帧：脱敏后原样透出。**必须先于**噪声判定与终态丢弃判定——
+    // 错误帧没有 choices，会被下面的噪声逻辑当空帧丢掉；而它恰恰是客户端
+    // 唯一能知道"为什么失败"的信息（6004 限流 / 审核 / 会话失效）。
+    if (isError) {
+      // 已发出合成终态帧（含 [DONE]）后不再追加，否则 [DONE] 之后还有帧属畸形流。
+      // 但 state.lastError 已在 processWorkbuddyFrame 中记录，聚合路径仍能拿到。
+      if (state.terminated) return ''
+      return `data: ${payload}`
+    }
 
     // 若触发抑制且全程未产出任何正文/工具调用，且尚未发送终态合成帧
     if (state.suppressed && !state.terminated && state.contentChars === 0 && !state.hasToolCalls) {

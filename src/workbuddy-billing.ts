@@ -170,6 +170,7 @@ async function billingCallOnce(
 }
 
 import { parseJwtClaims } from './workbuddy-upstream'
+import { newMessageId } from './workbuddy-session-ids'
 
 // ===== 签到幂等判定（移植 workbuddy2api cmd/signin/main.go） =====
 
@@ -1053,9 +1054,408 @@ export async function markAdoptTried(env: Env, providerId: string, uid: string, 
   } catch { /* KV 写失败不阻断主流程（退化为无防抖） */ }
 }
 
+// ===== 连登奖励兑换 + 连登抽奖（移植 workbuddy2api 91418c5 growth_reward.go） =====
+//
+// 端点（CN web 成长中心 SPA 逆向）：
+//   GET  /activity/growth/streak          → data.streak.days + data.redemption_status（各档状态）
+//   POST /activity/growth/redeem          → {"tier":"7d","client_token":"<hex>"}
+//   GET  /activity/growth/lottery/chances → data.balance（抽奖次数）
+//   POST /activity/growth/lottery/draw    → {"client_token":"<hex>"}
+//
+// 连登奖励 = **里程碑兑换**（非按天 claim）：7d/14d/28d 三档，同月每档各可领一次。
+// 领奖成功送 {credit_granted, energy_granted, cards_granted, chances_granted}，
+// chances 即抽奖次数，凭它调 draw。
+
+/** 连登奖励档位（对齐源实现 GrowthTierSpec）。 */
+export interface WorkbuddyGrowthTier {
+  tier: string
+  days?: number
+  credit?: number
+  energy?: number
+  cards?: number
+  chances?: number
+}
+
+/** 连登奖励兑换状态（对齐源实现 GrowthRedemptionStatus）。 */
+export interface WorkbuddyRedemptionStatus {
+  tier_7d_status?: string
+  tier_14d_status?: string
+  tier_28d_status?: string
+  tiers?: WorkbuddyGrowthTier[]
+  remaining_days?: number
+}
+
+/** 连登奖励 + 兑换状态整体快照（一次 GET 读完，免二次请求）。 */
+export interface WorkbuddyRewardState {
+  days: number
+  redemption: WorkbuddyRedemptionStatus
+}
+
+/** 领奖回执（对齐源实现 GrowthRedeemResult）。 */
+export interface WorkbuddyRedeemResult {
+  cards_granted: number
+  cards_overflow: number
+  credit_granted: number
+  energy_granted: number
+  chances_granted: number
+}
+
+/** 单次抽奖结果（对齐源实现 GrowthLotteryDrawResult）。 */
+export interface WorkbuddyLotteryDrawResult {
+  prize_code: string
+  prize_name: string
+  prize_type: string
+  credit_amount: number
+}
+
+/** 连登奖励档位顺序（由高到低，供"挑最高可领档"策略）。 */
+export const WORKBUDDY_GROWTH_TIERS = ['28d', '14d', '7d'] as const
+
+/** 各档达标所需连登天数（上游 SPA 常量同构；redemption_status.tiers 缺失时的兜底）。 */
+export const WORKBUDDY_GROWTH_TIER_DAYS: Record<string, number> = { '7d': 7, '14d': 14, '28d': 28 }
+
+/** 生成 SPA 同款 client_token：`<prefix>-<32hex>`（对齐源实现 growthClientToken）。 */
+export function growthClientToken(prefix: string): string {
+  return `${prefix}-${newMessageId()}`
+}
+
+/** 判定某档本月是否已领（status === "claimed"）。 */
+export function growthTierClaimed(redemption: WorkbuddyRedemptionStatus, tier: string): boolean {
+  switch (tier) {
+    case '7d': return redemption.tier_7d_status === 'claimed'
+    case '14d': return redemption.tier_14d_status === 'claimed'
+    case '28d': return redemption.tier_28d_status === 'claimed'
+    default: return false
+  }
+}
+
 /**
- * 推进一趟猫猫旅行状态机（对齐 workbuddy2api travel.go travelOne）：
- * 1. 查有无猫：无猫 → 同意协议 + 领养第一只猫（+300 分）；
+ * 从连登天数与兑换状态挑出**本日应领的最高档**（对齐源实现"从高到低挑已达标且未领"）：
+ * 返回 null 表示没有可领档（全已领 / 全未达标）。
+ */
+export function pickWorkbuddyRedeemTier(state: WorkbuddyRewardState): string | null {
+  for (const tier of WORKBUDDY_GROWTH_TIERS) {
+    if (growthTierClaimed(state.redemption, tier)) continue
+    const days = state.redemption.tiers?.find((t) => t.tier === tier)?.days
+      ?? WORKBUDDY_GROWTH_TIER_DAYS[tier]
+    if (state.days >= days) return tier
+  }
+  return null
+}
+
+/**
+ * 判定错误消息是否为「本月已领取」幂等态（409 duplicate / 已领取）。正常态，不刷 WARN。
+ * 注意 `growthCall` 抛的是 `new Error('http 409 …')` 形态，故按状态码 + 关键词双匹配。
+ */
+export function isRedeemAlreadyClaimed(errMsg: string): boolean {
+  if (!/\bhttp 409\b/.test(errMsg)) return false
+  const lower = errMsg.toLowerCase()
+  return lower.includes('duplicate') || errMsg.includes('已领取')
+}
+
+/** 判定是否为「连续登录天数不足」（403）。正常态（本次连登天数 < 该档门槛）。 */
+export function isRedeemNotEnoughDays(errMsg: string): boolean {
+  return /\bhttp 403\b/.test(errMsg) && errMsg.includes('连续登录天数不足')
+}
+
+/** 判定是否为「无抽奖次数」（400 insufficient lottery chance balance）。正常态。 */
+export function isLotteryNoChance(errMsg: string): boolean {
+  return /\bhttp 400\b/.test(errMsg) && errMsg.toLowerCase().includes('insufficient lottery chance balance')
+}
+
+/** 判定是否为「抽奖未开启」（400 lottery disabled）。正常态。 */
+export function isLotteryDisabled(errMsg: string): boolean {
+  return /\bhttp 400\b/.test(errMsg) && errMsg.toLowerCase().includes('lottery disabled')
+}
+
+/** 组装 growth 请求的可选身份头（与 streak/buddy 系列同口径）。 */
+function growthIdentityHeaders(opts?: { uid?: string; enterpriseId?: string; deviceToken?: string }): Record<string, string> {
+  const extraHeaders: Record<string, string> = {}
+  if (opts?.uid) extraHeaders['X-User-Id'] = opts.uid
+  if (opts?.enterpriseId) extraHeaders['X-Enterprise-Id'] = opts.enterpriseId
+  if (opts?.deviceToken) extraHeaders['X-Device-Token'] = opts.deviceToken
+  return extraHeaders
+}
+
+/**
+ * 读取连登天数 + 各档兑换状态：GET /activity/growth/streak。
+ * 失败返回 null（调用方跳过本轮，不改变签到语义）。
+ */
+export async function fetchWorkbuddyRewardState(
+  token: string,
+  realm: 'cn' | 'global',
+  opts?: { uid?: string; enterpriseId?: string; deviceToken?: string }
+): Promise<WorkbuddyRewardState | null> {
+  try {
+    const data = await growthCall(token, '/activity/growth/streak', realm, {
+      method: 'GET',
+      extraHeaders: growthIdentityHeaders(opts),
+    })
+    if (!data || typeof data !== 'object') return null
+    const days = typeof data?.streak?.days === 'number' ? data.streak.days : 0
+    const redemption = (data?.redemption_status && typeof data.redemption_status === 'object')
+      ? data.redemption_status as WorkbuddyRedemptionStatus
+      : {}
+    return { days, redemption }
+  } catch {
+    return null
+  }
+}
+
+/** 兑换结果（含正常态区分，供调用方静默处理）。 */
+export interface WorkbuddyRedeemOutcome {
+  /** 是否兑换成功 */
+  success: boolean
+  /** 正常态（本月已领 / 天数不足）：静默跳过，不算失败 */
+  normal?: 'already_claimed' | 'not_enough_days'
+  result?: WorkbuddyRedeemResult
+  message: string
+}
+
+/**
+ * 兑换指定档位连登奖励：POST /activity/growth/redeem。
+ *
+ * `client_token` **每次调用新生成**（对齐源实现注释）：复用旧键会被上游幂等去重吞掉本次领取。
+ */
+export async function redeemWorkbuddyGrowth(
+  token: string,
+  realm: 'cn' | 'global',
+  tier: string,
+  opts?: { uid?: string; enterpriseId?: string; deviceToken?: string; clientToken?: string }
+): Promise<WorkbuddyRedeemOutcome> {
+  const clientToken = opts?.clientToken || growthClientToken(`redeem-${tier}`)
+  try {
+    const data = await growthCall(token, '/activity/growth/redeem', realm, {
+      method: 'POST',
+      body: { tier, client_token: clientToken },
+      extraHeaders: growthIdentityHeaders(opts),
+    })
+    return {
+      success: true,
+      result: {
+        cards_granted: Number(data?.cards_granted) || 0,
+        cards_overflow: Number(data?.cards_overflow) || 0,
+        credit_granted: Number(data?.credit_granted) || 0,
+        energy_granted: Number(data?.energy_granted) || 0,
+        chances_granted: Number(data?.chances_granted) || 0,
+      },
+      message: `已兑换 ${tier} 连登奖励`,
+    }
+  } catch (e) {
+    const msg = (e as Error).message || String(e)
+    if (isRedeemAlreadyClaimed(msg)) return { success: false, normal: 'already_claimed', message: `${tier} 本月已领取` }
+    if (isRedeemNotEnoughDays(msg)) return { success: false, normal: 'not_enough_days', message: `${tier} 连登天数不足` }
+    return { success: false, message: `兑换失败: ${msg}` }
+  }
+}
+
+/** 查询抽奖次数余额：GET /activity/growth/lottery/chances（0 = 无次数，正常态）。 */
+export async function fetchWorkbuddyLotteryChances(
+  token: string,
+  realm: 'cn' | 'global',
+  opts?: { uid?: string; enterpriseId?: string; deviceToken?: string }
+): Promise<number | null> {
+  try {
+    const data = await growthCall(token, '/activity/growth/lottery/chances', realm, {
+      method: 'GET',
+      extraHeaders: growthIdentityHeaders(opts),
+    })
+    return typeof data?.balance === 'number' ? data.balance : 0
+  } catch {
+    return null
+  }
+}
+
+/** 抽奖结果（含正常态区分）。 */
+export interface WorkbuddyLotteryOutcome {
+  success: boolean
+  /** 正常态（无次数 / 抽奖未开启）：静默跳过，不算失败 */
+  normal?: 'no_chance' | 'disabled'
+  result?: WorkbuddyLotteryDrawResult
+  message: string
+}
+
+/**
+ * 抽一次奖：POST /activity/growth/lottery/draw。
+ *
+ * `client_token` 每次新生成（SPA `doDraw` 每次用新键）：抽奖对幂等键敏感，复用旧键会被吞掉。
+ */
+export async function drawWorkbuddyLottery(
+  token: string,
+  realm: 'cn' | 'global',
+  opts?: { uid?: string; enterpriseId?: string; deviceToken?: string; clientToken?: string }
+): Promise<WorkbuddyLotteryOutcome> {
+  const clientToken = opts?.clientToken || growthClientToken('draw')
+  try {
+    const data = await growthCall(token, '/activity/growth/lottery/draw', realm, {
+      method: 'POST',
+      body: { client_token: clientToken },
+      extraHeaders: growthIdentityHeaders(opts),
+    })
+    return {
+      success: true,
+      result: {
+        prize_code: String(data?.prize_code || ''),
+        prize_name: String(data?.prize_name || ''),
+        prize_type: String(data?.prize_type || ''),
+        credit_amount: Number(data?.credit_amount) || 0,
+      },
+      message: `抽奖获得: ${String(data?.prize_name || '未知奖品')}`,
+    }
+  } catch (e) {
+    const msg = (e as Error).message || String(e)
+    if (isLotteryNoChance(msg)) return { success: false, normal: 'no_chance', message: '无抽奖次数' }
+    if (isLotteryDisabled(msg)) return { success: false, normal: 'disabled', message: '抽奖未开启' }
+    return { success: false, message: `抽奖失败: ${msg}` }
+  }
+}
+
+/**
+ * 连登奖励**按天幂等闸** KV 前缀（`providerId:uid` → CST 日期）。
+ *
+ * 为什么需要：源实现用进程内存 Map（`rewardClaimed[uid] = 当日`）保证"每日每号最多领一轮"，
+ * 重启清零靠上游 409 兜底。Workers 多 isolate 无共享内存，**必须用 KV**，否则同一账号
+ * 会被不同 isolate 同时领奖（上游 409 能兜住，但会产生无意义的重复请求）。
+ * 语义与 `ADOPT_TRIED_KV_PREFIX` 同构。
+ */
+export const REDEEM_TRIED_KV_PREFIX = 'workbuddy:redeem-tried:'
+
+/** 该账号今日是否已领过连登奖励。 */
+export async function redeemTriedToday(env: Env, providerId: string, uid: string, from?: number): Promise<boolean> {
+  try {
+    const raw = await env.KV.get(`${REDEEM_TRIED_KV_PREFIX}${providerId}:${uid}`)
+    return raw === cstDay(from)
+  } catch {
+    return false // KV 不可读时不抑制（宁可多试一次，也不漏领）
+  }
+}
+
+/** 记录该账号今日已领连登奖励（TTL 2 天，跨日自动失效）。 */
+export async function markRedeemTried(env: Env, providerId: string, uid: string, from?: number): Promise<void> {
+  try {
+    await env.KV.put(`${REDEEM_TRIED_KV_PREFIX}${providerId}:${uid}`, cstDay(from), { expirationTtl: 2 * 24 * 60 * 60 })
+  } catch { /* KV 写失败不阻断主流程（退化为无防抖，靠上游 409 兜底） */ }
+}
+
+/** 一趟连登奖励 + 抽奖的执行结果（供 CheckinResult 展示）。 */
+export interface WorkbuddyRewardRunResult {
+  /** 是否实际做了动作（无动作时调用方不展示该字段） */
+  acted: boolean
+  /** 兑换档位（未兑换则无） */
+  tier?: string
+  /** 兑换到的积分 */
+  credit?: number
+  /** 兑换到的抽奖次数 */
+  chances?: number
+  /** 抽奖获得的奖品名 */
+  prize?: string
+  /** 抽奖获得的积分 */
+  prizeCredit?: number
+  message: string
+}
+
+/**
+ * 执行一趟「连登奖励兑换 + 连登抽奖」（对齐 workbuddy2api scheduler.runActivity 的末段）。
+ *
+ * 流程：
+ *  1. **按天幂等闸**：本 isolate 已领过（KV 记了当日）→ 直接跳过，不打扰上游；
+ *  2. 读 streak + 各档状态 → 挑最高可领档 → redeem；
+ *  3. 兑换成功 → 记当日已领（KV）→ 领到的 chances 用来 draw（有次数才抽）。
+ *
+ * 正常态静默（对齐源实现）：409 已领 / 403 天数不足 / 400 无次数 / 400 抽奖未开启
+ * 都不算失败，不刷 WARN、不改变 `base.success`。
+ *
+ * **global 门控**：调用方**不应**对 global realm 调用本函数——实测 global 新号
+ * `GET /activity/growth/streak` 返回 500，证据不足以证明 redeem/draw 在 global 可用，
+ * 故整链跳过（与既有"global 无签到/无猫猫旅行"的 D4 门控一致）。函数内也做一次防御性
+ * 检查，避免误用。
+ */
+export async function runWorkbuddyGrowthRewards(
+  token: string,
+  realm: 'cn' | 'global',
+  uid: string,
+  opts?: {
+    enterpriseId?: string
+    deviceToken?: string
+    env?: Env
+    providerId?: string
+    /** 注入"当前时刻"供测试（幂等闸按 CST 自然日） */
+    now?: number
+    /**
+     * 调用方**已读过**的奖励状态（`fetchWorkbuddyRewardState` 的结果）。
+     *
+     * 为什么需要：签到路径本来就要读一次 `/activity/growth/streak` 回填连登天数展示，
+     * 若本函数再读一次就是**同一端点一次签到打两遍**。源实现 `GrowthRewardState` 明确
+     * 设计为"一次 GET 读完（days + redemption_status），免二次请求"，故这里允许复用。
+     * 传 null 表示"调用方读过但失败了"——本函数仍会自行重试一次（保持独立调用语义）。
+     */
+    state?: WorkbuddyRewardState | null
+  }
+): Promise<WorkbuddyRewardRunResult> {
+  if (realm === 'global') {
+    return { acted: false, message: 'global 无连登奖励体系（门控跳过）' }
+  }
+  if (!uid) return { acted: false, message: 'uid 缺失，跳过' }
+
+  // 按天幂等闸（KV）：今日已领过则整链跳过
+  const canDebounce = !!opts?.env && !!opts?.providerId
+  if (canDebounce && await redeemTriedToday(opts!.env!, opts!.providerId!, uid, opts?.now)) {
+    return { acted: false, message: '今日已领连登奖励（防抖跳过）' }
+  }
+
+  const state = opts?.state ?? await fetchWorkbuddyRewardState(token, realm, { uid, enterpriseId: opts?.enterpriseId, deviceToken: opts?.deviceToken })
+  if (!state) return { acted: false, message: '无法获取连登奖励状态' }
+
+  const tier = pickWorkbuddyRedeemTier(state)
+  if (!tier) return { acted: false, message: `无可领档位（连登 ${state.days} 天）` }
+
+  const redeem = await redeemWorkbuddyGrowth(token, realm, tier, {
+    uid,
+    enterpriseId: opts?.enterpriseId,
+    deviceToken: opts?.deviceToken,
+  })
+  if (!redeem.success) {
+    // 天数不足是"上游说未达标"——记当日已试避免同日反复探测（与领养防抖同口径）
+    if (redeem.normal === 'not_enough_days' && canDebounce) {
+      await markRedeemTried(opts!.env!, opts!.providerId!, uid, opts?.now)
+    }
+    return { acted: false, message: redeem.message }
+  }
+
+  if (canDebounce) await markRedeemTried(opts!.env!, opts!.providerId!, uid, opts?.now)
+
+  const credit = redeem.result?.credit_granted || 0
+  const chances = redeem.result?.chances_granted || 0
+  const parts = [`已兑换 ${tier} 连登奖励`]
+  if (credit > 0) parts.push(`+${credit} 积分`)
+  if (chances > 0) parts.push(`+${chances} 抽奖次数`)
+
+  // 有抽奖次数才抽（chances 也可能来自历史结余，故再查一次余额）
+  let prize: string | undefined
+  let prizeCredit: number | undefined
+  const balance = chances > 0 ? chances : await fetchWorkbuddyLotteryChances(token, realm, {
+    uid, enterpriseId: opts?.enterpriseId, deviceToken: opts?.deviceToken,
+  })
+  if (typeof balance === 'number' && balance > 0) {
+    const draw = await drawWorkbuddyLottery(token, realm, {
+      uid, enterpriseId: opts?.enterpriseId, deviceToken: opts?.deviceToken,
+    })
+    if (draw.success && draw.result) {
+      prize = draw.result.prize_name || undefined
+      prizeCredit = draw.result.credit_amount || undefined
+      if (prize) parts.push(`抽奖: ${prize}`)
+      if (prizeCredit && prizeCredit > 0) parts.push(`+${prizeCredit} 积分`)
+    } else if (!draw.normal) {
+      // 非正常态失败（网络/未知错误）也记入消息，便于面板定位
+      parts.push(draw.message)
+    }
+  }
+
+  return { acted: true, tier, credit, chances, prize, prizeCredit, message: parts.join('，') }
+}
+
+/**
+ * 推进一趟猫猫旅行状态机（对齐 workbuddy2api travel.go travelOne）： * 1. 查有无猫：无猫 → 同意协议 + 领养第一只猫（+300 分）；
  * 2. 有猫 → 查旅行状态：
  *    - arrived (到站) → 领奖 claim（带回 reward_credit 积分）
  *    - idle (空闲且未达当日上限) → 派出 depart（古镇客栈 location_id=4）

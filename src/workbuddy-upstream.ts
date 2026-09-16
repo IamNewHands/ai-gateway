@@ -790,13 +790,76 @@ export function rewriteWorkbuddySystemPrompt(body: Record<string, unknown>, syst
 
 // ===== global 模型目录动态探测解析（移植 workbuddy2api global_models.go） =====
 
+/**
+ * `/v3/config` 模型目录端点（CN/global 双域通用，路径不含 base）。
+ *
+ * 为什么必须有它：官方客户端的模型目录是**两级取数**——企业端点（CN `/console/...`、
+ * global `/v2/...`）只给一部分，`/v3/config` 给全量。只探企业端点会丢掉 `/v3/config`
+ * 独有的模型（上游实测：`deepseek-v4.1-flash`/`gpt-6-astra`/`hy4-preview-f`/
+ * `kimi-k2.8-preview`）。
+ *
+ * UA 门禁（上游实测）：`/v3/config` 只放行三段式 CLI UA。Bearer + web UA → `400 code 12403`。
+ * 本仓 `injectWorkbuddyChatHeaders` 已注入三段式 UA（`buildWorkbuddyUserAgent`），故可直接复用。
+ */
+export const WORKBUDDY_V3_CONFIG_PATH = '/v3/config'
+
 /** global 模型目录探测路径候选（对齐 workbuddy2api globalModelsProbePaths）：
  *  /v2 家族优先（PR #20 实测 /v2/enterprises/personal/models 200 含完整模型表），
- *  /console 作 fallback（同域旧路径）。 */
+ *  /console 作 fallback（同域旧路径）。
+ *
+ *  v3-config-merge 后本家族降为**补缺路**：`/v3/config` 为主路，二者并发探测后并集合并
+ *  （`gpt-5.3-codex` 等家族独有模型经此进并集）。 */
 export const WORKBUDDY_GLOBAL_MODELS_PROBE_PATHS = [
   '/v2/enterprises/personal/models',
   '/console/enterprises/personal/models',
 ]
+
+/** CN 企业端点路径（对齐 workbuddy2api cnModelsPath，与 pages.ts `_modelsUrl` 同路径）。
+ *
+ *  修正历史误判：本仓 `admin.ts` 曾注释「CN 域 /console/…/models 实测 404，无公开端点」，
+ *  但上游长期用同一 URL 做 CN 动态源且可用——该「404」结论很可能是当初未带 WorkBuddy
+ *  三段式 UA / `CommonHeaders` 探测所致。 */
+export const WORKBUDDY_CN_MODELS_PATH = '/console/enterprises/personal/models'
+
+/** 非对话模型 id 前缀（嵌入 / 补全 / 代码专用）：选中会撞 `code=11102`。 */
+export const WORKBUDDY_NON_CHAT_ID_PREFIXES = ['nes-', 'completion-', 'codewise-'] as const
+
+/** 非对话模型输出上限阈值（`maxOutputTokens <= 256` 视为 tiny 输出非对话模型）。 */
+export const WORKBUDDY_NON_CHAT_MAX_OUTPUT_TOKENS = 256
+
+/** 图片生成模型标签（非本网关用途）。 */
+export const WORKBUDDY_NON_CHAT_TAG = 'text-to-image'
+
+/**
+ * 判定是否非对话模型（应从模型目录中过滤掉）。
+ * 来源：workbuddy2api `nonChatModel`（harness buddy.ts:547-555）。三类规则：
+ *  1. id 前缀 `nes-` / `completion-` / `codewise-`（嵌入/补全/代码专用）；
+ *  2. `maxOutputTokens > 0 && <= 256`（tiny 输出）；
+ *  3. `tags` 含 `text-to-image`（图片生成）。
+ *
+ * 为什么必须过滤：`/v3/config` 返回**全量** models，含大量非对话条目。不过滤就会把它们
+ * 塞进管理后台的可勾选清单，用户选中后每次调用都撞 `11102`（该后端无此模型）。
+ */
+export function isWorkbuddyNonChatModel(
+  id: string,
+  maxOutputTokens?: number,
+  tags?: string[],
+): boolean {
+  const lower = (id || '').trim().toLowerCase()
+  for (const p of WORKBUDDY_NON_CHAT_ID_PREFIXES) {
+    if (lower.startsWith(p)) return true
+  }
+  if (typeof maxOutputTokens === 'number' && maxOutputTokens > 0 &&
+    maxOutputTokens <= WORKBUDDY_NON_CHAT_MAX_OUTPUT_TOKENS) {
+    return true
+  }
+  if (Array.isArray(tags)) {
+    for (const t of tags) {
+      if (t === WORKBUDDY_NON_CHAT_TAG) return true
+    }
+  }
+  return false
+}
 
 /** 解析出的单条 global 模型条目（id/展示名 + reasoning 档位桶，仅元数据无倍率）。 */
 export interface WorkbuddyGlobalModelEntry {
@@ -810,7 +873,38 @@ export interface WorkbuddyGlobalModelEntry {
   descriptionZh?: string
   /** 模型标签（对齐源实现 tags，含 badge:限时免费 等）。 */
   tags?: string[]
+  /** 最大输出 tokens（对齐源实现 maxOutputTokens）——`nonChatModel` 过滤依据之一。 */
+  maxOutputTokens?: number
 }
+
+/**
+ * 合并两路模型目录（v3-config-merge 口径）：**primary 为主、secondary 补缺**。
+ *
+ * 规则（对齐 workbuddy2api `mergeGlobalCatalog` / `mergeModelInfos`）：
+ *  - 去重 key = 模型 id；
+ *  - 同 id **以 primary 条目为准**（credits 等字段权威在主路）；
+ *  - secondary 只补 primary 缺失的 id（如 `gpt-5.3-codex` 只在企业端点）；
+ *  - **输出顺序稳定**：primary 原序在前、secondary 补充项按原序在后——不依赖 map 迭代序。
+ */
+export function mergeWorkbuddyModelCatalogs(
+  primary: WorkbuddyGlobalModelEntry[],
+  secondary: WorkbuddyGlobalModelEntry[],
+): WorkbuddyGlobalModelEntry[] {
+  const seen = new Set<string>()
+  const out: WorkbuddyGlobalModelEntry[] = []
+  for (const e of primary || []) {
+    if (!e || !e.id || seen.has(e.id)) continue
+    seen.add(e.id)
+    out.push(e)
+  }
+  for (const e of secondary || []) {
+    if (!e || !e.id || seen.has(e.id)) continue
+    seen.add(e.id)
+    out.push(e)
+  }
+  return out
+}
+
 
 /**
  * 解析 global 模型目录响应（对齐 workbuddy2api parseGlobalModelNames）：
@@ -818,8 +912,15 @@ export interface WorkbuddyGlobalModelEntry {
  *  - 对象形态：data.models[].id/.name（id 优先），disabled 剔除，附带解析
  *    reasoning.supportedEfforts（数组优先）/ effort（单档视作单元素表）/ defaultEffort。
  * 解析失败 / 空名单 → 返回 null（调用方回落静态清单，等价"该端点没给全"）。
+ *
+ * opts.filterNonChat：按 `isWorkbuddyNonChatModel` 剔除非对话条目。`/v3/config` 返回**全量**
+ * models（含图片/补全模型），主路必须开过滤；企业端点家族已自带 `agents[cli]` 白名单，
+ * 开过滤也不改变结果（幂等），但为保持解析口径单一，两条路都开。
  */
-export function parseWorkbuddyGlobalModels(raw: string): WorkbuddyGlobalModelEntry[] | null {
+export function parseWorkbuddyGlobalModels(
+  raw: string,
+  opts?: { filterNonChat?: boolean },
+): WorkbuddyGlobalModelEntry[] | null {
   let env: { code?: unknown; data?: unknown }
   try {
     env = JSON.parse(raw) as { code?: unknown; data?: unknown }
@@ -843,7 +944,10 @@ export function parseWorkbuddyGlobalModels(raw: string): WorkbuddyGlobalModelEnt
     const out: WorkbuddyGlobalModelEntry[] = []
     for (const id of narrowArr) {
       const s = typeof id === 'string' ? id.trim() : ''
-      if (s !== '') out.push({ id: s })
+      if (s === '') continue
+      // 窄表无 maxOutputTokens/tags 元数据，只按 id 前缀过滤
+      if (opts?.filterNonChat && isWorkbuddyNonChatModel(s)) continue
+      out.push({ id: s })
     }
     return out.length > 0 ? out : null
   }
@@ -860,6 +964,12 @@ export function parseWorkbuddyGlobalModels(raw: string): WorkbuddyGlobalModelEnt
       : (typeof rec['name'] === 'string' ? rec['name'].trim() : '')
     if (id === '') continue
     if (rec['disabled'] === true) continue
+    // maxOutputTokens 需在过滤前取出（nonChatModel 的第二条规则依赖它）
+    const maxOut = typeof rec['maxOutputTokens'] === 'number' ? rec['maxOutputTokens'] : undefined
+    const tags = Array.isArray(rec['tags'])
+      ? rec['tags'].filter((t): t is string => typeof t === 'string' && t.trim() !== '')
+      : undefined
+    if (opts?.filterNonChat && isWorkbuddyNonChatModel(id, maxOut, tags)) continue
     const entry: WorkbuddyGlobalModelEntry = { id }
     const name = typeof rec['name'] === 'string' ? rec['name'].trim() : ''
     if (name !== '' && name !== id) entry.displayName = name
@@ -867,10 +977,8 @@ export function parseWorkbuddyGlobalModels(raw: string): WorkbuddyGlobalModelEnt
     // 仅展示透出，不参与选号）。
     if (typeof rec['credits'] === 'string' && rec['credits'].trim() !== '') entry.credits = rec['credits'].trim()
     if (typeof rec['descriptionZh'] === 'string' && rec['descriptionZh'].trim() !== '') entry.descriptionZh = rec['descriptionZh'].trim()
-    if (Array.isArray(rec['tags'])) {
-      const tags = rec['tags'].filter((t): t is string => typeof t === 'string' && t.trim() !== '')
-      if (tags.length > 0) entry.tags = tags
-    }
+    if (tags && tags.length > 0) entry.tags = tags
+    if (maxOut !== undefined) entry.maxOutputTokens = maxOut
     const rz = rec['reasoning']
     if (rz && typeof rz === 'object') {
       const r = rz as Record<string, unknown>

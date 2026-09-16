@@ -506,8 +506,7 @@ describe('WorkBuddy 池化代理端到端（粘性 + 会话头族 + 协议头）
     expect(r2.status).toBe(200)
   })
 
-  it('在途租约：账号池全部被判满时返回 503（租约确实在生效）', async () => {
-    // 用自定义 maxInFlight=1 的 provider 简化观察。
+  it('在途租约：账号池全部被判满时返回 503（租约确实在生效）', async () => {    // 用自定义 maxInFlight=1 的 provider 简化观察。
     // 注意：storage.getProviders 有 10s 模块级缓存，同一测试内不可多次 makeEnv 换 provider
     // （会读到上一个 provider 配置），故这里一次性构造。
     const p = makeProvider()
@@ -550,5 +549,106 @@ describe('WorkBuddy 池化代理端到端（粘性 + 会话头族 + 协议头）
     release!()
     expect((await first).status).toBe(200)
     expect(inFlightOf(PID, 'u1')).toBe(0)
+  })
+
+  // ===== 上游 error 帧透传（移植 workbuddy2api 5755fe3 error-passthrough）=====
+  //
+  // 缺陷现场：聚合路径只读 id/model/created/usage/choices，带 error 的帧被静默跳过，
+  // 结果是 **200 + 空内容** —— 客户端既拿不到错误也拿不到内容。
+  // 流式路径更早的缺陷是 normalizeWorkbuddyFrame 白名单把 error 整键剥掉，
+  // 帧被替换成语义为空的 chunk。以下测试锁死修复后的行为。
+
+  /** 构造一个 200 状态但流内带 error 帧的 SSE 响应（上游常见形态）。 */
+  function sseErrorResponse(errorFrame: Record<string, unknown>): Response {
+    const body = [
+      `data: ${JSON.stringify(errorFrame)}`,
+      '',
+      'data: [DONE]',
+      '',
+    ].join('\n')
+    return new Response(body, { status: 200, headers: { 'Content-Type': 'text/event-stream' } })
+  }
+
+  it('非流式：流内 6004 错误帧 → 429 + 上游 code/msg/requestId（不再产出 200 空内容）', async () => {
+    const { env, app } = makeEnv([makeProvider()])
+    await seedPool(env, ['u1'])
+
+    vi.stubGlobal('fetch', vi.fn(async () => sseErrorResponse({
+      error: { code: 6004, msg: 'The model provider is rate-limiting requests.', requestId: 'req-rl-42' },
+    })))
+
+    const res = await app.post({
+      model: `${PID}/deepseek-v4-flash`,
+      messages: [{ role: 'user', content: 'hi' }],
+      stream: false,
+    })
+
+    // 关键：**不是** 200
+    expect(res.status).toBe(429)
+    const body = await res.json() as { error: { message: string; type: string; code?: unknown; request_id?: unknown } }
+    expect(body.error.type).toBe('rate_limit_exceeded')
+    expect(body.error.code).toBe(6004)
+    expect(body.error.message).toBe('The model provider is rate-limiting requests.')
+    expect(body.error.request_id).toBe('req-rl-42')
+  })
+
+  it('非流式：非 6004 错误帧（11102 无此模型）→ 502 + 上游 code', async () => {
+    const { env, app } = makeEnv([makeProvider()])
+    await seedPool(env, ['u1'])
+
+    vi.stubGlobal('fetch', vi.fn(async () => sseErrorResponse({
+      error: { code: 11102, msg: 'service info not found' },
+    })))
+
+    const res = await app.post({
+      model: `${PID}/deepseek-v4-flash`,
+      messages: [{ role: 'user', content: 'hi' }],
+      stream: false,
+    })
+    expect(res.status).toBe(502)
+    const body = await res.json() as { error: { code?: unknown; type: string } }
+    expect(body.error.type).toBe('upstream_error')
+    expect(body.error.code).toBe(11102)
+  })
+
+  it('非流式：错误文案经网关脱敏（内网地址被剥离，不透传裸上游文本）', async () => {
+    const { env, app } = makeEnv([makeProvider()])
+    await seedPool(env, ['u1'])
+
+    vi.stubGlobal('fetch', vi.fn(async () => sseErrorResponse({
+      error: { code: 500, msg: 'upstream failed, see http://10.0.0.5/admin/diag for details', requestId: 'req-x' },
+    })))
+
+    const res = await app.post({
+      model: `${PID}/deepseek-v4-flash`,
+      messages: [{ role: 'user', content: 'hi' }],
+      stream: false,
+    })
+    const body = await res.json() as { error: { message: string } }
+    // 内网地址被 sanitizeUpstreamError 剥离
+    expect(body.error.message).not.toContain('10.0.0.5')
+    expect(body.error.message).toContain('upstream failed')
+  })
+
+  it('流式：错误帧原样透传（code/msg/requestId 可见，且不被白名单剥成空 chunk）', async () => {
+    const { env, app } = makeEnv([makeProvider()])
+    await seedPool(env, ['u1'])
+
+    vi.stubGlobal('fetch', vi.fn(async () => sseErrorResponse({
+      error: { code: 6004, msg: 'The model provider is rate-limiting requests.', requestId: 'req-stream-1' },
+    })))
+
+    const res = await app.post({
+      model: `${PID}/deepseek-v4-flash`,
+      messages: [{ role: 'user', content: 'hi' }],
+      stream: true,
+    })
+    expect(res.status).toBe(200)
+    const text = await res.text()
+    expect(text).toContain('"code":6004')
+    expect(text).toContain('rate-limiting requests')
+    expect(text).toContain('req-stream-1')
+    // 没有被替换成空 chunk 壳
+    expect(text).not.toContain('"id":"chatcmpl-wb2api"')
   })
 })
