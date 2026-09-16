@@ -1278,6 +1278,16 @@ function firstClosedBlockEnd(text: string, config: ToolCallConfig): number {
  */
 export function scrubToolFragments(text: unknown): string {
   let t = canonicalizeMarkup(String(text ?? ''))
+  // 定点迭代：删除多字符序列可能拼出新残片（如 <script），反复应用直到不再变化（有界 8 轮）
+  for (let round = 0; round < 8; round++) {
+    const before = t
+    t = scrubToolFragmentsOnce(t)
+    if (t === before) break
+  }
+  return t
+}
+
+function scrubToolFragmentsOnce(t: string): string {
   t = t.replace(/<!\[CDATA\[/g, '')
   t = t.replace(/\]\]>/g, '')
   // 完整协议标签（开/闭，含竖线、冒号、命名空间变体，含属性）：

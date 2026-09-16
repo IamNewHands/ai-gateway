@@ -8,6 +8,10 @@ on:
       - main
   workflow_dispatch:
 
+# 最小权限：仅读取仓库内容即可完成构建与部署（GITHUB_TOKEN 不需要写权限）
+permissions:
+  contents: read
+
 # 需要的 Secrets:
 #   CF_API_TOKEN   - Cloudflare API Token (Workers Scripts Edit)
 #   CF_ACCOUNT_ID  - Cloudflare Account ID（大号 6a30b6116e755fd44e618dbcddbc0db3）

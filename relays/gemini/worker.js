@@ -98,8 +98,9 @@ async function handleRelayInfo() {
     info.loc = parse('loc')
     info.colo = parse('colo')
     info.warp = parse('warp')
-  } catch (e) {
-    info.error = e instanceof Error ? e.message : String(e)
+  } catch {
+    // 不向外部暴露内部错误细节（信息泄露：CWE-209）
+    info.error = 'trace lookup failed'
   }
   return new Response(JSON.stringify(info, null, 2), {
     status: 200,

@@ -1667,7 +1667,7 @@ export function shouldRecoverCallerLocalExecRefusal(input: FableLocalExecRefusal
   const toolProtocolOnly = lastUserMarker < 0
     && /\[(?:ASSISTANT TOOL CALL|TOOL RESULT|ASSISTANT|TOOL)(?:\s|\])/iu.test(input.prompt)
   const userRequest = lastUserMarker >= 0
-    ? input.prompt.slice(lastUserMarker + 7).split(/\n\n\[[A-Z][^\]]*\]\n/u, 1)[0]
+    ? input.prompt.slice(lastUserMarker + 7).split(/\n\n\[[A-Z][^\]\n]*\]\n/u, 1)[0]
     : toolProtocolOnly ? '' : input.prompt
   const explanatoryOnly = /^(?:\s*(?:please\s+)?(?:explain|describe|tell me (?:how|why)|what|why|how (?:does|can|would))\b|\s*(?:请)?(?:解释|说明|为什么|如何|怎么))/iu.test(userRequest)
   // 具体的可用性拒绝本已是很强的证据，说明模型未能履行调用方本地任务。一旦因果关系上的
@@ -1744,7 +1744,7 @@ export function hasFreshCallerLocalFailureEvidence(
 function callerLocalRecoveryUserRequest(prompt: string): string {
   const lastUserMarker = prompt.lastIndexOf('[USER]\n')
   return lastUserMarker >= 0
-    ? prompt.slice(lastUserMarker + 7).split(/\n\n\[[A-Z][^\]]*\]\n/u, 1)[0]
+    ? prompt.slice(lastUserMarker + 7).split(/\n\n\[[A-Z][^\]\n]*\]\n/u, 1)[0]
     : prompt
 }
 

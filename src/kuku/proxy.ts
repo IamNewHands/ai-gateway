@@ -57,7 +57,14 @@ export function isKukuProvider(provider: Pick<Provider, 'type'>): boolean {
  * 在「测试 API Key」流程（前端新增表单直接点测试）中也能正确路由，避免落到通用 GET /models 404。
  */
 export function isKukuRequest(providerId: unknown, baseUrl: unknown): boolean {
-  return providerId === 'kuku' || (typeof baseUrl === 'string' && baseUrl.includes('kuku.baidu.com'))
+  if (providerId === 'kuku') return true
+  if (typeof baseUrl !== 'string') return false
+  // 解析后精确比对 hostname（而非子串匹配），避免任意拼接主机绕过/误配（CWE-20）
+  try {
+    return new URL(baseUrl).hostname === 'kuku.baidu.com'
+  } catch {
+    return false
+  }
 }
 
 async function createSession(

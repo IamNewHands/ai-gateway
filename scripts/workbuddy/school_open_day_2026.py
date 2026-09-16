@@ -165,7 +165,8 @@ class TransientError(RuntimeError):
 
 def derive_id(auth, salt):
     """由 uid 稳定派生一个 36 位 hex 设备标识（桌面指纹 machineId 用，幂等）。"""
-    return hashlib.md5(f"{salt}:{auth['uid']}".encode()).hexdigest()[:36]
+    # sha256 而非 md5（弱敏感数据哈希，CodeQL py/weak-sensitive-data-hashing）
+    return hashlib.sha256(f"{salt}:{auth['uid']}".encode()).hexdigest()[:36]
 
 
 def mask(token):

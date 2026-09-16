@@ -18,6 +18,8 @@ import { estimateBudgetTokens } from './context-budget'
 export const MAX_TASK_ANCHORS = 4
 export const MAX_TASK_ANCHOR_CONTEXT_CHARACTERS = 4_096
 const MAX_TASK_ANCHOR_VALUE_CHARACTERS = 1_024
+// ReDoS 有界扫描：用户文本长度上限，超出部分直接不参与锚点提取（超长文本通常已超出上下文预算）
+const MAX_TASK_ANCHOR_SCAN_CHARACTERS = 32_000
 
 export type TaskAnchorKind = 'windows_path' | 'unc_path' | 'unix_path' | 'url' | 'server'
 
@@ -113,6 +115,8 @@ function safeReference(kind: Exclude<TaskAnchorKind, 'url'>, raw: string): TaskA
 }
 
 function candidatesFromText(text: string): Array<TaskAnchor & { offset: number }> {
+  // ReDoS 有界扫描：超长用户文本截断后再跑正则（多项式回溯防护）
+  if (text.length > MAX_TASK_ANCHOR_SCAN_CHARACTERS) text = text.slice(0, MAX_TASK_ANCHOR_SCAN_CHARACTERS)
   const result: Array<TaskAnchor & { offset: number }> = []
   const hasSensitivePrefix = (offset: number): boolean => SENSITIVE_ASSIGNMENT_PATTERN.test(text.slice(Math.max(0, offset - 48), offset))
   const add = (kind: Exclude<TaskAnchorKind, 'url'>, raw: string, offset: number): void => {

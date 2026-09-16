@@ -116,7 +116,8 @@ def derive_id(auth, salt):
     只用于事件指纹注入，不参与任何业务逻辑。
     """
     import hashlib
-    return hashlib.md5(f"{salt}:{auth['uid']}".encode()).hexdigest()[:36]
+    # sha256 而非 md5（弱敏感数据哈希，CodeQL py/weak-sensitive-data-hashing）
+    return hashlib.sha256(f"{salt}:{auth['uid']}".encode()).hexdigest()[:36]
 
 
 def desktop_fingerprint(auth):

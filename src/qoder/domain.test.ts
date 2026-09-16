@@ -50,13 +50,13 @@ beforeEach(() => {
 describe('qoderChatUrl / qoderModelsUrl（按域分端点，含 Encode=1）', () => {
   it('CN 域 chat 端点 → gateway.qoder.com.cn 且带 Encode=1', () => {
     const url = qoderChatUrl('cn')
-    expect(url.startsWith('https://gateway.qoder.com.cn')).toBe(true)
+    expect(new URL(url).host).toBe('gateway.qoder.com.cn')
     expect(url).toContain('/algo/api/v2/service/pro/sse/agent_chat_generation')
     expect(url).toContain('Encode=1')
   })
   it('global 域 chat 端点 → api3.qoder.sh（keirouter ChatURLEncoded）', () => {
     const url = qoderChatUrl('global')
-    expect(url.startsWith('https://api3.qoder.sh')).toBe(true)
+    expect(new URL(url).host).toBe('api3.qoder.sh')
     expect(url).toContain('Encode=1')
   })
   it('CN 域模型端点 → gateway.qoder.com.cn/algo/api/v2/model/list?Encode=1', () => {
