@@ -149,7 +149,7 @@ function showUsageLogDetail(index) {
     ['输入 Token', record.double1], ['输出 Token', record.double2], ['缓存 Token', record.double3], ['总 Token', record.double4], ['延迟', formatLatency(record.double5)], ['重试次数', record.double6], ['上游状态', record.double7],
     ['Request ID', getLogField(record, 'blob12')], ['Trace ID', getLogField(record, 'blob13')], ['客户端 IP', getLogField(record, 'blob14')], ['User-Agent', getLogField(record, 'blob15')], ['位置', [record.blob16, record.blob17, record.blob18].filter(Boolean).join(' / ')], ['Colo', getLogField(record, 'blob19')], ['错误代码', getLogField(record, 'blob10')], ['错误摘要', getLogField(record, 'blob20')]
   ]
-  showM('<div class="log-detail-heading"><div><h3>请求详情</h3><p>Analytics Engine 观测事件</p></div><button class="icon-btn" type="button" onclick="closeM()" aria-label="关闭详情"><i class="fas fa-times"></i></button></div><dl class="log-detail-grid">' + fields.map(function(field) { return '<div><dt>' + escapeHtml(field[0]) + '</dt><dd>' + escapeHtml(field[1] == null || field[1] === '' ? '—' : field[1]) + '</dd></div>' }).join('') + '</dl>')
+  showM('<div class="log-detail-heading"><div><h3>请求详情</h3><p>Analytics Engine 观测事件</p></div><button class="icon-btn" type="button" onclick="closeM()" aria-label="关闭详情"><i class="fas fa-times"></i></button></div><dl class="log-detail-grid">' + fields.map(function(field) { return '<dt>' + escapeHtml(field[0]) + '</dt><dd>' + escapeHtml(field[1] == null || field[1] === '' ? '—' : field[1]) + '</dd>' }).join('') + '</dl>')
 }
 
 async function loadUsageLogs(resetPage) {

@@ -550,7 +550,7 @@ label, legend { color: var(--color-ink-2); font-size: var(--text-xs); font-weigh
 .log-time-range input[type="datetime-local"] { width: auto; min-width: 0; flex: 1 1 0; max-width: 11rem; }
 .syslog-filters .log-actions { grid-column: 1 / -1; display: flex; justify-content: flex-end; gap: var(--space-2xs); }
 .analytics-log-pagination { display: flex; align-items: center; justify-content: center; gap: var(--space-sm); margin-block-start: var(--space-sm); }
-.log-detail-grid { display: grid; grid-template-columns: minmax(6rem, auto) minmax(0, 1fr); gap: var(--space-2xs) var(--space-xs); font-size: var(--text-xs); }
+.log-detail-grid { display: grid; grid-template-columns: minmax(5rem, 8rem) minmax(0, 1fr); align-items: baseline; gap: var(--space-2xs) var(--space-xs); font-size: var(--text-xs); }
 .log-detail-grid dt { color: var(--color-muted); font-weight: 600; }
 .log-detail-grid dd { min-width: 0; overflow-wrap: anywhere; }
 .log-detail-heading { display: flex; align-items: flex-start; justify-content: space-between; gap: var(--space-sm); margin-block-end: var(--space-sm); }
