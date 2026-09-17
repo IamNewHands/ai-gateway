@@ -428,7 +428,12 @@ async function pollOauthBrowserFlow(env: Env, providerId: string, cfg: OAuthDevi
     }
 
     const tok = env_resp.data
+    const now = Date.now()
     const expiresInSec = tok.expiresIn || 7200
+    const expiresInMs = expiresInSec * 1000
+    // 同 refreshBrowserTokenState：超 10 年量级的 expiresIn 视为脏值，回落 7200s 默认，
+    // 避免 expires_at 被推到荒谬未来导致永不刷新（移植 2cd466e）。
+    const safeExpiresMs = expiresInMs > 0 && expiresInMs < OAUTH_EXPIRES_IN_MAX_MS ? expiresInMs : 7200 * 1000
     // 保存 cookies 到 token 状态，后续模型拉取和 API 转发需要复用
     const newCookies = res.headers.get('Set-Cookie') || device.cookies || undefined
     // 只记录是否有 Cookie（长度），绝不打印原文
@@ -437,8 +442,8 @@ async function pollOauthBrowserFlow(env: Env, providerId: string, cfg: OAuthDevi
     const tokenState: OAuthTokenState = {
       access_token: tok.accessToken,
       refresh_token: tok.refreshToken,
-      expires_at: Date.now() + expiresInSec * 1000,
-      updated_at: Date.now(),
+      expires_at: now + safeExpiresMs,
+      updated_at: now,
       cookies: newCookies,
     }
     await writeOauthToken(env, providerId, tokenState)
@@ -1271,6 +1276,17 @@ async function refreshOauthTokenBrowser(env: Env, providerId: string, cfg: OAuth
  * 对指定的 browser token state 执行刷新，返回新 state（供单 token 与 WorkBuddy 多账号池共用）。
  * 失败返回 null（调用方决定禁用/冷却账号）。
  */
+/**
+ * refresh / 登录响应 `expiresIn` 的量级上限（10 年，移植 workbuddy2api `2cd466e`，
+ * 对齐源 `refreshTokenExpiresInMax`）。
+ *
+ * 纯防御值：实测上游 refresh 响应恒带 `expiresIn=5184000`（60 天），且 JWT 的
+ * `exp-iat` 与 `expiresIn` 严格自洽。超过 10 年的值只可能是上游脏数据，照写会把
+ * `expires_at` 推到荒谬未来 → 临近过期判定永假 → token 永不刷新 → 静默过期 →
+ * 401 路径把账号**永久禁用**（需重登）。
+ */
+export const OAUTH_EXPIRES_IN_MAX_MS = 10 * 365 * 24 * 60 * 60 * 1000
+
 export async function refreshBrowserTokenState(
   env: Env,
   providerId: string,
@@ -1301,11 +1317,19 @@ export async function refreshBrowserTokenState(
     if (!env_resp || env_resp.code !== 0 || !env_resp.data?.accessToken) return null
 
     const tok = env_resp.data
+    const now = Date.now()
+    // expiresIn 缺省（≤0）或超 10 年量级（脏值）都**保留旧 expires_at**——对齐源实现
+    // `if tok.ExpiresIn > 0 && ...` 的写法（移植 2cd466e）。旧值缺失（0）时才回落 7200s，
+    // 避免 expires_at=0 导致每次请求都刷新。
+    const expiresInMs = (tok.expiresIn ?? 0) * 1000
+    const expiresAt = expiresInMs > 0 && expiresInMs < OAUTH_EXPIRES_IN_MAX_MS
+      ? now + expiresInMs
+      : (state.expires_at || now + 7200 * 1000)
     return {
       access_token: tok.accessToken,
       refresh_token: tok.refreshToken || state.refresh_token,
-      expires_at: Date.now() + (tok.expiresIn || 7200) * 1000,
-      updated_at: Date.now(),
+      expires_at: expiresAt,
+      updated_at: now,
       // R5：刷新后必须保留/更新 cookie jar——browser 模式上游 API 依赖 cookie 会话
       cookies: res.headers.get('Set-Cookie') || state.cookies,
     }
@@ -1408,7 +1432,16 @@ async function refreshAllBrowserPoolTokens(env: Env, p: ProviderLike): Promise<{
   // 闲置阈值：超过 20 天未被刷新则保活一次（对齐 M365 分支的 IDLE_MS）
   const IDLE_MS = 20 * 24 * 60 * 60 * 1000
 
-  let changed = false
+  // ===== 两阶段提交：先刷新产出补丁，最后重新读池合并写回 =====
+  // 为什么分两阶段（丢失更新修复）：旧实现在**持有池快照期间**逐个账号 await 上游刷新
+  // （每账号最长 15s 超时），循环结束后把整个 pool 原样写回。KV 没有 CAS，而写池的不止
+  // 这里——请求路径会写冷却/errCount/lastUsed/credits，oauth-pool.noteOauthError 也会写。
+  // 刷新期间这些并发写入会被最后那次「整体覆盖」静默吞掉：丢了冷却 → 坏号立刻被再次
+  // 选中；丢了禁用 → 风控号复活。改为：刷新阶段只产出「uid → 新 token」补丁、不持有
+  // 快照；提交阶段**重新读一次池**，只按 uid 打补丁再写回，把覆盖窗口从「整个刷新循环」
+  // （数十秒）压到「一次 KV get→put」（毫秒级）。残留：KV 无 CAS，最终 get→put 之间的
+  // 并发写仍可能丢失（无法根除），但影响面从整池降到极小窗口内的单次写。
+  const updates = new Map<string, { token: OAuthTokenState; clearSessionDead: boolean }>()
   for (const acc of pool) {
     if (!acc || !acc.token?.refresh_token) continue
     // 禁用账号需人工重登，刷新必然失败 → 跳过（不白打上游、不产生噪音）
@@ -1420,30 +1453,41 @@ async function refreshAllBrowserPoolTokens(env: Env, p: ProviderLike): Promise<{
 
     const fresh = await refreshBrowserTokenState(env, p.id, cfg, acc.token)
     if (fresh) {
-      acc.token = fresh
-      acc.updatedAt = now
-      changed = true
+      updates.set(acc.uid, {
+        token: fresh,
+        // 刷新成功证明 session 未死 → 待清零 12153 连续失败计数（对齐 workbuddy2api
+        // ClearSessionDead）。注意仅清计数，不动 disabled（禁用号上面已跳过）。
+        clearSessionDead: !!acc.state && typeof acc.state === 'object' && 'sessionDeadFails' in acc.state,
+      })
       ok++
-      // 刷新成功证明 session 未死 → 清零 12153 连续失败计数（对齐 workbuddy2api ClearSessionDead）。
-      // 注意仅清计数，不动 disabled（禁用号上面已跳过）。
-      if (acc.state && typeof acc.state === 'object' && 'sessionDeadFails' in acc.state) {
-        const st = acc.state as Record<string, unknown>
-        if (st['sessionDeadFails']) {
-          st['sessionDeadFails'] = 0
-          changed = true
-        }
-      }
     } else {
       fail++
       console.error(`[oauth] WorkBuddy 池账号刷新失败，可能需要重新登录 provider=${p.id} uid=${(acc.uid || '').slice(0, 8)} ${new Date().toISOString()}`)
     }
   }
-  // 仅在确有变更时写回（避免无谓 KV 写放大）
-  if (changed) {
-    try {
-      await env.KV.put(OAUTH_POOL_KV_PREFIX + p.id, JSON.stringify(pool))
-    } catch { /* KV 写失败不阻断 Cron */ }
-  }
+  // 无变更不写回（避免无谓 KV 写放大）
+  if (updates.size === 0) return { ok, fail }
+
+  // 提交阶段：重新读池（拿最新状态）→ 按 uid 打补丁 → 写回。
+  // 读失败/池损坏/非数组时**放弃写回**：宁愿本次 Cron 刷新不落盘，也不能用一份空池或
+  // 坏池覆盖掉真实账号（那才是真正的数据损失）。
+  try {
+    const raw = await env.KV.get(OAUTH_POOL_KV_PREFIX + p.id)
+    const parsed = raw ? JSON.parse(raw) : []
+    if (!Array.isArray(parsed)) throw new Error('oauth pool is not an array')
+    for (const acc of parsed) {
+      if (!acc || typeof acc !== 'object' || typeof acc.uid !== 'string') continue
+      const patch = updates.get(acc.uid)
+      if (!patch) continue
+      acc.token = patch.token
+      acc.updatedAt = now
+      if (patch.clearSessionDead && acc.state && typeof acc.state === 'object') {
+        const st = acc.state as Record<string, unknown>
+        if (st['sessionDeadFails']) st['sessionDeadFails'] = 0
+      }
+    }
+    await env.KV.put(OAUTH_POOL_KV_PREFIX + p.id, JSON.stringify(parsed))
+  } catch { /* KV 读/写失败不阻断 Cron */ }
   return { ok, fail }
 }
 

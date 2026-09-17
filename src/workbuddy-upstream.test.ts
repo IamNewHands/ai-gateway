@@ -26,8 +26,12 @@ import {
   ensureGlobalFallbackSystem,
   GLOBAL_FALLBACK_SYSTEM,
   rewriteWorkbuddySystemPrompt,
+  appendWorkbuddySystemPrompt,
+  repackToolResultBlocks,
+  cleanupOrphanToolCalls,
   WORKBUDDY_DEGRADED_PROMPT,
   sanitizeFingerprintText,
+  sanitizeLiteralsSnapshot,
   sanitizeWorkbuddyMessages,
   contentBlockedClientMessage,
   contentBlockedKeyword,
@@ -132,11 +136,40 @@ describe('account_fault 账号级故障分类（移植 workbuddy2api accountFaul
     expect(classifyWorkbuddyUpstreamError(500, BODY_14017)).toBe('account_fault')
   })
 
-  it('hard_credit 与 session_dead 仍优先于 account_fault（顺序不变）', () => {
-    // 余额关键词最严，必须最先判
-    expect(classifyWorkbuddyUpstreamError(403, '余额不足 request illegal')).toBe('hard_credit')
-    // session 死亡是需人工重登的终态，marker 更具体
+  it('精确 marker 优先于宽泛余额关键词（移植 145220d：session_dead/account_fault 先于 HARD_MARKERS）', () => {
+    // 12153（会话失效）比“余额”字样更具体：带 request illegal 的 403 先判 session_dead
     expect(classifyWorkbuddyUpstreamError(403, '12153 request illegal')).toBe('session_dead')
+    // 该文案含“余额”措辞但带 request illegal → 账号故障优先于宽泛关键词（旧顺序误判 hard_credit）
+    expect(classifyWorkbuddyUpstreamError(403, '余额不足 request illegal')).toBe('account_fault')
+  })
+
+  it('429 带 quota 措辞 → soft_rate（移植 145220d：不再被 HARD_MARKERS 抢判为硬冷却到次日）', () => {
+    for (const text of [
+      'quota exceeded',
+      'quota exhausted',
+      '额度不足',
+      '积分不足',
+      '{"code":1005,"msg":"plan limit reached"}',
+      '{"msg":"your plan quota exceeded"}',
+    ]) {
+      expect(classifyWorkbuddyUpstreamError(429, text)).toBe('soft_rate')
+    }
+  })
+
+  it('429 + 精确账号/模型级 marker 仍按更具体类别判定（不被 429 兜底吞掉）', () => {
+    expect(classifyWorkbuddyUpstreamError(429, BODY_14017)).toBe('account_fault')
+    expect(classifyWorkbuddyUpstreamError(429, BODY_11140)).toBe('account_fault')
+    expect(classifyWorkbuddyUpstreamError(429, '{"code":6004,"msg":"limit"}')).toBe('model_rate')
+  })
+
+  it('非 429 的 quota 文案仍进 hard_credit（硬冷却语义不变）', () => {
+    expect(classifyWorkbuddyUpstreamError(402, 'quota exceeded')).toBe('hard_credit')
+    expect(classifyWorkbuddyUpstreamError(403, '积分不足')).toBe('hard_credit')
+  })
+
+  it('11102（无此模型）在 400/404 上先于宽泛关键词 → model_blocked', () => {
+    expect(classifyWorkbuddyUpstreamError(404, '{"code":11102,"msg":"plan 不支持该模型"}')).toBe('model_blocked')
+    expect(classifyWorkbuddyUpstreamError(400, '{"code":11102,"msg":"model not found"}')).toBe('model_blocked')
   })
 
   it('普通 4xx 不带账号故障文案时不受影响 → client（403 无信封属 WAF 拦截）', () => {
@@ -798,32 +831,41 @@ describe('sanitizeWorkbuddyMessages 请求体脱敏', () => {
 
   it('**关键**：content 为 null 时仍净化 tool_calls.arguments（旧实现盲区）', () => {
     const body = {
-      messages: [{
-        role: 'assistant',
-        content: null,
-        tool_calls: [{
-          id: 'c1',
-          type: 'function',
-          function: { name: 'run', arguments: '{"command":"echo 11128"}' },
-        }],
-      }],
+      messages: [
+        {
+          role: 'assistant',
+          content: null,
+          tool_calls: [{
+            id: 'c1',
+            type: 'function',
+            function: { name: 'run', arguments: '{"command":"echo 11-128"}' },
+          }],
+        },
+        // P1-5 的孤儿配对裁剪会删掉无结果的 tool_calls；本用例只测脱敏，故补齐配对
+        { role: 'tool', tool_call_id: 'c1', content: 'ok' },
+      ],
     }
     sanitizeWorkbuddyMessages(body)
     const args = (body.messages[0] as any).tool_calls[0].function.arguments
-    expect(args).not.toContain('11128')
+    // 源指纹用 U+2011（非断字连字符）书写；脱敏后必须变成 ASCII 连字符，二者字节不同
+    expect(args).not.toContain('11‑128')
     expect(args).toContain('11-128')
   })
 
   it('tool_calls 的 function.name 不在脱敏范围', () => {
     const body = {
-      messages: [{
-        role: 'assistant',
-        content: null,
-        tool_calls: [{ id: 'c1', function: { name: '11128_tool', arguments: '{}' } }],
-      }],
+      messages: [
+        {
+          role: 'assistant',
+          content: null,
+          tool_calls: [{ id: 'c1', function: { name: '11-128_tool', arguments: '{}' } }],
+        },
+        // 同上：补齐配对，避免被 P1-5 的孤儿裁剪删掉 tool_calls
+        { role: 'tool', tool_call_id: 'c1', content: 'ok' },
+      ],
     }
     sanitizeWorkbuddyMessages(body)
-    expect((body.messages[0] as any).tool_calls[0].function.name).toBe('11128_tool')
+    expect((body.messages[0] as any).tool_calls[0].function.name).toBe('11-128_tool')
   })
 
   it('无 messages / 畸形输入不抛错', () => {
@@ -1013,11 +1055,27 @@ describe('ensureWorkbuddyMaxTokens（WorkBuddy 出站 max_tokens 安全护栏）
     expect(body['max_tokens']).toBe(4096)
   })
 
-  it('已提供有效正数 max_completion_tokens 时不额外注入 max_tokens', () => {
-    const body: Record<string, unknown> = { model: 'deepseek-v4-flash', max_completion_tokens: 8192 }
+  it('移植 edb9e97：别名 max_completion_tokens 翻译成 max_tokens 并删除（此前从不翻译 → 上游回落 ~32k 截断）', () => {
+    const body: Record<string, unknown> = { model: 'deepseek-v4-flash', max_completion_tokens: 128000 }
     ensureWorkbuddyMaxTokens(body)
-    expect(body['max_tokens']).toBeUndefined()
-    expect(body['max_completion_tokens']).toBe(8192)
+    expect(body['max_tokens']).toBe(128000)
+    expect(body['max_completion_tokens']).toBeUndefined()
+  })
+
+  it('显式 max_tokens 优先：别名一律删除，不改写既有 max_tokens', () => {
+    const body: Record<string, unknown> = { model: 'deepseek-v4-flash', max_tokens: 4096, max_completion_tokens: 128000 }
+    ensureWorkbuddyMaxTokens(body)
+    expect(body['max_tokens']).toBe(4096)
+    expect(body['max_completion_tokens']).toBeUndefined()
+  })
+
+  it('无效别名值不翻译（非正/非数字/非安全整数）→ 回落默认注入且别名被删', () => {
+    for (const bad of [0, -1, null, '8192', 8192.5, Number.NaN, Number.POSITIVE_INFINITY, 1e21]) {
+      const body: Record<string, unknown> = { model: 'deepseek-v4-flash', max_completion_tokens: bad }
+      ensureWorkbuddyMaxTokens(body)
+      expect(body['max_tokens']).toBe(32768)
+      expect(body['max_completion_tokens']).toBeUndefined()
+    }
   })
 
   it('非正数或无效 max_tokens 触发安全注入', () => {
@@ -1291,4 +1349,271 @@ describe('classifyWorkbuddyUpstreamError → waf_block', () => {
   })
 })
 
+describe('repackToolResultBlocks / cleanupOrphanToolCalls（移植 155af65：防 11148 顶死会话）', () => {
+  it('部分回结果：调用侧按 keepCalls 对称裁剪，只留有结果的 c1（不再整批删）', () => {
+    const messages = [
+      { role: 'assistant', tool_calls: [{ id: 'c1' }, { id: 'c2' }] },
+      { role: 'tool', tool_call_id: 'c1', content: 'r1' },
+      { role: 'user', content: 'next' },
+    ]
+    const { messages: out, changed } = cleanupOrphanToolCalls(messages)
+    expect(changed).toBe(true)
+    const tcs = (out[0] as any).tool_calls
+    expect(tcs).toHaveLength(1)
+    expect(tcs[0].id).toBe('c1')
+    // 结果侧保留 c1；两侧对称 → 不残留半截配对
+    expect((out[1] as any).tool_call_id).toBe('c1')
+    expect(out).toHaveLength(3)
+  })
 
+  it('全齐零改动：返回原数组且 changed=false', () => {
+    const messages = [
+      { role: 'assistant', tool_calls: [{ id: 'c1' }] },
+      { role: 'tool', tool_call_id: 'c1', content: 'r' },
+    ]
+    const { messages: out, changed } = cleanupOrphanToolCalls(messages)
+    expect(changed).toBe(false)
+    expect(out).toBe(messages)
+  })
+
+  it('孤儿 tool 结果整条删除（无对应调用）', () => {
+    const messages = [
+      { role: 'assistant', content: 'hi' },
+      { role: 'tool', tool_call_id: 'ghost', content: 'r' },
+    ]
+    const { messages: out, changed } = cleanupOrphanToolCalls(messages)
+    expect(changed).toBe(true)
+    expect(out).toHaveLength(1)
+    expect((out[0] as any).role).toBe('assistant')
+  })
+
+  it('无任何工具流量 → 原样返回（零分配零改动）', () => {
+    const messages = [{ role: 'user', content: 'hi' }]
+    const { messages: out, changed } = cleanupOrphanToolCalls(messages)
+    expect(changed).toBe(false)
+    expect(out).toBe(messages)
+  })
+
+  it('repack：插在同批 tool 结果中间的 developer 消息被挪到整组之后（只调顺序不改内容）', () => {
+    const messages = [
+      { role: 'assistant', tool_calls: [{ id: 'c00' }, { id: 'c01' }] },
+      { role: 'tool', tool_call_id: 'c00', content: 'r0' },
+      { role: 'developer', content: '<image_resize_notice>' },
+      { role: 'tool', tool_call_id: 'c01', content: 'r1' },
+    ]
+    const { messages: out, changed } = repackToolResultBlocks(messages)
+    expect(changed).toBe(true)
+    expect(out.map((m: any) => m.role)).toEqual(['assistant', 'tool', 'tool', 'developer'])
+    expect((out[1] as any).tool_call_id).toBe('c00')
+    expect((out[2] as any).tool_call_id).toBe('c01')
+    expect((out[3] as any).content).toBe('<image_resize_notice>')
+  })
+
+  it('repack：下一组 assistant.tool_calls 是组头，绝不被当插入物吞掉', () => {
+    const messages = [
+      { role: 'assistant', tool_calls: [{ id: 'c00' }] },
+      { role: 'tool', tool_call_id: 'c00', content: 'r0' },
+      { role: 'assistant', tool_calls: [{ id: 'c10' }] },
+      { role: 'tool', tool_call_id: 'c10', content: 'r1' },
+    ]
+    const { messages: out, changed } = repackToolResultBlocks(messages)
+    expect(changed).toBe(false)
+    expect(out).toBe(messages)
+  })
+
+  it('repack：无插入消息时零改动', () => {
+    const messages = [
+      { role: 'assistant', tool_calls: [{ id: 'c00' }, { id: 'c01' }] },
+      { role: 'tool', tool_call_id: 'c00', content: 'r0' },
+      { role: 'tool', tool_call_id: 'c01', content: 'r1' },
+    ]
+    const { changed } = repackToolResultBlocks(messages)
+    expect(changed).toBe(false)
+  })
+
+  it('生产路径（sanitizeWorkbuddyMessages）：图片 notice 插入 + 部分回结果一次走完，出站无半截配对', () => {
+    const body: Record<string, unknown> = {
+      messages: [
+        { role: 'assistant', tool_calls: [{ id: 'c00' }, { id: 'c01' }] },
+        { role: 'tool', tool_call_id: 'c00', content: 'r0' },
+        { role: 'developer', content: '<image_resize_notice>' },
+        { role: 'tool', tool_call_id: 'c01', content: 'r1' },
+      ],
+    }
+    sanitizeWorkbuddyMessages(body)
+    const roles = (body['messages'] as any[]).map((m) => m.role)
+    expect(roles).toEqual(['assistant', 'tool', 'tool', 'developer'])
+  })
+})
+
+describe('appendWorkbuddySystemPrompt（移植 ff64ecd / 51bc469 / 9288f55：append 模式）', () => {
+  it('在开头连续 system/developer 块之后插入网关 system，既有消息逐字不动', () => {
+    const body: Record<string, unknown> = {
+      messages: [
+        { role: 'system', content: 'client sys' },
+        { role: 'developer', content: 'client dev' },
+        { role: 'user', content: 'hi' },
+      ],
+    }
+    appendWorkbuddySystemPrompt(body, '[GW]')
+    const msgs = body['messages'] as any[]
+    expect(msgs.map((m) => m.role)).toEqual(['system', 'developer', 'system', 'user'])
+    expect(msgs[0].content).toBe('client sys')
+    expect(msgs[1].content).toBe('client dev')
+    expect(msgs[2]).toEqual({ role: 'system', content: '[GW]' })
+    expect(msgs[3].content).toBe('hi')
+  })
+
+  it('块长为 0（首条即 user）→ 插到最前；中途 system 不动', () => {
+    const body: Record<string, unknown> = {
+      messages: [
+        { role: 'user', content: 'hi' },
+        { role: 'system', content: 'mid sys' },
+      ],
+    }
+    appendWorkbuddySystemPrompt(body, '[GW]')
+    const msgs = body['messages'] as any[]
+    expect(msgs.map((m) => m.role)).toEqual(['system', 'user', 'system'])
+    expect(msgs[2].content).toBe('mid sys')
+  })
+
+  it('边界遇非对象消息即停（不越过它插）', () => {
+    const body: Record<string, unknown> = {
+      messages: [
+        { role: 'system', content: 'a' },
+        'not-an-object',
+        { role: 'user', content: 'hi' },
+      ],
+    }
+    appendWorkbuddySystemPrompt(body, '[GW]')
+    const msgs = body['messages'] as any[]
+    expect(msgs[0].content).toBe('a')
+    expect(msgs[1]).toEqual({ role: 'system', content: '[GW]' })
+    expect(msgs[2]).toBe('not-an-object')
+  })
+
+  it('空提示词零操作；messages 缺失 → 置为单条网关 system 且其余字段保留', () => {
+    const nop = { messages: [{ role: 'user', content: 'keep' }] }
+    appendWorkbuddySystemPrompt(nop, '')
+    expect((nop['messages'] as any[]).length).toBe(1)
+
+    const bare: Record<string, unknown> = { model: 'm' }
+    appendWorkbuddySystemPrompt(bare, '[GW]')
+    expect(bare['messages']).toEqual([{ role: 'system', content: '[GW]' }])
+    expect(bare['model']).toBe('m')
+  })
+
+  it('网关消息角色是 system 而非 developer（上游白名单无 developer）', () => {
+    const body: Record<string, unknown> = { messages: [{ role: 'user', content: 'hi' }] }
+    appendWorkbuddySystemPrompt(body, '[GW]')
+    expect((body['messages'] as any[])[0].role).toBe('system')
+  })
+})
+
+describe('11115 prompt is too long 专项分类（移植 5f26ce3 / f41c496）', () => {
+  it('400/404/413 + code 11115 或 msg 文案 → prompt_too_long（请求级错误，不罚号不轮转）', () => {
+    expect(classifyWorkbuddyUpstreamError(400, '{"code":11115,"msg":"prompt is too long"}')).toBe('prompt_too_long')
+    expect(classifyWorkbuddyUpstreamError(400, '{"code":"11115"}')).toBe('prompt_too_long')
+    expect(classifyWorkbuddyUpstreamError(400, '{"code": 11115}')).toBe('prompt_too_long')
+    expect(classifyWorkbuddyUpstreamError(404, 'Prompt Is Too Long')).toBe('prompt_too_long')
+    expect(classifyWorkbuddyUpstreamError(413, 'prompt is too long')).toBe('prompt_too_long')
+  })
+
+  it('429/5xx 上不判 11115（限流与服务端故障语义优先）', () => {
+    expect(classifyWorkbuddyUpstreamError(429, '{"code":11115,"msg":"prompt is too long"}')).toBe('soft_rate')
+    expect(classifyWorkbuddyUpstreamError(500, '{"code":11115,"msg":"prompt is too long"}')).toBe('server')
+  })
+
+  it('11115 撞在 requestId 上不算（只认 code 字段形态与 msg 文案）', () => {
+    expect(classifyWorkbuddyUpstreamError(400, '{"requestId":"req-11115-abc","msg":"bad params"}')).toBe('client')
+  })
+
+  it('11115 优先于通用 4xx 兜底与内容策略层（请求级语义最具体）', () => {
+    expect(classifyWorkbuddyUpstreamError(400, '{"code":11115,"msg":"prompt is too long"}')).not.toBe('client')
+    expect(classifyWorkbuddyUpstreamError(400, '{"code":11115,"msg":"prompt is too long"}')).not.toBe('bad_params')
+  })
+
+  it('formatWorkbuddyClientErrorMessage：prompt_too_long 原文逐字透传（不套固定前缀），空 body 用兜底短文案', () => {
+    const raw = '{"code":11115,"msg":"prompt is too long","data":{"tokens":32001,"limit":32000},"requestId":"req-1"}'
+    const f = formatWorkbuddyClientErrorMessage(400, raw, 'prompt_too_long')
+    // 逐字透传：真实 token 数与上限值必须保留
+    expect(f.message).toBe(raw)
+    expect(f.message).toContain('32001')
+    expect(f.message).toContain('req-1')
+    expect(f.code).toBe(11115)
+    // 空 body：可读兜底（不编造原文）
+    const empty = formatWorkbuddyClientErrorMessage(400, '', 'prompt_too_long')
+    expect(empty.message).toContain('prompt is too long')
+  })
+
+  it('其他 kind 仍走既有前缀包装（本次改动零影响）', () => {
+    const f = formatWorkbuddyClientErrorMessage(400, '{"msg":"bad params"}')
+    expect(f.message).toContain('上游请求参数错误')
+  })
+})
+
+describe('sanitize 裸键名兜底（移植源 sanitizeBareHdrRe / 分析文档第 5 节第 3 条）', () => {
+  it('无冒号的混合大小写裸键名被缩写（此前既不检测也不改写 → 带指纹出站 400/11-128）', () => {
+    expect(sanitizeFingerprintText('引用 \u0060X-Anthropic-Billing-Header\u0060 这个键')).toBe('引用 \u0060x-anthropic-billing-hdr\u0060 这个键')
+    expect(sanitizeFingerprintText('lower: x-anthropic-billing-header')).toBe('lower: x-anthropic-billing-hdr')
+    expect(sanitizeFingerprintText('X-ANTHROPIC-BILLING-HEADER')).toBe('x-anthropic-billing-hdr')
+  })
+
+  it('键值形态仍整段删除（剥离层语义不变，不被缩写层抢走）', () => {
+    const out = sanitizeFingerprintText('x-anthropic-billing-header: some-value; keep this')
+    expect(out).not.toContain('x-anthropic-billing-header')
+    expect(out).not.toContain('some-value')
+    expect(out).toContain('keep this')
+  })
+
+  it('普通文本零改动（预检不命中即原样返回）', () => {
+    expect(sanitizeFingerprintText('hello world')).toBe('hello world')
+  })
+})
+
+describe('sanitize 指纹字面量字节快照护栏（移植 231a076）', () => {
+  // 这些字面量是实验逆向出的上游逐字精确匹配黑名单，无契约可引用——改错一个字节
+  // 就漏拦（400 code=11-128）或误伤。快照锁死当前字节形态，任何未同步改动先红在这里。
+  // 期望值由运行态 dump 生成（控制台渲染会吞掉连字符/引号，勿手工誊抄）。
+  it('特征串的字节形态被锁死', () => {
+    const s = sanitizeLiteralsSnapshot()
+    expect(s.features).toEqual([
+      "x-anthropic-billing-header",
+      "cc_entrypoint=",
+      "You are Claude Code",
+      "Main branch (",
+      "You are a coding agent running in the Codex CLI",
+      "github.com/anthropics/",
+      "11128",
+    ])
+  })
+
+  it('改写对的字节形态被锁死（每对只改一个词/插一个连字符，语义不变）', () => {
+    const s = sanitizeLiteralsSnapshot()
+    expect(s.rewrites).toEqual([
+      ["You are Claude Code, Anthropic's official CLI for Claude", "You are Claude Code, Anthropic's official CLI tool for Claude"],
+      ["Main branch (you will usually use this for PRs)", "Default branch (you will usually use this for PRs)"],
+      ["You are a coding agent running in the Codex CLI, a terminal-based coding assistant.", "You are a coding agent running in the Codex CLI tool, a terminal-based coding assistant."],
+      ["To give feedback, users should report the issue at https://github.com/anthropics/claude-code/issues", "To provide feedback, users should report the issue at https://github.com/anthropics/claude-code/issues"],
+      ["11128", "11-128"],
+    ])
+  })
+
+  it('三条正则的 source 被锁死（header 剥离层 / 裸 kv 层 / 裸键名兜底层）', () => {
+    const s = sanitizeLiteralsSnapshot()
+    expect(s.hdrRe).toBe("x-anthropic-billing-header:[^;\\n]*;?\\s*")
+    expect(s.kvRe).toBe("\\bcc_[a-z0-9_]+=[^;\\n]*;?\\s*")
+    expect(s.bareHdrRe).toBe("x-anthropic-billing-header")
+  })
+
+  it('11-128 改写对是「插入 ASCII 连字符」（不是零宽空格，实测上游会归一化）', () => {
+    const s = sanitizeLiteralsSnapshot()
+    const pair = s.rewrites.find((r) => r[1] === '11-128')
+    expect(pair).toBeDefined()
+    // 源串是裸数字串，目标串比它多一个 ASCII 连字符（45）
+    expect([...pair![0]].map((c) => c.charCodeAt(0))).toEqual([49, 49, 49, 50, 56])
+    expect([...pair![1]].map((c) => c.charCodeAt(0))).toEqual([49, 49, 45, 49, 50, 56])
+    // 逐码点确认目标串全 ASCII（无 U+200B / U+2011 之类）
+    for (const ch of pair![1]) expect(ch.charCodeAt(0)).toBeLessThan(128)
+  })
+})

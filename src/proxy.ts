@@ -69,6 +69,7 @@ import {
   isAccountBanned,
   ensureGlobalFallbackSystem,
   rewriteWorkbuddySystemPrompt,
+  appendWorkbuddySystemPrompt,
   WORKBUDDY_DEGRADED_PROMPT,
   sanitizeWorkbuddyMessages,
   sanitizeFingerprintText,
@@ -89,7 +90,7 @@ import {
   bindSticky,
   unbindSticky,
 } from './workbuddy-sticky'
-import { createWorkbuddyChunkCleaner, sanitizeWorkbuddyErrorFrame, type WorkbuddyErrorFrame } from './workbuddy-sse'
+import { createWorkbuddyChunkCleaner, sanitizeWorkbuddyErrorFrame, WORKBUDDY_EMPTY_STREAM_FRAME, type WorkbuddyChunkCleaner, type WorkbuddyErrorFrame } from './workbuddy-sse'
 import { probeWorkbuddyModelCatalog, getCachedWorkbuddyEfforts } from './workbuddy-models'
 import {
   acquireInFlight,
@@ -376,10 +377,28 @@ async function aggregateWorkbuddySSE(
   let content = '', reasoning = '', role = '', respModel = '', respID = '', finish = ''
   let created = 0
   let usage: Record<string, unknown> | null = null
+  /**
+   * 正文是否已从 delta 路径采过（对齐源实现 `gotAnyContent`）。
+   * 非 delta 的 `choices[].message` 兜底分支受它守卫：一帧整条 message 之后不再拼接，
+   * 否则「每帧都带完整 message」的上游会把正文重复 N 遍（N = 帧数）。
+   */
+  let gotAnyContent = false
+  /** 上游显式发过 `data: [DONE]`（正常收尾）。见 P1-2 截断判定。 */
+  let sawDone = false
   const toolCalls: Map<number, Record<string, unknown>> = new Map()
   const toolOrder: number[] = []
+  /** 缺 index 的 tool_call 的分配序号源：跨帧延续「最近分配」槽位，同帧内递增。 */
+  let toolSeq = 0
+  /** id → 已分配的 index：跨帧持续，供缺 index 时按 id 归位既有调用。 */
+  const idIndex = new Map<string, number>()
   /** 流内首个上游错误帧（已脱敏）：聚合遇错即视为本请求失败 */
   let streamError: WorkbuddyErrorFrame | undefined
+  /**
+   * 有效数据事件计数（移植 workbuddy2api 0a86854）：口径 = JSON 解析成功且为**对象**
+   * 的数据帧（对齐 Go 侧 `json.Unmarshal(..., &map[string]any)` 成功即计数；数组/标量
+   * 解不进 map，等价于解析失败）。`[DONE]` 与注释行不计。
+   */
+  let validEvents = 0
 
   // 按 index 合并 tool_call delta
   function mergeToolCallDelta(merged: Record<string, unknown>, delta: Record<string, unknown>) {
@@ -402,10 +421,127 @@ async function aggregateWorkbuddySSE(
     }
   }
 
+  /** 分配下一个不与既有槽冲突的缺 index 序号（跳过合规流已占用的 index）。 */
+  function nextToolIndex(): number {
+    for (;;) {
+      const idx = toolSeq++
+      if (!toolCalls.has(idx)) return idx
+    }
+  }
+
+  /**
+   * 把一段 tool_calls 数组按 index 合并进累计表（移植 workbuddy2api 5c2db2f，对齐源
+   * `mergeToolCallsChunk`）。delta（流式分片，按 index 累积）与非 delta 的完整 message
+   * 共用同一合并逻辑，保证「上游给的身份/函数名不丢、arguments 拼接语义一致」。
+   *
+   * index 缺失兼容：OpenAI 规范要求 delta 帧的 tool_call 带 index（标记分片归属），
+   * 但部分上游省略它。此前缺 index 一律归 0——多调用场景下不同 call 被合并进同一槽，
+   * arguments 串联污染（`{"a":1}{"b":2}`）、name 互相覆盖。分派规则（对齐源实现）：
+   *  - 带 index → 按 index 累积（合规形态，零改动）；
+   *  - 缺 index 带 id 且 id 已见过 → 归位该 id 所在 index（跨帧有效）；
+   *  - 缺 index 带 id 且 id 是新的 → 开新序号（多调用不合并）；
+   *  - 缺 index 无 id → 延续最近收到碎片的槽（单调用延续分片的标准形态），无既往开新号。
+   */
+  function mergeToolCallsChunk(tcs: unknown[]) {
+    for (const tc of tcs) {
+      if (!tc || typeof tc !== 'object') continue
+      const call = tc as Record<string, unknown>
+      let idx = -1
+      if (typeof call.index === 'number' && Number.isFinite(call.index)) {
+        idx = Math.trunc(call.index)
+      } else {
+        const cid = typeof call.id === 'string' ? call.id : ''
+        if (cid !== '') {
+          const mid = idIndex.get(cid)
+          idx = mid !== undefined ? mid : nextToolIndex()
+        } else if (toolOrder.length > 0) {
+          idx = toolOrder[toolOrder.length - 1]
+        } else {
+          idx = nextToolIndex()
+        }
+      }
+      if (!toolCalls.has(idx)) {
+        toolCalls.set(idx, { index: idx })
+        toolOrder.push(idx)
+      }
+      const merged = toolCalls.get(idx)!
+      const callId = typeof call.id === 'string' ? call.id : ''
+      if (callId !== '') idIndex.set(callId, idx)
+      const mergedId = typeof merged.id === 'string' ? merged.id : ''
+      if (mergedId !== '') idIndex.set(mergedId, idx)
+      mergeToolCallDelta(merged, call)
+    }
+  }
+
+  /**
+   * 把非 delta 的完整 `message` 内容并入聚合（移植 workbuddy2api 11b75d4，对齐源
+   * `mergeMessageFields`）。role/reasoning_content/tool_calls 与 delta 分支同构透出；
+   * content 同样置 `gotAnyContent`（latch 语义与 delta 路径一致：一帧整条 message
+   * 之后，后续帧不重复追加）。此前该兜底分支只取 content——tool_calls/role/
+   * reasoning_content 全丢（上游若用 message 形态下发正文与工具调用，整体被丢弃）。
+   */
+  function mergeMessageFields(msg: Record<string, unknown>) {
+    if (typeof msg.role === 'string' && msg.role !== '') role = msg.role
+    if (typeof msg.content === 'string') {
+      content += msg.content
+      gotAnyContent = true
+    }
+    if (typeof msg.reasoning_content === 'string') reasoning += msg.reasoning_content
+    if (Array.isArray(msg.tool_calls)) mergeToolCallsChunk(msg.tool_calls)
+  }
+
+  /**
+   * 判断 tool_call 的 arguments 是否因分片丢失而残缺（移植 workbuddy2api 65b2f33，
+   * 对齐源 `isTruncatedArguments`）：
+   *  - 空串 / 纯空白 → false（合法无参工具）；
+   *  - 非空但 JSON 解析失败 → true（截断）；
+   *  - 能解析（含 null/标量/数组等任何合法 JSON）→ false。
+   */
+  function isTruncatedArguments(raw: string): boolean {
+    const trimmed = raw.trim()
+    if (trimmed === '') return false
+    try {
+      JSON.parse(trimmed)
+      return false
+    } catch {
+      return true
+    }
+  }
+
+  /** 丢弃 arguments 残缺的 tool_call（返回新数组；正例零改动）。 */
+  function dropTruncatedToolCalls(calls: Record<string, unknown>[]): Record<string, unknown>[] {
+    return calls.filter((call) => {
+      const fn = call.function
+      if (!fn || typeof fn !== 'object') return true
+      const args = (fn as Record<string, unknown>).arguments
+      if (typeof args !== 'string') return true
+      return !isTruncatedArguments(args)
+    })
+  }
+
+  /**
+   * 非流式 usage 缺 `total_tokens` 时合成补齐（移植 workbuddy2api 213e362，对齐源
+   * `ensureUsageTotal`）。OpenAI 非流式 usage 必含 total_tokens；部分上游末帧只发
+   * prompt_tokens + completion_tokens。已有 total 不覆盖；缺单边不臆造（单边有值
+   * 无法合成可信 total）；合成走新对象，不改上游 map（不可变口径）。
+   */
+  function ensureUsageTotal(u: Record<string, unknown>): Record<string, unknown> {
+    if (u.total_tokens !== undefined) return u
+    const pt = u.prompt_tokens
+    const ct = u.completion_tokens
+    if (typeof pt !== 'number' || typeof ct !== 'number') return u
+    if (!Number.isFinite(pt) || !Number.isFinite(ct)) return u
+    return { ...u, total_tokens: pt + ct }
+  }
+
   /** 消费一行 SSE 负载；返回 false 表示已确认上游错误，可提前停止聚合。 */
   function consume(data: string): boolean {
     try {
       const chunk = JSON.parse(data)
+      // 有效事件计数：解析成功即为一次有效数据帧（错误帧同样计数——它也是客户端
+      // 可见的数据事件，且下面会终止聚合走错误返回）。计数在错误帧判定**之前**，
+      // 与源实现 writeFrame / Aggregate 的计数位置一致。
+      if (chunk && typeof chunk === 'object' && !Array.isArray(chunk)) validEvents++
       // 上游错误帧：记录并终止（后续帧不再有意义）
       if (chunk && typeof chunk === 'object' && chunk.error !== undefined && chunk.error !== null) {
         streamError = sanitizeWorkbuddyErrorFrame(chunk as Record<string, unknown>, sanitizeError)
@@ -422,19 +558,22 @@ async function aggregateWorkbuddySSE(
           const delta = choice?.delta
           if (delta && typeof delta === 'object') {
             if (delta.role) role = delta.role
-            if (typeof delta.content === 'string') content += delta.content
+            if (typeof delta.content === 'string') {
+              content += delta.content
+              gotAnyContent = true
+            }
             if (typeof delta.reasoning_content === 'string') reasoning += delta.reasoning_content
             if (Array.isArray(delta.tool_calls)) {
-              for (const tc of delta.tool_calls) {
-                if (!tc || typeof tc !== 'object') continue
-                const idx = typeof tc.index === 'number' ? tc.index : 0
-                if (!toolCalls.has(idx)) {
-                  toolCalls.set(idx, { index: idx })
-                  toolOrder.push(idx)
-                }
-                mergeToolCallDelta(toolCalls.get(idx)!, tc)
-              }
+              // 缺 index 的分派见 mergeToolCallsChunk（移植 5c2db2f）
+              mergeToolCallsChunk(delta.tool_calls)
             }
+          }
+          // 非 delta 的完整 message 兜底（移植 11b75d4 + 6701631）：与 delta 分支同构
+          // 合并 role/content/reasoning_content/tool_calls，并由 gotAnyContent 守卫
+          // 防止「每帧都带完整 message」的上游把正文重复 N 遍。
+          const msg = choice?.message
+          if (msg && typeof msg === 'object' && !Array.isArray(msg) && !gotAnyContent) {
+            mergeMessageFields(msg as Record<string, unknown>)
           }
           if (choice.finish_reason) finish = choice.finish_reason
         }
@@ -457,7 +596,12 @@ async function aggregateWorkbuddySSE(
       let data = line.trim()
       if (!data) continue
       if (data.startsWith('data:')) data = data.slice(5).trim()
-      if (!data || data === '[DONE]') continue
+      if (!data) continue
+      if (data === '[DONE]') {
+        // 上游显式正常收尾（移植 65b2f33：EOF 截断判定依赖本标志）
+        sawDone = true
+        continue
+      }
       if (!consume(data)) break
     }
     if (streamError) break
@@ -466,11 +610,24 @@ async function aggregateWorkbuddySSE(
   if (!streamError && buffer.trim()) {
     let data = buffer.trim()
     if (data.startsWith('data:')) data = data.slice(5).trim()
-    if (data && data !== '[DONE]') consume(data)
+    if (data === '[DONE]') sawDone = true
+    else if (data) consume(data)
   }
 
   // 上游流内报错 → 交调用方按错误返回，绝不产出 200 + 空内容
   if (streamError) return { ok: false, error: streamError }
+
+  // 空流哨兵（移植 workbuddy2api 0a86854）：上游 200 但**没有任何有效数据事件**
+  // （空体 / 只有 [DONE] / 只有注释行）。此前会合成 content:"" 的假成功 200——
+  // 客户端既拿不到内容也拿不到错误（最坏的失败形态），运维日志里也看不到失败。
+  // 现在直接报错，由调用方映射为 502 + code=upstream_parse（workbuddyStreamErrorResponse
+  // 非 6004 一律 502，与源实现 handler 的 502 upstream_parse 同语义）。
+  if (validEvents === 0) {
+    return {
+      ok: false,
+      error: { message: 'empty upstream stream', code: 'upstream_parse', raw: WORKBUDDY_EMPTY_STREAM_FRAME },
+    }
+  }
 
   const message: Record<string, unknown> = {
     role: role || 'assistant',
@@ -479,7 +636,15 @@ async function aggregateWorkbuddySSE(
   if (reasoning) message.reasoning_content = reasoning
   if (toolOrder.length > 0) {
     toolOrder.sort((a, b) => a - b)
-    message.tool_calls = toolOrder.map(idx => toolCalls.get(idx)!)
+    let calls = toolOrder.map(idx => toolCalls.get(idx)!)
+    // 截断来源判定（移植 65b2f33，对齐源 Aggregate）：model 因 max_tokens 提前中止
+    // （finish_reason=length），或上游连接中断（EOF 收尾但未发 data: [DONE]）时，
+    // tool_call 的 arguments 可能只剩半截 JSON——残缺参数交给客户端会被解析成非法
+    // JSON 卡死会话。完整参数原样保留（正例零改动）；空参数（无参工具）不是截断。
+    if (finish === 'length' || !sawDone) {
+      calls = dropTruncatedToolCalls(calls)
+    }
+    if (calls.length > 0) message.tool_calls = calls
   }
 
   const result: Record<string, unknown> = {
@@ -493,7 +658,7 @@ async function aggregateWorkbuddySSE(
       finish_reason: finish || 'stop',
     }],
   }
-  if (usage) result.usage = usage
+  if (usage) result.usage = ensureUsageTotal(usage)
 
   return { ok: true, body: JSON.stringify(result) }
 }
@@ -507,6 +672,10 @@ async function aggregateWorkbuddySSE(
  *
  * 状态码按错误类别映射：模型级限流 6004 → 429（客户端应等待重试），其余 → 502
  * （上游在流中报错，属上游侧失败）。
+ *
+ * gateway_hint（移植 workbuddy2api fa7b5d9 `writeOpenAIErrorHint`）：错误帧已按上游真实
+ * code/文案判定出 `error.hint` 时**并列**附加 `error.gateway_hint`——message/code/request_id
+ * 一字不改；hint 未定义（未覆盖形态）→ 字段**缺席**（不编造）。
  */
 function workbuddyStreamErrorResponse(error: WorkbuddyErrorFrame): Response {
   const codeText = error.code !== undefined && error.code !== null ? String(error.code) : ''
@@ -517,6 +686,7 @@ function workbuddyStreamErrorResponse(error: WorkbuddyErrorFrame): Response {
   }
   if (error.code !== undefined) errorObj.code = error.code
   if (error.requestId !== undefined) errorObj.request_id = error.requestId
+  if (error.hint) errorObj.gateway_hint = error.hint
   return new Response(JSON.stringify({ error: errorObj }), {
     status,
     headers: { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' },
@@ -608,7 +778,14 @@ function passthroughResponse(
   response: Response,
   cleanFn?: (chunk: string) => string,
   onLine?: (line: string) => void,
-  stopSignal?: { aborted: boolean }
+  stopSignal?: { aborted: boolean },
+  /**
+   * 流收尾钩子（移植 workbuddy2api 0a86854 的空流兜底挂载点）：上游流出结束（正常读完
+   * 或被护盾中止）后调用一次，返回需补写到客户端的尾部文本（'' / undefined = 不补写）。
+   * 只有需要「流级收尾决定」的调用方传它——WorkBuddy 用它在 0 有效帧时补 error 帧 + [DONE]，
+   * 否则上游「200 + 空流」会被客户端当成正常收尾。
+   */
+  onEnd?: () => string | void
 ): Response {
   const headers: Record<string, string> = {
     'Cache-Control': 'no-store',
@@ -691,6 +868,12 @@ function passthroughResponse(
         await writer.write(lineBuffer)
       }
     } catch { /* 流异常，忽略 */ }
+    // 流收尾：补写尾部帧（如 WorkBuddy 空流兜底的 error 帧 + [DONE]）。
+    // 放在 close 之前，且异常隔离——收尾失败绝不能影响已发出的流。
+    try {
+      const tail = onEnd?.()
+      if (tail) await writer.write(tail)
+    } catch { /* 收尾异常忽略 */ }
     try { await writer.close() } catch { /* already closed */ }
   })()
 
@@ -705,6 +888,46 @@ function passthroughResponse(
     statusText: response.statusText,
     headers,
   })
+}
+
+/**
+ * WorkBuddy 流式**空流兜底**钩子工厂（移植 workbuddy2api 0a86854 的 StreamHint 收尾段）。
+ *
+ * 背景：上游 200 但一帧有效数据都没有（空体 / 只有 [DONE] / 只有注释行）时，网关此前
+ * 原样结束流——客户端既拿不到内容也拿不到错误，还会把它当正常收尾（假成功），
+ * 运维在日志里也只看到 200。源实现的做法是：HTTP 头已发出只能 200，但流结束前补一帧
+ * `error`（code=upstream_parse）+ `[DONE]`，并记一条 WARN/502 观测。
+ *
+ * 何时**不**套用（返回 undefined，退回既有行为）：
+ *  - `apply` 为假：客户端没要流式（非流式走聚合路径，那里空流已映射 502）、上游非 2xx、
+ *    或 Content-Type 不是 SSE——后两种下响应体多为 JSON，补 SSE 帧会污染它；
+ *  - 清洗器已发合成终态帧（护盾熔断自带 [DONE]）时 finishStream 自行返回 ''，不会重复补。
+ */
+function workbuddyEmptyStreamGuard(
+  cleaner: WorkbuddyChunkCleaner,
+  apply: boolean,
+  providerId: string,
+  model: string
+): (() => string) | undefined {
+  if (!apply) return undefined
+  return () => {
+    const stats = cleaner.frameStats()
+    if (stats.validFrames === 0 && !stats.terminated) {
+      console.warn(`[proxy-oauth] WorkBuddy 空流兜底：上游 200 但 0 有效帧，已补 error 帧(code=upstream_parse)+[DONE] provider=${providerId} model=${model}`)
+    } else if (stats.doneWithheld) {
+      console.warn(`[proxy-oauth] WorkBuddy 畸形流：有效帧出现在 [DONE] 之后，已补收尾 [DONE] provider=${providerId} model=${model}`)
+    }
+    return cleaner.finishStream()
+  }
+}
+
+/**
+ * 判断某上游响应是否该套用 WorkBuddy 流式空流兜底：仅「客户端要流式 + 上游 2xx +
+ * Content-Type 是 SSE」三种条件同时成立时才套用（理由见 workbuddyEmptyStreamGuard）。
+ */
+function shouldGuardWorkbuddyEmptyStream(response: Response, originalStream: unknown): boolean {
+  if (originalStream !== true || !response.ok) return false
+  return (response.headers.get('Content-Type') || '').toLowerCase().includes('text/event-stream')
 }
 
 const isStreamRequest = (body: ProxyRequestBody): boolean => body.stream === true
@@ -1934,11 +2157,16 @@ async function proxyOAuthRequestPooledCore(
       }
       // 系统提示词体系（移植 workbuddy2api internal/prompt）：
       //  - custom：用自有提示词整体替换 system/developer（覆盖上面注入的兜底 system，避免双 system）；
-      //  - passthrough 降级重试：调用方传 systemOverride（中性提示词）时替换。
-      if (provider.promptMode === 'custom' && provider.promptText) {
-        rewriteWorkbuddySystemPrompt(body, provider.promptText)
-      } else if (systemOverride) {
+      //  - append（移植 ff64ecd）：在开头连续 system/developer 块之后**追加**一条网关 system，
+      //    既有消息逐字不动（客户端项目规范与网关提示词并用）；
+      //  - passthrough 降级重试：调用方传 systemOverride（中性提示词）时**替换**——
+      //    append 带指纹原文重试是确定性再撞墙，降级期必须退化成 replace（对齐源 9288f55）。
+      if (systemOverride) {
         rewriteWorkbuddySystemPrompt(body, systemOverride)
+      } else if (provider.promptMode === 'custom' && provider.promptText) {
+        rewriteWorkbuddySystemPrompt(body, provider.promptText)
+      } else if (provider.promptMode === 'append' && provider.promptText) {
+        appendWorkbuddySystemPrompt(body, provider.promptText)
       }
     }
     const headers = buildOauthHeaders(cfg, token, { origin: buildOrigin(r), apiType: provider.apiType, cookies })
@@ -2184,6 +2412,7 @@ async function proxyOAuthRequestPooledCore(
           // —— 前置一步：系统提示词降级自愈（默认 passthrough，移植 workbuddy2api handler.go）：
           //   content_blocked 很可能是 system 指纹误报（非 custom 且本请求尚未降级过），
           //   换 WORKBUDDY_DEGRADED_PROMPT 中性提示词同账号重试一次；仍被拦才回内容墙。
+          //   append 模式共享同一 degradeGate（对齐源 9288f55）：降级期走 replace 退化。
           if (provider.promptMode !== 'custom' && !degradedApplied) {
             dedicatedDegrade: {
               degradedApplied = true
@@ -2209,6 +2438,15 @@ async function proxyOAuthRequestPooledCore(
             await unbindSticky(c.env, provider.id, sessKey)
           }
           throw new ContentBlockedError(text)
+        case 'prompt_too_long':
+          // 11115「prompt is too long」（移植 workbuddy2api 5f26ce3 分类 + f41c496 透传）：
+          // 上下文超限是**请求的问题不是账号的问题**——同一 body 换任何账号都超限，轮转只会
+          // 白扔健康号配额。**不罚号**（零冷却/零连败/零熔断）、**不轮转**（直接终态返回），
+          // 400 + 上游 body 原文透传（真实 token 数/上限值/requestId 都保留，禁止固定词覆盖）。
+          if (sessKey && account.uid === stickyUid) {
+            await unbindSticky(c.env, provider.id, sessKey)
+          }
+          throw new WorkbuddyClientError(response.status, text, 'prompt_too_long')
         case 'bad_params':
         case 'client':
         default:
@@ -2338,7 +2576,13 @@ async function proxyOAuthRequestPooled(
         console.warn(`[proxy-oauth] WorkBuddy 流式防护触发: ${kind}, provider=${provider.id}, model=${model}`)
       },
     })
-    return passthroughResponse(response, cleaner, onLine, stopSignal)
+    return passthroughResponse(
+      response,
+      cleaner,
+      onLine,
+      stopSignal,
+      workbuddyEmptyStreamGuard(cleaner, shouldGuardWorkbuddyEmptyStream(response, originalStream), provider.id, model)
+    )
   } catch (err) {
     // 内容拦截是**本请求的终态**：回 400 + 防火墙文案（不回 503，也不暴露账号/错误码）。
     if (err instanceof ContentBlockedError) {
@@ -2350,10 +2594,12 @@ async function proxyOAuthRequestPooled(
     // 客户端参数/格式错误是**本请求的终态**：透传 4xx + 上游具体原因（不轮转，避免误报 503 无可用账号）
     if (err instanceof WorkbuddyClientError) {
       logOAuthRequest(c, provider, model, subPath, forwardBody, err.status)
-      const formatted = formatWorkbuddyClientErrorMessage(err.status, err.upstreamText)
+      const formatted = formatWorkbuddyClientErrorMessage(err.status, err.upstreamText, err.kind)
       const errorObj: Record<string, unknown> = {
         message: formatted.message,
-        type: 'invalid_request_error',
+        // 11115 用独立 type（对齐源 writeOpenAIError(400, "prompt_too_long", ...)），
+        // 客户端可据此区分「上下文超限」与普通参数错。
+        type: err.kind === 'prompt_too_long' ? 'prompt_too_long' : 'invalid_request_error',
       }
       if (formatted.code !== undefined) errorObj.code = formatted.code
       return c.json({ error: errorObj }, err.status as any)
@@ -2448,11 +2694,14 @@ async function proxyOAuthRequest(
       if (r === 'global' && subPath === 'chat/completions') {
         ensureGlobalFallbackSystem(body)
       }
-      // 系统提示词体系（移植 workbuddy2api internal/prompt），同池化路径时序。
-      if (provider.promptMode === 'custom' && provider.promptText) {
-        rewriteWorkbuddySystemPrompt(body, provider.promptText)
-      } else if (systemOverride) {
+      // 系统提示词体系（移植 workbuddy2api internal/prompt），同池化路径时序：
+      // custom 替换 / append 追加 / 降级期一律退化为 replace（见池化路径注释）。
+      if (systemOverride) {
         rewriteWorkbuddySystemPrompt(body, systemOverride)
+      } else if (provider.promptMode === 'custom' && provider.promptText) {
+        rewriteWorkbuddySystemPrompt(body, provider.promptText)
+      } else if (provider.promptMode === 'append' && provider.promptText) {
+        appendWorkbuddySystemPrompt(body, provider.promptText)
       }
     }
     const headers = buildOauthHeaders(cfg, token, { origin: buildOrigin(r), apiType: provider.apiType, cookies: tokenState?.cookies })
@@ -2530,8 +2779,9 @@ async function proxyOAuthRequest(
       }
     }
 
-    // 系统提示词降级自愈（非池化路径，默认 passthrough）：content_blocked 很可能是 system
-    // 指纹误报，换 WORKBUDDY_DEGRADED_PROMPT 中性提示词同请求重试一次（custom 模式已替换、不再降级）。
+    // 系统提示词降级自愈（非池化路径，passthrough/append 共用同一 gate）：content_blocked
+    // 很可能是 system 指纹误报，换 WORKBUDDY_DEGRADED_PROMPT 中性提示词同请求重试一次
+    // （custom 模式已整体替换、不再降级；append 降级期退化为 replace，对齐源 9288f55）。
     if (!response.ok && provider.promptMode !== 'custom') {
       const blockText = await response.text().catch(() => '')
       if (classifyWorkbuddyUpstreamError(response.status, blockText) === 'content_blocked') {
@@ -2589,7 +2839,13 @@ async function proxyOAuthRequest(
         console.warn(`[proxy-oauth] WorkBuddy 流式防护触发: ${kind}, provider=${provider.id}, model=${model}`)
       },
     })
-    return passthroughResponse(response, cleaner, undefined, stopSignal)
+    return passthroughResponse(
+      response,
+      cleaner,
+      undefined,
+      stopSignal,
+      workbuddyEmptyStreamGuard(cleaner, shouldGuardWorkbuddyEmptyStream(response, originalStream), provider.id, model)
+    )
   } catch (err) {
     const error = err as Error
     logOAuthRequest(c, provider, model, subPath, forwardBody, 502)
@@ -2955,10 +3211,13 @@ export async function handleAnthropicMessages(c: Context<AppEnv>) {
           }
           // 客户端参数/格式错误终态：回 4xx（Anthropic 错误形状）+ 上游原因（不轮转，避免误报 503 无可用账号）
           if (e instanceof WorkbuddyClientError) {
-            const formatted = formatWorkbuddyClientErrorMessage(e.status, e.upstreamText)
+            const formatted = formatWorkbuddyClientErrorMessage(e.status, e.upstreamText, e.kind)
             return c.json({
               type: 'error',
-              error: { type: 'invalid_request_error', message: formatted.message },
+              error: {
+                type: e.kind === 'prompt_too_long' ? 'prompt_too_long' : 'invalid_request_error',
+                message: formatted.message,
+              },
             }, e.status as any)
           }
           return c.json({

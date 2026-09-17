@@ -31,6 +31,15 @@ import {
   fetchWorkbuddyLotteryChances,
   drawWorkbuddyLottery,
   runWorkbuddyGrowthRewards,
+  cstDay,
+  cstYesterday,
+  fetchWorkbuddyHeatmap,
+  heatmapDayScore,
+  fetchWorkbuddyMakeupCards,
+  useMakeupCard,
+  claimWorkbuddyGift,
+  claimWorkbuddyCompensation,
+  makeupWorkbuddyYesterday,
 } from './workbuddy-billing'
 
 describe('夜猫子任务 black_cat（移植 task_runner.py black_cat 分支）', () => {
@@ -746,9 +755,11 @@ describe('连登奖励兑换 + 连登抽奖（growth_reward）', () => {
   })
 
   it('runWorkbuddyGrowthRewards 无可领档位 → acted=false', async () => {
-    globalThis.fetch = vi.fn().mockResolvedValue(new Response(JSON.stringify({
-      code: 0, msg: 'ok', data: { streak: { days: 3 }, redemption_status: {} },
-    }), { status: 200 }))
+    // 注意：必须每次返回**新的** Response 实例。Response body 只能消费一次，
+    // 而本函数现在会先打礼包/补偿（243c7f2 移植）再读 streak，共 4 次请求；
+    // 沿用 mockResolvedValue 复用同一个 Response 会让后续请求读空 body。
+    const body = JSON.stringify({ code: 0, msg: 'ok', data: { streak: { days: 3 }, redemption_status: {} } })
+    globalThis.fetch = vi.fn().mockImplementation(async () => new Response(body, { status: 200 }))
     const res = await runWorkbuddyGrowthRewards('tok', 'cn', 'u1')
     expect(res.acted).toBe(false)
     expect(res.message).toContain('无可领档位')
@@ -845,5 +856,494 @@ describe('连登奖励兑换 + 连登抽奖（growth_reward）', () => {
     const res = await runWorkbuddyGrowthRewards('tok', 'cn', 'u1')
     expect(res.acted).toBe(false)
     expect(res.message).toContain('无法获取')
+  })
+})
+
+/**
+ * 连登管家三动作（移植 workbuddy2api 243c7f2 growth_bonus.go）：
+ * 补签卡保连登 + 新手礼包 + 活动补偿领取。
+ *
+ * 关键行为：三个端点 URL/方法/请求体正确；补签日期用 **CST 前一日**（非本地日期减一天）；
+ * 三者失败**不影响** `base.success` 语义（runWorkbuddyGrowthRewards 的 acted/消息）；
+ * 礼包与补偿在 growth 之前、补签在 streak 读取之后并重读 state。
+ */
+describe('连登管家三动作（补签卡 / 新手礼包 / 活动补偿，growth_bonus）', () => {
+  const originalFetch = globalThis.fetch
+
+  beforeEach(() => { vi.restoreAllMocks() })
+  afterEach(() => { globalThis.fetch = originalFetch })
+
+  /** 内存 KV，供幂等闸测试。 */
+  function makeEnv() {
+    const store = new Map<string, string>()
+    const kv = {
+      get: async (k: string) => store.get(k) ?? null,
+      put: async (k: string, v: string) => { store.set(k, v) },
+      delete: async (k: string) => { store.delete(k) },
+      list: async () => ({ keys: [], list_complete: true, cursor: '' }),
+    }
+    return { env: { KV: kv, GATEWAY_KV: kv, RATE_LIMIT_KV: kv, SESSION_KV: kv } as any, store }
+  }
+
+  /** 构造某 CST 时刻的 epoch ms（CST = UTC+8）。 */
+  const cstAt = (y: number, mo: number, d: number, h: number, mi = 0) => Date.UTC(y, mo, d, h - 8, mi)
+
+  // ---- 补签日期：CST 前一日（不是本地日期减一天） ----
+
+  it('cstYesterday：跨时区时刻仍取 CST 前一日（而非 UTC 前一日）', () => {
+    // CST 2026-09-16 00:30 == UTC 2026-09-15 16:30。
+    // 「本地(UTC)日期减一天」会得到 2026-09-14（错）；CST 前一日应为 2026-09-15。
+    const at = Date.UTC(2026, 8, 15, 16, 30)
+    expect(cstDay(at)).toBe('2026-09-16')
+    expect(cstYesterday(at)).toBe('2026-09-15')
+    // 直接反证：按 UTC 日减一天得到的错误值
+    const wrongLocal = new Date(at - 86400000)
+    expect(`${wrongLocal.getUTCFullYear()}-${String(wrongLocal.getUTCMonth() + 1).padStart(2, '0')}-${String(wrongLocal.getUTCDate()).padStart(2, '0')}`).toBe('2026-09-14')
+  })
+
+  it('cstYesterday：CST 23:30 与次日 00:30 都归到各自 CST 日的前一天', () => {
+    expect(cstYesterday(cstAt(2026, 8, 16, 23, 30))).toBe('2026-09-15')
+    expect(cstYesterday(cstAt(2026, 8, 17, 0, 30))).toBe('2026-09-16')
+    // 月末/跨月边界
+    expect(cstYesterday(cstAt(2026, 9, 1, 0, 5))).toBe('2026-09-30')
+    // 跨年边界
+    expect(cstYesterday(cstAt(2027, 0, 1, 7, 0))).toBe('2026-12-31')
+  })
+
+  // ---- 三个端点的 URL / 方法 / 请求体 ----
+
+  it('fetchWorkbuddyHeatmap：GET /activity/growth/heatmap，解析 cells 并截断 date 前 10 位', async () => {
+    const calls: Array<{ url: string; method?: string }> = []
+    globalThis.fetch = vi.fn().mockImplementation(async (url: string, init: any) => {
+      calls.push({ url, method: init?.method })
+      return new Response(JSON.stringify({
+        code: 0, msg: 'ok',
+        data: { cells: [{ date: '2026-09-15T00:00:00+08:00', score: 0 }, { date: '2026-09-14', score: 12 }] },
+      }), { status: 200 })
+    }) as unknown as typeof fetch
+
+    const cells = await fetchWorkbuddyHeatmap('tok', 'cn', { uid: 'u1' })
+    expect(calls[0].url).toBe('https://copilot.tencent.com/activity/growth/heatmap')
+    expect(calls[0].method).toBe('GET')
+    expect(cells).toEqual([{ date: '2026-09-15', score: 0 }, { date: '2026-09-14', score: 12 }])
+    expect(heatmapDayScore(cells!, '2026-09-15')).toBe(0)
+    // 无该日格 → undefined（区别于 score 0：无判据不得当漏签）
+    expect(heatmapDayScore(cells!, '2026-09-13')).toBeUndefined()
+  })
+
+  it('fetchWorkbuddyHeatmap：失败返回 null（只读判据失败静默）', async () => {
+    globalThis.fetch = vi.fn().mockResolvedValue(new Response('down', { status: 500 })) as unknown as typeof fetch
+    expect(await fetchWorkbuddyHeatmap('tok', 'cn')).toBeNull()
+  })
+
+  it('fetchWorkbuddyMakeupCards：读 streak 响应体的 makeup_cards.balance/max', async () => {
+    globalThis.fetch = vi.fn().mockResolvedValue(new Response(JSON.stringify({
+      code: 0, msg: 'ok', data: { streak: { days: 5 }, makeup_cards: { balance: 2, max: 3 } },
+    }), { status: 200 })) as unknown as typeof fetch
+
+    const cards = await fetchWorkbuddyMakeupCards('tok', 'cn', { uid: 'u1' })
+    expect(cards).toEqual({ balance: 2, max: 3 })
+  })
+
+  it('fetchWorkbuddyMakeupCards：makeup_cards 缺失 → balance 0（不误判有卡）', async () => {
+    globalThis.fetch = vi.fn().mockResolvedValue(new Response(JSON.stringify({
+      code: 0, msg: 'ok', data: { streak: { days: 5 } },
+    }), { status: 200 })) as unknown as typeof fetch
+    expect(await fetchWorkbuddyMakeupCards('tok', 'cn')).toEqual({ balance: 0, max: 0 })
+  })
+
+  it('fetchWorkbuddyRewardState 同时解析 makeup_cards（与 streak 同响应体，免二次请求）', async () => {
+    globalThis.fetch = vi.fn().mockResolvedValue(new Response(JSON.stringify({
+      code: 0, msg: 'ok',
+      data: {
+        streak: { days: 5 },
+        redemption_status: { tier_7d_status: 'locked' },
+        makeup_cards: { balance: 2, max: 3 },
+      },
+    }), { status: 200 })) as unknown as typeof fetch
+
+    const st = await fetchWorkbuddyRewardState('tok', 'cn', { uid: 'u1' })
+    expect(st!.days).toBe(5)
+    expect(st!.makeupCards).toEqual({ balance: 2, max: 3 })
+  })
+
+  it('fetchWorkbuddyRewardState：上游未给 makeup_cards → makeupCards 缺省（不误判有卡）', async () => {
+    globalThis.fetch = vi.fn().mockResolvedValue(new Response(JSON.stringify({
+      code: 0, msg: 'ok', data: { streak: { days: 5 }, redemption_status: {} },
+    }), { status: 200 })) as unknown as typeof fetch
+    const st = await fetchWorkbuddyRewardState('tok', 'cn')
+    expect(st!.makeupCards).toBeUndefined()
+  })
+
+  it('makeupWorkbuddyYesterday：传入 cards（已读到的余额）→ 不再单独 GET streak', async () => {
+    const calls: string[] = []
+    globalThis.fetch = vi.fn().mockImplementation(async (url: string) => {
+      calls.push(url)
+      if (url.includes('/activity/growth/heatmap')) {
+        return new Response(JSON.stringify({ code: 0, msg: 'ok', data: { cells: [{ date: '2026-09-15', score: 0 }] } }), { status: 200 })
+      }
+      return new Response(JSON.stringify({ code: 0, msg: 'ok', data: {} }), { status: 200 })
+    }) as unknown as typeof fetch
+
+    const at = Date.UTC(2026, 8, 15, 16, 30)
+    const used = await makeupWorkbuddyYesterday('tok', 'cn', { now: at, cards: { balance: 1, max: 3 } })
+    expect(used).toBe('2026-09-15')
+    // 复用调用方读到的余额：streak 一次都不打（与源实现"同响应体零加请求"一致）
+    expect(calls.some((u) => u.includes('/activity/growth/streak'))).toBe(false)
+    expect(calls.some((u) => u.includes('makeup-cards/use'))).toBe(true)
+  })
+
+  it('makeupWorkbuddyYesterday：cards=null（上游未给该段）→ 视为无卡，不补签', async () => {
+    const calls: string[] = []
+    globalThis.fetch = vi.fn().mockImplementation(async (url: string) => {
+      calls.push(url)
+      if (url.includes('/activity/growth/heatmap')) {
+        return new Response(JSON.stringify({ code: 0, msg: 'ok', data: { cells: [{ date: '2026-09-15', score: 0 }] } }), { status: 200 })
+      }
+      return new Response(JSON.stringify({ code: 0, msg: 'ok', data: {} }), { status: 200 })
+    }) as unknown as typeof fetch
+
+    const at = Date.UTC(2026, 8, 15, 16, 30)
+    expect(await makeupWorkbuddyYesterday('tok', 'cn', { now: at, cards: null })).toBeNull()
+    expect(calls.some((u) => u.includes('/activity/growth/streak'))).toBe(false)
+    expect(calls.some((u) => u.includes('makeup-cards/use'))).toBe(false)
+  })
+
+  it('useMakeupCard：POST /activity/growth/makeup-cards/use，体为 {"target_date":"..."}', async () => {
+    const calls: Array<{ url: string; method?: string; body: string }> = []
+    globalThis.fetch = vi.fn().mockImplementation(async (url: string, init: any) => {
+      calls.push({ url, method: init?.method, body: init?.body })
+      return new Response(JSON.stringify({ code: 0, msg: 'ok', data: {} }), { status: 200 })
+    }) as unknown as typeof fetch
+
+    await useMakeupCard('tok', 'cn', '2026-09-15', { uid: 'u1' })
+    expect(calls[0].url).toBe('https://copilot.tencent.com/activity/growth/makeup-cards/use')
+    expect(calls[0].method).toBe('POST')
+    expect(JSON.parse(calls[0].body)).toEqual({ target_date: '2026-09-15' })
+  })
+
+  it('claimWorkbuddyGift：POST /billing/meter/claim-gift，解析 data.credit', async () => {
+    const calls: Array<{ url: string; method?: string; body: string }> = []
+    globalThis.fetch = vi.fn().mockImplementation(async (url: string, init: any) => {
+      calls.push({ url, method: init?.method, body: init?.body })
+      return new Response(JSON.stringify({ code: 0, msg: 'ok', data: { credit: 500 } }), { status: 200 })
+    }) as unknown as typeof fetch
+
+    const out = await claimWorkbuddyGift('tok', 'cn', { uid: 'u1' })
+    // CN 路径为 `/billing/meter/claim-gift`（**无 /v2 前缀**）：源实现 claim-gift 走 billingBase + 原路径，
+    // 不经过 billingMeterPaths（后者只作用于 get-user-resource / daily-checkin）。
+    // 与源实现 243c7f2 测试桩的 `case "/billing/meter/claim-gift"` 逐字一致。
+    expect(calls[0].url).toBe('https://www.codebuddy.cn/billing/meter/claim-gift')
+    expect(calls[0].method).toBe('POST')
+    expect(calls[0].body).toBe('{}')
+    expect(out).toEqual({ success: true, credit: 500, message: '已领取' })
+  })
+
+  it('claimWorkbuddyCompensation：POST /billing/meter/claim-compensation，解析 data.credit', async () => {
+    const calls: Array<{ url: string; method?: string; body: string }> = []
+    globalThis.fetch = vi.fn().mockImplementation(async (url: string, init: any) => {
+      calls.push({ url, method: init?.method, body: init?.body })
+      return new Response(JSON.stringify({ code: 0, msg: 'ok', data: { credit: 300 } }), { status: 200 })
+    }) as unknown as typeof fetch
+
+    const out = await claimWorkbuddyCompensation('tok', 'cn', { uid: 'u1' })
+    // 同 claim-gift：CN 路径无 /v2 前缀（对齐源实现 billingJSON + claimCompensationPath）
+    expect(calls[0].url).toBe('https://www.codebuddy.cn/billing/meter/claim-compensation')
+    expect(calls[0].method).toBe('POST')
+    expect(out).toEqual({ success: true, credit: 300, message: '已领取' })
+  })
+
+  it('礼包/补偿业务错误（已领 / 未开启）→ success=false，不抛异常', async () => {
+    globalThis.fetch = vi.fn().mockResolvedValue(new Response(JSON.stringify({ code: 400, msg: 'already claimed' }), { status: 400 })) as unknown as typeof fetch
+    const gift = await claimWorkbuddyGift('tok', 'cn')
+    expect(gift.success).toBe(false)
+    expect(gift.credit).toBe(0)
+
+    globalThis.fetch = vi.fn().mockResolvedValue(new Response(JSON.stringify({ code: 400, msg: 'not opened' }), { status: 400 })) as unknown as typeof fetch
+    const comp = await claimWorkbuddyCompensation('tok', 'cn')
+    expect(comp.success).toBe(false)
+    expect(comp.credit).toBe(0)
+  })
+
+  it('回执缺 credit 字段不视为失败（credit 记 0，对齐源实现忽略解析错误）', async () => {
+    globalThis.fetch = vi.fn().mockResolvedValue(new Response(JSON.stringify({ code: 0, msg: 'ok', data: {} }), { status: 200 })) as unknown as typeof fetch
+    expect(await claimWorkbuddyGift('tok', 'cn')).toEqual({ success: true, credit: 0, message: '已领取' })
+  })
+
+  // ---- makeupWorkbuddyYesterday：判据链 + 补签日期 ----
+
+  it('makeupWorkbuddyYesterday：昨日漏签且有卡 → 补昨日（CST 前一日）并返回该日', async () => {
+    const calls: Array<{ url: string; method?: string; body: string }> = []
+    globalThis.fetch = vi.fn().mockImplementation(async (url: string, init: any) => {
+      calls.push({ url, method: init?.method, body: init?.body || '' })
+      if (url.includes('/activity/growth/heatmap')) {
+        return new Response(JSON.stringify({ code: 0, msg: 'ok', data: { cells: [{ date: '2026-09-15', score: 0 }] } }), { status: 200 })
+      }
+      if (url.includes('/activity/growth/streak')) {
+        return new Response(JSON.stringify({ code: 0, msg: 'ok', data: { streak: { days: 5 }, makeup_cards: { balance: 1, max: 3 } } }), { status: 200 })
+      }
+      return new Response(JSON.stringify({ code: 0, msg: 'ok', data: {} }), { status: 200 })
+    }) as unknown as typeof fetch
+
+    // now = CST 2026-09-16 00:30 → 昨日 = 2026-09-15（若误用本地日期减一天会得 09-14）
+    const at = Date.UTC(2026, 8, 15, 16, 30)
+    const used = await makeupWorkbuddyYesterday('tok', 'cn', { uid: 'u1', now: at })
+    expect(used).toBe('2026-09-15')
+
+    const useCall = calls.find((c) => c.url.includes('makeup-cards/use'))!
+    expect(useCall.method).toBe('POST')
+    expect(JSON.parse(useCall.body)).toEqual({ target_date: '2026-09-15' })
+  })
+
+  it('makeupWorkbuddyYesterday：昨日无漏签（score>0）→ 不补签、不发写请求', async () => {
+    const calls: string[] = []
+    globalThis.fetch = vi.fn().mockImplementation(async (url: string) => {
+      calls.push(url)
+      if (url.includes('/activity/growth/heatmap')) {
+        return new Response(JSON.stringify({ code: 0, msg: 'ok', data: { cells: [{ date: '2026-09-15', score: 8 }] } }), { status: 200 })
+      }
+      return new Response(JSON.stringify({ code: 0, msg: 'ok', data: {} }), { status: 200 })
+    }) as unknown as typeof fetch
+
+    const at = Date.UTC(2026, 8, 15, 16, 30)
+    expect(await makeupWorkbuddyYesterday('tok', 'cn', { now: at })).toBeNull()
+    expect(calls.some((u) => u.includes('makeup-cards/use'))).toBe(false)
+    // 连补签卡余额都不必查（判据已否）
+    expect(calls.some((u) => u.includes('/activity/growth/streak'))).toBe(false)
+  })
+
+  it('makeupWorkbuddyYesterday：昨日无该日格 → 不补签（无判据，不误当漏签）', async () => {
+    globalThis.fetch = vi.fn().mockResolvedValue(new Response(JSON.stringify({
+      code: 0, msg: 'ok', data: { cells: [{ date: '2026-09-14', score: 0 }] },
+    }), { status: 200 })) as unknown as typeof fetch
+    const at = Date.UTC(2026, 8, 15, 16, 30)
+    expect(await makeupWorkbuddyYesterday('tok', 'cn', { now: at })).toBeNull()
+  })
+
+  it('makeupWorkbuddyYesterday：无补签卡（balance 0）→ 不补签', async () => {
+    const calls: string[] = []
+    globalThis.fetch = vi.fn().mockImplementation(async (url: string) => {
+      calls.push(url)
+      if (url.includes('/activity/growth/heatmap')) {
+        return new Response(JSON.stringify({ code: 0, msg: 'ok', data: { cells: [{ date: '2026-09-15', score: 0 }] } }), { status: 200 })
+      }
+      if (url.includes('/activity/growth/streak')) {
+        return new Response(JSON.stringify({ code: 0, msg: 'ok', data: { makeup_cards: { balance: 0, max: 3 } } }), { status: 200 })
+      }
+      return new Response(JSON.stringify({ code: 0, msg: 'ok', data: {} }), { status: 200 })
+    }) as unknown as typeof fetch
+
+    const at = Date.UTC(2026, 8, 15, 16, 30)
+    expect(await makeupWorkbuddyYesterday('tok', 'cn', { now: at })).toBeNull()
+    expect(calls.some((u) => u.includes('makeup-cards/use'))).toBe(false)
+  })
+
+  it('makeupWorkbuddyYesterday：heatmap 查询失败 → 静默 null（不写上游）', async () => {
+    const calls: string[] = []
+    globalThis.fetch = vi.fn().mockImplementation(async (url: string) => {
+      calls.push(url)
+      return new Response('down', { status: 500 })
+    }) as unknown as typeof fetch
+    expect(await makeupWorkbuddyYesterday('tok', 'cn', { now: Date.now() })).toBeNull()
+    expect(calls.some((u) => u.includes('makeup-cards/use'))).toBe(false)
+  })
+
+  it('makeupWorkbuddyYesterday：补签接口业务错误（400 已补过）→ 静默 null，不抛', async () => {
+    globalThis.fetch = vi.fn().mockImplementation(async (url: string) => {
+      if (url.includes('/activity/growth/heatmap')) {
+        return new Response(JSON.stringify({ code: 0, msg: 'ok', data: { cells: [{ date: '2026-09-15', score: 0 }] } }), { status: 200 })
+      }
+      if (url.includes('/activity/growth/streak')) {
+        return new Response(JSON.stringify({ code: 0, msg: 'ok', data: { makeup_cards: { balance: 1 } } }), { status: 200 })
+      }
+      return new Response(JSON.stringify({ code: 400, msg: 'already made up' }), { status: 400 })
+    }) as unknown as typeof fetch
+    const at = Date.UTC(2026, 8, 15, 16, 30)
+    expect(await makeupWorkbuddyYesterday('tok', 'cn', { now: at })).toBeNull()
+  })
+
+  // ---- 接进 runWorkbuddyGrowthRewards：顺序 + 状态更新 + 失败不污染 ----
+
+  it('全链：礼包/补偿在 growth 之前领取，补签在 streak 读取之后并重读 state 挑档', async () => {
+    const order: string[] = []
+    let streakReads = 0
+    globalThis.fetch = vi.fn().mockImplementation(async (url: string) => {
+      if (url.includes('claim-gift')) { order.push('gift'); return new Response(JSON.stringify({ code: 0, msg: 'ok', data: { credit: 500 } }), { status: 200 }) }
+      if (url.includes('claim-compensation')) { order.push('compensation'); return new Response(JSON.stringify({ code: 0, msg: 'ok', data: { credit: 300 } }), { status: 200 }) }
+      if (url.includes('/activity/growth/heatmap')) {
+        order.push('heatmap')
+        return new Response(JSON.stringify({ code: 0, msg: 'ok', data: { cells: [{ date: '2026-09-15', score: 0 }] } }), { status: 200 })
+      }
+      if (url.includes('/activity/growth/streak')) {
+        order.push('streak')
+        streakReads++
+        // 第一次读（opts.state 未传）：连登 5 天，有补签卡；重读：恢复到 7 天
+        const days = streakReads === 1 ? 5 : 7
+        return new Response(JSON.stringify({ code: 0, msg: 'ok', data: { streak: { days }, redemption_status: {}, makeup_cards: { balance: 1, max: 3 } } }), { status: 200 })
+      }
+      if (url.includes('makeup-cards/use')) { order.push('makeup-use'); return new Response(JSON.stringify({ code: 0, msg: 'ok', data: {} }), { status: 200 }) }
+      if (url.includes('/activity/growth/redeem')) { order.push('redeem'); return new Response(JSON.stringify({ code: 0, msg: 'ok', data: { credit_granted: 100, chances_granted: 0 } }), { status: 200 }) }
+      if (url.includes('lottery/chances')) return new Response(JSON.stringify({ code: 0, msg: 'ok', data: { balance: 0 } }), { status: 200 })
+      return new Response(JSON.stringify({ code: 0, msg: 'ok', data: {} }), { status: 200 })
+    }) as unknown as typeof fetch
+
+    // now = CST 2026-09-16 12:00 → 昨日 = 2026-09-15
+    const at = Date.UTC(2026, 8, 16, 4, 0)
+    const res = await runWorkbuddyGrowthRewards('tok', 'cn', 'u1', { now: at })
+
+    // 顺序：礼包/补偿 → streak（带 makeup_cards）→ heatmap → 补签 → 重读 streak → redeem。
+    // streak 只读两次：首次拿天数+卡余额，补签成功后重读吃恢复后的天数；
+    // 补签的卡余额复用首次读取的 makeup_cards（不为同一端点多打一遍）。
+    expect(order).toEqual(['gift', 'compensation', 'streak', 'heatmap', 'makeup-use', 'streak', 'redeem'])
+    expect(streakReads).toBe(2)
+
+    // 状态更新：礼包/补偿到账、补签日期、且**补签后恢复到 7d 被吃到**（否则 5 天无可领档）
+    expect(res.acted).toBe(true)
+    expect(res.tier).toBe('7d')
+    expect(res.giftCredit).toBe(500)
+    expect(res.compensationCredit).toBe(300)
+    expect(res.makeupDate).toBe('2026-09-15')
+    expect(res.message).toContain('新手礼包 +500 积分')
+    expect(res.message).toContain('活动补偿 +300 积分')
+    expect(res.message).toContain('补签 2026-09-15')
+  })
+
+  it('复用调用方传入的 state：补签未触发时不重读 streak（只读一次）', async () => {
+    let streakReads = 0
+    globalThis.fetch = vi.fn().mockImplementation(async (url: string) => {
+      if (url.includes('/activity/growth/streak')) {
+        streakReads++
+        return new Response(JSON.stringify({ code: 0, msg: 'ok', data: { streak: { days: 20 }, redemption_status: {}, makeup_cards: { balance: 0 } } }), { status: 200 })
+      }
+      if (url.includes('/activity/growth/heatmap')) {
+        return new Response(JSON.stringify({ code: 0, msg: 'ok', data: { cells: [{ date: '2026-09-15', score: 5 }] } }), { status: 200 })
+      }
+      return new Response(JSON.stringify({ code: 0, msg: 'ok', data: { credit_granted: 10 } }), { status: 200 })
+    }) as unknown as typeof fetch
+
+    const at = Date.UTC(2026, 8, 16, 4, 0)
+    const state = { days: 20, redemption: {} }
+    const res = await runWorkbuddyGrowthRewards('tok', 'cn', 'u1', { state, now: at })
+    expect(res.acted).toBe(true)
+    expect(res.tier).toBe('14d')
+    expect(streakReads).toBe(0) // 用传入 state；补签未触发 → 不重读
+  })
+
+  it('失败路径：礼包/补偿/补签全失败（400/500）→ base 语义不变，redeem 照常成功', async () => {
+    globalThis.fetch = vi.fn().mockImplementation(async (url: string) => {
+      if (url.includes('claim-gift')) return new Response(JSON.stringify({ code: 400, msg: 'already claimed' }), { status: 400 })
+      if (url.includes('claim-compensation')) return new Response('kaboom', { status: 500 })
+      if (url.includes('/activity/growth/heatmap')) return new Response('down', { status: 500 })
+      if (url.includes('/activity/growth/streak')) {
+        return new Response(JSON.stringify({ code: 0, msg: 'ok', data: { streak: { days: 20 }, redemption_status: {} } }), { status: 200 })
+      }
+      if (url.includes('/activity/growth/redeem')) {
+        return new Response(JSON.stringify({ code: 0, msg: 'ok', data: { credit_granted: 200, chances_granted: 0 } }), { status: 200 })
+      }
+      if (url.includes('lottery/chances')) return new Response(JSON.stringify({ code: 0, msg: 'ok', data: { balance: 0 } }), { status: 200 })
+      return new Response(JSON.stringify({ code: 0, msg: 'ok', data: {} }), { status: 200 })
+    }) as unknown as typeof fetch
+
+    const res = await runWorkbuddyGrowthRewards('tok', 'cn', 'u1')
+    expect(res.acted).toBe(true)
+    expect(res.tier).toBe('14d')
+    expect(res.credit).toBe(200)
+    // 失败动作不落字段、不进消息（不污染成功结果）
+    expect(res.giftCredit).toBeUndefined()
+    expect(res.compensationCredit).toBeUndefined()
+    expect(res.makeupDate).toBeUndefined()
+    expect(res.message).not.toContain('新手礼包')
+    expect(res.message).not.toContain('活动补偿')
+  })
+
+  it('失败路径：streak 读不到时三个动作也不冒泡（acted=false 且消息仍是既有语义）', async () => {
+    globalThis.fetch = vi.fn().mockImplementation(async (url: string) => {
+      if (url.includes('claim-gift') || url.includes('claim-compensation')) {
+        return new Response(JSON.stringify({ code: 0, msg: 'ok', data: { credit: 100 } }), { status: 200 })
+      }
+      return new Response('down', { status: 500 })
+    }) as unknown as typeof fetch
+
+    const res = await runWorkbuddyGrowthRewards('tok', 'cn', 'u1')
+    expect(res.acted).toBe(false)
+    expect(res.message).toContain('无法获取')
+  })
+
+  it('无档可领但礼包到账 → acted=true 且带 giftCredit（动作不被吞掉）', async () => {
+    globalThis.fetch = vi.fn().mockImplementation(async (url: string) => {
+      if (url.includes('claim-gift')) return new Response(JSON.stringify({ code: 0, msg: 'ok', data: { credit: 500 } }), { status: 200 })
+      if (url.includes('claim-compensation')) return new Response(JSON.stringify({ code: 400, msg: 'not opened' }), { status: 400 })
+      if (url.includes('/activity/growth/streak')) {
+        return new Response(JSON.stringify({ code: 0, msg: 'ok', data: { streak: { days: 3 }, redemption_status: {} } }), { status: 200 })
+      }
+      if (url.includes('/activity/growth/heatmap')) {
+        return new Response(JSON.stringify({ code: 0, msg: 'ok', data: { cells: [] } }), { status: 200 })
+      }
+      return new Response(JSON.stringify({ code: 0, msg: 'ok', data: {} }), { status: 200 })
+    }) as unknown as typeof fetch
+
+    const res = await runWorkbuddyGrowthRewards('tok', 'cn', 'u1')
+    expect(res.acted).toBe(true)
+    expect(res.giftCredit).toBe(500)
+    expect(res.compensationCredit).toBeUndefined()
+    expect(res.message).toContain('新手礼包 +500 积分')
+    expect(res.message).toContain('无可领档位')
+  })
+
+  it('无档可领且补签成功 → acted=true 且带 makeupDate（补签动作不被吞掉）', async () => {
+    globalThis.fetch = vi.fn().mockImplementation(async (url: string) => {
+      if (url.includes('claim-gift') || url.includes('claim-compensation')) {
+        return new Response(JSON.stringify({ code: 400, msg: 'already claimed' }), { status: 400 })
+      }
+      if (url.includes('/activity/growth/streak')) {
+        // 补签后仍不足 7 天（3 → 4）→ 无可领档，但补签本身是有效动作
+        return new Response(JSON.stringify({ code: 0, msg: 'ok', data: { streak: { days: 4 }, redemption_status: {}, makeup_cards: { balance: 1, max: 3 } } }), { status: 200 })
+      }
+      if (url.includes('/activity/growth/heatmap')) {
+        return new Response(JSON.stringify({ code: 0, msg: 'ok', data: { cells: [{ date: '2026-09-15', score: 0 }] } }), { status: 200 })
+      }
+      return new Response(JSON.stringify({ code: 0, msg: 'ok', data: {} }), { status: 200 })
+    }) as unknown as typeof fetch
+
+    const at = Date.UTC(2026, 8, 16, 4, 0)
+    const res = await runWorkbuddyGrowthRewards('tok', 'cn', 'u1', { now: at })
+    expect(res.acted).toBe(true)
+    expect(res.makeupDate).toBe('2026-09-15')
+    expect(res.giftCredit).toBeUndefined()
+    expect(res.message).toContain('补签 2026-09-15')
+    expect(res.message).toContain('无可领档位')
+  })
+
+  it('KV 日键幂等：同日二次调用不发任何三动作请求（闸在动作之前）', async () => {
+    const { env } = makeEnv()
+    const calls: string[] = []
+    globalThis.fetch = vi.fn().mockImplementation(async (url: string) => {
+      calls.push(url)
+      if (url.includes('/activity/growth/streak')) {
+        return new Response(JSON.stringify({ code: 0, msg: 'ok', data: { streak: { days: 7 }, redemption_status: {} } }), { status: 200 })
+      }
+      if (url.includes('/activity/growth/heatmap')) {
+        return new Response(JSON.stringify({ code: 0, msg: 'ok', data: { cells: [] } }), { status: 200 })
+      }
+      return new Response(JSON.stringify({ code: 0, msg: 'ok', data: { credit_granted: 10 } }), { status: 200 })
+    }) as unknown as typeof fetch
+
+    expect((await runWorkbuddyGrowthRewards('tok', 'cn', 'u1', { env, providerId: 'wb' })).acted).toBe(true)
+    const n = calls.length
+    expect(calls.some((u) => u.includes('claim-gift'))).toBe(true)
+
+    const second = await runWorkbuddyGrowthRewards('tok', 'cn', 'u1', { env, providerId: 'wb' })
+    expect(second.acted).toBe(false)
+    expect(second.message).toContain('防抖')
+    expect(calls.length).toBe(n) // 二次调用零请求：礼包/补偿也没重发
+  })
+
+  it('global 门控：整链跳过，三动作零请求', async () => {
+    const fetchSpy = vi.fn()
+    globalThis.fetch = fetchSpy as unknown as typeof fetch
+    const res = await runWorkbuddyGrowthRewards('tok', 'global', 'u1')
+    expect(res.acted).toBe(false)
+    expect(res.message).toContain('global')
+    expect(fetchSpy).not.toHaveBeenCalled()
   })
 })

@@ -331,7 +331,10 @@ export async function handleUpdateProvider(c: Context<AppEnv>) {
   if (body.traeMaxHistoryChars !== undefined) updates.traeMaxHistoryChars = body.traeMaxHistoryChars ?? undefined
   if (body.traeMaxToolSchemaChars !== undefined) updates.traeMaxToolSchemaChars = body.traeMaxToolSchemaChars ?? undefined
   if (body.accountSpread !== undefined) updates.accountSpread = body.accountSpread ?? undefined
-  if (body.promptMode !== undefined) updates.promptMode = body.promptMode ?? undefined
+  // 提示词模式三值（移植 ff64ecd 的 append）：非法值不落库，回落 undefined（=passthrough）
+  if (body.promptMode !== undefined) {
+    updates.promptMode = body.promptMode === 'custom' || body.promptMode === 'append' ? body.promptMode : undefined
+  }
   if (body.promptText !== undefined) updates.promptText = body.promptText ?? undefined
   if (body.apiKeys !== undefined) {
     updates.apiKeys = normalizeArray(body.apiKeys, (k) => ({ key: k, enabled: true }))
@@ -452,7 +455,10 @@ export async function handleUpsertProvider(c: Context<AppEnv>) {
   if (body.toolBridge !== undefined) updates.toolBridge = body.toolBridge
   if (body.cnbPool !== undefined) updates.cnbPool = body.cnbPool
   if (body.cooldown !== undefined) updates.cooldown = body.cooldown
-  if (body.promptMode !== undefined) updates.promptMode = body.promptMode
+  // 提示词模式三值（custom / append / passthrough），非法值不落库
+  if (body.promptMode !== undefined) {
+    updates.promptMode = body.promptMode === 'custom' || body.promptMode === 'append' ? body.promptMode : 'passthrough'
+  }
   if (body.promptText !== undefined) updates.promptText = body.promptText
   if (body.thinkingInject !== undefined) updates.thinkingInject = body.thinkingInject
   if (body.cachePrefixInject !== undefined) updates.cachePrefixInject = body.cachePrefixInject

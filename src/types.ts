@@ -36,10 +36,12 @@ export interface Provider {
    *  - 'passthrough'（缺省）：透传客户端原始 system；遇内容拦截误报时自动换
    *    WORKBUDDY_DEGRADED_PROMPT 中性提示词同请求重试一次（见 proxy 内容墙处理）。
    *  - 'custom'：出站时用 promptText 整体替换 system/developer，从源头消除指纹误报。
+   *  - 'append'（移植 ff64ecd）：在开头连续 system/developer 块**之后**插入一条网关
+   *    system，既有消息（含客户端项目规范）逐字不动——两者并用。
    *  未设置按 'passthrough' 处理。
    */
-  promptMode?: 'passthrough' | 'custom'
-  /** custom 模式下注入的自有系统提示词文本（promptMode==='custom' 时生效）。 */
+  promptMode?: 'passthrough' | 'custom' | 'append'
+  /** custom/append 模式下注入的自有系统提示词文本（两模式均生效）。 */
   promptText?: string
   /** OAuth 设备码认证配置（authType === 'oauth-device' 时生效） */
   oauth?: OAuthDeviceConfig
@@ -476,9 +478,9 @@ export interface UpdateProviderRequest {
   traeMaxToolSchemaChars?: number | null
   /** M365 会话级多账号分摊（Account Spread，传 false/null 关闭） */
   accountSpread?: boolean | null
-  /** 系统提示词体系：'passthrough'（传 null 恢复默认）| 'custom' */
-  promptMode?: 'passthrough' | 'custom' | null
-  /** custom 模式下注入的自有系统提示词（传 ''/null 清空） */
+  /** 系统提示词体系：'passthrough'（传 null 恢复默认）| 'custom' | 'append' */
+  promptMode?: 'passthrough' | 'custom' | 'append' | null
+  /** custom/append 模式下注入的自有系统提示词（传 ''/null 清空） */
   promptText?: string | null
 }
 
@@ -515,8 +517,8 @@ export interface UpsertProviderRequest {
   traeMaxToolSchemaChars?: number
   /** M365 会话级多账号分摊（Account Spread） */
   accountSpread?: boolean
-  /** 系统提示词体系：'passthrough'（缺省）| 'custom'；custom 用 promptText 替换 system/developer。 */
-  promptMode?: 'passthrough' | 'custom'
+  /** 系统提示词体系：'passthrough'（缺省）| 'custom'（替换）| 'append'（追加并用） */
+  promptMode?: 'passthrough' | 'custom' | 'append'
   promptText?: string
 }
 

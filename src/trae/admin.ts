@@ -14,6 +14,7 @@ import type { ApiResponse, AppEnv, Env, Provider } from '../types'
 import { getProvider, getProviders, updateProvider } from '../storage'
 import { KV_KEYS } from '../config'
 import { TRAE_CONSTANTS, TRAE_STATIC_MODEL_IDS, TRAE_STATIC_MODELS } from './constants'
+import { contextWindowListing, maxOutputTokensListing } from '../model-context-catalog'
 import {
   exchangeToken,
   fetchCheckinStatus,
@@ -458,15 +459,26 @@ async function fetchTraeModelsCached(env: Env, provider: Provider): Promise<{ en
   return { entries: TRAE_STATIC_MODELS as unknown as Array<Record<string, any>>, from: 'static' }
 }
 
-/** TraeModelInfo[] → OpenAI /models 条目。 */
-function toOpenAIModelEntries(infos: TraeModelInfo[]): Array<Record<string, any>> {
-  return infos.map((mi) => ({
-    id: mi.id,
-    object: 'model',
-    created: 1753600000,
-    owned_by: 'trae-solo',
-    context_length: mi.contextWindow > 0 ? mi.contextWindow : 131072,
-  }))
+/**
+ * TraeModelInfo[] → OpenAI /models 条目。
+ * context_length / max_output_tokens 三级查找（../model-context-catalog，上游
+ * workbuddy2api 32a3c13 同口径）：远端实测值（max_input_tokens/max_output_tokens）
+ * 权威 → 知识表 → context_length 1M 兜底 / max_output_tokens 省略。
+ * 上游零值不再透出假 131072（会误导 Codex/ZCode 等按 context_length 提前截断丢上下文）。
+ */
+export function toOpenAIModelEntries(infos: TraeModelInfo[]): Array<Record<string, any>> {
+  return infos.map((mi) => {
+    const entry: Record<string, any> = {
+      id: mi.id,
+      object: 'model',
+      created: 1753600000,
+      owned_by: 'trae-solo',
+      context_length: contextWindowListing(mi.id, mi.contextWindow),
+    }
+    const maxOut = maxOutputTokensListing(mi.id, mi.maxTokens)
+    if (maxOut !== null) entry.max_output_tokens = maxOut
+    return entry
+  })
 }
 
 /** POST /admin/api/trae/:id/models：拉取模型清单（仅返回，不自动入库）。 */

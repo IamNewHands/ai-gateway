@@ -7,6 +7,10 @@ import {
   clearOauthSessionDead,
   clearOauthAccountModelCooldown,
   recordOauthModelCost,
+  getOauthModelCost,
+  pruneExpiredModelCosts,
+  listOauthModelCosts,
+  COST_OBSERVATION_TTL_MS,
   cooldownOauthAccount,
   cooldownOauthAccountSoftForModel,
   listModelCooldowns,
@@ -520,5 +524,42 @@ describe('成本优先分层挑号测试（对齐 workbuddy2api pick.go costTier
     })
     expect(picked).not.toBeNull()
     expect(picked!.uid).toBe('free-acc')
+  })
+
+  it('P2（移植 dcc4918/64064ce）：过期成本条目在挑号时被真删，Map 不再只增不减', async () => {
+    const pid = PROVIDER + '-cost-prune'
+    const kv = makeKV(pid, [
+      makeAccount('a1', { state: { credits: 10, disabled: false, until: 0, errCount: 0 } }),
+    ])
+    recordOauthModelCost(pid, 'a1', 'deepseek-v4-flash', 1.5, 1000)
+    expect(listOauthModelCosts(Date.now(), pid)).toHaveLength(1)
+
+    // 过期（超过 6h TTL）后：运行态已按 tier 1 处理，但条目此前永不回收
+    const future = Date.now() + COST_OBSERVATION_TTL_MS + 1000
+    expect(getOauthModelCost(pid, 'a1', 'deepseek-v4-flash', future).tier).toBe(1)
+    expect(pruneExpiredModelCosts(future)).toBe(1)
+    // 真删后任何时点都不再展示（不是"仅惰性判过期"）
+    expect(listOauthModelCosts(future, pid)).toHaveLength(0)
+    expect(pruneExpiredModelCosts(future)).toBe(0)
+  })
+
+  it('P2（移植 2493532）：成本台账按 uid/model 稳定排序，tier 由 costPer1k 推导，过期不展示', () => {
+    const pid = PROVIDER + '-cost-ledger'
+    recordOauthModelCost(pid, 'u2', 'glm-5.2', 2.0, 1000)
+    recordOauthModelCost(pid, 'u1', 'deepseek-v4-flash', 0, 1000)
+    recordOauthModelCost(pid, 'u1', 'glm-5.2', 1.0, 1000)
+
+    const now = Date.now()
+    const rows = listOauthModelCosts(now, pid)
+    expect(rows.map((r) => `${r.uid}/${r.model}`)).toEqual(['u1/deepseek-v4-flash', 'u1/glm-5.2', 'u2/glm-5.2'])
+    expect(rows[0].tier).toBe(0)
+    expect(rows[1].tier).toBe(2)
+    expect(rows[1].costPer1k).toBeCloseTo(1.0, 6)
+    expect(rows[0].samples).toBe(1)
+
+    // TTL 过滤口径与运行态一致：过期不展示
+    expect(listOauthModelCosts(now + COST_OBSERVATION_TTL_MS + 1, pid)).toHaveLength(0)
+    // 指定 providerId 隔离
+    expect(listOauthModelCosts(now, PROVIDER + '-other')).toHaveLength(0)
   })
 })

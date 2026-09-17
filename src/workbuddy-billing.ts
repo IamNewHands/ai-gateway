@@ -1026,6 +1026,20 @@ export function cstDay(from: number = Date.now()): string {
 }
 
 /**
+ * 返回某时刻**前一日**的 CST 自然日（`YYYY-MM-DD`）。
+ *
+ * 为什么必须这么算（对齐 workbuddy2api `GrowthYesterdayDate`）：补签卡的 `target_date`
+ * 是**上游 CST 自然日**。若写成「本地日期减一天」（`new Date(from - 86400000)` 后取本地
+ * 年月日，或先取本地日期再 `setDate(-1)`），在 Workers（本地时区 = UTC）上会得到 UTC 日，
+ * CST 00:00–08:00 这一档会**整整错一天**——把「昨天」补成「前天」，漏签的格子依旧是空的，
+ * 连续天数照样断（上游 `d6f51a8` 专门修过这类 CST/DST 错位）。
+ * 正确写法是先减 24h 再做 CST 换算，即复用 `cstDay`（中国无夏令时，固定 +8 无歧义）。
+ */
+export function cstYesterday(from: number = Date.now()): string {
+  return cstDay(from - 86400000)
+}
+
+/**
  * 领养当日防抖 KV 前缀（uid → CST 日期）。
  *
  * 为什么需要：领养（`buddy/first`）有对话量门槛，未达标时上游返回 400
@@ -1089,6 +1103,16 @@ export interface WorkbuddyRedemptionStatus {
 export interface WorkbuddyRewardState {
   days: number
   redemption: WorkbuddyRedemptionStatus
+  /**
+   * 补签卡余额（同响应体的 `data.makeup_cards` 段）。
+   *
+   * 为什么放这里：源实现 `GrowthStreakWithCards` 与 `GrowthRewardState` **是同一个端点**
+   * （`/activity/growth/streak`），只差解析哪一段。本仓既然已经为"免二次请求"把
+   * days + redemption_status 一次读完，就顺手把 `makeup_cards` 也解析掉——否则补签判据
+   * 会为同一端点再打一遍（与 `opts.state` 的设计意图相悖）。
+   * 上游未返回该段时缺省（补签判据按"无卡"处理，不误补）。
+   */
+  makeupCards?: WorkbuddyMakeupCards
 }
 
 /** 领奖回执（对齐源实现 GrowthRedeemResult）。 */
@@ -1177,8 +1201,181 @@ function growthIdentityHeaders(opts?: { uid?: string; enterpriseId?: string; dev
   return extraHeaders
 }
 
+// ===== 连登管家三动作（移植 workbuddy2api 243c7f2 growth_bonus.go）=====
+//
+// 端点（CN web 成长中心 SPA 逆向，源实现 growth_bonus.go 常量）：
+//   GET  /activity/growth/heatmap           → data.cells[]{date,score}（活跃地图热力格，score==0 判漏签）
+//   POST /activity/growth/makeup-cards/use  → {"target_date":"YYYY-MM-DD"}（对指定 CST 自然日补签）
+//   POST /billing/meter/claim-gift          → 新手礼包（每号一次，重复领返回业务错误）
+//   POST /billing/meter/claim-compensation  → 活动补偿（有则领，无则业务错误）
+//
+// 补签卡余额来自 `GET /activity/growth/streak` 的 `data.makeup_cards{balance,max}` 段
+// （与 `fetchWorkbuddyRewardState` 同响应体，源实现也是同一端点只多解析一段）。
+//
+// 语义（对齐源实现）：补签只在「昨日漏签且有卡」时触发——连续天数一断就要重攒 7 天，
+// 一张卡代价远小；礼包/补偿是幂等写（每号一次 / 有则领），业务错误是常态（绝大多数号
+// 早已领过），无法与真错误可靠区分，故全部静默。**三者失败都不得影响签到成功语义。**
+
+/** 活跃地图热力格（一日一格，对齐源实现 HeatmapCell）。 */
+export interface WorkbuddyHeatmapCell {
+  /** `YYYY-MM-DD`（上游可能带时间后缀，比较时只取前 10 位） */
+  date: string
+  /** 当日活跃计分（0 = 漏签） */
+  score: number
+}
+
+/** 补签卡余额（streak 响应的 `makeup_cards` 段，对齐源实现 GrowthMakeupCards）。 */
+export interface WorkbuddyMakeupCards {
+  /** 可用补签卡数 */
+  balance: number
+  /** 持有上限 */
+  max: number
+}
+
 /**
- * 读取连登天数 + 各档兑换状态：GET /activity/growth/streak。
+ * 读取活跃地图热力格：GET /activity/growth/heatmap。
+ * 失败返回 null（只读判据，调用方静默跳过，次日再判）。
+ */
+export async function fetchWorkbuddyHeatmap(
+  token: string,
+  realm: 'cn' | 'global',
+  opts?: { uid?: string; enterpriseId?: string; deviceToken?: string }
+): Promise<WorkbuddyHeatmapCell[] | null> {
+  try {
+    const data = await growthCall(token, '/activity/growth/heatmap', realm, {
+      method: 'GET',
+      extraHeaders: growthIdentityHeaders(opts),
+    })
+    const raw = Array.isArray(data?.cells) ? data.cells : []
+    return raw.map((c: any) => ({
+      // 只取前 10 位：上游 date 可能带时间后缀（对齐源实现 `c.Date[:10]`）
+      date: typeof c?.date === 'string' ? c.date.slice(0, 10) : '',
+      score: Number(c?.score) || 0,
+    }))
+  } catch {
+    return null
+  }
+}
+
+/**
+ * 返回 cells 中 `date` 当日的 score；**无该日格**返回 `undefined`。
+ *
+ * 为什么要区分「无格」与「score 0」：活跃地图未覆盖该日时拿不到漏签判据，
+ * 此时**不能**当作漏签去补签（对齐源实现 `HeatmapDayScore` 的 `ok=false` 分支）。
+ */
+export function heatmapDayScore(cells: WorkbuddyHeatmapCell[], date: string): number | undefined {
+  for (const c of cells) {
+    if (c.date.length >= 10 && c.date.slice(0, 10) === date) return c.score
+  }
+  return undefined
+}
+
+/**
+ * 读取连登天数 + 补签卡余额：GET /activity/growth/streak。
+ * 与 `fetchWorkbuddyRewardState` 同端点不同切片（只多解析 `makeup_cards` 段）。
+ * 失败返回 null（无卡判据 → 调用方静默跳过）。
+ */
+export async function fetchWorkbuddyMakeupCards(
+  token: string,
+  realm: 'cn' | 'global',
+  opts?: { uid?: string; enterpriseId?: string; deviceToken?: string }
+): Promise<WorkbuddyMakeupCards | null> {
+  try {
+    const data = await growthCall(token, '/activity/growth/streak', realm, {
+      method: 'GET',
+      extraHeaders: growthIdentityHeaders(opts),
+    })
+    return {
+      balance: Number(data?.makeup_cards?.balance) || 0,
+      max: Number(data?.makeup_cards?.max) || 0,
+    }
+  } catch {
+    return null
+  }
+}
+
+/**
+ * 对指定日期使用补签卡：POST /activity/growth/makeup-cards/use `{"target_date":"YYYY-MM-DD"}`。
+ * `targetDate` 必须是**上游 CST 自然日**（见 `cstYesterday`）。
+ * 无卡 / 该日无漏签 / 已补过 → 上游业务错误（400），调用方静默跳过。
+ */
+export async function useMakeupCard(
+  token: string,
+  realm: 'cn' | 'global',
+  targetDate: string,
+  opts?: { uid?: string; enterpriseId?: string; deviceToken?: string }
+): Promise<void> {
+  await growthCall(token, '/activity/growth/makeup-cards/use', realm, {
+    method: 'POST',
+    body: { target_date: targetDate },
+    extraHeaders: growthIdentityHeaders(opts),
+  })
+}
+
+/** 新手礼包 / 活动补偿路径（对齐源实现 claimGiftPath / claimCompensationPath）。 */
+export const CLAIM_GIFT_PATH = '/billing/meter/claim-gift'
+export const CLAIM_COMPENSATION_PATH = '/billing/meter/claim-compensation'
+
+/** billing 域领取类结果：`success` 表示上游受理，`credit` 为到账积分（缺失记 0）。 */
+export interface WorkbuddyClaimOutcome {
+  success: boolean
+  credit: number
+  message: string
+}
+
+/**
+ * billing 域领取类公共实现（对齐源实现 `claimBillingCredit`）：POST path → `data.credit`。
+ *
+ * 走 `billingCall`（billing 域，非 growth 域）——与 `fetchWorkbuddyCredits` 同域同头口径。
+ * 源实现用 `billingJSON` + **空对象** `{}` 请求体；本仓 `billingCall` 的 `body` 缺省即 `'{}'`，
+ * 故不传 body，保持逐字一致（传 `{}` 会得到同样的 `'{}'`，但缺省更能表达"上游无入参"）。
+ *
+ * 回执字段缺失**不视为失败**（调用方按 0 记日志，对齐源实现 `_ = json.Unmarshal` 忽略错误）。
+ * 业务错误（已领/未开启）是常态，返回 `success: false` 由调用方静默，不抛。
+ */
+export async function claimWorkbuddyBillingCredit(
+  token: string,
+  realm: 'cn' | 'global',
+  path: string,
+  opts?: { uid?: string; enterpriseId?: string; deviceToken?: string }
+): Promise<WorkbuddyClaimOutcome> {
+  try {
+    const data = await billingCall(token, path, realm, { extraHeaders: growthIdentityHeaders(opts) })
+    return { success: true, credit: Number(data?.credit) || 0, message: '已领取' }
+  } catch (e) {
+    return { success: false, credit: 0, message: (e as Error).message || String(e) }
+  }
+}
+
+/**
+ * 领取新手礼包：POST /billing/meter/claim-gift（每号一次）。
+ * 已领返回业务错误 → `success: false`，调用方静默跳过。
+ */
+export async function claimWorkbuddyGift(
+  token: string,
+  realm: 'cn' | 'global',
+  opts?: { uid?: string; enterpriseId?: string; deviceToken?: string }
+): Promise<WorkbuddyClaimOutcome> {
+  return claimWorkbuddyBillingCredit(token, realm, CLAIM_GIFT_PATH, opts)
+}
+
+/**
+ * 领取活动补偿：POST /billing/meter/claim-compensation（有则领）。
+ * 无可领返回业务错误 → `success: false`，调用方静默跳过。
+ */
+export async function claimWorkbuddyCompensation(
+  token: string,
+  realm: 'cn' | 'global',
+  opts?: { uid?: string; enterpriseId?: string; deviceToken?: string }
+): Promise<WorkbuddyClaimOutcome> {
+  return claimWorkbuddyBillingCredit(token, realm, CLAIM_COMPENSATION_PATH, opts)
+}
+
+/**
+ * 读取连登天数 + 各档兑换状态 + 补签卡余额：GET /activity/growth/streak。
+ *
+ * 一次 GET 同时给出 `streak.days` / `redemption_status` / `makeup_cards` 三段
+ * （对齐源实现 `GrowthRewardState` 与 `GrowthStreakWithCards` 共用同一端点的设计）。
  * 失败返回 null（调用方跳过本轮，不改变签到语义）。
  */
 export async function fetchWorkbuddyRewardState(
@@ -1196,7 +1393,11 @@ export async function fetchWorkbuddyRewardState(
     const redemption = (data?.redemption_status && typeof data.redemption_status === 'object')
       ? data.redemption_status as WorkbuddyRedemptionStatus
       : {}
-    return { days, redemption }
+    const cards = data?.makeup_cards
+    const makeupCards = (cards && typeof cards === 'object')
+      ? { balance: Number(cards.balance) || 0, max: Number(cards.max) || 0 }
+      : undefined
+    return { days, redemption, makeupCards }
   } catch {
     return null
   }
@@ -1351,6 +1552,12 @@ export interface WorkbuddyRewardRunResult {
   prize?: string
   /** 抽奖获得的积分 */
   prizeCredit?: number
+  /** 新手礼包到账积分（未领到则不设） */
+  giftCredit?: number
+  /** 活动补偿到账积分（未领到则不设） */
+  compensationCredit?: number
+  /** 补签成功的目标日（CST `YYYY-MM-DD`，未补签则不设） */
+  makeupDate?: string
   message: string
 }
 
@@ -1358,12 +1565,15 @@ export interface WorkbuddyRewardRunResult {
  * 执行一趟「连登奖励兑换 + 连登抽奖」（对齐 workbuddy2api scheduler.runActivity 的末段）。
  *
  * 流程：
+ *  0. **礼包 / 活动补偿**（移植 243c7f2）：幂等写，业务错误静默，先于 redeem；
+ *  0.5 **补签保连登**（移植 243c7f2）：昨日漏签且有卡才补，补成功则重读 state 吃恢复后天数；
  *  1. **按天幂等闸**：本 isolate 已领过（KV 记了当日）→ 直接跳过，不打扰上游；
  *  2. 读 streak + 各档状态 → 挑最高可领档 → redeem；
  *  3. 兑换成功 → 记当日已领（KV）→ 领到的 chances 用来 draw（有次数才抽）。
  *
  * 正常态静默（对齐源实现）：409 已领 / 403 天数不足 / 400 无次数 / 400 抽奖未开启
- * 都不算失败，不刷 WARN、不改变 `base.success`。
+ * 都不算失败，不刷 WARN、不改变 `base.success`。三个新动作同样**各自独立 try/catch**，
+ * 失败只落 `message`，绝不冒泡污染签到结果。
  *
  * **global 门控**：调用方**不应**对 global realm 调用本函数——实测 global 新号
  * `GET /activity/growth/streak` 返回 500，证据不足以证明 redeem/draw 在 global 可用，
@@ -1403,11 +1613,55 @@ export async function runWorkbuddyGrowthRewards(
     return { acted: false, message: '今日已领连登奖励（防抖跳过）' }
   }
 
-  const state = opts?.state ?? await fetchWorkbuddyRewardState(token, realm, { uid, enterpriseId: opts?.enterpriseId, deviceToken: opts?.deviceToken })
+  const identity = { uid, enterpriseId: opts?.enterpriseId, deviceToken: opts?.deviceToken }
+
+  // 0. 礼包 / 活动补偿领取（移植 workbuddy2api 243c7f2 claimGrowthBonus）：
+  //    两者都是幂等写（礼包每号一次 / 补偿有则领），**先于 redeem**——到账积分不依赖连登状态。
+  //    业务错误是常态（绝大多数号早已领过），无法与真错误可靠区分，故失败静默；
+  //    两个函数内部各自 try/catch，**任何失败都不会冒泡污染 base.success**。
+  const gift = await claimWorkbuddyGift(token, realm, identity)
+  const compensation = await claimWorkbuddyCompensation(token, realm, identity)
+  const bonusParts: string[] = []
+  if (gift.success && gift.credit > 0) bonusParts.push(`新手礼包 +${gift.credit} 积分`)
+  if (compensation.success && compensation.credit > 0) bonusParts.push(`活动补偿 +${compensation.credit} 积分`)
+
+  // 补签成功时用恢复后的状态重新挑档（见下），故 state 必须是可重绑定的
+  let state = opts?.state ?? await fetchWorkbuddyRewardState(token, realm, identity)
   if (!state) return { acted: false, message: '无法获取连登奖励状态' }
 
+  // 0.5 补签保连登（移植 workbuddy2api 243c7f2 makeupYesterday）：昨日漏签且**有卡**才补。
+  //     放在 reward-state 读取**之后**：补签把连登恢复到 7d/14d/28d 时，重读 state 让本日
+  //     redeem 直接吃到恢复后的天数（补签是保里程碑的关键）。失败静默返回 null。
+  //     cards 复用上面 state 里同响应体的 makeup_cards 段，不再单独 GET streak
+  //     （state 是调用方传入或刚读过，两种来源都已带该段）。
+  const makeupDate = await makeupWorkbuddyYesterday(token, realm, {
+    ...identity,
+    now: opts?.now,
+    cards: state.makeupCards ?? null,
+  })
+  if (makeupDate) {
+    const recovered = await fetchWorkbuddyRewardState(token, realm, identity)
+    if (recovered) state = recovered // 重读失败则沿用旧 state（不误判、不中断）
+  }
+
   const tier = pickWorkbuddyRedeemTier(state)
-  if (!tier) return { acted: false, message: `无可领档位（连登 ${state.days} 天）` }
+  if (!tier) {
+    // 无档可领：但礼包/补偿/补签若真的到账/生效，本身就是本日的动作，不应被吞掉
+    // （源实现对应位置有独立日志行 `gift ok (+N credit)` / `makeup ok ...`）。
+    if (bonusParts.length === 0 && !makeupDate) {
+      return { acted: false, message: `无可领档位（连登 ${state.days} 天）` }
+    }
+    const idleParts = [...bonusParts]
+    if (makeupDate) idleParts.push(`补签 ${makeupDate}（保住连登）`)
+    idleParts.push(`无可领档位（连登 ${state.days} 天）`)
+    return {
+      acted: true,
+      giftCredit: gift.success && gift.credit > 0 ? gift.credit : undefined,
+      compensationCredit: compensation.success && compensation.credit > 0 ? compensation.credit : undefined,
+      makeupDate: makeupDate || undefined,
+      message: idleParts.join('，'),
+    }
+  }
 
   const redeem = await redeemWorkbuddyGrowth(token, realm, tier, {
     uid,
@@ -1426,7 +1680,9 @@ export async function runWorkbuddyGrowthRewards(
 
   const credit = redeem.result?.credit_granted || 0
   const chances = redeem.result?.chances_granted || 0
-  const parts = [`已兑换 ${tier} 连登奖励`]
+  const parts = [...bonusParts]
+  if (makeupDate) parts.push(`补签 ${makeupDate}（保住连登）`)
+  parts.push(`已兑换 ${tier} 连登奖励`)
   if (credit > 0) parts.push(`+${credit} 积分`)
   if (chances > 0) parts.push(`+${chances} 抽奖次数`)
 
@@ -1451,7 +1707,70 @@ export async function runWorkbuddyGrowthRewards(
     }
   }
 
-  return { acted: true, tier, credit, chances, prize, prizeCredit, message: parts.join('，') }
+  return {
+    acted: true,
+    tier,
+    credit,
+    chances,
+    prize,
+    prizeCredit,
+    giftCredit: gift.success && gift.credit > 0 ? gift.credit : undefined,
+    compensationCredit: compensation.success && compensation.credit > 0 ? compensation.credit : undefined,
+    makeupDate: makeupDate || undefined,
+    message: parts.join('，'),
+  }
+}
+
+/**
+ * 昨日漏签且有补签卡时自动补签（移植 workbuddy2api 243c7f2 `makeupYesterday`）。
+ *
+ * 判据链（任一步不成立即静默返回 null，不写上游、不影响主流程）：
+ *   1. `GET /activity/growth/heatmap` 里**昨日**格 `score === 0`（漏签；无该日格 = 无判据）；
+ *   2. 补签卡余额 `> 0`（有卡）；
+ *   3. `POST /activity/growth/makeup-cards/use {"target_date": 昨日}`。
+ *
+ * 补签成功返回昨日（CST `YYYY-MM-DD`），调用方据此重读 state 挑档；
+ * 无卡 / 无漏签 / 无该日格 / 查询失败 / 上游业务错误（400）均返回 null。
+ *
+ * `opts.cards`：调用方**已读过**的补签卡余额（来自 `WorkbuddyRewardState.makeupCards`，
+ * 与 streak 同响应体）。传入时**不再单独 GET streak**——源实现同样复用同一次读取。
+ * 不传（或传 undefined）则自行读一次 `fetchWorkbuddyMakeupCards`，保持独立调用语义。
+ * 显式传 `null` 表示"调用方读过但上游没给该段" → 视为无卡判据，直接返回 null。
+ *
+ * `opts.now` 注入"当前时刻"供测试；**昨日固定用 `cstYesterday(now)`**，
+ * 不可用本地日期减一天（Workers 本地时区 = UTC，CST 00:00–08:00 会错一整天）。
+ */
+export async function makeupWorkbuddyYesterday(
+  token: string,
+  realm: 'cn' | 'global',
+  opts?: {
+    uid?: string
+    enterpriseId?: string
+    deviceToken?: string
+    now?: number
+    /** 已读到的补签卡余额（来自 reward state 同响应体）；null = 上游未给该段 */
+    cards?: WorkbuddyMakeupCards | null
+  }
+): Promise<string | null> {
+  try {
+    const cells = await fetchWorkbuddyHeatmap(token, realm, opts)
+    if (!cells) return null // 只读判据失败：静默（次日再判，无写风险）
+    const yesterday = cstYesterday(opts?.now)
+    const score = heatmapDayScore(cells, yesterday)
+    if (score === undefined || score !== 0) return null // 昨日有分或无判据：无需补签
+
+    // 有漏签 → 取补签卡余额：优先用调用方已读到的（同响应体，免二次请求）
+    const cards = opts?.cards !== undefined
+      ? opts.cards
+      : await fetchWorkbuddyMakeupCards(token, realm, opts)
+    if (!cards || cards.balance <= 0) return null // 无卡或查询失败：静默（次日再判）
+
+    await useMakeupCard(token, realm, yesterday, opts)
+    return yesterday
+  } catch {
+    // 上游业务错误（无卡/无漏签/已补过）是常态，静默返回 null
+    return null
+  }
 }
 
 /**

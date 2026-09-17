@@ -1,6 +1,8 @@
 /**
  * constants.ts — TRAE SOLO 上游技术常量（移植自 traework2api/internal/upstream/constants.go，实测值，禁止改动）。
  */
+import { contextWindowListing, maxOutputTokensListing } from '../model-context-catalog'
+
 export const TRAE_CONSTANTS = {
   AgentHost: 'https://trae-api-cn.mchost.guru',
   UgHost: 'https://api.trae.cn',
@@ -116,14 +118,31 @@ export const TRAE_STATIC_MODEL_IDS: string[] = [
   'summary',
 ]
 
-/** OpenAI 模型列表条目（静态回退用，created 用固定值保持稳定） */
-export const TRAE_STATIC_MODELS = TRAE_STATIC_MODEL_IDS.map((id) => ({
-  id,
-  object: 'model',
-  created: 1753600000,
-  owned_by: 'trae-solo',
-  context_length: 131072,
-}))
+/**
+ * OpenAI 模型列表条目（静态回退用，created 用固定值保持稳定）。
+ * context_length 经共享知识表三级查找（远端值 → 知识表 → 1M 兜底）：静态表无远端值，
+ * 故按模型名查表；未收录落 DEFAULT_CONTEXT_WINDOW（1M），不再透出假 131072
+ * （上游 workbuddy2api 32a3c13 同口径）。max_output_tokens 未知即省略（不编造输出上限）。
+ */
+export const TRAE_STATIC_MODELS = TRAE_STATIC_MODEL_IDS.map((id) => {
+  const entry: {
+    id: string
+    object: string
+    created: number
+    owned_by: string
+    context_length: number
+    max_output_tokens?: number
+  } = {
+    id,
+    object: 'model',
+    created: 1753600000,
+    owned_by: 'trae-solo',
+    context_length: contextWindowListing(id),
+  }
+  const maxOut = maxOutputTokensListing(id)
+  if (maxOut !== null) entry.max_output_tokens = maxOut
+  return entry
+})
 
 /** 模型名归一化：下划线 → 横线，首字母大写（deepseek_v4_pro → DeepSeek-V4-Pro） */
 export function normalizeTraeModelName(s: string): string {

@@ -6,7 +6,15 @@ import {
   backfillToolCallNames,
   createWorkbuddyChunkCleaner,
   sanitizeWorkbuddyErrorFrame,
+  buildWorkbuddyGatewayHint,
+  attachWorkbuddyGatewayHint,
   WORKBUDDY_SENTINEL_ID,
+  WORKBUDDY_EMPTY_STREAM_FRAME,
+  WORKBUDDY_HINT_MODEL_RATE,
+  WORKBUDDY_HINT_PROMPT_TOO_LONG,
+  WORKBUDDY_HINT_MODEL_BLOCKED,
+  WORKBUDDY_HINT_MODEL_PARAM_NEUTRAL,
+  WORKBUDDY_HINT_INVALID_IMAGE,
   isDegenerateReasoningWindow,
   WorkbuddyDegeneracyDetector,
   WORKBUDDY_DEFAULT_MAX_REASONING_CHARS,
@@ -210,12 +218,65 @@ describe('processWorkbuddyFrame（含首帧 id 续传）', () => {
 })
 
 describe('createWorkbuddyChunkCleaner（有状态清洗器）', () => {
-  it('非 data: 行 / 空行 / [DONE] 原样返回', () => {
+  it('非 data: 行 / 空行原样返回；[DONE] 见下（0 有效帧时会被扣留）', () => {
     const clean = createWorkbuddyChunkCleaner()
     expect(clean('')).toBe('')
     expect(clean('   ')).toBe('   ')
     expect(clean(': comment')).toBe(': comment')
+    // 出现过有效帧后 [DONE] 原样透传（既有语义不变）
+    clean(`data: ${JSON.stringify(chunk({ choices: [{ index: 0, delta: { content: 'x' }, finish_reason: null }] }))}`)
     expect(clean('data: [DONE]')).toBe('data: [DONE]')
+  })
+
+  it('空流兜底：0 有效帧时 [DONE] 被扣留，finishStream 补 error 帧 + [DONE]（移植 0a86854）', () => {
+    const clean = createWorkbuddyChunkCleaner()
+    // 上游「200 + 只有 [DONE]」：此前原样透传 → 客户端当正常收尾（假成功）
+    expect(clean('data: [DONE]')).toBe('')
+    expect(clean.frameStats()).toEqual({ validFrames: 0, terminated: false, doneWithheld: true })
+    // 流结束：补 error 帧（code=upstream_parse，与非流式空流 → 502 同 code）+ [DONE]
+    const tail = clean.finishStream()
+    expect(tail).toBe(`data: ${WORKBUDDY_EMPTY_STREAM_FRAME}\n\ndata: [DONE]`)
+    expect(JSON.parse(tail.slice(5, tail.indexOf('\n\n'))).error.code).toBe('upstream_parse')
+    // 幂等：重复收尾不再补帧
+    expect(clean.finishStream()).toBe('')
+  })
+
+  it('空流兜底：只有注释行/完全空体也要补帧', () => {
+    const clean = createWorkbuddyChunkCleaner()
+    expect(clean(': keep-alive')).toBe(': keep-alive')
+    expect(clean.finishStream()).toContain('empty upstream stream')
+  })
+
+  it('正常流不补帧：有有效帧时 finishStream 返回空串', () => {
+    const clean = createWorkbuddyChunkCleaner()
+    clean(`data: ${JSON.stringify(chunk({ choices: [{ index: 0, delta: { content: 'hi' }, finish_reason: null }] }))}`)
+    expect(clean('data: [DONE]')).toBe('data: [DONE]')
+    expect(clean.frameStats().validFrames).toBe(1)
+    expect(clean.finishStream()).toBe('')
+  })
+
+  it('上游错误帧计入有效帧：错误流不再被当成空流补帧（错误信息不被劫持）', () => {
+    const clean = createWorkbuddyChunkCleaner()
+    const errFrame = 'data: {"error":{"code":6004,"message":"rate limited"}}'
+    expect(clean(errFrame)).toContain('6004')
+    expect(clean('data: [DONE]')).toBe('data: [DONE]')
+    expect(clean.finishStream()).toBe('')
+    expect(clean.frameStats().validFrames).toBe(1)
+  })
+
+  it('解析失败的行不计有效帧（口径同源实现 writeFrame）：仅坏帧的流仍触发空流兜底', () => {
+    const clean = createWorkbuddyChunkCleaner()
+    expect(clean('data: {broken')).toBe('data: {broken')
+    expect(clean.frameStats().validFrames).toBe(0)
+    expect(clean.finishStream()).toContain('empty upstream stream')
+  })
+
+  it('畸形流：有效帧出现在 [DONE] 之后 → 补一个收尾 [DONE]（恰好一个）', () => {
+    const clean = createWorkbuddyChunkCleaner()
+    expect(clean('data: [DONE]')).toBe('')
+    clean(`data: ${JSON.stringify(chunk({ choices: [{ index: 0, delta: { content: 'late' }, finish_reason: null }] }))}`)
+    expect(clean.frameStats().validFrames).toBe(1)
+    expect(clean.finishStream()).toBe('data: [DONE]')
   })
 
   it('有效帧被重建（白名单 + finish_reason null）', () => {
@@ -543,3 +604,271 @@ describe('上游 error 帧透传（error-passthrough）', () => {
   })
 })
 
+/**
+ * P1-1（移植 5c2db2f）/ P1-4（移植 11b75d4 + 6701631）流式侧单元测试。
+ *
+ * 流式路径逐帧透传（客户端自己聚合），故网关的职责是：把非 delta 的完整 message
+ * 提升成 delta（否则白名单会整帧丢弃正文），并把缺 index 的 tool_call 分派好 index
+ * 后写回帧（否则客户端把不同调用并进同一槽）。
+ */
+describe('WorkBuddy 流式：message 提升与缺 index 分派（P1-1/P1-4）', () => {
+  it('非 delta message 帧：正文/推理/工具调用都被提升成 delta 下发（此前整帧丢正文）', () => {
+    const st = newWorkbuddyStreamState()
+    const frame = {
+      id: 'x1',
+      choices: [{
+        index: 0,
+        message: {
+          role: 'assistant',
+          content: 'abc',
+          reasoning_content: 'think',
+          tool_calls: [{ index: 0, id: 'call_a', type: 'function', function: { name: 'get_weather', arguments: '{"city":"北京"}' } }],
+        },
+      }],
+    }
+    const r = processWorkbuddyFrame(JSON.stringify(frame), st)
+    expect(r.valid).toBe(true)
+    const out = JSON.parse(r.payload)
+    expect(out.choices[0].delta.content).toBe('abc')
+    expect(out.choices[0].delta.reasoning_content).toBe('think')
+    expect(out.choices[0].delta.role).toBe('assistant')
+    expect(out.choices[0].delta.tool_calls[0].function.name).toBe('get_weather')
+  })
+
+  it('重复的完整 message 快照不重复下发正文（此前会得到 abcabcabc）', () => {
+    const st = newWorkbuddyStreamState()
+    const frame = (content: string) => JSON.stringify({
+      id: 'x1',
+      choices: [{ index: 0, message: { role: 'assistant', content } }],
+    })
+    const first = JSON.parse(processWorkbuddyFrame(frame('abc'), st).payload)
+    const second = JSON.parse(processWorkbuddyFrame(frame('abc'), st).payload)
+    const third = JSON.parse(processWorkbuddyFrame(frame('abc'), st).payload)
+    expect(first.choices[0].delta.content).toBe('abc')
+    expect(second.choices[0].delta.content).toBeUndefined()
+    expect(third.choices[0].delta.content).toBeUndefined()
+  })
+
+  it('快照式增长只补差量（客户端累加后仍等于快照原文）', () => {
+    const st = newWorkbuddyStreamState()
+    const frame = (content: string) => JSON.stringify({
+      id: 'x1',
+      choices: [{ index: 0, message: { role: 'assistant', content } }],
+    })
+    const a = JSON.parse(processWorkbuddyFrame(frame('ab'), st).payload)
+    const b = JSON.parse(processWorkbuddyFrame(frame('abc'), st).payload)
+    expect(a.choices[0].delta.content).toBe('ab')
+    expect(b.choices[0].delta.content).toBe('c')
+  })
+
+  it('delta 已下发过正文时，message 快照正文被跳过（不重复一遍）', () => {
+    const st = newWorkbuddyStreamState()
+    const deltaFrame = JSON.stringify({
+      id: 'x1',
+      choices: [{ index: 0, delta: { role: 'assistant', content: 'abc' } }],
+    })
+    processWorkbuddyFrame(deltaFrame, st)
+    const msgFrame = JSON.stringify({
+      id: 'x1',
+      choices: [{ index: 0, message: { role: 'assistant', content: 'abc' } }],
+    })
+    const out = JSON.parse(processWorkbuddyFrame(msgFrame, st).payload)
+    expect(out.choices[0].delta.content).toBeUndefined()
+  })
+
+  it('同帧两个缺 index 的 tool_call 分派到不同 index 并写回帧（不被客户端并进同一槽）', () => {
+    const st = newWorkbuddyStreamState()
+    const frame = JSON.stringify({
+      id: 'x1',
+      choices: [{
+        index: 0,
+        delta: {
+          tool_calls: [
+            { id: 'call_a', type: 'function', function: { name: 'f1', arguments: '{"a":1}' } },
+            { id: 'call_b', type: 'function', function: { name: 'f2', arguments: '{"b":2}' } },
+          ],
+        },
+      }],
+    })
+    const out = JSON.parse(processWorkbuddyFrame(frame, st).payload)
+    const tcs = out.choices[0].delta.tool_calls
+    expect(tcs.map((t: { index: number }) => t.index)).toEqual([0, 1])
+  })
+
+  it('缺 index 但带同一 id 的跨帧延续：归位到既有 index，不新开槽', () => {
+    const st = newWorkbuddyStreamState()
+    const first = JSON.stringify({
+      id: 'x1',
+      choices: [{ index: 0, delta: { tool_calls: [{ id: 'call_a', type: 'function', function: { name: 'f1', arguments: '{"a":' } }] } }],
+    })
+    const second = JSON.stringify({
+      id: 'x1',
+      choices: [{ index: 0, delta: { tool_calls: [{ id: 'call_a', function: { arguments: '1}' } }] } }],
+    })
+    const a = JSON.parse(processWorkbuddyFrame(first, st).payload)
+    const b = JSON.parse(processWorkbuddyFrame(second, st).payload)
+    expect(a.choices[0].delta.tool_calls[0].index).toBe(0)
+    expect(b.choices[0].delta.tool_calls[0].index).toBe(0)
+  })
+
+  it('缺 index 无 id 的碎片延续最近槽位（单调用标准形态）', () => {
+    const st = newWorkbuddyStreamState()
+    const first = JSON.stringify({
+      id: 'x1',
+      choices: [{ index: 0, delta: { tool_calls: [{ index: 0, id: 'call_a', type: 'function', function: { name: 'f1', arguments: '{"a":' } }] } }],
+    })
+    const second = JSON.stringify({
+      id: 'x1',
+      choices: [{ index: 0, delta: { tool_calls: [{ function: { arguments: '1}' } }] } }],
+    })
+    processWorkbuddyFrame(first, st)
+    const b = JSON.parse(processWorkbuddyFrame(second, st).payload)
+    expect(b.choices[0].delta.tool_calls[0].index).toBe(0)
+  })
+
+  it('合规 index 已占用时，缺 index 的新调用补位不覆盖既有槽', () => {
+    const st = newWorkbuddyStreamState()
+    const frame = JSON.stringify({
+      id: 'x1',
+      choices: [{
+        index: 0,
+        delta: {
+          tool_calls: [
+            { index: 0, id: 'call_a', type: 'function', function: { name: 'f1', arguments: '{"a":1}' } },
+            { id: 'call_b', type: 'function', function: { name: 'f2', arguments: '{"b":2}' } },
+          ],
+        },
+      }],
+    })
+    const out = JSON.parse(processWorkbuddyFrame(frame, st).payload)
+    const tcs = out.choices[0].delta.tool_calls
+    expect(tcs[0].index).toBe(0)
+    expect(tcs[1].index).toBe(1)
+  })
+})
+
+/**
+ * gateway_hint：上游 error 帧透出前的诊断附加字段
+ * （移植 workbuddy2api 76bb543 sse.go StreamHint + a749016 hint.go + fa7b5d9 handler 接线）。
+ *
+ * 纪律：hint 只做与 error.message **并列**的补充说明——message 一字不改；
+ * 未覆盖形态不带字段；非 JSON / 无 error 对象 / 空 hint 一律零改写。
+ */
+describe('gateway_hint：错误帧诊断附加字段（移植 76bb543 / a749016）', () => {
+  /** 6004 模型级限流帧（上游真实形态）。 */
+  const rateLimitFrame = {
+    error: { code: 6004, msg: 'The model provider is rate-limiting requests.', requestId: 'req-abc' },
+  }
+
+  it('buildWorkbuddyGatewayHint：已接线形态映射（6004/11115/11102/11133/11135）', () => {
+    expect(buildWorkbuddyGatewayHint('6004', 'The model provider is rate-limiting requests.'))
+      .toBe(WORKBUDDY_HINT_MODEL_RATE)
+    expect(buildWorkbuddyGatewayHint('11115', 'prompt is too long: 120000 tokens > 65536 maximum'))
+      .toBe(WORKBUDDY_HINT_PROMPT_TOO_LONG)
+    expect(buildWorkbuddyGatewayHint('', 'prompt is too long'))
+      .toBe(WORKBUDDY_HINT_PROMPT_TOO_LONG)
+    expect(buildWorkbuddyGatewayHint('11102', 'service info not found'))
+      .toBe(WORKBUDDY_HINT_MODEL_BLOCKED)
+    // 11133/11135 形态判定先于 Kind 表：只有真实上游 marker 才命中，不猜泛化短语。
+    expect(buildWorkbuddyGatewayHint('11133', 'Invalid request parameters'))
+      .toBe(WORKBUDDY_HINT_MODEL_PARAM_NEUTRAL)
+    expect(buildWorkbuddyGatewayHint('', '{"extError":{"code":"model_param_invalid"}}'))
+      .toBe(WORKBUDDY_HINT_MODEL_PARAM_NEUTRAL)
+    expect(buildWorkbuddyGatewayHint('11135', 'Please start a new conversation, replace the image, and try again.'))
+      .toBe(WORKBUDDY_HINT_INVALID_IMAGE)
+    expect(buildWorkbuddyGatewayHint('', '{"extError":{"code":"invalid_image_data"}}'))
+      .toBe(WORKBUDDY_HINT_INVALID_IMAGE)
+  })
+
+  it('buildWorkbuddyGatewayHint：未覆盖形态返回空串（不编造）', () => {
+    // 无 code / 空文案
+    expect(buildWorkbuddyGatewayHint('', '')).toBe('')
+    // 5xx 上游故障
+    expect(buildWorkbuddyGatewayHint('500', 'internal')).toBe('')
+    // 11101 参数错（本仓 bad_params 出口未接线）——**不能**被泛化短语误判成图片形态
+    expect(buildWorkbuddyGatewayHint('11101', 'Unmarshal chat params failed with error: unexpected EOF')).toBe('')
+    // 审核拦截（网关改写文案口径，不回上游 code）
+    expect(buildWorkbuddyGatewayHint('11-128', 'blocked by security policy')).toBe('')
+    // 泛化英文短语不命中（源实现的宽口径已被刻意收窄，见 buildWorkbuddyGatewayHint 注释）
+    expect(buildWorkbuddyGatewayHint('', 'invalid request parameters')).toBe('')
+    expect(buildWorkbuddyGatewayHint('', 'Please replace the image and retry')).toBe('')
+  })
+
+  it('attachWorkbuddyGatewayHint：只新增 gateway_hint，既有键逐字保留', () => {
+    const payload = JSON.stringify({ error: { message: 'm', code: '6004', requestId: 'r' } })
+    const out = JSON.parse(attachWorkbuddyGatewayHint(payload, 'hint text'))
+    expect(out.error.message).toBe('m')
+    expect(out.error.code).toBe('6004')
+    expect(out.error.requestId).toBe('r')
+    expect(out.error.gateway_hint).toBe('hint text')
+    expect(Object.keys(out)).toEqual(['error'])
+  })
+
+  it('attachWorkbuddyGatewayHint：空 hint / 非 JSON / 无 error 对象 → 逐字节原样', () => {
+    const payload = JSON.stringify({ error: { message: 'm', code: '6004' } })
+    expect(attachWorkbuddyGatewayHint(payload, '')).toBe(payload)
+    expect(attachWorkbuddyGatewayHint('not-json', 'hint')).toBe('not-json')
+    expect(attachWorkbuddyGatewayHint('[1,2]', 'hint')).toBe('[1,2]')
+    const noErr = JSON.stringify({ message: 'no error object' })
+    expect(attachWorkbuddyGatewayHint(noErr, 'hint')).toBe(noErr)
+    const nullErr = JSON.stringify({ error: null })
+    expect(attachWorkbuddyGatewayHint(nullErr, 'hint')).toBe(nullErr)
+  })
+
+  it('cleaner：error 帧透出时附加 gateway_hint，message/code/requestId 原文不变', () => {
+    const clean = createWorkbuddyChunkCleaner()
+    const out = clean(`data: ${JSON.stringify(rateLimitFrame)}`)
+    expect(out.startsWith('data: ')).toBe(true)
+    const err = JSON.parse(out.slice(5).trim()).error
+    expect(err.gateway_hint).toBe(WORKBUDDY_HINT_MODEL_RATE)
+    // message 原文一字不改 + 既有键原样
+    expect(err.msg).toBe('The model provider is rate-limiting requests.')
+    expect(err.code).toBe(6004)
+    expect(err.requestId).toBe('req-abc')
+  })
+
+  it('cleaner：hint 为空时字段不出现（零改写，无 gateway_hint 键）', () => {
+    const clean = createWorkbuddyChunkCleaner()
+    const frame = { error: { code: 11101, msg: 'Unmarshal chat params failed', requestId: 'req-x' } }
+    const out = clean(`data: ${JSON.stringify(frame)}`)
+    // 未覆盖形态：payload 原样透出（与附加前逐字节一致）
+    expect(out).toBe(`data: ${JSON.stringify(frame)}`)
+    expect(out).not.toContain('gateway_hint')
+  })
+
+  it('cleaner：非 JSON 帧与无 error 对象的帧零改写', () => {
+    const clean = createWorkbuddyChunkCleaner()
+    // 非 JSON data 负载：原样透传（不计有效帧）
+    expect(clean('data: not-json')).toBe('data: not-json')
+    // 合法 JSON 但无 error 对象：走白名单重建，绝不出现 gateway_hint
+    const out = clean(`data: ${JSON.stringify(chunk({ choices: [{ index: 0, delta: { content: 'hi' }, finish_reason: null }] }))}`)
+    expect(out).not.toContain('gateway_hint')
+    expect(JSON.parse(out.slice(5).trim()).choices[0].delta.content).toBe('hi')
+  })
+
+  it('sanitizeWorkbuddyErrorFrame：hint 按上游 code/文案判定，raw 保持脱敏原文不含 hint', () => {
+    const st = newWorkbuddyStreamState({ sanitizeErrorText: (t) => t.replace(/sk-[A-Za-z0-9]+/g, '***') })
+    const r = processWorkbuddyFrame(
+      JSON.stringify({ error: { code: 6004, msg: 'rate limited for sk-secret123', requestId: 'req-1' } }),
+      st,
+    )
+    expect(r.error!.hint).toBe(WORKBUDDY_HINT_MODEL_RATE)
+    // raw 是「已脱敏的上游帧原文」单一含义：含脱敏后的文案，不含 hint
+    expect(r.error!.raw).toContain('rate limited for ***')
+    expect(r.error!.raw).not.toContain('gateway_hint')
+    // 未覆盖形态：hint 字段缺席（undefined，而非空串）
+    const plain = sanitizeWorkbuddyErrorFrame({ error: { code: 500, msg: 'internal' } })
+    expect(plain.hint).toBeUndefined()
+    expect('hint' in plain).toBe(false)
+  })
+
+  it('空流兜底帧不带 hint（网关本地故障形态未覆盖，不编造）', () => {
+    const clean = createWorkbuddyChunkCleaner()
+    // 0 有效帧 → 收尾补 error 帧 + [DONE]
+    const tail = clean.finishStream()
+    expect(tail).toContain(WORKBUDDY_EMPTY_STREAM_FRAME)
+    expect(tail).not.toContain('gateway_hint')
+    expect(WORKBUDDY_EMPTY_STREAM_FRAME).not.toContain('gateway_hint')
+  })
+})
+

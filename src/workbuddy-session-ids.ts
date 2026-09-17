@@ -183,18 +183,19 @@ export async function turnRequestId(turnKeyValue: string): Promise<string> {
 }
 
 /**
- * 从请求体提取**会话粘性键**（对齐 workbuddy2api session.ExtractKey）。
+ * 从请求体提取**会话粘性键**（对齐 workbuddy2api session.ExtractKey，含 `ebd7921`）。
  *
- * 识别顺序（snake 优先于 camel）：
+ * 识别顺序（snake 优先于 camel，全部为**对话维度**）：
  *  1. `metadata.conversation_id`
  *  2. `metadata.conversationId`
- *  3. `metadata.user_id`
- *  4. 顶层 `conversation_id`
- *  5. 顶层 `conversationId`
+ *  3. 顶层 `conversation_id`
+ *  4. 顶层 `conversationId`
  *
- * 与 resolveConversationId 的差异：本函数**允许回落 `user_id`**（第 3 项）——
- * 粘性路由的目标是"同一用户尽量打同一账号"，user_id 回落是合理的；
- * 而 X-Conversation-ID 的语义是"对话 ID"，回落 user_id 会污染后台聚合判据。
+ * `metadata.user_id` **不再**作为粘性键（移植 `ebd7921`）：user 维度粒度过粗——一个
+ * user 的全部并行对话会被钉到同一账号（粘性范围远大于上游 prompt cache 的对话级边界），
+ * 且它原本排在顶层 `conversation_id` **之前**，会抢占真正的对话键。剔除后只发 user_id
+ * 的客户端回落加权轮换（与无标识客户端同路径），旧 user_id 绑定靠粘性 TTL 自然过期。
+ * 这也与 `resolveConversationId`（绝不回落 user_id）的口径重新统一。
  *
  * 解析失败 / 空 body → ''（绝不抛错）。
  */
@@ -203,7 +204,7 @@ export function extractSessionKey(body: Record<string, unknown> | null | undefin
   const meta = body['metadata']
   if (meta && typeof meta === 'object' && !Array.isArray(meta)) {
     const m = meta as Record<string, unknown>
-    for (const k of ['conversation_id', 'conversationId', 'user_id']) {
+    for (const k of ['conversation_id', 'conversationId']) {
       const v = m[k]
       if (typeof v === 'string' && v !== '') return v
     }

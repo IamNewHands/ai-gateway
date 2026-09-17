@@ -32,6 +32,7 @@ export type WorkbuddyErrorKind =
   | 'not_found'        // 404 上游偶发 → 短冷却，不累计错误
   | 'server'           // 5xx → 累计错误计数
   | 'waf_block'        // 403 + 无业务信封（APISIX WAF 拦截页/空体）→ 软冷却 + 抖动退避，不禁用
+  | 'prompt_too_long'  // 11115「prompt is too long」→ 请求级错误（非账号问题）：不罚号、不轮转，透传原文
   | 'bad_params'       // 400 Unmarshal 11101 → 客户端参数错，不罚号，仅换号
   | 'content_blocked'  // 400 审核拦截 → 不罚号
   | 'client'           // 其他 4xx → 不处罚，仅换号
@@ -176,18 +177,39 @@ export class ContentBlockedError extends Error {
 export class WorkbuddyClientError extends Error {
   readonly status: number
   readonly upstreamText: string
-  constructor(status: number, upstreamText: string) {
+  /**
+   * 错误分类（可选）：`prompt_too_long` 时错误体走**原文透传**（不套固定前缀），
+   * 见 formatWorkbuddyClientErrorMessage。
+   */
+  readonly kind?: WorkbuddyErrorKind
+  constructor(status: number, upstreamText: string, kind?: WorkbuddyErrorKind) {
     super(`upstream client error ${status}: ${upstreamText || 'bad request'}`)
     this.name = 'WorkbuddyClientError'
     this.status = status
     this.upstreamText = upstreamText
+    this.kind = kind
   }
 }
 
 /**
  * 提取并格式化上游 4xx 客户端错误的提示文案（优先提取业务 msg/message/code）。
+ *
+ * `prompt_too_long` 例外（移植 workbuddy2api f41c496 的 error-passthrough 语义）：
+ * 11115 的原文（真实 token 数/上限值/requestId）是最有价值的排查信息，必须**逐字透传**，
+ * 不能被固定前缀包一层。故该 kind 下直接用上游原文，仅在空 body 时给可读兜底短文案。
  */
-export function formatWorkbuddyClientErrorMessage(status: number, upstreamText: string): { message: string; code?: unknown } {
+export function formatWorkbuddyClientErrorMessage(
+  status: number,
+  upstreamText: string,
+  kind?: WorkbuddyErrorKind
+): { message: string; code?: unknown } {
+  if (kind === 'prompt_too_long') {
+    const raw = (upstreamText || '').trim()
+    return {
+      message: raw || PROMPT_TOO_LONG_FALLBACK_MESSAGE,
+      code: extractUpstreamCode(upstreamText),
+    }
+  }
   let msg = upstreamText || 'INVALID_REQUEST'
   let code: unknown = undefined
   try {
@@ -207,6 +229,26 @@ export function formatWorkbuddyClientErrorMessage(status: number, upstreamText: 
     }
   } catch { /* 非 JSON 则直接使用原文 */ }
   return { message: `上游请求参数错误 (HTTP ${status})：${msg}`, code }
+}
+
+/** 11115 空 body 时的可读兜底文案（不编造上游原文，只给分类语义）。 */
+export const PROMPT_TOO_LONG_FALLBACK_MESSAGE =
+  'prompt is too long：上下文超出上游模型上限（上游未返回明细，请缩减输入后重试）'
+
+/** 从上游错误体里取业务 code（error.code → 顶层 code），取不到返回 undefined。 */
+function extractUpstreamCode(upstreamText: string): unknown {
+  try {
+    const parsed = JSON.parse(upstreamText)
+    if (parsed && typeof parsed === 'object') {
+      const p = parsed as Record<string, unknown>
+      if (p['error'] && typeof p['error'] === 'object') {
+        const pe = p['error'] as Record<string, unknown>
+        if (pe['code'] !== undefined) return pe['code']
+      }
+      if (p['code'] !== undefined) return p['code']
+    }
+  } catch { /* 非 JSON */ }
+  return undefined
 }
 
 /**
@@ -236,31 +278,43 @@ export function parseSoftRateReset(bodyText: string): number | null {
 
 /**
  * 按 HTTP 状态码 + 响应体判定错误类别（对齐 workbuddy2api Classify 的判定顺序）：
- * 402 → 余额关键词 → session 死亡关键词 → **账号级故障（11140/14017）** → 6004 模型限流
- * → 429 软限流 → 404 → 5xx → WAF 403（无业务信封）→ 内容策略拦截 → 11101 参数错 → 其他 4xx。
- * 关键词优先于状态码：上游偶发把业务错误包在 5xx 里时，按真实原因分类。
+ * 11102 模型不存在（400/404）→ 402 → session 死亡关键词 → **账号级故障（11140/14017）**
+ * → 6004 模型限流 → **429 软限流** → 余额关键词 → 404 → 5xx → WAF 403（无业务信封）
+ * → 内容策略拦截 → 11101 参数错 → 其他 4xx。
+ * 非 429 场景下关键词优先于状态码：上游偶发把业务错误包在 5xx 里时，按真实原因分类。
  *
- * 判定顺序的语义依据（对齐源实现 client.go:235-256 的注释）：
- *  - 402 / 余额关键词最严、最不可自愈（只能等签到恢复），必须最先判；
+ * 判定顺序的语义依据（对齐源实现 client.go Classify 的注释）：
+ *  - **11102 最先判**：它是「模型在后端不存在」的确定性答复，语义比计费/限流都具体。
+ *    必须早于余额关键词层——本仓 HARD_MARKERS 含宽匹配 `plan`/`1005`，若 11102 答复的
+ *    msg 里混入 `plan` 字样（如 "service info not found in current plan"）会先被判成
+ *    hard_credit，坏号被硬冷却 12h 而非只做模型级避让（源实现把 IsModelBlocked 放在
+ *    首位正是为此）；
+ *  - 402 是真正的计费余额耗尽状态码，最严、最不可自愈（只能等签到恢复）；
  *  - session_dead 是需要人工重登的终态，且其 marker（12153 等）比限流层的大范围子串更具体；
- *  - **account_fault 必须先于 429 兜底**：14017 常带 HTTP 429，若落到 `status === 429`
+ *  - **account_fault 必须先于 429**：14017 常带 HTTP 429，若落到 `status === 429`
  *    会被误归 soft_rate——限流可指数退避等自愈，账号级故障等不来，语义完全不符。
  *    11140 的"模型级限流"变体（rate-limiting 文案）因 marker 不含 `request illegal`
- *    而天然不命中本层，会继续落到 model_rate / soft_rate，行为不受影响。
+ *    而天然不命中本层，会继续落到 model_rate / soft_rate，行为不受影响；
+ *  - **429 必须先于余额关键词层**（移植 workbuddy2api 145220d，fork-scan-absorb T-3）：
+ *    429 响应体高频携带 "quota exceeded"/"额度不足" 等跨计费/限流两界的措辞，
+ *    若余额关键词先判会把限流误归 hard_credit → 调用方硬冷却到次日 04:00，白扔号约 12h
+ *    （见 proxy.ts 的 `case 'hard_credit'`）。状态码是比关键词更权威的信号：上游既然给了
+ *    429 就按限流语义处理（宁可短冷却自愈，不可长冷却弃号）。真正的余额耗尽由 402 捕获，
+ *    非 429 状态码携带的 quota 措辞仍走下方余额关键词层，历史语义不变；
+ *  - 6004 模型级限流（本仓额外细分，源实现由调用方分流）判在 429 之前：更具体的业务码优先。
  */
 export function classifyWorkbuddyUpstreamError(status: number, bodyText: string): WorkbuddyErrorKind {
-  if (status === 402) return 'hard_credit'
   const lower = bodyText.toLowerCase()
-  for (const m of HARD_MARKERS) {
-    if (lower.includes(m.toLowerCase()) || bodyText.includes(m)) return 'hard_credit'
+  // 11115「prompt is too long」：请求级错误（移植 workbuddy2api 5f26ce3 promptTooLongRule）。
+  // 上下文超限是**请求的问题不是账号的问题**——同一 body 换任何账号发都会超限，与 WAF
+  // fail-fast 同哲学（确定与账号无关的错误不轮转，白扔健康号配额）。只认请求级状态码
+  // 400/404/413（429 属限流语义、5xx 属服务端故障，均优先）；marker 双通道：code 字段
+  // 形态（`"code":11115` / `"code":"11115"`，空格容差）与 msg 文案。判在 404/5xx/WAF/
+  // 内容策略/通用 4xx 兜底之前——请求级语义最具体。11115 恰好撞在 requestId 上不算。
+  if ((status === 400 || status === 404 || status === 413) &&
+    (/"code"\s*:\s*"?11115"?/.test(bodyText) || lower.includes('prompt is too long'))) {
+    return 'prompt_too_long'
   }
-  for (const m of SESSION_DEAD_MARKERS) {
-    if (bodyText.includes(m)) return 'session_dead'
-  }
-  for (const m of ACCOUNT_FAULT_MARKERS) {
-    if (lower.includes(m) || bodyText.includes(m)) return 'account_fault'
-  }
-  if (isModelRateLimit(bodyText)) return 'model_rate'
   // 11102「该后端无此模型」/ "service info not found"：确定性"模型在后端不存在"（移植
   // workbuddy2api IsModelBlocked）。只认 code==11102 或窄短语，且仅 400/404——
   // 避免 11102 恰好撞在 body 的 requestId 字段（整段文本）被误判。
@@ -268,7 +322,19 @@ export function classifyWorkbuddyUpstreamError(status: number, bodyText: string)
     (/"code"\s*:\s*"?11102"?/.test(bodyText) || lower.includes('service info not found'))) {
     return 'model_blocked'
   }
+  if (status === 402) return 'hard_credit'
+  for (const m of SESSION_DEAD_MARKERS) {
+    if (bodyText.includes(m)) return 'session_dead'
+  }
+  for (const m of ACCOUNT_FAULT_MARKERS) {
+    if (lower.includes(m) || bodyText.includes(m)) return 'account_fault'
+  }
+  if (isModelRateLimit(bodyText)) return 'model_rate'
+  // 429 先于余额关键词层（移植 145220d）：见上方顺序依据。
   if (status === 429) return 'soft_rate'
+  for (const m of HARD_MARKERS) {
+    if (lower.includes(m.toLowerCase()) || bodyText.includes(m)) return 'hard_credit'
+  }
   if (status === 404) return 'not_found'
   if (status >= 500) return 'server'
   // WAF 403（无业务信封的拦截形态）：判在内容策略/参数错误/通用 4xx 之前——这些层只认带文案
@@ -586,17 +652,33 @@ export function ensureWorkbuddyStreamOptions(body: Record<string, unknown>): voi
 export const WORKBUDDY_DEFAULT_MAX_TOKENS = 32768
 
 /**
- * 为出站 WorkBuddy 请求体注入默认 max_tokens 护栏（防上游失控或死循环无限消耗算力/额度）。
- * 规则：
- *  - 若客户端已显式提供有效数字 max_tokens 或 max_completion_tokens（> 0）→ 原样保留，尊重调用方意图；
- *  - 若未提供或为非正数/无效值 → 注入 WORKBUDDY_DEFAULT_MAX_TOKENS。
+ * 为出站 WorkBuddy 请求体翻译 `max_completion_tokens` 并注入默认 max_tokens 护栏。
+ *
+ * 规则（对齐 workbuddy2api payload.go translateMaxCompletionTokens，移植 edb9e97 / PR #116）：
+ *  - **别名一律删除**：上游（CN /v2 与 global /console 是同一套 API）只认 `max_tokens`，
+ *    OpenAI 新别名 `max_completion_tokens` 会被忽略后回落上游默认输出上限（实测 32000），
+ *    长回答被截。删掉别名同时减小 body 体积与排障噪音；
+ *  - 显式 `max_tokens` 为非正数/无效值（0/null/负数/非数字）→ 注入 WORKBUDDY_DEFAULT_MAX_TOKENS
+ *    （本仓安全护栏，源实现无此层：0/null 走上游默认）；
+ *  - 别名存在且为**正安全整数** → 回写整数形态的 `max_tokens`（避免小数尾巴/科学计数法进上游 body）；
+ *  - 别名存在但非正/非整数/非数字（0/null/负数/浮尾/字符串等非法值）→ 不翻译，回落护栏默认值。
+ *
+ * 为什么必须翻译而不是"透传别名 + 注入护栏"：本仓此前见 `max_completion_tokens > 0` 即
+ * 直接 return，出站 body 既无 `max_tokens` 也无兜底值——DSH 之类只发别名的客户端（实测
+ * `max_completion_tokens=128000`）在上游侧等于**没设上限**，实测被截到 32000。
  */
 export function ensureWorkbuddyMaxTokens(body: Record<string, unknown>, defaultTokens = WORKBUDDY_DEFAULT_MAX_TOKENS): void {
+  const alias = body['max_completion_tokens']
+  // 别名一律删除（上游只认 max_tokens；留着只会误导排障）
+  if (alias !== undefined) delete body['max_completion_tokens']
   const mt = body['max_tokens']
-  const mct = body['max_completion_tokens']
   const hasValidMt = typeof mt === 'number' && Number.isFinite(mt) && mt > 0
-  const hasValidMct = typeof mct === 'number' && Number.isFinite(mct) && mct > 0
-  if (hasValidMt || hasValidMct) return
+  if (hasValidMt) return
+  // 别名为正安全整数 → 翻译回写（Number.isSafeInteger 同时挡掉 1e21 这类会写成科学计数法的值）
+  if (typeof alias === 'number' && Number.isSafeInteger(alias) && alias > 0) {
+    body['max_tokens'] = alias
+    return
+  }
   body['max_tokens'] = defaultTokens
 }
 
@@ -710,6 +792,18 @@ const SANITIZE_FEATURES = [
 
 /** 剥离层：header 键名即触发（与值无关），整段删除。 */
 const SANITIZE_HDR_RE = /x-anthropic-billing-header:[^;\n]*;?\s*/gi
+/**
+ * 兜底层：**裸键名**（无冒号无值）同样是指纹（对齐 workbuddy2api sanitizeBareHdrRe）。
+ *
+ * 2026-09-13 实验 F4 证实：assistant 消息里用反引号引用裸键名即触发 11-128，而剥离层
+ * SANITIZE_HDR_RE 要求冒号、对裸串无效。键值形态被整段删除后，残留的裸键名做最小缩写
+ * （header→hdr）：破坏逐字匹配、语义不变、保留可读性。大小写不敏感，覆盖 X-Anthropic-… 变体。
+ *
+ * 与 SANITIZE_HDR_RE 的分工：本正则不要求冒号，是它的**超集**，但两者替换语义不同
+ * （整段删除 vs 最小缩写），不可合并。检测与改写都必须覆盖它，否则「混合大小写 + 无冒号」
+ * 形态（引号/示例文本里的 X-Anthropic-Billing-Header）既不检测也不改写 → 带指纹出站 → 400/11-128。
+ */
+const SANITIZE_BARE_HDR_RE = /x-anthropic-billing-header/gi
 /** 剥离层：尾随裸键值（cc_xxx=...;）循环清理。 */
 const SANITIZE_KV_RE = /\bcc_[a-z0-9_]+=[^;\n]*;?\s*/gi
 
@@ -748,19 +842,48 @@ const SANITIZE_REWRITES: Array<[string, string]> = [
   ['11128', '11-128'],
 ]
 
+/**
+ * 指纹字面量的**当前字节形态快照**（移植 workbuddy2api `231a076`，
+ * 对齐源 `TestSanitizeLiteralByteExact`）。
+ *
+ * 为什么需要：这些字面量（特征串 / 改写对 / 3 条正则）全部是实验逆向出的上游内容
+ * 审核**逐字精确匹配黑名单**，没有任何契约可引用——改错一个字节就会漏拦（400 code=11-128）
+ * 或误伤正常内容。快照把当前字节形态硬编码进测试：任何未来未同步的改动先红在测试上，
+ * 强制走「逐字节验证」流程（grep 全部出现点 + 真实账号上游实测 + 全族回归）。
+ *
+ * 本函数只把既有常量暴露给测试，**不改变任何行为**。
+ */
+export function sanitizeLiteralsSnapshot(): {
+  features: readonly string[]
+  rewrites: ReadonlyArray<readonly [string, string]>
+  hdrRe: string
+  kvRe: string
+  bareHdrRe: string
+} {
+  return {
+    features: SANITIZE_FEATURES,
+    rewrites: SANITIZE_REWRITES,
+    hdrRe: SANITIZE_HDR_RE.source,
+    kvRe: SANITIZE_KV_RE.source,
+    bareHdrRe: SANITIZE_BARE_HDR_RE.source,
+  }
+}
+
 /** 是否命中任一特征（快速路径）。 */
 function hasSanitizeFingerprint(text: string): boolean {
   for (const f of SANITIZE_FEATURES) {
     if (text.includes(f)) return true
   }
-  // header 键名有大小写变体，快速路径漏掉时再落正则兜底
-  SANITIZE_HDR_RE.lastIndex = 0
-  return SANITIZE_HDR_RE.test(text)
+  // header 键名有大小写变体，快速路径漏掉时再落正则兜底。裸键名（无冒号）是
+  // SANITIZE_HDR_RE 的超集形态，故只需这一个正则即可覆盖两种形态（对齐源
+  // hasFingerprint 的注释：无需再单独匹配要求冒号的那个）。
+  SANITIZE_BARE_HDR_RE.lastIndex = 0
+  return SANITIZE_BARE_HDR_RE.test(text)
 }
 
 /**
  * 单段文本净化（对齐 workbuddy2api sanitizeText）。
- * 顺序：**先改写、后剥离、最后 trim**。
+ * 顺序：**先改写、后剥离、最后兜底缩写裸键名、最后 trim**。
  */
 export function sanitizeFingerprintText(text: string): string {
   if (!hasSanitizeFingerprint(text)) return text
@@ -780,6 +903,9 @@ export function sanitizeFingerprintText(text: string): string {
       text = text.replace(SANITIZE_KV_RE, '')
     }
   }
+  // 兜底：键值形态已在上面整段删除，这里只剩裸键名（引用/示例文本形态）→ 最小缩写。
+  SANITIZE_BARE_HDR_RE.lastIndex = 0
+  text = text.replace(SANITIZE_BARE_HDR_RE, 'x-anthropic-billing-hdr')
   return text.trim()
 }
 
@@ -836,7 +962,180 @@ function sanitizeToolCallsValue(v: unknown): boolean {
 }
 
 /**
- * 出站请求体的**指纹脱敏**（移植 workbuddy2api sanitizeMessages）。
+ * tool 结果块重排（移植 workbuddy2api `155af65`，对齐源 `repackToolResultBlocks`）。
+ *
+ * 把插在 `assistant.tool_calls` 与其 tool 结果之间的**非 tool 消息**挪到整组之后，
+ * 保证同一批 tool_call 的结果在 wire 上连续。
+ *
+ * 背景：Codex 的 `image_resize_notice` 会把一条 developer/system 消息插在 tool 输出
+ * 后面；并行调用时它插在两份 tool 结果中间：
+ *
+ *     assistant tool_calls=[c00 c01] | tool c00 | developer <notice> | tool c01
+ *
+ * OpenAI 兼容协议要求 tool 结果紧跟 assistant，中间插任何消息都算配对断裂，上游判
+ * 11148（tool_call_sequence_broken）并顶死整条会话。这里**只调顺序、不改内容**：
+ *
+ *     assistant tool_calls=[c00 c01] | tool c00 | tool c01 | developer <notice>
+ *
+ * 结果顺序保持不变（同批 tool_call 的原相对顺序 = 结果顺序）。下一组
+ * `assistant.tool_calls` 是新的组头，绝不当作插入物吞掉（否则它自己那批结果永远得不到
+ * 重排）。无插入消息时返回原数组 + false（零改动零分配）。
+ */
+export function repackToolResultBlocks(messages: unknown[]): { messages: unknown[]; changed: boolean } {
+  if (messages.length < 3) return { messages, changed: false }
+  const out: unknown[] = []
+  let changed = false
+  let i = 0
+  while (i < messages.length) {
+    const m = messages[i]
+    if (!m || typeof m !== 'object' || Array.isArray(m)) {
+      out.push(m)
+      i++
+      continue
+    }
+    const msg = m as Record<string, unknown>
+    if (msg['role'] !== 'assistant') {
+      out.push(m)
+      i++
+      continue
+    }
+    const tcs = msg['tool_calls']
+    if (!Array.isArray(tcs) || tcs.length === 0) {
+      out.push(m)
+      i++
+      continue
+    }
+    const want = new Set<string>()
+    for (const tci of tcs) {
+      if (tci && typeof tci === 'object' && !Array.isArray(tci)) {
+        const id = (tci as Record<string, unknown>)['id']
+        if (typeof id === 'string' && id !== '') want.add(id)
+      }
+    }
+    // 收集紧随其后（允许被其他消息打断）的同批 tool 结果，按原相对顺序
+    out.push(m)
+    i++
+    const results: unknown[] = []
+    const between: unknown[] = []
+    let sawNonTool = false
+    while (i < messages.length) {
+      const mm = messages[i]
+      if (!mm || typeof mm !== 'object' || Array.isArray(mm)) break
+      const row = mm as Record<string, unknown>
+      const role = typeof row['role'] === 'string' ? (row['role'] as string) : ''
+      if (role === 'tool') {
+        const id = typeof row['tool_call_id'] === 'string' ? (row['tool_call_id'] as string) : ''
+        if (!want.has(id)) break
+        results.push(mm)
+        if (sawNonTool) changed = true
+        i++
+        continue
+      }
+      // assistant 后还没有任何结果：交由 cleanupOrphanToolCalls 处理
+      if (results.length === 0) break
+      // 下一组 assistant.tool_calls 是新的组头，绝不能当插入物吞掉
+      if (role === 'assistant') {
+        const next = row['tool_calls']
+        if (Array.isArray(next) && next.length > 0) break
+      }
+      // 同批结果尚未收齐时，中间消息视为插入物，暂存待后移
+      between.push(mm)
+      sawNonTool = true
+      i++
+    }
+    out.push(...results, ...between)
+  }
+  if (!changed) return { messages, changed: false }
+  return { messages: out, changed: true }
+}
+
+/**
+ * 剔除无法配对的 tool_call 与 tool 结果（移植 workbuddy2api `155af65`，对齐源
+ * `cleanupOrphanToolCalls`）。
+ *
+ * 背景：OpenAI 兼容协议要求带 `tool_calls` 的 assistant 消息，其每个 tool_call id 都要
+ * 有对应的 `role:'tool'` 结果；反之 role:'tool' 也必须能对应到前置调用。不完整配对会让
+ * 上游对之后**每条**消息都返 400（11148 tool calls and tool results do not match），
+ * 整条会话报废。宁可丢一轮工具上下文，也要让会话自愈。
+ *
+ * 关键：调用侧与结果侧**共用同一份 keepCalls 按 id 对称裁剪**。历史实现是「批内每个 id
+ * 都齐才整批保留，否则删掉整个 tool_calls 键」，那会留下无主结果——批 [c1,c2] 只回了 c1
+ * 时调用侧整批被删、而 tool{c1} 仍按 id 命中保留，出站变成「无 tool_calls 的 assistant +
+ * 孤儿 tool」，照样 11148。
+ *
+ * 返回清理后的数组与是否发生删除；无任何工具流量时原数组原样返回。
+ */
+export function cleanupOrphanToolCalls(messages: unknown[]): { messages: unknown[]; changed: boolean } {
+  if (messages.length === 0) return { messages, changed: false }
+  const callIDs = new Set<string>()
+  const resultIDs = new Set<string>()
+  let hasTraffic = false
+  for (const m of messages) {
+    if (!m || typeof m !== 'object' || Array.isArray(m)) continue
+    const msg = m as Record<string, unknown>
+    const role = msg['role']
+    if (role === 'tool') {
+      const id = msg['tool_call_id']
+      if (typeof id === 'string' && id !== '') {
+        resultIDs.add(id)
+        hasTraffic = true
+      }
+    } else if (role === 'assistant') {
+      const tcs = msg['tool_calls']
+      if (Array.isArray(tcs)) {
+        for (const tci of tcs) {
+          if (!tci || typeof tci !== 'object' || Array.isArray(tci)) continue
+          const id = (tci as Record<string, unknown>)['id']
+          if (typeof id === 'string' && id !== '') {
+            callIDs.add(id)
+            hasTraffic = true
+          }
+        }
+      }
+    }
+  }
+  if (!hasTraffic) return { messages, changed: false }
+  // keepCalls：调用 id 双侧齐全（调用存在且结果存在）。重复 id 与乱序均按集合处理。
+  const keepCalls = new Set<string>()
+  for (const id of callIDs) if (resultIDs.has(id)) keepCalls.add(id)
+
+  let changed = false
+  // 1) assistant.tool_calls：按 keepCalls 对称裁剪，只留有结果的调用；过滤后为空则删键。
+  for (const m of messages) {
+    if (!m || typeof m !== 'object' || Array.isArray(m)) continue
+    const msg = m as Record<string, unknown>
+    if (msg['role'] !== 'assistant') continue
+    const tcs = msg['tool_calls']
+    if (!Array.isArray(tcs) || tcs.length === 0) continue
+    const keptCalls = tcs.filter((tci) => {
+      if (!tci || typeof tci !== 'object' || Array.isArray(tci)) return false
+      const id = (tci as Record<string, unknown>)['id']
+      return typeof id === 'string' && keepCalls.has(id)
+    })
+    if (keptCalls.length === tcs.length) continue // 整批齐全：零改动
+    changed = true
+    if (keptCalls.length === 0) {
+      delete msg['tool_calls']
+      continue
+    }
+    msg['tool_calls'] = keptCalls
+  }
+  // 2) role:tool 结果：只有对应 tool_call 被保留才保留；孤儿结果整条删除。
+  const kept = messages.filter((m) => {
+    if (!m || typeof m !== 'object' || Array.isArray(m)) return true
+    const msg = m as Record<string, unknown>
+    if (msg['role'] !== 'tool') return true
+    const id = msg['tool_call_id']
+    return typeof id === 'string' && keepCalls.has(id)
+  })
+  if (kept.length !== messages.length) changed = true
+  if (!changed) return { messages, changed: false }
+  return { messages: kept, changed: true }
+}
+
+/**
+ * 出站请求体的**指纹脱敏**（移植 workbuddy2api sanitizeMessages）+ tool 配对修复
+ * （移植 `155af65`：先 repack 再 cleanup，两侧同口径）。
  *
  * 遍历 messages：对每条消息的 `content` 与 `tool_calls` **各自独立**判断
  * （content 可以为 null——工具调用轮；早期实现遇 null 就 continue，导致 tool_calls
@@ -858,6 +1157,12 @@ export function sanitizeWorkbuddyMessages(body: Record<string, unknown>): void {
       sanitizeToolCallsValue(msg['tool_calls'])
     }
   }
+  // tool 配对两步（见 repackToolResultBlocks / cleanupOrphanToolCalls）：先重排再清理。
+  // 插在结果中间的非 tool 消息（Codex image_resize_notice）同样判配对断裂，先 repack
+  // 挪后，再 cleanup 删孤儿，两侧同口径。无改动时两步都返回原数组，回写等于零操作。
+  const repacked = repackToolResultBlocks(messages)
+  const cleaned = cleanupOrphanToolCalls(repacked.messages)
+  if (repacked.changed || cleaned.changed) body['messages'] = cleaned.messages
 }
 
 // ===== global 兜底 system 注入 =====
@@ -929,6 +1234,48 @@ export function rewriteWorkbuddySystemPrompt(body: Record<string, unknown>, syst
   } else {
     body['messages'] = [{ role: 'system', content: systemPrompt }]
   }
+}
+
+/**
+ * 在「开头连续 system/developer 块」之后插入一条网关自有 system 提示词（移植
+ * workbuddy2api `ff64ecd`，对齐源 `prompt.Append`；见 51bc469 / 9288f55）。
+ *
+ * 与 `rewriteWorkbuddySystemPrompt`（整体替换）并列的第三种模式：
+ *  - 开头连续块 = 从 `messages[0]` 起 role 为 `system`/`developer` 的消息（精确匹配，
+ *    与 Rewrite 的删除口径一致）；遇第一条非 system/developer 消息（含非对象消息、
+ *    无 role 消息）即停；
+ *  - 插入点 = 连续块末尾之后（块长 0 时即 messages 最前）；
+ *  - 所有既有消息（含开头块、中途 system、user/assistant/tool）**逐字不动**——
+ *    客户端项目规范/工具约定与网关提示词并用。
+ *
+ * 边界必须同时匹配 `system` 与 `developer`：归一（developer→system）在下游
+ * `sanitizeUpstreamBody` 里做，本函数执行时开头块里的 developer 还是 developer。
+ * 网关消息的角色用 `system` 而非 `developer`——上游 role 白名单不含 developer，
+ * 插 developer 等于制造一次必然归一与多余 11-128 风险窗口。
+ *
+ * 守卫与 Rewrite 逐条一致：空 prompt → 原样返回；无 messages 字段 → 置为单条网关
+ * system，其余字段原样保留。
+ */
+export function appendWorkbuddySystemPrompt(body: Record<string, unknown>, systemPrompt: string): void {
+  if (!systemPrompt) return
+  const msgs = body['messages']
+  if (!Array.isArray(msgs)) {
+    body['messages'] = [{ role: 'system', content: systemPrompt }]
+    return
+  }
+  let insertAt = 0
+  for (const m of msgs) {
+    if (!m || typeof m !== 'object' || Array.isArray(m)) break
+    const role = (m as Record<string, unknown>)['role']
+    if (role !== 'system' && role !== 'developer') break
+    insertAt++
+  }
+  // 已有消息逐字不动：只在插入点拼接，不重排、不改写任何元素
+  body['messages'] = [
+    ...msgs.slice(0, insertAt),
+    { role: 'system', content: systemPrompt },
+    ...msgs.slice(insertAt),
+  ]
 }
 
 // ===== global 模型目录动态探测解析（移植 workbuddy2api global_models.go） =====

@@ -2,6 +2,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { Hono } from 'hono'
 import { handleProxy } from './proxy'
 import { writeOauthPool, __resetOauthPoolRuntimeForTests } from './oauth-pool'
+import { OAUTH_POOL_KV_PREFIX } from './oauth'
 import { __resetStickyCacheForTests, STICKY_KV_PREFIX } from './workbuddy-sticky'
 import { __resetSessionIdsForTests } from './workbuddy-session-ids'
 import { __resetInFlightForTests, inFlightOf, inFlightSnapshot } from './workbuddy-inflight'
@@ -650,5 +651,402 @@ describe('WorkBuddy 池化代理端到端（粘性 + 会话头族 + 协议头）
     expect(text).toContain('req-stream-1')
     // 没有被替换成空 chunk 壳
     expect(text).not.toContain('"id":"chatcmpl-wb2api"')
+  })
+
+  // ===== gateway_hint：错误附加说明字段（移植 76bb543 / a749016 / fa7b5d9）=====
+
+  it('非流式：6004 错误体附加 error.gateway_hint，message/code/request_id 一字不改', async () => {
+    const { env, app } = makeEnv([makeProvider()])
+    await seedPool(env, ['u1'])
+
+    vi.stubGlobal('fetch', vi.fn(async () => sseErrorResponse({
+      error: { code: 6004, msg: 'The model provider is rate-limiting requests.', requestId: 'req-hint-1' },
+    })))
+
+    const res = await app.post({
+      model: `${PID}/deepseek-v4-flash`,
+      messages: [{ role: 'user', content: 'hi' }],
+      stream: false,
+    })
+    expect(res.status).toBe(429)
+    const body = await res.json() as { error: { message: string; type: string; code?: unknown; request_id?: unknown; gateway_hint?: unknown } }
+    expect(body.error.gateway_hint).toBe('rate limited by upstream; retry after reset')
+    // hint 只做并列补充：既有字段与文案原样
+    expect(body.error.message).toBe('The model provider is rate-limiting requests.')
+    expect(body.error.code).toBe(6004)
+    expect(body.error.request_id).toBe('req-hint-1')
+    expect(body.error.type).toBe('rate_limit_exceeded')
+  })
+
+  it('非流式：11102（无此模型）错误体附加换模型 hint', async () => {
+    const { env, app } = makeEnv([makeProvider()])
+    await seedPool(env, ['u1'])
+
+    vi.stubGlobal('fetch', vi.fn(async () => sseErrorResponse({
+      error: { code: 11102, msg: 'service info not found' },
+    })))
+
+    const res = await app.post({
+      model: `${PID}/deepseek-v4-flash`,
+      messages: [{ role: 'user', content: 'hi' }],
+      stream: false,
+    })
+    expect(res.status).toBe(502)
+    const body = await res.json() as { error: { message: string; gateway_hint?: unknown } }
+    expect(body.error.gateway_hint).toBe('upstream has no such model on this backend; switch model or retry on another account')
+    expect(body.error.message).toBe('service info not found')
+  })
+
+  it('非流式：未覆盖形态（500）不带 gateway_hint 字段（不编造）', async () => {
+    const { env, app } = makeEnv([makeProvider()])
+    await seedPool(env, ['u1'])
+
+    vi.stubGlobal('fetch', vi.fn(async () => sseErrorResponse({
+      error: { code: 500, msg: 'internal upstream failure' },
+    })))
+
+    const res = await app.post({
+      model: `${PID}/deepseek-v4-flash`,
+      messages: [{ role: 'user', content: 'hi' }],
+      stream: false,
+    })
+    expect(res.status).toBe(502)
+    const body = await res.json() as { error: Record<string, unknown> }
+    // 字段**缺席**（不是空串）
+    expect('gateway_hint' in body.error).toBe(false)
+    expect(body.error.message).toBe('internal upstream failure')
+  })
+
+  it('流式：错误帧透出时附加 gateway_hint，且 message/code/requestId 原文不变', async () => {
+    const { env, app } = makeEnv([makeProvider()])
+    await seedPool(env, ['u1'])
+
+    vi.stubGlobal('fetch', vi.fn(async () => sseErrorResponse({
+      error: { code: 6004, msg: 'The model provider is rate-limiting requests.', requestId: 'req-stream-hint' },
+    })))
+
+    const res = await app.post({
+      model: `${PID}/deepseek-v4-flash`,
+      messages: [{ role: 'user', content: 'hi' }],
+      stream: true,
+    })
+    expect(res.status).toBe(200)
+    const text = await res.text()
+    expect(text).toContain('"gateway_hint":"rate limited by upstream; retry after reset"')
+    // 原文不动
+    expect(text).toContain('rate-limiting requests')
+    expect(text).toContain('"code":6004')
+    expect(text).toContain('req-stream-hint')
+  })
+
+  it('P0-1（移植 145220d）：429 带 quota 措辞 → 短冷却，不再误判硬冷却到次日 04:00', async () => {
+    const { env, store, app } = makeEnv([makeProvider()])
+    await seedPool(env, ['u1'])
+
+    // 上游 429 + 跨「计费/限流」两界的措辞（旧顺序：余额关键词先判 → hard_credit → 白扔号约 12h）
+    vi.stubGlobal('fetch', vi.fn(async () => new Response('{"error":{"message":"quota exceeded"}}', {
+      status: 429,
+      headers: { 'Content-Type': 'application/json' },
+    })))
+
+    await app.post({
+      model: `${PID}/deepseek-v4-flash`,
+      messages: [{ role: 'user', content: 'hi' }],
+      stream: false,
+    })
+
+    const pool = JSON.parse(store.get(OAUTH_POOL_KV_PREFIX + PID)!) as Array<{ uid: string; state: { reason?: string; until?: number } }>
+    const st = pool.find((a) => a.uid === 'u1')!.state
+    // hard_credit 分支写 reason='余额不足' + until≈次日 04:00；soft_rate 分支写 '429 rate limit'
+    expect(st.reason).toBe('429 rate limit')
+    expect((st.until || 0) - Date.now()).toBeLessThanOrEqual(60 * 60 * 1000)
+  })
+
+  it('P0-3（移植 edb9e97）：出站把 max_completion_tokens 翻译成 max_tokens（DSH 只发别名）', async () => {
+    const { env, app } = makeEnv([makeProvider()])
+    await seedPool(env, ['u1'])
+
+    await app.post({
+      model: `${PID}/deepseek-v4-flash`,
+      messages: [{ role: 'user', content: 'hi' }],
+      // DSH 实测发的别名；上游只认 max_tokens，不翻译会回落默认 ~32000 截断长回答
+      max_completion_tokens: 128000,
+      stream: false,
+    })
+
+    const body = JSON.parse(calls[0].body)
+    expect(body.max_tokens).toBe(128000)
+    expect(body.max_completion_tokens).toBeUndefined()
+  })
+
+  it('P0-2（移植 0a86854）：非流式上游 200 空流 → 502 + code=upstream_parse（不再产出假成功 200）', async () => {
+    const { env, app } = makeEnv([makeProvider()])
+    await seedPool(env, ['u1'])
+
+    // 200 + 只有 [DONE]（0 有效数据帧）
+    vi.stubGlobal('fetch', vi.fn(async () => new Response('data: [DONE]\n\n', {
+      status: 200,
+      headers: { 'Content-Type': 'text/event-stream' },
+    })))
+
+    const res = await app.post({
+      model: `${PID}/deepseek-v4-flash`,
+      messages: [{ role: 'user', content: 'hi' }],
+      stream: false,
+    })
+
+    expect(res.status).toBe(502)
+    const body = await res.json() as { error: { message: string; code: string } }
+    expect(body.error.code).toBe('upstream_parse')
+    expect(body.error.message).toContain('empty upstream stream')
+  })
+
+  it('P0-2（移植 0a86854）：流式上游 200 空流 → 补 error 帧 + [DONE]（客户端能知道失败）', async () => {
+    const { env, app } = makeEnv([makeProvider()])
+    await seedPool(env, ['u1'])
+
+    // 完全空体：0 帧，连 [DONE] 都没有
+    vi.stubGlobal('fetch', vi.fn(async () => new Response('', {
+      status: 200,
+      headers: { 'Content-Type': 'text/event-stream' },
+    })))
+
+    const res = await app.post({
+      model: `${PID}/deepseek-v4-flash`,
+      messages: [{ role: 'user', content: 'hi' }],
+      stream: true,
+    })
+
+    // HTTP 头早已发出（wire 仍 200），失败靠帧内 error 表达
+    expect(res.status).toBe(200)
+    const text = await res.text()
+    expect(text).toContain('"code":"upstream_parse"')
+    expect(text).toContain('empty upstream stream')
+    expect(text).toContain('data: [DONE]')
+  })
+
+  it('P0-2 反例：只有 [DONE] 的流式空流同样补帧（不被当成正常收尾）', async () => {
+    const { env, app } = makeEnv([makeProvider()])
+    await seedPool(env, ['u1'])
+
+    vi.stubGlobal('fetch', vi.fn(async () => new Response('data: [DONE]\n\n', {
+      status: 200,
+      headers: { 'Content-Type': 'text/event-stream' },
+    })))
+
+    const res = await app.post({
+      model: `${PID}/deepseek-v4-flash`,
+      messages: [{ role: 'user', content: 'hi' }],
+      stream: true,
+    })
+
+    const text = await res.text()
+    // 上游那个 [DONE] 被扣留，补的是 error 帧 + 恰好一个 [DONE]
+    expect(text).toContain('upstream_parse')
+    expect(text.match(/data: \[DONE\]/g)?.length).toBe(1)
+  })
+
+  it('P1-1（移植 5c2db2f）：两个缺 index 的 tool_call 不被并进同一槽（参数不串联、name 不覆盖）', async () => {
+    const { env, app } = makeEnv([makeProvider()])
+    await seedPool(env, ['u1'])
+
+    const body = [
+      'data: {"id":"x1","choices":[{"index":0,"delta":{"tool_calls":[{"id":"call_a","type":"function","function":{"name":"f1","arguments":"{\\"a\\":1}"}}]}}]}',
+      '',
+      'data: {"id":"x1","choices":[{"index":0,"delta":{"tool_calls":[{"id":"call_b","type":"function","function":{"name":"f2","arguments":"{\\"b\\":2}"}}]}}]}',
+      '',
+      'data: {"id":"x1","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}',
+      '',
+      'data: [DONE]',
+      '',
+    ].join('\n')
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(body, {
+      status: 200,
+      headers: { 'Content-Type': 'text/event-stream' },
+    })))
+
+    const res = await app.post({
+      model: `${PID}/deepseek-v4-flash`,
+      messages: [{ role: 'user', content: 'hi' }],
+      stream: false,
+    })
+    expect(res.status).toBe(200)
+    const json = await res.json() as { choices: { message: { tool_calls: { function: { name: string; arguments: string } }[] } }[] }
+    const callsOut = json.choices[0].message.tool_calls
+    expect(callsOut).toHaveLength(2)
+    expect(callsOut.map(c => c.function.name).sort()).toEqual(['f1', 'f2'])
+    expect(callsOut.map(c => c.function.arguments).sort()).toEqual(['{"a":1}', '{"b":2}'])
+  })
+
+  it('P1-1 对照：合规 index 流不受影响，缺 index 的补位不覆盖既有槽', async () => {
+    const { env, app } = makeEnv([makeProvider()])
+    await seedPool(env, ['u1'])
+
+    const body = [
+      'data: {"id":"x1","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_a","type":"function","function":{"name":"f1","arguments":"{\\"a\\":1}"}}]}}]}',
+      '',
+      'data: {"id":"x1","choices":[{"index":0,"delta":{"tool_calls":[{"id":"call_b","type":"function","function":{"name":"f2","arguments":"{\\"b\\":2}"}}]}}]}',
+      '',
+      'data: {"id":"x1","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}',
+      '',
+      'data: [DONE]',
+      '',
+    ].join('\n')
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(body, {
+      status: 200,
+      headers: { 'Content-Type': 'text/event-stream' },
+    })))
+
+    const res = await app.post({
+      model: `${PID}/deepseek-v4-flash`,
+      messages: [{ role: 'user', content: 'hi' }],
+      stream: false,
+    })
+    const json = await res.json() as { choices: { message: { tool_calls: { index: number; function: { name: string; arguments: string } }[] } }[] }
+    const callsOut = json.choices[0].message.tool_calls
+    expect(callsOut).toHaveLength(2)
+    expect(new Set(callsOut.map(c => c.index)).size).toBe(2)
+    expect(callsOut.find(c => c.index === 0)?.function.arguments).toBe('{"a":1}')
+  })
+
+  it('P1-2（移植 65b2f33）：EOF 截断（无 [DONE]）的残缺 tool_call 参数被丢弃，不交给客户端', async () => {
+    const { env, app } = makeEnv([makeProvider()])
+    await seedPool(env, ['u1'])
+
+    // 无 [DONE] 收尾（连接中断），arguments 只剩半截 JSON
+    const body = [
+      'data: {"id":"x1","choices":[{"index":0,"delta":{"role":"assistant","content":"","tool_calls":[{"id":"call_a","type":"function","function":{"name":"bash","arguments":"{\\"cmd\\":"},"index":0}]}}]}',
+      '',
+      'data: {"id":"x1","choices":[{"index":0,"delta":{"tool_calls":[{"function":{"arguments":"\\"ls\\""},"index":0}]}}]}',
+      '',
+    ].join('\n')
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(body, {
+      status: 200,
+      headers: { 'Content-Type': 'text/event-stream' },
+    })))
+
+    const res = await app.post({
+      model: `${PID}/deepseek-v4-flash`,
+      messages: [{ role: 'user', content: 'hi' }],
+      stream: false,
+    })
+    expect(res.status).toBe(200)
+    const json = await res.json() as { choices: { message: { tool_calls?: unknown } }[] }
+    expect(json.choices[0].message.tool_calls).toBeUndefined()
+  })
+
+  it('P1-2 对照：正常 [DONE] 收尾的完整 tool_call 不被误伤', async () => {
+    const { env, app } = makeEnv([makeProvider()])
+    await seedPool(env, ['u1'])
+
+    const body = [
+      'data: {"id":"x1","choices":[{"index":0,"delta":{"tool_calls":[{"id":"call_a","type":"function","function":{"name":"get_weather","arguments":"{\\"city\\":\\"北京\\"}"},"index":0}]}}]}',
+      '',
+      'data: {"id":"x1","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}',
+      '',
+      'data: [DONE]',
+      '',
+    ].join('\n')
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(body, {
+      status: 200,
+      headers: { 'Content-Type': 'text/event-stream' },
+    })))
+
+    const res = await app.post({
+      model: `${PID}/deepseek-v4-flash`,
+      messages: [{ role: 'user', content: 'hi' }],
+      stream: false,
+    })
+    const json = await res.json() as { choices: { message: { tool_calls: { function: { arguments: string } }[] } }[] }
+    expect(json.choices[0].message.tool_calls).toHaveLength(1)
+    expect(json.choices[0].message.tool_calls[0].function.arguments).toBe('{"city":"北京"}')
+  })
+
+  it('P1-4（移植 11b75d4 + 6701631）：非 delta message 帧透出正文/推理/工具调用，且重复快照不重复追加', async () => {
+    const { env, app } = makeEnv([makeProvider()])
+    await seedPool(env, ['u1'])
+
+    const frame = 'data: {"id":"x1","choices":[{"index":0,"message":{"role":"assistant","content":"abc","reasoning_content":"think","tool_calls":[{"index":0,"id":"call_a","type":"function","function":{"name":"get_weather","arguments":"{\\"city\\":\\"北京\\"}"}}]}}]}'
+    const body = [
+      frame, '',
+      frame, '',
+      frame, '',
+      'data: {"id":"x1","choices":[{"index":0,"message":{},"finish_reason":"tool_calls"}],"usage":{"total_tokens":11}}',
+      '',
+      'data: [DONE]',
+      '',
+    ].join('\n')
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(body, {
+      status: 200,
+      headers: { 'Content-Type': 'text/event-stream' },
+    })))
+
+    const res = await app.post({
+      model: `${PID}/deepseek-v4-flash`,
+      messages: [{ role: 'user', content: 'hi' }],
+      stream: false,
+    })
+    const json = await res.json() as {
+      choices: { message: { role: string; content: string; reasoning_content?: string; tool_calls?: { function: { name: string; arguments: string } }[] } }[]
+    }
+    const msg = json.choices[0].message
+    // 逐帧重复的完整快照只采一次（此前 latch 不生效会得到 abcabcabc）
+    expect(msg.content).toBe('abc')
+    expect(msg.role).toBe('assistant')
+    expect(msg.reasoning_content).toBe('think')
+    expect(msg.tool_calls).toHaveLength(1)
+    expect(msg.tool_calls![0].function.name).toBe('get_weather')
+  })
+
+  it('P1-6（移植 213e362）：非流式 usage 缺 total_tokens 时按 prompt+completion 合成', async () => {
+    const { env, app } = makeEnv([makeProvider()])
+    await seedPool(env, ['u1'])
+
+    const body = [
+      'data: {"id":"c1","choices":[{"index":0,"delta":{"role":"assistant","content":"hi"}}]}',
+      '',
+      'data: {"id":"c1","choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":5}}',
+      '',
+      'data: [DONE]',
+      '',
+    ].join('\n')
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(body, {
+      status: 200,
+      headers: { 'Content-Type': 'text/event-stream' },
+    })))
+
+    const res = await app.post({
+      model: `${PID}/deepseek-v4-flash`,
+      messages: [{ role: 'user', content: 'hi' }],
+      stream: false,
+    })
+    const json = await res.json() as { usage: { prompt_tokens: number; completion_tokens: number; total_tokens?: number } }
+    expect(json.usage.total_tokens).toBe(15)
+  })
+
+  it('P1-6 反例：已有 total_tokens 不覆盖；缺单边不臆造', async () => {
+    const { env, app } = makeEnv([makeProvider()])
+    await seedPool(env, ['u1'])
+
+    const body = [
+      'data: {"id":"c1","choices":[{"index":0,"delta":{"role":"assistant","content":"hi"}}]}',
+      '',
+      'data: {"id":"c1","choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":100}}',
+      '',
+      'data: [DONE]',
+      '',
+    ].join('\n')
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(body, {
+      status: 200,
+      headers: { 'Content-Type': 'text/event-stream' },
+    })))
+
+    const res = await app.post({
+      model: `${PID}/deepseek-v4-flash`,
+      messages: [{ role: 'user', content: 'hi' }],
+      stream: false,
+    })
+    const json = await res.json() as { usage: { total_tokens?: number } }
+    expect(json.usage.total_tokens).toBe(100)
   })
 })

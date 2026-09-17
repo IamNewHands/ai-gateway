@@ -63,9 +63,9 @@ describe('resolveConversationId（只认 conversationId，绝不回落 user_id�
   })
 
   it('**不**回落 metadata.user_id（避免污染后台按对话聚合）', () => {
-    // 这是与 extractSessionKey 的关键差异
+    // 移植 ebd7921 后两者口径一致：extractSessionKey 也不再回落 user_id
     expect(resolveConversationId({ metadata: { user_id: 'u1' } })).toBe('')
-    expect(extractSessionKey({ metadata: { user_id: 'u1' } })).toBe('u1')
+    expect(extractSessionKey({ metadata: { user_id: 'u1' } })).toBe('')
   })
 
   it('空/畸形输入返回空串（不抛错）', () => {
@@ -79,13 +79,20 @@ describe('resolveConversationId（只认 conversationId，绝不回落 user_id�
   })
 })
 
-describe('extractSessionKey（允许回落 user_id）', () => {
-  it('识别顺序：metadata.conversation_id → conversationId → user_id → 顶层', () => {
+describe('extractSessionKey（只认 conversation 维度，剔除 user_id）', () => {
+  it('识别顺序：metadata.conversation_id → conversationId → 顶层', () => {
     expect(extractSessionKey({ metadata: { conversation_id: 'a', conversationId: 'b', user_id: 'c' } })).toBe('a')
     expect(extractSessionKey({ metadata: { conversationId: 'b', user_id: 'c' } })).toBe('b')
-    expect(extractSessionKey({ metadata: { user_id: 'c' } })).toBe('c')
     expect(extractSessionKey({ conversation_id: 'd' })).toBe('d')
     expect(extractSessionKey({ conversationId: 'e' })).toBe('e')
+  })
+
+  it('移植 ebd7921：metadata.user_id 不再是粘性键（回落空串 → 加权轮换）', () => {
+    expect(extractSessionKey({ metadata: { user_id: 'c' } })).toBe('')
+    expect(extractSessionKey({ user_id: 'c' })).toBe('')
+    // user_id 不再抢占顶层 conversation_id（旧实现会返回 'c'）
+    expect(extractSessionKey({ metadata: { user_id: 'c' }, conversation_id: 'd' })).toBe('d')
+    expect(extractSessionKey({ metadata: { user_id: 'c' }, conversationId: 'e' })).toBe('e')
   })
 
   it('空/畸形输入返回空串', () => {

@@ -38,6 +38,9 @@
     Buddy_App/_QQ       buddyapp 五连（discover→…→bind_skip）  1  （application_id: open-platform search）
   web 域行为（fork ReportWebEvent 实测：POST www.workbuddy.cn/v2/report + web 指纹）：
     Library_read        web_element_click(library_doc_intro_click) 1  （space 文档 URL）
+  小程序成长任务（growth 域 X-Client-Platform: miniprogram 专属下发，chat 域同头）：
+    Sequential_Tasks_1  在小程序内完成 1 次有效对话（mini chat_request_send，
+                        无 activityId——服务端按 source=mini_program 指纹关联） 100c+5e
   仍不可伪造：
     Expert_Philanthropy   真实捐款动作(M8)
 
@@ -92,6 +95,9 @@ MAPPING = {
     "RichMeow_Chat":          {"kind": "richmeow",   "target": 1, "src": "无(桌面指纹对话链)"},
     # web 域 web_element_click（fork ReportWebEvent，三账号实测点亮）
     "Library_read":           {"kind": "library",    "target": 1, "src": "无(资料库介绍点击)"},
+    # 小程序成长任务（growth 域小程序限定）：列表/accept/claim 均需 X-Client-Platform: miniprogram。
+    # 该 code 在默认（无 mp 头）任务列表里不存在，必须专段处理，不进 process_task 主循环。
+    "Sequential_Tasks_1":     {"kind": "minichat",   "target": 1, "src": "无(mini 对话无activityId)"},
     # 不可伪造（真实业务副作用）
     "Expert_Philanthropy":    {"unforgeable": True, "reason": "真实捐款动作(M8)"},
 }
@@ -229,6 +235,16 @@ COS_EXPERT_URL = ("https://acc-1258344699.cos.accelerate.myqcloud.com/"
 PLAYBOOK_BASE = "https://static.workbuddy.cn/workbuddy/playbook"
 MARKET_LIST_PATH = "/v2/operation-platform/market/expert/list"
 WEB_BASE = "https://www.workbuddy.cn"
+
+# 小程序成长任务（growth 域小程序限定）吸收常量（源提交 8622910）：
+#   growth 域任务列表/accept/claim 端点对 X-Client-Platform 敏感——带 miniprogram 才下发
+#   小程序限定任务（默认 18 项 vs mp 口径 9 项）。web 小程序 H5 由请求拦截器统一注入该头
+#   （config-D_y8qqW1.js：判 session platform=miniProgram 时注入）。
+#   实测结论（源提交 8622910 记录）：缺该头时 accept 返回 task not found。
+MP_PLATFORM_HEADER = {"X-Client-Platform": "miniprogram"}
+# 小程序 UA 由微信原生注入（源 school 模块 _build_headers 同款，mp 上报沿用）
+MP_UA = ("Mozilla/5.0 (Linux; Android 14; MicroMessenger/8.0.49 WeChat/0.8.0 "
+         "MiniProgramEnv/android; wkbrowser xweb)")
 
 # fork 桌面指纹（desktop.go）/ web 域（report.go）吸收常量
 DESKTOP_UA = "WorkBuddy/5.5.6 WorkBuddy/5.5.6 CLI/2.137.1"
@@ -427,8 +443,8 @@ def ids_for(kind, auth, need, offset=0):
         return [("", {}) for _ in range(need)]
     if kind == "richmeow":
         return [("", {}) for _ in range(need)]
-    if kind in ("buddy5", "library"):
-        # history/current 不是顺序语义：buddy5/library 是固定事件组按需补 1 次（offset 无意义）
+    if kind in ("buddy5", "library", "minichat"):
+        # history/current 不是顺序语义：buddy5/library/minichat 是固定事件组按需补 1 次（offset 无意义）
         return [("", {}) for _ in range(need)]
     return []
 
@@ -547,6 +563,34 @@ def report_desktop_events(auth, events):
         arr.append(m)
     st, r = tc.do_post(auth, tc.chat_base(auth), tc.PATH_REPORT, arr,
                        headers=_desktop_headers(auth))
+    sc = r.get("code") if isinstance(r, dict) else r
+    return st, sc
+
+
+def _mp_headers(auth, extra=None):
+    """小程序域请求头（源 school 模块 _build_headers 同款：Bearer + MP UA + 可选覆盖）。
+
+    与 task_common._headers 的差异：UA 换微信小程序 UA（web/desktop 头不同源，勿混用）。
+    """
+    h = {
+        "Authorization": "Bearer " + auth["token"],
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+        "User-Agent": MP_UA,
+    }
+    if extra:
+        h.update(extra)
+    return h
+
+
+def report_mp_events(auth, events):
+    """以小程序指纹向 {billing}=www.codebuddy.cn/v2/report 上报事件数组。
+
+    返回业务信封 (st, code)。源实现走 school.report_events（同 codebuddy.cn 域 +
+    MP UA 头）；目标仓无 school 段，故此处自带小程序头，不复用 web/desktop 通道。
+    """
+    st, r = tc.do_post(auth, tc.billing_base(auth), tc.PATH_REPORT, events,
+                       headers=_mp_headers(auth))
     sc = r.get("code") if isinstance(r, dict) else r
     return st, sc
 
@@ -683,6 +727,18 @@ def build_event(auth, kind, obj_id, meta, idx):
                 "traceId": "", "rootRequestId": cid, "parentConversationId": cid,
                 "agentName": "default", "agentType": "conversation", "userId": uid}
 
+    if kind == "minichat":
+        # 小程序成长任务（Sequential_Tasks_1）判据：mini 指纹 chat_request_send，
+        # 无 activityId（growth 域按 source=mini_program 指纹关联，源提交 8622910 实测
+        # 0ceb9c7c 点亮）。形状对齐 school.mini_chat_event，仅去掉 activityId、
+        # extVersion 由 SaaS 修正为 2.4.0（mp 口径实际版本）。
+        return {"eventCode": "chat_request_send", "timestamp": now, "reportDelay": 0,
+                "source": "mini_program", "ideName": "wx_app_cloud",
+                "ideType": "WorkBuddy_MP", "extName": "workbuddy-mp",
+                "extVersion": "2.4.0", "mode": "chat",
+                "conversationId": cid, "requestId": cid, "inputLength": 12,
+                "mentionContexts": [], "mentionContextCount": 0, "userId": uid}
+
     raise ValueError(f"unknown kind: {kind}")
 
 
@@ -723,14 +779,17 @@ def _claim_via_web(auth, code, uid8, stats, gap):
     return _claim_parse(auth, code, uid8, stats, gap, st, r, via_web=True)
 
 
-def claim_one(auth, code, uid8, stats, gap):
+def claim_one(auth, code, uid8, stats, gap, mp=False):
     """领单个任务。返回 1=新入账 2=already_claimed 0=失败。
 
     chat 域（M15 实测成功）先行；400 则自动降级 web 域带完整头（web_claim_fallback）。
     幂等语义保持：already_claimed 不算失败（返回 2）。
+    mp=True 时带 X-Client-Platform: miniprogram（小程序限定任务 claim 必需；缺头
+    源提交 8622910 实测 accept 即 task not found，claim 同一口径）。
     """
     st, r = tc.do_post(auth, tc.chat_base(auth),
-                       f"/activity/growth/tasks/{code}/claim", None)
+                       f"/activity/growth/tasks/{code}/claim", None,
+                       headers=MP_PLATFORM_HEADER if mp else None)
     if st != 200 or not isinstance(r, dict) or r.get("code") != 0:
         msg = r.get("msg") if isinstance(r, dict) else r
         # 400 降级到 web 域（fork 实测 Web 成长中心端点）：chat 域路径对部分任务 400
@@ -741,6 +800,109 @@ def claim_one(auth, code, uid8, stats, gap):
         stats["fail"] += 1
         return 0
     return _claim_parse(auth, code, uid8, stats, gap, st, r)
+
+
+# --------------------------------------------------------------------------
+# 小程序成长任务（growth 域小程序限定，Sequential_Tasks_1）
+# 源提交 8622910：accept → mini 指纹对话点亮 → claim，全程 X-Client-Platform: miniprogram。
+# 该任务在默认（无 mp 头）列表里不下发，故专段处理，不进 process_task 主循环。
+# --------------------------------------------------------------------------
+def _mp_list_tasks(auth):
+    """带 X-Client-Platform: miniprogram 拉任务列表（小程序限定任务仅在该口径下发）。"""
+    st, r = tc.do_get(auth, tc.chat_base(auth), tc.PATH_LIST_TASKS,
+                      headers=MP_PLATFORM_HEADER)
+    if st != 200 or not isinstance(r, dict):
+        raise RuntimeError(f"mp list_tasks http={st}")
+    return (r.get("data") or {}).get("tasks") or []
+
+
+def _mp_task_status(auth, code):
+    """mp 口径查单任务；无此任务返回 None。"""
+    return next((t for t in _mp_list_tasks(auth) if t.get("task_code") == code), None)
+
+
+def process_minichat_task(auth, code, opts, stats):
+    """小程序成长任务：mp 口径查询 → accept → mini 对话上报 → 回读 → claim。
+
+    与 process_task 的 growth 主循环分开处理：该任务在默认（无 mp 头）列表里不存在，
+    accept/claim 也要求同一头。实测结论（源提交 8622910）：缺 X-Client-Platform 头时
+    accept 返回 task not found。
+    """
+    uid8 = auth["uid"][:8]
+    try:
+        t = _mp_task_status(auth, code)
+    except Exception as e:
+        print(f"[task_runner] {uid8} {code}: mp list_tasks 失败: {e}")
+        stats["fail"] += 1
+        return
+    if t is None:
+        print(f"[task_runner] {uid8} {code}: mp 口径任务不存在，skip")
+        stats["skip"] += 1
+        return
+
+    ast = t.get("accept_status")
+    prog = t.get("progress") or {}
+    cur = prog.get("current") or 0
+    target = prog.get("target") or 1
+    stats["total"] += 1
+
+    if ast == "claimed":
+        print(f"[task_runner] {uid8} {code}: query claimed({cur}/{target}) -> 已领，跳过")
+        stats["already"] += 1
+        return
+    if ast == "completed" or cur >= target:
+        if not opts.yes:
+            print(f"[task_runner] {uid8} {code}: query completed({cur}/{target}) -> 可领(claim)，dry-run 跳过")
+            stats["pending"] += 1
+            return
+        claim_one(auth, code, uid8, stats, opts.gap, mp=True)
+        return
+
+    if not opts.yes:
+        print(f"[task_runner] {uid8} {code}: query {ast}({cur}/{target}) -> "
+              f"可点亮(mini chat_request_send)，dry-run 跳过")
+        stats["pending"] += 1
+        return
+
+    # 1) accept（mp 头；缺头实测 task not found，见源提交 8622910）
+    if ast == "not_accepted":
+        st, r = tc.do_post(auth, tc.chat_base(auth), tc.PATH_ACCEPT_TASKS,
+                           {"task_codes": [code]}, headers=MP_PLATFORM_HEADER)
+        res = (((r.get("data") or {}).get("results") or [{}])[0].get("status")
+               if isinstance(r, dict) else r)
+        print(f"[task_runner] {uid8} {code}: accept {st} {res}")
+        time.sleep(opts.gap)
+        if st != 200 or res != "accepted":
+            stats["fail"] += 1
+            return
+
+    # 2) 判据上报：mini 指纹 chat_request_send（无 activityId），走 codebuddy.cn 域
+    need = max(1, target - cur)
+    for i in range(need):
+        ev = build_event(auth, "minichat", "", {}, i)
+        st, sc = report_mp_events(auth, [ev])
+        print(f"[task_runner] {uid8} {code}: report {i + 1}/{need} {st} code={sc} (mini growth)")
+        time.sleep(opts.gap)
+
+    time.sleep(2.0)  # 服务端归账留时
+
+    # 3) 回读 + claim（mp 头）
+    t2 = _mp_task_status(auth, code) or t
+    ast2 = t2.get("accept_status")
+    prog2 = t2.get("progress") or {}
+    cur2 = prog2.get("current", 0)
+    print(f"[task_runner] {uid8} {code}: query re-read {cur2}/{prog2.get('target', target)} "
+          f"accept_status={ast2}")
+    if ast2 == "claimed":
+        print(f"[task_runner] {uid8} {code}: {ast} -> claimed（本轮已入账）")
+        stats["already"] += 1
+        return
+    if ast2 == "completed" or cur2 >= prog2.get("target", target):
+        claim_one(auth, code, uid8, stats, opts.gap, mp=True)
+        return
+    print(f"[task_runner] {uid8} {code}: report 未达 target"
+          f"（{cur2}/{prog2.get('target', target)}），WARN 待下次")
+    stats["pending"] += 1
 
 
 # --------------------------------------------------------------------------
@@ -950,10 +1112,15 @@ def process_account(auth, opts, stats):
         return
 
     by_code = {t.get("task_code"): t for t in tasks}
+    # minichat 段（小程序限定任务）：该 code 在默认（无 mp 头）growth 任务列表里不下发，
+    # 由 process_minichat_task 专段处理，不进 process_task（否则必然 query 任务不存在）。
+    minichat_in_map = [c for c in MAPPING if MAPPING[c].get("kind") == "minichat"]
     if opts.only_codes:
-        codes = opts.only_codes
+        codes = [c for c in opts.only_codes if c not in minichat_in_map]
+        process_minichat = bool(set(opts.only_codes) & set(minichat_in_map))
     else:
-        codes = list(MAPPING)
+        codes = [c for c in MAPPING if MAPPING[c].get("kind") != "minichat"]
+        process_minichat = True
         # 未在映射表但存在于任务列表的（如 first_buddy）——只计数展示
         for t in tasks:
             c = t.get("task_code")
@@ -976,6 +1143,27 @@ def process_account(auth, opts, stats):
             stats["skip"] += 1
             continue
         process_task(auth, code, t, opts, stats)
+
+    # 小程序成长任务段（mp 口径）：已完成/可领状态下 only_claim 模式仍可入账（claim 幂等）；
+    # 未完成则点亮判据属写操作，只在非 only_claim 模式触发（与 process_task 的 only_claim 同规则）。
+    if process_minichat:
+        if opts.only_claim and not opts.yes:
+            # only_claim + dry-run：无写操作，专段内部亦只做 dry-run 跳过（源提交 8622910 同）
+            print(f"[task_runner] {uid8} Sequential_Tasks_1: only_claim dry-run 跳过")
+        else:
+            try:
+                t = _mp_task_status(auth, "Sequential_Tasks_1")
+                ast = (t or {}).get("accept_status")
+                if opts.only_claim and ast not in ("completed", "claimed"):
+                    # only_claim 只入账已完成/已领任务；未完成不点亮
+                    print(f"[task_runner] {uid8} Sequential_Tasks_1: only_claim 跳过（未 completed）")
+                    stats["total"] += 1
+                    stats["pending"] += 1
+                else:
+                    process_minichat_task(auth, "Sequential_Tasks_1", opts, stats)
+            except Exception as e:
+                print(f"[task_runner] {uid8} Sequential_Tasks_1: mp 查询失败: {e}")
+                stats["fail"] += 1
 
 
 # --------------------------------------------------------------------------

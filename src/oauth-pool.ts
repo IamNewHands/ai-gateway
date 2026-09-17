@@ -331,6 +331,41 @@ const costKey = (providerId: string, uid: string, model: string) => `${providerI
 export const COST_OBSERVATION_TTL_MS = 6 * 60 * 60 * 1000 // 6 小时观测有效期
 
 /**
+ * 成本分层**条件探索**的运行态（移植 workbuddy2api 81ff728 + 5deb3c6）。
+ *
+ * 默认 `0` = 完全关闭（行为与移植前逐字一致，对齐源 `pool.cost_explore_interval: "0"`）。
+ * 打开后：tier 0 垄断层存在、tier 1 有成员、且距上次探索 ≥ 窗口时，本次 pick 生效层切
+ * tier 1-only（搭车改道，零新增上游请求）。运行态不持久化（重启重新计时，学费只付一次）。
+ */
+let costExploreIntervalMs = 0
+const costExploreLast = new Map<string, number>()
+let costExploreEvents = 0
+const exploreKey = (providerId: string, model: string) => `${providerId}\u001f${model}`
+
+/** 设置探索窗口（毫秒）；`0` = 关闭（合法值，对齐源配置 "0"）。 */
+export function setCostExploreInterval(ms: number): void {
+  costExploreIntervalMs = Number.isFinite(ms) && ms > 0 ? ms : 0
+}
+
+/** 探索台账（只读透出，供 /status 与面板解释「为何这次没选最便宜的号」）。 */
+export function costExploreStatus(): { intervalMs: number; eventsTotal: number; perModel: Array<{ providerId: string; model: string; lastAt: number }> } {
+  const perModel: Array<{ providerId: string; model: string; lastAt: number }> = []
+  for (const [k, lastAt] of costExploreLast) {
+    const sep = k.indexOf('\u001f')
+    if (sep < 0) continue
+    perModel.push({ providerId: k.slice(0, sep), model: k.slice(sep + 1), lastAt })
+  }
+  perModel.sort((a, b) => (a.providerId === b.providerId ? (a.model < b.model ? -1 : 1) : a.providerId < b.providerId ? -1 : 1))
+  return { intervalMs: costExploreIntervalMs, eventsTotal: costExploreEvents, perModel }
+}
+
+/** 测试用：重置探索运行态（不影响 interval 配置）。 */
+export function __resetCostExploreForTests(): void {
+  costExploreLast.clear()
+  costExploreEvents = 0
+}
+
+/**
  * 记录实测模型扣费成本（EMA 平滑，alpha=0.3）。
  * 由每次成功响应的 usage.credit 折算而来；tokens<=0 不记录。
  */
@@ -382,6 +417,64 @@ export function getOauthModelCost(
 
 export function __resetOauthModelCostsForTests(): void {
   modelCosts.clear()
+}
+
+/**
+ * 真正**删除**已过期的成本观测条目（移植 workbuddy2api `dcc4918` / `64064ce`，
+ * 对齐源 `pruneExpiredModelCosts`）。
+ *
+ * 背景：`getOauthModelCost` 只做惰性 TTL 判定（过期即返回 tier 1），但内存条目本身
+ * 从不删除——`modelCosts` 是 module 级 Map，per-isolate 只增不减：账号×模型组合
+ * 越多、换号越频繁，泄漏越大（与 `modelCooldowns` 靠 prune 真删的口径不一致）。
+ *
+ * 调用时机：挑号写锁路径（`pickOauthAccount`）内，与模型冷却同处一次遍历。
+ * 返回被删除的条目数（观测/测试用）。
+ */
+export function pruneExpiredModelCosts(now = Date.now()): number {
+  let removed = 0
+  for (const [k, rec] of modelCosts) {
+    if (now - rec.updatedAt > COST_OBSERVATION_TTL_MS) {
+      modelCosts.delete(k)
+      removed++
+    }
+  }
+  return removed
+}
+
+/**
+ * 成本台账快照（移植 workbuddy2api `2493532`，对齐源 `Status.ModelCosts`）。
+ *
+ * 口径与运行态 `getOauthModelCost` 一致：**过期不展示**（TTL 过滤），按 uid+model
+ * 排序保证输出稳定。tier 不单独落字段——由 `costPer1k <= 0` 推导（单一表征，
+ * 避免双重事实源）。无观测返回空数组。
+ *
+ * 只读遍历，不参与选号，零选号风险。
+ */
+export function listOauthModelCosts(
+  now = Date.now(),
+  providerId?: string
+): Array<{ uid: string; model: string; costPer1k: number; lastSeen: number; samples: number; tier: number }> {
+  const out: Array<{ uid: string; model: string; costPer1k: number; lastSeen: number; samples: number; tier: number }> = []
+  for (const [k, rec] of modelCosts) {
+    if (now - rec.updatedAt > COST_OBSERVATION_TTL_MS) continue
+    // key 形态：`${providerId}:${uid}:${model}`；providerId 可能含 ':'，故从两侧切
+    const first = k.indexOf(':')
+    if (first < 0) continue
+    const pid = k.slice(0, first)
+    if (providerId !== undefined && pid !== providerId) continue
+    const rest = k.slice(first + 1)
+    const second = rest.indexOf(':')
+    if (second < 0) continue
+    out.push({
+      uid: rest.slice(0, second),
+      model: rest.slice(second + 1),
+      costPer1k: rec.costPer1k,
+      lastSeen: rec.updatedAt,
+      samples: rec.samples,
+      tier: rec.costPer1k <= 0 ? 0 : 2,
+    })
+  }
+  return out.sort((a, b) => (a.uid === b.uid ? (a.model < b.model ? -1 : a.model > b.model ? 1 : 0) : a.uid < b.uid ? -1 : 1))
 }
 
 /** 兼容迁移：池为空时把单 token（oauth:token:<id>）种子成池账号；返回是否迁移。 */
@@ -488,12 +581,33 @@ export async function pickOauthAccount(
       !opts?.isInFlightFull?.(a.uid, a)
     )
     if (candidates.length > 0) {
+      // 过期成本条目真删（移植 dcc4918：Map 只增不减会 per-isolate 泄漏；
+      // 惰性 TTL 判定不回收条目本身）。放在挑号写路径，与模型冷却同口径。
+      pruneExpiredModelCosts(now)
       // 成本分层：reqModel 非空时，按实测扣费分层只保留最优层
       if (reqModel) {
         let bestTier = 2
         for (const c of candidates) {
           const { tier } = getOauthModelCost(providerId, c.uid, reqModel, now)
           if (tier < bestTier) bestTier = tier
+        }
+        // 条件探索（移植 workbuddy2api 81ff728 + 5deb3c6，默认关闭）：
+        // 成本分层是**硬过滤**——免费号（tier 0）一旦垄断，tier 1 的新号永远拿不到
+        // 实测机会，学习被冻结（"为何总选这个号"的根因）。探索=**搭车改道**：把既有的
+        // 真实用户请求改道给未知号，零新增上游请求（成功即毕业、失败走既有错误策略，
+        // 无探测风暴）。窗口内只探索一次，防并发重复。
+        if (bestTier === 0 && costExploreIntervalMs > 0) {
+          const tier1 = candidates.filter((c) => getOauthModelCost(providerId, c.uid, reqModel, now).tier === 1)
+          if (tier1.length > 0) {
+            const ek = exploreKey(providerId, reqModel)
+            const last = costExploreLast.get(ek) ?? 0
+            if (now - last >= costExploreIntervalMs) {
+              costExploreLast.set(ek, now)
+              costExploreEvents++
+              candidates = tier1
+              bestTier = 1
+            }
+          }
         }
         const inTier = candidates.filter((c) => getOauthModelCost(providerId, c.uid, reqModel, now).tier === bestTier)
         if (bestTier === 2) {
@@ -915,6 +1029,9 @@ export async function listOauthPoolStatus(env: Env, providerId: string): Promise
     lastUsed: pickRuntime.get(runtimeKey(providerId, a.uid))?.lastUsed ?? 0,
     // 6004 模型级限流隔离观测字段（多模型表：透出全部未过期条目，供面板展示"哪些模型还在限额"）
     modelCooldowns: listModelCooldowns(a.state, now),
+    // 成本台账（移植 2493532）：本账号在该 provider 下的实测扣费观测（TTL 内）。
+    // 面板据此解释"为何总选这个号"——成本分层择优的可见依据。
+    modelCosts: listOauthModelCosts(now, providerId).filter((r) => r.uid === a.uid),
     tokenMask: a.token?.access_token ? `${a.token.access_token.slice(0, 8)}••••${a.token.access_token.slice(-6)}` : '',
   }))
 }
