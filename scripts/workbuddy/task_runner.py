@@ -41,6 +41,9 @@
   小程序成长任务（growth 域 X-Client-Platform: miniprogram 专属下发，chat 域同头）：
     Sequential_Tasks_1  在小程序内完成 1 次有效对话（mini chat_request_send，
                         无 activityId——服务端按 source=mini_program 指纹关联） 100c+5e
+    school_season       参与「校园日」有奖活动（jump 落 coffee-activity H5 = school 开学季
+                        同一活动；mini chat_request_send + activityId=school_open_day_2026
+                        点亮，无 activityId 不点亮）                              100c+5e
   仍不可伪造：
     Expert_Philanthropy   真实捐款动作(M8)
 
@@ -67,6 +70,10 @@ import sys, os, json, time, argparse, glob, urllib.request
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import task_common as tc
+# school 模块仅作**事件形状单一事实源**复用（school.mini_chat_event），不复用其 HTTP 层
+# ——mp 上报通道本文件已有（report_mp_events，同 codebuddy.cn 域 + 同 MP 头）。
+# 源提交 e45f39f 的 schoolseason 判据直接调 school.mini_chat_event，勿在此手抄第二份形状。
+import school_open_day_2026 as school
 
 # --------------------------------------------------------------------------
 # 任务映射表（task_code -> 完成定义）
@@ -98,6 +105,11 @@ MAPPING = {
     # 小程序成长任务（growth 域小程序限定）：列表/accept/claim 均需 X-Client-Platform: miniprogram。
     # 该 code 在默认（无 mp 头）任务列表里不存在，必须专段处理，不进 process_task 主循环。
     "Sequential_Tasks_1":     {"kind": "minichat",   "target": 1, "src": "无(mini 对话无activityId)"},
+    # 同一下发口径的「校园日」任务（移植 workbuddy2api e45f39f）：jump_url 落
+    # coffee-activity H5（/events/school-season/），但完成判据走 school 域 activityId 关联
+    # ——一条 mini chat_request_send + activityId=school_open_day_2026 即点亮，
+    # **无 activityId 不点亮**（源实测 0ceb9c7c/f8657995）。accept/claim 均要求 mp 头。
+    "school_season":          {"kind": "schoolseason", "target": 1, "src": "无(mini chat+activityId)"},
     # 不可伪造（真实业务副作用）
     "Expert_Philanthropy":    {"unforgeable": True, "reason": "真实捐款动作(M8)"},
 }
@@ -443,8 +455,9 @@ def ids_for(kind, auth, need, offset=0):
         return [("", {}) for _ in range(need)]
     if kind == "richmeow":
         return [("", {}) for _ in range(need)]
-    if kind in ("buddy5", "library", "minichat"):
-        # history/current 不是顺序语义：buddy5/library/minichat 是固定事件组按需补 1 次（offset 无意义）
+    if kind in ("buddy5", "library", "minichat", "schoolseason"):
+        # history/current 不是顺序语义：buddy5/library/minichat/schoolseason 是固定事件组
+        # 按需补 1 次（offset 无意义）
         return [("", {}) for _ in range(need)]
     return []
 
@@ -739,6 +752,14 @@ def build_event(auth, kind, obj_id, meta, idx):
                 "conversationId": cid, "requestId": cid, "inputLength": 12,
                 "mentionContexts": [], "mentionContextCount": 0, "userId": uid}
 
+    if kind == "schoolseason":
+        # growth 域 school_season（校园日）判据：mini 指纹 chat_request_send +
+        # activityId=school_open_day_2026（与 school 域开学季同 activityId 关联，
+        # 源实测 0ceb9c7c 点亮；**无 activityId 的事件不点亮**）。
+        # 复用 school 模块构造器保证字段与 school 段单一事实源（勿在此手抄第二份形状，
+        # 移植 e45f39f 的「复用不复制」口径）。
+        return school.mini_chat_event(auth, cid)
+
     raise ValueError(f"unknown kind: {kind}")
 
 
@@ -827,7 +848,15 @@ def process_minichat_task(auth, code, opts, stats):
     与 process_task 的 growth 主循环分开处理：该任务在默认（无 mp 头）列表里不存在，
     accept/claim 也要求同一头。实测结论（源提交 8622910）：缺 X-Client-Platform 头时
     accept 返回 task not found。
+
+    同一 mp 下发口径覆盖两个 code（移植 e45f39f 的 spec 化分派）：
+      Sequential_Tasks_1  判据 kind=minichat（无 activityId）
+      school_season       判据 kind=schoolseason（mini chat + activityId）
+    两者仅上报事件形状不同，链路（accept/claim/回读）完全一致。spec 由 MAPPING 提供，
+    未映射的 mp 任务保守跳过（kind 缺省回落 minichat，保持旧行为）。
     """
+    spec = MAPPING.get(code) or {}
+    kind = spec.get("kind") or "minichat"
     uid8 = auth["uid"][:8]
     try:
         t = _mp_task_status(auth, code)
@@ -860,26 +889,25 @@ def process_minichat_task(auth, code, opts, stats):
 
     if not opts.yes:
         print(f"[task_runner] {uid8} {code}: query {ast}({cur}/{target}) -> "
-              f"可点亮(mini chat_request_send)，dry-run 跳过")
+              f"可点亮({kind})，dry-run 跳过")
         stats["pending"] += 1
         return
 
     # 1) accept（mp 头；缺头实测 task not found，见源提交 8622910）
+    #    移植 c793ae3：走同一 _accept_with_verify（读 results[].status + 回读 accept_status
+    #    双重确认 + 重试一次）。mp 段此前只判 st/res，同样漏掉「200+未登记」形态。
     if ast == "not_accepted":
-        st, r = tc.do_post(auth, tc.chat_base(auth), tc.PATH_ACCEPT_TASKS,
-                           {"task_codes": [code]}, headers=MP_PLATFORM_HEADER)
-        res = (((r.get("data") or {}).get("results") or [{}])[0].get("status")
-               if isinstance(r, dict) else r)
-        print(f"[task_runner] {uid8} {code}: accept {st} {res}")
-        time.sleep(opts.gap)
-        if st != 200 or res != "accepted":
+        if not _accept_with_verify(auth, code, uid8, opts.gap, mp=True):
+            print(f"[task_runner] {uid8} {code}: accept 未登记生效，本轮跳过待下次")
             stats["fail"] += 1
             return
 
-    # 2) 判据上报：mini 指纹 chat_request_send（无 activityId），走 codebuddy.cn 域
+    # 2) 判据上报：mini 指纹 chat_request_send（minichat 无 activityId /
+    #    schoolseason 带 activityId=school_open_day_2026），走 codebuddy.cn 域
+    #    （本仓 report_mp_events 与源 school.report_events 同域同头）
     need = max(1, target - cur)
     for i in range(need):
-        ev = build_event(auth, "minichat", "", {}, i)
+        ev = build_event(auth, kind, "", {}, i)
         st, sc = report_mp_events(auth, [ev])
         print(f"[task_runner] {uid8} {code}: report {i + 1}/{need} {st} code={sc} (mini growth)")
         time.sleep(opts.gap)
@@ -994,16 +1022,57 @@ def process_task(auth, code, t, opts, stats):
     light_up(auth, code, spec, cur, target, uid8, opts, stats)
 
 
+def _accept_with_verify(auth, code, uid8, gap, mp=False):
+    """accept 并验证登记生效（移植 workbuddy2api c793ae3）。
+
+    上游存在 **HTTP 200 + msg=OK 但 results[].status 非 accepted / 服务端未落账** 的
+    形态（源实测 4f96ce49）：此时后续上报事件全部不归账——not_accepted 态上报
+    progress 纹丝不动，accept 真正生效后同样事件立即 +1。这正是「13 个任务上报成功
+    却永远点不亮」的根因；旧日志只打 msg，把失败掩盖成成功。
+
+    返回 True=accept 已生效（本轮或此前）；False=重试后仍未生效。
+    判定以**回读 accept_status** 为准（响应 status 只是初筛），失败重试一次。
+
+    mp=True 时带 X-Client-Platform: miniprogram（本仓适配：mp 限定任务缺该头 accept
+    返回 task not found，见源提交 8622910；源实现此 helper 未覆盖 mp 段，本仓把它
+    参数化以便同一判据同时服务 growth 段与 mp 段）。
+    """
+    hdr = MP_PLATFORM_HEADER if mp else None
+    for attempt in (1, 2):
+        if mp:
+            st, r = tc.do_post(auth, tc.chat_base(auth), tc.PATH_ACCEPT_TASKS,
+                               {"task_codes": [code]}, headers=hdr)
+        else:
+            st, r = tc.accept_tasks(auth, [code])
+        status = ""
+        if isinstance(r, dict):
+            results = ((r.get("data") or {}).get("results") or [])
+            status = (results[0].get("status") or "") if results else (r.get("msg") or "")
+        else:
+            status = str(r)
+        # 回读确认登记生效（响应可能说 accepted 但服务端未落账）
+        if mp:
+            t = _mp_task_status(auth, code) or {}
+        else:
+            t = tc.task_status(auth, code) or {}
+        ast = t.get("accept_status") or "not_accepted"
+        ok = (st == 200 and status == "accepted" and ast != "not_accepted")
+        print(f"[task_runner] {uid8} {code}: accept 尝试{attempt} {st} status={status} "
+              f"回读={ast}{' -> 生效' if ok else ''}")
+        if ok:
+            return True
+        time.sleep(gap)
+    return False
+
+
 def light_up(auth, code, spec, cur, target, uid8, opts, stats, cap=0):
-    """accept(若未接) → 按 target 补齐上报 → 回读 → 已满则 claim。"""
+    """accept(若未接，带登记验证与重试) → 按 target 补齐上报 → 回读 → 已满则 claim。"""
     ast = tc.task_status(auth, code)
     ast = ast.get("accept_status") if ast else "not_accepted"
     if ast == "not_accepted":
-        st_a, r_a = tc.accept_tasks(auth, [code])
-        msg = r_a.get("msg") if isinstance(r_a, dict) else r_a
-        print(f"[task_runner] {uid8} {code}: accept {st_a} {msg}")
-        time.sleep(opts.gap)
-        if st_a != 200:
+        # 移植 c793ae3：accept 成功判定必须含登记验证，否则 200+未登记时上报全不归账
+        if not _accept_with_verify(auth, code, uid8, opts.gap):
+            print(f"[task_runner] {uid8} {code}: accept 未登记生效，本轮跳过待下次")
             stats["fail"] += 1
             return
 
@@ -1112,14 +1181,17 @@ def process_account(auth, opts, stats):
         return
 
     by_code = {t.get("task_code"): t for t in tasks}
-    # minichat 段（小程序限定任务）：该 code 在默认（无 mp 头）growth 任务列表里不下发，
+    # minichat 段（小程序限定任务）：这些 code 在默认（无 mp 头）growth 任务列表里不下发，
     # 由 process_minichat_task 专段处理，不进 process_task（否则必然 query 任务不存在）。
-    minichat_in_map = [c for c in MAPPING if MAPPING[c].get("kind") == "minichat"]
+    # 移植 e45f39f：schoolseason 与 minichat 同属 mp 下发口径，一并纳入本段。
+    minichat_in_map = [c for c in MAPPING if MAPPING[c].get("kind") in ("minichat", "schoolseason")]
     if opts.only_codes:
         codes = [c for c in opts.only_codes if c not in minichat_in_map]
         process_minichat = bool(set(opts.only_codes) & set(minichat_in_map))
     else:
-        codes = [c for c in MAPPING if MAPPING[c].get("kind") != "minichat"]
+        # mp 下发口径的两个 code 都排除在 growth 主循环外（它们在默认列表里不存在，
+        # 进了主循环必然 query 任务不存在）；由下面的 mp 专段处理。
+        codes = [c for c in MAPPING if MAPPING[c].get("kind") not in ("minichat", "schoolseason")]
         process_minichat = True
         # 未在映射表但存在于任务列表的（如 first_buddy）——只计数展示
         for t in tasks:
@@ -1149,21 +1221,26 @@ def process_account(auth, opts, stats):
     if process_minichat:
         if opts.only_claim and not opts.yes:
             # only_claim + dry-run：无写操作，专段内部亦只做 dry-run 跳过（源提交 8622910 同）
-            print(f"[task_runner] {uid8} Sequential_Tasks_1: only_claim dry-run 跳过")
+            print(f"[task_runner] {uid8} mp 段: only_claim dry-run 跳过")
         else:
-            try:
-                t = _mp_task_status(auth, "Sequential_Tasks_1")
-                ast = (t or {}).get("accept_status")
-                if opts.only_claim and ast not in ("completed", "claimed"):
-                    # only_claim 只入账已完成/已领任务；未完成不点亮
-                    print(f"[task_runner] {uid8} Sequential_Tasks_1: only_claim 跳过（未 completed）")
-                    stats["total"] += 1
-                    stats["pending"] += 1
-                else:
-                    process_minichat_task(auth, "Sequential_Tasks_1", opts, stats)
-            except Exception as e:
-                print(f"[task_runner] {uid8} Sequential_Tasks_1: mp 查询失败: {e}")
-                stats["fail"] += 1
+            # --only 语义（移植 e45f39f）：指定了 mp code 时只跑指定的（与 growth/school 段一致）；
+            # 未指定则遍历全部 mp 下发口径 code（Sequential_Tasks_1 + school_season）。
+            mp_codes = ([c for c in opts.only_codes if c in minichat_in_map]
+                        if opts.only_codes else minichat_in_map)
+            for mp_code in mp_codes:
+                try:
+                    t = _mp_task_status(auth, mp_code)
+                    ast = (t or {}).get("accept_status")
+                    if opts.only_claim and ast not in ("completed", "claimed"):
+                        # only_claim 只入账已完成/已领任务；未完成不点亮
+                        print(f"[task_runner] {uid8} {mp_code}: only_claim 跳过（未 completed）")
+                        stats["total"] += 1
+                        stats["pending"] += 1
+                    else:
+                        process_minichat_task(auth, mp_code, opts, stats)
+                except Exception as e:
+                    print(f"[task_runner] {uid8} {mp_code}: mp 查询失败: {e}")
+                    stats["fail"] += 1
 
 
 # --------------------------------------------------------------------------

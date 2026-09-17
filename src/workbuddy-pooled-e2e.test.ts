@@ -1049,4 +1049,158 @@ describe('WorkBuddy 池化代理端到端（粘性 + 会话头族 + 协议头）
     const json = await res.json() as { usage: { total_tokens?: number } }
     expect(json.usage.total_tokens).toBe(100)
   })
+
+  /**
+   * 空 content 帧不占 latch（移植 workbuddy2api 94bc325 + f2e51ab，源 issue #142）。
+   *
+   * `gotAnyContent` 的语义是「已采到**非空**正文」。此前两个采集点只判
+   * `typeof content === 'string'`，空串照样置位 → 抢占 latch → 后续真正带正文的
+   * `message` 兜底帧被 `!gotAnyContent` 守卫拒绝 → 客户端拿到 **200 + 空正文**
+   * （既不是错误也不是内容，最坏的失败形态）。
+   *
+   * 下列用例按源 sse_latch_test.go 的五条规格逐条对齐。
+   */
+  it('P0-新增（移植 94bc325 + f2e51ab）：role-only 空 content 首帧不占 latch，后续 message 正文照常采到', async () => {
+    const { env, app } = makeEnv([makeProvider()])
+    await seedPool(env, ['u1'])
+
+    // OpenAI 标准形态：首帧只带 role，content 为空串；正文由后面的完整 message 帧下发
+    const body = [
+      'data: {"id":"x1","choices":[{"index":0,"delta":{"role":"assistant","content":""},"finish_reason":null}]}',
+      '',
+      'data: {"id":"x1","choices":[{"index":0,"message":{"role":"assistant","content":"Hello"}}]}',
+      '',
+      'data: {"id":"x1","choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"total_tokens":5}}',
+      '',
+      'data: [DONE]',
+      '',
+    ].join('\n')
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(body, {
+      status: 200,
+      headers: { 'Content-Type': 'text/event-stream' },
+    })))
+
+    const res = await app.post({
+      model: `${PID}/deepseek-v4-flash`,
+      messages: [{ role: 'user', content: 'hi' }],
+      stream: false,
+    })
+    expect(res.status).toBe(200)
+    const json = await res.json() as { choices: { message: { content: string } }[] }
+    expect(json.choices[0].message.content).toBe('Hello')
+  })
+
+  it('P0-新增对照：空 content 的 message 帧不占 latch（此前 200 + 空正文）', async () => {
+    const { env, app } = makeEnv([makeProvider()])
+    await seedPool(env, ['u1'])
+
+    const body = [
+      'data: {"id":"x1","choices":[{"index":0,"message":{"role":"assistant","content":""}}]}',
+      '',
+      'data: {"id":"x1","choices":[{"index":0,"message":{"role":"assistant","content":"Hello"}}]}',
+      '',
+      'data: [DONE]',
+      '',
+    ].join('\n')
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(body, {
+      status: 200,
+      headers: { 'Content-Type': 'text/event-stream' },
+    })))
+
+    const res = await app.post({
+      model: `${PID}/deepseek-v4-flash`,
+      messages: [{ role: 'user', content: 'hi' }],
+      stream: false,
+    })
+    const json = await res.json() as { choices: { message: { content: string } }[] }
+    expect(json.choices[0].message.content).toBe('Hello')
+  })
+
+  it('P0-新增：空 content 帧仍照常合并 role / reasoning_content / tool_calls（不因跳过 content 而丢字段）', async () => {
+    const { env, app } = makeEnv([makeProvider()])
+    await seedPool(env, ['u1'])
+
+    const body = [
+      'data: {"id":"x1","choices":[{"index":0,"message":{"role":"assistant","content":"","reasoning_content":"think","tool_calls":[{"index":0,"id":"call_a","type":"function","function":{"name":"get_weather","arguments":"{\\"city\\":\\"北京\\"}"}}]}}]}',
+      '',
+      'data: {"id":"x1","choices":[{"index":0,"message":{"role":"assistant","content":"Hello"}}]}',
+      '',
+      'data: [DONE]',
+      '',
+    ].join('\n')
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(body, {
+      status: 200,
+      headers: { 'Content-Type': 'text/event-stream' },
+    })))
+
+    const res = await app.post({
+      model: `${PID}/deepseek-v4-flash`,
+      messages: [{ role: 'user', content: 'hi' }],
+      stream: false,
+    })
+    const json = await res.json() as {
+      choices: { message: { role: string; content: string; reasoning_content?: string; tool_calls?: { function: { name: string } }[] } }[]
+    }
+    const msg = json.choices[0].message
+    expect(msg.content).toBe('Hello')
+    expect(msg.role).toBe('assistant')
+    expect(msg.reasoning_content).toBe('think')
+    expect(msg.tool_calls).toHaveLength(1)
+    expect(msg.tool_calls![0].function.name).toBe('get_weather')
+  })
+
+  it('P0-新增对照：delta 已采到非空正文后，message 兜底帧仍被 latch 挡住（去重语义不回退）', async () => {
+    const { env, app } = makeEnv([makeProvider()])
+    await seedPool(env, ['u1'])
+
+    // delta 路径先出 "ab"，随后一帧带完整 message "abcd" —— 兜底必须被拒，否则正文被重复追加
+    const body = [
+      'data: {"id":"x1","choices":[{"index":0,"delta":{"role":"assistant","content":"ab"}}]}',
+      '',
+      'data: {"id":"x1","choices":[{"index":0,"message":{"role":"assistant","content":"abcd"}}]}',
+      '',
+      'data: [DONE]',
+      '',
+    ].join('\n')
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(body, {
+      status: 200,
+      headers: { 'Content-Type': 'text/event-stream' },
+    })))
+
+    const res = await app.post({
+      model: `${PID}/deepseek-v4-flash`,
+      messages: [{ role: 'user', content: 'hi' }],
+      stream: false,
+    })
+    const json = await res.json() as { choices: { message: { content: string } }[] }
+    expect(json.choices[0].message.content).toBe('ab')
+  })
+
+  it('P0-新增对照：整条流全是空 content 帧 → 200 + 空正文（不误判为上游失败）', async () => {
+    const { env, app } = makeEnv([makeProvider()])
+    await seedPool(env, ['u1'])
+
+    // 有有效数据事件（validEvents>0），故不触发空流哨兵；空正文是上游真实输出
+    const body = [
+      'data: {"id":"x1","choices":[{"index":0,"delta":{"role":"assistant","content":""}}]}',
+      '',
+      'data: {"id":"x1","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}',
+      '',
+      'data: [DONE]',
+      '',
+    ].join('\n')
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(body, {
+      status: 200,
+      headers: { 'Content-Type': 'text/event-stream' },
+    })))
+
+    const res = await app.post({
+      model: `${PID}/deepseek-v4-flash`,
+      messages: [{ role: 'user', content: 'hi' }],
+      stream: false,
+    })
+    expect(res.status).toBe(200)
+    const json = await res.json() as { choices: { message: { content: string } }[] }
+    expect(json.choices[0].message.content).toBe('')
+  })
 })

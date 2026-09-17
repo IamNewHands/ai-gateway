@@ -378,11 +378,25 @@ async function aggregateWorkbuddySSE(
   let created = 0
   let usage: Record<string, unknown> | null = null
   /**
-   * 正文是否已从 delta 路径采过（对齐源实现 `gotAnyContent`）。
+   * 正文是否已采过**非空**内容（对齐源实现 `gotAnyContent`）。
    * 非 delta 的 `choices[].message` 兜底分支受它守卫：一帧整条 message 之后不再拼接，
    * 否则「每帧都带完整 message」的上游会把正文重复 N 遍（N = 帧数）。
+   * 置位只发生在 appendContent 内，且**空串不置位**（源 issue #142）。
    */
   let gotAnyContent = false
+  /**
+   * 正文唯一写入点（移植 workbuddy2api f2e51ab，对齐源 `appendContent`）。
+   *
+   * 两条采集路径（delta 分片 / 非 delta 整条 message）共用它，保证「空串不占 latch」
+   * 的口径只有一处定义：空串既无字节可追加，也不构成「已采到正文」。此前两处各自
+   * `if (typeof x === 'string') { content += x; gotAnyContent = true }`，空串同样置位
+   * （源 issue #142），使后续真正带正文的帧被 `!gotAnyContent` 守卫丢弃 → 200 + 空正文。
+   */
+  const appendContent = (txt: unknown) => {
+    if (typeof txt !== 'string' || txt === '') return
+    content += txt
+    gotAnyContent = true
+  }
   /** 上游显式发过 `data: [DONE]`（正常收尾）。见 P1-2 截断判定。 */
   let sawDone = false
   const toolCalls: Map<number, Record<string, unknown>> = new Map()
@@ -482,10 +496,8 @@ async function aggregateWorkbuddySSE(
    */
   function mergeMessageFields(msg: Record<string, unknown>) {
     if (typeof msg.role === 'string' && msg.role !== '') role = msg.role
-    if (typeof msg.content === 'string') {
-      content += msg.content
-      gotAnyContent = true
-    }
+    // 空串 content 不占 latch：appendContent 内部已排除空串（移植 94bc325 + f2e51ab）
+    if (typeof msg.content === 'string') appendContent(msg.content)
     if (typeof msg.reasoning_content === 'string') reasoning += msg.reasoning_content
     if (Array.isArray(msg.tool_calls)) mergeToolCallsChunk(msg.tool_calls)
   }
@@ -558,10 +570,10 @@ async function aggregateWorkbuddySSE(
           const delta = choice?.delta
           if (delta && typeof delta === 'object') {
             if (delta.role) role = delta.role
-            if (typeof delta.content === 'string') {
-              content += delta.content
-              gotAnyContent = true
-            }
+            // 空串 content 不占 latch（移植 94bc325 + f2e51ab）：role-only 首帧
+            // （`delta.content=""`）此前会占住 gotAnyContent，使后续整条 message 兜底帧
+            // 被拒 → 200 + 空正文。此处与 mergeMessageFields 共用 appendContent。
+            if (typeof delta.content === 'string') appendContent(delta.content)
             if (typeof delta.reasoning_content === 'string') reasoning += delta.reasoning_content
             if (Array.isArray(delta.tool_calls)) {
               // 缺 index 的分派见 mergeToolCallsChunk（移植 5c2db2f）
