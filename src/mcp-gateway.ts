@@ -1,6 +1,7 @@
 import { Context } from 'hono'
 import { getMcps } from './storage'
 import { isSafeHttpUrl } from './admin'
+import { MAX_ADMIN_REQUEST_BYTES, RequestBodyError, readStrictJSONLimited } from './request-body'
 import type { AppEnv, Env, McpServer } from './types'
 
 /**
@@ -152,8 +153,12 @@ async function fetchAllTools(
 export async function handleMcpJsonRpc(c: Context<AppEnv>): Promise<Response> {
   let body: { id?: unknown; jsonrpc?: string; method?: string; params?: Record<string, unknown> }
   try {
-    body = await c.req.json()
-  } catch {
+    // 有界读取：JSON-RPC 信封很小，裸 c.req.json() 会让超大 body 先被完整缓冲。
+    body = await readStrictJSONLimited<typeof body>(c.req.raw, MAX_ADMIN_REQUEST_BYTES)
+  } catch (err) {
+    // 超限不是 JSON-RPC 的 "Parse error"（-32700），单独走全局 onError → 413，
+    // 避免把"请求体过大"误报成"报文语法错误"而误导客户端去改语法。
+    if (err instanceof RequestBodyError && err.code === 'REQUEST_TOO_LARGE') throw err
     return c.json(rpcError(null, MCP_JSONRPC_VERSION, -32700, 'Parse error'), 400)
   }
 

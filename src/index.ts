@@ -3,7 +3,7 @@ import { cors } from 'hono/cors'
 import { logger } from 'hono/logger'
 import { adminAuthMiddleware, cloudflareAccessMiddleware, proxyKeyAuthMiddleware, managementAuthMiddleware, handleLogin, handleLogout } from './auth'
 import { handleProxy, handleModels, handleAnthropicMessages, handleResponses } from './proxy'
-import { RequestBodyError } from './request-body'
+import { RequestBodyError, readJSONLimited, readFormDataLimited, MAX_IMAGE_REQUEST_BYTES, MAX_IMAGE_BINARY_BYTES } from './request-body'
 import { handleImageGeneration, handleImageFile } from './m365/images'
 import { isM365Provider } from './m365/proxy'
 import { handleProxyWebSocket } from './ws'
@@ -351,6 +351,12 @@ app.all('/admin/api/m365/accounts/:id', handleM365Accounts)
 // M365 账号池底层存储诊断（只读，排查"面板空"）
 app.get('/admin/api/m365/diag', handleM365Diag)
 
+/** multipart 字段读取：非字符串（缺省或文件）一律按未提供处理，与修复前 parseBody 的取值语义一致 */
+function formString(form: FormData, name: string): string | undefined {
+  const value = form.get(name)
+  return typeof value === 'string' ? value : undefined
+}
+
 // M365 DALL-E 图片生成（/v1/images/generations, /v1/images/edits）—— 需在通用转发之前注册
 app.post('/v1/images/generations', async (c) => {
   const providers = (await getProviders(c.env)) as Provider[]
@@ -358,17 +364,19 @@ app.post('/v1/images/generations', async (c) => {
   if (!m365) {
     return c.json({ error: { message: 'no M365 account configured for image generation', type: 'configuration_error' } }, 503)
   }
-  const body = await c.req.json().catch(() => ({}))
+  // 有界读取：图片入口此前用裸 c.req.json()，超大请求体会被完整缓冲后才解析。
+  const body = await readJSONLimited<Record<string, unknown>>(c.req.raw, MAX_IMAGE_REQUEST_BYTES)
   if (typeof body['prompt'] !== 'string' || !body['prompt'].trim()) {
     return c.json({ error: { message: 'prompt is required', type: 'invalid_request_error' } }, 400)
   }
   return handleImageGeneration(c.env, m365, {
     prompt: body['prompt'],
-    model: body['model'],
-    n: body['n'],
-    size: body['size'],
-    response_format: body['response_format'],
-    user: body['user'],
+    // 其余字段不做 wire 校验（与修复前一致），交由 handleImageGeneration 校验参数
+    model: body['model'] as string | undefined,
+    n: body['n'] as number | undefined,
+    size: body['size'] as string | undefined,
+    response_format: body['response_format'] as 'url' | 'b64_json' | undefined,
+    user: body['user'] as string | undefined,
     operation: 'generation',
     baseUrl: new URL(c.req.url).origin,
   })
@@ -381,10 +389,21 @@ app.post('/v1/images/edits', async (c) => {
   }
   const ct = c.req.header('Content-Type') || ''
   if (ct.includes('multipart/form-data')) {
-    const form = await c.req.parseBody()
-    const file = form['image'] as File | undefined
-    if (!file) {
+    // 有界读取：c.req.parseBody() 直接读原始流、无任何上界。
+    const form = await readFormDataLimited(c.req.raw, MAX_IMAGE_REQUEST_BYTES)
+    // @cloudflare/workers-types 把 FormData.get 标注为 string|null，但 multipart 文件字段运行时是 File；
+    // 这里显式区分：字符串字段（含把 image 当文本字段误传）按"缺少图片"处理，与 OpenAI edits 契约一致。
+    const fileField = form.get('image') as unknown
+    if (!fileField || typeof fileField === 'string') {
       return c.json({ error: { message: 'image is required', type: 'invalid_request_error' } }, 400)
+    }
+    const file = fileField as File
+    // 单图体积上界：在 arrayBuffer()/base64 之前判断，避免对超大文件做一次全量拷贝与 4/3 膨胀。
+    if (file.size === 0) {
+      return c.json({ error: { message: 'image must be non-empty', type: 'invalid_request_error' } }, 400)
+    }
+    if (file.size > MAX_IMAGE_BINARY_BYTES) {
+      return c.json({ error: { message: `image exceeds ${MAX_IMAGE_BINARY_BYTES} bytes`, type: 'invalid_request_error', code: 'IMAGE_TOO_LARGE' } }, 413)
     }
     const buf = await file.arrayBuffer()
     // 分块转 base64：展开运算符对真实图片（几十万字节）会超出参数上限直接 RangeError
@@ -396,11 +415,11 @@ app.post('/v1/images/edits', async (c) => {
     }
     const b64 = btoa(binary)
     return handleImageGeneration(c.env, m365, {
-      prompt: typeof form['prompt'] === 'string' ? form['prompt'] : '',
-      model: typeof form['model'] === 'string' ? form['model'] : undefined,
-      n: typeof form['n'] === 'string' ? parseInt(form['n']) : undefined,
-      size: typeof form['size'] === 'string' ? form['size'] : undefined,
-      response_format: typeof form['response_format'] === 'string' ? form['response_format'] as 'url' | 'b64_json' : undefined,
+      prompt: formString(form, 'prompt') ?? '',
+      model: formString(form, 'model'),
+      n: (() => { const raw = formString(form, 'n'); return raw !== undefined ? parseInt(raw) : undefined })(),
+      size: formString(form, 'size'),
+      response_format: formString(form, 'response_format') as 'url' | 'b64_json' | undefined,
       operation: 'edit',
       image: b64,
       imageType: file.type,
@@ -408,16 +427,22 @@ app.post('/v1/images/edits', async (c) => {
     })
   }
   // JSON body
-  const body = await c.req.json().catch(() => ({}))
+  const body = await readJSONLimited<Record<string, unknown>>(c.req.raw, MAX_IMAGE_REQUEST_BYTES)
+  // 与 generations 分支对齐：prompt 必填。此前 edits 分支缺失该校验，空 prompt 会被拼进
+  // 上游指令模板（"...Instructions: . Preserve everything..."）后才由 M365 以难以归因的
+  // 方式失败，客户端拿到的是上游错误而不是明确的 400。
+  if (typeof body['prompt'] !== 'string' || !body['prompt'].trim()) {
+    return c.json({ error: { message: 'prompt is required', type: 'invalid_request_error' } }, 400)
+  }
   return handleImageGeneration(c.env, m365, {
     prompt: body['prompt'],
-    model: body['model'],
-    n: body['n'],
-    size: body['size'],
-    response_format: body['response_format'],
+    model: body['model'] as string | undefined,
+    n: body['n'] as number | undefined,
+    size: body['size'] as string | undefined,
+    response_format: body['response_format'] as 'url' | 'b64_json' | undefined,
     operation: 'edit',
-    image: body['image'],
-    imageType: body['image_type'],
+    image: body['image'] as string | undefined,
+    imageType: body['image_type'] as string | undefined,
     baseUrl: new URL(c.req.url).origin,
   })
 })
@@ -455,10 +480,13 @@ app.onError((err, c) => {
   if (err instanceof SyntaxError && /Unexpected (end of JSON input|token)/i.test(err.message)) {
     return c.json({ error: { message: '请求体 JSON 格式错误', type: 'bad_request' } }, 400)
   }
-  // 入站请求体有界读取错误（移植 M365-Gateway request-body.ts）：超限 413，非法 JSON 400。
+  // 入站请求体有界读取错误（移植 M365-Gateway request-body.ts）：超限 413，非法 JSON/multipart 400。
   if (err instanceof RequestBodyError) {
     if (err.code === 'REQUEST_TOO_LARGE') {
       return c.json({ error: { message: 'request body exceeds configured limit', type: 'invalid_request_error', code: 'REQUEST_TOO_LARGE' } }, 413)
+    }
+    if (err.code === 'INVALID_MULTIPART') {
+      return c.json({ error: { message: 'multipart 请求体格式错误', type: 'invalid_request_error', code: 'INVALID_MULTIPART' } }, 400)
     }
     return c.json({ error: { message: '请求体 JSON 格式错误', type: 'invalid_request_error', code: 'INVALID_JSON' } }, 400)
   }

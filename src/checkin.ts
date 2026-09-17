@@ -65,6 +65,7 @@ import {
   ACTIVITY_ACCOUNT_DELAY_MS,
 } from './workbuddy-billing'
 import { queryUsageOverview } from './analytics/query'
+import { MAX_ADMIN_REQUEST_BYTES, readOptionalJSONLimited } from './request-body'
 
 /**
  * 国际版注册地区默认兜底（取不到白名单时用，region 完善提交所需）。
@@ -939,8 +940,8 @@ export async function runAllCheckins(env: Env, silent = false, opts?: { interact
 
 /** POST /admin/api/checkin 或 /api/manage/checkin：手动触发签到。body 可选 {id} 单个。 */
 export async function handleCheckinTrigger(c: Context<{ Bindings: Env }>) {
-  let body: { id?: string; silent?: boolean } = {}
-  try { body = await c.req.json() } catch { /* 空 body，全量 */ }
+  // 有界读取：body 可选（空 → 全量签到），容错语义与原 try/catch 一致；超限仍 413。
+  const body = await readOptionalJSONLimited<{ id?: string; silent?: boolean }>(c.req.raw, MAX_ADMIN_REQUEST_BYTES)
   const id = body.id?.trim()
 
   if (id) {

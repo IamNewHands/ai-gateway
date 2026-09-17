@@ -41,6 +41,7 @@ import {
 import { isTraeProvider } from './proxy'
 import type { TraeAccount, TraeCheckinResult, TraeLoginState, TraeModelInfo, TraeAccountStatus, TraeEntPackInfo } from './types'
 import { writeLog } from '../admin'
+import { MAX_ADMIN_REQUEST_BYTES, readOptionalJSONLimited } from '../request-body'
 
 // ===== 工具 =====
 
@@ -131,8 +132,9 @@ export async function handleTraeLoginCallback(c: Context<AppEnv>) {
   const provider = await getProvider(c.env, id)
   if (!provider) return c.json<ApiResponse>({ success: false, message: '提供商不存在' }, 404)
 
-  let body: { callbackUrl?: string } = {}
-  try { body = await c.req.json() } catch { /* 空 body */ }
+  // 有界读取：readOptionalJSONLimited 已内含"空/非法 body → {}"容错（等价于原 try/catch），
+  // 但超限仍抛 REQUEST_TOO_LARGE 交给全局 onError → 413，不被这里吞掉。
+  const body = await readOptionalJSONLimited<{ callbackUrl?: string }>(c.req.raw, MAX_ADMIN_REQUEST_BYTES)
   const callbackUrl = (body.callbackUrl || '').trim()
   if (!callbackUrl) return c.json<ApiResponse>({ success: false, message: '缺少 callbackUrl' }, 400)
 
@@ -519,8 +521,7 @@ export async function handleTraeSetPrefer(c: Context<AppEnv>) {
   if (!id) return c.json<ApiResponse>({ success: false, message: '缺少 id 参数' }, 400)
   const provider = await getProvider(c.env, id)
   if (!provider) return c.json<ApiResponse>({ success: false, message: '提供商不存在' }, 404)
-  let body: { uid?: string } = {}
-  try { body = await c.req.json() } catch { /* 空 body */ }
+  const body = await readOptionalJSONLimited<{ uid?: string }>(c.req.raw, MAX_ADMIN_REQUEST_BYTES)
   const uid = (body.uid || '').trim()
   // 校验 uid 必须是已配置账号，防止乱填
   const uids = getTraeAccounts(provider).map(a => a.uid)
@@ -535,8 +536,7 @@ export async function handleTraeAccountRemove(c: Context<AppEnv>) {
   if (!id) return c.json<ApiResponse>({ success: false, message: '缺少 id 参数' }, 400)
   const provider = await getProvider(c.env, id)
   if (!provider) return c.json<ApiResponse>({ success: false, message: '提供商不存在' }, 404)
-  let body: { uid?: string } = {}
-  try { body = await c.req.json() } catch { /* 空 body */ }
+  const body = await readOptionalJSONLimited<{ uid?: string }>(c.req.raw, MAX_ADMIN_REQUEST_BYTES)
   const uid = (body.uid || '').trim()
   if (!uid) return c.json<ApiResponse>({ success: false, message: '缺少 uid' }, 400)
   const removed = await removeTraeAccount(c.env, id, uid)

@@ -12,6 +12,7 @@
 import type { Env, Provider } from '../types'
 import { isM365Provider } from './proxy'
 import { getM365Account, updateM365RefreshToken, M365_OAUTH } from './oauth'
+import { base64ByteLength, MAX_IMAGE_BINARY_BYTES } from '../request-body'
 
 /** DALL-E 请求格式 */
 interface ImageGenRequest {
@@ -222,6 +223,18 @@ export async function handleImageGeneration(
 
   if (isEdit && !body.image) {
     return new Response(JSON.stringify({ error: { message: 'image is required for edits', type: 'invalid_request_error' } }), { status: 400, headers: { 'Content-Type': 'application/json' } })
+  }
+
+  // 单图体积上界：必须在拼接 data: URL 之前判断——拼接与后续 JSON.stringify 会让同一份
+  // base64 在内存中出现多份（原始字符串 + data URL + 请求体副本），之后再查已无意义。
+  if (isEdit && body.image) {
+    const imageBytes = base64ByteLength(body.image)
+    if (imageBytes === 0) {
+      return new Response(JSON.stringify({ error: { message: 'image must be non-empty base64', type: 'invalid_request_error' } }), { status: 400, headers: { 'Content-Type': 'application/json' } })
+    }
+    if (imageBytes > MAX_IMAGE_BINARY_BYTES) {
+      return new Response(JSON.stringify({ error: { message: `image exceeds ${MAX_IMAGE_BINARY_BYTES} bytes`, type: 'invalid_request_error', code: 'IMAGE_TOO_LARGE' } }), { status: 413, headers: { 'Content-Type': 'application/json' } })
+    }
   }
 
   // 构造图片生成 prompt

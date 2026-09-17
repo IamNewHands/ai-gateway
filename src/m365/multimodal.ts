@@ -7,10 +7,13 @@
  * discarded.
  */
 
+import { MAX_IMAGE_BINARY_BYTES } from '../request-body'
+
 const MAX_CONTENT_PARTS = 256
 const MAX_IMAGES = 8
 const MAX_IMAGE_URL_CHARACTERS = 8_192
-const MAX_DATA_IMAGE_BYTES = 4 * 1_024 * 1_024
+// 单图解码后字节上限与图片编辑入口共用同一条预算（定义在 request-body.ts，避免两处各写一份漂移）。
+const MAX_DATA_IMAGE_BYTES = MAX_IMAGE_BINARY_BYTES
 const MAX_TOTAL_DATA_IMAGE_BYTES = 6 * 1_024 * 1_024
 // Base64 expands binary data by roughly 4/3. Reject an obviously oversized
 // data URI before the anchored regexp and per-character validator allocate or

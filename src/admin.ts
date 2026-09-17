@@ -26,6 +26,7 @@ import {
 } from './storage'
 import { testModelConnection } from './proxy'
 import { probeMcpServers } from './mcp-gateway'
+import { MAX_ADMIN_REQUEST_BYTES, readOptionalJSONLimited, readStrictJSONLimited } from './request-body'
 import { isTraeProvider, testTraeCredential, testTraeModel } from './trae/proxy'
 import { fetchOpenCodeModels, isOpenCodeProvider, resolveOpenCodeUrls, testOpenCodeModel } from './opencode'
 import { isQoderProvider, fetchQoderModels } from './qoder/proxy'
@@ -212,7 +213,7 @@ export async function handleGetProviders(c: Context<AppEnv>) {
 }
 
 export async function handleCreateProvider(c: Context<AppEnv>) {
-  const body = await c.req.json<CreateProviderRequest>()
+  const body = await readStrictJSONLimited<CreateProviderRequest>(c.req.raw, MAX_ADMIN_REQUEST_BYTES)
   // opencode 未传地址时自动填充
   if (body.id === 'opencode' && !body.baseUrl) {
     body.baseUrl = OPENCODE_DEFAULT_URL
@@ -281,7 +282,7 @@ export async function handleCreateProvider(c: Context<AppEnv>) {
 export async function handleUpdateProvider(c: Context<AppEnv>) {
   const id = c.req.param('id')
   if (!id) return c.json<ApiResponse>({ success: false, message: '缺少 id 参数' }, 400)
-  const body = await c.req.json<UpdateProviderRequest>()
+  const body = await readStrictJSONLimited<UpdateProviderRequest>(c.req.raw, MAX_ADMIN_REQUEST_BYTES)
 
   const existing = await getProvider(c.env, id)
   if (!existing) {
@@ -361,7 +362,7 @@ export async function handleUpdateProvider(c: Context<AppEnv>) {
  * 供 /api/manage/providers/upsert 使用（需 managementAuthMiddleware）。
  */
 export async function handleUpsertProvider(c: Context<AppEnv>) {
-  const body = await c.req.json<UpsertProviderRequest>()
+  const body = await readStrictJSONLimited<UpsertProviderRequest>(c.req.raw, MAX_ADMIN_REQUEST_BYTES)
   if (!body.id) {
     return c.json<ApiResponse>({ success: false, message: 'id 为必填项' }, 400)
   }
@@ -517,7 +518,7 @@ export async function handleDeleteProvider(c: Context<AppEnv>) {
 export async function handleTestModel(c: Context<AppEnv>) {
   const id = c.req.param('id')
   if (!id) return c.json<ApiResponse>({ success: false, message: '缺少 id 参数' }, 400)
-  const { modelId } = await c.req.json<TestModelRequest>()
+  const { modelId } = await readStrictJSONLimited<TestModelRequest>(c.req.raw, MAX_ADMIN_REQUEST_BYTES)
 
   if (!modelId) {
     return c.json<ApiResponse>({ success: false, message: 'modelId 为必填项' }, 400)
@@ -686,12 +687,12 @@ export async function handleTestModel(c: Context<AppEnv>) {
 // ===== Key / 模型连通性测试（通过服务端代理，避免 CORS） =====
 
 export async function handleTestKeyNew(c: Context<AppEnv>) {
-  const { url, apiKey, apiType, providerId } = await c.req.json<{
+  const { url, apiKey, apiType, providerId } = await readStrictJSONLimited<{
     url: string
     apiKey: string
     apiType?: string
     providerId?: string
-  }>()
+  }>(c.req.raw, MAX_ADMIN_REQUEST_BYTES)
   // CNB 免 Key：允许无 apiKey，由 providerId 判定
   let cnbProvider: Provider | null = null
   if (providerId) {
@@ -906,13 +907,13 @@ export async function handleTestKeyNew(c: Context<AppEnv>) {
 }
 
 export async function handleTestModelNew(c: Context<AppEnv>) {
-  const { url, apiKey, apiType, model, providerId } = await c.req.json<{
+  const { url, apiKey, apiType, model, providerId } = await readStrictJSONLimited<{
     url: string
     apiKey: string
     apiType?: string
     model: string
     providerId?: string
-  }>()
+  }>(c.req.raw, MAX_ADMIN_REQUEST_BYTES)
   if (!url || !model || (!apiKey && !(isOpenCodeProvider(providerId || '') || (providerId && isCnbProvider({ id: providerId } as Provider))))) {
     return c.json<ApiResponse>({ success: false, message: 'url、apiKey、model 为必填项' }, 400)
   }
@@ -1061,7 +1062,7 @@ export async function handleGetMcps(c: Context<AppEnv>) {
 }
 
 export async function handleCreateMcp(c: Context<AppEnv>) {
-  const body = await c.req.json<Partial<McpServer>>()
+  const body = await readStrictJSONLimited<Partial<McpServer>>(c.req.raw, MAX_ADMIN_REQUEST_BYTES)
   const mcps = await getMcps(c.env)
   const v = validateMcpInput(body, new Set(mcps.map((m) => m.name)))
   if (!v.ok) {
@@ -1079,7 +1080,7 @@ export async function handleCreateMcp(c: Context<AppEnv>) {
  * 逐个校验，非法项跳过并在 errors 中说明；已创建的整批一次性写入 KV。
  */
 export async function handleMcpsBatch(c: Context<AppEnv>) {
-  const rawBody = await c.req.json<Array<Partial<McpServer>> | { mcps?: Array<Partial<McpServer>> }>()
+  const rawBody = await readStrictJSONLimited<Array<Partial<McpServer>> | { mcps?: Array<Partial<McpServer>> }>(c.req.raw, MAX_ADMIN_REQUEST_BYTES)
   const items = Array.isArray(rawBody) ? rawBody : rawBody?.mcps
   if (!Array.isArray(items) || items.length === 0) {
     return c.json<ApiResponse>({ success: false, message: '请求体必须是非空数组（或 { mcps: [...] }）' }, 400)
@@ -1129,7 +1130,7 @@ export async function handleMcpHealthAdmin(c: Context<AppEnv>) {
 export async function handleUpdateMcp(c: Context<AppEnv>) {
   const id = c.req.param('id')
   if (!id) return c.json<ApiResponse>({ success: false, message: '缺少 id 参数' }, 400)
-  const body = await c.req.json<Partial<McpServer>>()
+  const body = await readStrictJSONLimited<Partial<McpServer>>(c.req.raw, MAX_ADMIN_REQUEST_BYTES)
 
   const updates: Partial<McpServer> = {}
   if (body.name !== undefined) {
@@ -1174,7 +1175,7 @@ export async function handleGetUnimodels(c: Context<AppEnv>) {
 }
 
 export async function handleCreateUnimodel(c: Context<AppEnv>) {
-  const body = await c.req.json<Partial<UniModel>>()
+  const body = await readStrictJSONLimited<Partial<UniModel>>(c.req.raw, MAX_ADMIN_REQUEST_BYTES)
   if (!body.name) {
     return c.json<ApiResponse>({ success: false, message: 'name 为必填项' }, 400)
   }
@@ -1204,7 +1205,7 @@ export async function handleCreateUnimodel(c: Context<AppEnv>) {
 export async function handleUpdateUnimodel(c: Context<AppEnv>) {
   const id = c.req.param('id')
   if (!id) return c.json<ApiResponse>({ success: false, message: '缺少 id 参数' }, 400)
-  const body = await c.req.json<Partial<UniModel>>()
+  const body = await readStrictJSONLimited<Partial<UniModel>>(c.req.raw, MAX_ADMIN_REQUEST_BYTES)
 
   const updates: Partial<UniModel> = {}
   if (body.name !== undefined) {
@@ -1270,7 +1271,7 @@ export async function handleGetProxyKeys(c: Context<AppEnv>) {
 }
 
 export async function handleCreateProxyKey(c: Context<AppEnv>) {
-  const body = await c.req.json<CreateProxyKeyRequest>()
+  const body = await readStrictJSONLimited<CreateProxyKeyRequest>(c.req.raw, MAX_ADMIN_REQUEST_BYTES)
   const id = crypto.randomUUID()
   const randomPart = crypto.randomUUID().replace(/-/g, '')
   const key = `${PROXY_KEY_PREFIX}${randomPart}`
@@ -1322,13 +1323,13 @@ export async function handleDeleteProxyKey(c: Context<AppEnv>) {
 export async function handleUpdateProxyKey(c: Context<AppEnv>) {
   const id = c.req.param('id')
   if (!id) return c.json<ApiResponse>({ success: false, message: '缺少 id 参数' }, 400)
-  const body = await c.req.json<{
+  const body = await readStrictJSONLimited<{
     enabled?: boolean
     allowedModels?: string[]
     expiresIn?: string
     expiresInDays?: number
     expiresInHours?: number
-  }>()
+  }>(c.req.raw, MAX_ADMIN_REQUEST_BYTES)
   const updates: Partial<import('./types').ProxyKey> = {}
   if (body.enabled !== undefined) updates.enabled = body.enabled
   if (body.allowedModels !== undefined) updates.allowedModels = body.allowedModels
@@ -1439,7 +1440,7 @@ export async function handleOAuthPoolRemove(c: Context<AppEnv>) {
   if (!isOAuthPoolProvider(provider) && !isQoder) {
     return c.json<ApiResponse>({ success: false, message: '该提供商不是多账号池模式' }, 400)
   }
-  const body = await c.req.json<{ uid?: string }>().catch(() => ({})) as { uid?: string }
+  const body = await readOptionalJSONLimited<{ uid?: string }>(c.req.raw, MAX_ADMIN_REQUEST_BYTES)
   const uid = String(body?.uid || '').trim()
   if (!uid) return c.json<ApiResponse>({ success: false, message: '缺少 uid 参数' }, 400)
   const removed = isQoder
@@ -1459,7 +1460,7 @@ export async function handleOAuthPoolSetPrefer(c: Context<AppEnv>) {
   if (!isOAuthPoolProvider(provider) && !isQoder) {
     return c.json<ApiResponse>({ success: false, message: '该提供商不是多账号池模式' }, 400)
   }
-  const body = await c.req.json<{ uid?: string }>().catch(() => ({})) as { uid?: string }
+  const body = await readOptionalJSONLimited<{ uid?: string }>(c.req.raw, MAX_ADMIN_REQUEST_BYTES)
   const uid = String(body?.uid || '').trim()
   // 校验 uid 必须是池内账号，防止乱填
   if (uid) {
@@ -1677,7 +1678,7 @@ export async function handleOAuthGeminiCallback(c: Context<AppEnv>) {
     return c.json<ApiResponse>({ success: false, message: '该提供商不是 Gemini 授权模式' }, 400)
   }
 
-  const body = await c.req.json<{ callbackUrl?: string }>()
+  const body = await readStrictJSONLimited<{ callbackUrl?: string }>(c.req.raw, MAX_ADMIN_REQUEST_BYTES)
   const callbackUrl = String(body?.callbackUrl || '').trim()
   if (!callbackUrl) {
     return c.json<ApiResponse>({ success: false, message: 'callbackUrl 为必填项' }, 400)
@@ -1712,7 +1713,7 @@ export async function handleOAuthM365Callback(c: Context<AppEnv>) {
     return c.json<ApiResponse>({ success: false, message: '该提供商不是 M365 PKCE 授权模式' }, 400)
   }
 
-  const body = await c.req.json<{ callbackUrl?: string }>()
+  const body = await readStrictJSONLimited<{ callbackUrl?: string }>(c.req.raw, MAX_ADMIN_REQUEST_BYTES)
   const callbackUrl = String(body?.callbackUrl || '').trim()
   if (!callbackUrl) {
     return c.json<ApiResponse>({ success: false, message: 'callbackUrl 为必填项' }, 400)
@@ -1743,7 +1744,7 @@ export async function handleOAuthM365ROPC(c: Context<AppEnv>) {
     return c.json<ApiResponse>({ success: false, message: '该提供商不是 M365 ROPC 授权模式' }, 400)
   }
 
-  const body = await c.req.json<{ username?: string; password?: string }>()
+  const body = await readStrictJSONLimited<{ username?: string; password?: string }>(c.req.raw, MAX_ADMIN_REQUEST_BYTES)
   const username = String(body?.username || '').trim()
   const password = String(body?.password || '')
   if (!username || !password) {
@@ -2363,7 +2364,7 @@ export async function handleLogsClear(c: Context<AppEnv>) {
 /** 获取/设置日志开关状态 + 保留天数 */
 export async function handleLogConfig(c: Context<AppEnv>) {
   if (c.req.method === 'POST') {
-    const body = await c.req.json().catch(() => ({}))
+    const body = await readOptionalJSONLimited(c.req.raw, MAX_ADMIN_REQUEST_BYTES)
     // enabled 字段可选：未传时保持现有值（兼容只改保留天数的调用）
     if (body.enabled !== undefined) {
       const enabled = body.enabled ? 'true' : 'false'
@@ -2405,7 +2406,7 @@ export async function isM365DebugSseEnabled(env: Env): Promise<boolean> {
 /** GET/POST /admin/api/m365/debug-sse —— 获取/设置 M365 SSE 调试日志开关 */
 export async function handleM365DebugConfig(c: Context<AppEnv>) {
   if (c.req.method === 'POST') {
-    const body = await c.req.json().catch(() => ({}))
+    const body = await readOptionalJSONLimited(c.req.raw, MAX_ADMIN_REQUEST_BYTES)
     const enabled = !!body.enabled
     await c.env.KV.put('config:m365_debug_sse', enabled ? 'true' : 'false')
     m365DebugCache = { at: Date.now(), value: enabled }  // 立即刷新缓存
@@ -2434,10 +2435,14 @@ async function resolveM365ProviderIdByStr(c: Context<AppEnv>, providerId: string
  * POST /v1/sessions {provider_id, session_id} —— 按 session_id 查询指定绑定
  */
 export async function handleM365Sessions(c: Context<AppEnv>) {
+  // 请求体只读一次：有界读取消费的是原始流（非 Hono 的 bodyCache），重复读取会拿到空流。
+  // GET 无 body；POST 读一次供 provider_id 与 session_id 共用。
+  const body: Record<string, unknown> = c.req.method === 'POST'
+    ? await readOptionalJSONLimited(c.req.raw, MAX_ADMIN_REQUEST_BYTES)
+    : {}
   // provider_id：query 优先，POST 也支持 body 传入
   let providerId = c.req.query('provider_id') || ''
   if (!providerId && c.req.method === 'POST') {
-    const body = await c.req.json().catch(() => ({}))
     if (typeof body['provider_id'] === 'string') providerId = body['provider_id']
   }
   const resolved = await resolveM365ProviderIdByStr(c, providerId)
@@ -2450,7 +2455,6 @@ export async function handleM365Sessions(c: Context<AppEnv>) {
     const tenant = c.get('proxyKeyHash') || ''
     const sessions = await listM365Sessions(c.env, providerIdResolved, tenant)
     if (c.req.method === 'POST') {
-      const body = await c.req.json().catch(() => ({}))
       const sid = typeof body['session_id'] === 'string' ? body['session_id'] : ''
       if (sid) {
         const hit = sessions.find((s) => s.sessionId === sid)
@@ -2546,7 +2550,7 @@ export async function handleM365Conversations(c: Context<AppEnv>) {
 
 /** POST /admin/api/m365/conversations/whitelist —— 白名单管理 {provider_id, conversation_id, action} */
 export async function handleM365ConversationWhitelist(c: Context<AppEnv>) {
-  const body = await c.req.json().catch(() => ({}))
+  const body = await readOptionalJSONLimited(c.req.raw, MAX_ADMIN_REQUEST_BYTES)
   const providerId = typeof body['provider_id'] === 'string' ? body['provider_id'] : ''
   const resolved = await resolveM365ProviderIdByStr(c, providerId)
   if (!resolved) {
@@ -2578,7 +2582,7 @@ export async function handleM365ConversationConfig(c: Context<AppEnv>) {
     return c.json({ error: { message: '缺少有效的 M365 provider_id 参数', type: 'invalid_request_error' } }, 400)
   }
   if (c.req.method === 'POST') {
-    const body = await c.req.json().catch(() => ({}))
+    const body = await readOptionalJSONLimited(c.req.raw, MAX_ADMIN_REQUEST_BYTES)
     const mode = body['mode']
     if (mode && (mode === 'after_response' || mode === 'keep_n' || mode === 'max_age' || mode === 'on_exit')) {
       await setCleanupMode(c.env, resolved, mode)
@@ -2811,7 +2815,7 @@ export async function handleGetThinkingPrompt(c: Context<AppEnv>) {
 /** 保存（或清空）思维引导提示词。body.prompt 为空 → 清空回退默认。 */
 export async function handleSetThinkingPrompt(c: Context<AppEnv>) {
   const { setThinkingPrompt } = await import('./thinking')
-  const body = await c.req.json<{ prompt?: string }>()
+  const body = await readStrictJSONLimited<{ prompt?: string }>(c.req.raw, MAX_ADMIN_REQUEST_BYTES)
   const prompt = typeof body?.prompt === 'string' ? body.prompt : ''
   await setThinkingPrompt(c.env, prompt)
   return c.json<ApiResponse>({ success: true, message: '已保存' })
@@ -2829,7 +2833,7 @@ export async function handleGetCachePrefix(c: Context<AppEnv>) {
 /** 保存（或清空）缓存前缀。body.prefix 为空 → 清空回退默认。 */
 export async function handleSetCachePrefix(c: Context<AppEnv>) {
   const { setCachePrefix } = await import('./cache-prefix')
-  const body = await c.req.json<{ prefix?: string }>()
+  const body = await readStrictJSONLimited<{ prefix?: string }>(c.req.raw, MAX_ADMIN_REQUEST_BYTES)
   const prefix = typeof body?.prefix === 'string' ? body.prefix : ''
   await setCachePrefix(c.env, prefix)
   return c.json<ApiResponse>({ success: true, message: '已保存' })
@@ -2847,7 +2851,7 @@ export async function handleGetPerfSettings(c: Context<AppEnv>) {
 /** 保存性能设置（部分字段合并，空对象 → 清空回退默认） */
 export async function handleSetPerfSettings(c: Context<AppEnv>) {
   const { setPerfSettings } = await import('./perf')
-  const body = await c.req.json<{ settings?: Partial<import('./perf').PerfSettings> }>()
+  const body = await readStrictJSONLimited<{ settings?: Partial<import('./perf').PerfSettings> }>(c.req.raw, MAX_ADMIN_REQUEST_BYTES)
   const settings = body?.settings ?? {}
   await setPerfSettings(c.env, settings)
   return c.json<ApiResponse>({ success: true, message: '已保存（最多 10s 生效）' })

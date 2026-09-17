@@ -161,9 +161,11 @@ Select-String -Path "D:\GitHub_Clone\M365-Gateway\src\*.ts" `
 
 | 符号 | 目标落地 | 验证 |
 |---|---|---|
-| `RequestBodyError` / `readTextLimited` / `readJSONLimited` | 新建 `src/request-body.ts`，逐行等价 | `request-body.test.ts` 12 例 |
-| `MAX_AI_REQUEST_BYTES`(8MiB) / `MAX_RESPONSES_REQUEST_BYTES` / `MAX_COMPACTION_REQUEST_BYTES`(16MiB) | 同上 | 同上 |
-| 入站请求体上界接线 | `proxy.ts` 三个入口（`handleProxy`/`handleAnthropicMessages`/`handleResponses`）改用 `readBoundedJSON`（读流累计计数，超限即 cancel）；`index.ts` 全局 `onError` 映射 `RequestBodyError`→413/400 | 新增守卫逻辑 |
+| `RequestBodyError` / `readTextLimited` / `readJSONLimited` | 新建 `src/request-body.ts`，逐行等价 | `request-body.test.ts` |
+| `MAX_AI_REQUEST_BYTES`(8MiB) / `MAX_RESPONSES_REQUEST_BYTES` | 同上 | 同上 |
+| `readBytesLimited` / `readFormDataLimited` / `base64ByteLength`（本地扩展，非源仓库符号） | 同上；multipart 需按字节读取（fatal UTF-8 解码器会在图片字节上抛错） | `request-body.test.ts` + `images-body-bound.test.ts` |
+| `readStrictJSONLimited` / `readOptionalJSONLimited` / `MAX_ADMIN_REQUEST_BYTES`（本地扩展） | 同上；管理面两种既有错误语义（严格抛错 / `.catch(() => ({}))`）分别保留 | `request-body.test.ts` + `admin-body-bound.test.ts` |
+| 入站请求体上界接线 | `proxy.ts` 三个入口改用 `readBoundedJSON`；`index.ts` 图片三入口 + `admin.ts` 21 处 + `auth.ts` + `checkin.ts` + `mcp-gateway.ts` + `trae/admin.ts` 全部改用有界读取；`index.ts` 全局 `onError` 映射 `RequestBodyError`→413/400 | 新增守卫逻辑 + 两个 e2e 回归文件 |
 | `CHAT_HUB_PAYLOAD_LIMITS` / `BoundedPayloadSubtype` / `BoundedPayloadPhase` / `BoundedPayloadMetadata` / `BoundedPayloadError` / `assertBoundedPayload` | `src/m365/chathub.ts` | `payload-guardrails.test.ts` 19 例 |
 | `boundedPayloadMetadata` / `BoundedPayloadDiagnostic` / `boundedPayloadDiagnostic`（+私有 `logBoundedPayloadFailure`） | `src/m365/chathub.ts`，隐私安全：仅数值+机器标签 | 同上 |
 | `ChatHubAttemptError` 增 `terminalEmptyQuota` / `boundedPayload` 字段 | 构造签名向后兼容（string 或 unknown cause 均可） | 同上 |

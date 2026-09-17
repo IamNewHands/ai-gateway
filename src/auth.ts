@@ -2,6 +2,7 @@ import { Context, Next } from 'hono'
 import { getCookie, setCookie, deleteCookie } from 'hono/cookie'
 import { createSession, getSession, deleteSession, getValidProxyKey, recordLoginFailure, resetLoginFailures, getLoginFailureCount } from './storage'
 import { SESSION_TTL } from './config'
+import { MAX_ADMIN_REQUEST_BYTES, readStrictJSONLimited } from './request-body'
 import type { AppEnv, Env } from './types'
 
 /** SHA-256 哈希 */
@@ -230,7 +231,12 @@ export async function cloudflareAccessMiddleware(c: Context<AppEnv>, next: Next)
 
 /** 管理员登录 */
 export async function handleLogin(c: Context<AppEnv>) {
-  const { username, password } = await c.req.json()
+  // 有界读取：登录是未鉴权公网入口，裸 c.req.json() 会让超大 body 先被完整缓冲。
+  // 严格解析（空正文/非法 JSON 均抛 INVALID_JSON）经全局 onError 映射 400，与原 SyntaxError 分支同状态码。
+  const { username, password } = await readStrictJSONLimited<{ username?: string; password?: string }>(
+    c.req.raw,
+    MAX_ADMIN_REQUEST_BYTES,
+  )
   const adminUser = c.env.ADMIN_USERNAME
   const adminPass = c.env.ADMIN_PASSWORD
 
