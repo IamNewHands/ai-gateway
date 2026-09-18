@@ -10,6 +10,7 @@ import {
   buildChatMeta,
   injectConversationHeaders,
   extractSessionKey,
+  stickyFallbackKey,
   __resetSessionIdsForTests,
   __resetTurnSaltForTests,
 } from './workbuddy-session-ids'
@@ -351,5 +352,84 @@ describe('injectConversationHeaders（9 个头）', () => {
     expect(h1['X-Conversation-Message-ID']).not.toBe(h2['X-Conversation-Message-ID'])
     expect(h1['X-Request-ID']).not.toBe(h2['X-Request-ID'])
     expect(h1['X-B3-SpanId']).not.toBe(h2['X-B3-SpanId'])
+  })
+})
+
+describe('extractSessionKey 第 5 源 prompt_cache_key（移植 8058019）', () => {
+  it('conversation 维度四键优先于 prompt_cache_key', () => {
+    expect(extractSessionKey({ conversation_id: 'conv', prompt_cache_key: 'pck' })).toBe('conv')
+    expect(extractSessionKey({ conversationId: 'conv', prompt_cache_key: 'pck' })).toBe('conv')
+    expect(extractSessionKey({ metadata: { conversationId: 'meta' }, prompt_cache_key: 'pck' })).toBe('meta')
+  })
+
+  it('无 conversation 键时回落 prompt_cache_key；无则空串', () => {
+    expect(extractSessionKey({ prompt_cache_key: 'pck-123' })).toBe('pck-123')
+    expect(extractSessionKey({ prompt_cache_key: '' })).toBe('')
+    expect(extractSessionKey({ prompt_cache_key: 42 })).toBe('')
+  })
+})
+
+describe('stickyFallbackKey（移植 8058019 + 10eefa8）', () => {
+  it('同首条 user 消息恒同键，追加历史不影响（会话级键）', async () => {
+    const b1 = { messages: [{ role: 'user', content: 'hello session' }, { role: 'assistant', content: 'hi' }] }
+    const b2 = {
+      messages: [
+        { role: 'user', content: 'hello session' },
+        { role: 'assistant', content: 'hi' },
+        { role: 'user', content: 'second turn' },
+      ],
+    }
+    const k1 = await stickyFallbackKey(b1)
+    const k2 = await stickyFallbackKey(b2)
+    expect(k1).toMatch(/^fb:[0-9a-f]{32}$/)
+    expect(k2).toBe(k1)
+  })
+
+  it('首条 user 文本相同 → 同键；不同 → 换键（开新会话自然换键）', async () => {
+    const a = { messages: [{ role: 'user', content: 'same first' }] }
+    const b = { messages: [{ role: 'user', content: 'same first' }, { role: 'assistant', content: 'x' }] }
+    const c = { messages: [{ role: 'user', content: 'different first' }] }
+    const [ka, kb, kc] = await Promise.all([stickyFallbackKey(a), stickyFallbackKey(b), stickyFallbackKey(c)])
+    expect(ka).toMatch(/^fb:[0-9a-f]{32}$/)
+    expect(kb).toBe(ka)
+    expect(kc).not.toBe(ka)
+  })
+
+  it('空白归一：首尾空白去重后同键（对齐 Go TrimSpace）', async () => {
+    const a = { messages: [{ role: 'user', content: 'hello' }] }
+    const b = { messages: [{ role: 'user', content: '  hello  ' }] }
+    const [ka, kb] = await Promise.all([stickyFallbackKey(a), stickyFallbackKey(b)])
+    expect(kb).toBe(ka)
+  })
+
+  it('多模态 part 拼接文本参与派生', async () => {
+    const a = { messages: [{ role: 'user', content: [{ type: 'text', text: 'multi ' }, { type: 'text', text: 'modal' }] }] }
+    const k = await stickyFallbackKey(a)
+    expect(k).toMatch(/^fb:[0-9a-f]{32}$/)
+  })
+
+  it('user_id 抑制（10eefa8）：metadata.user_id / 顶层 user_id 恒返回空串', async () => {
+    expect(await stickyFallbackKey({ metadata: { user_id: 'u1' }, messages: [{ role: 'user', content: 'x' }] })).toBe('')
+    expect(await stickyFallbackKey({ user_id: 'u1', messages: [{ role: 'user', content: 'x' }] })).toBe('')
+  })
+
+  it('user_id 非字符串/空串不抑制', async () => {
+    const k1 = await stickyFallbackKey({ metadata: { user_id: '' }, messages: [{ role: 'user', content: 'x' }] })
+    const k2 = await stickyFallbackKey({ user_id: 42, messages: [{ role: 'user', content: 'x' }] })
+    expect(k1).toMatch(/^fb:[0-9a-f]{32}$/)
+    expect(k2).toMatch(/^fb:[0-9a-f]{32}$/)
+  })
+
+  it('无 user 消息 / 首条 user 无文本 / 空态 → 空串', async () => {
+    expect(await stickyFallbackKey(null)).toBe('')
+    expect(await stickyFallbackKey({})).toBe('')
+    expect(await stickyFallbackKey({ messages: [{ role: 'assistant', content: 'a' }] })).toBe('')
+    expect(await stickyFallbackKey({ messages: [{ role: 'user', content: [{ type: 'image_url' }] }] })).toBe('')
+  })
+
+  it('extractSessionKey 命中时不经 fallback 也不会冲突：两键空间独立', async () => {
+    const body = { conversation_id: 'c1', messages: [{ role: 'user', content: 'x' }] }
+    expect(extractSessionKey(body)).toBe('c1')
+    expect(await stickyFallbackKey(body)).toMatch(/^fb:/)
   })
 })

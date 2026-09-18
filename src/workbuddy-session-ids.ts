@@ -183,13 +183,16 @@ export async function turnRequestId(turnKeyValue: string): Promise<string> {
 }
 
 /**
- * 从请求体提取**会话粘性键**（对齐 workbuddy2api session.ExtractKey，含 `ebd7921`）。
+ * 从请求体提取**会话粘性键**（对齐 workbuddy2api session.ExtractKey，含 `ebd7921`、`8058019`）。
  *
- * 识别顺序（snake 优先于 camel，全部为**对话维度**）：
+ * 识别顺序（snake 优先于 camel，前四项为**对话维度**）：
  *  1. `metadata.conversation_id`
  *  2. `metadata.conversationId`
  *  3. 顶层 `conversation_id`
  *  4. 顶层 `conversationId`
+ *  5. 顶层 `prompt_cache_key`（`8058019` 新增，置于最后，绝不抢占 conversation 维度优先级）：
+ *     pi-ai 系客户端把会话 ID 放在这个 OpenAI 前缀缓存字段里，语义就是「同一会话复用
+ *     同一前缀」，与粘性诉求同源。纳入后这类客户端无需改配置即可命中粘性。
  *
  * `metadata.user_id` **不再**作为粘性键（移植 `ebd7921`）：user 维度粒度过粗——一个
  * user 的全部并行对话会被钉到同一账号（粘性范围远大于上游 prompt cache 的对话级边界），
@@ -213,7 +216,69 @@ export function extractSessionKey(body: Record<string, unknown> | null | undefin
     const v = body[k]
     if (typeof v === 'string' && v !== '') return v
   }
+  const pck = body['prompt_cache_key']
+  if (typeof pck === 'string' && pck !== '') return pck
   return ''
+}
+
+/**
+ * 为**无会话标识**的客户端派生会话级稳定粘性键（对齐 workbuddy2api `8058019`+`10eefa8`
+ * StickyFallbackKey）。
+ *
+ * 背景：OpenAI 兼容协议本身没有会话 ID 字段——dsh / Codex / Cherry Studio 等客户端的
+ * 请求体里既无 conversationId 也无 metadata，extractSessionKey 恒返回 '' → 粘性路由
+ * 永不参与 → 同一会话的连续请求逐请求换号，上游 prompt cache 被打散。本函数给这类
+ * 客户端一个不依赖其配合的键：body 里**首条** role==='user' 消息文本的 sha256 前 16
+ * 字节 hex（前缀 `fb:`）。
+ *
+ * 为什么取首条：会话内历史不断追加，但首条 user 消息恒定 → 同会话恒同键；开新会话
+ * 自然换键。与 turnKey 取**最后一条**（**轮级**，供会话头族按对话轮聚合）不可混用。
+ *
+ * 抑制条件（`10eefa8`，P1-anti-monopoly 契约在 fallback 路径的延伸）：body 携带
+ * `metadata.user_id` 或顶层 `user_id` 时**恒返回 ''**——extractSessionKey 有意剔除
+ * user_id 作粘性键，若 fallback 不设闸，只发 user_id 的请求会借首条 prompt 重新获得
+ * 粘性，多个并行对话因首条 prompt 相同被钉到同一账号。判定口径与 extractSessionKey
+ * 一致（字段存在且为非空字符串才算标识；非字符串/空串不抑制）。
+ *
+ * 无 body / 无 messages / 无 user 消息 / 首条 user 消息无文本（纯图片）→ ''。
+ * **WebCrypto 的 digest 是异步的** → 本函数同步返回 Promise，调用方需 await。
+ */
+export async function stickyFallbackKey(body: Record<string, unknown> | null | undefined): Promise<string> {
+  if (hasUserID(body)) return ''
+  if (!body || typeof body !== 'object') return ''
+  const msgs = body['messages']
+  if (!Array.isArray(msgs) || msgs.length === 0) return ''
+  for (const m of msgs) {
+    if (!m || typeof m !== 'object' || Array.isArray(m)) continue
+    const rec = m as Record<string, unknown>
+    if (rec['role'] !== 'user') continue
+    // 首条 user 消息无文本（纯图片/多模态无文字等）→ 不继续往后找：往后找会让键随
+    // 会话推进而漂移（一旦某轮该位置带上文本），破坏「同会话恒同键」。
+    const text = contentText(rec['content']).trim()
+    if (text === '') return ''
+    const data = new TextEncoder().encode(text)
+    const digest = await crypto.subtle.digest('SHA-256', data)
+    const bytes = new Uint8Array(digest).slice(0, 16)
+    let out = ''
+    for (const b of bytes) out += b.toString(16).padStart(2, '0')
+    return `fb:${out}`
+  }
+  return ''
+}
+
+/**
+ * 报告 body 是否携带 user 维度标识（`metadata.user_id` 或顶层 `user_id`）。
+ * 只判「字段存在且为非空字符串」，与 extractSessionKey 的口径一致。
+ */
+function hasUserID(body: Record<string, unknown> | null | undefined): boolean {
+  if (!body || typeof body !== 'object') return false
+  const meta = body['metadata']
+  if (meta && typeof meta === 'object' && !Array.isArray(meta)) {
+    const v = (meta as Record<string, unknown>)['user_id']
+    if (typeof v === 'string' && v !== '') return true
+  }
+  const top = body['user_id']
+  return typeof top === 'string' && top !== ''
 }
 
 /** 会话头族元数据（对齐 workbuddy2api upstream.ChatMeta）。 */

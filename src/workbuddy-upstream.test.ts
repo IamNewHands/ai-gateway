@@ -369,6 +369,22 @@ describe('isModelRateLimit & parseSoftRateReset 6004 限流解析（移植 workb
     expect(parseSoftRateReset(body)).toBeNull()
   })
 
+  it('英文形态（global 域）6004 body 解析重置墙钟（f044e5c）', () => {
+    const expected = new Date('2026-09-18T16:06:52+08:00').getTime()
+    // global 域实测英文形态（带 UTC+8 后缀）
+    const bodyEn =
+      '{"code":6004,"msg":"usage exceeds frequency limit, but don\'t worry, your usage will reset at 2026-09-18 16:06:52 UTC+8, alternatively, you can switch to the other models to continue using it."}'
+    expect(parseSoftRateReset(bodyEn)).toBe(expected)
+    // 不带 UTC+8 后缀
+    expect(parseSoftRateReset('{"code":6004,"msg":"your usage will reset at 2026-09-18 16:06:52"}')).toBe(expected)
+    // 大小写混合
+    expect(parseSoftRateReset('{"code":6004,"msg":"Your Usage Will RESET AT 2026-09-18 16:06:52 UTC+8"}')).toBe(expected)
+  })
+
+  it('英文自然语言不应被解析为重置时间（f044e5c）', () => {
+    expect(parseSoftRateReset('{"code":6004,"msg":"your usage will reset at the end of the day"}')).toBeNull()
+  })
+
   it('classifyWorkbuddyUpstreamError 分类 6004 / bad_params / content_blocked', () => {
     expect(classifyWorkbuddyUpstreamError(429, '{"code":6004,"msg":"将在 2026-09-11 18:33:27 重置"}')).toBe('model_rate')
     expect(classifyWorkbuddyUpstreamError(400, 'Unmarshal chat params failed')).toBe('bad_params')
@@ -458,6 +474,60 @@ describe('DeepSeek 思维链注入与历史消息回填（移植 workbuddy2api t
     const msgs = body['messages'] as any[]
     expect(msgs[1].reasoning_content).toBe('think1')
     expect(msgs[3].reasoning_content).toBe('')
+  })
+
+  it('backfillReasoningContent：enabled + 零痕迹 → 每条 assistant 补空串（3b048ec，issue #165）', () => {
+    // 模拟管线实态：injectDeepSeekThinking 先行注入 enabled
+    const body: Record<string, unknown> = {
+      model: 'deepseek-v4-flash',
+      thinking: { type: 'enabled' },
+      messages: [
+        { role: 'user', content: 'u1' },
+        { role: 'assistant', content: 'a1' },
+        { role: 'user', content: 'u2' },
+        { role: 'assistant', content: 'a2' },
+      ],
+    }
+    backfillReasoningContent(body)
+    const msgs = body['messages'] as any[]
+    expect(msgs[1].reasoning_content).toBe('')
+    expect(msgs[3].reasoning_content).toBe('')
+  })
+
+  it('backfillReasoningContent：disabled + 零痕迹 → 零改动（3b048ec 四分支之一）', () => {
+    const body: Record<string, unknown> = {
+      model: 'deepseek-v4-flash',
+      thinking: { type: 'disabled' },
+      messages: [
+        { role: 'user', content: 'u' },
+        { role: 'assistant', content: 'plain' },
+      ],
+    }
+    backfillReasoningContent(body)
+    const msgs = body['messages'] as any[]
+    expect(msgs[1].reasoning_content).toBeUndefined()
+  })
+
+  it('backfillReasoningContent：null/数字 reasoning_content 归一化为空串（3b048ec）', () => {
+    for (const bad of [null, 123]) {
+      const body: Record<string, unknown> = {
+        model: 'deepseek-v4-flash',
+        messages: [{ role: 'assistant', content: 'a', reasoning_content: bad }],
+      }
+      backfillReasoningContent(body)
+      const msgs = body['messages'] as any[]
+      expect(msgs[0].reasoning_content).toBe('')
+    }
+  })
+
+  it('backfillReasoningContent：已有 string reasoning_content 不被覆盖', () => {
+    const body: Record<string, unknown> = {
+      model: 'deepseek-v4-flash',
+      messages: [{ role: 'assistant', content: 'a', reasoning_content: 'kept' }],
+    }
+    backfillReasoningContent(body)
+    const msgs = body['messages'] as any[]
+    expect(msgs[0].reasoning_content).toBe('kept')
   })
 })
 

@@ -260,12 +260,16 @@ export function isModelRateLimit(bodyText: string): boolean {
 }
 
 /**
- * 从 429 6004 body 解析「将在 … 重置」时间（上游 UTC+8 文案，对齐 workbuddy2api ParseSoftRateReset）。
- * 成功返回 epoch ms 墙钟时刻，解析失败或非 6004 返回 null。
+ * 从 429 6004 body 解析限流重置时间（对齐 workbuddy2api ParseRateReset，含 f044e5c）。
+ * 上游 CN 域文案为「将在 … 重置」，global 域为英文形态 "usage will reset at YYYY-MM-DD HH:mm:ss UTC+8"。
+ * 先试中文再试英文；英文正则锚定完整时间戳格式，避免匹配 "reset at the end of the day"
+ * 之类的自然语言。成功返回 epoch ms 墙钟时刻，解析失败或非 6004 返回 null。
  */
 export function parseSoftRateReset(bodyText: string): number | null {
   if (!isModelRateLimit(bodyText)) return null
-  const m = bodyText.match(/将在\s*([\d\-:\s]+)(?:\s*UTC\+8)?\s*重置/)
+  const m =
+    bodyText.match(/将在\s*([\d\-:\s]+)(?:\s*UTC\+8)?\s*重置/) ??
+    bodyText.match(/reset\s+at\s+(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2})(?:\s*UTC\+8)?/i)
   if (!m || !m[1]) return null
   const ts = m[1].trim().replace(/\s*UTC\+8$/, '')
   const parts = ts.split(/\s+/)
@@ -731,11 +735,20 @@ function ensureDeepSeekEffort(body: Record<string, unknown>): void {
 }
 
 /**
- * DeepSeek 多轮一致性回填（对齐 workbuddy2api thinking.go backfillReasoningContent）：
- * 官方客户端规则 requiresReasoningContentOnAssistantMessages：
- * 若会话内任一 assistant 消息含有 reasoning 痕迹（非空 reasoning 字符串或已有 reasoning_content），
- * 上游要求后续请求中所有 assistant 消息都带 reasoning_content（string，无则补空串 ""），
- * 否则直接以 HTTP 400 拒绝请求。
+ * DeepSeek 多轮一致性回填（对齐 workbuddy2api thinking.go backfillReasoningContent，含 3b048ec）：
+ * 官方客户端规则 requiresReasoningContentOnAssistantMessages：上游要求所有 assistant 消息
+ * 都带 reasoning_content（string，无则补空串 ""），否则直接以 HTTP 400 拒绝请求。
+ *
+ * 门控（对齐官方 ReasoningContentBackfillRule：thinkingEnabled || hasTrace）：
+ *  - 非 deepseek 模型 → 零改动；
+ *  - deepseek + enabled（含注入后默认形态）→ 每条 assistant 保证 reasoning_content 是 string：
+ *    已有 string 原样保留；reasoning 是 string 则复制；两者皆无 → 补空串 ""。
+ *    第三方客户端丢推理回传（零痕迹）形态下官方本就补，旧实现只认 hasTrace 半边是缺陷；
+ *  - deepseek + disabled + 无痕迹 → 零改动（两个半边都不亮）；
+ *  - deepseek + disabled + 有痕迹 → 照补（hasTrace 半边，多轮一致性不因关思维链而丢）。
+ *
+ * thinkingEnabled 读**注入后**请求体 thinking.type === 'enabled'——调用管线中
+ * injectDeepSeekThinking 恒先行（proxy.ts 全部调用点顺序已满足）。
  */
 export function backfillReasoningContent(body: Record<string, unknown>): void {
   const model = typeof body['model'] === 'string' ? body['model'] : ''
@@ -743,6 +756,12 @@ export function backfillReasoningContent(body: Record<string, unknown>): void {
 
   const msgs = body['messages']
   if (!Array.isArray(msgs) || msgs.length === 0) return
+
+  const th = body['thinking']
+  const thinkingEnabled =
+    !!(th && typeof th === 'object' && !Array.isArray(th) &&
+      typeof (th as Record<string, unknown>)['type'] === 'string' &&
+      ((th as Record<string, unknown>)['type'] as string).trim().toLowerCase() === 'enabled')
 
   // 第一遍：检测是否有任何 reasoning 痕迹
   let hasTrace = false
@@ -758,14 +777,16 @@ export function backfillReasoningContent(body: Record<string, unknown>): void {
       break
     }
   }
-  if (!hasTrace) return
+  if (!thinkingEnabled && !hasTrace) return
 
-  // 第二遍：为所有 assistant 补齐 reasoning_content 字段
+  // 第二遍：为所有 assistant 补齐 reasoning_content 字段。
+  // 跳过条件只认 string（官方 "string"!==typeof 才动手）：null/数字不再被当
+  // 「已有」跳过，归一化为 ""。
   for (const item of msgs) {
     if (!item || typeof item !== 'object') continue
     const m = item as Record<string, unknown>
     if (m['role'] !== 'assistant') continue
-    if (m['reasoning_content'] !== undefined) continue // 已有不覆盖
+    if (typeof m['reasoning_content'] === 'string') continue // 已有 string → 不覆盖
     if (typeof m['reasoning'] === 'string') {
       m['reasoning_content'] = m['reasoning']
     } else {

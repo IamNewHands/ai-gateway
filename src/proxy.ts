@@ -83,6 +83,7 @@ import {
 import {
   buildChatMeta,
   extractSessionKey,
+  stickyFallbackKey,
   type ChatMeta,
 } from './workbuddy-session-ids'
 import {
@@ -2224,14 +2225,20 @@ async function proxyOAuthRequestPooledCore(
   // 注意：粘性命中校验带**模型维度**——绑定号若被 6004 模型级限额（对其他模型仍可用），
   // 必须重分配，否则会话会被钉在"对当前模型不可用"的号上反复失败。
   const sessKey = chatMeta ? extractSessionKey(forwardBody as Record<string, unknown>) : ''
+  // stickyKey 是**粘性专用**键，与 sessKey（会话头族聚合用）分开（移植 workbuddy2api
+  // 8058019）：sessKey 为空时（OpenAI 兼容客户端——dsh / Codex 等既无 conversationId
+  // 也无 metadata）回落首条 user 消息派生的会话级 fallback 键，使粘性仍能生效。
+  // 不能直接改 sessKey：那会连带改变会话头族 requestIdForKey 的聚合语义。
+  // stickyFallbackKey 内部已抑制带 user_id 的请求（10eefa8，P1-anti-monopoly 契约）。
+  const stickyKey = sessKey || (chatMeta ? await stickyFallbackKey(forwardBody as Record<string, unknown>) : '')
   let stickyUid = ''
-  if (sessKey) {
+  if (stickyKey) {
     const poolNow = await readOauthPool(c.env, provider.id)
     const availability = (uid: string): boolean => {
       const acc = poolNow.find((a) => a.uid === uid)
       return !!acc && isOauthAccountHealthy(acc, Date.now(), reqModel)
     }
-    const resolved = await resolveSticky(c.env, provider.id, sessKey, availability)
+    const resolved = await resolveSticky(c.env, provider.id, stickyKey, availability)
     if (resolved.hit) stickyUid = resolved.uid
   }
 
@@ -2297,8 +2304,8 @@ async function proxyOAuthRequestPooledCore(
         const wafCdMs = raMs !== null ? raMs : cd.softMs
         await cooldownOauthAccount(c.env, provider.id, account.uid, wafCdMs, raMs !== null ? 'waf 403 block (retry-after)' : 'waf 403 block')
         // 粘性解绑：WAF 频控带 IP/指纹粘性，本轮撞 WAF 解绑让会话下一跳重新分配。
-        if (sessKey && account.uid === stickyUid) {
-          await unbindSticky(c.env, provider.id, sessKey)
+        if (stickyKey && account.uid === stickyUid) {
+          await unbindSticky(c.env, provider.id, stickyKey)
           stickyUid = ''
         }
         lastErr = new Error(`account ${account.uid} waf 403 blocked`)
@@ -2335,8 +2342,8 @@ async function proxyOAuthRequestPooledCore(
       if (response.status === 401 || response.status === 403) {
         await disableOauthAccount(c.env, provider.id, account.uid, 'session dead (401/403)')
         // 粘性解绑：失败号若是本会话的绑定号，下次请求重新分配（对齐 session.go Unbind）
-        if (sessKey && account.uid === stickyUid) {
-          await unbindSticky(c.env, provider.id, sessKey)
+        if (stickyKey && account.uid === stickyUid) {
+          await unbindSticky(c.env, provider.id, stickyKey)
           stickyUid = ''
         }
         lastErr = new Error(`account ${account.uid} session dead`)
@@ -2438,16 +2445,16 @@ async function proxyOAuthRequestPooledCore(
                 modelBlockHits.delete(modelBlockKey)
                 await clearOauthAccountModelCooldown(c.env, provider.id, account.uid, reqModel)
               }
-              if (sessKey && account.uid !== stickyUid) {
-                await bindSticky(c.env, provider.id, sessKey, account.uid)
+              if (stickyKey && account.uid !== stickyUid) {
+                await bindSticky(c.env, provider.id, stickyKey, account.uid)
               }
               releaseOnce()
               return { response: dResp, originalStream: dStream, account }
             }
             // 降级重试仍被拦 → 用户内容本身触发审核，回内容墙
           }
-          if (sessKey && account.uid === stickyUid) {
-            await unbindSticky(c.env, provider.id, sessKey)
+          if (stickyKey && account.uid === stickyUid) {
+            await unbindSticky(c.env, provider.id, stickyKey)
           }
           throw new ContentBlockedError(text)
         case 'prompt_too_long':
@@ -2455,8 +2462,8 @@ async function proxyOAuthRequestPooledCore(
           // 上下文超限是**请求的问题不是账号的问题**——同一 body 换任何账号都超限，轮转只会
           // 白扔健康号配额。**不罚号**（零冷却/零连败/零熔断）、**不轮转**（直接终态返回），
           // 400 + 上游 body 原文透传（真实 token 数/上限值/requestId 都保留，禁止固定词覆盖）。
-          if (sessKey && account.uid === stickyUid) {
-            await unbindSticky(c.env, provider.id, sessKey)
+          if (stickyKey && account.uid === stickyUid) {
+            await unbindSticky(c.env, provider.id, stickyKey)
           }
           throw new WorkbuddyClientError(response.status, text, 'prompt_too_long')
         case 'bad_params':
@@ -2465,14 +2472,14 @@ async function proxyOAuthRequestPooledCore(
           // 客户端请求问题（400 参数错/超长/畸形 JSON 等）：请求本身的问题，换任何账号都会撞同一错误。
           // 不处罚账号（防雪崩），立即终止本请求，不轮转，直接向客户端透传 4xx 与上游原因，
           // 避免轮空整个账号池后误报「503 OAuth 账号池无可用账号」。
-          if (sessKey && account.uid === stickyUid) {
-            await unbindSticky(c.env, provider.id, sessKey)
+          if (stickyKey && account.uid === stickyUid) {
+            await unbindSticky(c.env, provider.id, stickyKey)
           }
           throw new WorkbuddyClientError(response.status, text)
       }
       // 粘性解绑：失败号若是本会话的绑定号，下次请求重新分配
-      if (sessKey && account.uid === stickyUid) {
-        await unbindSticky(c.env, provider.id, sessKey)
+      if (stickyKey && account.uid === stickyUid) {
+        await unbindSticky(c.env, provider.id, stickyKey)
         stickyUid = ''
       }
       lastErr = new Error(`account ${account.uid} http ${response.status} (${kind})`)
@@ -2491,8 +2498,8 @@ async function proxyOAuthRequestPooledCore(
     // 粘性跟随最终成功号（对齐 session.go:190-193）：本轮成功的账号成为该会话的绑定，
     // 覆盖旧绑定。若粘性号失败后轮换到别的号成功，这里把会话重绑到新号，
     // 多轮对话下一跳不再随机抽 → 保住新号上的 prompt cache。
-    if (sessKey && account.uid !== stickyUid) {
-      await bindSticky(c.env, provider.id, sessKey, account.uid)
+    if (stickyKey && account.uid !== stickyUid) {
+      await bindSticky(c.env, provider.id, stickyKey, account.uid)
     }
     // 释放本轮在途名额：上游已返回响应头，租约使命完成。
     // 流式场景下 body 由外层 passthroughResponse 消费——源实现的 inFlight 同样在
