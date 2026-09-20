@@ -735,7 +735,8 @@ function ensureDeepSeekEffort(body: Record<string, unknown>): void {
 }
 
 /**
- * DeepSeek 多轮一致性回填（对齐 workbuddy2api thinking.go backfillReasoningContent，含 3b048ec）：
+ * DeepSeek 多轮一致性回填（对齐 workbuddy2api thinking.go backfillReasoningContent，
+ * 含 `3b048ec` 门控与 `5657229` 的 reasoning 镜像）：
  * 官方客户端规则 requiresReasoningContentOnAssistantMessages：上游要求所有 assistant 消息
  * 都带 reasoning_content（string，无则补空串 ""），否则直接以 HTTP 400 拒绝请求。
  *
@@ -746,6 +747,10 @@ function ensureDeepSeekEffort(body: Record<string, unknown>): void {
  *    第三方客户端丢推理回传（零痕迹）形态下官方本就补，旧实现只认 hasTrace 半边是缺陷；
  *  - deepseek + disabled + 无痕迹 → 零改动（两个半边都不亮）；
  *  - deepseek + disabled + 有痕迹 → 照补（hasTrace 半边，多轮一致性不因关思维链而丢）。
+ *
+ * **reasoning 镜像（`5657229`）**：部分账号/租户额外校验 assistant 的 `len(reasoning)>0`
+ * （缺失/null/空串 400、空白串 200）→ 同一循环里镜像写 reasoning：已非空不动、rc 非空
+ * 则同源写入、两者皆空补单空格 `" "`。该字段是透传校验位非内容消费位。
  *
  * thinkingEnabled 读**注入后**请求体 thinking.type === 'enabled'——调用管线中
  * injectDeepSeekThinking 恒先行（proxy.ts 全部调用点顺序已满足）。
@@ -779,19 +784,37 @@ export function backfillReasoningContent(body: Record<string, unknown>): void {
   }
   if (!thinkingEnabled && !hasTrace) return
 
-  // 第二遍：为所有 assistant 补齐 reasoning_content 字段。
+  // 第二遍：为所有 assistant 补齐 reasoning_content 字段，并**镜像**保证 reasoning
+  // 字段存在且非空（移植 workbuddy2api `5657229`，issue #165 追评——部分账号/租户对
+  // thinking 形态校验 assistant 的 `len(reasoning)>0`：缺失/null/空串 400，空白串 200；
+  // 官方 CLI 本就给 assistant 挂上一轮 reasoning 文本，见 itemsToMessages 的
+  // applyPendingReasoning——「每条 assistant 保证 reasoning 非空」是官方出站形态）。
   // 跳过条件只认 string（官方 "string"!==typeof 才动手）：null/数字不再被当
   // 「已有」跳过，归一化为 ""。
+  //   - reasoning_content 已是非空 string → 不动（原有语义保留）；
+  //   - 否则若 reasoning 是 string → 用同源文本回填 reasoning_content；
+  //   - 两者皆无 → reasoning_content 补 ""；
+  //   - 镜像：reasoning 已是非空 string → 不动；否则 rc 非空 → 写入 rc 值；
+  //     两者皆空 → 补单个空格 " "（上游 `len>0` **不 trim**：空白串过闸、空串不过；
+  //     空白串占位有官方 Moonshot 规则 "-" 同款先例，且该字段是透传校验位而非内容
+  //     消费位，对模型上下文无语义影响）。
   for (const item of msgs) {
     if (!item || typeof item !== 'object') continue
     const m = item as Record<string, unknown>
     if (m['role'] !== 'assistant') continue
-    if (typeof m['reasoning_content'] === 'string') continue // 已有 string → 不覆盖
-    if (typeof m['reasoning'] === 'string') {
-      m['reasoning_content'] = m['reasoning']
+    let rc: string
+    if (typeof m['reasoning_content'] === 'string') {
+      rc = m['reasoning_content'] // 已有 string → 不覆盖
+    } else if (typeof m['reasoning'] === 'string') {
+      rc = m['reasoning']
+      m['reasoning_content'] = rc
     } else {
-      m['reasoning_content'] = ''
+      rc = ''
+      m['reasoning_content'] = rc
     }
+    // 镜像写 reasoning：已非空 → 不动；rc 非空 → 同源文本；皆空 → 单空格占位。
+    if (typeof m['reasoning'] === 'string' && m['reasoning'] !== '') continue
+    m['reasoning'] = rc !== '' ? rc : ' '
   }
 }
 

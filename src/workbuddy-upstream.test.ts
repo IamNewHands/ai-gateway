@@ -529,6 +529,118 @@ describe('DeepSeek 思维链注入与历史消息回填（移植 workbuddy2api t
     const msgs = body['messages'] as any[]
     expect(msgs[0].reasoning_content).toBe('kept')
   })
+
+  // ===== 5657229 / issue #165 追评：镜像写 reasoning 字段 =====
+  // 部分租户校验 assistant 的 len(reasoning)>0（缺失/null/空串 400、空白串 200）。
+
+  /** 提取各 assistant 消息的 reasoning 字段：缺 → '<absent>'，非 string → '<non-string>'。 */
+  const assistantReasoning = (body: Record<string, unknown>): string[] => {
+    const out: string[] = []
+    for (const item of body['messages'] as any[]) {
+      if (!item || item.role !== 'assistant') continue
+      if (!('reasoning' in item)) out.push('<absent>')
+      else if (typeof item.reasoning === 'string') out.push(item.reasoning)
+      else out.push('<non-string>')
+    }
+    return out
+  }
+
+  it('reasoning 镜像 R7：enabled + 零痕迹 → 每条 assistant 的 reasoning 存在且非空（RED）', () => {
+    const body: Record<string, unknown> = {
+      model: 'deepseek-v4-flash',
+      thinking: { type: 'enabled' },
+      messages: [
+        { role: 'user', content: 'u1' },
+        { role: 'assistant', content: 'a1' },
+        { role: 'user', content: 'u2' },
+        { role: 'assistant', content: 'a2' },
+        { role: 'user', content: 'u3' },
+      ],
+    }
+    backfillReasoningContent(body)
+    const got = assistantReasoning(body)
+    expect(got).toHaveLength(2)
+    for (const r of got) {
+      expect(r).not.toBe('<absent>')
+      expect(r).not.toBe('<non-string>')
+      expect(r).not.toBe('') // 空串不过闸；空白串过闸
+    }
+  })
+
+  it('reasoning 镜像 R8：优先级（已有非空不动 / rc 非空同源 / 皆无补单空格 / null 与空串归一）', () => {
+    // 门控取 thinkingEnabled 半边（与源测试 PrepareBodyOptWithEfforts 的注入后形态等价）：
+    // 无痕迹场景必须靠 enabled 开门，否则整个回填不执行。
+    const cases: Array<{ name: string; msg: Record<string, unknown>; want: string }> = [
+      { name: 'rc 有值 + reasoning 缺失 → 镜像复制', msg: { role: 'assistant', content: 'a', reasoning_content: 'source text' }, want: 'source text' },
+      { name: 'rc 有值 + reasoning null → 归一化为来源文本', msg: { role: 'assistant', content: 'a', reasoning: null, reasoning_content: 'source text' }, want: 'source text' },
+      { name: 'rc 有值 + reasoning 空串 → 覆盖为来源文本', msg: { role: 'assistant', content: 'a', reasoning: '', reasoning_content: 'source text' }, want: 'source text' },
+      { name: '两者皆无 → 补单个空格（空白串过闸、空串不过）', msg: { role: 'assistant', content: 'a' }, want: ' ' },
+      { name: 'reasoning 已非空 → 原样保留不覆盖', msg: { role: 'assistant', content: 'a', reasoning: 'kept', reasoning_content: 'other' }, want: 'kept' },
+    ]
+    for (const c of cases) {
+      const body: Record<string, unknown> = {
+        model: 'deepseek-v4-flash',
+        thinking: { type: 'enabled' },
+        messages: [c.msg],
+      }
+      backfillReasoningContent(body)
+      const got = assistantReasoning(body)
+      expect(got, c.name).toEqual([c.want])
+    }
+  })
+
+  it('reasoning 镜像 R9：非 deepseek 模型零改动（含缺失不补）', () => {
+    const absent: Record<string, unknown> = {
+      model: 'glm-5.2',
+      messages: [{ role: 'assistant', content: 'a' }],
+    }
+    backfillReasoningContent(absent)
+    expect(assistantReasoning(absent)).toEqual(['<absent>'])
+
+    const kept: Record<string, unknown> = {
+      model: 'glm-5.2',
+      messages: [{ role: 'assistant', content: 'a', reasoning: 'kept' }],
+    }
+    backfillReasoningContent(kept)
+    expect(assistantReasoning(kept)).toEqual(['kept'])
+  })
+
+  it('reasoning 镜像 R10：门控组合（disabled + 零痕迹零改动 / disabled + 有痕迹照补）', () => {
+    const noTrace: Record<string, unknown> = {
+      model: 'deepseek-v4-flash',
+      thinking: { type: 'disabled' },
+      messages: [{ role: 'user', content: 'u' }, { role: 'assistant', content: 'plain' }],
+    }
+    backfillReasoningContent(noTrace)
+    expect(assistantReasoning(noTrace)).toEqual(['<absent>'])
+
+    const hasTrace: Record<string, unknown> = {
+      model: 'deepseek-v4-flash',
+      thinking: { type: 'disabled' },
+      messages: [{ role: 'assistant', content: 'a', reasoning_content: 'trace' }],
+    }
+    backfillReasoningContent(hasTrace)
+    expect(assistantReasoning(hasTrace)).toEqual(['trace'])
+  })
+
+  it('reasoning 镜像：既有 R1-R6 回归不受影响（rc 仍按旧契约补齐）', () => {
+    const body: Record<string, unknown> = {
+      model: 'deepseek-v4-flash',
+      messages: [
+        { role: 'user', content: 'q1' },
+        { role: 'assistant', content: 'a1', reasoning: 'think1' },
+        { role: 'user', content: 'q2' },
+        { role: 'assistant', content: 'a2' },
+      ],
+    }
+    backfillReasoningContent(body)
+    const msgs = body['messages'] as any[]
+    expect(msgs[1].reasoning_content).toBe('think1')
+    expect(msgs[3].reasoning_content).toBe('')
+    // 镜像：第一条 reasoning 已非空不动；第二条 rc 为空 → 补单空格。
+    expect(msgs[1].reasoning).toBe('think1')
+    expect(msgs[3].reasoning).toBe(' ')
+  })
 })
 
 describe('WorkBuddy 归属头与身份头注入 injectWorkbuddyChatHeaders', () => {

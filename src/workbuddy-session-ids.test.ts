@@ -4,6 +4,7 @@ import {
   isValidB3TraceId,
   resolveConversationId,
   contentText,
+  contentSignature,
   turnKey,
   requestIdForKey,
   turnRequestId,
@@ -170,14 +171,114 @@ describe('turnKey（最后一条 user 消息的序号+文本）', () => {
     expect(k1).not.toBe(k2)
   })
 
-  it('最后一条 user 无文本（纯图片）→ 空串，且不继续往前找', () => {
+  it('最后一条 user 无可签名内容（空/null/空 parts）→ 空串，且不继续往前找', () => {
     const body = {
       messages: [
         { role: 'user', content: 'has text' },
-        { role: 'user', content: [{ type: 'image_url', image_url: { url: 'x' } }] },
+        { role: 'user', content: null },
       ],
     }
     expect(turnKey(body)).toBe('')
+  })
+
+  // ===== a767465 内容签名：纯图片轮不再碎片化 =====
+
+  it('纯图片末条 user → 非空轮级键，且同 body 恒同键（a767465 G1）', () => {
+    const body = {
+      messages: [
+        { role: 'user', content: [{ type: 'image_url', image_url: { url: 'https://img.example/cat.png' } }] },
+      ],
+    }
+    const a = turnKey(body)
+    const b = turnKey(body)
+    expect(a).not.toBe('') // RED：修复前为 '' → 聚合头退化请求级随机
+    expect(a).toBe(b)
+    expect(a).toMatch(/^u0:\[image_url:[0-9a-f]{8}\]$/)
+  })
+
+  it('图文混合键 ≠ 纯文本键 ≠ 纯图键（同图同序号下三形态互异）', () => {
+    const mixed = turnKey({ messages: [{ role: 'user', content: [
+      { type: 'text', text: '看图' },
+      { type: 'image_url', image_url: { url: 'https://img.example/cat.png' } },
+    ] }] })
+    const textOnly = turnKey({ messages: [{ role: 'user', content: '看图' }] })
+    const imageOnly = turnKey({ messages: [{ role: 'user', content: [
+      { type: 'image_url', image_url: { url: 'https://img.example/cat.png' } },
+    ] }] })
+    expect(textOnly).toBe('u0:看图') // 纯文本路径键值零漂移（向后兼容契约）
+    expect(mixed).not.toBe(textOnly)
+    expect(mixed).not.toBe(imageOnly)
+    expect(mixed).toContain('看图')
+    expect(mixed).toContain('[image_url:')
+  })
+
+  it('不同图片 → 不同键（摘要区分内容）', () => {
+    const a = turnKey({ messages: [{ role: 'user', content: [
+      { type: 'image_url', image_url: { url: 'https://img.example/cat.png' } },
+    ] }] })
+    const b = turnKey({ messages: [{ role: 'user', content: [
+      { type: 'image_url', image_url: { url: 'https://img.example/dog.png' } },
+    ] }] })
+    expect(a).not.toBe('')
+    expect(b).not.toBe('')
+    expect(a).not.toBe(b)
+  })
+
+  it('同图不同序号（跨轮）→ 不同键（序号入键的既有设计不回退）', () => {
+    const a = turnKey({ messages: [{ role: 'user', content: [
+      { type: 'image_url', image_url: { url: 'https://img.example/cat.png' } },
+    ] }] })
+    const b = turnKey({ messages: [
+      { role: 'user', content: '第一问' },
+      { role: 'assistant', content: '答' },
+      { role: 'user', content: [{ type: 'image_url', image_url: { url: 'https://img.example/cat.png' } }] },
+    ] })
+    expect(a).not.toBe('')
+    expect(b).not.toBe('')
+    expect(a).not.toBe(b)
+    expect(b.startsWith('u2:')).toBe(true)
+  })
+
+  it('全文本 parts 的签名 == contentText 结果（数组形态零漂移）', () => {
+    const parts = [{ type: 'text', text: 'aa' }, { type: 'text', text: 'bb' }]
+    expect(contentSignature(parts)).toBe(contentText(parts))
+    expect(turnKey({ messages: [{ role: 'user', content: parts }] })).toBe('u0:aabb')
+  })
+
+  it('data: 超长 base64 只入短摘要（键长有界）', () => {
+    const longUrl = 'data:image/png;base64,' + 'QUFBQQ'.repeat(4096)
+    const k = turnKey({ messages: [{ role: 'user', content: [
+      { type: 'image_url', image_url: { url: longUrl } },
+    ] }] })
+    expect(k).not.toBe('')
+    expect(k.length).toBeLessThan(256) // 摘要化防键膨胀
+  })
+
+  it('contentSignature 边界：空/null/空数组/全空文本 part → 空串（不伪造）', () => {
+    expect(contentSignature(null)).toBe('')
+    expect(contentSignature(undefined)).toBe('')
+    expect(contentSignature(123)).toBe('')
+    expect(contentSignature([])).toBe('')
+    expect(contentSignature([{ type: 'text', text: '' }])).toBe('')
+    expect(contentSignature([null])).toBe('')
+  })
+
+  it('contentSignature 边界：非文本 part 时整体 trim（对齐源 TrimSpace）', () => {
+    const sig = contentSignature([
+      { type: 'text', text: '  看图  ' },
+      { type: 'image_url', image_url: { url: 'x' } },
+    ])
+    expect(sig.startsWith(' ')).toBe(false)
+    expect(sig.endsWith(' ')).toBe(false)
+    expect(sig).toContain('看图')
+    expect(sig).toContain('[image_url:')
+  })
+
+  it('contentSignature 畸形 part → 空串（对齐源 Unmarshal 失败即返 ""）', () => {
+    expect(contentSignature(['plain-string'])).toBe('')
+    expect(contentSignature([{ type: 'text', text: 42 }])).toBe('')
+    expect(contentSignature([{ type: 7, text: 'x' }])).toBe('')
+    expect(contentSignature([[]])).toBe('')
   })
 
   it('多模态 content 拼接后入键', () => {
@@ -247,7 +348,7 @@ describe('turnRequestId（轮级纯派生）', () => {
   })
 })
 
-describe('buildChatMeta（conversationRequestId 三级回退）', () => {
+describe('buildChatMeta（conversationRequestId 四分支，含 b9ac0d3 统一轮级）', () => {
   beforeEach(() => { __resetSessionIdsForTests() })
 
   it('① 入站 X-Conversation-Request-ID 头透传优先', async () => {
@@ -259,14 +360,70 @@ describe('buildChatMeta（conversationRequestId 三级回退）', () => {
     expect(meta.conversationRequestId).toBe('inbound-abc')
   })
 
-  it('② 无入站头但会话键非空 → 会话级稳定值', async () => {
-    const m1 = await buildChatMeta({ body: { messages: [] }, sessionKey: 'sess-1' })
-    const m2 = await buildChatMeta({ body: { messages: [] }, sessionKey: 'sess-1' })
-    expect(m1.conversationRequestId).toBe(m2.conversationRequestId)
-    expect(m1.conversationRequestId).toMatch(/^[0-9a-f]{32}$/)
+  // ===== b9ac0d3 / 源 issue #170：带会话键客户端统一轮级 =====
+
+  it('② 会话键 + 同会话两轮（末条 user 不同）→ 出站 ID 必须不同（轮级，R1 RED）', async () => {
+    const a = await buildChatMeta({
+      body: { messages: [{ role: 'user', content: '第一问' }] },
+      sessionKey: 'conv-t',
+    })
+    const b = await buildChatMeta({
+      body: { messages: [
+        { role: 'user', content: '第一问' },
+        { role: 'assistant', content: '答' },
+        { role: 'user', content: '第二问' },
+      ] },
+      sessionKey: 'conv-t',
+    })
+    expect(a.conversationRequestId).toMatch(/^[0-9a-f]{32}$/)
+    expect(b.conversationRequestId).toMatch(/^[0-9a-f]{32}$/)
+    expect(a.conversationRequestId).not.toBe(b.conversationRequestId)
   })
 
-  it('③ 无会话键 → 轮级派生（同轮恒定）', async () => {
+  it('② 会话键 + 同会话同轮文本 → 同键（轮内 tool-call 多步共享，R2）', async () => {
+    const step1 = await buildChatMeta({
+      body: { messages: [{ role: 'user', content: '跑一下' }] },
+      sessionKey: 'conv-t',
+    })
+    const step2 = await buildChatMeta({
+      body: { messages: [
+        { role: 'user', content: '跑一下' },
+        { role: 'assistant', tool_calls: [{ id: 'c1', function: { name: 'pwsh' } }] },
+        { role: 'tool', tool_call_id: 'c1', content: '结果' },
+      ] },
+      sessionKey: 'conv-t',
+    })
+    expect(step1.conversationRequestId).toBe(step2.conversationRequestId)
+  })
+
+  it('② 会话键 + 轮转重试（同 body 重复调用）→ 同键（R3 回归）', async () => {
+    const body = { messages: [{ role: 'user', content: '重试场景' }] }
+    const a = await buildChatMeta({ body, sessionKey: 'conv-r' })
+    const b = await buildChatMeta({ body, sessionKey: 'conv-r' })
+    expect(a.conversationRequestId).toBe(b.conversationRequestId)
+  })
+
+  it('② 不同会话同轮文本 → 不同键（sessKey 入复合键防撞，R4）', async () => {
+    const body = { messages: [{ role: 'user', content: '同样的问题' }] }
+    const a = await buildChatMeta({ body, sessionKey: 'conv-a' })
+    const b = await buildChatMeta({ body, sessionKey: 'conv-b' })
+    expect(a.conversationRequestId).not.toBe(b.conversationRequestId)
+  })
+
+  it('② 会话键 + turnKey 空态（无 user 消息）→ 会话级兜底同值（R5）', async () => {
+    const a = await buildChatMeta({
+      body: { messages: [{ role: 'assistant', content: '续' }] },
+      sessionKey: 'conv-e',
+    })
+    const b = await buildChatMeta({
+      body: { messages: [{ role: 'assistant', content: '又续' }] },
+      sessionKey: 'conv-e',
+    })
+    expect(a.conversationRequestId).toBe(b.conversationRequestId)
+    expect(a.conversationRequestId).toMatch(/^[0-9a-f]{32}$/)
+  })
+
+  it('③ 无会话键 → 轮级派生（同轮恒定，R6 回归）', async () => {
     const body = { messages: [{ role: 'user', content: 'hi' }] }
     const m1 = await buildChatMeta({ body })
     const m2 = await buildChatMeta({ body })
@@ -277,6 +434,40 @@ describe('buildChatMeta（conversationRequestId 三级回退）', () => {
     const m1 = await buildChatMeta({ body: { messages: [{ role: 'assistant', content: 'a' }] } })
     const m2 = await buildChatMeta({ body: { messages: [{ role: 'assistant', content: 'a' }] } })
     expect(m1.conversationRequestId).not.toBe(m2.conversationRequestId)
+  })
+
+  it('③ 无会话键 + 纯图片轮 → 轮级键非空且同轮恒定（a767465 × b9ac0d3 交汇）', async () => {
+    const body = { messages: [{ role: 'user', content: [
+      { type: 'image_url', image_url: { url: 'https://img.example/cat.png' } },
+    ] }] }
+    const a = await buildChatMeta({ body })
+    const b = await buildChatMeta({ body })
+    expect(a.conversationRequestId).toBe(b.conversationRequestId)
+  })
+
+  it('会话键 + 纯图片轮 → 同轮同键、跨轮换键（两修复叠加）', async () => {
+    const first = await buildChatMeta({
+      body: { messages: [{ role: 'user', content: [
+        { type: 'image_url', image_url: { url: 'https://img.example/cat.png' } },
+      ] }] },
+      sessionKey: 'conv-img',
+    })
+    const sameTurn = await buildChatMeta({
+      body: { messages: [{ role: 'user', content: [
+        { type: 'image_url', image_url: { url: 'https://img.example/cat.png' } },
+      ] }] },
+      sessionKey: 'conv-img',
+    })
+    const nextTurn = await buildChatMeta({
+      body: { messages: [
+        { role: 'user', content: [{ type: 'image_url', image_url: { url: 'https://img.example/cat.png' } }] },
+        { role: 'assistant', content: '答' },
+        { role: 'user', content: [{ type: 'image_url', image_url: { url: 'https://img.example/dog.png' } }] },
+      ] },
+      sessionKey: 'conv-img',
+    })
+    expect(first.conversationRequestId).toBe(sameTurn.conversationRequestId)
+    expect(first.conversationRequestId).not.toBe(nextTurn.conversationRequestId)
   })
 
   it('conversationId 与 traceId 透传', async () => {
@@ -420,11 +611,58 @@ describe('stickyFallbackKey（移植 8058019 + 10eefa8）', () => {
     expect(k2).toMatch(/^fb:[0-9a-f]{32}$/)
   })
 
-  it('无 user 消息 / 首条 user 无文本 / 空态 → 空串', async () => {
+  it('无 user 消息 / 首条 user 无可签名内容 / 空态 → 空串', async () => {
     expect(await stickyFallbackKey(null)).toBe('')
     expect(await stickyFallbackKey({})).toBe('')
     expect(await stickyFallbackKey({ messages: [{ role: 'assistant', content: 'a' }] })).toBe('')
-    expect(await stickyFallbackKey({ messages: [{ role: 'user', content: [{ type: 'image_url' }] }] })).toBe('')
+    expect(await stickyFallbackKey({ messages: [{ role: 'user', content: null }] })).toBe('')
+    expect(await stickyFallbackKey({ messages: [{ role: 'user', content: [] }] })).toBe('')
+  })
+
+  // ===== a767465：首图会话的粘性盲区修复 =====
+
+  it('首条 user 纯图片 → 派生非空粘性键，且同 body 恒同键（a767465 G1）', async () => {
+    const body = { messages: [{ role: 'user', content: [
+      { type: 'image_url', image_url: { url: 'https://img.example/cat.png' } },
+    ] }] }
+    const a = await stickyFallbackKey(body)
+    const b = await stickyFallbackKey(body)
+    expect(a).toMatch(/^fb:[0-9a-f]{32}$/) // RED：修复前为 '' → 逐请求换号
+    expect(b).toBe(a)
+  })
+
+  it('首图会话推进（历史追加）不换键（#169 契约对图片形态同样成立）', async () => {
+    const first = { messages: [{ role: 'user', content: [
+      { type: 'image_url', image_url: { url: 'https://img.example/cat.png' } },
+    ] }] }
+    const longer = { messages: [
+      { role: 'user', content: [{ type: 'image_url', image_url: { url: 'https://img.example/cat.png' } }] },
+      { role: 'assistant', content: '答' },
+      { role: 'user', content: '继续' },
+    ] }
+    expect(await stickyFallbackKey(longer)).toBe(await stickyFallbackKey(first))
+  })
+
+  it('纯文本粘性键零漂移：签名化后仍与旧 contentText 口径同键（#169 回归）', async () => {
+    const a = { messages: [{ role: 'user', content: '开场白' }] }
+    const longer = { messages: [
+      { role: 'user', content: '开场白' },
+      { role: 'assistant', content: '好的' },
+      { role: 'user', content: '继续' },
+    ] }
+    const [ka, kb] = await Promise.all([stickyFallbackKey(a), stickyFallbackKey(longer)])
+    expect(ka).toMatch(/^fb:[0-9a-f]{32}$/)
+    expect(kb).toBe(ka)
+  })
+
+  it('不同图片 → 不同粘性键', async () => {
+    const a = await stickyFallbackKey({ messages: [{ role: 'user', content: [
+      { type: 'image_url', image_url: { url: 'https://img.example/cat.png' } },
+    ] }] })
+    const b = await stickyFallbackKey({ messages: [{ role: 'user', content: [
+      { type: 'image_url', image_url: { url: 'https://img.example/dog.png' } },
+    ] }] })
+    expect(a).not.toBe(b)
   })
 
   it('extractSessionKey 命中时不经 fallback 也不会冲突：两键空间独立', async () => {

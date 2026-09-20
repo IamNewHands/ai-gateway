@@ -206,7 +206,7 @@ describe('WorkBuddy 池化代理端到端（粘性 + 会话头族 + 协议头）
     expect(h['x-b3-sampled']).toBe('1')
   })
 
-  it('同一会话多轮 → 会话头族聚合主键恒定（上游按对话轮聚合）', async () => {
+  it('同一会话多轮 → 聚合主键按对话轮换新（b9ac0d3 统一轮级，对齐官方 CLI）', async () => {
     const { env, app } = makeEnv([makeProvider()])
     await seedPool(env, ['u1'])
 
@@ -221,12 +221,23 @@ describe('WorkBuddy 池化代理端到端（粘性 + 会话头族 + 协议头）
       { role: 'assistant', content: 'a1' },
       { role: 'user', content: 'q2' },
     ] })
+    // 同轮内 tool-call 多步（末条 user 不变）→ 仍同键（轮内聚合语义保留）
+    await app.post({ ...base, messages: [
+      { role: 'user', content: 'q1' },
+      { role: 'assistant', content: 'a1' },
+      { role: 'user', content: 'q2' },
+      { role: 'assistant', tool_calls: [{ id: 'c1', function: { name: 'pwsh' } }] },
+      { role: 'tool', tool_call_id: 'c1', content: '结果' },
+    ] })
 
-    expect(calls.length).toBeGreaterThanOrEqual(2)
+    expect(calls.length).toBeGreaterThanOrEqual(3)
     const c1 = calls[0].headers['x-conversation-request-id']
     const c2 = calls[1].headers['x-conversation-request-id']
-    // 同一 conversationId（会话键）→ 聚合主键恒定
-    expect(c2).toBe(c1)
+    const c3 = calls[2].headers['x-conversation-request-id']
+    // #170 契约：换 user 消息即换键（会话键客户端同样走轮级，对齐官方 USER_PROMPT_SUBMIT 重生成）
+    expect(c2).not.toBe(c1)
+    // 轮内追加 assistant/tool 消息不改键（#35 轮内聚合核心语义）
+    expect(c3).toBe(c2)
     // 但消息级 ID 每轮不同
     expect(calls[1].headers['x-conversation-message-id']).not.toBe(calls[0].headers['x-conversation-message-id'])
   })
