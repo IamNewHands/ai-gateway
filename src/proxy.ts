@@ -66,6 +66,7 @@ import {
   injectWorkbuddyChatHeaders,
   ensureWorkbuddyStreamOptions,
   ensureWorkbuddyMaxTokens,
+  normalizeWorkbuddyImageURL,
   isAccountBanned,
   ensureGlobalFallbackSystem,
   rewriteWorkbuddySystemPrompt,
@@ -91,7 +92,7 @@ import {
   bindSticky,
   unbindSticky,
 } from './workbuddy-sticky'
-import { createWorkbuddyChunkCleaner, sanitizeWorkbuddyErrorFrame, WORKBUDDY_EMPTY_STREAM_FRAME, type WorkbuddyChunkCleaner, type WorkbuddyErrorFrame } from './workbuddy-sse'
+import { createWorkbuddyChunkCleaner, sanitizeWorkbuddyErrorFrame, WORKBUDDY_EMPTY_STREAM_FRAME, WORKBUDDY_HINT_INVALID_IMAGE, type WorkbuddyChunkCleaner, type WorkbuddyErrorFrame } from './workbuddy-sse'
 import { probeWorkbuddyModelCatalog, getCachedWorkbuddyEfforts } from './workbuddy-models'
 import {
   acquireInFlight,
@@ -2155,6 +2156,8 @@ async function proxyOAuthRequestPooledCore(
       sanitizeUpstreamBody(body)
       sanitizeBlockedTemplates(body)
       normalizeOpenAIToolChoice(body)
+      // image_url 形状归一（字符串 → {url}）：上游只认 OpenAI 对象形态（移植 c5cdb46）
+      normalizeWorkbuddyImageURL(body)
       if (capturedEffort) {
         const model = typeof body['model'] === 'string' ? body['model'] : ''
         applyWorkbuddyReasoningEffort(body, capturedEffort, resolveWorkbuddyEfforts(cfg, provider.id, model))
@@ -2466,6 +2469,15 @@ async function proxyOAuthRequestPooledCore(
             await unbindSticky(c.env, provider.id, stickyKey)
           }
           throw new WorkbuddyClientError(response.status, text, 'prompt_too_long')
+        case 'image_invalid':
+          // 图片格式/数据无效（400 + 11135 家族，移植 c5cdb46 的 ErrImageInvalid 分支）：
+          // 同 body 换任何账号都得到相同的解析错误——**不罚号、不轮转**，400 原文透传。
+          // 与 prompt_too_long 同待遇；差异只在出口附 `image_invalid` type 与定向 gateway_hint
+          // （源实现 writeOpenAIErrorHint 的 image_invalid 形态）。
+          if (stickyKey && account.uid === stickyUid) {
+            await unbindSticky(c.env, provider.id, stickyKey)
+          }
+          throw new WorkbuddyClientError(response.status, text, 'image_invalid')
         case 'bad_params':
         case 'client':
         default:
@@ -2617,10 +2629,16 @@ async function proxyOAuthRequestPooled(
       const errorObj: Record<string, unknown> = {
         message: formatted.message,
         // 11115 用独立 type（对齐源 writeOpenAIError(400, "prompt_too_long", ...)），
-        // 客户端可据此区分「上下文超限」与普通参数错。
-        type: err.kind === 'prompt_too_long' ? 'prompt_too_long' : 'invalid_request_error',
+        // 客户端可据此区分「上下文超限」与普通参数错；11135 图片无效同理（移植 c5cdb46
+        // 的 image_invalid 出口）。
+        type: err.kind === 'prompt_too_long'
+          ? 'prompt_too_long'
+          : err.kind === 'image_invalid' ? 'image_invalid' : 'invalid_request_error',
       }
       if (formatted.code !== undefined) errorObj.code = formatted.code
+      // 图片无效附定向 hint（对齐源 writeOpenAIErrorHint 的 image_invalid 形态）。
+      // 与 error.message 并列，不替换/不包装 message。
+      if (err.kind === 'image_invalid') errorObj.gateway_hint = WORKBUDDY_HINT_INVALID_IMAGE
       return c.json({ error: errorObj }, err.status as any)
     }
     logOAuthRequest(c, provider, model, subPath, forwardBody, 503)
@@ -2699,6 +2717,8 @@ async function proxyOAuthRequest(
       sanitizeUpstreamBody(body)
       sanitizeBlockedTemplates(body)
       normalizeOpenAIToolChoice(body)
+      // image_url 形状归一（字符串 → {url}）：上游只认 OpenAI 对象形态（移植 c5cdb46）
+      normalizeWorkbuddyImageURL(body)
       if (capturedEffort) {
         const m = typeof body['model'] === 'string' ? body['model'] : ''
         applyWorkbuddyReasoningEffort(body, capturedEffort, resolveWorkbuddyEfforts(cfg, provider.id, m))
@@ -3203,6 +3223,8 @@ export async function handleAnthropicMessages(c: Context<AppEnv>) {
         ensureWorkbuddyStreamOptions(upstreamBody)
         ensureWorkbuddyMaxTokens(upstreamBody)
         normalizeOpenAIToolChoice(upstreamBody)
+        // image_url 形状归一（字符串 → {url}）：上游只认 OpenAI 对象形态（移植 c5cdb46）
+        normalizeWorkbuddyImageURL(upstreamBody)
         // reasoning_effort 降级（移植 workbuddy2api）：运营者声明 oauth.effortPolicy 才恢复/降级，未声明保持删除
         if (wbCapturedEffort) {
           const m = typeof upstreamBody['model'] === 'string' ? upstreamBody['model'] : ''
@@ -3231,12 +3253,16 @@ export async function handleAnthropicMessages(c: Context<AppEnv>) {
           // 客户端参数/格式错误终态：回 4xx（Anthropic 错误形状）+ 上游原因（不轮转，避免误报 503 无可用账号）
           if (e instanceof WorkbuddyClientError) {
             const formatted = formatWorkbuddyClientErrorMessage(e.status, e.upstreamText, e.kind)
+            const errorObj: Record<string, unknown> = {
+              type: e.kind === 'prompt_too_long'
+                ? 'prompt_too_long'
+                : e.kind === 'image_invalid' ? 'image_invalid' : 'invalid_request_error',
+              message: formatted.message,
+            }
+            if (e.kind === 'image_invalid') errorObj.gateway_hint = WORKBUDDY_HINT_INVALID_IMAGE
             return c.json({
               type: 'error',
-              error: {
-                type: e.kind === 'prompt_too_long' ? 'prompt_too_long' : 'invalid_request_error',
-                message: formatted.message,
-              },
+              error: errorObj,
             }, e.status as any)
           }
           return c.json({
@@ -4429,6 +4455,8 @@ export async function handleResponses(c: Context<AppEnv>) {
         ensureWorkbuddyMaxTokens(upstreamBody)
         // tool_choice 归一（对象形式会被上游 400 code=11101 拒绝）
         normalizeOpenAIToolChoice(upstreamBody)
+        // image_url 形状归一（字符串 → {url}）：上游只认 OpenAI 对象形态（移植 c5cdb46）
+        normalizeWorkbuddyImageURL(upstreamBody)
         // reasoning_effort 降级（按运营者声明的 effortPolicy）
         if (wbCapturedEffort) {
           const m = typeof upstreamBody['model'] === 'string' ? upstreamBody['model'] : ''

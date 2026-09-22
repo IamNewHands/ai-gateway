@@ -33,6 +33,7 @@ export type WorkbuddyErrorKind =
   | 'server'           // 5xx → 累计错误计数
   | 'waf_block'        // 403 + 无业务信封（APISIX WAF 拦截页/空体）→ 软冷却 + 抖动退避，不禁用
   | 'prompt_too_long'  // 11115「prompt is too long」→ 请求级错误（非账号问题）：不罚号、不轮转，透传原文
+  | 'image_invalid'    // 400 图片格式/数据无效（11135 家族）→ 请求级错误：不罚号、不轮转，透传原文 + 定向 hint
   | 'bad_params'       // 400 Unmarshal 11101 → 客户端参数错，不罚号，仅换号
   | 'content_blocked'  // 400 审核拦截 → 不罚号
   | 'client'           // 其他 4xx → 不处罚，仅换号
@@ -283,8 +284,9 @@ export function parseSoftRateReset(bodyText: string): number | null {
 /**
  * 按 HTTP 状态码 + 响应体判定错误类别（对齐 workbuddy2api Classify 的判定顺序）：
  * 11102 模型不存在（400/404）→ 402 → session 死亡关键词 → **账号级故障（11140/14017）**
- * → 6004 模型限流 → **429 软限流** → 余额关键词 → 404 → 5xx → WAF 403（无业务信封）
- * → 内容策略拦截 → 11101 参数错 → 其他 4xx。
+ * → 6004 模型限流 → **429 + 14018 积分耗尽（硬）** → **429 软限流** → 余额关键词 → 404 → 5xx
+ * → WAF 403（无业务信封）→ **图片无效（400 + 11135 家族）** → 内容策略拦截 → 11101 参数错
+ * → 其他 4xx。
  * 非 429 场景下关键词优先于状态码：上游偶发把业务错误包在 5xx 里时，按真实原因分类。
  *
  * 判定顺序的语义依据（对齐源实现 client.go Classify 的注释）：
@@ -305,6 +307,13 @@ export function parseSoftRateReset(bodyText: string): number | null {
  *    （见 proxy.ts 的 `case 'hard_credit'`）。状态码是比关键词更权威的信号：上游既然给了
  *    429 就按限流语义处理（宁可短冷却自愈，不可长冷却弃号）。真正的余额耗尽由 402 捕获，
  *    非 429 状态码携带的 quota 措辞仍走下方余额关键词层，历史语义不变；
+ *  - **429 + 业务码 14018 是上述"429 一律软限流"的例外**（移植 80acb32，源 issue #175）：
+ *    14018 明确表示账号积分耗尽，靠状态码判不了（上游把它包在 429 里）。判据只取结构化
+ *    `code`，不含文案——故 `{"code":1,"msg":"Credits exhausted"}` 仍按软限流，不会因文案
+ *    误硬冷却真限流号。落 hard_credit 后 reason 含"余额不足"→ 被 oauth-pool 的硬冷却排除
+ *    规则挡在全冷却兜底之外（否则 60s 后又被顶班选中，反复撞同一耗尽错误）；
+ *  - 图片无效（400 + 11135 家族）判在内容策略/参数错误之前：请求级语义，出口需带定向 hint
+ *    （`client` 兜底虽同样不轮转，但不附 `gateway_hint`）；
  *  - 6004 模型级限流（本仓额外细分，源实现由调用方分流）判在 429 之前：更具体的业务码优先。
  */
 export function classifyWorkbuddyUpstreamError(status: number, bodyText: string): WorkbuddyErrorKind {
@@ -334,6 +343,14 @@ export function classifyWorkbuddyUpstreamError(status: number, bodyText: string)
     if (lower.includes(m) || bodyText.includes(m)) return 'account_fault'
   }
   if (isModelRateLimit(bodyText)) return 'model_rate'
+  // 429 + 业务码 14018 = 账号积分耗尽（移植 workbuddy2api 80acb32，源 issue #175）。
+  // 必须**先于**通用 429 兜底：否则误归 soft_rate（60s 软冷却、reason `'429 rate limit'`
+  // 不含硬冷却关键词）→ 该号逃过 oauth-pool.ts:714 的 HARD_COOL_REASON_RE 排除，仍可被
+  // 全冷却兜底 pickEarliestCoolingFallback 顶班选中 → 60s 后再次撞同一错误，白烧轮次。
+  // 只认结构化 `code` 字段（容忍 JSON 空白与字符串/数字两形态，对齐本仓 11115/11102/11101
+  // 口径）；**不认文案**——`{"code":1,"msg":"Credits exhausted"}` 与 `{"requestId":"14018"}`
+  // 仍按软限流：文案跨计费/限流两界，状态码 + 业务码才是权威信号。
+  if (status === 429 && /"code"\s*:\s*"?14018"?/.test(bodyText)) return 'hard_credit'
   // 429 先于余额关键词层（移植 145220d）：见上方顺序依据。
   if (status === 429) return 'soft_rate'
   for (const m of HARD_MARKERS) {
@@ -346,6 +363,18 @@ export function classifyWorkbuddyUpstreamError(status: number, bodyText: string)
   // 带业务信封的 403（11140 request illegal 等）已被上方 account_fault 捕获，走不到本层。
   if (isWafBlocked(status, bodyText)) return 'waf_block'
   if (status >= 400) {
+    // 图片格式/数据无效（400 + 11135 家族）= 确定性的**请求级**错误：同一 body 换任何账号
+    // 都是同样的解析结果，轮转只会白扔健康号配额（移植 workbuddy2api c5cdb46 的
+    // ErrImageInvalid）。本仓不轮转/不罚号的语义已由 client 兜底承担，此独立分类用于
+    // **出口分流**：附 `image_invalid` type 与定向 gateway_hint（proxy.ts 的
+    // WorkbuddyClientError 出口）。业务码经正则判定（容忍 JSON 空白与字符串/数字两形态；
+    // 源 5d5223d 修的是 Go 字面量 marker 的空格盲区，本仓正则口径天然无此问题）。
+    // **刻意不收**源实现的 `replace the image` 泛化短语——与本仓 hint 侧
+    // `isWorkbuddyInvalidImageData` 的既有纪律一致（该短语会命中大量非 11135 的参数错误）。
+    if (status === 400 && (/"code"\s*:\s*"?11135"?/.test(bodyText) ||
+      lower.includes('invalid_image_data') || lower.includes('invalid image_url content'))) {
+      return 'image_invalid'
+    }
     for (const m of CONTENT_BLOCKED_MARKERS) {
       if (lower.includes(m)) return 'content_blocked'
     }
@@ -684,6 +713,44 @@ export function ensureWorkbuddyMaxTokens(body: Record<string, unknown>, defaultT
     return
   }
   body['max_tokens'] = defaultTokens
+}
+
+// ===== 出站请求体 image_url 形状归一 =====
+
+/**
+ * 兼容 OpenAI chat 多模态内容的两种 `image_url` 写法（移植 workbuddy2api c5cdb46
+ * `normalizeImageURL`，源 `internal/upstream/payload.go`）。
+ *
+ * OpenAI Chat Completions 规范用**对象**形态 `{"url":"...","detail":"..."}`；部分客户端
+ * （以及 Responses → Chat 转换器）会发**字符串**形态 `"data:..."` / `"https://..."`。
+ * WorkBuddy 上游只接受对象形态，字符串会返 400 `code=11101`
+ * "cannot unmarshal string into ... ImageContent"。
+ *
+ * 只做形状转换：字符串 → `{"url": 原值}`；已是对象则**逐字不动**（`url`/`detail`/`mime_type`
+ * 原样保留）。空字符串、缺失值、非字符串非对象一律**不补默认值**——让上游返回真实错误，
+ * 而不是由网关编造一个 URL 掩盖问题。
+ *
+ * 与源实现的差异：源在 `PrepareBodyOpt*` 里对所有提供商统一执行；本仓出站管线是按提供商
+ * 分流的（`proxy.ts` 的 workbuddy 分支），故此处只挂到 4 个 workbuddy 出站点，
+ * 不改其他提供商行为。
+ */
+export function normalizeWorkbuddyImageURL(body: Record<string, unknown>): void {
+  const msgs = body['messages']
+  if (!Array.isArray(msgs)) return
+  for (const rawMsg of msgs) {
+    if (!rawMsg || typeof rawMsg !== 'object' || Array.isArray(rawMsg)) continue
+    const parts = (rawMsg as Record<string, unknown>)['content']
+    if (!Array.isArray(parts)) continue
+    for (const rawPart of parts) {
+      if (!rawPart || typeof rawPart !== 'object' || Array.isArray(rawPart)) continue
+      const part = rawPart as Record<string, unknown>
+      if (part['type'] !== 'image_url') continue
+      const imageURL = part['image_url']
+      // 只转换非空字符串形态；对象/数组/null/缺失/空串一律不碰
+      if (typeof imageURL !== 'string' || imageURL === '') continue
+      part['image_url'] = { url: imageURL }
+    }
+  }
 }
 
 

@@ -50,6 +50,7 @@ import {
   RETRY_AFTER_SANITY_MS,
   isWafBlocked,
   hasBusinessEnvelope,
+  normalizeWorkbuddyImageURL,
 } from './workbuddy-upstream'
 
 describe('classifyWorkbuddyUpstreamError 错误分类（移植 workbuddy2api Classify）', () => {
@@ -94,6 +95,128 @@ describe('classifyWorkbuddyUpstreamError 错误分类（移植 workbuddy2api Cla
 
   it('<400 兜底 → client', () => {
     expect(classifyWorkbuddyUpstreamError(200, 'weird')).toBe('client')
+  })
+})
+
+describe('429 + code 14018 积分耗尽 → hard_credit（移植 workbuddy2api 80acb32，源 issue #175）', () => {
+  it('429 + 顶层 code 14018（数字/字符串）→ hard_credit', () => {
+    expect(classifyWorkbuddyUpstreamError(429, '{"code":14018,"msg":"Credits exhausted"}')).toBe('hard_credit')
+    expect(classifyWorkbuddyUpstreamError(429, '{"code":"14018","msg":"Credits exhausted"}')).toBe('hard_credit')
+  })
+
+  it('429 + 嵌套 error.data.code 14018 / JSON 空白 → hard_credit', () => {
+    expect(classifyWorkbuddyUpstreamError(429, '{"error":{"data":{"code":14018,"msg":"Credits exhausted"}}}'))
+      .toBe('hard_credit')
+    // 空白容差（红例：字面量 marker `"code":14018` 会漏判带空格的合法形态）
+    expect(classifyWorkbuddyUpstreamError(429, '{"code": 14018, "msg": "credits exhausted"}')).toBe('hard_credit')
+  })
+
+  it('**反例**：仅同文案而无 14018 业务码 → 仍为 soft_rate（不误硬冷却真限流号）', () => {
+    // 文案跨计费/限流两界，只有「状态码 + 业务码」双信号才判积分耗尽
+    expect(classifyWorkbuddyUpstreamError(429, '{"code":1,"msg":"Credits exhausted"}')).toBe('soft_rate')
+    expect(classifyWorkbuddyUpstreamError(429, 'Credits exhausted')).toBe('soft_rate')
+  })
+
+  it('**反例**：14018 出现在 requestId 等其他字段 → 仍为 soft_rate（不误命中）', () => {
+    expect(classifyWorkbuddyUpstreamError(429, '{"requestId":"14018","msg":"slow down"}')).toBe('soft_rate')
+    expect(classifyWorkbuddyUpstreamError(429, '{"error_code":"14018","msg":"slow down"}')).toBe('soft_rate')
+  })
+
+  it('14018 但状态码非 429 → 仍由既有余额关键词层接住 hard_credit（本层是 429 场景的补位）', () => {
+    // 非 429 时文案 `credits exhausted` 本就命中 HARD_MARKERS 走 hard_credit——
+    // 本层补的正是「429 会先短路到 soft_rate」这条漏洞。
+    expect(classifyWorkbuddyUpstreamError(400, '{"code":14018,"msg":"Credits exhausted"}')).toBe('hard_credit')
+  })
+})
+
+describe('400 + 11135 图片无效 → image_invalid（移植 workbuddy2api c5cdb46 ErrImageInvalid）', () => {
+  it('400 + code 11135（数字/字符串/带空白/嵌套）→ image_invalid', () => {
+    expect(classifyWorkbuddyUpstreamError(400, '{"code":11135,"msg":"invalid_image_data"}')).toBe('image_invalid')
+    expect(classifyWorkbuddyUpstreamError(400, '{"code":"11135","msg":"image rejected"}')).toBe('image_invalid')
+    expect(classifyWorkbuddyUpstreamError(400, '{"code": 11135, "msg": "image rejected"}')).toBe('image_invalid')
+    expect(classifyWorkbuddyUpstreamError(400, '{"error":{"code":11135,"message":"image rejected"}}')).toBe('image_invalid')
+  })
+
+  it('400 + 图片文案 marker（无业务码）→ image_invalid', () => {
+    // 源报文形态（handler_test.go 实测）
+    expect(classifyWorkbuddyUpstreamError(400,
+      '{"code":11101,"msg":"Parse message failed: invalid image_url content at index 2: json: cannot unmarshal string"}'))
+      .toBe('image_invalid')
+    expect(classifyWorkbuddyUpstreamError(400, 'invalid_image_data')).toBe('image_invalid')
+  })
+
+  it('**反例**：400 + 非图片业务码 → 保持原有分类（不误报图片问题）', () => {
+    expect(classifyWorkbuddyUpstreamError(400, '{"code":11133,"msg":"other business error"}')).toBe('client')
+    expect(classifyWorkbuddyUpstreamError(400, '{"code":11101,"msg":"Unmarshal chat params failed"}')).toBe('bad_params')
+    // 源实现的 `replace the image` 泛化短语本仓刻意不收（会命中大量非 11135 的参数错误）
+    expect(classifyWorkbuddyUpstreamError(400, 'Please replace the image and retry')).toBe('client')
+  })
+
+  it('**反例**：11135 但状态码非 400 → 不判 image_invalid', () => {
+    expect(classifyWorkbuddyUpstreamError(500, '{"code":11135,"msg":"image rejected"}')).toBe('server')
+  })
+})
+
+describe('normalizeWorkbuddyImageURL 出站 image_url 形状归一（移植 workbuddy2api c5cdb46）', () => {
+  it('字符串形态 → 对象形态（data: 与 https 两种）', () => {
+    const body = {
+      messages: [{
+        role: 'user',
+        content: [
+          { type: 'text', text: '看图' },
+          { type: 'image_url', image_url: 'data:image/png;base64,AAA' },
+          { type: 'image_url', image_url: 'https://example.com/a.png' },
+        ],
+      }],
+    }
+    normalizeWorkbuddyImageURL(body)
+    const parts = (body.messages[0] as any).content
+    expect(parts[1].image_url).toEqual({ url: 'data:image/png;base64,AAA' })
+    expect(parts[2].image_url).toEqual({ url: 'https://example.com/a.png' })
+    // 非图片 part 不动
+    expect(parts[0]).toEqual({ type: 'text', text: '看图' })
+  })
+
+  it('已是对象形态 → 逐字不动（url/detail/mime_type 原样保留）', () => {
+    const body = {
+      messages: [{
+        role: 'user',
+        content: [{ type: 'image_url', image_url: { url: 'https://x/y.png', detail: 'high', mime_type: 'image/png' } }],
+      }],
+    }
+    normalizeWorkbuddyImageURL(body)
+    expect((body.messages[0] as any).content[0].image_url)
+      .toEqual({ url: 'https://x/y.png', detail: 'high', mime_type: 'image/png' })
+  })
+
+  it('空串/缺失/null/非字符串非对象 → 不补默认值（让上游返回真实错误）', () => {
+    const body = {
+      messages: [{
+        role: 'user',
+        content: [
+          { type: 'image_url', image_url: '' },
+          { type: 'image_url' },
+          { type: 'image_url', image_url: null },
+          { type: 'image_url', image_url: 42 },
+        ],
+      }],
+    }
+    normalizeWorkbuddyImageURL(body)
+    const parts = (body.messages[0] as any).content
+    expect(parts[0].image_url).toBe('')
+    expect(parts[1].image_url).toBeUndefined()
+    expect(parts[2].image_url).toBeNull()
+    expect(parts[3].image_url).toBe(42)
+  })
+
+  it('畸形入参不抛错（无 messages / 非数组 / 非对象消息 / 非数组 content）', () => {
+    expect(() => normalizeWorkbuddyImageURL({})).not.toThrow()
+    expect(() => normalizeWorkbuddyImageURL({ messages: 'x' })).not.toThrow()
+    expect(() => normalizeWorkbuddyImageURL({ messages: [null, 'x', 7] })).not.toThrow()
+    expect(() => normalizeWorkbuddyImageURL({ messages: [{ role: 'user', content: 'plain string' }] })).not.toThrow()
+    const n = { messages: [{ role: 'user', content: 'plain string' }] }
+    normalizeWorkbuddyImageURL(n)
+    expect(n.messages[0].content).toBe('plain string')
   })
 })
 

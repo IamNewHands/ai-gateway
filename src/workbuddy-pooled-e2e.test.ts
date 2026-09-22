@@ -7,6 +7,7 @@ import { __resetStickyCacheForTests, STICKY_KV_PREFIX } from './workbuddy-sticky
 import { __resetSessionIdsForTests } from './workbuddy-session-ids'
 import { __resetInFlightForTests, inFlightOf, inFlightSnapshot } from './workbuddy-inflight'
 import { clearCache } from './storage'
+import { WORKBUDDY_HINT_INVALID_IMAGE } from './workbuddy-sse'
 import type { AppEnv, Env, OAuthTokenState, Provider } from './types'
 
 /**
@@ -771,6 +772,125 @@ describe('WorkBuddy 池化代理端到端（粘性 + 会话头族 + 协议头）
     // hard_credit 分支写 reason='余额不足' + until≈次日 04:00；soft_rate 分支写 '429 rate limit'
     expect(st.reason).toBe('429 rate limit')
     expect((st.until || 0) - Date.now()).toBeLessThanOrEqual(60 * 60 * 1000)
+  })
+
+  // ===== R6-1：429 + code 14018 积分耗尽（移植 80acb32，源 issue #175）=====
+
+  it('R6-1：429 + code 14018 → 硬积分冷却（余额不足，远超 60s），换健康号成功', async () => {
+    const { env, store, app } = makeEnv([makeProvider({ preferOauthUid: 'bad' })])
+    await seedPool(env, ['bad', 'good'])
+
+    // 首轮被 preferOauthUid 钉到 bad；bad 返回「429 + 14018 积分耗尽」
+    vi.stubGlobal('fetch', vi.fn(async (url: string | URL | Request, init?: RequestInit) => {
+      const raw = (init?.headers || {}) as Record<string, string>
+      const h: Record<string, string> = {}
+      for (const k of Object.keys(raw)) h[k.toLowerCase()] = String(raw[k])
+      calls.push({
+        url: typeof url === 'string' ? url : String(url),
+        headers: h,
+        body: typeof init?.body === 'string' ? init.body : '',
+      })
+      if (h['x-user-id'] === 'bad') {
+        return new Response('{"code":14018,"msg":"Credits exhausted"}', {
+          status: 429,
+          headers: { 'Content-Type': 'application/json' },
+        })
+      }
+      return sseResponse()
+    }))
+
+    const res = await app.post({
+      model: `${PID}/deepseek-v4-flash`,
+      messages: [{ role: 'user', content: 'hi' }],
+      stream: false,
+    })
+    // 耗尽的坏号被硬冷却后轮到健康号，请求照常成功（不回 503）
+    expect(res.status).toBe(200)
+    expect(calls.length).toBe(2)
+    expect(calls[0].headers['x-user-id']).toBe('bad')
+    expect(calls[1].headers['x-user-id']).toBe('good')
+
+    const pool = JSON.parse(store.get(OAUTH_POOL_KV_PREFIX + PID)!) as Array<{ uid: string; state: { reason?: string; until?: number } }>
+    const bad = pool.find((a) => a.uid === 'bad')!.state
+    // 硬积分冷却：reason 含「余额不足」→ 被 oauth-pool 的 HARD_COOL_REASON_RE 挡在全冷却兜底之外
+    // （这正是本修复的目的：不再 60s 后被 pickEarliestCoolingFallback 顶班选中反复撞同一错误）
+    expect(bad.reason).toBe('余额不足')
+    expect((bad.until || 0) - Date.now()).toBeGreaterThan(60 * 60 * 1000)
+    // 健康号未被牵连（无冷却）
+    const good = pool.find((a) => a.uid === 'good')!.state
+    expect((good.until || 0) - Date.now()).toBeLessThanOrEqual(0)
+  })
+
+  // ===== R6-2：出站 image_url 形状归一（移植 c5cdb46 的 normalizeImageURL）=====
+
+  it('R6-2：字符串形态 image_url 出站前归一为 OpenAI 对象形态', async () => {
+    const { env, app } = makeEnv([makeProvider()])
+    await seedPool(env, ['u1'])
+
+    const res = await app.post({
+      model: `${PID}/deepseek-v4-flash`,
+      messages: [{
+        role: 'user',
+        content: [
+          { type: 'text', text: '看这张图' },
+          { type: 'image_url', image_url: 'https://example.com/cat.png' },
+          { type: 'image_url', image_url: { url: 'https://example.com/dog.png', detail: 'high' } },
+        ],
+      }],
+      stream: false,
+    })
+    expect(res.status).toBe(200)
+
+    const sent = JSON.parse(calls[0].body) as { messages: Array<{ content: Array<Record<string, unknown>> }> }
+    const parts = sent.messages[0].content
+    // 字符串形态 → 对象形态
+    expect(parts[1].image_url).toEqual({ url: 'https://example.com/cat.png' })
+    // 已是对象形态 → 逐字不动
+    expect(parts[2].image_url).toEqual({ url: 'https://example.com/dog.png', detail: 'high' })
+    // 文本 part 不动
+    expect(parts[0]).toEqual({ type: 'text', text: '看这张图' })
+  })
+
+  // ===== R6-3：400 + 11135 图片无效 → image_invalid type + 定向 gateway_hint =====
+
+  it('R6-3：400 + 11135 → 400 + image_invalid type + gateway_hint，且不轮转不罚号', async () => {
+    const { env, store, app } = makeEnv([makeProvider()])
+    await seedPool(env, ['u1'])
+
+    vi.stubGlobal('fetch', vi.fn(async (url: string | URL | Request, init?: RequestInit) => {
+      const raw = (init?.headers || {}) as Record<string, string>
+      const h: Record<string, string> = {}
+      for (const k of Object.keys(raw)) h[k.toLowerCase()] = String(raw[k])
+      calls.push({
+        url: typeof url === 'string' ? url : String(url),
+        headers: h,
+        body: typeof init?.body === 'string' ? init.body : '',
+      })
+      return new Response('{"code":11135,"msg":"invalid_image_data"}', {
+        status: 400,
+        headers: { 'Content-Type': 'application/json' },
+      })
+    }))
+
+    const res = await app.post({
+      model: `${PID}/deepseek-v4-flash`,
+      messages: [{ role: 'user', content: [{ type: 'image_url', image_url: { url: 'https://x/bad.png' } }] }],
+      stream: false,
+    })
+    expect(res.status).toBe(400)
+    const body = await res.json() as { error: { message: string; type: string; gateway_hint?: unknown; code?: unknown } }
+    expect(body.error.type).toBe('image_invalid')
+    expect(body.error.gateway_hint).toBe(WORKBUDDY_HINT_INVALID_IMAGE)
+    // message 仍透传上游原文（hint 只做并列补充，不替换/不包装 message）
+    expect(body.error.message).toContain('invalid_image_data')
+
+    // 请求级错误：只打一次上游（不轮转），账号零处罚（无冷却）
+    expect(calls.length).toBe(1)
+    const pool = JSON.parse(store.get(OAUTH_POOL_KV_PREFIX + PID)!) as Array<{ uid: string; state: { reason?: string; until?: number; errCount?: number } }>
+    const st = pool.find((a) => a.uid === 'u1')!.state
+    expect(st.reason).toBeUndefined()
+    expect((st.until || 0) - Date.now()).toBeLessThanOrEqual(0)
+    expect(st.errCount || 0).toBe(0)
   })
 
   it('P0-3（移植 edb9e97）：出站把 max_completion_tokens 翻译成 max_tokens（DSH 只发别名）', async () => {
