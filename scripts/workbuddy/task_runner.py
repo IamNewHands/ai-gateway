@@ -44,6 +44,10 @@
     school_season       参与「校园日」有奖活动（jump 落 coffee-activity H5 = school 开学季
                         同一活动；mini chat_request_send + activityId=school_open_day_2026
                         点亮，无 activityId 不点亮）                              100c+5e
+    Sequential_Tasks_2  在小程序内选中专家并完成有效对话（mp 指纹 expert_actual_use，
+                        不带 activityId/conversationId——小程序源码实测形状）   200c+5e
+    Sequential_Tasks_3  在小程序内完成 5 次有效对话（判据与 1 同形状，逐次上报、
+                        进度按上报条数累加，实测一次上报 5 条即 5/5）          300c+5e
   仍不可伪造：
     Expert_Philanthropy   真实捐款动作(M8)
 
@@ -110,6 +114,13 @@ MAPPING = {
     # ——一条 mini chat_request_send + activityId=school_open_day_2026 即点亮，
     # **无 activityId 不点亮**（源实测 0ceb9c7c/f8657995）。accept/claim 均要求 mp 头。
     "school_season":          {"kind": "schoolseason", "target": 1, "src": "无(mini chat+activityId)"},
+    # 小程序成长任务续（同 mp 下发口径、同 minichat 处理链路）：
+    # Sequential_Tasks_2 = 小程序内选中专家并完成有效对话，判据 mp 指纹 expert_actual_use，
+    # 无 activityId/conversationId（小程序源码实测形状，勿照抄 school 的 expert 事件）
+    "Sequential_Tasks_2":     {"kind": "miniexpert",  "target": 1, "src": "专家市场 ex_ id(mini)"},
+    # Sequential_Tasks_3 = 小程序内完成 5 次有效对话：与 Tasks_1 判据同形状（mp 指纹
+    # chat_request_send 无 activityId），只是 target=5 —— 按上报条数累加，无需新事件形状
+    "Sequential_Tasks_3":     {"kind": "minichat",    "target": 5, "src": "无(mini 对话×5 无activityId)"},
     # 不可伪造（真实业务副作用）
     "Expert_Philanthropy":    {"unforgeable": True, "reason": "真实捐款动作(M8)"},
 }
@@ -455,6 +466,9 @@ def ids_for(kind, auth, need, offset=0):
         return [("", {}) for _ in range(need)]
     if kind == "richmeow":
         return [("", {}) for _ in range(need)]
+    if kind == "miniexpert":
+        # 专家 id 取自小程序自身的专家市场端点（mp 口径，与 school 段的 school 分类不同源）
+        return _dedup_slice(_fetch_market_experts(auth), offset, need)
     if kind in ("buddy5", "library", "minichat", "schoolseason"):
         # history/current 不是顺序语义：buddy5/library/minichat/schoolseason 是固定事件组
         # 按需补 1 次（offset 无意义）
@@ -752,6 +766,25 @@ def build_event(auth, kind, obj_id, meta, idx):
                 "conversationId": cid, "requestId": cid, "inputLength": 12,
                 "mentionContexts": [], "mentionContextCount": 0, "userId": uid}
 
+    if kind == "miniexpert":
+        # 小程序成长任务 Sequential_Tasks_2（选中专家并完成有效对话）判据：
+        # mp 指纹 expert_actual_use。形状对齐小程序源码 app-service.js 的真实发射点
+        # （common.mp 遥测 y() + ideName=wx_app_cloud + 专家字段），机读差异字段：
+        #   · 无 conversationId/activityId —— 真实事件就是这两个字段都不带
+        #     （不同于 school 域 expert 事件：那套带 activityId+SaaS 才是开学季判据）
+        #   · extVersion 用小程序自身版本 2.2.8（school 段的 "SaaS" 是另一口径）
+        #   · type 固定 "send_message"（小程序恒发此值）
+        # 实测 00e26541：上报即 completed，claim 入账 200c+5e（两域无差异）。
+        return {"eventCode": "expert_actual_use", "timestamp": now, "reportDelay": 0,
+                "ideName": "wx_app_cloud", "ideType": "WorkBuddy_MP",
+                "extName": "workbuddy-mp", "extVersion": "2.2.8", "product": "SaaS",
+                "source": "mini_program", "os": "android", "osVersion": "14",
+                "arch": "arm64", "timezone": "Asia/Shanghai",
+                "machineId": derive_id(auth, "machine"),
+                "userId": uid, "id": obj_id, "name": obj_id,
+                "expertTitle": m.get("name") or obj_id, "type": "send_message",
+                "characterCount": 12, "expertType": m.get("expertType") or "agent"}
+
     if kind == "schoolseason":
         # growth 域 school_season（校园日）判据：mini 指纹 chat_request_send +
         # activityId=school_open_day_2026（与 school 域开学季同 activityId 关联，
@@ -872,7 +905,9 @@ def process_minichat_task(auth, code, opts, stats):
     ast = t.get("accept_status")
     prog = t.get("progress") or {}
     cur = prog.get("current") or 0
-    target = prog.get("target") or 1
+    # 未 accept 的 mp 任务 progress 为 null（实测 Sequential_Tasks_3 未激活时全空），
+    # 此时 target 必须由 MAPPING 提供——否则多元任务（Tasks_3 target=5）只会上报 1 次。
+    target = prog.get("target") or spec.get("target") or 1
     stats["total"] += 1
 
     if ast == "claimed":
@@ -893,6 +928,22 @@ def process_minichat_task(auth, code, opts, stats):
         stats["pending"] += 1
         return
 
+    # 判据上报的对象 id 先经 ids_for 解析（miniexpert 需真实专家 id，空 id 服务端
+    # 不入账）；无对象 id 的 kind 由 ids_for 返回空的 obj_id/meta，行为与原先一致。
+    # 与 process_task 同口径：ids 为空说明该类任务缺少可用载体，保守不点亮。
+    # 必须在 accept 之前判定——否则会留下「已登记未上报」的半程态（下次仍需 accept
+    # 分支才能补报），宁可整任务不动作。
+    need = max(1, target - cur)
+    ids = ids_for(kind, auth, need, offset=cur)
+    if not ids:
+        print(f"[task_runner] {uid8} {code}: {kind} 无可用对象 id，WARN 跳过点亮")
+        stats["pending"] += 1
+        return
+    if len(ids) < need:
+        # 对象池不够本轮目标（如专家市场返回数少于 need）：按可用数上报，剩余下次补
+        # （回读会如实报出缺口并记 pending，不伪造 id 凑数）。
+        print(f"[task_runner] {uid8} {code}: 可用对象 id {len(ids)} < 需 {need}，本轮按可用数上报")
+
     # 1) accept（mp 头；缺头实测 task not found，见源提交 8622910）
     #    移植 c793ae3：走同一 _accept_with_verify（读 results[].status + 回读 accept_status
     #    双重确认 + 重试一次）。mp 段此前只判 st/res，同样漏掉「200+未登记」形态。
@@ -905,9 +956,8 @@ def process_minichat_task(auth, code, opts, stats):
     # 2) 判据上报：mini 指纹 chat_request_send（minichat 无 activityId /
     #    schoolseason 带 activityId=school_open_day_2026），走 codebuddy.cn 域
     #    （本仓 report_mp_events 与源 school.report_events 同域同头）
-    need = max(1, target - cur)
-    for i in range(need):
-        ev = build_event(auth, kind, "", {}, i)
+    for i, (obj_id, meta) in enumerate(ids):
+        ev = build_event(auth, kind, obj_id, meta, i)
         st, sc = report_mp_events(auth, [ev])
         print(f"[task_runner] {uid8} {code}: report {i + 1}/{need} {st} code={sc} (mini growth)")
         time.sleep(opts.gap)
@@ -919,17 +969,20 @@ def process_minichat_task(auth, code, opts, stats):
     ast2 = t2.get("accept_status")
     prog2 = t2.get("progress") or {}
     cur2 = prog2.get("current", 0)
-    print(f"[task_runner] {uid8} {code}: query re-read {cur2}/{prog2.get('target', target)} "
+    # 回读同样要防 progress: null（键存在但值为 None 时 dict.get 的默认值不生效，
+    # 直接比较会抛 TypeError）；target2 与上面的 target 同口径兜底。
+    target2 = prog2.get("target") or spec.get("target") or 1
+    print(f"[task_runner] {uid8} {code}: query re-read {cur2}/{target2} "
           f"accept_status={ast2}")
     if ast2 == "claimed":
         print(f"[task_runner] {uid8} {code}: {ast} -> claimed（本轮已入账）")
         stats["already"] += 1
         return
-    if ast2 == "completed" or cur2 >= prog2.get("target", target):
+    if ast2 == "completed" or cur2 >= target2:
         claim_one(auth, code, uid8, stats, opts.gap, mp=True)
         return
     print(f"[task_runner] {uid8} {code}: report 未达 target"
-          f"（{cur2}/{prog2.get('target', target)}），WARN 待下次")
+          f"（{cur2}/{target2}），WARN 待下次")
     stats["pending"] += 1
 
 
@@ -1183,15 +1236,17 @@ def process_account(auth, opts, stats):
     by_code = {t.get("task_code"): t for t in tasks}
     # minichat 段（小程序限定任务）：这些 code 在默认（无 mp 头）growth 任务列表里不下发，
     # 由 process_minichat_task 专段处理，不进 process_task（否则必然 query 任务不存在）。
-    # 移植 e45f39f：schoolseason 与 minichat 同属 mp 下发口径，一并纳入本段。
-    minichat_in_map = [c for c in MAPPING if MAPPING[c].get("kind") in ("minichat", "schoolseason")]
+    # 移植 e45f39f/ee3c694：schoolseason、miniexpert 与 minichat 同属 mp 下发口径，一并纳入本段。
+    minichat_in_map = [c for c in MAPPING
+                       if MAPPING[c].get("kind") in ("minichat", "schoolseason", "miniexpert")]
     if opts.only_codes:
         codes = [c for c in opts.only_codes if c not in minichat_in_map]
         process_minichat = bool(set(opts.only_codes) & set(minichat_in_map))
     else:
-        # mp 下发口径的两个 code 都排除在 growth 主循环外（它们在默认列表里不存在，
+        # mp 下发口径的 code 均排除在 growth 主循环外（它们在默认列表里不存在，
         # 进了主循环必然 query 任务不存在）；由下面的 mp 专段处理。
-        codes = [c for c in MAPPING if MAPPING[c].get("kind") not in ("minichat", "schoolseason")]
+        codes = [c for c in MAPPING
+                 if MAPPING[c].get("kind") not in ("minichat", "schoolseason", "miniexpert")]
         process_minichat = True
         # 未在映射表但存在于任务列表的（如 first_buddy）——只计数展示
         for t in tasks:
