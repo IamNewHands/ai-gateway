@@ -900,15 +900,7 @@ def main():
     else:
         prefixes = []
         if not a.accounts or (len(a.accounts) == 1 and a.accounts[0].upper() == "ALL"):
-            pattern1 = os.path.join(tc.AUTHS, "workbuddy-*.json")
-            pattern2 = os.path.join(tc.AUTHS, "*.json")
-            files = sorted(glob.glob(pattern1)) or sorted(glob.glob(pattern2))
-            for p in files:
-                base = os.path.basename(p)
-                if base.startswith("workbuddy-"):
-                    prefixes.append(base[10:].replace(".json", ""))
-                else:
-                    prefixes.append(base.replace(".json", ""))
+            prefixes.extend(tc.get_all_auth_prefixes())
         else:
             prefixes = a.accounts
         seen, prefixes2 = set(), []

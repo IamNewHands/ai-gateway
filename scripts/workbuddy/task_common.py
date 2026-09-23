@@ -44,45 +44,9 @@ def _parse_jwt(token: str) -> dict:
     return {}
 
 
-def load_auth(uid_or_file: str) -> dict:
-    """从 auths/、指定 JSON 文件或环境变量加载账号凭证。
-
-    uid_or_file 可以为：
-      - "env": 从环境变量 WORKBUDDY_TOKEN, WORKBUDDY_UID, WORKBUDDY_DOMAIN 读取
-      - 绝对路径或相对路径的 .json 文件
-      - uid 前缀（自动匹配 workbuddy-{pre}*.json 或 {pre}*.json）
-
-    支持的数据格式：
-      - workbuddy2api 格式：{"auth": {"accessToken": "..."}, "account": {"uid": "..."}}
-      - ai-gateway 格式：{"token": {"access_token": "..."}, "uid": "..."}
-      - 扁平格式：{"access_token": "...", "uid": "..."}
-
-    返回 {token, uid, domain, nick, file} 五元组。
-    """
-    if uid_or_file == "env":
-        token = os.environ.get("WORKBUDDY_TOKEN", "")
-        if not token:
-            raise SystemExit("Environment variable WORKBUDDY_TOKEN is not set")
-        claims = _parse_jwt(token)
-        uid = os.environ.get("WORKBUDDY_UID") or claims.get("uid") or claims.get("sub") or "env_user"
-        domain = os.environ.get("WORKBUDDY_DOMAIN") or claims.get("domain") or ""
-        nick = os.environ.get("WORKBUDDY_NICK") or claims.get("nickname") or claims.get("name") or uid
-        return {"token": token, "domain": domain, "uid": uid, "nick": nick, "file": "env"}
-
-    if os.path.sep in uid_or_file or uid_or_file.endswith(".json") or os.path.isfile(uid_or_file):
-        p = uid_or_file
-        if not os.path.isabs(p) and not os.path.exists(p):
-            p = os.path.join(AUTHS, p)
-    else:
-        pre = uid_or_file
-        hits = glob.glob(os.path.join(AUTHS, f"workbuddy-{pre}*.json")) or glob.glob(os.path.join(AUTHS, f"{pre}*.json"))
-        if not hits:
-            raise SystemExit(f"no auth for {pre} in {AUTHS}")
-        p = hits[0]
-
-    with open(p, "r", encoding="utf-8") as f:
-        d = json.load(f)
-
+def _parse_auth_dict(d: dict, p: str) -> dict:
+    if not isinstance(d, dict):
+        raise SystemExit(f"Invalid auth entry in {p}: expected dict, got {type(d).__name__}")
     # 1. workbuddy2api 格式
     if "auth" in d and isinstance(d["auth"], dict):
         a = d["auth"]
@@ -114,6 +78,135 @@ def load_auth(uid_or_file: str) -> dict:
         uid = claims.get("uid") or claims.get("sub") or "unknown_user"
 
     return {"token": token, "domain": domain, "uid": uid, "nick": nick, "file": os.path.basename(p)}
+
+
+def get_all_auth_prefixes() -> list:
+    """返回 AUTHS 目录下所有可用账号的 uid 前缀（支持单账号文件与多账号导出数组文件）。"""
+    pattern1 = os.path.join(AUTHS, "workbuddy-*.json")
+    pattern2 = os.path.join(AUTHS, "*.json")
+    files = sorted(set(glob.glob(pattern1) + glob.glob(pattern2)))
+    prefixes = []
+    for p in files:
+        try:
+            with open(p, "r", encoding="utf-8") as f:
+                content = json.load(f)
+            if isinstance(content, list):
+                for item in content:
+                    if isinstance(item, dict) and item.get("uid"):
+                        prefixes.append(item["uid"][:8])
+            elif isinstance(content, dict):
+                uid = content.get("uid") or (content.get("account") or {}).get("uid")
+                if uid:
+                    prefixes.append(uid[:8])
+                else:
+                    base = os.path.basename(p)
+                    if base.startswith("workbuddy-"):
+                        prefixes.append(base[10:].replace(".json", "")[:8])
+                    else:
+                        prefixes.append(base.replace(".json", "")[:8])
+        except Exception:
+            base = os.path.basename(p)
+            prefixes.append(base.replace(".json", ""))
+    seen, res = set(), []
+    for x in prefixes:
+        if x and x not in seen:
+            seen.add(x)
+            res.append(x)
+    return res
+
+
+def load_auth(uid_or_file: str) -> dict:
+    """从 auths/、指定 JSON 文件或环境变量加载账号凭证。
+
+    uid_or_file 可以为：
+      - "env": 从环境变量 WORKBUDDY_TOKEN, WORKBUDDY_UID, WORKBUDDY_DOMAIN 读取
+      - 绝对路径或相对路径的 .json 文件（单账号 dict 或多账号 list）
+      - uid 前缀（自动匹配独立文件或多账号导出数组文件中的匹配账号）
+
+    支持的数据格式：
+      - workbuddy2api 格式：{"auth": {"accessToken": "..."}, "account": {"uid": "..."}}
+      - ai-gateway 格式：{"token": {"access_token": "..."}, "uid": "..."}
+      - 扁平格式：{"access_token": "...", "uid": "..."}
+      - ai-gateway 批量导出数组：[{...}, {...}]
+
+    返回 {token, domain, uid, nick, file} 五元组。
+    """
+    if uid_or_file == "env":
+        token = os.environ.get("WORKBUDDY_TOKEN", "")
+        if not token:
+            raise SystemExit("Environment variable WORKBUDDY_TOKEN is not set")
+        claims = _parse_jwt(token)
+        uid = os.environ.get("WORKBUDDY_UID") or claims.get("uid") or claims.get("sub") or "env_user"
+        domain = os.environ.get("WORKBUDDY_DOMAIN") or claims.get("domain") or ""
+        nick = os.environ.get("WORKBUDDY_NICK") or claims.get("nickname") or claims.get("name") or uid
+        return {"token": token, "domain": domain, "uid": uid, "nick": nick, "file": "env"}
+
+    pre = ""
+    target_item = None
+    target_file = ""
+
+    if os.path.sep in uid_or_file or uid_or_file.endswith(".json") or os.path.isfile(uid_or_file):
+        p = uid_or_file
+        if not os.path.isabs(p) and not os.path.exists(p):
+            p = os.path.join(AUTHS, p)
+        if not os.path.exists(p):
+            raise SystemExit(f"Auth file not found: {p}")
+        target_file = p
+    else:
+        pre = uid_or_file
+        hits = glob.glob(os.path.join(AUTHS, f"workbuddy-{pre}*.json")) or glob.glob(os.path.join(AUTHS, f"{pre}*.json"))
+        if hits:
+            target_file = hits[0]
+        else:
+            # 扫描所有 JSON 文件（支持从多账号导出数组文件中按 UID 查找）
+            all_files = sorted(set(glob.glob(os.path.join(AUTHS, "workbuddy-*.json")) + glob.glob(os.path.join(AUTHS, "*.json"))))
+            for fpath in all_files:
+                try:
+                    with open(fpath, "r", encoding="utf-8") as f:
+                        content = json.load(f)
+                    if isinstance(content, list):
+                        for item in content:
+                            if isinstance(item, dict):
+                                i_uid = str(item.get("uid") or "")
+                                i_nick = str(item.get("nickname") or "")
+                                if i_uid.startswith(pre) or i_nick == pre:
+                                    target_item = item
+                                    target_file = fpath
+                                    break
+                        if target_item:
+                            break
+                    elif isinstance(content, dict):
+                        i_uid = str(content.get("uid") or (content.get("account") or {}).get("uid") or "")
+                        if i_uid.startswith(pre):
+                            target_item = content
+                            target_file = fpath
+                            break
+                except Exception:
+                    continue
+            if not target_file and not target_item:
+                raise SystemExit(f"no auth for {pre} in {AUTHS}")
+
+    if target_item is not None:
+        return _parse_auth_dict(target_item, target_file)
+
+    with open(target_file, "r", encoding="utf-8") as f:
+        d = json.load(f)
+
+    if isinstance(d, list):
+        if not d:
+            raise SystemExit(f"Empty account list in {target_file}")
+        matched = None
+        if pre:
+            for item in d:
+                if isinstance(item, dict):
+                    i_uid = str(item.get("uid") or "")
+                    i_nick = str(item.get("nickname") or "")
+                    if i_uid.startswith(pre) or i_nick == pre:
+                        matched = item
+                        break
+        d = matched if matched is not None else d[0]
+
+    return _parse_auth_dict(d, target_file)
 
 
 def chat_base(auth: dict) -> str:

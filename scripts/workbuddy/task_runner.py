@@ -1328,15 +1328,7 @@ def main():
     prefixes = []
     for acc in a.accounts:
         if acc.upper() == "ALL":
-            pattern1 = os.path.join(tc.AUTHS, "workbuddy-*.json")
-            pattern2 = os.path.join(tc.AUTHS, "*.json")
-            files = sorted(glob.glob(pattern1)) or sorted(glob.glob(pattern2))
-            for p in files:
-                base = os.path.basename(p)
-                if base.startswith("workbuddy-"):
-                    prefixes.append(base[10:].replace(".json", ""))
-                else:
-                    prefixes.append(base.replace(".json", ""))
+            prefixes.extend(tc.get_all_auth_prefixes())
         else:
             prefixes.append(acc)
     # 去重保序
