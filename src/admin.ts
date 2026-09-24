@@ -28,7 +28,7 @@ import { testModelConnection } from './proxy'
 import { probeMcpServers } from './mcp-gateway'
 import { MAX_ADMIN_REQUEST_BYTES, readOptionalJSONLimited, readStrictJSONLimited } from './request-body'
 import { isTraeProvider, testTraeCredential, testTraeModel } from './trae/proxy'
-import { fetchOpenCodeModels, isOpenCodeProvider, resolveOpenCodeUrls, testOpenCodeModel } from './opencode'
+import { fetchOpenCodeModels, isOpenCodeProvider, resolveOpenCodeUrls, testOpenCodeKey, testOpenCodeModel } from './opencode'
 import { isQoderProvider, fetchQoderModels } from './qoder/proxy'
 import { isClineProvider, fetchClineModels, fetchClineRecommendedModels, testClineChat, testClineRefreshToken, startClineOAuth, pollClineOAuth } from './cline/proxy'
 import { isGeminiProvider, testGeminiModel, GEMINI_MODELS } from './gemini/proxy'
@@ -212,6 +212,25 @@ export async function handleGetProviders(c: Context<AppEnv>) {
   return c.json<ApiResponse<Provider[]>>({ success: true, data: providers })
 }
 
+/** OpenCode reasoning 档位白名单（与 src/opencode.ts OPENCODE_REASONING_EFFORTS 对齐） */
+const REASONING_EFFORTS = ['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max']
+
+/** 归一 reasoning 档位：非法值 / 空值一律视为「不设置」，避免脏值写进配置后被上游 400 */
+function normalizeReasoningEffort(value: unknown): string | undefined {
+  return typeof value === 'string' && REASONING_EFFORTS.includes(value) ? value : undefined
+}
+
+/** 归一按模型的 reasoning 覆盖表：丢弃非法档位与空 key；无有效项返回 undefined */
+function normalizeReasoningEffortByModel(value: unknown): Record<string, string> | undefined {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined
+  const out: Record<string, string> = {}
+  for (const [model, effort] of Object.entries(value as Record<string, unknown>)) {
+    const normalized = normalizeReasoningEffort(effort)
+    if (model && normalized) out[model] = normalized
+  }
+  return Object.keys(out).length > 0 ? out : undefined
+}
+
 export async function handleCreateProvider(c: Context<AppEnv>) {
   const body = await readStrictJSONLimited<CreateProviderRequest>(c.req.raw, MAX_ADMIN_REQUEST_BYTES)
   // opencode 未传地址时自动填充
@@ -257,6 +276,8 @@ export async function handleCreateProvider(c: Context<AppEnv>) {
     cnbPool: body.cnbPool,
     cooldown: body.cooldown,
     allowUnlistedModels: body.allowUnlistedModels,
+    reasoningEffort: normalizeReasoningEffort(body.reasoningEffort),
+    reasoningEffortByModel: normalizeReasoningEffortByModel(body.reasoningEffortByModel),
     thinkingInject: body.thinkingInject,
     cachePrefixInject: body.cachePrefixInject,
     geminiBaseUrl: body.geminiBaseUrl?.replace(/\/$/, ''),
@@ -318,6 +339,8 @@ export async function handleUpdateProvider(c: Context<AppEnv>) {
   if (body.cnbPool !== undefined) updates.cnbPool = body.cnbPool ?? undefined
   if (body.cooldown !== undefined) updates.cooldown = body.cooldown ?? undefined
   if (body.allowUnlistedModels !== undefined) updates.allowUnlistedModels = body.allowUnlistedModels
+  if (body.reasoningEffort !== undefined) updates.reasoningEffort = normalizeReasoningEffort(body.reasoningEffort)
+  if (body.reasoningEffortByModel !== undefined) updates.reasoningEffortByModel = normalizeReasoningEffortByModel(body.reasoningEffortByModel)
   if (body.thinkingInject !== undefined) updates.thinkingInject = body.thinkingInject ?? undefined
   if (body.cachePrefixInject !== undefined) updates.cachePrefixInject = body.cachePrefixInject ?? undefined
   if (body.geminiBaseUrl !== undefined) {
@@ -420,6 +443,8 @@ export async function handleUpsertProvider(c: Context<AppEnv>) {
       promptText: body.promptText,
       thinkingInject: body.thinkingInject,
       cachePrefixInject: body.cachePrefixInject,
+      reasoningEffort: normalizeReasoningEffort(body.reasoningEffort),
+      reasoningEffortByModel: normalizeReasoningEffortByModel(body.reasoningEffortByModel),
       geminiBaseUrl: body.geminiBaseUrl?.replace(/\/$/, ''),
       traeEnableRemoteBudget: body.traeEnableRemoteBudget,
       traeRemoteOnlyModels: body.traeRemoteOnlyModels,
@@ -463,6 +488,8 @@ export async function handleUpsertProvider(c: Context<AppEnv>) {
   if (body.promptText !== undefined) updates.promptText = body.promptText
   if (body.thinkingInject !== undefined) updates.thinkingInject = body.thinkingInject
   if (body.cachePrefixInject !== undefined) updates.cachePrefixInject = body.cachePrefixInject
+  if (body.reasoningEffort !== undefined) updates.reasoningEffort = normalizeReasoningEffort(body.reasoningEffort)
+  if (body.reasoningEffortByModel !== undefined) updates.reasoningEffortByModel = normalizeReasoningEffortByModel(body.reasoningEffortByModel)
   if (body.enabled !== undefined) updates.enabled = body.enabled
   if (body.traeEnableRemoteBudget !== undefined) updates.traeEnableRemoteBudget = body.traeEnableRemoteBudget ?? undefined
   if (body.traeRemoteOnlyModels !== undefined) updates.traeRemoteOnlyModels = body.traeRemoteOnlyModels ?? undefined
@@ -687,11 +714,13 @@ export async function handleTestModel(c: Context<AppEnv>) {
 // ===== Key / 模型连通性测试（通过服务端代理，避免 CORS） =====
 
 export async function handleTestKeyNew(c: Context<AppEnv>) {
-  const { url, apiKey, apiType, providerId } = await readStrictJSONLimited<{
+  const { url, apiKey, apiType, providerId, model } = await readStrictJSONLimited<{
     url: string
     apiKey: string
     apiType?: string
     providerId?: string
+    /** 单 key 诊断（opencode）用的模型 ID；缺省取该提供商首个启用模型 */
+    model?: string
   }>(c.req.raw, MAX_ADMIN_REQUEST_BYTES)
   // CNB 免 Key：允许无 apiKey，由 providerId 判定
   let cnbProvider: Provider | null = null
@@ -717,24 +746,39 @@ export async function handleTestKeyNew(c: Context<AppEnv>) {
   }
 
   if (providerId && isOpenCodeProvider(providerId)) {
+    const mirrors = resolveOpenCodeUrls(c.env)
     // 没填 key 时检查是否配了镜像，避免迷惑性报错
     if (!apiKey) {
-      const mirrors = resolveOpenCodeUrls(c.env)
       if (mirrors.length === 0) {
         return c.json<ApiResponse>({
           success: true,
           data: { success: false, statusCode: 0, message: '请先填写 API Key 或配置 OPENCODE_MIRRORS_URL 环境变量' },
         })
       }
+      const result = await fetchOpenCodeModels(url, [{ key: apiKey, enabled: true }], mirrors)
+      return c.json<ApiResponse>({
+        success: true,
+        data: {
+          success: result.success,
+          statusCode: result.statusCode || 0,
+          message: result.message,
+          data: result.data,
+        },
+      })
     }
-    const result = await fetchOpenCodeModels(url, [{ key: apiKey, enabled: true }], resolveOpenCodeUrls(c.env))
+    // P1-3 单 key 诊断：钉住这一个 key 发一次整形后的最小推理请求并分类，
+    // 能区分「key 无效」/「被限流」/「免费档拒绝」/「模型不可用」，
+    // 比只拉模型列表更有信息量（对齐 opencode2api /api/debug/inference 的 selected-key 判定）。
+    const provider = await getProvider(c.env, providerId)
+    const diagModel = model || provider?.models.find((m) => m.enabled)?.id || ''
+    const diag = await testOpenCodeKey(url, apiKey, diagModel)
     return c.json<ApiResponse>({
       success: true,
       data: {
-        success: result.success,
-        statusCode: result.statusCode || 0,
-        message: result.message,
-        data: result.data,
+        success: diag.status === 'usable',
+        statusCode: diag.httpStatus || 0,
+        message: `[${diag.status}] ${diag.message}（${diag.latencyMs}ms）`,
+        keyStatus: diag.status,
       },
     })
   }

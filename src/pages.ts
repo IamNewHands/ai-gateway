@@ -126,6 +126,20 @@ function effDdNewHtml(): string {
   return `<details class="eff-dd" title="reasoning_effort 支持档位（多选；仅 WorkBuddy/CodeBuddy 上游生效）：请求档位在支持列表内透传，不支持则自动降级为 ≤请求档位的最高支持档"><summary class="eff-sum">effort 不启用</summary><div class="eff-pop">${boxes}</div></details>`
 }
 
+/**
+ * OpenCode 提供商默认 reasoning 档位下拉（与 src/opencode.ts OPENCODE_REASONING_EFFORTS 对齐）。
+ * 语义是「强制默认值」而非「支持档位」：客户端已显式声明 reasoning_effort / reasoning.effort
+ * 时不覆盖；选 none = 显式关闭思考；空 = 不设置、原样透传。
+ */
+const OPENCODE_EFFORT_LEVELS = ['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'] as const
+
+function opencodeEffortSelectHtml(selectId: string, selected: string | undefined): string {
+  const opts = ['<option value="">（不设置，原样透传）</option>']
+    .concat(OPENCODE_EFFORT_LEVELS.map((lv) => `<option value="${lv}"${selected === lv ? ' selected' : ''}>${lv}</option>`))
+    .join('')
+  return `<label class="switch-label" style="display:flex;align-items:center;gap:.5rem"><span>默认 reasoning 档位（仅 OpenCode 提供商消费）——客户端显式声明时忽略；<code>none</code> = 显式关闭思考。</span><select id="${escapePageHtml(selectId)}" style="max-width:12rem">${opts}</select></label>`
+}
+
 // UX8：厂商预设与 OAuth 预置模板——单一数据源。
 // SSR 下拉 option 与客户端 applyProviderPreset / applyOauthPreset* 共用，
 // 注入为页面 script 常量，消除服务端/客户端两套重复预设表。
@@ -559,7 +573,7 @@ ${H('管理')}
               <button class="collapse-btn" onclick="toggleAdvOauth('aum-fs', this)" type="button" aria-expanded="false">
                 <i class="fas fa-chevron-right collapse-icon" aria-hidden="true"></i> 模型策略（未配置模型透传，可选）
               </button>
-              <fieldset class="form-group hd" id="aum-fs"><legend>模型策略</legend><label class="switch-label"><span>允许未配置模型透传——开启后请求该提供商的任意 modelId 都直接转发（跳过「未配置」校验），适合模型频繁上架、不想每次手动加模型的提供商（如 OpenRouter）。</span><span class="tg"><input type="checkbox" id="aum"><span class="sl"></span></span></label></fieldset>
+              <fieldset class="form-group hd" id="aum-fs"><legend>模型策略</legend><label class="switch-label"><span>允许未配置模型透传——开启后请求该提供商的任意 modelId 都直接转发（跳过「未配置」校验），适合模型频繁上架、不想每次手动加模型的提供商（如 OpenRouter）。</span><span class="tg"><input type="checkbox" id="aum"><span class="sl"></span></span></label>${opencodeEffortSelectHtml('re', undefined)}</fieldset>
             </div>
             <div class="panel-actions"><label class="switch-label"><span>创建后立即启用</span><span class="tg"><input type="checkbox" checked id="aen"><span class="sl"></span></span></label><div><button class="btn btn-s" onclick="hideAdd()">取消</button><button class="btn btn-p" onclick="createProv()"><i class="fas fa-check" aria-hidden="true"></i>创建提供商</button></div></div>
             <div id="atestR" class="mt-1" aria-live="polite"></div>
@@ -685,7 +699,7 @@ ${H('管理')}
                 <button class="collapse-btn" onclick="toggleAdvOauth('aum-fs-${escapePageJsx(p.id)}', this)" type="button" aria-expanded="false">
                   <i class="fas fa-chevron-right collapse-icon" aria-hidden="true"></i> 模型策略（未配置模型透传，可选）${p.allowUnlistedModels?'<span class="bd bd-on" style="margin-left:6px">透传已启用</span>':''}
                 </button>
-                <fieldset class="form-group hd" id="aum-fs-${escapePageHtml(p.id)}"><legend>模型策略</legend><label class="switch-label"><span>允许未配置模型透传——开启后请求该提供商的任意 modelId 都直接转发（跳过「未配置」校验），适合模型频繁上架、不想每次手动加模型的提供商（如 OpenRouter）。</span><span class="tg"><input type="checkbox" id="aum-${escapePageHtml(p.id)}" ${p.allowUnlistedModels?'checked':''}><span class="sl"></span></span></label></fieldset>
+                <fieldset class="form-group hd" id="aum-fs-${escapePageHtml(p.id)}"><legend>模型策略</legend><label class="switch-label"><span>允许未配置模型透传——开启后请求该提供商的任意 modelId 都直接转发（跳过「未配置」校验），适合模型频繁上架、不想每次手动加模型的提供商（如 OpenRouter）。</span><span class="tg"><input type="checkbox" id="aum-${escapePageHtml(p.id)}" ${p.allowUnlistedModels?'checked':''}><span class="sl"></span></span></label>${opencodeEffortSelectHtml('re-' + p.id, p.reasoningEffort)}</fieldset>
               </div>
               <div class="collapse-section">
                 <button class="collapse-btn" onclick="toggleAdvOauth('psys-fs-${escapePageJsx(p.id)}', this)" type="button" aria-expanded="false">
@@ -1494,7 +1508,7 @@ async function createProv(opts) {
     const r = await fetch('/admin/api/providers', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ id, name: nm, baseUrl: url, apiType, authType, oauth: authType === 'oauth-device' ? oauth : undefined, apiKeys: keys, models, enabled, toolBridge: (document.getElementById('atb')||{}).checked === true, allowUnlistedModels: (document.getElementById('aum')||{}).checked === true, thinkingInject, cachePrefixInject, type: providerType || (vb && vb.primary ? 'vision-bridge' : undefined), kukuThinkMode, visionBridge: vb, geminiBaseUrl: ((document.getElementById('agbu')||{}).value || '').trim() || undefined })
+      body: JSON.stringify({ id, name: nm, baseUrl: url, apiType, authType, oauth: authType === 'oauth-device' ? oauth : undefined, apiKeys: keys, models, enabled, toolBridge: (document.getElementById('atb')||{}).checked === true, allowUnlistedModels: (document.getElementById('aum')||{}).checked === true, reasoningEffort: ((document.getElementById('re')||{}).value || undefined), thinkingInject, cachePrefixInject, type: providerType || (vb && vb.primary ? 'vision-bridge' : undefined), kukuThinkMode, visionBridge: vb, geminiBaseUrl: ((document.getElementById('agbu')||{}).value || '').trim() || undefined })
     })
     const d = await r.json()
     if (d.success) {
@@ -3083,7 +3097,7 @@ async function save(id) {
     const r = await fetch('/admin/api/providers/' + encodeURIComponent(id), {
       method: 'PUT',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ name: nm, baseUrl: url, apiType, authType, oauth: authType === 'oauth-device' ? oauth : undefined, apiKeys: keys, models, enabled, toolBridge: (document.getElementById('atb-' + id)||{}).checked === true, allowUnlistedModels: (document.getElementById('aum-' + id)||{}).checked === true, thinkingInject, cachePrefixInject, cooldown: collectCooldown(id), type: providerType, kukuThinkMode, visionBridge: vb, geminiBaseUrl: ((document.getElementById('gbu-' + id)||{}).value || '').trim() || null, traeEnableRemoteBudget, traeRemoteOnlyModels, traeMaxMessages, traeMaxHistoryChars, traeMaxToolSchemaChars, accountSpread: (document.getElementById('m365-spread-' + id)||{}).checked === true, promptMode, promptText })
+      body: JSON.stringify({ name: nm, baseUrl: url, apiType, authType, oauth: authType === 'oauth-device' ? oauth : undefined, apiKeys: keys, models, enabled, toolBridge: (document.getElementById('atb-' + id)||{}).checked === true, allowUnlistedModels: (document.getElementById('aum-' + id)||{}).checked === true, reasoningEffort: ((document.getElementById('re-' + id)||{}).value || null), thinkingInject, cachePrefixInject, cooldown: collectCooldown(id), type: providerType, kukuThinkMode, visionBridge: vb, geminiBaseUrl: ((document.getElementById('gbu-' + id)||{}).value || '').trim() || null, traeEnableRemoteBudget, traeRemoteOnlyModels, traeMaxMessages, traeMaxHistoryChars, traeMaxToolSchemaChars, accountSpread: (document.getElementById('m365-spread-' + id)||{}).checked === true, promptMode, promptText })
     })
     const d = await r.json()
     if (d.success) { toast('已保存', 'success'); reloadAdmin() }

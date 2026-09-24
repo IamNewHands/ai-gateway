@@ -66,6 +66,14 @@ export interface Provider {
    * 账号池冷却参数（trae 与 workbuddy 账号池共用）。不配则用各池默认值。
    */
   cooldown?: CooldownConfig
+  /**
+   * 提供商级默认 reasoning 档位（仅 opencode 提供商消费，见 src/opencode.ts
+   * applyOpenCodeReasoningEffort）。合法值 none/minimal/low/medium/high/xhigh/max；
+   * 客户端已显式声明 reasoning_effort / reasoning.effort 时一律不覆盖；none = 显式关思考。
+   */
+  reasoningEffort?: string
+  /** 按模型覆盖 reasoningEffort（key = 模型 ID）。仅 opencode 提供商消费。 */
+  reasoningEffortByModel?: Record<string, string>
   createdAt: string
   updatedAt: string
   /**
@@ -432,6 +440,9 @@ export interface CreateProviderRequest {
   cnbPool?: { min?: number; max?: number; ttlMinutes?: number }
   cooldown?: CooldownConfig
   allowUnlistedModels?: boolean
+  /** OpenCode 提供商默认 reasoning 档位（见 Provider.reasoningEffort） */
+  reasoningEffort?: string
+  reasoningEffortByModel?: Record<string, string>
   thinkingInject?: string[]
   cachePrefixInject?: string[]
   geminiBaseUrl?: string
@@ -465,6 +476,9 @@ export interface UpdateProviderRequest {
   /** 传 null 可恢复各池默认冷却参数 */
   cooldown?: CooldownConfig | null
   allowUnlistedModels?: boolean
+  /** OpenCode 默认 reasoning 档位（传 null/'' 清除） */
+  reasoningEffort?: string | null
+  reasoningEffortByModel?: Record<string, string> | null
   /** 传空数组可清空思维引导注入选择 */
   thinkingInject?: string[] | null
   /** 传空数组可清空缓存前缀注入选择 */
@@ -507,6 +521,8 @@ export interface UpsertProviderRequest {
   cnbPool?: { min?: number; max?: number; ttlMinutes?: number }
   cooldown?: CooldownConfig
   allowUnlistedModels?: boolean
+  reasoningEffort?: string
+  reasoningEffortByModel?: Record<string, string>
   thinkingInject?: string[]
   cachePrefixInject?: string[]
   geminiBaseUrl?: string

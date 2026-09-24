@@ -1373,6 +1373,23 @@ async function transcribeImagesForProvider(
 }
 
 /**
+ * OpenCode 会话亲和信号（P0-2，对齐 opencode2api internal/identity/request.go:25-33）：
+ * 请求头族里的显式会话 ID 优先，其次回落 body 的 conversation_id / prompt_cache_key
+ * （复用 WorkBuddy 侧的 extractSessionKey）；都没有则返回 ''，由 opencode.ts 用
+ * 「previous_response_id → 首条 user 内容」兜底。
+ *
+ * 这个信号决定两件事：canonical session ID（保住上游 prompt cache 亲和）与 key 起点
+ * （同一会话固定打同一个 key）。
+ */
+function resolveOpenCodeAffinityKey(c: Context<AppEnv>, body: Record<string, unknown>): string {
+  for (const name of ['x-opencode-session', 'x-session-affinity', 'x-session-id', 'conversation-id']) {
+    const value = c.req.header(name)
+    if (value) return value
+  }
+  return extractSessionKey(body)
+}
+
+/**
  * 转发核心逻辑：校验模型 → 路由到对应上游（opencode / qoder / oauth / 通用 Key 轮询），
  * 返回上游 Response。HTTP 路径由 handleProxy 直接返回；WS 桥接路径（ws.ts）读取其
  * 响应体并分块以 WS 文本帧回推。
@@ -1522,6 +1539,10 @@ export async function forwardProxy(
         body: JSON.stringify(forwardBody),
         mirrorUrls: resolveOpenCodeUrls(c.env),
         providerName: provider.name,
+        // 会话亲和（P0-2）：头族显式会话 ID 优先，body 兜底由 opencode.ts 负责
+        affinityKey: resolveOpenCodeAffinityKey(c, forwardBody as Record<string, unknown>),
+        // 提供商级默认 reasoning 档位；客户端显式声明时 opencode.ts 会忽略
+        reasoningEffort: provider.reasoningEffortByModel?.[modelId] ?? provider.reasoningEffort,
         // opencode 内部 key 切换 / 走 public 等关键事件透传到系统日志
         logger: (level, message, details) => {
           const logType = level === 'info' ? 'request' : level
