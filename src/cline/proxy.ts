@@ -716,7 +716,24 @@ export async function pumpStreamAttempt(
     ring: [] as string[],
     suppress: false,
     contentChars: 0,
+    reasoningChars: 0,
+    frames: 0,
+    /** 是否见过带 finish_reason 的帧：流结束时用它判定「上游是否正常收尾」。 */
+    sawFinish: false,
     hasToolCalls: false,
+  }
+  /**
+   * 记录一帧的终态统计（探测期与续流期共用，保证 sawFinish 在两条路径上都被置位）。
+   *
+   * sawFinish 是「上游是否正常收尾」的唯一判据：探测期缓冲的帧由 flushHealthy 直接
+   * 写回、不经过 routeToStream，所以只在一处统计会漏掉探测期见到的 finish_reason。
+   */
+  const noteFacts = (facts: FrameFacts) => {
+    state.frames++
+    state.contentChars += facts.contentChars
+    if (facts.reasoningDelta !== null) state.reasoningChars += (facts.reasoningDelta as string).length
+    if (facts.finishReason) state.sawFinish = true
+    if (facts.hasToolCalls) state.hasToolCalls = true
   }
   let buf = ''
   const probeDeltas: string[] = []   // 探测期收集的 reasoning delta
@@ -737,8 +754,7 @@ export async function pumpStreamAttempt(
     let obj: Record<string, unknown> | null = null
     try { obj = unwrapData(JSON.parse(payload)) as Record<string, unknown> } catch { obj = null }
     const facts = inspectFrame(obj)
-    state.contentChars += facts.contentChars
-    if (facts.hasToolCalls) state.hasToolCalls = true
+    noteFacts(facts)
     const isReasoning = facts.reasoningDelta !== null
     if (isReasoning) {
       state.ring.push(facts.reasoningDelta as string)
@@ -786,6 +802,7 @@ export async function pumpStreamAttempt(
         cbuf = cbuf.slice(ci + 1)
         await routeToStream(line, w)
       }
+      let abnormal = false
       try {
         while (true) {
           const { done, value } = await reader.read()
@@ -802,7 +819,21 @@ export async function pumpStreamAttempt(
         // 上游流异常（网络重置/断连等）：不再静默截断。给客户端发一帧错误后再收尾，
         // 让 DSH 等客户端按可重试错误快速处理，而不是对着一个没有 finish_reason 的
         // 半截流干等超时。帧格式与上方 upstream_runaway 错误帧一致。
+        abnormal = true
         const errMsg = { error: { message: 'Cline 上游流中途断开，连接异常终止', type: 'upstream_interrupted' } }
+        await w.write(encoder.encode('data: ' + JSON.stringify(errMsg) + '\n\n')).catch(() => {})
+      }
+      // 上游「干净结束」但全程没发 finish_reason：此前直接 w.close()，客户端只看到半截流，
+      // DSH 归类成 TRANSPORT 的 Stream ended without finish_reason 并白重试 5 次（实测
+      // 2026-09-25 一轮 6 次全挂、约 77 秒）。补一帧具名错误，把静默截断变成可归因的失败。
+      // 注意：探测期缓冲帧由上面 initial 循环直接写回、不过 routeToStream，故 sawFinish
+      // 必须由 noteFacts 在探测期也置位（见 state 上方注释）。
+      if (!abnormal && !state.sawFinish) {
+        const detail =
+          `frames=${state.frames}, content=${state.contentChars}, reasoning=${state.reasoningChars}, toolCalls=${state.hasToolCalls}`
+        const errMsg = {
+          error: { message: `Cline 上游流未发送 finish_reason 即结束（疑似截断）：${detail}`, type: 'upstream_no_finish' },
+        }
         await w.write(encoder.encode('data: ' + JSON.stringify(errMsg) + '\n\n')).catch(() => {})
       }
       await w.close().catch(() => {})
@@ -822,6 +853,7 @@ export async function pumpStreamAttempt(
   }
 
   // ---- 探测阶段：读行直到能做出放行/拦截判定 ----
+  let probeErrored = false
   try {
     while (true) {
       const { done, value } = await reader.read()
@@ -845,8 +877,7 @@ export async function pumpStreamAttempt(
         let obj: Record<string, unknown> | null = null
         try { obj = unwrapData(JSON.parse(payload)) as Record<string, unknown> } catch { obj = null }
         const facts = inspectFrame(obj)
-        state.contentChars += facts.contentChars
-        if (facts.hasToolCalls) state.hasToolCalls = true
+        noteFacts(facts)
         const isReasoning = facts.reasoningDelta !== null
         if (isReasoning) probeDeltas.push(facts.reasoningDelta as string)
         // 纯空白 "\n" 排版噪声：照常计入 probeDeltas（退化判定依赖空白占比），
@@ -890,6 +921,7 @@ export async function pumpStreamAttempt(
     }
   } catch {
     /* 探测期读上游异常：下方按空流处理 */
+    probeErrored = true
   }
 
   // 探测阶段上游流自然结束
@@ -899,6 +931,19 @@ export async function pumpStreamAttempt(
     return { kind: 'degenerate' }
   }
   if (buffered.length === 0) {
+    await reader.cancel().catch(() => {})
+    return { kind: 'empty' }
+  }
+  // 有帧、但全程没见过 finish_reason：上游是「截断结束」而不是正常收尾。
+  // 此刻还一字节都没写给客户端（探测期的帧全在 buffered 里），所以可以安全丢弃重试——
+  // 交给 proxyStreamChat 冷却换号，比把半截流交给客户端好（DSH 会归成 TRANSPORT 的
+  // Stream ended without finish_reason 并白重试 5 次；2026-09-25 实测一轮 6 次全挂）。
+  //
+  // 只覆盖「干净 EOF」这一种。探测期读异常（probeErrored）保持原行为：flushHealthy +
+  // upstream_interrupted 错误帧——那条路径有专门用例钉住，是否也改成重试属于独立决策。
+  // 观测到的线上故障正是干净 EOF（客户端只报 Stream ended without finish_reason、
+  // 没收到任何具名错误帧），所以这个范围足够覆盖它。
+  if (!probeErrored && !state.sawFinish) {
     await reader.cancel().catch(() => {})
     return { kind: 'empty' }
   }
@@ -950,7 +995,7 @@ async function proxyStreamChat(
     await sleep(500 + Math.random() * 500)
   }
   return jsonResponse(
-    { error: { message: 'Cline 推理退化/空响应连续 3 次未产出正文，已冷却换号仍失败', type: 'upstream_runaway' } },
+    { error: { message: 'Cline 推理退化/空响应/上游截断连续 3 次未产出可用流，已冷却换号仍失败', type: 'upstream_runaway' } },
     502
   )
 }

@@ -697,3 +697,81 @@ describe('summarizeOutboundReasoning（[DEBUG-sig] 出站 reasoning 形态统计
     })
   })
 })
+
+// 上游 200 流「干净结束」但全程没发 finish_reason：此前直接 w.close()，客户端只看到半截流，
+// DSH 归类 TRANSPORT 的 Stream ended without finish_reason 并白重试 5 次
+// （2026-09-25 实测一轮 6 次全挂、约 77 秒）。现在补一帧具名错误。
+describe('上游流未发 finish_reason 的截断兜底（2026-09-25）', () => {
+  it('有正文但无 finish_reason → 补 upstream_no_finish，正文不丢', async () => {
+    const outcome = await pumpStreamAttempt(sseResp(dataFrame({ content: 'hi' })))
+    expect(outcome.kind).toBe('healthy')
+    const text = await readAll(outcome.response!)
+    expect(text).toContain('"content":"hi"')
+    expect(text).toContain('upstream_no_finish')
+  })
+
+  it('探测期就见到 finish_reason（缓冲帧直写、不过 routeToStream）→ 不补错误帧', async () => {
+    const body = dataFrame({ reasoning_content: 'think' }) + dataFrame({}, 'stop')
+    const outcome = await pumpStreamAttempt(sseResp(body))
+    expect(outcome.kind).toBe('healthy')
+    const text = await readAll(outcome.response!)
+    expect(text).not.toContain('upstream_no_finish')
+  })
+
+  it('放行之后才收到 finish_reason → 不补错误帧', async () => {
+    const body = dataFrame({ content: 'hi' }) + dataFrame({}, 'stop') + doneFrame()
+    const outcome = await pumpStreamAttempt(sseResp(body))
+    expect(outcome.kind).toBe('healthy')
+    const text = await readAll(outcome.response!)
+    expect(text).not.toContain('upstream_no_finish')
+  })
+
+  it('上游异常断开仍走 upstream_interrupted（不被新分支抢走）', async () => {
+    const enc = new TextEncoder()
+    let step = 0
+    // 用 pull 而非 start 里 enqueue+error：controller.error 会清空已入队分片，
+    // 那样探测期就拿不到正文帧、直接判 empty，测不到 flush 之后的 catch 分支。
+    const broken = new ReadableStream<Uint8Array>({
+      pull(c) {
+        if (step++ === 0) {
+          c.enqueue(enc.encode(dataFrame({ content: 'hi' })))
+          return
+        }
+        c.error(new Error('boom'))
+      },
+    })
+    const outcome = await pumpStreamAttempt(new Response(broken, { status: 200 }))
+    expect(outcome.kind).toBe('healthy')
+    const text = await readAll(outcome.response!)
+    expect(text).toContain('upstream_interrupted')
+    expect(text).not.toContain('upstream_no_finish')
+  })
+
+  // 探测期就截断：此刻还没写给客户端任何字节，可以安全丢弃重试（真正的自愈那一半）。
+  it('探测期只有 reasoning、无 finish_reason → 判 empty 交给上层重试，不交给客户端', async () => {
+    const outcome = await pumpStreamAttempt(sseResp(dataFrame({ reasoning_content: 'think' })))
+    expect(outcome.kind).toBe('empty')
+    expect(outcome.response).toBeUndefined()
+  })
+
+  it('截断 → proxyStreamChat 冷却换号重试，第 2 次完整流才交给客户端', async () => {
+    installFetch((_b, i) =>
+      i === 0
+        ? new Response(dataFrame({ reasoning_content: 'partial-think' }), {
+            status: 200,
+            headers: { 'Content-Type': 'text/event-stream' },
+          })
+        : sseOkResp(),
+    )
+    const resp = await proxyClineChatRequest(
+      undefined,
+      clineProvider([REFRESH_TOKEN]),
+      { model: DEFAULT_MODEL, messages: [{ role: 'user', content: 'hi' }] },
+      { stream: true },
+    )
+    expect(resp.status).toBe(200)
+    const text = await readAll(resp)
+    expect(text).toContain('"content":"hi"')
+    expect(text).not.toContain('partial-think')
+  })
+})
