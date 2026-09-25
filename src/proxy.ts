@@ -17,6 +17,7 @@ import {
 } from './opencode'
 import { isQoderProvider, proxyQoderChatRequest } from './qoder/proxy'
 import { isClineProvider, proxyClineChatRequest } from './cline/proxy'
+import type { ClineDiag } from './cline/proxy'
 import { isVisionBridgeProvider, buildVisionBridgeRequestBody } from './vision/bridge'
 import { isGeminiProvider, proxyGeminiChatRequest } from './gemini/proxy'
 import { isCnbProvider, proxyCnbChatRequest, CnbStreamDiag } from './cnb/proxy'
@@ -1589,7 +1590,23 @@ export async function forwardProxy(
     // Cline（cline2api）：refreshToken 换 accessToken 转发到 api.cline.bot，
     // 账号池在 cline/proxy.ts 内部管理（多账号自动切换），不走普通 API Key 逻辑。
     if (isClineProvider(providerId)) {
-      const response = await proxyClineChatRequest(c.env, provider, forwardBody as Record<string, unknown>)
+      // [DEBUG-sig] 诊断：出站 body 的 reasoning 形态 + 上游 SSE 里的 encrypted 帧，写进 KV 日志。
+      // 结论拿到后连同 cline/proxy.ts 的 [DEBUG-sig] 段一起删除（全仓搜 [DEBUG-sig]）。
+      const sigDiag: ClineDiag = {
+        onOutbound: (m, stats) => {
+          try {
+            c.executionCtx.waitUntil(writeLog(c.env, 'info', `[DEBUG-sig] outbound ${m}`,
+              JSON.stringify(stats).substring(0, 4000)))
+          } catch { /* 日志失败不得影响转发 */ }
+        },
+        onUpstreamEncrypted: (m, sample) => {
+          try {
+            c.executionCtx.waitUntil(writeLog(c.env, 'info', `[DEBUG-sig] upstream-encrypted ${m}`,
+              sample.substring(0, 4000)))
+          } catch { /* 日志失败不得影响转发 */ }
+        },
+      }
+      const response = await proxyClineChatRequest(c.env, provider, forwardBody as Record<string, unknown>, { diag: sigDiag })
       const logLevel = response.ok ? 'request' : (response.status >= 500 ? 'error' : 'warn')
       try {
         const bodySummary = summarizeRequestBody(forwardBody)

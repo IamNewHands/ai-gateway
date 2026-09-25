@@ -699,7 +699,9 @@ interface StreamAttemptOutcome {
 /** @internal 流式尝试的探测 + 后台续流（导出供测试验证流式语义）。 */
 export async function pumpStreamAttempt(
   resp: Response,
-  onRunaway?: () => void
+  onRunaway?: () => void,
+  /** [DEBUG-sig] 每条完整原始 SSE 行回调一次（不传则零开销）。 */
+  onRawLine?: (line: string) => void
 ): Promise<StreamAttemptOutcome> {  const reader = resp.body!.getReader()
   const decoder = new TextDecoder()
   const encoder = new TextEncoder()
@@ -722,6 +724,7 @@ export async function pumpStreamAttempt(
 
   /** 把单行 SSE 帧路由到 writer（供后台续流用），含退化监控 + 抑制 + 空转报错。 */
   const routeToStream = async (line: string, w: WritableStreamDefaultWriter<Uint8Array>): Promise<void> => {
+    if (onRawLine) onRawLine(line) // [DEBUG-sig]
     if (!line.startsWith('data:')) {
       if (line !== '') await w.write(encoder.encode(line + '\n'))
       return
@@ -828,6 +831,7 @@ export async function pumpStreamAttempt(
       while ((idx = buf.indexOf('\n')) >= 0) {
         const line = buf.slice(0, idx)
         buf = buf.slice(idx + 1)
+        if (onRawLine) onRawLine(line) // [DEBUG-sig]
 
         if (!line.startsWith('data:')) {
           if (line !== '') buffered.push(line + '\n')
@@ -912,8 +916,23 @@ function applyModelCooldown(pool: Pool, model: string, ms: number) {
  * 流式转发（带推理空转防护）：最多 3 次尝试，退化/空响应冷却切号重试；
  * 全部失败时返回 502 错误 JSON（客户端按错误处理，可自行重试）。
  */
-async function proxyStreamChat(pool: Pool, body: Record<string, unknown>, sessionId: string): Promise<Response> {
+async function proxyStreamChat(
+  pool: Pool,
+  body: Record<string, unknown>,
+  sessionId: string,
+  /** [DEBUG-sig] 诊断回调（可选，不传零开销） */
+  diag?: ClineDiag
+): Promise<Response> {
   const model = String((body as Record<string, unknown>).model || '')
+  // [DEBUG-sig] 上游 SSE 里首次出现 "encrypted" 时报一次（跨 3 次重试只报第一次）。
+  let encryptedSeen = false
+  const onRawLine = diag?.onUpstreamEncrypted
+    ? (line: string) => {
+        if (encryptedSeen || !line.includes('encrypted')) return
+        encryptedSeen = true
+        diag.onUpstreamEncrypted!(model, line.slice(0, 400))
+      }
+    : undefined
   for (let attempt = 0; attempt < 3; attempt++) {
     const resp = await clineFetchWithRetry(pool, '/chat/completions', body, sessionId, true)
     if (!resp.ok) {
@@ -925,7 +944,7 @@ async function proxyStreamChat(pool: Pool, body: Record<string, unknown>, sessio
         resp.status || 502
       )
     }
-    const outcome = await pumpStreamAttempt(resp, () => applyModelCooldown(pool, model, CLINE_COOLDOWN_RUNAWAY_MS))
+    const outcome = await pumpStreamAttempt(resp, () => applyModelCooldown(pool, model, CLINE_COOLDOWN_RUNAWAY_MS), onRawLine)
     if (outcome.kind === 'healthy') return outcome.response!
     applyModelCooldown(pool, model, outcome.kind === 'degenerate' ? CLINE_COOLDOWN_RUNAWAY_MS : CLINE_COOLDOWN_EMPTY_MS)
     await sleep(500 + Math.random() * 500)
@@ -1093,9 +1112,72 @@ async function proxyNonStreamChat(pool: Pool, body: Record<string, unknown>, ses
 
 // ===== 对外接口 =====
 
+// ---------------------------------------------------------------------------
+// [DEBUG-sig] 诊断插桩：定位「tool call 之后下一轮恒定 400 INVALID_ARGUMENT」。
+//
+// 背景：Gemini 3 要求每个 function call 都带 thought_signature，Cline 账号通道
+// （openai-format）在签名缺失时不补 → Google 回 400 INVALID_ARGUMENT
+// （cline/cline#7551）。要判定 ai-gateway 这一跳有没有可能补上，必须先实测两件事：
+//   ① 出站 body 的 messages 里有没有 reasoning_details、item.type 是什么；
+//   ② Cline 上游 SSE 里有没有 reasoning.encrypted（加密签名本体）。
+//
+// 本段是纯诊断：不传 diag 时零开销、行为不变。结论拿到后整段可删——连同
+// proxy.ts 的 cline 分支 diag 传参、proxy.test.ts 的 summarizeOutboundReasoning 用例。
+// 全仓搜 `[DEBUG-sig]` 可一次找齐所有待删点。
+// ---------------------------------------------------------------------------
+
+/** [DEBUG-sig] 出站 body 里 reasoning 相关字段的形态统计。 */
+export interface OutboundReasoningStats {
+  messages: number
+  assistant: number
+  withReasoningDetails: number
+  withReasoningContent: number
+  detailTypes: Record<string, number>
+  encryptedItems: number
+}
+
+/** [DEBUG-sig] 统计 messages 里 reasoning 字段的形态（纯函数，零副作用）。 */
+export function summarizeOutboundReasoning(messages: unknown): OutboundReasoningStats {
+  const stats: OutboundReasoningStats = {
+    messages: 0,
+    assistant: 0,
+    withReasoningDetails: 0,
+    withReasoningContent: 0,
+    detailTypes: {},
+    encryptedItems: 0,
+  }
+  if (!Array.isArray(messages)) return stats
+  stats.messages = messages.length
+  for (const raw of messages) {
+    if (!raw || typeof raw !== 'object') continue
+    const msg = raw as Record<string, unknown>
+    if (msg.role === 'assistant') stats.assistant++
+    if (typeof msg.reasoning_content === 'string' && msg.reasoning_content !== '') stats.withReasoningContent++
+    const details = msg.reasoning_details
+    if (!Array.isArray(details) || details.length === 0) continue
+    stats.withReasoningDetails++
+    for (const item of details) {
+      const t = item && typeof item === 'object' ? String((item as Record<string, unknown>).type || 'unknown') : 'unknown'
+      stats.detailTypes[t] = (stats.detailTypes[t] || 0) + 1
+      if (t.includes('encrypted')) stats.encryptedItems++
+    }
+  }
+  return stats
+}
+
+/** [DEBUG-sig] 诊断回调。不传 = 零开销，正常转发路径完全不受影响。 */
+export interface ClineDiag {
+  /** 出站 body 构造完成后回调一次（免费链每个候选模型各一次）。 */
+  onOutbound?: (model: string, stats: OutboundReasoningStats) => void
+  /** 上游 SSE 原始帧首次出现 "encrypted" 时回调一次（跨重试只报第一次，避免刷屏）。 */
+  onUpstreamEncrypted?: (model: string, sample: string) => void
+}
+
 export interface ClineProxyOptions {
   /** 客户端是否要求流式（false 时聚合为非流式 chat.completion） */
   stream?: boolean
+  /** [DEBUG-sig] 诊断回调 */
+  diag?: ClineDiag
 }
 
 /**
@@ -1126,9 +1208,11 @@ export async function proxyClineChatRequest(
     // 上游恒定强制流式（item4）：免费通道非流式返回 500 "empty response content"，
     // 统一以流式取数，客户端要非流式时再聚合成 chat.completion。
     const body = buildUpstreamBody({ ...forwardBody, model }, true, sessionId, freeSet)
+    // [DEBUG-sig] 出站 body 的 reasoning 形态统计（诊断用，不传 diag 时零开销）
+    if (opts?.diag?.onOutbound) opts.diag.onOutbound(model, summarizeOutboundReasoning(body.messages))
     try {
       const resp = wantStream
-        ? await proxyStreamChat(pool, body, sessionId)
+        ? await proxyStreamChat(pool, body, sessionId, opts?.diag)
         : await proxyNonStreamChat(pool, body, sessionId)
       // 402/429 = 「该模型在当前账号池上不可用」→ 沿免费链换模型（移植 169fd9d）。
       // 其余错误（400/403/5xx）原样透传：不把参数错误伪装成「换个模型就好了」。

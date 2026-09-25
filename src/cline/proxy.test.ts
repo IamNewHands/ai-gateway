@@ -1,6 +1,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
-import { parseCooldownMs, fetchClineModels, isRunawayReasoningCutoff, isDegenerateReasoningDeltas, isWhitespaceOnlyReasoningDelta, normalizeReasoningDeltaForUI, pumpStreamAttempt, sanitizeClineMessages, isFreeClineModel, clineModelFallbackChain, buildUpstreamBody, proxyClineChatRequest, __resetClineCatalogCacheForTests, CLINE_MAX_TOKENS, CLINE_FREE_WHITELIST, DEFAULT_MODEL } from './proxy'
+import { parseCooldownMs, fetchClineModels, isRunawayReasoningCutoff, isDegenerateReasoningDeltas, isWhitespaceOnlyReasoningDelta, normalizeReasoningDeltaForUI, pumpStreamAttempt, sanitizeClineMessages, isFreeClineModel, clineModelFallbackChain, buildUpstreamBody, proxyClineChatRequest, summarizeOutboundReasoning, __resetClineCatalogCacheForTests, CLINE_MAX_TOKENS, CLINE_FREE_WHITELIST, DEFAULT_MODEL } from './proxy'
 import type { Provider } from '../types'
+import type { OutboundReasoningStats } from './proxy'
 
 /** 读取一个 Response 的完整文本（用于流式结果断言）。 */
 async function readAll(resp: Response): Promise<string> {
@@ -597,5 +598,102 @@ describe('402 余额耗尽与免费链降级', () => {
     expect(bodies).toHaveLength(1)
     expect(bodies[0].model).toBe(DEFAULT_MODEL)
     expect(bodies[0].max_tokens).toBeUndefined()
+  })
+})
+
+// [DEBUG-sig] 诊断纯函数单测（与插桩同生共死：结论拿到后连同插桩一起删）
+describe('summarizeOutboundReasoning（[DEBUG-sig] 出站 reasoning 形态统计）', () => {
+  it('非数组输入返回全零', () => {
+    expect(summarizeOutboundReasoning(undefined)).toEqual({
+      messages: 0, assistant: 0, withReasoningDetails: 0, withReasoningContent: 0, detailTypes: {}, encryptedItems: 0,
+    })
+    expect(summarizeOutboundReasoning('nope').messages).toBe(0)
+  })
+
+  it('统计 assistant 数、reasoning_content、reasoning_details 的 type 直方图', () => {
+    const stats = summarizeOutboundReasoning([
+      { role: 'developer', content: 'x' },
+      { role: 'user', content: 'hi' },
+      { role: 'assistant', reasoning_content: '思考', tool_calls: [{ id: 'a' }] },
+      {
+        role: 'assistant',
+        tool_calls: [{ id: 'b' }],
+        reasoning_details: [
+          { type: 'reasoning.text', text: 't', format: 'unknown', index: 0 },
+          { type: 'reasoning.text', text: 't2', format: 'unknown', index: 0 },
+        ],
+      },
+      { role: 'tool', content: 'r', tool_call_id: 'b' },
+    ])
+    expect(stats.messages).toBe(5)
+    expect(stats.assistant).toBe(2)
+    expect(stats.withReasoningContent).toBe(1)
+    expect(stats.withReasoningDetails).toBe(1)
+    expect(stats.detailTypes).toEqual({ 'reasoning.text': 2 })
+    expect(stats.encryptedItems).toBe(0)
+  })
+
+  it('识别 reasoning.encrypted（Gemini 3 思维签名）并计数', () => {
+    const stats = summarizeOutboundReasoning([
+      {
+        role: 'assistant',
+        tool_calls: [{ id: 'b' }],
+        reasoning_details: [{ type: 'reasoning.encrypted', data: 'EtcMCt...', format: 'google-gemini-v1', index: 0 }],
+      },
+    ])
+    expect(stats.withReasoningDetails).toBe(1)
+    expect(stats.encryptedItems).toBe(1)
+    expect(stats.detailTypes['reasoning.encrypted']).toBe(1)
+  })
+
+  it('空 reasoning_details 数组不计入 withReasoningDetails', () => {
+    const stats = summarizeOutboundReasoning([{ role: 'assistant', reasoning_details: [] }])
+    expect(stats.withReasoningDetails).toBe(0)
+    expect(stats.detailTypes).toEqual({})
+  })
+
+  // 插桩的“导线”本身也要测：否则回调没接上会静默报 0，导出错误结论。
+  it('onRawLine 能拿到含 reasoning.encrypted 的原始帧（探测期）', async () => {
+    const lines: string[] = []
+    const body =
+      'data: {"id":"c1","choices":[{"index":0,"delta":{"reasoning_details":[{"type":"reasoning.encrypted","data":"EtcMCt","format":"google-gemini-v1","index":0}]}}]}\n\n' +
+      'data: {"id":"c1","choices":[{"index":0,"delta":{"content":"hi"}}]}\n\n' +
+      'data: [DONE]\n\n'
+    const outcome = await pumpStreamAttempt(sseResp(body), undefined, (l) => lines.push(l))
+    expect(outcome.kind).toBe('healthy')
+    expect(lines.some((l) => l.includes('reasoning.encrypted'))).toBe(true)
+    await readAll(outcome.response!)
+  })
+
+  it('proxyClineChatRequest 传出 onOutbound 统计', async () => {
+    const seen: Array<{ model: string; stats: OutboundReasoningStats }> = []
+    installFetch(() => sseOkResp())
+    const resp = await proxyClineChatRequest(
+      undefined,
+      clineProvider([REFRESH_TOKEN]),
+      {
+        model: DEFAULT_MODEL,
+        messages: [
+          { role: 'user', content: 'hi' },
+          {
+            role: 'assistant',
+            tool_calls: [{ id: 'a', function: { name: 'x', arguments: '{}' } }],
+            reasoning_details: [{ type: 'reasoning.text', text: 't', format: 'unknown', index: 0 }],
+          },
+          { role: 'tool', content: 'r', tool_call_id: 'a' },
+        ],
+      },
+      { stream: false, diag: { onOutbound: (m, s) => seen.push({ model: m, stats: s }) } },
+    )
+    expect(resp.status).toBe(200)
+    expect(seen).toHaveLength(1)
+    expect(seen[0].model).toBe(DEFAULT_MODEL)
+    expect(seen[0].stats).toMatchObject({
+      assistant: 1,
+      withReasoningDetails: 1,
+      withReasoningContent: 0,
+      encryptedItems: 0,
+      detailTypes: { 'reasoning.text': 1 },
+    })
   })
 })
