@@ -381,6 +381,10 @@ interface AnthropicSSEAccumulator {
     input: string  // 累积的 JSON arguments
     thinking?: string
     signature?: string
+    /** tool_use 块是否已发出 content_block_start（延迟发送：name 可能晚于 id 到达） */
+    started?: boolean
+    /** 已作为 input_json_delta 发出的 arguments 长度（防重复/漏发） */
+    sent?: number
   }>
   currentBlockIndex: number
   stopReason: string | null
@@ -462,15 +466,17 @@ export function openAIChunkToAnthropicSSE(
   if (!delta) {
     // 没有 delta 但有 finish_reason？usage 可能在此
     if (choice.finish_reason && !acc.stopReason) {
-      acc.stopReason = mapFinishReason(choice.finish_reason)
       if (chunk.usage) {
         acc.outputTokens = chunk.usage.completion_tokens ?? chunk.usage.total_tokens ?? acc.outputTokens
       }
       // 关闭当前未关闭的 content block（text 或 tool_use），
-      // 否则客户端会因 content_block 缺少 stop 事件而报 "truncated: stream ended"
+      // 否则客户端会因 content_block 缺少 stop 事件而报 "truncated: stream ended"。
+      // 必须先关块再定 stop_reason：空名畸形 tool_use 在关块时被丢弃（移植 49fdb8a）。
       if (!acc.currentBlockClosed) {
         closeCurrentBlock(acc, events)
       }
+      acc.stopReason = mapFinishReason(choice.finish_reason)
+      if (acc.stopReason === 'tool_use' && !hasStartedToolUseBlock(acc)) acc.stopReason = 'end_turn'
       events.push(`event: message_delta`)
       events.push(`data: ${JSON.stringify({
         type: 'message_delta',
@@ -564,46 +570,40 @@ export function openAIChunkToAnthropicSSE(
           text: '',
           id: tc.id || '',
           name: tc.function?.name || '',
-          input: tc.function?.arguments || '',
+          input: '',
+          sent: 0,
         }
         acc.contentBlocks.push(block)
         acc.currentBlockIndex = blockIndex
-
-        events.push(`event: content_block_start`)
-        events.push(`data: ${JSON.stringify({
-          type: 'content_block_start',
-          index: blockIndex,
-          content_block: { type: 'tool_use', id: block.id, name: block.name, input: {} },
-        })}`)
+        // content_block_start 延迟到 ensureToolBlockStarted 再发（name 可能晚于 id 到达）
         acc.currentBlockClosed = false
       } else if (block) {
-        // 已存在的块：补全 id/name，累积 arguments
+        // 已存在的块：补全 id/name
         if (tc.id) block.id = tc.id
         if (tc.function?.name) block.name = tc.function.name
-        if (tc.function?.arguments) {
-          block.input += tc.function.arguments
-          events.push(`event: content_block_delta`)
-          events.push(`data: ${JSON.stringify({
-            type: 'content_block_delta',
-            index: block.index,
-            delta: { type: 'input_json_delta', partial_json: tc.function.arguments },
-          })}`)
-        }
+      }
+      // 累积 arguments，并在 name 到齐后增量发出
+      // （含首片：旧实现在「创建分支」里把首片塞进 input 却从不发 delta，导致 input 残缺）
+      if (block && tc.function?.arguments) {
+        block.input += tc.function.arguments
+        emitToolArgsDelta(acc, block, events)
       }
     }
   }
 
   // 处理 finish_reason
   if (choice.finish_reason && !acc.stopReason) {
-    acc.stopReason = mapFinishReason(choice.finish_reason)
     if (chunk.usage) {
       acc.outputTokens = chunk.usage.completion_tokens ?? chunk.usage.total_tokens ?? acc.outputTokens
     }
 
-    // 关闭当前未关闭的 content block（text 或 tool_use）
+    // 先关块（空名畸形 tool_use 会在此被丢弃），再据存活块定 stop_reason：
+    // 没有任何可用 tool_use 存活时不能报 tool_use（移植 49fdb8a）
     if (!acc.currentBlockClosed) {
       closeCurrentBlock(acc, events)
     }
+    acc.stopReason = mapFinishReason(choice.finish_reason)
+    if (acc.stopReason === 'tool_use' && !hasStartedToolUseBlock(acc)) acc.stopReason = 'end_turn'
 
     events.push(`event: message_delta`)
     events.push(`data: ${JSON.stringify({
@@ -618,6 +618,68 @@ export function openAIChunkToAnthropicSSE(
 
   // Anthropic SSE: 每个 event+data 对用 \n 连接，事件对间用 \n\n 分隔（见 formatAnthropicSSE）
   return formatAnthropicSSE(events)
+}
+
+/** 生成 tool_use 块 id（上游未返回 id 时的兜底，移植 luawei1/cline2api 49fdb8a）。 */
+function genToolUseId(): string {
+  return `toolu_${Date.now().toString(16)}${Math.floor(Math.random() * 0x10000).toString(16)}`
+}
+
+/**
+ * 延迟发送 tool_use 块的 content_block_start；返回 false 表示该块是空名畸形调用，应整体丢弃。
+ *
+ * 为什么延迟：上游的 `function.name` 分片可能晚于 id 到达，甚至整片丢失。创建块时立刻发
+ * start 会把空 name 直播给客户端 —— 客户端拿到无法执行的 tool_use，执行失败后又把残缺记录
+ * 回放进下一轮历史，导致上游**恒定 400**
+ * `tool_calls[N].function.name must be a non-empty string`，毒化整个会话
+ * （移植 luawei1/cline2api `49fdb8a`）。改为在真要输出内容/关闭块时才发，此时 name 已定。
+ */
+function ensureToolBlockStarted(
+  acc: AnthropicSSEAccumulator,
+  block: AnthropicSSEAccumulator['contentBlocks'][number],
+  events: string[]
+): boolean {
+  if (block.started) return true
+  if (!block.name) return false
+  if (!block.id) block.id = genToolUseId()
+  events.push(`event: content_block_start`)
+  events.push(`data: ${JSON.stringify({
+    type: 'content_block_start',
+    index: block.index,
+    content_block: { type: 'tool_use', id: block.id, name: block.name, input: {} },
+  })}`)
+  block.started = true
+  acc.currentBlockClosed = false
+  return true
+}
+
+/**
+ * 发送尚未发出的 arguments 增量。
+ *
+ * 用 `sent` 记录已发长度：name 晚到时，此前累积的 arguments 会在这一并补发，不丢不重；
+ * 也修掉旧实现「创建块时把首片 arguments 塞进 input 却从不发 delta」导致的 input 残缺
+ * （客户端报 truncated / JSON 解析失败）。
+ */
+function emitToolArgsDelta(
+  acc: AnthropicSSEAccumulator,
+  block: AnthropicSSEAccumulator['contentBlocks'][number],
+  events: string[]
+): void {
+  if (!ensureToolBlockStarted(acc, block, events)) return
+  const pending = block.input.slice(block.sent ?? 0)
+  if (!pending) return
+  block.sent = block.input.length
+  events.push(`event: content_block_delta`)
+  events.push(`data: ${JSON.stringify({
+    type: 'content_block_delta',
+    index: block.index,
+    delta: { type: 'input_json_delta', partial_json: pending },
+  })}`)
+}
+
+/** 是否至少有一个已发出的 tool_use 块（决定 stop_reason 能否报 tool_use）。 */
+function hasStartedToolUseBlock(acc: AnthropicSSEAccumulator): boolean {
+  return acc.contentBlocks.some((b) => b.type === 'tool_use' && b.started)
 }
 
 /** 确保当前 block 是 text 类型，若不是则创建新的。返回是否新建了 block。 */
@@ -650,6 +712,13 @@ function closeCurrentBlock(acc: AnthropicSSEAccumulator, events: string[]): void
   if (acc.currentBlockIndex < 0 || acc.currentBlockIndex >= acc.contentBlocks.length) return
   const block = acc.contentBlocks[acc.currentBlockIndex]
   if (block.type === 'tool_use') {
+    // 空名畸形 tool_call：整个块丢弃，不发 start/stop（见 ensureToolBlockStarted）
+    if (!ensureToolBlockStarted(acc, block, events)) {
+      acc.currentBlockClosed = true
+      return
+    }
+    // 收尾补发尚未发出的 arguments（name 晚到的形态）
+    emitToolArgsDelta(acc, block, events)
     // 解析累积的 input JSON 为规范字符串（便于非流式聚合/调试）
     try {
       const parsed = JSON.parse(block.input)
@@ -776,19 +845,26 @@ export function aggregateOpenAIToAnthropic(chunks: OpenAIChunk[]): Record<string
     contentBlocks.push({ type: 'text', text: content })
   }
   for (const [, entry] of toolCallAccum) {
+    // 跳过空名畸形 tool_call（GLM 流式分片丢失 / 工具调用以文本形式泄漏）：客户端无法执行，
+    // 回放进下一轮历史会让上游恒定 400 "tool_calls[N].function.name must be a non-empty string"
+    // （移植 luawei1/cline2api 49fdb8a）。id 缺失时补兜底 id。
+    if (!entry.name) continue
+    if (!entry.id) entry.id = genToolUseId()
     let input: Record<string, unknown> = {}
     try { input = JSON.parse(entry.args) } catch { /* keep empty */ }
     contentBlocks.push({ type: 'tool_use', id: entry.id, name: entry.name, input })
     toolCalls.push({ id: entry.id, name: entry.name, input })
   }
 
+  // 没有任何可用 tool_call 存活时不能报 tool_use（移植 49fdb8a）
+  const mappedStop = mapFinishReason(finishReason || 'stop')
   return {
     id: msgId || `msg_${Date.now()}`,
     type: 'message',
     role: 'assistant',
     model,
     content: contentBlocks,
-    stop_reason: mapFinishReason(finishReason || 'stop'),
+    stop_reason: mappedStop === 'tool_use' && toolCalls.length === 0 ? 'end_turn' : mappedStop,
     stop_sequence: null,
     usage: { input_tokens: inputTokens, output_tokens: outputTokens },
   }

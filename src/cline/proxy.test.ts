@@ -1,5 +1,6 @@
-import { describe, it, expect } from 'vitest'
-import { parseCooldownMs, fetchClineModels, isRunawayReasoningCutoff, isDegenerateReasoningDeltas, isWhitespaceOnlyReasoningDelta, normalizeReasoningDeltaForUI, pumpStreamAttempt } from './proxy'
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
+import { parseCooldownMs, fetchClineModels, isRunawayReasoningCutoff, isDegenerateReasoningDeltas, isWhitespaceOnlyReasoningDelta, normalizeReasoningDeltaForUI, pumpStreamAttempt, sanitizeClineMessages, isFreeClineModel, clineModelFallbackChain, buildUpstreamBody, proxyClineChatRequest, __resetClineCatalogCacheForTests, CLINE_MAX_TOKENS, CLINE_FREE_WHITELIST, DEFAULT_MODEL } from './proxy'
+import type { Provider } from '../types'
 
 /** 读取一个 Response 的完整文本（用于流式结果断言）。 */
 async function readAll(resp: Response): Promise<string> {
@@ -309,5 +310,292 @@ describe('reasoning 双换行回归（2026-09-10 Cline 分片漂移）', () => {
     expect(text).toContain('reasoning_content":"Second sentence. "')
     expect(text).not.toContain('reasoning_content":"First sentence.\\n\\n"')
     expect(text).not.toContain('reasoning_content":"Second sentence.\\n\\n"')
+  })
+})
+
+// ============================================================================
+// cline2api 双上游移植（2026-09-24）新增覆盖
+// 详见 _port-analysis/cline2api-0924-porting-analysis.md
+//  - cline2api-workers v1.1.8 `43a2930`：免费档剥离 max_tokens
+//  - luawei1/cline2api `1184f91`：非免费档 < 16 兜默认
+//  - luawei1/cline2api `169fd9d`：模型级不可用时沿免费链降级，非 429/402 原样透传
+//  - luawei1/cline2api `49fdb8a`：空名 tool_call / 孤儿 tool 结果清洗
+// ============================================================================
+
+/** 每个用例用独立 provider id，避免模块级账号池（含冷却状态）跨用例污染。 */
+let providerSeq = 0
+function clineProvider(keys: string[]): Provider {
+  return {
+    id: 'cline-test-' + ++providerSeq,
+    name: 'Cline',
+    baseUrl: 'https://api.cline.bot/api/v1',
+    apiType: 'openai',
+    apiKeys: keys.map((k) => ({ key: k, enabled: true })),
+  } as unknown as Provider
+}
+
+const REFRESH_TOKEN = 'rt-abcdefghijklmnop'
+const PAID_MODEL = 'z-ai/glm-5.3-flash'
+
+function jsonResp(body: unknown, status = 200): Response {
+  return new Response(JSON.stringify(body), { status, headers: { 'Content-Type': 'application/json' } })
+}
+
+/** 一段最小可用 SSE：一条正文 delta + finish_reason=stop + [DONE]。 */
+const SSE_OK = [
+  'data: {"id":"c1","choices":[{"index":0,"delta":{"content":"hi"},"finish_reason":null}]}\n\n',
+  'data: {"id":"c1","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}\n\n',
+  'data: [DONE]\n\n',
+]
+
+function sseOkResp(): Response {
+  return new Response(SSE_OK.join(''), { status: 200, headers: { 'Content-Type': 'text/event-stream' } })
+}
+
+interface FetchHarness {
+  /** 每次 chat/completions 的上游请求体，按顺序。 */
+  bodies: Array<Record<string, unknown>>
+}
+
+/** 安装 fetch 替身：目录端点 + auth refresh + chat 三路分流。 */
+function installFetch(chat: (body: Record<string, unknown>, callIndex: number) => Response): FetchHarness {
+  const bodies: Array<Record<string, unknown>> = []
+  const fn = vi.fn(async (input: unknown, init?: RequestInit) => {
+    const url = String(input)
+    if (url.includes('recommended-models')) {
+      return jsonResp({ recommended: [], free: [{ id: DEFAULT_MODEL }], clinePass: [] })
+    }
+    if (url.endsWith('/v1/models')) {
+      return jsonResp({ data: [] })
+    }
+    if (url.includes('/auth/refresh')) {
+      return jsonResp({ data: { accessToken: 'tok-1', expiresAt: Date.now() + 3_600_000 } })
+    }
+    if (url.includes('/chat/completions')) {
+      const body = JSON.parse(String(init?.body || '{}')) as Record<string, unknown>
+      bodies.push(body)
+      return chat(body, bodies.length - 1)
+    }
+    throw new Error('unexpected url: ' + url)
+  })
+  vi.stubGlobal('fetch', fn)
+  return { bodies }
+}
+
+beforeEach(() => {
+  __resetClineCatalogCacheForTests()
+})
+
+afterEach(() => {
+  vi.unstubAllGlobals()
+})
+
+describe('sanitizeClineMessages（移植 49fdb8a 步骤①② + 复用 cleanupOrphanToolCalls）', () => {
+  it('丢弃空名 tool_call，保留合法 tool_call', () => {
+    const out = sanitizeClineMessages([
+      { role: 'user', content: 'hi' },
+      {
+        role: 'assistant',
+        tool_calls: [
+          { id: 'a1', type: 'function', function: { name: 'Bash', arguments: '{"command":"ls"}' } },
+          { id: 'a2', type: 'function', function: { name: '', arguments: '{}' } },
+        ],
+      },
+      { role: 'tool', tool_call_id: 'a1', content: 'ok' },
+    ]) as Array<Record<string, unknown>>
+    expect(out).toHaveLength(3)
+    const tcs = out[1].tool_calls as Array<Record<string, unknown>>
+    expect(tcs).toHaveLength(1)
+    expect((tcs[0].function as Record<string, unknown>).name).toBe('Bash')
+  })
+
+  it('全部为空名时移除 tool_calls 字段', () => {
+    const out = sanitizeClineMessages([
+      { role: 'assistant', tool_calls: [{ id: 'a2', type: 'function', function: { name: '', arguments: '{}' } }] },
+    ]) as Array<Record<string, unknown>>
+    expect(out).toHaveLength(1)
+    expect('tool_calls' in out[0]).toBe(false)
+  })
+
+  it('丢弃孤儿 tool 结果（无对应合法 tool_call）', () => {
+    const out = sanitizeClineMessages([
+      { role: 'user', content: 'hi' },
+      { role: 'tool', tool_call_id: 'ghost', content: 'orphan' },
+      { role: 'tool', tool_call_id: '', content: 'no id' },
+    ]) as Array<Record<string, unknown>>
+    expect(out).toHaveLength(1)
+    expect(out[0].role).toBe('user')
+  })
+
+  it('顺序正确：空名 tool_call 被丢弃后，其 tool 结果也一并清掉（不会变成新孤儿）', () => {
+    const out = sanitizeClineMessages([
+      { role: 'assistant', tool_calls: [{ id: 'a2', type: 'function', function: { name: '', arguments: '{}' } }] },
+      { role: 'tool', tool_call_id: 'a2', content: 'result of malformed call' },
+    ]) as Array<Record<string, unknown>>
+    expect(out).toHaveLength(1)
+    expect(out[0].role).toBe('assistant')
+  })
+
+  it('正常历史原样保留', () => {
+    const input = [
+      { role: 'system', content: 'sys' },
+      { role: 'user', content: 'q' },
+      { role: 'assistant', tool_calls: [{ id: 'a1', type: 'function', function: { name: 'Read', arguments: '{}' } }] },
+      { role: 'tool', tool_call_id: 'a1', content: 'data' },
+    ]
+    expect(sanitizeClineMessages(input)).toHaveLength(4)
+  })
+
+  it('非数组入参原样返回', () => {
+    expect(sanitizeClineMessages(undefined)).toBeUndefined()
+    expect(sanitizeClineMessages('nope')).toBe('nope')
+  })
+})
+
+describe('isFreeClineModel（免费判定必须用列表成员，不能用前缀）', () => {
+  it('free 列表成员判定优先于前缀', () => {
+    const freeSet = new Set(['stealth/space-bunny-alpha'])
+    // 无 cline-free/ 前缀，但确实在 free 列表里 —— 这是 2026-09-24 实测发现的形态
+    expect(isFreeClineModel('stealth/space-bunny-alpha', freeSet)).toBe(true)
+    // 有 cline-free/ 前缀，但不在 free 列表里 → 以列表为准
+    expect(isFreeClineModel('cline-free/whatever', freeSet)).toBe(false)
+  })
+
+  it('无 free 列表时回落前缀与白名单启发式', () => {
+    expect(isFreeClineModel('cline-free/deepseek-v4.1-flash')).toBe(true)
+    expect(isFreeClineModel('cline-pass/glm-5.3')).toBe(false)
+    expect(isFreeClineModel(CLINE_FREE_WHITELIST[0])).toBe(true)
+  })
+})
+
+describe('buildUpstreamBody max_tokens 通道分档', () => {
+  const freeSet = new Set([DEFAULT_MODEL])
+
+  it('免费档剥离 max_tokens 与 max_completion_tokens（43a2930）', () => {
+    expect(buildUpstreamBody({ model: DEFAULT_MODEL, max_tokens: 4096 }, true, 's1', freeSet).max_tokens).toBeUndefined()
+    expect(buildUpstreamBody({ model: DEFAULT_MODEL, max_completion_tokens: 4096 }, true, 's1', freeSet).max_tokens).toBeUndefined()
+  })
+
+  it('非免费档保留客户端 max_tokens', () => {
+    expect(buildUpstreamBody({ model: PAID_MODEL, max_tokens: 4096 }, true, 's1', freeSet).max_tokens).toBe(4096)
+  })
+
+  it('非免费档低于硬下限 16 兜到默认（1184f91）', () => {
+    for (const raw of [0, 1, 8, 15]) {
+      expect(buildUpstreamBody({ model: PAID_MODEL, max_tokens: raw }, true, 's1', freeSet).max_tokens).toBe(CLINE_MAX_TOKENS)
+    }
+    expect(buildUpstreamBody({ model: PAID_MODEL, max_tokens: 16 }, true, 's1', freeSet).max_tokens).toBe(16)
+    expect(buildUpstreamBody({ model: PAID_MODEL, max_tokens: 1024 }, true, 's1', freeSet).max_tokens).toBe(1024)
+  })
+
+  it('非免费档未带 max_tokens 时兜默认护栏', () => {
+    expect(buildUpstreamBody({ model: PAID_MODEL }, true, 's1', freeSet).max_tokens).toBe(CLINE_MAX_TOKENS)
+  })
+
+  it('messages 经过 sanitizeClineMessages 清洗', () => {
+    const body = buildUpstreamBody(
+      { model: DEFAULT_MODEL, messages: [{ role: 'assistant', tool_calls: [{ id: 'x', function: { name: '' } }] }] },
+      true,
+      's1',
+      freeSet,
+    )
+    const msgs = body.messages as Array<Record<string, unknown>>
+    expect('tool_calls' in msgs[0]).toBe(false)
+  })
+})
+
+describe('clineModelFallbackChain（移植 169fd9d）', () => {
+  it('点名模型优先，其后是默认免费档与目录免费模型，付费档不进链，且去重', () => {
+    const chain = clineModelFallbackChain(PAID_MODEL, [
+      { id: DEFAULT_MODEL, cost: 'free' },
+      { id: 'stealth/space-bunny-alpha', cost: 'free' },
+      { id: 'cline-pass/glm-5.3', cost: 'pass' },
+    ])
+    expect(chain[0]).toBe(PAID_MODEL)
+    expect(chain).toContain(DEFAULT_MODEL)
+    expect(chain).toContain('stealth/space-bunny-alpha')
+    expect(chain).not.toContain('cline-pass/glm-5.3')
+    expect(new Set(chain).size).toBe(chain.length)
+  })
+
+  it('点名模型本身是免费档时不产生重复项', () => {
+    const chain = clineModelFallbackChain(DEFAULT_MODEL, [{ id: DEFAULT_MODEL, cost: 'free' }])
+    expect(chain.filter((m) => m === DEFAULT_MODEL)).toHaveLength(1)
+  })
+})
+
+describe('402 余额耗尽与免费链降级', () => {
+  it('402 计费档模型 → 沿免费链换模型并返回成功（移植 169fd9d）', async () => {
+    const { bodies } = installFetch((body) =>
+      body.model === PAID_MODEL
+        ? jsonResp({ error: { code: 'insufficient_credits', message: 'Insufficient balance. Your Cline Credits balance is $0.01' } }, 402)
+        : sseOkResp(),
+    )
+    const resp = await proxyClineChatRequest(
+      undefined,
+      clineProvider([REFRESH_TOKEN]),
+      { model: PAID_MODEL, messages: [{ role: 'user', content: 'hi' }] },
+      { stream: false },
+    )
+    expect(resp.status).toBe(200)
+    // 第一次打计费档，第二次换成免费档
+    expect(bodies.map((b) => b.model)).toEqual([PAID_MODEL, DEFAULT_MODEL])
+    // 计费档带 max_tokens，免费档被剥离
+    expect(bodies[0].max_tokens).toBe(CLINE_MAX_TOKENS)
+    expect(bodies[1].max_tokens).toBeUndefined()
+    const data = (await resp.json()) as { choices: Array<{ message: { content: string } }> }
+    expect(data.choices[0].message.content).toBe('hi')
+  })
+
+  it('整条链都 402 → 明确 402 upstream_plan_exhausted（不再静默透传上游原文）', async () => {
+    installFetch(() => jsonResp({ error: { code: 'insufficient_credits', message: 'Insufficient balance' } }, 402))
+    const resp = await proxyClineChatRequest(
+      undefined,
+      clineProvider([REFRESH_TOKEN]),
+      { model: PAID_MODEL, messages: [{ role: 'user', content: 'hi' }] },
+      { stream: false },
+    )
+    expect(resp.status).toBe(402)
+    const data = (await resp.json()) as { error: { type: string; message: string } }
+    expect(data.error.type).toBe('upstream_plan_exhausted')
+    expect(data.error.message).toContain('insufficient_credits')
+  })
+
+  it('5xx 不触发模型降级，原样透传（169fd9d 语义）', async () => {
+    const { bodies } = installFetch(() => jsonResp({ error: 'boom' }, 500))
+    const resp = await proxyClineChatRequest(
+      undefined,
+      clineProvider([REFRESH_TOKEN]),
+      { model: PAID_MODEL, messages: [{ role: 'user', content: 'hi' }] },
+      { stream: false },
+    )
+    expect(resp.status).toBe(500)
+    expect(bodies).toHaveLength(1)
+  })
+
+  it('400 不触发模型降级', async () => {
+    const { bodies } = installFetch(() => jsonResp({ error: 'bad request' }, 400))
+    const resp = await proxyClineChatRequest(
+      undefined,
+      clineProvider([REFRESH_TOKEN]),
+      { model: PAID_MODEL, messages: [{ role: 'user', content: 'hi' }] },
+      { stream: false },
+    )
+    expect(resp.status).toBe(400)
+    expect(bodies).toHaveLength(1)
+  })
+
+  it('点名免费档成功时不降级，且请求体无 max_tokens', async () => {
+    const { bodies } = installFetch(() => sseOkResp())
+    const resp = await proxyClineChatRequest(
+      undefined,
+      clineProvider([REFRESH_TOKEN]),
+      { model: DEFAULT_MODEL, messages: [{ role: 'user', content: 'hi' }] },
+      { stream: false },
+    )
+    expect(resp.status).toBe(200)
+    expect(bodies).toHaveLength(1)
+    expect(bodies[0].model).toBe(DEFAULT_MODEL)
+    expect(bodies[0].max_tokens).toBeUndefined()
   })
 })

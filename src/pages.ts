@@ -178,7 +178,9 @@ const PROVIDER_PRESETS: Record<string, { name: string; id: string; baseUrl: stri
     models: ['gemini-2.5-flash', 'gemini-2.5-pro', 'gemini-2.5-flash-lite', 'gemini-2.0-flash', 'gemini-2.0-flash-lite', 'gemini-3-flash-preview', 'gemini-3-pro-preview', 'gemini-3.5-flash'],
   },
   cline:        { name: 'Cline (白嫖模型)',    id: 'cline',        baseUrl: 'https://api.cline.bot/api/v1',                      apiType: 'openai',
-    models: ['poolside/laguna-s-2.1:free', 'deepseek/deepseek-v4-flash', 'cline-free/glm-5.2', 'cline-pass/glm-5.2', 'cline-pass/deepseek-v4-flash', 'cline-pass/qwen3.7-max'],
+    // 2026-09-24 实测（recommended-models）：free 档 5 项 + cline-pass 付费档。
+    // 旧的 poolside/laguna-s-2.1:free、cline-free/glm-5.2 已不在免费列表内。
+    models: ['cline-free/deepseek-v4.1-flash', 'cline-free/gemini-3.8-flash', 'cline-free/mimo-v2.6-flash', 'cline-free/muse-spark-1.3-contributor', 'stealth/space-bunny-alpha', 'cline-pass/glm-5.3', 'cline-pass/deepseek-v4.1-flash', 'cline-pass/qwen3.8-max'],
   },
   cnb:          { name: 'CNB (免费 deepseek-v4)', id: 'cnb',       baseUrl: 'https://cnb.cool',                                   apiType: 'openai', toolBridge: true,
     models: ['deepseek-v4-flash', 'deepseek-v4-pro'],

@@ -9,30 +9,64 @@
  * 多账号：provider.apiKeys（enabled）里一行一个 refreshToken，
  *   额度用尽(空响应)/刷失败/401 时自动冷却并切换到下一个账号。
  *
- * 可用模型（2026-08 实测，见项目 README）：
- *   poolside/laguna-s-2.1:free 为当前唯一稳定可用（API 免费）；
- *   deepseek/deepseek-v4-flash 与 cline-free/* 被官方锁定(403，仅 Cline 产品界面)；
- *   cline-pass/* 需付费订阅。
+ * 模型分档（2026-09-24 实测 https://api.cline.bot/api/v1/ai/cline/recommended-models）：
+ *   free 档（走官方免费额度，不需 credits）：cline-free/gemini-3.8-flash、
+ *     stealth/space-bunny-alpha、cline-free/mimo-v2.6-flash、
+ *     cline-free/deepseek-v4.1-flash、cline-free/muse-spark-1.3-contributor；
+ *   cline-pass/* 需付费订阅；其余（如 z-ai/glm-5.3-flash）走 credits 计费档，
+ *     余额不足返回 402 insufficient_credits。
+ *
+ * ⚠️ 免费判定必须用「free 列表成员」而非前缀：stealth/space-bunny-alpha 是免费模型
+ *    但没有 cline-free/ 前缀，前缀判定会把它当计费档 → 402。
  */
 
 import type { Env, Provider } from '../types'
 import { updateProvider, getProviders } from '../storage'
 import { streamFetchWithTimeout } from '../opencode'
+// 通用 tool 配对工具（纯函数、与提供商无关）：Cline 出站历史同样需要清孤儿 tool 结果。
+// 复用而非复制，避免两份实现漂移（owner 仍在 workbuddy-upstream.ts）。
+import { cleanupOrphanToolCalls } from '../workbuddy-upstream'
 
 export const CLINE_PROVIDER_ID = 'cline'
 export const CLINE_API_BASE = 'https://api.cline.bot/api/v1'
 
-export const DEFAULT_MODEL = 'poolside/laguna-s-2.1:free'
+/** 默认模型：Cline 官方免费额度通道（对齐上游 cline2api-workers 1.1.8 的 DEFAULT_MODEL）。 */
+export const DEFAULT_MODEL = 'cline-free/deepseek-v4.1-flash'
 
-/** 实测模型列表（poolside 免费可用；deepseek 已锁；cline-free 锁定；cline-pass 需订阅）。 */
+/**
+ * 静态兜底模型表（2026-09-24 实测）。
+ * 动态目录拉取成功时以动态结果为准；本表仅在拉取失败时兜底，并供后台「获取模型」预填。
+ */
 export const CLINE_MODELS: Array<{ id: string; provider: string; cost: string }> = [
-  { id: 'poolside/laguna-s-2.1:free', provider: 'poolside', cost: 'free' },
-  { id: 'deepseek/deepseek-v4-flash', provider: 'deepseek', cost: 'locked' },
-  { id: 'cline-free/glm-5.2', provider: 'zai', cost: 'locked' },
-  { id: 'cline-pass/glm-5.2', provider: 'zai', cost: 'pass' },
-  { id: 'cline-pass/deepseek-v4-flash', provider: 'deepseek', cost: 'pass' },
-  { id: 'cline-pass/qwen3.7-max', provider: 'qwen', cost: 'pass' },
+  { id: 'cline-free/deepseek-v4.1-flash', provider: 'cline-free', cost: 'free' },
+  { id: 'cline-free/gemini-3.8-flash', provider: 'cline-free', cost: 'free' },
+  { id: 'cline-free/mimo-v2.6-flash', provider: 'cline-free', cost: 'free' },
+  { id: 'cline-free/muse-spark-1.3-contributor', provider: 'cline-free', cost: 'free' },
+  { id: 'stealth/space-bunny-alpha', provider: 'stealth', cost: 'free' },
+  { id: 'cline-pass/glm-5.3', provider: 'zai', cost: 'pass' },
+  { id: 'cline-pass/deepseek-v4.1-flash', provider: 'deepseek', cost: 'pass' },
+  { id: 'cline-pass/qwen3.8-max', provider: 'qwen', cost: 'pass' },
 ]
+
+/**
+ * Cline 官方免费白名单（移植 cline2api-workers worker.js `refreshModels` 的 FREE_WHITELIST）。
+ * 这些 ID 在 `/v1/models` 里没有 `:free` 后缀，但走官方免费额度，必须显式识别。
+ */
+export const CLINE_FREE_WHITELIST: readonly string[] = [
+  'deepseek/deepseek-v4-flash',
+  'deepseek/deepseek-v4-flash-0731',
+  'z-ai/glm-5.3-flash',
+  'z-ai/glm-5.2:free',
+  'xiaomi/mimo-v2.5',
+  'minimax/minimax-m3',
+  'poolside/laguna-s-2.1',
+  'cline-free/deepseek-v4.1-flash',
+  'cline-free/muse-spark-1.3-contributor',
+  'cline-free/solar-pro4',
+]
+
+/** 免费链末位兜底（对齐上游 freeModelLastResort）。 */
+export const CLINE_FREE_LAST_RESORT = 'cline-free/deepseek-v4.1-flash'
 
 export function isClineProvider(providerId: string): boolean {
   return providerId === CLINE_PROVIDER_ID
@@ -61,6 +95,22 @@ const CLINE_COOLDOWN_EMPTY_MS = 60 * 1000       // 空响应（免费额度耗�
 const CLINE_COOLDOWN_401_MS = 60 * 1000         // token 失效默认冷却
 // 推理空转（length 截断但无正文）默认冷却：比普通空响应短，便于快速切号重试
 const CLINE_COOLDOWN_RUNAWAY_MS = 30 * 1000
+/**
+ * 余额/权益耗尽（402 insufficient_credits）的模型级冷却默认时长。
+ *
+ * 402 的语义是「该模型走 credits 计费档，而当前账号余额不足」——**不代表账号不能跑免费模型**，
+ * 所以只冷却「账号 × 该模型」这一格，由免费链换模型；整体冷却账号会把后续免费模型一起打死。
+ * 时长给足 12h（余额耗尽不会自愈，除非充值或次日探活复活），但下一次请求若该模型仍被点名，
+ * 免费链会直接跳过它，不再空转打上游。
+ */
+const CLINE_COOLDOWN_PLAN_MS = 12 * 3600 * 1000
+/**
+ * 上游对输出 token 的硬下限（移植 luawei1/cline2api 1184f91）。
+ *
+ * Cline 免费模型经 OpenRouter 转发时（如 meta/muse-spark），max_output_tokens < 16
+ * 会被上游直接 400，且错误会被免费模型回退链吞掉。故非免费通道把 < 16 兜到默认值。
+ */
+const CLINE_MIN_UPSTREAM_MAX_TOKENS = 16
 
 /**
  * max_tokens「护栏默认」与 effort 默认档（推理空转防御）。
@@ -70,10 +120,14 @@ const CLINE_COOLDOWN_RUNAWAY_MS = 30 * 1000
  * 95% 是空白/换行、几乎不产出正文，最后以 length 截断。而 OpenAI 兼容推理模型把
  * reasoning 与最终答案共用一个 max_tokens 总预算，空转会一次性烧光它。
  *
- * 因此把原来无脑兜底 128000 换成「护栏语义」：
- *   - 客户端显式带 max_tokens / max_completion_tokens → 原样透传，尊重客户端请求
- *     （超长回答不会被网关误掐）；
- *   - 客户端没带 → 用 CLINE_MAX_TOKENS 作为护栏默认，避免空转烧光几十万预算。
+ * 因此把原来无脑兜底 128000 换成「护栏语义」，并按通道分档（2026-09-24 移植）：
+ *   - **免费档**（官方免费额度通道）：**剥离 max_tokens / max_completion_tokens**。
+ *     上游风控「免费模型请求体带 max_tokens 一律 500 empty response content」
+ *     （移植 cline2api-workers v1.1.8 `43a2930`）。已知代价：上游按自己节奏生成，
+ *     客户端无法提前截断——这是上游明示的取舍。
+ *   - **非免费档**：保留客户端值；低于上游硬下限 `CLINE_MIN_UPSTREAM_MAX_TOKENS` 的
+ *     兜到 CLINE_MAX_TOKENS（移植 luawei1/cline2api `1184f91`，防 OpenRouter 转发 400）。
+ *   - 客户端没带时同样兜 CLINE_MAX_TOKENS，避免空转烧光几十万预算。
  * 空转的兜底见 isRunawayReasoningCutoff + proxyNonStreamChat 的重试/冷却。
  *
  * 2026-09-05 复盘：昨天只把空转兜底挂在非流式路径（proxyNonStreamChat），而 DSH 等
@@ -83,7 +137,7 @@ const CLINE_COOLDOWN_RUNAWAY_MS = 30 * 1000
  *   - proxyStreamChat：探测期缓冲 → 退化则取消上游 + 冷却 + 换号重试；健康才放行，
  *     放行后继续滚动监控，退化中途出现则抑制后续 reasoning delta（不再往 UI 直播垃圾）。
  */
-const CLINE_MAX_TOKENS = 32768          // 客户端未指定 max_tokens 时的护栏默认（原 128000 过激进）
+export const CLINE_MAX_TOKENS = 32768          // 客户端未指定 max_tokens 时的护栏默认（原 128000 过激进）
 const CLINE_DEFAULT_REASONING_EFFORT = 'medium'  // 免费通道默认档位（原 high 过激进）
 
 /**
@@ -297,6 +351,34 @@ function cooldownAccount(acc: Account, ms: number) {
   acc.expiry = 0
 }
 
+/**
+ * 账号当前是否可用：软冷却与「账号 × 模型」冷却都不命中才算可用。
+ * @param model 有模型上下文时额外检查模型级冷却；不传则只判账号级。
+ */
+function isAccountAvailable(acc: Account, model: string | undefined, now: number): boolean {
+  if (acc.cooldownUntil > now) return false
+  if (model) {
+    const until = acc.modelCooldowns.get(model)
+    if (until && until > now) return false
+  }
+  return true
+}
+
+/** 池中是否还有账号能跑该模型（不改状态，供免费链跳过与降级判定）。 */
+function hasAvailableAccount(pool: Pool, model?: string): boolean {
+  const now = Date.now()
+  return pool.accounts.some((acc) => isAccountAvailable(acc, model, now))
+}
+
+/**
+ * 池中是否还有账号可用（**忽略模型级冷却**）。
+ * 用于区分「账号池整体不可用（应立刻回错）」与「只是该模型在部分账号上冷却（可换模型）」。
+ */
+function hasAnyUsableAccount(pool: Pool): boolean {
+  const now = Date.now()
+  return pool.accounts.some((acc) => acc.cooldownUntil <= now)
+}
+
 async function getAccountToken(account: Account, pool?: Pool): Promise<string> {
   const now = Date.now()
   if (account.cooldownUntil > now) throw new Error('account_cooldown')
@@ -338,13 +420,13 @@ async function getAccountToken(account: Account, pool?: Pool): Promise<string> {
   return accessToken
 }
 
-/** 轮询选一个可用账号，取到 accessToken。全失败则清冷却重试一次最早的。（item7 支持模型级冷却） */
+/** 轮询选一个可用账号，取到 accessToken。（item7 支持模型级冷却） */
 async function getAccessToken(pool: Pool, model?: string): Promise<string> {
   if (pool.accounts.length === 0) throw new Error('未配置 Cline RefreshToken')
+  const now = Date.now()
   for (let attempt = 0; attempt < pool.accounts.length; attempt++) {
     const acc = pool.accounts[attempt % pool.accounts.length]
-    if (acc.cooldownUntil && acc.cooldownUntil > Date.now()) continue
-    if (model && acc.modelCooldowns.get(model) && (acc.modelCooldowns.get(model) as number) > Date.now()) continue
+    if (!isAccountAvailable(acc, model, now)) continue
     pool.current = acc
     try {
       return await getAccountToken(acc, pool)
@@ -352,7 +434,13 @@ async function getAccessToken(pool: Pool, model?: string): Promise<string> {
       continue // 刷新失败也切下个号
     }
   }
-  const acc = pool.accounts[0]
+  // 兜底：优先挑一个软冷却已到期的账号强制复活一次（保留原「不空转」语义）；
+  // 若全都还在软冷却，则挑一个「该模型未冷却」的账号复活——**不能挑该模型已冷却的账号**，
+  // 否则会把「该模型余额耗尽 → 改走免费链」的判定绕过去，又去打一次必然 402 的上游。
+  const acc =
+    pool.accounts.find((a) => a.cooldownUntil <= now) ??
+    pool.accounts.find((a) => !model || (a.modelCooldowns.get(model) ?? 0) <= now)
+  if (!acc) throw new Error('该模型在所有账号上均处于冷却中')
   pool.current = acc
   acc.cooldownUntil = 0
   try {
@@ -424,6 +512,16 @@ async function clineFetchWithRetry(
   }
   for (let attempt = 0; attempt <= maxRetries; attempt++) {
     const resp = await enqueue(() => clineFetch(pool, path, bodyObj, sessionId))
+    // 余额/权益耗尽（402）：该模型走 credits 计费档，而当前账号余额不足。
+    // 只做**模型级**冷却（账号仍可跑免费模型），换号重试可能命中有余额的账号；
+    // 全账号都不可用时立刻回 402，由调用方沿免费链换模型（移植 luawei1 169fd9d 语义）。
+    if (resp.status === 402) {
+      const text = await resp.clone().text().catch(() => '')
+      applyCooldown(cooldownFromResponse(resp, text, CLINE_COOLDOWN_PLAN_MS))
+      if (!hasAvailableAccount(pool, model)) return planExhaustedResponse(text)
+      await sleep(500 + Math.floor(Math.random() * 500))
+      continue
+    }
     // 明确限流：冷却 + 切号重试
     if (resp.status === 429) {
       const text = await resp.clone().text().catch(() => '')
@@ -461,24 +559,65 @@ async function clineFetchWithRetry(
 
 // ===== 请求体构造 =====
 
-function buildUpstreamBody(
+/**
+ * 清洗出站消息历史里的畸形 tool_calls（移植 luawei1/cline2api `49fdb8a` 步骤①②）。
+ *
+ * 背景：上游偶发输出 `function.name` 为空的 tool call（GLM 流式分片丢失 / 工具调用以
+ * 文本形式泄漏），客户端执行后把残缺记录回放进下一轮历史，导致上游**恒定 400**
+ * `tool_calls[N].function.name must be a non-empty string`，毒化整个会话。
+ *
+ *   ① 丢弃 `function.name` 为空的 tool_call；
+ *   ② 过滤后 `tool_calls` 为空则移除该字段；
+ *   ③ 孤儿 tool 结果（无对应合法 tool_call）整条删除 —— 复用已导出的
+ *      `cleanupOrphanToolCalls`，不重复实现。
+ *
+ * **顺序要紧**：先做①②再做③。反过来的话，被①②丢掉的空名 tool_call 所对应的
+ * tool 结果会因为「调用当时还在」而被保留，变成新的孤儿。
+ *
+ * @param messages 客户端原始 messages（非数组时原样返回）
+ */
+export function sanitizeClineMessages(messages: unknown): unknown {
+  if (!Array.isArray(messages)) return messages
+  for (const m of messages) {
+    if (!m || typeof m !== 'object' || Array.isArray(m)) continue
+    const msg = m as Record<string, unknown>
+    if (msg['role'] !== 'assistant') continue
+    const tcs = msg['tool_calls']
+    if (!Array.isArray(tcs)) continue
+    const kept = tcs.filter((tc) => {
+      if (!tc || typeof tc !== 'object' || Array.isArray(tc)) return false
+      const fn = (tc as Record<string, unknown>)['function']
+      if (!fn || typeof fn !== 'object' || Array.isArray(fn)) return false
+      const name = (fn as Record<string, unknown>)['name']
+      return typeof name === 'string' && name !== ''
+    })
+    if (kept.length === tcs.length) continue // 无空名：零改动
+    if (kept.length === 0) delete msg['tool_calls'] // ② 全空名 → 删键
+    else msg['tool_calls'] = kept
+  }
+  // ③ 再清孤儿 tool 结果（② 删掉调用后，其结果在这里被一并清掉）
+  return cleanupOrphanToolCalls(messages).messages
+}
+
+export function buildUpstreamBody(
   forwardBody: Record<string, unknown>,
   isStream: boolean,
-  sessionId: string
+  sessionId: string,
+  freeSet?: Set<string>
 ): Record<string, unknown> {
-  // 护栏语义：客户端显式带了 max_tokens 就原样透传（尊重其请求，不误掐长回答）；
-  // 客户端没带才用 CLINE_MAX_TOKENS 兜底，避免空转把预算一路烧到几十万。
-  const rawMax = forwardBody.max_tokens ?? forwardBody.max_completion_tokens
-  const maxTokens =
-    rawMax != null && rawMax !== ''
-      ? Math.max(Math.floor(Number(rawMax)) || 1, 1)
-      : CLINE_MAX_TOKENS
+  const model = (forwardBody.model as string) || DEFAULT_MODEL
   const body: Record<string, unknown> = {
-    model: (forwardBody.model as string) || DEFAULT_MODEL,
-    max_tokens: maxTokens,
+    model,
     session_id: sessionId,
     reasoning_effort: String(forwardBody.reasoning_effort || forwardBody.reasoningEffort || CLINE_DEFAULT_REASONING_EFFORT),
-    messages: Array.isArray(forwardBody.messages) ? forwardBody.messages : [],
+    messages: sanitizeClineMessages(forwardBody.messages) as unknown[],
+  }
+  // max_tokens 分档（见 CLINE_MAX_TOKENS 文档）：免费档剥离，非免费档保留并兜下限。
+  // 免费判定用 free 列表成员（不是前缀）——stealth/space-bunny-alpha 无 cline-free/ 前缀。
+  if (!isFreeClineModel(model, freeSet)) {
+    const rawMax = forwardBody.max_tokens ?? forwardBody.max_completion_tokens
+    const parsed = rawMax != null && rawMax !== '' ? Math.floor(Number(rawMax)) || 0 : 0
+    body.max_tokens = parsed >= CLINE_MIN_UPSTREAM_MAX_TOKENS ? parsed : CLINE_MAX_TOKENS
   }
   if (isStream) body.stream = true
   const passthrough = [
@@ -778,6 +917,8 @@ async function proxyStreamChat(pool: Pool, body: Record<string, unknown>, sessio
   for (let attempt = 0; attempt < 3; attempt++) {
     const resp = await clineFetchWithRetry(pool, '/chat/completions', body, sessionId, true)
     if (!resp.ok) {
+      // 402 余额耗尽是我们自己合成的响应（已带明确 message 与 type），原样透传不二次包装
+      if (resp.headers.get('X-Cline-Plan-Exhausted')) return resp
       const errText = await resp.text().catch(() => '')
       return jsonResponse(
         { error: { message: `Cline 上游 HTTP ${resp.status}: ${errText.slice(0, 300)}`, type: 'upstream_error' } },
@@ -800,6 +941,33 @@ function jsonResponse(obj: unknown, status: number): Response {
     status,
     headers: { 'Content-Type': 'application/json; charset=utf-8' },
   })
+}
+
+/**
+ * 402 余额耗尽、且该模型在全部账号上都不可用时的响应。
+ *
+ * 状态码保留 402（上层与客户端能按「余额」语义识别、可与 429 区分），
+ * `type` 用 `upstream_plan_exhausted` 与普通上游错误区分。
+ * 该响应同时是免费链的「换下一个模型」信号（见 proxyClineChatRequest）。
+ */
+function planExhaustedResponse(upstreamText = ''): Response {
+  const detail = upstreamText ? ` 上游原文：${upstreamText.slice(0, 200)}` : ''
+  return new Response(
+    JSON.stringify({
+      error: {
+        message:
+          'Cline 余额/权益耗尽（402 insufficient_credits）：该模型走 credits 计费档而账号余额不足。' +
+          '请改用免费档模型（cline-free/* 或 stealth/space-bunny-alpha），或充值后重试。' +
+          detail,
+        type: 'upstream_plan_exhausted',
+      },
+    }),
+    {
+      status: 402,
+      // 标记：调用方原样透传，不再被包装成 "Cline 上游 HTTP 402: {...}"
+      headers: { 'Content-Type': 'application/json; charset=utf-8', 'X-Cline-Plan-Exhausted': '1' },
+    }
+  )
 }
 
 // ===== 非流式聚合（item4/5）：上游恒定流式，客户端要非流式时把 SSE 聚合成 chat.completion =====
@@ -897,6 +1065,8 @@ async function proxyNonStreamChat(pool: Pool, body: Record<string, unknown>, ses
   for (let attempt = 0; attempt < 3; attempt++) {
     const resp = await clineFetchWithRetry(pool, '/chat/completions', body, sessionId, true)
     if (!resp.ok) {
+      // 402 余额耗尽是我们自己合成的响应（已带明确 message 与 type），原样透传不二次包装
+      if (resp.headers.get('X-Cline-Plan-Exhausted')) return resp
       const errText = await resp.text().catch(() => '')
       return jsonResponse(
         { error: { message: `Cline 上游 HTTP ${resp.status}: ${errText.slice(0, 300)}`, type: 'upstream_error' } },
@@ -943,19 +1113,38 @@ export async function proxyClineChatRequest(
   const pool = poolFromProvider(provider, _env as Env)
   const wantStream = opts ? !!opts.stream : forwardBody.stream === true
   const sessionId = 'sess_' + Date.now()
-  // 上游恒定强制流式（item4）：免费通道非流式返回 500 "empty response content"，
-  // 统一以流式取数，客户端要非流式时再聚合成 chat.completion。
-  const body = buildUpstreamBody(forwardBody, true, sessionId)
-  try {
-    if (wantStream) {
-      // 2026-09-05：流式不再纯透传（原 streamSSE），改为带推理退化防护的流式转发：
-      // 探测期判定空转 → 冷却换号重试；健康才放行，透传期持续抑制退化 reasoning。
-      return await proxyStreamChat(pool, body, sessionId)
+  const requested = String(forwardBody.model || DEFAULT_MODEL)
+  const { models, freeSet } = await getClineCatalog()
+  const chain = clineModelFallbackChain(requested, models)
+  let last: Response | null = null
+
+  for (let i = 0; i < chain.length; i++) {
+    const model = chain[i]
+    const isLast = i === chain.length - 1
+    // 该模型在所有账号上都冷却中（含 402 余额耗尽的模型级冷却）→ 直接换下一个模型，不打上游
+    if (!hasAvailableAccount(pool, model)) continue
+    // 上游恒定强制流式（item4）：免费通道非流式返回 500 "empty response content"，
+    // 统一以流式取数，客户端要非流式时再聚合成 chat.completion。
+    const body = buildUpstreamBody({ ...forwardBody, model }, true, sessionId, freeSet)
+    try {
+      const resp = wantStream
+        ? await proxyStreamChat(pool, body, sessionId)
+        : await proxyNonStreamChat(pool, body, sessionId)
+      // 402/429 = 「该模型在当前账号池上不可用」→ 沿免费链换模型（移植 169fd9d）。
+      // 其余错误（400/403/5xx）原样透传：不把参数错误伪装成「换个模型就好了」。
+      if ((resp.status === 402 || resp.status === 429) && !isLast) {
+        last = resp
+        continue
+      }
+      if (model !== requested) {
+        console.log(`[cline-fallback] model ${requested} unavailable on all accounts, served via ${model}`)
+      }
+      return resp
+    } catch (err) {
+      return jsonResponse({ error: { message: (err as Error).message || 'Cline 转发失败', type: 'api_error' } }, 500)
     }
-    return await proxyNonStreamChat(pool, body, sessionId)
-  } catch (err) {
-    return jsonResponse({ error: { message: (err as Error).message || 'Cline 转发失败', type: 'api_error' } }, 500)
   }
+  return last ?? jsonResponse({ error: { message: 'Cline 全部候选模型均不可用', type: 'upstream_unavailable' } }, 502)
 }
 
 /** 返回 Cline 实测可用模型列表（普通 JSON，供管理面板拉取模型）。 */
@@ -968,12 +1157,45 @@ export function fetchClineModels(): { ok: true; message: string; models: Array<{
 }
 
 // ===== 动态模型同步（item6，移植自 luawei1/cline2api models_sync.go） =====
+// 2026-09-24 扩为三源合并（移植 cline2api-workers worker.js refreshModels）：
+//   ① recommended-models 的 free / recommended / clinePass
+//   ② /v1/models 的 `:free` 后缀
+//   ③ /v1/models 命中 CLINE_FREE_WHITELIST 的 ID
+// ②③ 是必需的：`stealth/space-bunny-alpha` 这类免费模型**只在 /v1/models 里出现**，
+// 且没有 cline-free/ 前缀，只靠①会把它判成计费档 → 402。
+// 有意未纳入：recommended-models 的 clineCloud 组（Cline Cloud 独立档，上游 workers 版也不读）。
 
 const CLINE_RECOMMENDED_URL = 'https://api.cline.bot/api/v1/ai/cline/recommended-models'
+const CLINE_MODELS_URL = 'https://api.cline.bot/api/v1/models'
+/** 目录缓存 TTL（对齐上游 workers 版 MODELS_TTL = 10 分钟）。 */
+const CLINE_CATALOG_TTL_MS = 10 * 60 * 1000
 
 export interface RemoteClineModel { id: string; cost: 'free' | 'pass' }
 
-/** 拉取 Cline 官方推荐/免费/订阅模型清单（免认证），按 free 优先去重。 */
+/** 拉取 `/v1/models`（免鉴权），只保留免费档：`:free` 后缀或命中 FREE_WHITELIST。 */
+async function fetchClineModelsEndpoint(): Promise<RemoteClineModel[]> {
+  const resp = await fetch(CLINE_MODELS_URL, {
+    headers: { 'User-Agent': 'Mozilla/5.0 (cline2api)' },
+    signal: AbortSignal.timeout(10000),
+  })
+  if (!resp.ok) throw new Error(`/v1/models HTTP ${resp.status}`)
+  const data = (await resp.json()) as { data?: Array<{ id?: string; batch?: boolean }> }
+  const list = Array.isArray(data?.data) ? data.data : []
+  const out: RemoteClineModel[] = []
+  for (const m of list) {
+    const id = m?.id
+    if (!id) continue
+    // batch 变体不是对话模型，剔除（对齐上游）
+    if (m.batch || id.endsWith(':batch')) continue
+    if (id.includes(':free') || CLINE_FREE_WHITELIST.includes(id)) out.push({ id, cost: 'free' })
+  }
+  return out
+}
+
+/**
+ * 拉取 Cline 官方推荐/免费/订阅模型清单（免认证），按 free 优先去重。
+ * `/v1/models` 失败**不致命**（主清单已拿到时静默跳过），保证后台「获取模型」不因单源故障全灭。
+ */
 export async function fetchClineRecommendedModels(): Promise<RemoteClineModel[]> {
   const resp = await fetch(CLINE_RECOMMENDED_URL, { signal: AbortSignal.timeout(10000) })
   if (!resp.ok) throw new Error(`recommended-models HTTP ${resp.status}`)
@@ -997,7 +1219,75 @@ export async function fetchClineRecommendedModels(): Promise<RemoteClineModel[]>
   add(data.free, 'free')
   add(data.recommended, 'pass')
   add(data.clinePass, 'pass')
+  // 补 /v1/models 的免费档（stealth/* 等无前缀免费模型只在这里出现）
+  try {
+    for (const m of await fetchClineModelsEndpoint()) {
+      if (seen.has(m.id)) continue
+      seen.add(m.id)
+      out.push(m)
+    }
+  } catch { /* 非致命：主清单已拿到 */ }
   return out
+}
+
+/** 静态兜底目录（动态拉取失败时使用）。 */
+function staticClineCatalog(): RemoteClineModel[] {
+  return CLINE_MODELS.map((m) => ({ id: m.id, cost: m.cost === 'free' ? 'free' : 'pass' }) as RemoteClineModel)
+}
+
+let clineCatalogCache: { models: RemoteClineModel[]; freeSet: Set<string>; at: number } | null = null
+
+/**
+ * 取 Cline 模型目录与 free 集合（10 分钟缓存）。**请求路径的 free 判定唯一真源。**
+ * 拉取失败回落静态表——请求路径不能因目录不可用而整体失败。
+ */
+export async function getClineCatalog(): Promise<{ models: RemoteClineModel[]; freeSet: Set<string> }> {
+  const now = Date.now()
+  if (clineCatalogCache && now - clineCatalogCache.at < CLINE_CATALOG_TTL_MS) {
+    return { models: clineCatalogCache.models, freeSet: clineCatalogCache.freeSet }
+  }
+  let models: RemoteClineModel[]
+  try {
+    models = await fetchClineRecommendedModels()
+    if (models.length === 0) models = staticClineCatalog()
+  } catch {
+    models = staticClineCatalog()
+  }
+  const freeSet = new Set(models.filter((m) => m.cost === 'free').map((m) => m.id))
+  clineCatalogCache = { models, freeSet, at: now }
+  return { models, freeSet }
+}
+
+/** 供测试清空目录缓存。 */
+export function __resetClineCatalogCacheForTests(): void { clineCatalogCache = null }
+
+/**
+ * 判定模型是否走官方免费额度（决定 max_tokens 剥离与降级链成员资格）。
+ *
+ * **必须用 free 列表成员判定，不能用前缀**：`stealth/space-bunny-alpha` 是免费模型但
+ * 没有 `cline-free/` 前缀，前缀判定会把它当计费档 → 送 max_tokens → 上游 500。
+ * 目录尚未取到时回落「前缀 + 白名单」启发式，宁可保守也不能漏判。
+ */
+export function isFreeClineModel(id: string, freeSet?: Set<string>): boolean {
+  if (freeSet && freeSet.size > 0) return freeSet.has(id)
+  return id.startsWith('cline-free/') || CLINE_FREE_WHITELIST.includes(id)
+}
+
+/**
+ * 免费模型降级链（移植 luawei1/cline2api `modelFallbackChain`，169fd9d）：
+ * 点名模型优先，其后是默认免费档与目录内全部免费模型，末位兜底 CLINE_FREE_LAST_RESORT。
+ *
+ * 上游语义：**只有 429/402 才降级**（模型级不可用）；400/403/5xx 等原样透传，
+ * 避免把参数错误伪装成「换模型就好了」。
+ */
+export function clineModelFallbackChain(requested: string, models: RemoteClineModel[]): string[] {
+  const chain: string[] = []
+  const push = (id: string) => { if (id && !chain.includes(id)) chain.push(id) }
+  push(requested)
+  push(DEFAULT_MODEL)
+  for (const m of models) if (m.cost === 'free') push(m.id)
+  push(CLINE_FREE_LAST_RESORT)
+  return chain
 }
 
 // ===== 每日健康检查（item10，移植自 Go 版冷却自愈：探活并刷新过期 token） =====

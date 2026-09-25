@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest'
-import { openAIChunkToResponsesSSE, responsesToOpenAI, buildResponsesFallbackCompleted } from './formats'
+import { openAIChunkToResponsesSSE, responsesToOpenAI, buildResponsesFallbackCompleted, createAnthropicSSEAccumulator, openAIChunkToAnthropicSSE, aggregateOpenAIToAnthropic } from './formats'
 
 // 构造一个响应转换器的累加器（与 proxy.ts handleResponsesSpecial 的用法一致）
 function acc(): Parameters<typeof openAIChunkToResponsesSSE>[1] {
@@ -226,5 +226,134 @@ describe('buildResponsesFallbackCompleted 流式兜底', () => {
     const out = buildResponsesFallbackCompleted(acc())
     expect(out).toContain('event: response.completed')
     expect(out).toContain('resp_unknown')
+  })
+})
+
+// ============================================================================
+// Anthropic 转换的畸形 tool_call 防护（移植 luawei1/cline2api 49fdb8a，2026-09-24）
+//
+// 背景：上游偶发输出 function.name 为空的 tool call（GLM 流式分片丢失 / 工具调用以文本
+// 形式泄漏）。这类块客户端无法执行，执行失败后会把残缺记录回放进下一轮历史，导致上游
+// 恒定 400 "tool_calls[N].function.name must be a non-empty string"，毒化整个会话。
+// ============================================================================
+
+/** 收集 Anthropic SSE 里所有 input_json_delta 的 partial_json，按顺序拼接。 */
+function anthropicToolArgDeltas(sse: string): string[] {
+  const out: string[] = []
+  for (const line of sse.split('\n')) {
+    if (!line.startsWith('data:')) continue
+    const payload = line.slice(5).trim()
+    if (!payload) continue
+    try {
+      const obj = JSON.parse(payload) as { type?: string; delta?: { partial_json?: string } }
+      if (obj.type === 'content_block_delta' && obj.delta?.partial_json !== undefined) {
+        out.push(obj.delta.partial_json)
+      }
+    } catch { /* 跳过非 JSON 行 */ }
+  }
+  return out
+}
+
+function toolDeltaChunk(toolCalls: unknown[]): never {
+  return {
+    id: 'chatcmpl-t',
+    object: 'chat.completion.chunk',
+    model: 'm',
+    choices: [{ index: 0, delta: { tool_calls: toolCalls }, finish_reason: null }],
+  } as never
+}
+
+function finishChunk(finish: string): never {
+  return { id: 'x', model: 'm', choices: [{ index: 0, delta: {}, finish_reason: finish }] } as never
+}
+
+describe('Anthropic 流式：畸形 tool_call 防护', () => {
+  it('空名 tool_call → 不发 content_block_start，stop_reason 降级为 end_turn', () => {
+    const a = createAnthropicSSEAccumulator()
+    // id 到齐但 name 整片丢失
+    const first = openAIChunkToAnthropicSSE(
+      toolDeltaChunk([{ index: 0, id: 'call_1', type: 'function', function: { name: '', arguments: '{}' } }]),
+      a,
+    )
+    expect(first).not.toContain('"type":"tool_use"')
+    const last = openAIChunkToAnthropicSSE(finishChunk('tool_calls'), a)
+    expect(last).not.toContain('content_block_start')
+    expect(last).not.toContain('content_block_stop')
+    expect(last).toContain('"stop_reason":"end_turn"')
+  })
+
+  it('name 晚于 id 到达 → name 到齐后才发 start，且此前累积的 arguments 不丢', () => {
+    const a = createAnthropicSSEAccumulator()
+    // 第 1 帧：只有 id + 首片 args（name 缺失）
+    openAIChunkToAnthropicSSE(
+      toolDeltaChunk([{ index: 0, id: 'call_1', type: 'function', function: { arguments: '{"cmd":' } }]),
+      a,
+    )
+    // 第 2 帧：name 到齐 + 后续 args
+    const out = openAIChunkToAnthropicSSE(
+      toolDeltaChunk([{ index: 0, type: 'function', function: { name: 'exec', arguments: '"ls"}' } }]),
+      a,
+    )
+    expect(out).toContain('event: content_block_start')
+    expect(out).toContain('"name":"exec"')
+    // 首片 + 后续片拼接后必须是完整 JSON（旧实现会把首片吞掉）
+    expect(anthropicToolArgDeltas(out).join('')).toBe('{"cmd":"ls"}')
+  })
+
+  it('单帧 name+args → arguments 作为 input_json_delta 发出（修旧实现漏发首片）', () => {
+    const a = createAnthropicSSEAccumulator()
+    const out = openAIChunkToAnthropicSSE(
+      toolDeltaChunk([{ index: 0, id: 'c1', type: 'function', function: { name: 'exec', arguments: '{"a":1}' } }]),
+      a,
+    )
+    expect(out).toContain('"name":"exec"')
+    expect(anthropicToolArgDeltas(out).join('')).toBe('{"a":1}')
+  })
+
+  it('正常多帧 tool_call → start/stop 齐全，stop_reason=tool_use（不误伤）', () => {
+    const a = createAnthropicSSEAccumulator()
+    openAIChunkToAnthropicSSE(
+      toolDeltaChunk([{ index: 0, id: 'c1', type: 'function', function: { name: 'exec', arguments: '' } }]),
+      a,
+    )
+    openAIChunkToAnthropicSSE(toolDeltaChunk([{ index: 0, type: 'function', function: { arguments: '{"a"' } }]), a)
+    openAIChunkToAnthropicSSE(toolDeltaChunk([{ index: 0, type: 'function', function: { arguments: ':1}' } }]), a)
+    const last = openAIChunkToAnthropicSSE(finishChunk('tool_calls'), a)
+    expect(last).toContain('event: content_block_stop')
+    expect(last).toContain('"stop_reason":"tool_use"')
+  })
+})
+
+describe('aggregateOpenAIToAnthropic：畸形 tool_call 清洗', () => {
+  it('空名 tool_call 被丢弃，stop_reason 从 tool_use 降级为 end_turn', () => {
+    const resp = aggregateOpenAIToAnthropic([
+      toolDeltaChunk([{ index: 0, id: 'a1', type: 'function', function: { name: '', arguments: '{}' } }]),
+      finishChunk('tool_calls'),
+    ])
+    const content = resp['content'] as Array<Record<string, unknown>>
+    expect(content.some((b) => b['type'] === 'tool_use')).toBe(false)
+    expect(resp['stop_reason']).toBe('end_turn')
+  })
+
+  it('缺 id 的 tool_call 补兜底 id（toolu_ 前缀）', () => {
+    const resp = aggregateOpenAIToAnthropic([
+      toolDeltaChunk([{ index: 0, type: 'function', function: { name: 'exec', arguments: '{"a":1}' } }]),
+      finishChunk('tool_calls'),
+    ])
+    const content = resp['content'] as Array<Record<string, unknown>>
+    const tu = content.find((b) => b['type'] === 'tool_use') as Record<string, unknown>
+    expect(String(tu['id'])).toMatch(/^toolu_/)
+    expect(tu['name']).toBe('exec')
+    expect(resp['stop_reason']).toBe('tool_use')
+  })
+
+  it('正常 tool_call 保留且 stop_reason=tool_use（不误伤）', () => {
+    const resp = aggregateOpenAIToAnthropic([
+      toolDeltaChunk([{ index: 0, id: 'c1', type: 'function', function: { name: 'exec', arguments: '{"a":1}' } }]),
+      finishChunk('tool_calls'),
+    ])
+    expect(resp['stop_reason']).toBe('tool_use')
+    const content = resp['content'] as Array<Record<string, unknown>>
+    expect(content.filter((b) => b['type'] === 'tool_use')).toHaveLength(1)
   })
 })
