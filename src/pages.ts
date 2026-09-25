@@ -1402,7 +1402,8 @@ function testNewAKey(btn) {
   const apiType = document.getElementById('afmt').value
   const tr = btn.parentElement.querySelector('.trt') || document.getElementById('atestR')
   showSpinner(tr)
-  testKeyConnection(url, apiType, k, providerId).then(function(result) {
+  // 新建表单的测试按钮同样要模型列表来渲染模型网格
+  testKeyConnection(url, apiType, k, providerId, 'fetchModels').then(function(result) {
     if (result.success) {
       document.getElementById('amcl').innerHTML = renderModelGrid(extractModels(result.data), null, providerId)
       document.getElementById('amc').classList.remove('hd')
@@ -2941,7 +2942,8 @@ async function testKeyRow(id, idx) {
   // UX6：结果写入该 Key 行自己的结果区，多个 Key 并发测试互不覆盖
   const tr = document.getElementById('ktr-' + id + '-' + idx) || document.getElementById('tr-' + id)
   showSpinner(tr)
-  const result = await testKeyConnection(url, apiType, k, id)
+  // 「测试密钥」按钮：opencode 走单 key 推理诊断（intent=diagnose），其余提供商忽略该参数
+  const result = await testKeyConnection(url, apiType, k, id, 'diagnose')
   showResult(tr, result.success, result.success ? '' : (result.message && result.message.indexOf('HTTP') !== -1 ? result.message : 'HTTP ' + result.status + (result.message ? ': ' + result.message : '')))
   if (result.success) {
     showEditModelsList(id, extractModels(result.data))
@@ -2960,7 +2962,8 @@ async function fetchEditModels(id) {
   const apiType = document.getElementById('at-' + id).value
   const tr = document.getElementById('tr-' + id)
   showSpinner(tr)
-  const result = await testKeyConnection(url, apiType, apiKey, id)
+  // 「获取模型」按钮：要的是模型列表（intent=fetchModels），与 key 可用性无关
+  const result = await testKeyConnection(url, apiType, apiKey, id, 'fetchModels')
   // UX7：showResult 内部已转义，不再二次转义
   showResult(tr, result.success, result.success ? '' : (result.message || '获取模型失败'))
   if (result.success) {

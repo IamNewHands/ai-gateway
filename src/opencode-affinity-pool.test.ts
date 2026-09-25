@@ -3,10 +3,12 @@ import {
   __resetOpenCodeKeyHealthForTests,
   applyOpenCodeReasoningEffort,
   canonicalOpenCodeSessionId,
+  diagnoseOpenCodeKey,
   openCodeAffinitySignal,
   proxyOpenCodeRequest,
   testOpenCodeKey,
 } from './opencode'
+import { openCodeTestIntent } from './admin'
 
 /**
  * 第二批移植（opencode2api → ai-gateway OpenCode 提供商）的回归测试：
@@ -350,5 +352,87 @@ describe('P1-3 testOpenCodeKey 单 key 诊断分类', () => {
     const { fetcher, calls } = makeFetcher(() => jsonResponse(401, { error: { message: 'Invalid API key.' } }))
     await call(fetcher)
     expect(calls.length).toBe(1)
+  })
+})
+
+describe('openCodeTestIntent：/admin/api/test-key 的意图路由', () => {
+  it('缺省 / 未带 key → fetchModels（模型列表，不能被诊断顶掉）', () => {
+    expect(openCodeTestIntent(undefined, 'k')).toBe('fetchModels')
+    expect(openCodeTestIntent('fetchModels', 'k')).toBe('fetchModels')
+    expect(openCodeTestIntent('diagnose', '')).toBe('fetchModels')
+    expect(openCodeTestIntent('whatever', 'k')).toBe('fetchModels')
+  })
+
+  it('显式 diagnose + 有 key → diagnose', () => {
+    expect(openCodeTestIntent('diagnose', 'k')).toBe('diagnose')
+  })
+})
+
+describe('diagnoseOpenCodeKey：先拉实时列表再探测', () => {
+  const MODELS_URL = BASE + '/models'
+  const CHAT_URL = BASE + '/chat/completions'
+  const modelList = (ids: string[]) => jsonResponse(200, { object: 'list', data: ids.map((id) => ({ id })) })
+  const UNAVAILABLE = { error: { type: 'server_error', message: 'Upstream request failed: Model is unavailable.' } }
+
+  it('从实时列表挑 big-pickle 探测（不信任配置里可能已下架的模型）', async () => {
+    const seen: string[] = []
+    const fetcher = (async (url: string | URL | Request, init?: RequestInit) => {
+      const u = String(url)
+      seen.push(`${init?.method ?? 'GET'} ${u}`)
+      if (u === MODELS_URL) return modelList(['deepseek-v4-flash-free', 'mimo-v2.5-free', 'big-pickle'])
+      return sseResponse(DONE_FRAMES)
+    }) as unknown as typeof fetch
+    const diag = await diagnoseOpenCodeKey(BASE, 'key-aaaa', undefined, fetcher)
+    expect(diag.status).toBe('usable')
+    expect(diag.model).toBe('big-pickle')
+    expect(seen[0]).toBe(`GET ${MODELS_URL}`)
+    expect(seen[1]).toBe(`POST ${CHAT_URL}`)
+    expect(diag.models).toContain('mimo-v2.5-free')
+  })
+
+  it('首选模型「不可用」时自动换下一个候选（不再误报 key 故障）', async () => {
+    let chatCalls = 0
+    const fetcher = (async (url: string | URL | Request) => {
+      const u = String(url)
+      if (u === MODELS_URL) return modelList(['big-pickle', 'mimo-v2.5-free'])
+      chatCalls++
+      return chatCalls === 1 ? jsonResponse(400, UNAVAILABLE) : sseResponse(DONE_FRAMES)
+    }) as unknown as typeof fetch
+    const diag = await diagnoseOpenCodeKey(BASE, 'key-aaaa', undefined, fetcher)
+    expect(diag.status).toBe('usable')
+    expect(diag.model).toBe('mimo-v2.5-free')
+    expect(diag.attempted).toBe(2)
+  })
+
+  it('候选全部不可用 → request_error 且带出实际探测的模型', async () => {
+    const fetcher = (async (url: string | URL | Request) =>
+      String(url) === MODELS_URL ? modelList(['big-pickle']) : jsonResponse(400, UNAVAILABLE)) as unknown as typeof fetch
+    const diag = await diagnoseOpenCodeKey(BASE, 'key-aaaa', undefined, fetcher)
+    expect(diag.status).toBe('request_error')
+    expect(diag.model).toBe('big-pickle')
+    expect(diag.message).toContain('Model is unavailable')
+  })
+
+  it('key 被拒（列表 401）→ rejected，且只打官方地址不回退镜像', async () => {
+    const urls: string[] = []
+    const fetcher = (async (url: string | URL | Request) => {
+      urls.push(String(url))
+      return jsonResponse(401, { error: { message: 'Invalid API key.' } })
+    }) as unknown as typeof fetch
+    const diag = await diagnoseOpenCodeKey(BASE, 'bad-key', undefined, fetcher)
+    expect(diag.status).toBe('rejected')
+    expect(diag.message).toContain('模型列表获取失败')
+    expect(urls.every((u) => u.startsWith(BASE))).toBe(true)
+  })
+
+  it('显式指定模型时跳过列表拉取，只发一次推理请求', async () => {
+    const urls: string[] = []
+    const fetcher = (async (url: string | URL | Request) => {
+      urls.push(String(url))
+      return sseResponse(DONE_FRAMES)
+    }) as unknown as typeof fetch
+    const diag = await diagnoseOpenCodeKey(BASE, 'key-aaaa', 'big-pickle', fetcher)
+    expect(diag.status).toBe('usable')
+    expect(urls).toEqual([CHAT_URL])
   })
 })

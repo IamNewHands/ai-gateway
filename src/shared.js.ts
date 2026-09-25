@@ -52,12 +52,13 @@ function showResult(el, success, msg) {
 }
 
 // ── API 请求函数 ──
-async function testKeyConnection(url, apiType, key, providerId) {
+// intent: 'fetchModels'（要模型列表，缺省）| 'diagnose'（要单 key 推理诊断，opencode 专属）
+async function testKeyConnection(url, apiType, key, providerId, intent) {
   try {
     var r = await fetch('/admin/api/test-key', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ url: url, apiKey: key, apiType: apiType, providerId: providerId })
+      body: JSON.stringify({ url: url, apiKey: key, apiType: apiType, providerId: providerId, intent: intent })
     })
     var d = await r.json()
     if (d.success && d.data) {

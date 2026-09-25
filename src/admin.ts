@@ -28,7 +28,7 @@ import { testModelConnection } from './proxy'
 import { probeMcpServers } from './mcp-gateway'
 import { MAX_ADMIN_REQUEST_BYTES, readOptionalJSONLimited, readStrictJSONLimited } from './request-body'
 import { isTraeProvider, testTraeCredential, testTraeModel } from './trae/proxy'
-import { fetchOpenCodeModels, isOpenCodeProvider, resolveOpenCodeUrls, testOpenCodeKey, testOpenCodeModel } from './opencode'
+import { diagnoseOpenCodeKey, fetchOpenCodeModels, isOpenCodeProvider, resolveOpenCodeUrls, testOpenCodeModel } from './opencode'
 import { isQoderProvider, fetchQoderModels } from './qoder/proxy'
 import { isClineProvider, fetchClineModels, fetchClineRecommendedModels, testClineChat, testClineRefreshToken, startClineOAuth, pollClineOAuth } from './cline/proxy'
 import { isGeminiProvider, testGeminiModel, GEMINI_MODELS } from './gemini/proxy'
@@ -229,6 +229,18 @@ function normalizeReasoningEffortByModel(value: unknown): Record<string, string>
     if (model && normalized) out[model] = normalized
   }
   return Object.keys(out).length > 0 ? out : undefined
+}
+
+/**
+ * opencode 的 `/admin/api/test-key` 意图判定：只有显式 `intent='diagnose'` 且带了 key
+ * 才跑单 key 推理诊断；其余（含缺省）一律返回模型列表。
+ *
+ * 为什么要有这个开关：「获取模型」按钮与新建表单的测试都依赖**模型列表**（前端用
+ * `result.data` 渲染模型网格），如果被诊断逻辑顶掉，按钮会既拿不到列表、又因探测用的
+ * 模型可能已下架而报错（2026-09-24 回归）。
+ */
+export function openCodeTestIntent(intent: unknown, apiKey: string): 'fetchModels' | 'diagnose' {
+  return intent === 'diagnose' && apiKey ? 'diagnose' : 'fetchModels'
 }
 
 export async function handleCreateProvider(c: Context<AppEnv>) {
@@ -714,13 +726,15 @@ export async function handleTestModel(c: Context<AppEnv>) {
 // ===== Key / 模型连通性测试（通过服务端代理，避免 CORS） =====
 
 export async function handleTestKeyNew(c: Context<AppEnv>) {
-  const { url, apiKey, apiType, providerId, model } = await readStrictJSONLimited<{
+  const { url, apiKey, apiType, providerId, model, intent } = await readStrictJSONLimited<{
     url: string
     apiKey: string
     apiType?: string
     providerId?: string
-    /** 单 key 诊断（opencode）用的模型 ID；缺省取该提供商首个启用模型 */
+    /** 单 key 诊断（opencode）用的模型 ID；缺省从上游实时模型列表里挑免费档模型 */
     model?: string
+    /** 'fetchModels'（缺省）要模型列表；'diagnose' 要单 key 推理诊断（opencode 专属） */
+    intent?: string
   }>(c.req.raw, MAX_ADMIN_REQUEST_BYTES)
   // CNB 免 Key：允许无 apiKey，由 providerId 判定
   let cnbProvider: Provider | null = null
@@ -747,9 +761,13 @@ export async function handleTestKeyNew(c: Context<AppEnv>) {
 
   if (providerId && isOpenCodeProvider(providerId)) {
     const mirrors = resolveOpenCodeUrls(c.env)
-    // 没填 key 时检查是否配了镜像，避免迷惑性报错
-    if (!apiKey) {
-      if (mirrors.length === 0) {
+    // 同一端点被两个按钮复用，靠 intent 区分：
+    //  - 'fetchModels'（「获取模型」按钮 / 新建表单的测试）：要模型列表，与 key 可用性无关
+    //  - 'diagnose'（编辑表单的「测试密钥」）：要单 key 推理诊断
+    // 缺省按 fetchModels 处理，保证未显式声明的调用方行为不变。
+    if (openCodeTestIntent(intent, apiKey) === 'fetchModels') {
+      // 没填 key 时检查是否配了镜像，避免迷惑性报错
+      if (!apiKey && mirrors.length === 0) {
         return c.json<ApiResponse>({
           success: true,
           data: { success: false, statusCode: 0, message: '请先填写 API Key 或配置 OPENCODE_MIRRORS_URL 环境变量' },
@@ -766,19 +784,19 @@ export async function handleTestKeyNew(c: Context<AppEnv>) {
         },
       })
     }
-    // P1-3 单 key 诊断：钉住这一个 key 发一次整形后的最小推理请求并分类，
-    // 能区分「key 无效」/「被限流」/「免费档拒绝」/「模型不可用」，
-    // 比只拉模型列表更有信息量（对齐 opencode2api /api/debug/inference 的 selected-key 判定）。
-    const provider = await getProvider(c.env, providerId)
-    const diagModel = model || provider?.models.find((m) => m.enabled)?.id || ''
-    const diag = await testOpenCodeKey(url, apiKey, diagModel)
+    // P1-3 单 key 诊断：先用该 key 直连官方拉实时模型列表，再拿列表里的免费档模型
+    // 发一次最小推理请求并分类。**不能用后台配置里存的模型**——配置可能停留在已下架的
+    // id 上，会把「模型下架」误报成「key 有问题」。
+    const diag = await diagnoseOpenCodeKey(url, apiKey, model)
     return c.json<ApiResponse>({
       success: true,
       data: {
         success: diag.status === 'usable',
         statusCode: diag.httpStatus || 0,
-        message: `[${diag.status}] ${diag.message}（${diag.latencyMs}ms）`,
+        message: `[${diag.status}]${diag.model ? ` (model=${diag.model})` : ''} ${diag.message}（${diag.latencyMs}ms）`,
         keyStatus: diag.status,
+        // 顺带把拉到的模型列表回给前端，测试密钥时也能刷新模型网格（与旧行为一致）
+        data: diag.models ? { data: diag.models.map((id) => ({ id })) } : undefined,
       },
     })
   }

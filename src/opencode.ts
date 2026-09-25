@@ -1259,6 +1259,70 @@ export async function testOpenCodeKey(
   return { status: 'request_error', ...base }
 }
 
+/** 上游「模型不可用」的报文特征：模型已下架，不是 key 的问题 */
+const MODEL_UNAVAILABLE_PATTERN = /model is unavailable|not supported|is not available/i
+
+export interface OpenCodeKeyDiagnosis extends OpenCodeKeyTestResult {
+  /** 实际用于探测的模型 */
+  model?: string
+  /** 已尝试的候选模型数 */
+  attempted?: number
+  /** 探测期间拿到的上游模型列表（供后台同时刷新模型网格） */
+  models?: string[]
+}
+
+/**
+ * 单 key 完整诊断（后台「测试密钥」按钮）：
+ *
+ * 1. 先用该 key 直连官方地址拉一次上游模型列表——这一步与具体模型无关，
+ *    能直接判出 key 是否被拒（401）。**故意不走镜像**：镜像用 public 凭据，
+ *    会掩盖坏 key。
+ * 2. 从**实时列表**里挑免费档模型（优先 big-pickle，其次 `-free`）发最小推理请求。
+ *    不能用后台配置里存的模型：配置可能停留在已下架的 id 上，会把
+ *    「模型下架」误报成「key 有问题」（这正是 2026-09-24 的实际故障）。
+ * 3. 命中「模型不可用」时换下一个候选（最多 3 个）。
+ */
+export async function diagnoseOpenCodeKey(
+  baseUrl: string,
+  apiKey: string,
+  explicitModel?: string,
+  fetcher?: typeof fetch,
+): Promise<OpenCodeKeyDiagnosis> {
+  const f = fetcher ?? fetch
+  if (explicitModel) {
+    return { ...(await testOpenCodeKey(baseUrl, apiKey, explicitModel, f)), model: explicitModel, attempted: 1 }
+  }
+  const listed = await fetchOpenCodeModels(baseUrl, [{ key: apiKey, enabled: true }], [], f)
+  const ids = listed.success
+    ? (((listed.data as { data?: Array<{ id?: unknown }> } | undefined)?.data) ?? [])
+        .map((m) => m.id)
+        .filter((id): id is string => typeof id === 'string' && id !== '')
+    : []
+  if (ids.length === 0) {
+    // 连模型列表都拿不到：按状态码给结论（401 = key 被拒 / 429 = 限流 / 5xx = 上游故障）
+    const status = listed.statusCode ?? 0
+    const mapped: OpenCodeKeyStatus = status === 401 ? 'rejected'
+      : status === 429 ? 'rate_limited'
+        : status >= 500 ? 'upstream_error'
+          : 'request_error'
+    return { status: mapped, message: `模型列表获取失败：${listed.message}`, httpStatus: status, latencyMs: 0, attempted: 0 }
+  }
+  const ordered = [
+    ...ids.filter((id) => id === 'big-pickle'),
+    ...ids.filter((id) => id !== 'big-pickle' && id.endsWith('-free')),
+    ...ids.filter((id) => id !== 'big-pickle' && !id.endsWith('-free')),
+  ].slice(0, 3)
+
+  let last: OpenCodeKeyDiagnosis | null = null
+  for (let i = 0; i < ordered.length; i++) {
+    const model = ordered[i]
+    const result = await testOpenCodeKey(baseUrl, apiKey, model, f)
+    last = { ...result, model, attempted: i + 1, models: ids }
+    if (!(result.status === 'request_error' && MODEL_UNAVAILABLE_PATTERN.test(result.message))) return last
+  }
+  return last ?? { status: 'unavailable', message: '上游未返回任何可探测的模型', latencyMs: 0, models: ids }
+}
+
 export async function fetchOpenCodeModels(
   baseUrl: string,
   apiKeys: ApiKeyEntry[],
