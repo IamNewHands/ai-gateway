@@ -188,6 +188,12 @@ export function prepareBody(src: string): string {
     for (const mi of obj['messages']) {
       const m: Record<string, any> | null = mi && typeof mi === 'object' ? mi : null
       if (!m) continue
+      // 上游 SOLO 的角色白名单只有 system/assistant/user/tool/function：
+      // OpenAI 新式客户端（DSH / Codex 等）用 developer 承载系统提示词，原样透传会被上游
+      // 以 4027 invalid_parameter_error（"developer is not one of [...]"）整请求拒绝。
+      // 与 WorkBuddy 通路 sanitizeUpstreamBody 的 developer→system 归一化保持同一口径。
+      if (m['role'] === 'developer') m['role'] = 'system'
+
       const content = m['content']
       const role = typeof m['role'] === 'string' ? m['role'] : ''
 

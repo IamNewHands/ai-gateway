@@ -124,3 +124,27 @@ describe('prepareBody 回归：历史/工具预算接线后仍产出合法 SOLO 
     expect(Array.isArray(parsed.messages)).toBe(true)
   })
 })
+
+describe('prepareBody：上游角色白名单归一化（SOLO 只认 system/assistant/user/tool/function）', () => {
+  it('developer → system（DSH / Codex 等客户端用 developer 承载系统提示词）', () => {
+    const body = { model: 'glm-5.2', messages: [msg('developer', 'sys prompt'), msg('user', 'hi')] }
+    const parsed = JSON.parse(prepareBody(JSON.stringify(body)))
+    // 4027 回归：上游对 developer 直接整请求拒绝（invalid_parameter_error）
+    expect(parsed.messages.map((m: { role: string }) => m.role)).toEqual(['system', 'user'])
+  })
+
+  it('白名单内角色原样保留（system/user/assistant/tool 不被改写）', () => {
+    const body = {
+      model: 'glm-5.2',
+      messages: [
+        msg('system', 's'),
+        msg('user', 'u'),
+        { role: 'assistant', content: null, tool_calls: [{ id: 'c1', function: { name: 'read', arguments: '{}' } }] },
+        { role: 'tool', tool_call_id: 'c1', content: 'x' },
+        msg('developer', 'd'),
+      ],
+    }
+    const parsed = JSON.parse(prepareBody(JSON.stringify(body)))
+    expect(parsed.messages.map((m: { role: string }) => m.role)).toEqual(['system', 'user', 'assistant', 'tool', 'system'])
+  })
+})
