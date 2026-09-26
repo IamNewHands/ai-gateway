@@ -11,6 +11,7 @@ export type TraeErrKind =
   | 'not_found'   // 404 → 短冷却 60s 不累计 errCount
   | 'server'      // 5xx
   | 'client'      // 其他 4xx
+  | 'client_params' // 请求侧参数错（4027 invalid_parameter_error 等）：不罚号、不轮转，4xx 终态透传
   | 'transport'   // 网络/连接中断（建连超时、客户端掐断等），与账号健康无关，不惩罚账号
 
 /** 归一化后的账号凭证（持久化为 JSON 存在 provider.apiKeys 中，每个 key 一行一个账号） */

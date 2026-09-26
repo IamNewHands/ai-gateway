@@ -14,7 +14,7 @@ import type { Env, Provider } from '../types'
 import { withSSEKeepAlive } from '../opencode'
 import { getPerfSettings } from '../perf'
 import { TRAE_DEFAULT_MODEL, TRAE_KEEPALIVE_MS, TRAE_RAW_MAX_HISTORY_CHARS, TRAE_RAW_MAX_MESSAGES, TRAE_RAW_MAX_TOOL_SCHEMA_CHARS, TRAE_STATIC_MODEL_IDS, TRAE_STREAM_IDLE_TIMEOUT_MS, TRAE_WORK_CONSTANTS, isWorkModel, normalizeTraeModelName } from './constants'
-import { chatStream, chatWorkStream, exchangeToken, extractLastUserPrompt, needsTraeRefresh, parseAuth, probeTraeCredits } from './upstream'
+import { chatStream, chatWorkStream, exchangeToken, extractLastUserPrompt, isTraeRequestSideError, needsTraeRefresh, parseAuth, probeTraeCredits } from './upstream'
 import { isRemoteOnlyModel, type HistoryBudget } from './payload'
 import { aggregateSoloSse, aggregateWorkSse, soloStreamToOpenAIStream, workStreamToOpenAIStream } from './sse'
 import type { SOLOStreamError } from './types'
@@ -223,6 +223,33 @@ function openaiError(status: number, code: string, message: string): Response {
   })
 }
 
+/**
+ * 请求侧参数错的 OpenAI 兼容 4xx 终态。
+ *
+ * 与 openaiError 分开的理由有两条，都不能省：
+ *  1. `type` 必须是 invalid_request_error —— 客户端据此区分「我发的 body 有问题」与
+ *     「网关/上游故障」，前者重试无用；
+ *  2. 状态码必须原样回 4xx —— 不能退化成 503「账号池无可用账号」。把请求侧问题伪装成
+ *     账号问题正是本层要修的误导（用户看到 503 会去查账号池，而账号池是健康的）。
+ *
+ * 上游原文截断 + 剥离控制字符后透传（对齐本仓脱敏口径；错误原因要可诊断）。
+ */
+function traeClientParamsError(detail: string, httpStatus = 400): Response {
+  const status = httpStatus >= 400 && httpStatus < 500 ? httpStatus : 400
+  const text = String(detail || '').replace(/[\u0000-\u001f\u007f]/g, ' ').trim().substring(0, 300)
+  return new Response(JSON.stringify({
+    error: {
+      message: '请求参数被上游拒绝（同一 body 换任何账号都会撞同一校验，已停止轮转）'
+        + (text ? '：' + text : ''),
+      type: 'invalid_request_error',
+      code: 'client_params',
+    },
+  }), {
+    status,
+    headers: { 'Content-Type': 'application/json; charset=utf-8' },
+  })
+}
+
 /** HTTP 错误分类 → 冷却状态机（Go chatCompletions status >= 400 分支）。 */
 async function applyChatError(env: Env, providerId: string, uid: string, kind: string, cd: TraeCooldownConfig): Promise<void> {
   switch (kind) {
@@ -243,18 +270,29 @@ async function applyChatError(env: Env, providerId: string, uid: string, kind: s
       // 网络/连接中断（建连超时、客户端掐断等）与账号健康无关：
       // 不冷却、不累计 errCount，避免一次网络抖动把整个账号池刷成 no_healthy_account。
       break
+    case 'client_params':
+      // 请求侧参数错（4027 invalid_parameter_error 等）：**不罚号**。
+      // 同一 body 换任何账号都会撞同一个参数校验，罚号只会把健康的池刷成不可用
+      // （这正是「界面全绿却报无可用账号」的成因之一）。终态出口由调用方负责。
+      break
     default:
       await noteTraeError(env, providerId, uid, cd.errThreshold, cd.errMs)
   }
 }
 
-/** 流内业务错误 → 冷却状态机（Go handleStreamError：1005 plan → 长冷却；其余累计错误）。 */
-async function applyStreamError(env: Env, providerId: string, uid: string, se: SOLOStreamError, cd: TraeCooldownConfig): Promise<void> {
+/**
+ * 流内业务错误 → 冷却状态机（Go handleStreamError：1005 plan → 长冷却；其余累计错误）。
+ *
+ * @returns true = 请求侧错误：**不罚号**，调用方须走 4xx 终态且不轮转。
+ */
+async function applyStreamError(env: Env, providerId: string, uid: string, se: SOLOStreamError, cd: TraeCooldownConfig): Promise<boolean> {
+  if (isTraeRequestSideError(se.code, se.msg)) return true
   if (se.code === 1005) {
     await cooldownTraeAccount(env, providerId, uid, cd.planMs, 'plan 权益不足')
   } else {
     await noteTraeError(env, providerId, uid, cd.errThreshold, cd.errMs)
   }
+  return false
 }
 
 /**
@@ -506,6 +544,12 @@ export async function proxyTraeChatRequest(
       await applyChatError(env, provider.id, account.uid, kind, cd)
       await releaseTraeSession(env, provider.id, account.uid).catch(() => {})
 
+      // 请求侧参数错是**本请求的终态**：同一 body 换任何账号都会撞同一校验，继续轮转
+      // 只会白扔健康号配额，且最终被误报成 503「账号池无可用账号」（账号其实是好的）。
+      if (kind === 'client_params') {
+        return traeClientParamsError((e as any).msg || (e as Error).message || '', (e as any).status || 400)
+      }
+
       // 核心容灾降级：若 SOLO 通道因额度耗尽（4008/1005 plan_limit）或限流（429 soft_rate）失败，且无自定义 tools，自动切换到 Work 通道！
       if ((kind === 'plan_limit' || kind === 'soft_rate') && !hasTools) {
         const fallbackResp = await executeWorkRequest(env, provider, body, configName, prompt, stream)
@@ -523,6 +567,8 @@ export async function proxyTraeChatRequest(
       // 流内业务错误（1005 plan/5xx 等）→ 冷却账号，错误信息注入 SSE
       // 记录最后一次 solo 错误，结束日志带上真实错误码（否则日志只见 end=complete，真因被掩盖）
       let lastSoloErr: SOLOStreamError | null = null
+      // 请求侧错误（4027 等）由 applyStreamError 内部判定为「不罚号」：流已开、状态码改不了，
+      // 客户端由 sse.ts 的标准 error 帧获知（帧里有 code/msg），这里只保证不误伤账号。
       const onErr = (se: SOLOStreamError) => { lastSoloErr = se; void applyStreamError(env, provider.id, account.uid, se, cd) }
       // 包 SSE 心跳 + idle 兜底：思考模型静默期客户端会因无事件 idle 超时判定流结束
       //（实测 ~15-20s 自动截断），`: keep-alive\n\n` 注释行重置客户端计时器；上游
@@ -566,8 +612,12 @@ export async function proxyTraeChatRequest(
     const agg = aggregateSoloSse(text)
     if (agg.err) {
       lastErr = new Error(`solo stream error code=${agg.err.code} msg=${agg.err.msg}`)
-      await applyStreamError(env, provider.id, account.uid, agg.err, cd)
+      const requestSide = await applyStreamError(env, provider.id, account.uid, agg.err, cd)
       await releaseTraeSession(env, provider.id, account.uid).catch(() => {})
+      // 请求侧参数错 → 4xx 终态，不轮转（同 HTTP 路径；避免被误报成 503 账号池无可用账号）
+      if (requestSide) {
+        return traeClientParamsError(`solo error code=${agg.err.code} msg=${agg.err.msg}`)
+      }
       // 聚合发现 1005 或 4008 额度不足，自动尝试 Work 通道
       if ((agg.err.code === 1005 || agg.err.code === 4008) && !hasTools) {
         const fallbackResp = await executeWorkRequest(env, provider, body, configName, prompt, stream)

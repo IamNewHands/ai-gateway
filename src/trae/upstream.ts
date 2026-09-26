@@ -10,6 +10,24 @@ import type { TraeAccount, TraeCreditsSnapshot, TraeEntPackInfo, TraeEntUsageDet
 
 const sessionDeadMarkers = ['login', 'token 失效', 'token invalid', 'session', 'unauthorized', '401']
 
+/**
+ * 是否为**请求侧**错误（同一 body 换任何账号都会撞同一个校验）。
+ *
+ * 判据（对齐 WorkBuddy 通路 bad_params / prompt_too_long / image_invalid 的哲学：
+ * 请求的问题不是账号的问题——轮转只会白扔健康号配额，罚号更会把整个池刷成不可用）：
+ *  - SOLO 业务码 4027：上游参数校验失败（实测 `developer` 角色被拒时返回
+ *    `tool call failed: invalid_parameter_error:developer is not one of [...]`）；
+ *  - 文案含 `invalid_parameter` / `invalid parameter`（HTTP 形态的同类错误）。
+ *
+ * **刻意只认这两条**：账号级故障（1005 plan / 4008 配额 / 401 session / 429 限流 / 5xx）
+ * 全部不命中，罚号与轮转语义保持不变。
+ */
+export function isTraeRequestSideError(code: number, msg: string): boolean {
+  if (code === 4027) return true
+  const lower = String(msg || '').toLowerCase()
+  return lower.includes('invalid_parameter') || lower.includes('invalid parameter')
+}
+
 /** 按 HTTP 状态码 + body 判定错误类别。 */
 export function classifyTraeError(status: number, body: string): TraeErrKind {
   const lower = body.toLowerCase()
@@ -25,6 +43,10 @@ export function classifyTraeError(status: number, body: string): TraeErrKind {
   if (status === 429) return 'soft_rate'
   if (status === 404) return 'not_found'
   if (status >= 500) return 'server'
+  // 请求侧参数错（400 家族 + invalid_parameter 判据）：独立分类供调用方走「不罚号、不轮转」
+  // 的 4xx 终态出口。判在通用 client 兜底之前——两者的账号策略相同（都不罚号），
+  // 差别在出口：client_params 必须立即终止本请求，而不是继续换号重试。
+  if (status >= 400 && isTraeRequestSideError(status, body)) return 'client_params'
   if (status >= 400) return 'client'
   return 'none'
 }
