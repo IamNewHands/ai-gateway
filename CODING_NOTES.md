@@ -158,6 +158,36 @@ TRAE 相关问题前先读本节。**
 ——它们是被聚合层假 `stop` 掩盖的截断样本；给任何「兜底伪装」逻辑动刀前先修样本，
 否则会把正确的回归误判成 bug。
 
+### Cline 建连超时定责（2026-09-27，改 cline 转发/超时前必读）
+
+事故现象：用户报「重试延迟 543 毫秒」，失败原因是
+`500: {"message":"The operation was aborted","type":"api_error"}`。**543ms 是正常退避，不是故障**：
+DSH 的 retry policy 是 `initialDelayMs=500` + `jitterRatio=0.1`（`dsh-llm/lib/types/retry-policy.js:12-15`），
+第 1 次重试天然落在 450–550ms。真正的病在**单次尝试要烧 90 秒**。
+
+取证（DSH 会话记录 `session-f634b209`）：`step/start` → 91.0s → 183.5s → 292.0s → 385.1s，
+每次恰好 +92s，与 `OPENCODE_CONNECT_TIMEOUT_MS = 90000` 吻合。全仓该错误体唯一生产者是
+`cline/proxy.ts` 的 catch（AbortError 被原样包成 500）；DSH 把 "500" 归类 SERVER 并重试 5 次
+（`dsh-llm-pi-ai/lib/index.js:1372`），而退避上限只有 8s → 5 次重试 ≈ 7.5 分钟全撞同一个卡死的上游。
+
+修复（对齐 trae `fd301f9` 的定责口径）：
+
+- `clineFetch` 给建连/首字节失败打 `kind='transport'`（`ClineTransportError`），**不罚号**
+  （同 trae `applyChatError` 的 transport 分支纪律：一次网络抖动不该刷空账号池）
+- `proxyClineChatRequest` 的 catch 分流：transport → **503 `upstream_unreachable`**，
+  文案写明「账号未被惩罚，非账号池问题」；其余保持 500 `api_error`
+- `CLINE_CHAT_CONNECT_TIMEOUT_MS = 30_000`，经 `streamFetchWithTimeout` 的
+  `connectTimeoutMs` 显式传入（**不继承全局 90s**）。与 `TRAE_CHAT_CONNECT_TIMEOUT_MS` 一致，
+  单次失败成本 91s → 31s
+
+**有意的取舍（不要"顺手改回去"）**：
+
+- 只给**建连阶段**打 transport 标记。账号池问题（`未配置 Cline RefreshToken`、全账号冷却、
+  token 刷新失败）**不带标记**，出口不变 —— 把池问题伪装成网络故障是反向误导
+- 全局 `OPENCODE_CONNECT_TIMEOUT_MS` 保持 90s 不动：其它 provider（含长思考）依赖它，
+  cline 单独收紧，可回退面最小
+- 30s 是**可调常量**：若线上出现「30s 内合法未出首字节」的误杀，只改这一个值
+
 ### 已知缺口
 
 - ~~`/v1/responses`（Responses API）无 TRAE 分支~~ **已支持**：`handleResponses` 内加

@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
-import { parseCooldownMs, fetchClineModels, isRunawayReasoningCutoff, isDegenerateReasoningDeltas, isWhitespaceOnlyReasoningDelta, normalizeReasoningDeltaForUI, pumpStreamAttempt, sanitizeClineMessages, isFreeClineModel, clineModelFallbackChain, buildUpstreamBody, proxyClineChatRequest, __resetClineCatalogCacheForTests, CLINE_MAX_TOKENS, CLINE_FREE_WHITELIST, DEFAULT_MODEL } from './proxy'
+import { parseCooldownMs, fetchClineModels, isRunawayReasoningCutoff, isDegenerateReasoningDeltas, isWhitespaceOnlyReasoningDelta, normalizeReasoningDeltaForUI, pumpStreamAttempt, sanitizeClineMessages, isFreeClineModel, clineModelFallbackChain, buildUpstreamBody, proxyClineChatRequest, __resetClineCatalogCacheForTests, CLINE_MAX_TOKENS, CLINE_FREE_WHITELIST, CLINE_CHAT_CONNECT_TIMEOUT_MS, DEFAULT_MODEL } from './proxy'
 import type { Provider } from '../types'
 
 /** 读取一个 Response 的完整文本（用于流式结果断言）。 */
@@ -720,5 +720,151 @@ describe('上游流未发 finish_reason 的截断兜底（2026-09-25）', () => 
     const text = await readAll(resp)
     expect(text).toContain('"content":"hi"')
     expect(text).not.toContain('partial-think')
+  })
+})
+
+// 传输层定责（2026-09-27）：建连/首字节阶段失败此前被原样包成
+// `500 {"message":"The operation was aborted","type":"api_error"}`——无 code、无分类，
+// DSH 把 "500" 归成 SERVER 并按其 500ms 起步的退避白重试 5 次，而单次尝试要烧 90s
+// 建连超时（实测会话 f634b209：step/start → 91.0s → 183.5s → 292.0s → 385.1s）。
+// 现在按 trae 口径回 503 upstream_unreachable，并把 cline 建连超时收到 30s。
+describe('传输层故障定责（503 upstream_unreachable + 30s 建连超时）', () => {
+  it('建连抛错（网络/DNS/TLS）→ 503 upstream_unreachable，不报 500 api_error', async () => {
+    installFetch(() => { throw new Error('The operation was aborted') })
+    const resp = await proxyClineChatRequest(
+      undefined,
+      clineProvider([REFRESH_TOKEN]),
+      { model: DEFAULT_MODEL, messages: [{ role: 'user', content: 'hi' }] },
+      { stream: true },
+    )
+    expect(resp.status).toBe(503)
+    const data = (await resp.json()) as { error: { type: string; code: string; message: string } }
+    expect(data.error.code).toBe('upstream_unreachable')
+    expect(data.error.type).toBe('api_error')
+    // 文案必须点明「非账号池问题」——否则排查方向又会被引到账号上
+    expect(data.error.message).toContain('非账号池问题')
+    expect(data.error.message).toContain('The operation was aborted')
+  })
+
+  it('非流式路径同样定责 503（不因 wantStream 分支漏掉）', async () => {
+    installFetch(() => { throw new Error('The operation was aborted') })
+    const resp = await proxyClineChatRequest(
+      undefined,
+      clineProvider([REFRESH_TOKEN]),
+      { model: DEFAULT_MODEL, messages: [{ role: 'user', content: 'hi' }] },
+      { stream: false },
+    )
+    expect(resp.status).toBe(503)
+    const data = (await resp.json()) as { error: { code: string } }
+    expect(data.error.code).toBe('upstream_unreachable')
+  })
+
+  it('账号池故障（refreshToken 刷新全失败）保持 500，不被误报成传输故障', async () => {
+    // 账号存在但刷新 token 失败 → getAccessToken 抛「所有账号刷新 token 均失败」。
+    // 这类是池/鉴权问题，与「网关↔上游连不上」不同因，必须保持原 500 api_error 出口。
+    const fn = vi.fn(async (input: unknown) => {
+      const url = String(input)
+      if (url.includes('recommended-models')) return jsonResp({ recommended: [], free: [{ id: DEFAULT_MODEL }], clinePass: [] })
+      if (url.endsWith('/v1/models')) return jsonResp({ data: [] })
+      if (url.includes('/auth/refresh')) return jsonResp({ error: 'invalid_grant' }, 400)
+      throw new Error('unexpected url: ' + url)
+    })
+    vi.stubGlobal('fetch', fn)
+    const resp = await proxyClineChatRequest(
+      undefined,
+      clineProvider([REFRESH_TOKEN]),
+      { model: DEFAULT_MODEL, messages: [{ role: 'user', content: 'hi' }] },
+      { stream: true },
+    )
+    expect(resp.status).toBe(500)
+    const data = (await resp.json()) as { error: { type: string; code?: string; message: string } }
+    expect(data.error.type).toBe('api_error')
+    expect(data.error.code).toBeUndefined()
+    expect(data.error.message).not.toContain('upstream_unreachable')
+  })
+
+  it('账号池为空 → 502 upstream_unavailable（池问题不伪装成网络故障）', async () => {
+    installFetch(() => sseOkResp())
+    const resp = await proxyClineChatRequest(
+      undefined,
+      clineProvider([]),
+      { model: DEFAULT_MODEL, messages: [{ role: 'user', content: 'hi' }] },
+      { stream: true },
+    )
+    expect(resp.status).toBe(502)
+    const data = (await resp.json()) as { error: { type: string; code?: string } }
+    expect(data.error.type).toBe('upstream_unavailable')
+    expect(data.error.code).toBeUndefined()
+  })
+
+  it('建连超时常量为 30s（与 trae 通道一致，单次失败成本 91s → 31s）', () => {
+    expect(CLINE_CHAT_CONNECT_TIMEOUT_MS).toBe(30_000)
+  })
+
+  it('建连超时真的传给上游 fetch（signal 会在到点 abort）', async () => {    const seen: Array<AbortSignal | undefined> = []
+    const fn = vi.fn(async (input: unknown, init?: RequestInit) => {
+      const url = String(input)
+      if (url.includes('recommended-models')) return jsonResp({ recommended: [], free: [{ id: DEFAULT_MODEL }], clinePass: [] })
+      if (url.endsWith('/v1/models')) return jsonResp({ data: [] })
+      if (url.includes('/auth/refresh')) return jsonResp({ data: { accessToken: 'tok-1', expiresAt: Date.now() + 3_600_000 } })
+      if (url.includes('/chat/completions')) {
+        seen.push(init?.signal ?? undefined)
+        return sseOkResp()
+      }
+      throw new Error('unexpected url: ' + url)
+    })
+    vi.stubGlobal('fetch', fn)
+    const resp = await proxyClineChatRequest(
+      undefined,
+      clineProvider([REFRESH_TOKEN]),
+      { model: DEFAULT_MODEL, messages: [{ role: 'user', content: 'hi' }] },
+      { stream: true },
+    )
+    expect(resp.status).toBe(200)
+    await readAll(resp)
+    // streamFetchWithTimeout 用 AbortController 的 signal 传给 fetch；拿到响应头后已 clearTimeout，
+    // 故此处只断言 signal 存在且未被 abort（30s 未到）。
+    expect(seen).toHaveLength(1)
+    expect(seen[0]).toBeInstanceOf(AbortSignal)
+    expect(seen[0]!.aborted).toBe(false)
+  })
+
+  it('30s 到点真的 abort：上游挂死 31s → 503 upstream_unreachable（不是 90s）', async () => {
+    vi.useFakeTimers()
+    try {
+      // 上游永不返回响应头：fetch 只在 signal abort 时 reject——精确复现线上卡死形态。
+      const fn = vi.fn(async (input: unknown, init?: RequestInit) => {
+        const url = String(input)
+        if (url.includes('recommended-models')) return jsonResp({ recommended: [], free: [{ id: DEFAULT_MODEL }], clinePass: [] })
+        if (url.endsWith('/v1/models')) return jsonResp({ data: [] })
+        if (url.includes('/auth/refresh')) return jsonResp({ data: { accessToken: 'tok-1', expiresAt: Date.now() + 3_600_000 } })
+        if (url.includes('/chat/completions')) {
+          return await new Promise<Response>((_resolve, reject) => {
+            const signal = init?.signal
+            if (!signal) return
+            if (signal.aborted) return reject(new Error('The operation was aborted'))
+            signal.addEventListener('abort', () => reject(new Error('The operation was aborted')), { once: true })
+          })
+        }
+        throw new Error('unexpected url: ' + url)
+      })
+      vi.stubGlobal('fetch', fn)
+      const pending = proxyClineChatRequest(
+        undefined,
+        clineProvider([REFRESH_TOKEN]),
+        { model: DEFAULT_MODEL, messages: [{ role: 'user', content: 'hi' }] },
+        { stream: true },
+      )
+      // 推进到 29s：还没到点，请求仍挂起
+      await vi.advanceTimersByTimeAsync(29_000)
+      // 越过 30s 建连超时 → signal abort → fetch reject → 定责 503
+      await vi.advanceTimersByTimeAsync(2_000)
+      const resp = await pending
+      expect(resp.status).toBe(503)
+      const data = (await resp.json()) as { error: { code: string } }
+      expect(data.error.code).toBe('upstream_unreachable')
+    } finally {
+      vi.useRealTimers()
+    }
   })
 })

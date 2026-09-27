@@ -104,6 +104,38 @@ const CLINE_COOLDOWN_RUNAWAY_MS = 30 * 1000
  * 免费链会直接跳过它，不再空转打上游。
  */
 const CLINE_COOLDOWN_PLAN_MS = 12 * 3600 * 1000
+
+/**
+ * Cline chat 的建连/首字节超时（**cline 专属，不继承全局 OPENCODE_CONNECT_TIMEOUT_MS**）。
+ *
+ * 为什么从全局默认 90s 收到 30s（2026-09-27 定责，证据来自 DSH 会话记录）：
+ * 一次线上请求在 `/chat/completions` 上 90 秒不吐响应头，`streamFetchWithTimeout` 的
+ * 90s 定时器 abort → AbortError("The operation was aborted") 被本文件旧 catch 原样包成
+ * `500 {"message":"The operation was aborted","type":"api_error"}`（无 code、无分类）。
+ * DSH 把 "500" 归类成 SERVER 并按其退避策略重试 5 次（`dsh-llm-pi-ai/lib/index.js:1372`），
+ * 而退避上限只有 8s（`dsh-llm/lib/types/retry-policy.js:12-15`）——于是单次尝试烧 90s、
+ * 5 次重试 ≈ 7.5 分钟全撞同一个卡死的上游，用户看到的现象却是「重试延迟 543ms」（其实是
+ * 正常的 500ms×抖动，真病在 90s）。实测时序（会话 f634b209）：step/start → 91.0s → 183.5s
+ * → 292.0s → 385.1s，每次恰好 +92s，与 90s 建连超时吻合。
+ *
+ * 30s 与 trae 通道一致（`TRAE_CHAT_CONNECT_TIMEOUT_MS`，src/trae/constants.ts:75）：
+ * 把单次失败成本从 91s 压到 31s，同时保留思考模型首字节前的合理等待。
+ * **可调**：若线上出现「30s 内合法未出首字节」的误杀，改这一个常量即可。
+ */
+export const CLINE_CHAT_CONNECT_TIMEOUT_MS = 30_000
+
+/**
+ * 传输层故障标记（与 trae 同口径：`src/trae/upstream.ts:605-613` 给建连失败打 `kind='transport'`）。
+ *
+ * 只在**建连/首字节失败**处打标（DNS/TLS/连接被掐断/30s 超时 abort），
+ * 账号池问题（无 refreshToken、全账号冷却、token 刷新失败）**不带此标记**——
+ * 两者出口不同：传输类回 503 `upstream_unreachable`（可重试、不冤枉账号），
+ * 池类保持原 500，避免把「账号池不可用」伪装成「网络故障」。
+ */
+interface ClineTransportError extends Error {
+  kind?: 'transport'
+}
+
 /**
  * 上游对输出 token 的硬下限（移植 luawei1/cline2api 1184f91）。
  *
@@ -466,11 +498,23 @@ async function clineFetch(
     // item1：Cline 客户端指纹头，规避非官方客户端 403
     ...CLINE_FINGERPRINT_HEADERS,
   }
-  const resp = await streamFetchWithTimeout(CLINE_API_BASE + path, {
-    method: 'POST',
-    headers,
-    body: JSON.stringify(bodyObj),
-  })
+  // 建连/首字节阶段的失败（DNS/TLS/连接被掐断/CLINE_CHAT_CONNECT_TIMEOUT_MS 到点 abort）
+  // 与账号健康无关，打 transport 标记供上层定责；不在这里罚号（同 trae 的纪律：
+  // 一次网络抖动不该把整个账号池刷成 no_healthy_account）。
+  let resp: Response
+  try {
+    resp = await streamFetchWithTimeout(CLINE_API_BASE + path, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify(bodyObj),
+    }, { connectTimeoutMs: CLINE_CHAT_CONNECT_TIMEOUT_MS })
+  } catch (e) {
+    const err = new Error(
+      `cline transport error: ${(e as Error).message || String(e)}`
+    ) as ClineTransportError
+    err.kind = 'transport'
+    throw err
+  }
   // token 失效：标记当前账号冷却，强制重试（会用别的账号/刷新）
   if (resp.status === 401 && !retried) {
     if (pool.current) cooldownAccount(pool.current, CLINE_COOLDOWN_401_MS)
@@ -1193,6 +1237,21 @@ export async function proxyClineChatRequest(
       }
       return resp
     } catch (err) {
+      // 传输层故障（建连/首字节失败，见 clineFetch 的 ClineTransportError）→ 按 trae 口径定责：
+      // 503 `upstream_unreachable`，文案点明「账号未被惩罚，非账号池问题」。
+      // 用 503 而非 500：客户端（DSH/pi-ai）对 5xx 一样可重试，但 code 与文案把排查方向
+      // 从「账号池」引回「网关↔上游连接」——2026-09-27 那次用户正是被 500 api_error 引偏，
+      // 去查重试延迟而不是 90s 建连超时（trae 侧同类修复见 src/trae/proxy.ts:733-738）。
+      const transport = (err as ClineTransportError).kind === 'transport'
+      if (transport) {
+        return jsonResponse({
+          error: {
+            message: 'Cline 上游连接超时/中断（账号未被惩罚，非账号池问题）：' + ((err as Error).message || ''),
+            type: 'api_error',
+            code: 'upstream_unreachable',
+          },
+        }, 503)
+      }
       return jsonResponse({ error: { message: (err as Error).message || 'Cline 转发失败', type: 'api_error' } }, 500)
     }
   }
