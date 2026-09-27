@@ -23,6 +23,8 @@ const EMPTY_COOLDOWN_MS = 10 * 1000 // 空响应冷却 10s（原版 10–30s）
 const UNKNOWN_COOLDOWN_MS = 30 * 1000 // 未知错误冷却 30s（原版 10–30s）
 const IMAGE_LIMIT_COOLDOWN_MS = 24 * 60 * 60 * 1000 // 图片额度耗尽冷却 24h（同原版 MarkImageLimited）
 const METERING_COOLDOWN_MS = 15 * 60 * 1000 // 结构化 metering 节流固定冷却 15min（同原版 8-27）
+/** 传输类失败的新鲜度窗口：超过该窗口的传输类失败不再用于判定"全账号因本地网络故障不可用"（同原版 5min） */
+export const TRANSPORT_FAILURE_WINDOW_MS = 5 * 60 * 1000
 // 全局熔断器参数（同原版：30s 窗口内失败 ≥10 次且失败率 ≥50% → 熔断 30s）。
 // KV 落盘使其在跨实例/跨 DO 间共享，达到"全局"熔断语义。
 const BREAKER_WINDOW_MS = 30 * 1000
@@ -51,6 +53,14 @@ export interface AccountHealthState {
   allowance?: Record<string, number>
   /** 余量观测时间（Unix ms），0 表示无观测 */
   allowanceAt?: number
+  /**
+   * 最近一次失败是否属"本地/传输类"（DNS/TLS/连接/握手/代理），而非上游配额或鉴权拒绝。
+   * 移植自 M365-Copilot2API `accountHealth.LastCategory` + `IsTransportCategory`（issue #79）：
+   * 用于在全账号不可用时区分"查 DNS/代理"与"退避重试"，避免把本地网络故障伪装成 429 限流。
+   */
+  lastFailureTransport?: boolean
+  /** 上述传输类判定的观测时间（Unix ms），0 表示无观测 */
+  lastFailureAt?: number
   /** 最后更新时间 */
   updatedAt: number
 }
@@ -71,6 +81,8 @@ export async function readHealth(env: Env, accountId: string): Promise<AccountHe
       trippedUntil: s.trippedUntil || 0,
       allowance: s.allowance,
       allowanceAt: s.allowanceAt || 0,
+      lastFailureTransport: !!s.lastFailureTransport,
+      lastFailureAt: s.lastFailureAt || 0,
       updatedAt: s.updatedAt || 0,
     }
   } catch {
@@ -182,6 +194,69 @@ export function isRetryable(err: Error | string): boolean {
 }
 
 /**
+ * 判断错误是否属"本地/传输类"故障（DNS/TLS/连接/握手/读超时/代理），
+ * 而非上游配额、鉴权或内容策略拒绝。
+ *
+ * 移植自 M365-Copilot2API `IsTransportCategory`（internal/web/account_health.go:511-517）。
+ * 用途与 `isRetryable` 不同：`isRetryable` 决定"是否换个账号再试"（含 422、含泛指 upstream），
+ * 本函数决定"该告诉客户端去查网络，还是去退避"——因此**必须**比 `isRetryable` 更窄。
+ *
+ * 刻意排除（否则会把上游配额/鉴权/语义问题误报成本地网络故障）：
+ * - 配额/限流：429 / rate limit / throttl / quota（**不含 503**：源侧 OVERLOAD_503 属传输类）
+ * - 鉴权：401 / 403 / invalid_grant
+ * - 语义：content policy / empty completion / 422 / unprocessable
+ * - 时间预算与上游停滞：chat_progress_timeout / chat_deadline_exceeded / request aborted
+ *   （这两类是"微软长时间不吐内容"，与本地 DNS/代理无关）
+ * 也刻意不匹配泛化的 `upstream` 一词（`isRetryable` 含它，但上游报错不等于本地网络故障）。
+ */
+export function isTransportFailure(err: Error | string): boolean {
+  const msg = typeof err === 'string' ? err : err.message || ''
+  const low = msg.toLowerCase()
+  // 先排除：这些信号出现时一律不判为"连接层不可用"。
+  // 注意 503 不在此列 —— 源侧 CategoryOverload503 明确属于 IsTransportCategory
+  // （account_health.go:513），即"服务不可达/过载"与"配额限流"是两类语义。
+  if (
+    low.includes('rate limit') || low.includes('throttl') || low.includes('quota') ||
+    /\b429\b/.test(low) ||
+    isAuthFailure(low) ||
+    low.includes('content policy') || low.includes('offensive') ||
+    low.includes('empty completion') || low.includes('empty response') ||
+    /\b422\b/.test(low) || low.includes('unprocessable') ||
+    low.includes('chat_progress_timeout') || low.includes('chat_deadline_exceeded') ||
+    low.includes('request aborted')
+  ) return false
+  return (
+    low.includes('dns') || low.includes('no such host') || low.includes('getaddrinfo') ||
+    low.includes('name resolution') || low.includes('enotfound') ||
+    low.includes('tls') || low.includes('certificate') || low.includes('ssl') ||
+    low.includes('handshake') ||
+    low.includes('connection') || low.includes('connect ') || low.includes('econnrefused') ||
+    low.includes('econnreset') || low.includes('reset') || low.includes('refused') ||
+    low.includes('socket') || low.includes('socks') ||
+    low.includes('read timeout') || low.includes('i/o timeout') || low.includes('timed out') ||
+    low.includes('timeout') ||
+    low.includes('eof') || low.includes('ws closed') || low.includes('ws error') ||
+    low.includes('network') || low.includes('proxy') ||
+    low.includes('bad gateway') || low.includes('gateway timeout') ||
+    low.includes('service unavailable') || /\b503\b/.test(low) ||
+    // 拨号层的通用失败标签：目标侧 fetch 抛错时归一为 WS_DIAL_ERROR（含 DNS/TLS/连接失败），
+    // 源侧对应 CategoryTCP（account_health.go:155）—— 同属传输类。
+    // 注意 401/403 已在上面被 isAuthFailure 提前排除，不会误判成传输故障。
+    low.includes('ws_dial_error') || low.includes('ws dial error') ||
+    // WS 拨号级 5xx / 408 / 425：连接都没建立起来，属连接层而非配额。
+    // 目标侧实际格式 `ws dial failed: HTTP {status}`，源侧格式 `WS_DIAL_FAILED:{status}`。
+    /ws[_ ]dial[_ ]failed:?\s*(?:http\s+)?(?:5\d\d|408|425)/.test(low)
+  )
+}
+
+/** 判断某账号是否在新鲜窗口内因本地/传输类故障被冷却（供"全账号不可用"时区分 503/429）。 */
+export async function isTransportBlockedRecently(env: Env, accountId: string): Promise<boolean> {
+  const state = await readHealth(env, accountId)
+  if (!state.lastFailureTransport || !state.lastFailureAt) return false
+  return Date.now() - state.lastFailureAt < TRANSPORT_FAILURE_WINDOW_MS
+}
+
+/**
  * 标记账户失败（分类冷却）。
  * - 鉴权失败（401/403）：冷却 24h（同原版）
  * - 限流（429/503）：指数退避 30s·2^(n-1) 封顶 30min；503 用 15s；上游 Retry-After 优先
@@ -200,6 +275,11 @@ export async function markAccountFailure(
   const msg = typeof err === 'string' ? err : err.message || ''
 
   updateBreaker(state, now, false)
+
+  // 记录本次失败的类目（同原版 MarkFailure 写 lastCategory/lastCategoryAt）：
+  // 供"全账号不可用"时区分本地网络故障（503 network_error）与上游配额（429）。
+  state.lastFailureTransport = isTransportFailure(err)
+  state.lastFailureAt = now
 
   if (isAuthFailure(err)) {
     state.authFailed = true
@@ -264,6 +344,9 @@ export async function markAccountSuccess(env: Env, accountId: string): Promise<v
     trippedUntil: state.trippedUntil,
     // 原版显式保留 imageLimited/imageLimitUntil 到自然到期，普通对话成功不解封图片额度
     imageLimitedUntil: state.imageLimitedUntil > Date.now() ? state.imageLimitedUntil : 0,
+    // 成功即证明网络可达：清掉传输类失败记录，避免刚恢复的账号仍被判为"本地网络故障"
+    lastFailureTransport: false,
+    lastFailureAt: 0,
     updatedAt: Date.now(),
   })
 }
@@ -287,6 +370,10 @@ export async function markAccountTokenRefreshed(env: Env, accountId: string): Pr
     breakerTotal: state.breakerTotal,
     trippedUntil: state.trippedUntil,
     imageLimitedUntil: state.imageLimitedUntil > Date.now() ? state.imageLimitedUntil : 0,
+    // 传输类失败记录原样保留：本函数只负责"token 已续期"这一事实，
+    // 不代表网络一定恢复（刷新可能命中的是缓存/另一条路径），故不在此清除。
+    lastFailureTransport: state.lastFailureTransport,
+    lastFailureAt: state.lastFailureAt,
     updatedAt: Date.now(),
   })
 }

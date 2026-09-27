@@ -101,6 +101,9 @@ const MAX_QUEUED_SOCKET_CHARACTERS = 2_000_000
 const MAX_SIGNALR_RECORDS_PER_REQUEST = 16_384
 // 上游图片 URL / data URL 的字符总量上限（含 base64 的 6MiB 量级）。
 const MAX_UPSTREAM_IMAGE_URL_CHARACTERS = 6 * 1024 * 1024
+// 保留用于图片提取的原始帧数上限：图片只出现在少量终帧/结果帧里，
+// 畸形回合下无上限累积会撑爆隔离区内存（同 MAX_SIGNALR_RECORDS_PER_REQUEST 的量级约束）。
+const MAX_RETAINED_RAW_FRAMES = 512
 
 export const CHAT_HUB_PAYLOAD_LIMITS = Object.freeze({
   frameCharacters: MAX_FRAME_CHARACTERS,
@@ -467,6 +470,99 @@ function bytesToBase64(bytes: Uint8Array): string {
     binary += String.fromCharCode.apply(null, bytes.subarray(i, i + chunk) as unknown as number[])
   }
   return btoa(binary)
+}
+
+/**
+ * 上游引用标记（PUA 私有控制字符）：`\uE200cite\uE202<refId>\uE201`。
+ *
+ * M365 在正文里内联这类控制标记来标注 web 搜索引用。目标侧 VARIANTS **主动开启**了
+ * `feature.enableCitationsForSynthesisData` / `IncludeSourceAttributionsConcise`
+ * （见本文件 VARIANTS），因此该标记会随 `messages[].text` 到达并原样进入客户端正文。
+ * 证据：姊妹仓 M365-Gateway 的测试夹具 `test/responses-endpoint.test.ts:804` 中就有一条
+ * 真实上游输出 `\uE200cite\uE202turn1file1\uE201`。
+ *
+ * 移植自 M365-Copilot2API `stripCitationMarkersStream`（internal/web/public_identity.go:293）。
+ * 与源一致：不还原引用 URL（目标无 references 解析），只删除控制标记本身。
+ */
+const CITATION_OPEN = '\uE200cite\uE202'
+const CITATION_CLOSE = '\uE201'
+
+/**
+ * 删除一个文本片段里的完整引用标记，并返回**未消费的尾串**（可能是被切断的半个标记）。
+ *
+ * 返回的 rest 必须由调用方保留到下一片段前面再处理 —— 标记可能跨分片到达，
+ * 若直接丢弃 rest，残缺的 `\uE200cite\uE202` 就会漏进正文。
+ *
+ * 行为（对齐源实现）：
+ * - 完整标记 `OPEN<id>CLOSE` → 整段删除
+ * - 有 OPEN 无 CLOSE → 从 OPEN 起点整段保留为 rest（等下一片）
+ * - 结尾是 OPEN 的**真前缀**（如 `\uE200cit`）→ 扣留该前缀为 rest，避免半标记外泄
+ */
+export function stripCitationMarkers(text: string): { text: string; rest: string } {
+  let pending = text
+  let out = ''
+  for (;;) {
+    const i = pending.indexOf(CITATION_OPEN)
+    if (i < 0) break
+    out += pending.slice(0, i)
+    const after = pending.slice(i + CITATION_OPEN.length)
+    const j = after.indexOf(CITATION_CLOSE)
+    if (j < 0) {
+      // 半个标记：从标记起点整段扣留，等下一分片
+      return { text: out, rest: pending.slice(i) }
+    }
+    pending = after.slice(j + CITATION_CLOSE.length)
+  }
+  // 结尾可能是 OPEN 的前缀（跨分片被切断）：扣留最长匹配前缀
+  let keep = 0
+  const max = Math.min(CITATION_OPEN.length - 1, pending.length)
+  for (let n = max; n > 0; n--) {
+    if (pending.endsWith(CITATION_OPEN.slice(0, n))) { keep = n; break }
+  }
+  // 孤立的 CLOSE（其 OPEN 已被前一片/另一通道消费掉）：单字符、无前缀歧义，直接删除。
+  // 若不删，正文与增量两条通道交替时会出现"OPEN 走快照路径被丢、CLOSE 留在增量里"的泄漏。
+  out += pending.slice(0, pending.length - keep).split(CITATION_CLOSE).join('')
+  return { text: out, rest: pending.slice(pending.length - keep) }
+}
+
+/**
+ * 带跨分片状态的引用标记剥离器：把 rest 累积到下一片前面。
+ * 流式路径必须用它（`stripCitationMarkers` 单独调用会丢掉半个标记的状态）。
+ */
+export class CitationMarkerStripper {
+  private pending = ''
+
+  /** 送入一片文本，返回可安全外发的部分（可能为空串） */
+  push(fragment: string): string {
+    if (!fragment) return ''
+    const { text, rest } = stripCitationMarkers(this.pending + fragment)
+    this.pending = rest
+    return text
+  }
+
+  /**
+   * 收尾：把仍未闭合的残留标记丢弃（真泄漏为 0），返回剩余可外发文本。
+   * 上游正常完成时 pending 通常为空；若非空且不是标记前缀，则按普通文本外发。
+   */
+  flush(): string {
+    const leftover = this.pending
+    this.pending = ''
+    if (!leftover) return ''
+    // 残留若仍是 OPEN 的前缀，说明上游把标记截断了：丢弃（避免半个控制字符外泄）
+    if (CITATION_OPEN.startsWith(leftover)) return ''
+    return stripCitationMarkers(leftover).text
+  }
+}
+
+/** 一次性（非流式）剥离：删除全部完整标记；未闭合的残缺标记一并丢弃。 */
+export function scrubCitationMarkers(text: string): string {
+  // 快路径：两类标记字符都不存在时直接返回（绝大多数文本走这里）。
+  // 必须同时检查 CLOSE —— 只有孤立 \uE201 的文本同样需要清洗。
+  if (!text || (!text.includes('\uE200') && !text.includes(CITATION_CLOSE))) return text
+  const first = stripCitationMarkers(text)
+  if (!first.rest) return first.text
+  // 有未闭合残留：丢弃该残段（非流式无法再等下一片）
+  return first.text + stripCitationMarkers(first.rest).text
 }
 
 /**
@@ -1050,8 +1146,8 @@ function buildPlugins(tools: ChatHubTool[], mcpServerUrl?: string): Record<strin
 }
 
 /** WS 消息读取上限（同 B socketReader，chathub.ts:1547-1643 的 BoundedPayloadError 边界） */
-export const DEFAULT_MAX_QUEUED_SOCKET_CHARS = 2_000_000
-export const DEFAULT_MAX_FRAME_CHARS = 1_500_000
+export const DEFAULT_MAX_QUEUED_SOCKET_CHARS = MAX_QUEUED_SOCKET_CHARACTERS
+export const DEFAULT_MAX_FRAME_CHARS = MAX_FRAME_CHARACTERS
 
 export interface SocketRead { msg?: string; err?: Error }
 
@@ -1301,8 +1397,24 @@ export async function chatWithHandlers(
     let syntheticFailure = false
     /** 收集原生工具事件（含 messages[] 之外的插件调用），供上层 nativeToolCalls 提取 */
     const collectedEvents: unknown[] = []
-    /** 收集图片 URL 的帧内容：update 帧 arguments + result 帧 item（同原版 events 全量收集） */
+    /** 收集图片 URL 的帧内容：update 帧 arguments + result 帧 item（同原版 events 全量收集）。
+     * 有界：畸形/超长回合不得让本数组无限增长（见 MAX_RETAINED_RAW_FRAMES）。 */
     const rawFrames: unknown[] = []
+    /** 本次请求已解析的 SignalR 记录总数（跨消息累计，见 MAX_SIGNALR_RECORDS_PER_REQUEST） */
+    let signalRRecords = 0
+
+    /** 有界收集：达到上限后停止保留新帧（图片提取只依赖少量终帧，超限帧无保留价值）。 */
+    const retainFrame = (value: unknown): void => {
+      if (rawFrames.length >= MAX_RETAINED_RAW_FRAMES) return
+      rawFrames.push(value)
+    }
+
+    // 引用标记剥离器（PUA 控制字符，见 stripCitationMarkers 注释）。
+    // 正文与推理各持一个实例：两条通道独立分片，共用一个会让半个标记错配到另一条流上。
+    // 必须在**喂入累计器之前**剥离：appendChatSnapshot/appendChatHubDelta 依赖前缀匹配，
+    // 若累计文本里留着标记而上游快照不含，前缀就会失配并触发分歧重写（丢内容）。
+    const bodyCitationStripper = new CitationMarkerStripper()
+    const reasoningCitationStripper = new CitationMarkerStripper()
 
     /** 调试：上报 ChatHub 原始文本（增量/快照/最终消息），供上层排查换行与格式来源 */
     const debugEmit = (tag: string, text: string): void => {
@@ -1338,19 +1450,61 @@ export async function chatWithHandlers(
     // ChatHub 以"全量快照 + 光标重写"方式送文本，只输出未见过的后缀。
     // 对齐原版 client.go emitSnapshot：仅当新快照以前缀命中当前文本时才补发尾部，
     // 非前缀的重写直接跳过，避免吐出重复/错乱片段。
-    const emitSnapshot = (snapshot: string): void => {
-      if (!snapshot) return
-      debugEmit('chathub-snapshot', snapshot)
-      // 同原版顺序：图片额度 → 限流 → 假成功占位 → 内容策略
-      if (imageLimitDetected(snapshot)) throw new Error('upstream image generation daily limit reached')
-      if (rateLimited(snapshot)) throw new Error('upstream rate-limit notice')
-      // 假成功节流占位按普通 bot 消息到达时立即抛出（同 B:1861-1862）
-      if (syntheticUpstreamFailureCode(snapshot)) throw new Error('upstream rate-limit notice')
-      if (contentPolicyDetected(snapshot)) throw new Error('upstream content policy flagged as offensive')
-      const cur = streamedText
-      const merged = appendChatSnapshot(cur, snapshot, onDelta ?? undefined)
+    /**
+     * 把一段**已剥离**文本并入流式累计文本（快照语义）。
+     * 与 writeAtCursor 的增量合并分开：这里只做前缀对齐 + 上界断言。
+     */
+    const mergeSnapshot = (clean: string): void => {
+      if (!clean) return
+      const merged = appendChatSnapshot(streamedText, clean, onDelta ?? undefined)
       streamedText = merged.text
+      // 输出上界：畸形上游可能持续推快照撑爆隔离区内存（同 MAX_OUTPUT_CHARACTERS 注释）
+      assertBoundedPayload('CHAT_OUTPUT_TOO_LARGE', streamedText.length, MAX_OUTPUT_CHARACTERS, 'update_snapshot')
       if (merged.skipped) skippedSnapshots++
+    }
+
+    /**
+     * 送入一段快照文本：先做上游错误检测（用原文，标记不影响词表匹配），再并入累计文本。
+     * `clean` 由调用方按通道语义预先剥离（见下方两条通道的说明）。
+     */
+    const emitSnapshot = (raw: string, clean: string): void => {
+      if (!raw) return
+      debugEmit('chathub-snapshot', raw)
+      // 同原版顺序：图片额度 → 限流 → 假成功占位 → 内容策略
+      if (imageLimitDetected(raw)) throw new Error('upstream image generation daily limit reached')
+      if (rateLimited(raw)) throw new Error('upstream rate-limit notice')
+      // 假成功节流占位按普通 bot 消息到达时立即抛出（同 B:1861-1862）
+      if (syntheticUpstreamFailureCode(raw)) throw new Error('upstream rate-limit notice')
+      if (contentPolicyDetected(raw)) throw new Error('upstream content policy flagged as offensive')
+      mergeSnapshot(clean)
+    }
+
+    /**
+     * 终态收尾：把两个剥离器里未闭合的残留落地，清洗最终消息，再与流式文本对齐。
+     *
+     * 顺序很重要：
+     * - 先 flush 剥离器（残留并入 streamedText），保证 finalizeText 比对的是已剥离文本
+     * - **先清洗 final 再 finalizeText**：finalizeText 会把 final 的尾部经 onDelta 直接发给
+     *   客户端；若 final 仍带标记，那一截就绕过了剥离器（真实泄漏路径）
+     */
+    const flushCitations = (finalRaw: string): string => {
+      const bodyTail = bodyCitationStripper.flush()
+      if (bodyTail) streamedText = appendChatHubDelta(streamedText, bodyTail, onDelta ?? undefined)
+      const reasoningTail = reasoningCitationStripper.flush()
+      if (reasoningTail) reasoningBuf += reasoningTail
+      return finalizeText(streamedText, scrubCitationMarkers(finalRaw), onDelta)
+    }
+
+    /**
+     * 有界图片提取：data:image base64 单个可达数 MiB，无上限时几张图就能撑爆隔离区内存
+     * （见 MAX_UPSTREAM_IMAGE_URL_CHARACTERS 注释）。累计超限即抛体积错误，
+     * 由上层转成隐私安全的诊断（只含数值边界，不含 URL 文本）。
+     */
+    const boundedImageURLs = (): string[] => {
+      const urls = imageURLs(rawFrames)
+      const total = urls.reduce((sum, u) => sum + u.length, 0)
+      assertBoundedPayload('CHAT_IMAGE_OUTPUT_TOO_LARGE', total, MAX_UPSTREAM_IMAGE_URL_CHARACTERS, 'image_output')
+      return urls
     }
 
     while (Date.now() < deadline) {
@@ -1367,6 +1521,10 @@ export async function chatWithHandlers(
       let semanticProgress = false
 
       const parts = read.msg.split(RS)
+      // 记录数上界：SignalR 每个 WS 消息只应携带少量记录；畸形的小记录流会把 CPU 预算
+      // 耗在 JSON.parse 上（见 MAX_SIGNALR_RECORDS_PER_REQUEST 注释）。
+      signalRRecords += parts.length
+      assertBoundedPayload('WS_FRAME_TOO_MANY_RECORDS', signalRRecords, MAX_SIGNALR_RECORDS_PER_REQUEST, 'websocket_frame')
       for (const partRaw of parts) {
         const part = partRaw.trim()
         if (!part) continue
@@ -1383,7 +1541,7 @@ export async function chatWithHandlers(
         if (frame.type === 1 && frame.target === 'update') {
           // update 帧即视为存在语义进展（同原版 04f5481：语义帧才续期进度截止）
           semanticProgress = true
-          if (frame.arguments && Array.isArray(frame.arguments)) rawFrames.push(...frame.arguments)
+          if (frame.arguments && Array.isArray(frame.arguments)) for (const v of frame.arguments) retainFrame(v)
           for (const arg of frame.arguments || []) {
             if (!arg || typeof arg !== 'object' || Array.isArray(arg)) continue
             const a = arg as Record<string, unknown>
@@ -1394,8 +1552,15 @@ export async function chatWithHandlers(
             }
             const msgs = Array.isArray(a['messages']) ? (a['messages'] as unknown[]) : []
             for (const ev of classifyUpdateMessages(msgs)) {
-              if (ev.kind === 'reasoning') reasoningBuf += ev.text || ''
-              if (ev.kind !== 'text' && onEvent) onEvent(ev)
+              if (ev.kind === 'reasoning') {
+                // 推理通道同样剥离引用标记（与正文分开的独立分片流）
+                const cleanReasoning = reasoningCitationStripper.push(ev.text || '')
+                reasoningBuf += cleanReasoning
+                // 外发事件必须用**已剥离**的文本，否则 onEvent 会绕过剥离器把标记送到客户端
+                if (onEvent && cleanReasoning) onEvent({ ...ev, text: cleanReasoning })
+              } else if (onEvent) {
+                onEvent(ev)
+              }
             }
             // Disengaged 检测（同 B:1947）：部分租户在终态前发送 Disengaged 标记
             if (Array.isArray(msgs) && msgs.some((m) => m && typeof m === 'object' && (m as Record<string, unknown>)['messageType'] === 'Disengaged')) {
@@ -1418,11 +1583,18 @@ export async function chatWithHandlers(
               // 假成功节流占位：不透传给客户端，记为上游限流（同 B:1951）
               if (syntheticUpstreamFailureCode(wac)) {
                 syntheticFailure = true
+              } else if (streamedText === '') {
+                // 无基线：writeAtCursor 首片按快照并入（增量片在无基线时就是全部已知文本）。
+                // 走增量剥离器保持与后续增量片同一状态，避免半标记跨通道错配。
+                emitSnapshot(wac, bodyCitationStripper.push(wac))
               } else {
-                // 安全合并：处理重复/累计帧问题（同 B appendChatHubDelta:1679-1693）
-                if (streamedText !== '') {
-                  streamedText = appendChatHubDelta(streamedText, wac, onDelta ?? undefined)
-                } else emitSnapshot(wac)
+                // 引用标记先剥离再合并：appendChatHubDelta 同样依赖前缀/后缀匹配
+                const cleanWac = bodyCitationStripper.push(wac)
+                if (cleanWac) {
+                  streamedText = appendChatHubDelta(streamedText, cleanWac, onDelta ?? undefined)
+                  // 输出上界（writeAtCursor 通道，同上）
+                  assertBoundedPayload('CHAT_OUTPUT_TOO_LARGE', streamedText.length, MAX_OUTPUT_CHARACTERS, 'streamed_text')
+                }
               }
             }
             for (const mraw of msgs) {
@@ -1434,7 +1606,10 @@ export async function chatWithHandlers(
               // 用户可见正文：ChatHub 正常答案快照显式标注 messageType='Chat'，
               // 仅 undefined/'Chat' 两种才算正文（对齐 chatHubAnswerMessageText）。
               const answer = chatHubAnswerMessageText(m)
-              if (answer !== '') emitSnapshot(answer)
+              // messages[].text 是**累计全文**（每帧含至今完整文本），必须用无状态剥离：
+              // 累计文本自带完整标记，无需跨片状态；若沿用增量剥离器的 pending，
+              // 会把上一帧扣留的半标记拼到本帧前面，造成正文重复/错位。
+              if (answer !== '') emitSnapshot(answer, scrubCitationMarkers(answer))
             }
           }
           continue
@@ -1447,7 +1622,7 @@ export async function chatWithHandlers(
           const item = frame.item as Record<string, unknown> | undefined
           if (item) {
             // 图片 URL 也可能只出现在 result 帧（item/result 元数据）：一并纳入收集
-            rawFrames.push(item)
+            retainFrame(item)
             // 终帧 reasoning 收割（同 C chathub.ts:2053-2057）：推理可能只出现在 result 帧的
             // messages 数组，仅靠 type=1 收集会丢失。只收 reasoning，正文以 finalText 为准不重发。
             if (Array.isArray(item['messages'])) {
@@ -1505,7 +1680,7 @@ export async function chatWithHandlers(
           if (syntheticFailure) throw new Error('upstream rate-limit notice')
           if (rateLimited(finalText)) throw new Error('upstream rate-limit notice')
           // 以最终消息对齐流式文本：流式漏掉的尾部在这里补发（原版 finalizeText）
-          let text = finalizeText(streamedText, finalText || streamedText, onDelta)
+          let text = flushCitations(finalText || streamedText)
           // thinking 标签剥离兜底：上游没走 CoT 信号时，正文自带的 <thought>/<thinking> 归入 reasoning（同 C:1896-1901）
           if (reasoningBuf.trim() === '') {
             const stripped = extractThoughtTags(text)
@@ -1528,7 +1703,7 @@ export async function chatWithHandlers(
             events: collectedEvents,
             rawResult,
             throttling,
-            images: imageURLs(rawFrames),
+            images: boundedImageURLs(),
           }
         }
 
@@ -1539,7 +1714,7 @@ export async function chatWithHandlers(
             throw new Error(`chathub closed before completion: ${upstreamErrorLabel(frame.error)}`)
           }
           if (finalText || collectedEvents.length > 0) {
-            let text = finalizeText(streamedText, finalText || streamedText, onDelta)
+            let text = flushCitations(finalText || streamedText)
             // type=7 与 type=3 相同的 thinking 标签剥离兜底
             if (reasoningBuf.trim() === '') {
               const stripped = extractThoughtTags(text)
@@ -1554,7 +1729,7 @@ export async function chatWithHandlers(
               events: collectedEvents,
               rawResult,
               throttling,
-              images: imageURLs(rawFrames),
+              images: boundedImageURLs(),
             }
           }
           throw new Error('chathub closed before completion: clean without final')
@@ -1567,11 +1742,15 @@ export async function chatWithHandlers(
     }
     throw new Error('chathub response deadline exceeded before completion')
   } catch (err) {
+    // 体积超限：输出隐私安全的数值诊断（只含封闭标签 + 数值边界，不含任何负载文本）
+    logBoundedPayloadFailure(err)
     // 把调用失败包装为 ChatHubAttemptError，向调用方暴露 invocationSubmitted：
     // payload 已提交的失败绝不允许重连/重试/跨账号转移（避免重复执行用户任务）。
     if (err instanceof ChatHubAttemptError) throw err
-    const message = err instanceof Error ? err.message : String(err)
-    const wrapped = new ChatHubAttemptError(message, invocationSubmitted) as ChatHubAttemptError & { retryAfterSeconds?: number }
+    // 传**原始 err 对象**而非 message 字符串：ChatHubAttemptError 的构造函数依赖它
+    // 提取 boundedPayload 元数据与重连安全性。此前传 message 会让体积诊断永远为 null
+    // （真实缺陷：logBoundedPayloadFailure 因此从未输出过任何诊断）。
+    const wrapped = new ChatHubAttemptError(err, invocationSubmitted) as ChatHubAttemptError & { retryAfterSeconds?: number }
     const retryAfterSeconds = (err as Error & { retryAfterSeconds?: number })?.retryAfterSeconds
     if (typeof retryAfterSeconds === 'number') wrapped.retryAfterSeconds = retryAfterSeconds
     throw wrapped
