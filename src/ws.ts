@@ -1,6 +1,9 @@
 import { Context } from 'hono'
 import { forwardProxy } from './proxy'
 import { writeLog } from './admin'
+import { createAnalyticsContext } from './analytics/types'
+import type { UsageMetrics } from './analytics/types'
+import { createStreamUsageProbe, writeAnalyticsEvent } from './analytics/usage-logger'
 import type { AppEnv } from './types'
 
 /**
@@ -107,13 +110,48 @@ export async function handleProxyWebSocket(c: Context<AppEnv>) {
       // 复用 HTTP 转发核心（强制 POST，与正常 chat/completions 调用一致）
       const response = await forwardProxy(c, body, 'POST')
 
+      // analytics：本入口直接调 forwardProxy，绕过了 handleProxy 的 finalizeProxyResponse，
+      // 此前 WS 桥接的流量一条都不进 Analytics Engine。这里补一条同口径记录。
+      // 响应体由本函数自己消费（下方 loop），故不能复用 finalizeProxyResponse，
+      // 改为在透传管道里内联 usage 探针，与 HTTP 路径同一套解析逻辑。
+      let wsUsage: UsageMetrics | undefined
+      const wsContext = () => {
+        const base = createAnalyticsContext(
+          c,
+          c.get('proxyKey') || null,
+          c.get('proxyKeyHash') || '',
+          'chat/completions',
+          String(model || ''),
+          'stream',
+        )
+        const upstream = c.get('analyticsUpstream')
+        return upstream ? { ...base, ...upstream } : base
+      }
+
       // 把上游响应体分块以 WS 文本帧回推；SSE 流逐块转发，JSON 一次转发
       if (!response.body) {
+        writeAnalyticsEvent(c, { context: wsContext(), result: 'failure', upstreamStatus: response.status })
         sendError(`上游无响应体 (HTTP ${response.status})`)
         return
       }
 
-      const reader = response.body.pipeThrough(new TextDecoderStream()).getReader()
+      const probe = createStreamUsageProbe('', (value) => {
+        wsUsage = wsUsage ? {
+          promptTokens: Math.max(wsUsage.promptTokens, value.promptTokens),
+          completionTokens: Math.max(wsUsage.completionTokens, value.completionTokens),
+          cachedTokens: Math.max(wsUsage.cachedTokens, value.cachedTokens),
+          totalTokens: Math.max(wsUsage.totalTokens, value.totalTokens),
+        } : value
+      }, () => {
+        writeAnalyticsEvent(c, {
+          context: wsContext(),
+          result: response.ok ? 'success' : 'failure',
+          usage: wsUsage,
+          upstreamStatus: response.status,
+        })
+      })
+
+      const reader = response.body.pipeThrough(probe).pipeThrough(new TextDecoderStream()).getReader()
       try {
         while (true) {
           const { done: streamDone, value } = await reader.read()
