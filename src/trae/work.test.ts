@@ -10,6 +10,9 @@ import {
 import {
   workStreamToOpenAIStream,
   aggregateWorkSse,
+  soloStreamToOpenAIStream,
+  aggregateSoloSse,
+  normalizeSoloUsage,
 } from './sse'
 import {
   isTraeWorkHealthy,
@@ -169,6 +172,100 @@ describe('Trae Work: 流式与非流式 SSE 协议转换 (sse.ts)', () => {
     expect(result.resp?.choices[0].message.reasoning_content).toBe('Step 1: Plan')
     expect(result.resp?.choices[0].finish_reason).toBe('stop')
     expect(result.resp?.usage?.total_tokens).toBe(40)
+  })
+})
+
+describe('Trae: token_usage 归一化（SOLO 上游用 Anthropic 口径 / 顶层字段名）', () => {
+  // 上游实测样本（2026-09-27，同一段 19635 token 前缀连发两次）
+  const hit = { prompt_tokens: 19635, completion_tokens: 47, total_tokens: 19682, reasoning_tokens: 45, cache_read_input_tokens: 19584 }
+  const miss = { prompt_tokens: 19635, completion_tokens: 60, total_tokens: 19695, reasoning_tokens: 58, cache_read_input_tokens: 0 }
+
+  it('cache_read_input_tokens → 补 prompt_tokens_details.cached_tokens，原字段保留', () => {
+    const out = normalizeSoloUsage(hit)
+    expect(out?.prompt_tokens_details?.cached_tokens).toBe(19584)
+    // 原字段必须保留：Anthropic /v1/messages 通路仍按 cache_read_input_tokens 消费
+    expect(out?.cache_read_input_tokens).toBe(19584)
+    expect(out?.prompt_tokens).toBe(19635)
+  })
+
+  it('顶层 reasoning_tokens → 补 completion_tokens_details.reasoning_tokens，原字段保留', () => {
+    const out = normalizeSoloUsage(hit)
+    expect(out?.completion_tokens_details?.reasoning_tokens).toBe(45)
+    expect(out?.reasoning_tokens).toBe(45)
+    expect(normalizeSoloUsage(miss)?.completion_tokens_details?.reasoning_tokens).toBe(58)
+  })
+
+  it('已存在的嵌套 details 被合并不被覆盖；缺失的字段不补别名', () => {
+    const out = normalizeSoloUsage({
+      prompt_tokens: 10,
+      completion_tokens: 20,
+      total_tokens: 30,
+      cache_read_input_tokens: 8,
+      prompt_tokens_details: { audio_tokens: 3 },
+      completion_tokens_details: { accepted_prediction_tokens: 4 },
+    })
+    expect(out?.prompt_tokens_details).toEqual({ audio_tokens: 3, cached_tokens: 8 })
+    expect(out?.completion_tokens_details?.accepted_prediction_tokens).toBe(4)
+    expect(out?.completion_tokens_details?.reasoning_tokens).toBeUndefined()
+    // reasoning_tokens 缺失 → 不产生 completion_tokens_details
+    const plain = { prompt_tokens: 10, completion_tokens: 20, total_tokens: 30 }
+    const plainOut = normalizeSoloUsage(plain)
+    expect(plainOut?.completion_tokens_details).toBeUndefined()
+  })
+
+  it('未命中如实补 0；上游缺该字段时原样返回、不编造缓存字段', () => {
+    expect(normalizeSoloUsage(miss)?.prompt_tokens_details?.cached_tokens).toBe(0)
+    const plain = { prompt_tokens: 10, completion_tokens: 20, total_tokens: 30 }
+    const out = normalizeSoloUsage(plain)
+    expect(out).toEqual(plain)
+    expect(out?.prompt_tokens_details).toBeUndefined()
+  })
+
+  it('非对象输入不产生 usage', () => {
+    expect(normalizeSoloUsage(null)).toBeNull()
+    expect(normalizeSoloUsage([1, 2])).toBeNull()
+    expect(normalizeSoloUsage('x')).toBeNull()
+  })
+
+  it('soloStreamToOpenAIStream 末帧 usage 带 OpenAI 口径缓存与推理字段（trae 直连主路径）', async () => {
+    const events = [
+      'event: output\ndata: {"response":"收到"}\n\n',
+      `event: token_usage\ndata: ${JSON.stringify(hit)}\n\n`,
+      'event: done\ndata: {"finish_reason":"stop"}\n\n',
+    ].join('')
+    const upstreamStream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode(events))
+        controller.close()
+      },
+    })
+    const reader = soloStreamToOpenAIStream(upstreamStream, 'deepseek-v4.1-flash').getReader()
+    const decoder = new TextDecoder()
+    let aggregated = ''
+    while (true) {
+      const { done, value } = await reader.read()
+      if (done) break
+      aggregated += decoder.decode(value)
+    }
+    const usageFrames = aggregated.split('\n\n')
+      .map((f) => f.replace(/^data:\s*/, ''))
+      .filter((d) => d.startsWith('{') && d.includes('"usage"'))
+      .map((d) => JSON.parse(d))
+    expect(usageFrames.length).toBeGreaterThan(0)
+    expect(usageFrames[0].usage.prompt_tokens_details.cached_tokens).toBe(19584)
+    expect(usageFrames[0].usage.completion_tokens_details.reasoning_tokens).toBe(45)
+  })
+
+  it('aggregateSoloSse / aggregateWorkSse 聚合后的 usage 同样带 OpenAI 口径字段', () => {
+    const solo = `event: output\ndata: {"response":"hi"}\n\nevent: token_usage\ndata: ${JSON.stringify(hit)}\n\n`
+    const soloUsage = aggregateSoloSse(solo).resp?.usage
+    expect(soloUsage?.prompt_tokens_details?.cached_tokens).toBe(19584)
+    expect(soloUsage?.completion_tokens_details?.reasoning_tokens).toBe(45)
+
+    const work = `event: output\ndata: {"text":"hi"}\n\nevent: token_usage\ndata: ${JSON.stringify(hit)}\n\n`
+    const workUsage = aggregateWorkSse(work, 'm').resp?.usage
+    expect(workUsage?.prompt_tokens_details?.cached_tokens).toBe(19584)
+    expect(workUsage?.completion_tokens_details?.reasoning_tokens).toBe(45)
   })
 })
 

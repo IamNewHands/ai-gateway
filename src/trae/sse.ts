@@ -52,6 +52,52 @@ export function parseSoloLine(eventName: string, dataLine: string): SOLOEvent | 
   return ev
 }
 
+/** 计数读取：数字 / 数字字符串 → number；其余 → null（不编造）。 */
+function toCount(v: unknown): number | null {
+  if (typeof v === 'number' && Number.isFinite(v)) return v
+  if (typeof v === 'string' && v.trim() !== '' && Number.isFinite(Number(v))) return Number(v)
+  return null
+}
+
+/** 取嵌套对象为可合并副本（非对象 → 空对象），避免覆盖上游已下发的兄弟字段。 */
+function asRecord(v: unknown): Record<string, any> {
+  return v && typeof v === 'object' && !Array.isArray(v) ? { ...(v as Record<string, any>) } : {}
+}
+
+/**
+ * SOLO / Work 上游 token_usage → 补 OpenAI 口径字段（其余字段原样保留）。
+ *
+ * 上游实测（2026-09-27，同一段 19635 token 前缀连发两次）：
+ *  1. 缓存命中放在 Anthropic 口径 `cache_read_input_tokens`（首回合 0，次回合 19584），
+ *     **没有** OpenAI 口径的 `prompt_tokens_details.cached_tokens`；
+ *  2. 推理 token 放在**顶层** `reasoning_tokens`（如 58），**没有** OpenAI 口径的
+ *     `completion_tokens_details.reasoning_tokens`。
+ *
+ * 而 OpenAI 兼容客户端（DSH 的 pi-ai 等）分别只认
+ * `prompt_tokens_details.cached_tokens`（→ prompt_cache_hit_tokens → cached_tokens）与
+ * `completion_tokens_details.reasoning_tokens`，于是上游明明命中缓存 / 有推理量，
+ * 客户端与管理端统计却恒显示 0。
+ *
+ * 这里只补别名，不改写、不删除上游原字段（Anthropic /v1/messages 通路仍读
+ * `cache_read_input_tokens`）。上游未上报对应字段（缺失 / 非数字）时不补该别名，不编造 0。
+ */
+export function normalizeSoloUsage(raw: unknown): Record<string, any> | null {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null
+  const usage = { ...(raw as Record<string, any>) }
+
+  const cacheRead = toCount(usage['cache_read_input_tokens'])
+  if (cacheRead !== null) {
+    usage['prompt_tokens_details'] = { ...asRecord(usage['prompt_tokens_details']), cached_tokens: cacheRead }
+  }
+
+  const reasoning = toCount(usage['reasoning_tokens'])
+  if (reasoning !== null) {
+    usage['completion_tokens_details'] = { ...asRecord(usage['completion_tokens_details']), reasoning_tokens: reasoning }
+  }
+
+  return usage
+}
+
 /** SSE 行级状态：维护 event/data 跨行累积。 */
 interface SseState {
   event: string
@@ -133,7 +179,7 @@ export function aggregateSoloSse(text: string): { resp: Record<string, any> | nu
         mergeToolCallJSON(toolCalls, toolOrder, ev.toolCalls)
         break
       case 'token_usage':
-        usage = ev.usage
+        usage = normalizeSoloUsage(ev.usage)
         break
       case 'done':
         if (ev.finishReason !== '') finishReason = ev.finishReason
@@ -304,7 +350,7 @@ export function soloStreamToOpenAIStream(
               break
             }
             case 'token_usage':
-              pendingUsage = ev.usage
+              pendingUsage = normalizeSoloUsage(ev.usage)
               break
             case 'done': {
               // 上游 SOLO 的 done 常自报 finish_reason=stop，即使本回合已发起工具调用。
@@ -555,9 +601,7 @@ export function workStreamToOpenAIStream(
             break
           }
           case 'token_usage': {
-            if (payload && typeof payload === 'object') {
-              pendingUsage = payload
-            }
+            pendingUsage = normalizeSoloUsage(payload)
             break
           }
           case 'done': {
@@ -715,7 +759,7 @@ export function aggregateWorkSse(text: string, model: string): { resp: Record<st
         break
       }
       case 'token_usage': {
-        if (payload && typeof payload === 'object') usage = payload
+        usage = normalizeSoloUsage(payload)
         break
       }
       case 'done': {
