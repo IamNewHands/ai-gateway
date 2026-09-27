@@ -1238,7 +1238,10 @@ export async function proxyClineChatRequest(
   opts?: ClineProxyOptions
 ): Promise<Response> {
   const pool = poolFromProvider(provider, _env as Env)
-  const wantStream = opts ? !!opts.stream : forwardBody.stream === true
+  // 只认显式给出的 opts.stream；opts 存在但没带 stream（如只带 diag）时**不能**当成
+  // 非流式——否则流式客户端会收到一个 application/json 聚合体，pi-ai/OpenAI SDK 按 SSE
+  // 解析得到 0 个 chunk，报 "Stream ended without finish_reason"（TRANSPORT）并白重试 5 次。
+  const wantStream = opts?.stream ?? forwardBody.stream === true
   const sessionId = 'sess_' + Date.now()
   const requested = String(forwardBody.model || DEFAULT_MODEL)
   const { models, freeSet } = await getClineCatalog()

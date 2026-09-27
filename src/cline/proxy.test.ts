@@ -601,6 +601,51 @@ describe('402 余额耗尽与免费链降级', () => {
   })
 })
 
+// opts.stream 语义回归（2026-09-27）：wantStream 曾写成 `opts ? !!opts.stream : body.stream`，
+// 于是调用方只传 diag（proxy.ts 的 [DEBUG-sig] 插桩，commit 6833ed7）时被当成「非流式」，
+// 流式客户端收到 application/json 聚合体 → pi-ai 按 SSE 解析到 0 个 chunk →
+// "Stream ended without finish_reason"(TRANSPORT) 白重试 5 次。判据必须是 opts.stream 本身。
+describe('opts.stream 语义（只带 diag 时不得改变流式判定）', () => {
+  it('body.stream=true + opts 只带 diag → 仍走 SSE，不被聚合成 JSON', async () => {
+    installFetch(() => sseOkResp())
+    const resp = await proxyClineChatRequest(
+      undefined,
+      clineProvider([REFRESH_TOKEN]),
+      { model: DEFAULT_MODEL, messages: [{ role: 'user', content: 'hi' }], stream: true },
+      { diag: { onOutbound: () => {} } },
+    )
+    expect(resp.status).toBe(200)
+    expect(resp.headers.get('Content-Type')).toContain('text/event-stream')
+    const text = await readAll(resp)
+    expect(text).toContain('"content":"hi"')
+    expect(text).toContain('data: [DONE]')
+  })
+
+  it('opts.stream=false 显式覆盖 body.stream=true → 仍聚合为非流式 JSON', async () => {
+    installFetch(() => sseOkResp())
+    const resp = await proxyClineChatRequest(
+      undefined,
+      clineProvider([REFRESH_TOKEN]),
+      { model: DEFAULT_MODEL, messages: [{ role: 'user', content: 'hi' }], stream: true },
+      { stream: false },
+    )
+    expect(resp.headers.get('Content-Type')).toContain('application/json')
+    const data = (await resp.json()) as { choices: Array<{ message: { content: string } }> }
+    expect(data.choices[0].message.content).toBe('hi')
+  })
+
+  it('不传 opts 时按 body.stream 判定（回归保护）', async () => {
+    installFetch(() => sseOkResp())
+    const resp = await proxyClineChatRequest(
+      undefined,
+      clineProvider([REFRESH_TOKEN]),
+      { model: DEFAULT_MODEL, messages: [{ role: 'user', content: 'hi' }], stream: true },
+    )
+    expect(resp.headers.get('Content-Type')).toContain('text/event-stream')
+    await readAll(resp)
+  })
+})
+
 // [DEBUG-sig] 诊断纯函数单测（与插桩同生共死：结论拿到后连同插桩一起删）
 describe('summarizeOutboundReasoning（[DEBUG-sig] 出站 reasoning 形态统计）', () => {
   it('非数组输入返回全零', () => {
