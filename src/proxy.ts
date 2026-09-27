@@ -1208,11 +1208,15 @@ const finalizeProxyResponse = async (
   response: Response,
   context: AnalyticsContext,
   route: string,
+  probeProviderType = '',
 ): Promise<Response> => {
   const headers = new Headers(response.headers)
   headers.set('Cache-Control', 'no-store')
+  // 结果按上游状态判定：4xx/5xx 记为 failure（此前一律写 success，导致管理端
+  // 失败率恒为 0，而 result 维度与 failures 指标都基于这个字段）。
+  const result: 'success' | 'failure' = response.ok ? 'success' : 'failure'
   if (!response.body) {
-    writeAnalyticsEvent(c, { context, result: 'success', upstreamStatus: response.status })
+    writeAnalyticsEvent(c, { context, result, upstreamStatus: response.status })
     return new Response(null, { status: response.status, statusText: response.statusText, headers })
   }
 
@@ -1221,7 +1225,7 @@ const finalizeProxyResponse = async (
     // 不再 tee 出独立观察支流：旧实现里客户端断开后观察支流仍会继续读完上游
     // body；现在客户端 Cancel 会沿管道传播到上游，立即停止后续流消费。
     let usage: UsageMetrics | undefined
-    const probe = createStreamUsageProbe('', (value) => {
+    const probe = createStreamUsageProbe(probeProviderType, (value) => {
       usage = usage ? {
         promptTokens: Math.max(usage.promptTokens, value.promptTokens),
         completionTokens: Math.max(usage.completionTokens, value.completionTokens),
@@ -1230,7 +1234,7 @@ const finalizeProxyResponse = async (
       } : value
     }, () => {
       // 正常流结束时写 analytics；客户端中途断开（cancel）不会走到这里
-      writeAnalyticsEvent(c, { context, result: 'success', usage, upstreamStatus: response.status })
+      writeAnalyticsEvent(c, { context, result, usage, upstreamStatus: response.status })
     })
     const clientStream = response.body.pipeThrough(probe)
     return new Response(clientStream, { status: response.status, statusText: response.statusText, headers })
@@ -1241,11 +1245,11 @@ const finalizeProxyResponse = async (
   if (contentType.includes('json')) {
     const payload = await response.json().catch(() => null) as unknown
     const usage = normalizeUsage(route, { apiType: 'openai' } as import('./types').Provider, payload) || undefined
-    writeAnalyticsEvent(c, { context, result: 'success', usage, upstreamStatus: response.status })
+    writeAnalyticsEvent(c, { context, result, usage, upstreamStatus: response.status })
     headers.delete('Content-Length')  // 重序列化后长度可能变化，去掉上游旧值
     return new Response(JSON.stringify(payload), { status: response.status, statusText: response.statusText, headers })
   }
-  writeAnalyticsEvent(c, { context, result: 'success', upstreamStatus: response.status })
+  writeAnalyticsEvent(c, { context, result, upstreamStatus: response.status })
   return new Response(response.body, { status: response.status, statusText: response.statusText, headers })
 }
 
@@ -3156,6 +3160,34 @@ export async function handleModels(c: Context<AppEnv>) {
 // ============================================================
 
 export async function handleAnthropicMessages(c: Context<AppEnv>) {
+  const proxyKey = c.get('proxyKey') || null
+  const proxyKeyHash = c.get('proxyKeyHash') || ''
+  let context = createAnalyticsContext(c, proxyKey, proxyKeyHash, 'messages', '', 'sync')
+  try {
+    const response = await handleAnthropicMessagesInner(c)
+    const req = c.get('analyticsRequest')
+    if (req) {
+      context = createAnalyticsContext(c, proxyKey, proxyKeyHash, req.route, req.model, req.streamMode)
+    }
+    return finalizeProxyResponse(c, response, applyUpstreamAttribution(c, context), 'messages', 'anthropic')
+  } catch (err) {
+    writeAnalyticsEvent(c, {
+      context: applyUpstreamAttribution(c, context),
+      result: 'failure',
+      errorSummary: summarizeError(err instanceof Error ? err.message : String(err)),
+    })
+    throw err
+  }
+}
+
+/**
+ * /v1/messages 实际处理逻辑（内层）。
+ *
+ * 拆成内外两层的原因：本函数有多处提前 return（模型缺失/提供商不存在/模型未配置），
+ * 若在每处都补写 analytics 会漏项且易腐化。外层包装统一在**唯一出口**补记用量，
+ * 与 handleProxy 的 finalizeProxyResponse 走同一条记录路径。
+ */
+async function handleAnthropicMessagesInner(c: Context<AppEnv>) {
   try {
     const anthropicBody = await readBoundedJSON<Record<string, unknown>>(c)
     const model = anthropicBody['model'] as string
@@ -3163,6 +3195,13 @@ export async function handleAnthropicMessages(c: Context<AppEnv>) {
     if (!model) {
       return c.json({ type: 'error', error: { type: 'invalid_request_error', message: 'Missing model' } }, 400)
     }
+
+    // 供外层包装补记 analytics（body 已被本函数消费，外层无法再解析）
+    c.set('analyticsRequest', {
+      route: 'messages',
+      model,
+      streamMode: anthropicBody['stream'] === true ? 'stream' : 'sync',
+    })
 
     // 解析 providerId/modelId 格式
     const parsed = parseModelId(model)
@@ -3207,6 +3246,14 @@ export async function handleAnthropicMessages(c: Context<AppEnv>) {
         error: { type: 'invalid_request_error', message: `Model "${modelId}" not configured` },
       }, 404)
     }
+
+    // 本入口不走 forwardProxy，需自行登记 analytics 归属（同 forwardProxy 内的处理）
+    c.set('analyticsUpstream', {
+      providerId: provider.id,
+      providerName: provider.name,
+      providerType: provider.apiType || 'openai',
+      upstreamModel: modelId,
+    })
 
     // Anthropic → OpenAI 转换
     const anthropicReq = anthropicBody as any
@@ -4327,6 +4374,28 @@ async function handleAnthropicM365(
 // ============================================================
 
 export async function handleResponses(c: Context<AppEnv>) {
+  const proxyKey = c.get('proxyKey') || null
+  const proxyKeyHash = c.get('proxyKeyHash') || ''
+  let context = createAnalyticsContext(c, proxyKey, proxyKeyHash, 'responses', '', 'sync')
+  try {
+    const response = await handleResponsesInner(c)
+    const req = c.get('analyticsRequest')
+    if (req) {
+      context = createAnalyticsContext(c, proxyKey, proxyKeyHash, req.route, req.model, req.streamMode)
+    }
+    return finalizeProxyResponse(c, response, applyUpstreamAttribution(c, context), 'responses')
+  } catch (err) {
+    writeAnalyticsEvent(c, {
+      context: applyUpstreamAttribution(c, context),
+      result: 'failure',
+      errorSummary: summarizeError(err instanceof Error ? err.message : String(err)),
+    })
+    throw err
+  }
+}
+
+/** /v1/responses 实际处理逻辑（内层）；拆层原因同 handleAnthropicMessagesInner。 */
+async function handleResponsesInner(c: Context<AppEnv>) {
   try {
     const responsesBody = await readBoundedJSON<Record<string, unknown>>(c, MAX_RESPONSES_REQUEST_BYTES)
     const model = responsesBody['model'] as string
@@ -4334,6 +4403,13 @@ export async function handleResponses(c: Context<AppEnv>) {
     if (!model) {
       return c.json({ error: { message: 'Missing model', type: 'invalid_request_error' } }, 400)
     }
+
+    // 供外层包装补记 analytics（body 已被本函数消费，外层无法再解析）
+    c.set('analyticsRequest', {
+      route: 'responses',
+      model,
+      streamMode: responsesBody['stream'] === true ? 'stream' : 'sync',
+    })
 
     const parsed = parseModelId(model)
     if (!parsed) {
@@ -4365,6 +4441,14 @@ export async function handleResponses(c: Context<AppEnv>) {
     if (!modelConfig) {
       return c.json({ error: { message: `Model "${modelId}" not configured`, type: 'invalid_request_error' } }, 404)
     }
+
+    // 本入口不走 forwardProxy，需自行登记 analytics 归属（同 forwardProxy 内的处理）
+    c.set('analyticsUpstream', {
+      providerId: provider.id,
+      providerName: provider.name,
+      providerType: provider.apiType || 'openai',
+      upstreamModel: modelId,
+    })
 
     // Responses → OpenAI 转换
     const responsesReq = responsesBody as any

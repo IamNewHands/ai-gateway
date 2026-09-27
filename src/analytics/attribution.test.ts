@@ -1,6 +1,6 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { Hono } from 'hono'
-import { handleProxy } from '../proxy'
+import { handleProxy, handleAnthropicMessages, handleResponses } from '../proxy'
 import { clearCache } from '../storage'
 import type { AppEnv, Env, Provider } from '../types'
 
@@ -84,10 +84,12 @@ function makeHarness(providers: Provider[]) {
   } as unknown as Env
   const app = new Hono<AppEnv>()
   app.post('/v1/chat/completions', (c) => handleProxy(c))
+  app.post('/v1/messages', (c) => handleAnthropicMessages(c))
+  app.post('/v1/responses', (c) => handleResponses(c))
   return {
     points,
-    async post(bodyObj: Record<string, unknown>) {
-      const req = new Request('https://gw.test/v1/chat/completions', {
+    async post(bodyObj: Record<string, unknown>, path = '/v1/chat/completions') {
+      const req = new Request(`https://gw.test${path}`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(bodyObj),
@@ -192,5 +194,53 @@ describe('analytics 归属：渠道身份与上游模型必须落到数据点', 
     for (const p of h.points) {
       expect(p.blobs[BLOB.providerId]).toBe('')
     }
+  })
+
+  it('/v1/messages 与 /v1/responses 也写用量（修复前这两条入口一个点都不写）', async () => {
+    const json = JSON.stringify({
+      id: 'c1', object: 'chat.completion', model: 'gpt-test',
+      choices: [{ index: 0, message: { role: 'assistant', content: 'hi' }, finish_reason: 'stop' }],
+      usage: { prompt_tokens: 11, completion_tokens: 3, total_tokens: 14 },
+    })
+
+    for (const [path, body, route] of [
+      ['/v1/messages', { model: 'plain/gpt-test', max_tokens: 16, messages: [{ role: 'user', content: 'hi' }] }, 'messages'],
+      ['/v1/responses', { model: 'plain/gpt-test', input: 'hi' }, 'responses'],
+    ] as const) {
+      globalThis.fetch = vi.fn(async () => new Response(json, {
+        status: 200, headers: { 'Content-Type': 'application/json' },
+      })) as any
+      clearCache()
+      const h = makeHarness([plainProvider()])
+      const resp = await h.post(body as Record<string, unknown>, path)
+      expect(resp.status).toBe(200)
+      await resp.text()
+
+      expect(h.points.length, `${path} 应写 1 个数据点`).toBe(1)
+      const blobs = h.points[0].blobs
+      expect(blobs[BLOB.route], `${path} 的 route`).toBe(route)
+      expect(blobs[BLOB.providerId], `${path} 的 providerId`).toBe('plain')
+      expect(blobs[BLOB.upstreamModel], `${path} 的 upstreamModel`).toBe('gpt-test')
+      expect(blobs[BLOB.requestedModel], `${path} 的 requestedModel`).toBe('plain/gpt-test')
+    }
+  })
+
+  it('上游 4xx 记 failure（修复前一律记 success，失败率恒为 0）', async () => {
+    globalThis.fetch = vi.fn(async () => new Response(JSON.stringify({
+      error: { message: 'bad upstream', type: 'upstream_error' },
+    }), { status: 400, headers: { 'Content-Type': 'application/json' } })) as any
+
+    const h = makeHarness([plainProvider()])
+    const resp = await h.post({
+      model: 'plain/gpt-test',
+      messages: [{ role: 'user', content: 'hi' }],
+      stream: false,
+    })
+    expect(resp.status).toBe(400)
+    await resp.text()
+
+    expect(h.points.length).toBe(1)
+    expect(h.points[0].blobs[BLOB.result]).toBe('failure')
+    expect(h.points[0].doubles[7]).toBe(0) // successFlag
   })
 })

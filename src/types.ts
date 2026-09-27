@@ -735,6 +735,18 @@ export interface AppVariables {
     providerType: string
     upstreamModel: string
   }
+  /**
+   * /v1/messages 与 /v1/responses 入口解析出的请求元信息，供外层包装补记 analytics。
+   *
+   * 这两个入口此前完全不写用量（探针实测 writeDataPoint 调用数为 0），管理端统计里
+   * 看不到走 Anthropic / Responses 协议的流量。元信息在 body 解析后才可知，故由内层
+   * 处理器写入、外层包装读取。
+   */
+  analyticsRequest?: {
+    route: string
+    model: string
+    streamMode: 'sync' | 'stream'
+  }
 }
 
 export type AppEnv = {
