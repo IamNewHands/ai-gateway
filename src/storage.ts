@@ -240,22 +240,37 @@ export async function deleteSession(env: Env, sessionId: string): Promise<void> 
 // 下次客户端用 previous_response_id 引用时，把该历史追加回 messages，实现多轮上下文的存续。
 const RESPONSES_HISTORY_TTL = 2 * 60 * 60 // 与 M365 convCache TTL(2h) 对齐
 
-export async function saveResponseHistory(env: Env, responseId: string, messages: unknown[]): Promise<void> {
+/** 历史体含租户归属（v2）。旧条目是裸数组（v1，无归属），读取时按 legacy 放行。 */
+interface ResponseHistoryEnvelope {
+  v: 2
+  /** 调用方 API Key 哈希；空串表示未启用鉴权的部署 */
+  t: string
+  m: unknown[]
+}
+
+export async function saveResponseHistory(env: Env, responseId: string, messages: unknown[], tenant = ''): Promise<void> {
   if (!responseId) return
   try {
-    await env.KV.put(KV_KEYS.RESPONSES_PREFIX + responseId, JSON.stringify(messages || []), {
+    const envelope: ResponseHistoryEnvelope = { v: 2, t: tenant, m: messages || [] }
+    await env.KV.put(KV_KEYS.RESPONSES_PREFIX + responseId, JSON.stringify(envelope), {
       expirationTtl: RESPONSES_HISTORY_TTL,
     })
   } catch { /* 记忆保存失败不影响响应 */ }
 }
 
-export async function getResponseHistory(env: Env, responseId: string): Promise<unknown[] | null> {
+export async function getResponseHistory(env: Env, responseId: string, tenant = ''): Promise<unknown[] | null> {
   if (!responseId) return null
   try {
     const raw = await env.KV.get(KV_KEYS.RESPONSES_PREFIX + responseId)
     if (!raw) return null
-    const parsed = JSON.parse(raw)
-    return Array.isArray(parsed) ? parsed : null
+    const parsed: unknown = JSON.parse(raw)
+    // v1 legacy：裸数组，无租户归属，无法判定归属故放行（旧条目最多存活 2h）
+    if (Array.isArray(parsed)) return parsed
+    const env2 = parsed as Partial<ResponseHistoryEnvelope> | null
+    if (!env2 || env2.v !== 2 || !Array.isArray(env2.m)) return null
+    // 租户不匹配一律按不存在处理（不区分 404 与 403，避免泄漏 response.id 是否存在）
+    if (String(env2.t ?? '') !== tenant) return null
+    return env2.m
   } catch { return null }
 }
 
@@ -272,9 +287,14 @@ export interface ResponseAliasMeta {
   createdAt: number
   /** 已消费的 tool call_id 列表（一次性：提交过 tool 结果后不得再提交） */
   consumedCallIds: string[]
+  /**
+   * 所属租户（调用方 API Key 哈希）。写入时必填；读取时若与调用方租户不符按不存在处理。
+   * 旧条目缺失该字段 → 视为 legacy 放行（旧别名最多存活 7 天）。
+   */
+  tenant?: string
 }
 
-export async function saveResponseAlias(env: Env, responseId: string, meta: ResponseAliasMeta): Promise<void> {
+export async function saveResponseAlias(env: Env, responseId: string, meta: ResponseAliasMeta, tenant = ''): Promise<void> {
   if (!responseId) return
   try {
     // 别名不可变：已存在则不覆盖（分支点一旦确定，后续只能派生新分支）
@@ -284,6 +304,7 @@ export async function saveResponseAlias(env: Env, responseId: string, meta: Resp
       sourceResponseId: meta.sourceResponseId,
       createdAt: meta.createdAt,
       consumedCallIds: (meta.consumedCallIds || []).slice(-MAX_CONSUMED_CALL_IDS),
+      tenant: meta.tenant ?? tenant,
     }
     await env.KV.put(KV_KEYS.RESPONSES_ALIAS_PREFIX + responseId, JSON.stringify(bounded), {
       expirationTtl: RESPONSE_ALIAS_TTL_SECONDS,
@@ -291,17 +312,21 @@ export async function saveResponseAlias(env: Env, responseId: string, meta: Resp
   } catch { /* 别名保存失败不影响响应 */ }
 }
 
-export async function getResponseAlias(env: Env, responseId: string): Promise<ResponseAliasMeta | null> {
+export async function getResponseAlias(env: Env, responseId: string, tenant = ''): Promise<ResponseAliasMeta | null> {
   if (!responseId) return null
   try {
     const raw = await env.KV.get(KV_KEYS.RESPONSES_ALIAS_PREFIX + responseId)
     if (!raw) return null
     const parsed = JSON.parse(raw) as ResponseAliasMeta
     if (!parsed || typeof parsed !== 'object') return null
+    const owner = typeof parsed.tenant === 'string' ? parsed.tenant : null
+    // 有归属则必须匹配；legacy（无 tenant 字段）放行以兼容旧条目
+    if (owner !== null && owner !== tenant) return null
     return {
       sourceResponseId: String(parsed.sourceResponseId || responseId),
       createdAt: Number(parsed.createdAt) || 0,
       consumedCallIds: Array.isArray(parsed.consumedCallIds) ? parsed.consumedCallIds.map(String) : [],
+      tenant: owner ?? undefined,
     }
   } catch { return null }
 }
@@ -310,15 +335,15 @@ export async function getResponseAlias(env: Env, responseId: string): Promise<Re
  * 消费一个 tool call_id（一次性）。返回 false 表示该 call_id 已被消费过，
  * 调用方应返回 409 tool_output_already_consumed，避免重复执行有副作用的工具。
  */
-export async function consumeResponseCallId(env: Env, responseId: string, callId: string): Promise<boolean> {
+export async function consumeResponseCallId(env: Env, responseId: string, callId: string, tenant = ''): Promise<boolean> {
   if (!responseId || !callId) return true
   try {
-    const alias = await getResponseAlias(env, responseId)
+    const alias = await getResponseAlias(env, responseId, tenant)
     if (!alias) return true
     if (alias.consumedCallIds.includes(callId)) return false
     alias.consumedCallIds = [...alias.consumedCallIds, callId].slice(-MAX_CONSUMED_CALL_IDS)
     // 消费表更新采用就地覆盖（与别名"不可变分支点"互不冲突：只追加消费记录）
-    await env.KV.put(KV_KEYS.RESPONSES_ALIAS_PREFIX + responseId, JSON.stringify(alias), {
+    await env.KV.put(KV_KEYS.RESPONSES_ALIAS_PREFIX + responseId, JSON.stringify({ ...alias, tenant: alias.tenant ?? tenant }), {
       expirationTtl: RESPONSE_ALIAS_TTL_SECONDS,
     })
     return true

@@ -12,6 +12,7 @@
 import type { Env, Provider } from '../types'
 import { isM365Provider } from './proxy'
 import { getM365Account, updateM365RefreshToken, M365_OAUTH } from './oauth'
+import { isPrivateOrLocalHostname } from './multimodal'
 import { base64ByteLength, MAX_IMAGE_BINARY_BYTES } from '../request-body'
 
 /** DALL-E 请求格式 */
@@ -94,6 +95,39 @@ async function getDesignerToken(env: Env, providerId: string, _provider: Provide
   return json['access_token'] as string
 }
 
+/** 非 designer 图床（跨域跳转后的匿名下载）的重定向跳数上限 */
+const MAX_CDN_REDIRECTS = 5
+
+/**
+ * 无鉴权图床下载：手动跟随重定向，每一跳都用 `isPrivateOrLocalHostname` 重新校验。
+ *
+ * 原实现用 `redirect: 'follow'`：上游 3xx 的 Location 可把 Worker 导向任意地址
+ * （`https://[::1]/`、CGNAT `100.64/10`、`169.254.0.0/16` 等），且跳数不受控。
+ * 改为 manual + 逐跳校验 + 跳数上限，公共 CDN 的 DNS 域名不受影响。
+ *
+ * 导出仅供测试（生产调用点为 downloadDesignerImage 的跨域分支）。
+ */
+export async function fetchImageCDNResponse(url: string, hops = 0): Promise<Response> {
+  if (hops > MAX_CDN_REDIRECTS) throw new Error('image CDN redirect limit exceeded')
+  let target: URL
+  try { target = new URL(url) } catch { throw new Error('image CDN redirect to invalid URL') }
+  if (target.protocol !== 'https:' || target.username !== '' || target.password !== '' || isPrivateOrLocalHostname(target.hostname)) {
+    throw new Error('image CDN redirect to unsafe address')
+  }
+  const resp = await fetch(url, {
+    headers: { Accept: 'image/*' },
+    signal: AbortSignal.timeout(30000),
+    redirect: 'manual',
+  })
+  if (resp.status >= 300 && resp.status < 400) {
+    const location = resp.headers.get('Location')
+    if (!location) throw new Error('image CDN redirect without Location')
+    const next = location.startsWith('http') ? location : new URL(location, url).toString()
+    return fetchImageCDNResponse(next, hops + 1)
+  }
+  return resp
+}
+
 /** 下载 Designer 图片。重定向仅允许落到 designerapp 主机、最多 3 跳，鉴权只发给目标图床（防 token 泄露 / SSRF） */
 async function downloadDesignerImage(url: string, token: string, hops = 0): Promise<{ data: Uint8Array; contentType: string }> {
   const MAX_REDIRECTS = 3
@@ -124,8 +158,8 @@ async function downloadDesignerImage(url: string, token: string, hops = 0): Prom
     if (nextHost === 'designerapp.officeapps.live.com') {
       return downloadDesignerImage(next, token, hops + 1)
     }
-    // 非 designer 域的图床：视为一次跨域跳转，改用无鉴权下载
-    const anon = await fetch(next, { headers: { Accept: 'image/*' }, signal: AbortSignal.timeout(30000), redirect: 'follow' })
+    // 非 designer 域的图床：视为一次跨域跳转，改用无鉴权下载（逐跳校验，见 fetchImageCDNResponse）
+    const anon = await fetchImageCDNResponse(next)
     if (!anon.ok) throw new Error(`Designer image download HTTP ${anon.status}`)
     const buf = await anon.arrayBuffer()
     if (buf.byteLength > 20 * 1024 * 1024) {

@@ -4443,8 +4443,10 @@ async function handleResponsesInner(c: Context<AppEnv>) {
     const inputMsgs = ((openaiBody['messages'] as unknown[]) || [])
     let g5Base = [...inputMsgs]
     const prevRespId = responsesBody['previous_response_id']
+    // 租户归属：历史/别名只允许同一调用方 API Key 读取（键可被毫秒时间戳枚举，见 §3.3）
+    const g5Tenant = c.get('proxyKeyHash') || ''
     if (prevRespId) {
-      const prior = await getResponseHistory(c.env, String(prevRespId))
+      const prior = await getResponseHistory(c.env, String(prevRespId), g5Tenant)
       if (prior && prior.length > 0) {
         openaiBody['messages'] = [...prior, ...inputMsgs]
         g5Base = [...prior, ...g5Base]
@@ -4458,7 +4460,7 @@ async function handleResponsesInner(c: Context<AppEnv>) {
 
     // G5：把「已解析历史 + 本次输入 + assistant 输出」按 response.id 存入 KV
     const g5Save = (respId: string, fullHistory: unknown[]) => {
-      try { c.executionCtx.waitUntil(saveResponseHistory(c.env, respId, fullHistory)) } catch {}
+      try { c.executionCtx.waitUntil(saveResponseHistory(c.env, respId, fullHistory, g5Tenant)) } catch {}
     }
 
     const originalStream = responsesReq.stream === true
@@ -4536,7 +4538,7 @@ async function handleResponsesInner(c: Context<AppEnv>) {
       // Responses 别名强约束：校验本次提交的 tool 结果 call_id 是否已被消费（防重复执行有副作用工具），
       // 并在完成后把新建的 response.id 注册为不可变别名，供后续 previous_response_id 派生分支。
       const prevId = responsesBody['previous_response_id'] ? String(responsesBody['previous_response_id']) : ''
-      const consumedCheck = await validateConsumedCallIds(c.env, prevId, responsesReq)
+      const consumedCheck = await validateConsumedCallIds(c.env, prevId, responsesReq, g5Tenant)
       if (!consumedCheck.ok) {
         return c.json({ error: { message: consumedCheck.message, type: 'tool_output_already_consumed' } }, 409)
       }
@@ -4548,10 +4550,10 @@ async function handleResponsesInner(c: Context<AppEnv>) {
               sourceResponseId: prevId || respId,
               createdAt: Date.now(),
               consumedCallIds: consumedCheck.callIds,
-            })
+            }, g5Tenant)
             // 把本请求提交的 call_id 标记为已消费（写在被引用的别名上），防止重复回填执行结果
             for (const callId of consumedCheck.callIds) {
-              await consumeResponseCallId(c.env, prevId, callId)
+              await consumeResponseCallId(c.env, prevId, callId, g5Tenant)
             }
           })())
         } catch { /* 别名保存失败不影响响应 */ }
@@ -5316,6 +5318,7 @@ async function validateConsumedCallIds(
   env: Env,
   previousResponseId: string,
   responsesReq: Record<string, unknown>,
+  tenant = '',
 ): Promise<{ ok: true; callIds: string[] } | { ok: false; message: string }> {
   const callIds: string[] = []
   const input = responsesReq['input']
@@ -5329,7 +5332,7 @@ async function validateConsumedCallIds(
     }
   }
   if (!previousResponseId || callIds.length === 0) return { ok: true, callIds }
-  const alias = await getResponseAlias(env, previousResponseId)
+  const alias = await getResponseAlias(env, previousResponseId, tenant)
   if (alias) {
     for (const callId of callIds) {
       if (alias.consumedCallIds.includes(callId)) {

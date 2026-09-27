@@ -13,6 +13,7 @@
 import { classifyUpdateMessages, extractToolEvents, normalizeFrame, imageURLs } from './events'
 import type { ChatHubStreamEvent } from './events'
 import { toolProtocolPrompt, clientToolWireName, redactPublicFunctionNames, redactSchemaDocumentation } from './tools'
+import { isPrivateOrLocalHostname } from './multimodal'
 
 /**
  * Workers 出站 WebSocket 客户端。
@@ -203,17 +204,24 @@ function buildWSURL(acc: ChatHubAccount, sessionID: string, conversationID: stri
   return `${WS_BASE}/${encodeURIComponent(acc.oid)}@${encodeURIComponent(acc.tid)}?${q.toString()}`
 }
 
-/** 校验远程图片下载 URL（防 SSRF，同 ai-gateway isSafeHttpUrl 思路） */
-function isSafeDownloadURL(url: string): boolean {
+/**
+ * 校验远程图片下载 URL（防 SSRF）。
+ *
+ * 与入站的 `isPrivateOrLocalHostname`（multimodal.ts）共用同一套私网/本机判定，
+ * 覆盖 IPv6 全形态（含 `::ffff:` 映射）、CGNAT `100.64/10`、`169.254.0.0/16`、
+ * `0.0.0.0`、组播等——此前这里的字符串正则只拦 IPv4 私有段与精确
+ * `169.254.169.254`，重定向到 `https://[::1]/` 之类的地址可通过。
+ *
+ * 仅在**重定向跳转**场景起作用：客户端入站图片 URL 已先经 multimodal.ts 校验，
+ * 但重定向目标不经过入站校验，必须在此逐跳重新判定。
+ */
+export function isSafeDownloadURL(url: string): boolean {
   try {
     const u = new URL(url)
     if (u.protocol !== 'https:') return false
-    const host = u.hostname.toLowerCase()
-    if (host === 'localhost' || host.endsWith('.local')) return false
-    if (/^(10\.|127\.|172\.(1[6-9]|2\d|3[01])\.|192\.168\.)/.test(host)) return false
-    if (host === '169.254.169.254') return false
     // 拒绝带用户名/密码（userinfo）的 URL，避免凭证被带到重定向目标
     if (u.username !== '' || u.password !== '') return false
+    if (isPrivateOrLocalHostname(u.hostname)) return false
     return true
   } catch {
     return false
@@ -1042,14 +1050,25 @@ export function chatPayload(req: ChatHubRequest, requestID: string, firstTurn = 
     break
   }
 
+  // optionsSets 顺序与内容对齐真实浏览器流量（HAR har1#364 SEND，见
+  // docs/har-mining/02-hidden-endpoints.md:100-106 与 01-ws-protocol-payload.md:418-428 §6.3）。
+  // 前 33 项与源 internal/chathub/client.go:1422-1458 逐项同序（MemoryV2=true 形态，
+  // update_memory_plugin/add_custom_instructions 位于 cwc_fileupload_odb 之后、cwc_flux_v3 之前）；
+  // §6.3 指出「数组比较型风控会看出顺序差异」，故此处按真实串顺序排列而非随意追加。
   const optionsSets = [
     'search_result_progress_messages_with_search_queries',
     'update_textdoc_response_after_streaming',
     'deepleo_networking_timeout_10minutes_canmore',
     'cwc_flux_image',
+    'cwc_code_interpreter',
+    'cwc_code_interpreter_amsfix',
     'cwcfluxgptv',
     'flux_v3_gptv_enable_upload_multi_image_in_turn_wo_ch',
     'gptvnorm2048',
+    'cwc_code_interpreter_citation_fix',
+    'code_interpreter_interactive_charts',
+    'cwc_code_interpreter_interactive_charts_inline_image',
+    'code_interpreter_matplotlib_patching',
     'cwc_fileupload_odb',
     'update_memory_plugin',
     'add_custom_instructions',
@@ -1057,11 +1076,24 @@ export function chatPayload(req: ChatHubRequest, requestID: string, firstTurn = 
     'flux_v3_progress_messages',
     'enable_batch_token_processing',
     'enable_gg_gpt',
-    'cwc_code_interpreter_v3',
-    'rich_responses',
-    // 静态补全缺失项（同原版 optionsSets 静态部分；不引入 FeatureFlags 条件项）
-    'code-interpreter',
     'flux_v3_references',
+    'flux_v3_references_entities',
+    'flux_v3_references_ci',
+    'add_filestore_filetype',
+    'cwc_code_interpreter_citation_sourceannotations',
+    'cdxcwc_code_interpreter_hallucinated_url_filter',
+    'flux_v3_image_gen_enable_dimensions',
+    'flux_v3_image_gen_enable_non_watermarked_storage',
+    'flux_v3_image_gen_enable_icon_dimensions',
+    'flux_v3_image_gen_enable_system_text_with_params',
+    'flux_v3_image_gen_enable_designer_dimensions_meta_prompting_in_system_prompts',
+    'flux_v3_image_gen_enable_story',
+    'rich_responses',
+    // —— 目标自造项（HAR 与源均无，保留在尾部不删除）——
+    // 无法在本机用有效 M365 token 验证移除后的影响，故只做追加、不做删除；
+    // 待实机抓包确认后可作为「多余项」清理（同 §4.1 的 variants 多余项处理思路）。
+    'cwc_code_interpreter_v3',
+    'code-interpreter',
     'image-gen-dimensions-1024x1024',
     'image-gen-dimensions-1792x1792',
   ]

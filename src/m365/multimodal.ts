@@ -92,7 +92,17 @@ function strictBase64Bytes(value: string, maximumBytes = Number.POSITIVE_INFINIT
   return (value.length / 4) * 3 - padding
 }
 
-function privateOrLocalHostname(hostname: string): boolean {
+/**
+ * 私网/本机主机名判定（SSRF 拦截面）。
+ *
+ * 同时用于「客户端图片 URL 入站校验」与「下载期间每一跳重定向校验」（见 chathub.ts
+ * `isSafeDownloadURL` / images.ts `fetchImageCDNResponse`），保证同一套规则覆盖
+ * 入站与出站两侧，避免重定向到 `[::1]`、`100.64/10` 等地址绕过。
+ *
+ * 注：本函数只做字面量判定，不做 DNS 解析（Workers 无同步 DNS API），
+ * DNS rebinding 属已知残余风险。
+ */
+export function isPrivateOrLocalHostname(hostname: string): boolean {
   const host = hostname.toLowerCase().replace(/^\[|\]$/gu, '')
   if (!host || host === 'localhost' || host.endsWith('.localhost') || host.endsWith('.local') || host.endsWith('.internal')) return true
   // Image CDNs normally use DNS names. Reject every literal IPv6 spelling so
@@ -149,7 +159,7 @@ function normalizeImageURL(value: unknown, detail: unknown): { attachment: Norma
   } catch {
     throw new MultimodalInputError('invalid_image')
   }
-  if (url.protocol !== 'https:' || url.username || url.password || privateOrLocalHostname(url.hostname)) {
+  if (url.protocol !== 'https:' || url.username || url.password || isPrivateOrLocalHostname(url.hostname)) {
     throw new MultimodalInputError('invalid_image')
   }
   return {

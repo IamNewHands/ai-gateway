@@ -366,9 +366,10 @@ export class M365Session {
       }
     }, Math.min(15_000, Math.max(1000, Math.floor(leaseTtlMs / 3))))
     try {
-    // convCache 复用层：新会话且无工具时，命中 account+model+systemPromptHash+tenant 则沿用云端对话（同原版第三层复用，租户隔离对齐 #57）
+    // convCache 复用层：新会话命中 account+model+systemPromptHash+tenant 则沿用云端对话（同原版第三层复用，租户隔离对齐 #57）。
+    // 门禁见 mayReuseConvCache：客户端显式声明会话边界时不复用，否则会串到别的会话的云端历史。
     const sysHash = model ? systemPromptHash(messages as never[]) : ''
-    if (resolved.isNew && model && sysHash) {
+    if (mayReuseConvCache(resolved.isNew, model, sysHash, explicitSessionId)) {
       try {
         const reuse = await convCacheLookup(this.env, providerId, acc.oid, model, sysHash, payload.tenant)
         if (reuse) {
@@ -1615,4 +1616,22 @@ export function sessionKey(providerId: string, explicitSessionId: string | undef
     return `${providerId}:t:${t}:ctx:${sha256Hex(parts.join('||'))}`
   }
   return `${providerId}:t:${t}:ex:${crypto.randomUUID()}`
+}
+
+/**
+ * convCache 复用门禁（同原版第三层复用的适用条件，收紧一处）。
+ *
+ * 原版按 account+model+systemPromptHash+tenant 命中即沿用云端对话，键里**不含 session id**。
+ * 客户端显式声明了会话边界（body 显式字段 / metadata.* 里的稳定 id，见
+ * `session-candidates.ts` `explicitSessionIdFromBody`）时，这个复用会把**新建的显式会话**
+ * 改写成同账号+同模型+同 system prompt 的**另一个会话**的云端对话：
+ * `resolveSession` 对未知显式 ID 返回 `isNew:true`（session.ts:299），门禁只看 isNew 就拦不住，
+ * 后果是首个请求只发最新一条用户消息（durable.ts 复用分支）却挂在别人的云端历史上，
+ * 且客户端无法用显式 session id 逃逸。
+ *
+ * 因此显式 session id 视为「这是一条新的会话边界」，不参与 convCache 复用。
+ * 代价：这类请求失去复用省下的上下文 token，换来会话隔离。
+ */
+export function mayReuseConvCache(isNew: boolean, model: string, sysHash: string, explicitSessionId: string | undefined): boolean {
+  return Boolean(isNew && model && sysHash) && !explicitSessionId
 }
