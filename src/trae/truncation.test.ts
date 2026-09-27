@@ -479,3 +479,118 @@ describe('Trae SOLO 收尾审计：done 次数与 done 之后的内容', () => {
     expect(info.contentChars).toBe(2)
   })
 })
+
+/**
+ * transport 换号无信息增益：`transport` 与账号健康无关（`applyChatError` 对它刻意不罚号），
+ * 第 2 次撞的仍是同一条「网关↔上游建连」。故撞满 `MAX_TRANSPORT_ATTEMPTS`(2) 即跳出，
+ * 不再拿健康账号白耗 30s/次（实测 2026-09-27 连撞两个账号 62s，520ms 后重试即成功）。
+ *
+ * 两个 owner 都要覆盖：
+ *  - SOLO 主循环（proxyTraeChatRequest）：3 个账号在池里，但只允许撞 2 次；
+ *  - Work 循环（executeWorkRequest）：transport 既不罚号（workErrCount 保持 0），也只撞 2 次。
+ */
+describe('Trae transport：撞满 2 次即跳出（换号无信息增益）', () => {
+  const PROVIDER_ID = 'trae-transport-cap'
+  const UIDS = ['u_cap_1', 'u_cap_2', 'u_cap_3']
+
+  function makeEnv(): any {
+    return {
+      KV: {
+        data: new Map<string, string>(),
+        async get(key: string) { return this.data.get(key) || null },
+        async put(key: string, val: string) { this.data.set(key, val) },
+        async delete(key: string) { this.data.delete(key) },
+      },
+    }
+  }
+
+  /** 3 个账号：足够证明「不是账号池挑不出第 3 个」，而是刻意不撞第 3 次。 */
+  function makeProvider(id: string): any {
+    return {
+      id,
+      name: 'TRAE transport cap',
+      type: 'trae',
+      apiKeys: UIDS.map((uid) => ({
+        key: JSON.stringify({
+          uid,
+          token: `tok_${uid}`,
+          refreshToken: `ref_${uid}`,
+          // 毫秒口径（远大于秒口径的 now+24h）→ needsTraeRefresh 为 false，测试只打转发端点
+          expiresAt: Date.now() + 3600_000,
+        }),
+        enabled: true,
+      })),
+    }
+  }
+
+  it('SOLO 与 Work 双双 transport → SOLO 只撞 2 次（池里还有第 3 个账号也不撞）', async () => {
+    const originalFetch = globalThis.fetch
+    let soloCalls = 0
+    let workCalls = 0
+    globalThis.fetch = async (input: any) => {
+      const url = String(input)
+      if (url.includes('/api/agent/v3/create_agent_task')) {
+        workCalls++
+        throw new Error('The operation was aborted')
+      }
+      if (url.includes('/api/agent/v3/llm_utils_chat')) {
+        soloCalls++
+        throw new Error('The operation was aborted')
+      }
+      return new Response('not found', { status: 404 })
+    }
+    try {
+      const env = makeEnv()
+      const pid = `${PROVIDER_ID}-solo`
+      const provider = makeProvider(pid)
+      for (const uid of UIDS) await setTraeWorkCredits(env, pid, uid, 50)
+
+      const resp = await proxyTraeChatRequest(env, provider, {
+        model: 'glm-5.2',
+        messages: [{ role: 'user', content: 'hi' }],
+        stream: false,
+      })
+
+      // 修复前是 3（MAX_ROTATE）；现在第 2 次 transport 即定性，跳出
+      expect(soloCalls).toBe(2)
+      // Work 兜底同样撞满 2 次即停
+      expect(workCalls).toBe(2)
+      expect(resp.status).toBe(503)
+      const body = await resp.json() as any
+      expect(body.error.code).toBe('upstream_unreachable')
+      expect(String(body.error.message)).not.toContain('all accounts unavailable')
+    } finally {
+      globalThis.fetch = originalFetch
+    }
+  })
+
+  it('Work 通道 transport 不罚号：workErrCount/errCount 全为 0、不进冷却', async () => {
+    const originalFetch = globalThis.fetch
+    globalThis.fetch = async () => { throw new Error('The operation was aborted') }
+    try {
+      const env = makeEnv()
+      const pid = `${PROVIDER_ID}-work`
+      const provider = makeProvider(pid)
+      for (const uid of UIDS) await setTraeWorkCredits(env, pid, uid, 50)
+
+      // 显式 Work 模型 → 直通 executeWorkRequest，不经过 SOLO 主循环
+      const resp = await proxyTraeChatRequest(env, provider, {
+        model: 'DeepSeek-V4-Flash-Official',
+        messages: [{ role: 'user', content: 'hi' }],
+        stream: false,
+      })
+
+      expect(resp.status).toBe(503)
+      const pool = await readTraePool(env, pid)
+      for (const uid of UIDS) {
+        // 连接层故障不是账号故障：既不计 SOLO errCount，也不计 workErrCount
+        expect(pool[uid]?.errCount ?? 0).toBe(0)
+        expect(pool[uid]?.until ?? 0).toBe(0)
+        expect(pool[uid]?.workErrCount ?? 0).toBe(0)
+        expect(pool[uid]?.workUntil ?? 0).toBe(0)
+      }
+    } finally {
+      globalThis.fetch = originalFetch
+    }
+  })
+})

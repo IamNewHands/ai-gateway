@@ -152,6 +152,16 @@ TRAE 相关问题前先读本节。**
   宽松客户端仍能靠 `stop` + `[DONE]` 正常收尾
 - `kind='transport'` 纳入 Work 通道兜底（仅 `!hasTools` 时）：Work 走另一条 host/协议
   （`create_agent_task`），是同因不同路的真兜底，比继续轮流撞同一个建连超时（30s×N）划算
+- **transport 撞满 2 次即跳出**（`MAX_TRANSPORT_ATTEMPTS = 2`，2026-09-27 追加）：transport 与
+  账号健康无关（`applyChatError` 对它刻意不罚号），**换号没有信息增益**——第 2 次撞的还是同一条
+  「网关↔上游建连」。SOLO 主循环与 Work 循环（`executeWorkRequest`）各自计数、各自跳出；Work
+  循环原先**没有** transport 分支，transport 会落到 `else` 走 `noteTraeWorkError` **罚号**（违反
+  上面那条铁律），本轮一并修掉。保留 2 次而非 1 次：单次失败可能只是抖动，第 2 次仍失败才足以
+  定性为「链路持续不可达」。**transport 路径的 Work 兜底每次请求只试一次**（`workFallbackTried`）：
+  第 1 次 transport 时循环内已兜底，撞满跳出后函数末尾按该标记跳过，否则同一条链路会被撞两轮、
+  503 前的总等待被放大成 2×（2×30s ×2）。
+  **不要"顺手改回" MAX_ROTATE 的 3**：那 3 次是给**账号相关**故障（plan_limit/soft_rate/
+  session_dead）用的，撞不同账号才有信息增益。
 
 **测试样本铁律**：构造「成功响应」样本时必须带自然收尾事件（SOLO `event: done`、Work
 `event: done` 或 `[DONE]`）。修该缺陷时当场揪出 4 处既有样本缺收尾事件却断言 200/`stop`

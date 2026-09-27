@@ -44,6 +44,18 @@ export const TRAE_PROVIDER_ID = 'trae'
 /** 单请求最多换号次数（Go 默认 3）。 */
 const MAX_ROTATE = 3
 
+/**
+ * transport（建连超时/被掐断）连续撞满几次即停止换号。
+ *
+ * 依据：transport 与账号健康无关（`applyChatError` 对它刻意不罚号），**换号没有信息增益**——
+ * 第 2 次仍是同一个「网关↔上游建连」问题，只是再白耗一个 `TRAE_CHAT_CONNECT_TIMEOUT_MS`(30s)。
+ * 实测 2026-09-27：连撞两个账号 62s ≈ 2×30s，而 520ms 后重试即成功（池子本来是健康的）。
+ *
+ * 保留 2 次而非 1 次：单次失败可能只是瞬时抖动，换一个账号再试一次仍有信息量（能区分
+ * 「抖动」与「链路持续不可达」）；第 2 次仍失败即可定性为后者，继续轮转纯属浪费。
+ */
+const MAX_TRANSPORT_ATTEMPTS = 2
+
 /** 是否是 TRAE SOLO 提供商（id 固定或用 trae 域）。 */
 export function isTraeProvider(provider: Provider): boolean {
   return Boolean(provider.id === TRAE_PROVIDER_ID || (provider.baseUrl && provider.baseUrl.includes('trae')))
@@ -319,6 +331,8 @@ export async function executeWorkRequest(
   const cd = resolveTraeCooldown(provider)
   const tried = new Set<string>()
   let lastErr: Error | null = null
+  // transport 计数：与账号无关的链路故障，换号无信息增益（见 MAX_TRANSPORT_ATTEMPTS）。
+  let transportAttempts = 0
   // 非流式聚合见过「上游没发 done」：Work 是最后一层兜底，此时不能回半句话，
   // 也不能用 no_healthy_account 把网络截断说成账号池不可用（曾把排查引到账号上）。
   let truncationSeen = false
@@ -360,8 +374,16 @@ export async function executeWorkRequest(
     } catch (e) {
       lastErr = e as Error
       const status = (e as any).status || 0
+      const kind = (e as any).kind || ''
       const msg = (e as any).msg || (e as Error).message || ''
-      if (status === 429) {
+      if (kind === 'transport') {
+        // 连接层失败（建连超时/被掐断）与账号健康无关：**不冷却、不累计 workErrCount**
+        //（与 SOLO 侧 `applyChatError` 的 transport 分支同纪律，见 CODING_NOTES
+        //「连接层/收尾层失败不是账号故障，禁止罚号」）。换号也没有信息增益——第 2 次
+        // 撞的是同一条「网关↔上游建连」，故撞满 MAX_TRANSPORT_ATTEMPTS 即跳出。
+        transportAttempts++
+        if (transportAttempts >= MAX_TRANSPORT_ATTEMPTS) break
+      } else if (status === 429) {
         await cooldownTraeWorkAccount(env, provider.id, account.uid, cd.softMs, 'work 429 rate limit')
       } else if (status === 401 || status === 403) {
         await disableTraeAccount(env, provider.id, account.uid, 'work session dead')
@@ -536,6 +558,11 @@ export async function proxyTraeChatRequest(
   const cd = resolveTraeCooldown(provider)
   const tried = new Set<string>()
   let lastErr: Error | null = null
+  // transport 计数：与账号无关的链路故障，换号无信息增益（见 MAX_TRANSPORT_ATTEMPTS）。
+  let transportAttempts = 0
+  // Work 兜底是否已在本循环内尝试过：跳出后函数末尾还会再兜底一次，每次兜底都是
+  // 2×30s 的建连等待。已在循环内试过就不再重复（同一 body、同一时刻、同一条链路）。
+  let workFallbackTried = false
   // 特性A：账号级并发上限与空闲回收阈值（未配置则维持原独占挑选语义）
   const concurrency = typeof provider.traeConcurrency === 'number' ? provider.traeConcurrency : 0
   const idleMs = typeof provider.traeSessionIdleMs === 'number' ? provider.traeSessionIdleMs : 0
@@ -588,7 +615,21 @@ export async function proxyTraeChatRequest(
       // transport 也纳入的理由：它不罚号、也不证明账号坏（见 applyChatError），继续轮流撞
       // 同一个建连超时只会把 30s×N 白耗完再回 503（实测 2026-09-27 连撞两个账号 62s）。
       // Work 走的是另一条 host/协议（chatWorkStream），是同因不同路的真兜底。
-      if ((kind === 'plan_limit' || kind === 'soft_rate' || kind === 'transport') && !hasTools) {
+      if (kind === 'transport') {
+        // 换号没有信息增益：transport 与账号无关（applyChatError 对它刻意不罚号），第 2 次撞的
+        // 还是同一条「网关↔上游建连」。撞满 MAX_TRANSPORT_ATTEMPTS 即跳出，不再用健康账号白耗 30s。
+        transportAttempts++
+        // Work 兜底只试一次：Work 侧同样撞「网关↔上游建连」，试过就不再重复（跳出后函数末尾
+        // 也会按 workFallbackTried 跳过），否则同一条链路会被撞两轮、等待被放大成 2×。
+        if (!hasTools && !workFallbackTried) {
+          workFallbackTried = true
+          const fallbackResp = await executeWorkRequest(env, provider, body, configName, prompt, stream)
+          if (fallbackResp) return fallbackResp
+        }
+        if (transportAttempts >= MAX_TRANSPORT_ATTEMPTS) break
+        continue
+      }
+      if ((kind === 'plan_limit' || kind === 'soft_rate') && !hasTools) {
         const fallbackResp = await executeWorkRequest(env, provider, body, configName, prompt, stream)
         if (fallbackResp) return fallbackResp
       }
@@ -733,8 +774,10 @@ export async function proxyTraeChatRequest(
     })
   }
 
-  // 2. 所有 SOLO 账号均不可用（全部冷却/禁用/额度耗尽），最终尝试 Work 通道兜底
-  if (!hasTools) {
+  // 2. 所有 SOLO 账号均不可用（全部冷却/禁用/额度耗尽），最终尝试 Work 通道兜底。
+  //    循环内已兜底过就不再重复：transport 撞满跳出时循环里刚试过 Work，而 Work 侧同样
+  //    撞的是「网关↔上游建连」，再撞一遍只是又白等 2×30s（实测 62s 那次的放大来源）。
+  if (!hasTools && !workFallbackTried) {
     const fallbackResp = await executeWorkRequest(env, provider, body, configName, prompt, stream)
     if (fallbackResp) return fallbackResp
   }
