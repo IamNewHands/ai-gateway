@@ -594,3 +594,147 @@ describe('Trae transport：撞满 2 次即跳出（换号无信息增益）', ()
     }
   })
 })
+
+/**
+ * Token 预刷新（`exchangeToken` → `doJson`）阶段的连接层失败。
+ *
+ * 缺陷（本轮修）：`doJson` / `doJsonText` 原先抛**裸** Error（无 `kind`），于是 proxy 的
+ * refresh catch 走 `else` 分支把网络抖动当成账号故障冷却 10 分钟——正是 CODING_NOTES
+ * 「连接层/收尾层失败不是账号故障，禁止罚号」的反面，且两个循环（SOLO / Work）都有这一处。
+ *
+ * 修法：`doJson` / `doJsonText` 的 fetch catch 打 `kind='transport'`；两处 refresh catch 加
+ * transport 分支——不冷却、只计数、撞满 `MAX_TRANSPORT_ATTEMPTS` 即跳出。
+ *
+ * 用 `expiresAt: 0` 强制 `needsTraeRefresh` 为真，使请求在**刷新阶段**就失败（不碰转发端点）。
+ */
+describe('Trae token 预刷新：连接层失败不罚号、撞满 2 次即跳出', () => {
+  const PROVIDER_ID = 'trae-refresh-transport'
+  const UIDS = ['u_rf_1', 'u_rf_2', 'u_rf_3']
+
+  function makeEnv(): any {
+    return {
+      KV: {
+        data: new Map<string, string>(),
+        async get(key: string) { return this.data.get(key) || null },
+        async put(key: string, val: string) { this.data.set(key, val) },
+        async delete(key: string) { this.data.delete(key) },
+      },
+    }
+  }
+
+  /** expiresAt: 0 → needsTraeRefresh 恒为真（每轮必先刷新 token）。 */
+  function makeProvider(id: string): any {
+    return {
+      id,
+      name: 'TRAE refresh transport',
+      type: 'trae',
+      apiKeys: UIDS.map((uid) => ({
+        key: JSON.stringify({
+          uid,
+          token: `tok_${uid}`,
+          refreshToken: `ref_${uid}`,
+          expiresAt: 0,
+        }),
+        enabled: true,
+      })),
+    }
+  }
+
+  const EXCHANGE = '/cloudide/api/v3/trae/oauth/ExchangeToken'
+
+  it('SOLO 循环：刷新阶段 transport → 只撞 2 次、不冷却账号、503 upstream_unreachable', async () => {
+    const originalFetch = globalThis.fetch
+    let exchangeCalls = 0
+    let forwardCalls = 0
+    globalThis.fetch = async (input: any) => {
+      const url = String(input)
+      if (url.includes(EXCHANGE)) {
+        exchangeCalls++
+        throw new Error('The operation was aborted')
+      }
+      forwardCalls++
+      return new Response('not found', { status: 404 })
+    }
+    try {
+      const env = makeEnv()
+      const pid = `${PROVIDER_ID}-solo`
+      const provider = makeProvider(pid)
+
+      const resp = await proxyTraeChatRequest(env, provider, {
+        model: 'glm-5.2',
+        messages: [{ role: 'user', content: 'hi' }],
+        stream: false,
+        // 带 tools → Work 兜底禁用，把断言锁在 SOLO 循环这一处
+        tools: [{ type: 'function', function: { name: 'noop', parameters: { type: 'object', properties: {} } } }],
+      })
+
+      // 修复前是 3（MAX_ROTATE）；现在第 2 次 transport 即定性，跳出
+      expect(exchangeCalls).toBe(2)
+      // 刷新就失败 → 从未打到转发端点
+      expect(forwardCalls).toBe(0)
+      expect(resp.status).toBe(503)
+      const body = await resp.json() as any
+      expect(body.error.code).toBe('upstream_unreachable')
+
+      // 核心：网络抖动不再被当成账号故障（修复前这里是 errMs 冷却 + reason='refresh: ...'）
+      const pool = await readTraePool(env, pid)
+      for (const uid of UIDS) {
+        expect(pool[uid]?.errCount ?? 0).toBe(0)
+        expect(pool[uid]?.until ?? 0).toBe(0)
+        expect(pool[uid]?.reason ?? '').not.toContain('refresh')
+        expect(pool[uid]?.workErrCount ?? 0).toBe(0)
+        expect(pool[uid]?.workUntil ?? 0).toBe(0)
+      }
+    } finally {
+      globalThis.fetch = originalFetch
+    }
+  })
+
+  it('Work 循环：刷新阶段 transport → 同样只撞 2 次、不罚号（含 workErrCount）', async () => {
+    const originalFetch = globalThis.fetch
+    let exchangeCalls = 0
+    let workCalls = 0
+    globalThis.fetch = async (input: any) => {
+      const url = String(input)
+      if (url.includes('/api/agent/v3/create_agent_task')) { workCalls++; return new Response('x', { status: 200 }) }
+      if (url.includes(EXCHANGE)) {
+        exchangeCalls++
+        throw new Error('The operation was aborted')
+      }
+      return new Response('not found', { status: 404 })
+    }
+    try {
+      const env = makeEnv()
+      const pid = `${PROVIDER_ID}-work`
+      const provider = makeProvider(pid)
+
+      // 显式 Work 模型 → 先走 executeWorkRequest（Work 循环自己的 refresh catch）
+      const resp = await proxyTraeChatRequest(env, provider, {
+        model: 'DeepSeek-V4-Flash-Official',
+        messages: [{ role: 'user', content: 'hi' }],
+        stream: false,
+      })
+
+      // 三个刷新阶段各封顶 2 次：Work 主路径 2 + SOLO 兜底路径 2 + 函数末尾 Work 兜底 2。
+      // 未封顶时每段都是 3（MAX_ROTATE）→ 合计 9。
+      expect(exchangeCalls).toBe(6)
+      // 刷新全部失败 → 从未打到 Work 转发端点
+      expect(workCalls).toBe(0)
+      expect(resp.status).toBe(503)
+      const body = await resp.json() as any
+      expect(body.error.code).toBe('upstream_unreachable')
+
+      const pool = await readTraePool(env, pid)
+      for (const uid of UIDS) {
+        expect(pool[uid]?.errCount ?? 0).toBe(0)
+        expect(pool[uid]?.until ?? 0).toBe(0)
+        expect(pool[uid]?.workErrCount ?? 0).toBe(0)
+        expect(pool[uid]?.workUntil ?? 0).toBe(0)
+        expect(pool[uid]?.reason ?? '').not.toContain('refresh')
+        expect(pool[uid]?.workReason ?? '').not.toContain('refresh')
+      }
+    } finally {
+      globalThis.fetch = originalFetch
+    }
+  })
+})

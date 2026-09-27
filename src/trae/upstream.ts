@@ -272,7 +272,13 @@ async function doJson(
       signal: AbortSignal.timeout(timeoutMs),
     })
   } catch (e) {
-    throw new Error(`request failed: ${(e as Error).message || String(e)}`)
+    // 连接层失败（DNS/TLS/建连超时/被掐断）打 transport 标记，与 chatStream/chatWorkStream 同纪律：
+    // 调用方据此「不罚号」——一次网络抖动不该把健康账号刷进冷却（见 CODING_NOTES
+    //「连接层/收尾层失败不是账号故障，禁止罚号」）。此前这里抛裸 Error，token 预刷新阶段的
+    // 抖动会被 proxy 的 refresh catch 当成账号故障冷却 10 分钟。
+    const err = new Error(`request failed: ${(e as Error).message || String(e)}`) as Error & { kind?: TraeErrKind }
+    ;(err as any).kind = 'transport'
+    throw err
   }
   const raw = await response.text()
   if (response.status >= 400) {
@@ -306,7 +312,10 @@ async function doJsonText(
       signal: AbortSignal.timeout(timeoutMs),
     })
   } catch (e) {
-    throw new Error(`request failed: ${(e as Error).message || String(e)}`)
+    // 同 doJson：连接层失败打 transport 标记（调用方据此不罚号）。
+    const err = new Error(`request failed: ${(e as Error).message || String(e)}`) as Error & { kind?: TraeErrKind }
+    ;(err as any).kind = 'transport'
+    throw err
   }
   const raw = await response.text()
   if (response.status >= 400) {

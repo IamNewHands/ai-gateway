@@ -162,6 +162,13 @@ TRAE 相关问题前先读本节。**
   503 前的总等待被放大成 2×（2×30s ×2）。
   **不要"顺手改回" MAX_ROTATE 的 3**：那 3 次是给**账号相关**故障（plan_limit/soft_rate/
   session_dead）用的，撞不同账号才有信息增益。
+- **`doJson` / `doJsonText` 的连接层失败也打 `kind='transport'`**（2026-09-27 追加）：这两个
+  短请求辅助（ExchangeToken / 模型 / 签到 / 积分）原先抛**裸** Error（无 `kind`），于是
+  proxy 两处 refresh catch 的 `else` 分支把网络抖动当成账号故障冷却 10 分钟
+  （`reason='refresh: ...'`）——正是上面那条铁律的反面。现在 fetch catch 打 transport 标记，
+  两处 refresh catch 加 transport 分支：**不冷却、只计数、撞满 `MAX_TRANSPORT_ATTEMPTS` 即跳出**
+  （与转发阶段同一纪律：换号没有信息增益）。区分保持不变：`session_dead`（401 家族）仍禁用账号，
+  `refresh_failed: no token in response` 这类**凭证真失效**仍是账号问题，继续冷却。
 
 **测试样本铁律**：构造「成功响应」样本时必须带自然收尾事件（SOLO `event: done`、Work
 `event: done` 或 `[DONE]`）。修该缺陷时当场揪出 4 处既有样本缺收尾事件却断言 200/`stop`

@@ -360,7 +360,12 @@ export async function executeWorkRequest(
     } catch (e) {
       lastErr = e as Error
       const kind = (e as any).kind
-      if (kind === 'session_dead') {
+      if (kind === 'transport') {
+        // 刷新阶段的连接层失败同样与账号无关（upstream.doJson 已打 transport 标记）：
+        // 不冷却、不累计 workErrCount，只计数——撞满即跳出，避免把健康账号逐个刷进冷却。
+        transportAttempts++
+        if (transportAttempts >= MAX_TRANSPORT_ATTEMPTS) break
+      } else if (kind === 'session_dead') {
         await disableTraeAccount(env, provider.id, account.uid, 'refresh session dead')
       } else {
         await cooldownTraeWorkAccount(env, provider.id, account.uid, cd.errMs, 'refresh: ' + ((e as Error).message || '').substring(0, 120))
@@ -586,7 +591,13 @@ export async function proxyTraeChatRequest(
     } catch (e) {
       lastErr = e as Error
       const kind = (e as any).kind
-      if (kind === 'session_dead') {
+      if (kind === 'transport') {
+        // 刷新阶段的连接层失败与账号无关（upstream.doJson 已打 transport 标记）：不冷却。
+        // 与转发阶段同一纪律——换号也没有信息增益，撞满即跳出（跳出后由函数末尾按 transport
+        // 定责报 503 upstream_unreachable）。
+        transportAttempts++
+        if (transportAttempts >= MAX_TRANSPORT_ATTEMPTS) break
+      } else if (kind === 'session_dead') {
         await disableTraeAccount(env, provider.id, account.uid, 'refresh session dead')
       } else {
         await cooldownTraeAccount(env, provider.id, account.uid, cd.errMs, 'refresh: ' + ((e as Error).message || '').substring(0, 120))
