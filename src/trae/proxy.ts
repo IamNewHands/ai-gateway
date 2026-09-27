@@ -319,6 +319,9 @@ export async function executeWorkRequest(
   const cd = resolveTraeCooldown(provider)
   const tried = new Set<string>()
   let lastErr: Error | null = null
+  // 非流式聚合见过「上游没发 done」：Work 是最后一层兜底，此时不能回半句话，
+  // 也不能用 no_healthy_account 把网络截断说成账号池不可用（曾把排查引到账号上）。
+  let truncationSeen = false
 
   // 默认使用请求模型；若非 Work 模型则回退 DefaultWorkModel
   let workModel = configName
@@ -427,8 +430,9 @@ export async function executeWorkRequest(
     }
 
     // 非流式
-    const text = await resp.text().catch(() => '')
-    const agg = aggregateWorkSse(text, workModel)
+    let workReadError = false
+    const text = await resp.text().catch(() => { workReadError = true; return '' })
+    const agg = aggregateWorkSse(text, workModel, { readError: workReadError })
     if (agg.err) {
       lastErr = new Error(`work stream error code=${agg.err.code} msg=${agg.err.msg}`)
       if (agg.err.code === 1005 || agg.err.code === 4008) {
@@ -439,12 +443,35 @@ export async function executeWorkRequest(
       continue
     }
 
+    // 上游没发 done 就断：不罚号（noteTraeWorkError 会把一次上游截断累计成 Work 通道冷却，
+    // 账号本身没问题），换号重试；全部撞完由下方统一报 503 upstream_unreachable。
+    if (agg.truncated) {
+      const info = agg.truncated
+      truncationSeen = true
+      const msg = `[trae-work-agg] provider=${provider.id} uid=${account.uid} model=${workModel}`
+        + ` end=truncated kind=${info.kind} content=${info.contentChars} reasoning=${info.reasoningChars}`
+        + ` usage=${info.sawUsage}`
+      console.log(msg) // codeql-disable: 纯诊断日志，不含密钥/敏感 token
+      writeLog(env, 'warn', msg).catch(() => { /* 日志失败不影响响应 */ })
+      continue
+    }
+
     const out = agg.resp!
     out['model'] = workModel
     return new Response(JSON.stringify(out), {
       status: 200,
       headers: { 'Content-Type': 'application/json; charset=utf-8' },
     })
+  }
+
+  // Work 通道是最后一层兜底：上游没发 done 时既不能回半句话（旧行为：聚合出的
+  // finish_reason='stop' + 200），也不能报 no_healthy_account 把网络截断说成账号问题。
+  if (truncationSeen) {
+    return openaiError(
+      503,
+      'upstream_unreachable',
+      'TRAE Work 通道上游未发送 done/收尾事件（账号未被惩罚，非账号池问题）'
+    )
   }
 
   return null
@@ -621,8 +648,11 @@ export async function proxyTraeChatRequest(
     }
 
     // 非流式：聚合 SOLO SSE 为单条 chat.completion
-    const text = await resp.text().catch(() => '')
-    const agg = aggregateSoloSse(text)
+    // 读体抛错也要记下来：聚合层只能看见「没有 done」，区分不了「干净 EOF」与「读体异常」
+    //（与流式路径的 readErrored 同义，决定 truncated.kind 是 no_done 还是 read_error）。
+    let aggReadError = false
+    const text = await resp.text().catch(() => { aggReadError = true; return '' })
+    const agg = aggregateSoloSse(text, { readError: aggReadError })
     if (agg.err) {
       lastErr = new Error(`solo stream error code=${agg.err.code} msg=${agg.err.msg}`)
       const requestSide = await applyStreamError(env, provider.id, account.uid, agg.err, cd)
@@ -640,6 +670,32 @@ export async function proxyTraeChatRequest(
     }
     await noteTraeSuccess(env, provider.id, account.uid)
     await releaseTraeSession(env, provider.id, account.uid).catch(() => {})
+
+    // 上游没发 done 就断（非流式聚合截断）：与流式路径同构的处理——
+    //   1. 不罚号：这条路径的聚合结果不会经过 applyStreamError，但若把截断塞进 err 通道，
+    //      noteTraeError 会把一次网络抖动累计成账号冷却，最后又报「账号池无可用账号」；
+    //   2. 不返回 agg.resp：那是半句话，客户端会当完整回答（2026-09-27 事故）；
+    //   3. 先降级 Work 通道（另一条 host/协议），仍失败则由函数末尾按 transport 定责报
+    //      503 upstream_unreachable（可重试，且不冤枉账号）。
+    if (agg.truncated) {
+      const info = agg.truncated
+      const msg = `[trae-agg] provider=${provider.id} uid=${account.uid} model=${configName}`
+        + ` end=truncated kind=${info.kind} content=${info.contentChars} reasoning=${info.reasoningChars}`
+        + ` toolCalls=${info.sawToolCalls} usage=${info.sawUsage}`
+      console.log(msg) // codeql-disable: 纯诊断日志，不含密钥/敏感 token
+      writeLog(env, 'warn', msg).catch(() => { /* 日志失败不影响响应 */ })
+      const e = new Error(
+        `TRAE SOLO 非流式聚合未收到 done（kind=${info.kind} content=${info.contentChars}）`
+      ) as Error & { kind?: string }
+      e.kind = 'transport' // 复用末尾 503 定责：不罚号、不报「账号池无可用账号」
+      lastErr = e
+      if (!hasTools) {
+        const fallbackResp = await executeWorkRequest(env, provider, body, configName, prompt, stream)
+        if (fallbackResp) return fallbackResp
+      }
+      continue
+    }
+
     const out = agg.resp!
     out['model'] = configName
     return new Response(JSON.stringify(out), {

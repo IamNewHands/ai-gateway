@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest'
-import { soloStreamToOpenAIStream, type SoloStreamEndInfo } from './sse'
+import { aggregateSoloSse, aggregateWorkSse, soloStreamToOpenAIStream, type SoloStreamEndInfo } from './sse'
 import { proxyTraeChatRequest } from './proxy'
 import { readTraePool, setTraeWorkCredits } from './pool'
 
@@ -113,7 +113,72 @@ describe('Trae SOLO 流式收尾：上游未发 done 不得静默收尾', () => 
   })
 })
 
-describe('Trae SOLO 连接层失败（transport）：Work 兜底与文案定责', () => {
+describe('Trae SOLO 非流式聚合：未发 done 不得再聚合为 stop', () => {
+  it('有正文但无 done → truncated=no_done，finish_reason 不再是 stop', () => {
+    const agg = aggregateSoloSse(
+      'event: output\ndata: {"response":"结论是"}\n\nevent: token_usage\ndata: {"prompt_tokens":10,"completion_tokens":2}\n\n'
+    )
+
+    expect(agg.err).toBeNull()
+    expect(agg.truncated).not.toBeNull()
+    expect(agg.truncated!.kind).toBe('no_done')
+    expect(agg.truncated!.contentChars).toBe(3)
+    expect(agg.truncated!.sawUsage).toBe(true)
+    // 正文仍可取出（调用方可自行决定是否丢弃），但收尾信号不再谎报 stop
+    expect(agg.resp!.choices[0].message.content).toBe('结论是')
+    expect(agg.resp!.choices[0].finish_reason).toBe('length')
+  })
+
+  it('读体抛错（调用方标记）→ truncated=read_error', () => {
+    const agg = aggregateSoloSse('event: output\ndata: {"response":"半句"}\n\n', { readError: true })
+
+    expect(agg.truncated!.kind).toBe('read_error')
+    expect(agg.resp!.choices[0].finish_reason).toBe('length')
+  })
+
+  it('反例：正常 done → truncated=null 且 finish_reason 保留上游值', () => {
+    const agg = aggregateSoloSse(
+      'event: output\ndata: {"response":"完整回答"}\n\nevent: done\ndata: {"finish_reason":"stop"}\n\n'
+    )
+
+    expect(agg.truncated).toBeNull()
+    expect(agg.resp!.choices[0].finish_reason).toBe('stop')
+  })
+
+  it('反例：done 自带 length（真实上限截断）→ 不误报，原值保留', () => {
+    const agg = aggregateSoloSse(
+      'event: output\ndata: {"response":"被上限截断"}\n\nevent: done\ndata: {"finish_reason":"length"}\n\n'
+    )
+
+    expect(agg.truncated).toBeNull()
+    expect(agg.resp!.choices[0].finish_reason).toBe('length')
+  })
+
+  it('Work 聚合：无 done 且无 [DONE] → truncated=no_done；两种收尾信号任一出现 → null', () => {
+    const bad = aggregateWorkSse('event: output\ndata: {"text":"半句"}\n\n', 'glm-5.2')
+    expect(bad.truncated).not.toBeNull()
+    expect(bad.truncated!.kind).toBe('no_done')
+    expect(bad.truncated!.contentChars).toBe(2)
+    expect(bad.resp!.choices[0].finish_reason).toBe('length')
+
+    // Work 侧两个自然收尾信号：event: done 与 SSE 层 [DONE]
+    const viaDone = aggregateWorkSse('event: output\ndata: {"text":"完整"}\n\nevent: done\ndata: {}\n\n', 'glm-5.2')
+    expect(viaDone.truncated).toBeNull()
+    expect(viaDone.resp!.choices[0].finish_reason).toBe('stop')
+
+    const viaSseDone = aggregateWorkSse('event: output\ndata: {"text":"完整"}\n\ndata: [DONE]\n\n', 'glm-5.2')
+    expect(viaSseDone.truncated).toBeNull()
+  })
+
+  it('反例：上游 error 事件优先于截断判定（err 非空时 truncated 为 null）', () => {
+    const agg = aggregateSoloSse('event: error\ndata: {"code":1005,"message":"plan limit"}\n\n')
+
+    expect(agg.err?.code).toBe(1005)
+    expect(agg.truncated).toBeNull()
+  })
+})
+
+describe('Trae 连接层失败与聚合截断：Work 兜底与 503 定责', () => {
   const UID = 'u_transport'
   const PROVIDER_ID = 'trae-transport'
 
@@ -145,7 +210,9 @@ describe('Trae SOLO 连接层失败（transport）：Work 兜底与文案定责'
     }
   }
 
-  const workSse = 'event: output\ndata: {"text": "Answered via Work Failover"}\n\n'
+  // Work 通道样本必须带自然收尾（event: done / [DONE]）：少了它聚合层会（正确地）
+  // 判定为截断——这正是本次修复要抓的情形，不能拿它当「成功响应」的样本。
+  const workSse = 'event: output\ndata: {"text": "Answered via Work Failover"}\n\nevent: done\ndata: {}\n\n'
 
   it('SOLO 建连失败（fetch 抛错）→ 立即降级 Work 通道并成功响应', async () => {
     const originalFetch = globalThis.fetch
@@ -219,6 +286,127 @@ describe('Trae SOLO 连接层失败（transport）：Work 兜底与文案定责'
       expect(String(body.error.message)).not.toContain('all accounts unavailable')
 
       // 账号未被惩罚：transport 不计 errCount、不进冷却
+      const pool = await readTraePool(env, pid)
+      expect(pool[UID]?.errCount ?? 0).toBe(0)
+      expect(pool[UID]?.until ?? 0).toBe(0)
+    } finally {
+      globalThis.fetch = originalFetch
+    }
+  })
+
+  // ===== 非流式聚合截断（上游 200 + 有正文但没有 done）=====
+  // 修复前：aggregate*Sse 留下默认 finish_reason='stop'，proxy 直接回 200 半句话。
+
+  const soloPartial = 'event: output\ndata: {"response":"结论是"}\n\n'
+  const workTruncated = 'event: output\ndata: {"text":"Work 也断了"}\n\n'
+  const workComplete = 'event: output\ndata: {"text":"Work 兜底完整回答"}\n\nevent: done\ndata: {}\n\n'
+
+  it('SOLO 非流式没收到 done → 降级 Work 通道，不把半句话当成功返回', async () => {
+    const originalFetch = globalThis.fetch
+    const calls: string[] = []
+    globalThis.fetch = async (input: any) => {
+      const url = String(input)
+      calls.push(url)
+      if (url.includes('/api/agent/v3/create_agent_task')) {
+        return new Response(workComplete, { status: 200, headers: { 'Content-Type': 'text/event-stream' } })
+      }
+      if (url.includes('/api/agent/v3/llm_utils_chat')) {
+        return new Response(soloPartial, { status: 200, headers: { 'Content-Type': 'text/event-stream' } })
+      }
+      return new Response('not found', { status: 404 })
+    }
+    try {
+      const env = makeEnv()
+      const pid = `${PROVIDER_ID}-agg-work-ok`
+      const provider = makeProvider(pid)
+      await setTraeWorkCredits(env, pid, UID, 50)
+
+      const resp = await proxyTraeChatRequest(env, provider, {
+        model: 'glm-5.2',
+        messages: [{ role: 'user', content: 'hi' }],
+        stream: false,
+      })
+
+      expect(calls[0]).toContain('/api/agent/v3/llm_utils_chat')
+      expect(calls[1]).toContain('/api/agent/v3/create_agent_task')
+      expect(resp.status).toBe(200)
+      const json = await resp.json() as any
+      expect(json.choices[0].message.content).toBe('Work 兜底完整回答')
+      expect(json.choices[0].message.content).not.toContain('结论是')
+    } finally {
+      globalThis.fetch = originalFetch
+    }
+  })
+
+  it('SOLO 与 Work 非流式都截断 → 503 upstream_unreachable，账号与 Work 通道都不被罚', async () => {
+    const originalFetch = globalThis.fetch
+    globalThis.fetch = async (input: any) => {
+      const url = String(input)
+      if (url.includes('/api/agent/v3/create_agent_task')) {
+        return new Response(workTruncated, { status: 200, headers: { 'Content-Type': 'text/event-stream' } })
+      }
+      return new Response(soloPartial, { status: 200, headers: { 'Content-Type': 'text/event-stream' } })
+    }
+    try {
+      const env = makeEnv()
+      const pid = `${PROVIDER_ID}-agg-work-fail`
+      const provider = makeProvider(pid)
+      await setTraeWorkCredits(env, pid, UID, 50)
+
+      const resp = await proxyTraeChatRequest(env, provider, {
+        model: 'glm-5.2',
+        messages: [{ role: 'user', content: 'hi' }],
+        stream: false,
+      })
+
+      expect(resp.status).toBe(503)
+      const body = await resp.json() as any
+      expect(body.error.code).toBe('upstream_unreachable')
+      expect(String(body.error.message)).toContain('未发送')
+      expect(String(body.error.message)).not.toContain('all accounts unavailable')
+
+      // 截断不定性为账号故障：SOLO errCount 与 Work workErrCount 都不累计
+      const pool = await readTraePool(env, pid)
+      expect(pool[UID]?.errCount ?? 0).toBe(0)
+      expect(pool[UID]?.until ?? 0).toBe(0)
+      expect(pool[UID]?.workErrCount ?? 0).toBe(0)
+      expect(pool[UID]?.workUntil ?? 0).toBe(0)
+    } finally {
+      globalThis.fetch = originalFetch
+    }
+  })
+
+  it('带 tools（Work 兜底被禁用）时 SOLO 非流式截断 → 503 upstream_unreachable，不是「账号池无可用」', async () => {
+    const originalFetch = globalThis.fetch
+    let workCallCount = 0
+    globalThis.fetch = async (input: any) => {
+      const url = String(input)
+      if (url.includes('/api/agent/v3/create_agent_task')) {
+        workCallCount++
+        return new Response(workComplete, { status: 200, headers: { 'Content-Type': 'text/event-stream' } })
+      }
+      return new Response(soloPartial, { status: 200, headers: { 'Content-Type': 'text/event-stream' } })
+    }
+    try {
+      const env = makeEnv()
+      const pid = `${PROVIDER_ID}-agg-tools`
+      const provider = makeProvider(pid)
+      await setTraeWorkCredits(env, pid, UID, 50)
+
+      const resp = await proxyTraeChatRequest(env, provider, {
+        model: 'glm-5.2',
+        messages: [{ role: 'user', content: 'hi' }],
+        stream: false,
+        tools: [{ type: 'function', function: { name: 'noop', parameters: { type: 'object', properties: {} } } }],
+      })
+
+      // 自定义 tools 场景不走 Work 通道（工具 schema 无法映射），因此这里不该有 Work 调用
+      expect(workCallCount).toBe(0)
+      expect(resp.status).toBe(503)
+      const body = await resp.json() as any
+      expect(body.error.code).toBe('upstream_unreachable')
+      expect(String(body.error.message)).not.toContain('all accounts unavailable')
+
       const pool = await readTraePool(env, pid)
       expect(pool[UID]?.errCount ?? 0).toBe(0)
       expect(pool[UID]?.until ?? 0).toBe(0)

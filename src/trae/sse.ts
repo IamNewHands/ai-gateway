@@ -158,9 +158,20 @@ function feedLines(st: SseState, text: string, events: SOLOEvent[]): void {
 
 /**
  * 聚合完整 SOLO SSE 文本 → 单个 OpenAI chat.completion（非流式）。
- * 上游 error 事件返回 { err }；成功返回 { resp }。
+ * 上游 error 事件返回 { err }（err 优先，此时 truncated 恒为 null）；成功返回 { resp }。
+ *
+ * 关键：「收到 done」与「没收到 done」是两种结局，必须分开报。事故证据（2026-09-27）：
+ * 上游半路断流时既无 done 也无 error，本函数此前留下默认的 `finish_reason='stop'`，
+ * 调用方据此回 200 —— 客户端把半句话当完整回答（与流式路径 `soloStreamToOpenAIStream`
+ * 的 no_done 分支同一个真因，只是这条路没有错误帧可发）。
+ *
+ * 因此新增 `truncated`：**调用方不得在它非空时把 resp 当成功返回**。同时在这种情形下
+ * `finish_reason` 不再谎报 stop（无工具调用时降级为 length），作为客户端侧的最后一道可见信号。
+ *
+ * @param opts.readError 读取响应体时已抛错（调用方 catch 后传 true）：用于区分「读体异常」
+ *   与「干净 EOF 但没有 done」，与流式路径的 readError 标记同义。
  */
-export function aggregateSoloSse(text: string): { resp: Record<string, any> | null; err: SOLOStreamError | null } {
+export function aggregateSoloSse(text: string, opts?: { readError?: boolean }): { resp: Record<string, any> | null; err: SOLOStreamError | null; truncated: SoloStreamEndInfo | null } {
   const st: SseState = { event: '', data: '' }
   const events: SOLOEvent[] = []
   feedLines(st, text, events)
@@ -177,6 +188,7 @@ export function aggregateSoloSse(text: string): { resp: Record<string, any> | nu
   const toolCalls = new Map<number, Record<string, any>>()
   const toolOrder: number[] = []
   let upstreamErr: SOLOStreamError | null = null
+  let sawDone = false
 
   for (const ev of events) {
     switch (ev.event) {
@@ -189,6 +201,7 @@ export function aggregateSoloSse(text: string): { resp: Record<string, any> | nu
         usage = normalizeSoloUsage(ev.usage)
         break
       case 'done':
+        sawDone = true
         if (ev.finishReason !== '') finishReason = ev.finishReason
         break
       case 'error':
@@ -196,7 +209,7 @@ export function aggregateSoloSse(text: string): { resp: Record<string, any> | nu
         break
     }
   }
-  if (upstreamErr) return { resp: null, err: upstreamErr }
+  if (upstreamErr) return { resp: null, err: upstreamErr, truncated: null }
 
   const message: Record<string, any> = { role: 'assistant', content }
   if (reasoning !== '') message['reasoning_content'] = reasoning
@@ -215,6 +228,19 @@ export function aggregateSoloSse(text: string): { resp: Record<string, any> | nu
     finishReason = 'tool_calls'
   }
 
+  // 非流式没有错误帧可发，finish_reason 是客户端唯一可见的收尾信号：没收到 done 就不能给
+  // stop 的假象（有工具调用时保留 tool_calls —— 那是可执行动作，不该被降级成 length）。
+  if (!sawDone && toolOrder.length === 0) finishReason = 'length'
+
+  // 无 done = 上游半路断流（或读体异常）。调用方必须据此判失败，不得把 resp 当成功返回。
+  const truncated: SoloStreamEndInfo | null = sawDone ? null : {
+    kind: opts?.readError ? 'read_error' : 'no_done',
+    contentChars: content.length,
+    reasoningChars: reasoning.length,
+    sawToolCalls: toolOrder.length > 0,
+    sawUsage: usage !== null,
+  }
+
   const resp: Record<string, any> = {
     id: `chatcmpl-${Date.now()}`,
     object: 'chat.completion',
@@ -223,7 +249,7 @@ export function aggregateSoloSse(text: string): { resp: Record<string, any> | nu
     choices: [{ index: 0, message, finish_reason: finishReason }],
   }
   if (usage) resp['usage'] = usage
-  return { resp, err: null }
+  return { resp, err: null, truncated }
 }
 
 /**
@@ -295,7 +321,10 @@ function encodeSse(data: string): Uint8Array {
 }
 
 /**
- * 上游流收尾诊断（供调用方记日志/告警，判定「静默截断」）。
+ * 上游收尾诊断（供调用方记日志/告警，判定「静默截断」）。
+ *
+ * 同一个类型服务两条路：流式 `soloStreamToOpenAIStream` 的 `onTruncated` 回调，
+ * 以及非流式聚合（`aggregateSoloSse` / `aggregateWorkSse` 的 `truncated` 字段）。
  *
  * `kind` 两个取值对应两种收尾异常：
  *  - `read_error`：读上游响应体时抛错（连接被掐断/重置）；
@@ -736,14 +765,19 @@ export function workStreamToOpenAIStream(
 
 /**
  * 将完整的 Work SSE 文本聚合成非流式 OpenAI chat.completion 响应。
+ *
+ * 与 `aggregateSoloSse` 同一条判定：**没收到 done 就不是成功**。Work 侧的自然收尾信号
+ * 有两个（`event: done` 与 SSE 层 `[DONE]`，与 `workStreamToOpenAIStream` 的 sawDone 一致），
+ * 二者都没出现时返回 `truncated`，且 finish_reason 不再硬编码 stop（降级为 length）。
+ * 此前该值是无条件 `'stop'`，等价于把上游截断伪装成正常完成。
  */
-export function aggregateWorkSse(text: string, model: string): { resp: Record<string, any> | null; err: SOLOStreamError | null } {
+export function aggregateWorkSse(text: string, model: string, opts?: { readError?: boolean }): { resp: Record<string, any> | null; err: SOLOStreamError | null; truncated: SoloStreamEndInfo | null } {
   const trimmed = text.trim()
   if (trimmed.startsWith('{')) {
     try {
       const obj = JSON.parse(trimmed)
       if (obj && Array.isArray(obj.choices)) {
-        return { resp: obj, err: null }
+        return { resp: obj, err: null, truncated: null }
       }
     } catch { /* continue */ }
   }
@@ -752,6 +786,7 @@ export function aggregateWorkSse(text: string, model: string): { resp: Record<st
   let fullReasoning = ''
   let usage: Record<string, any> | null = null
   let upstreamErr: SOLOStreamError | null = null
+  let sawDone = false
   let currentEvent = ''
   let fullText = ''
 
@@ -778,7 +813,7 @@ export function aggregateWorkSse(text: string, model: string): { resp: Record<st
     }
     if (!line.startsWith('data:')) continue
     const dataContent = line.slice(5).trim()
-    if (dataContent === '[DONE]') break
+    if (dataContent === '[DONE]') { sawDone = true; break }
 
     let evObj: any = null
     try {
@@ -826,6 +861,7 @@ export function aggregateWorkSse(text: string, model: string): { resp: Record<st
         break
       }
       case 'done': {
+        sawDone = true
         if (payload.last_assistant_response) {
           try {
             const arr = JSON.parse(payload.last_assistant_response)
@@ -849,18 +885,26 @@ export function aggregateWorkSse(text: string, model: string): { resp: Record<st
     }
   }
 
-  if (upstreamErr) return { resp: null, err: upstreamErr }
+  if (upstreamErr) return { resp: null, err: upstreamErr, truncated: null }
 
   const message: Record<string, any> = { role: 'assistant', content: fullContent }
   if (fullReasoning) message['reasoning_content'] = fullReasoning
+
+  const truncated: SoloStreamEndInfo | null = sawDone ? null : {
+    kind: opts?.readError ? 'read_error' : 'no_done',
+    contentChars: fullContent.length,
+    reasoningChars: fullReasoning.length,
+    sawToolCalls: false, // Work 聚合不解析工具调用
+    sawUsage: usage !== null,
+  }
 
   const resp: Record<string, any> = {
     id: `chatcmpl-${Date.now()}`,
     object: 'chat.completion',
     created: Math.floor(Date.now() / 1000),
     model,
-    choices: [{ index: 0, message, finish_reason: 'stop' }],
+    choices: [{ index: 0, message, finish_reason: truncated ? 'length' : 'stop' }],
   }
   if (usage) resp['usage'] = usage
-  return { resp, err: null }
+  return { resp, err: null, truncated }
 }

@@ -162,6 +162,7 @@ describe('Trae Work: 流式与非流式 SSE 协议转换 (sse.ts)', () => {
       'event: plan_item\ndata: {"status": "start", "plan_title": "Step 1: Plan"}\n\n',
       'event: output\ndata: {"text": "Hello world!"}\n\n',
       'event: token_usage\ndata: {"prompt_tokens": 15, "completion_tokens": 25, "total_tokens": 40}\n\n',
+      'data: [DONE]\n\n',
     ].join('')
 
     const result = aggregateWorkSse(workEvents, 'claude-3-7-sonnet')
@@ -172,6 +173,8 @@ describe('Trae Work: 流式与非流式 SSE 协议转换 (sse.ts)', () => {
     expect(result.resp?.choices[0].message.reasoning_content).toBe('Step 1: Plan')
     expect(result.resp?.choices[0].finish_reason).toBe('stop')
     expect(result.resp?.usage?.total_tokens).toBe(40)
+    // 有 [DONE] 才算自然收尾（无它即截断，见 truncation.test.ts）
+    expect(result.truncated).toBeNull()
   })
 })
 
@@ -415,7 +418,7 @@ describe('Trae Work: 容灾降级与请求路由端到端 (proxyTraeChatRequest)
       const url = String(input)
       if (url.includes('/api/agent/v3/create_agent_task')) {
         hitWorkEndpoint = true
-        const bodyText = 'event: output\ndata: {"text": "Hello from Work Agent"}\n\n'
+        const bodyText = 'event: output\ndata: {"text": "Hello from Work Agent"}\n\nevent: done\ndata: {}\n\n'
         return new Response(bodyText, {
           status: 200,
           headers: { 'Content-Type': 'text/event-stream' },
@@ -463,7 +466,7 @@ describe('Trae Work: 容灾降级与请求路由端到端 (proxyTraeChatRequest)
       const url = String(input)
       if (url.includes('/api/agent/v3/create_agent_task')) {
         workCallCount++
-        const bodyText = 'event: output\ndata: {"text": "Answered via Work Failover"}\n\n'
+        const bodyText = 'event: output\ndata: {"text": "Answered via Work Failover"}\n\nevent: done\ndata: {}\n\n'
         return new Response(bodyText, {
           status: 200,
           headers: { 'Content-Type': 'text/event-stream' },
