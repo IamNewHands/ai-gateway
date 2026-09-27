@@ -175,3 +175,17 @@ TRAE 思考模型在推理阶段可能 15~20s 不发数据，客户端（AI SDK 
 - TRAE 直出流（`trae/proxy.ts`）：`TRAE_KEEPALIVE_MS = 8000`、`TRAE_STREAM_IDLE_TIMEOUT_MS = 180000`
 - 转换后流（proxy.ts 的 Anthropic / Responses 转换）：`SSE_KEEPALIVE_MS = 8000`、`SSE_IDLE_TIMEOUT_MS = 180000`
 - 心跳注释行仅对**严格 SSE**（text/event-stream）安全；Anthropic / Responses 转换循环都以 `data:` 前缀过滤行，注释行会被自然跳过，不会污染解析
+
+## CodeQL：`js/clear-text-logging` 在本仓是「命名启发式」误报（2026-09-27 定责）
+
+- 该查询的 source 是**按名字猜**的（CodeQL `HeuristicNames`）：变量名/属性名命中 `apiKeys`、`oauth*`
+  即当作敏感数据。本仓 Provider schema 恰好就叫 `provider.apiKeys` / `provider.oauth`，天然撞名。
+- 实锤：`src/proxy.ts:930/932` 只打印两个普通 `string` 形参（`providerId`、`model`）也被判为泄露
+  ——污点顺着 Provider 对象流动，**改日志字段/脱敏打印都消不掉这一族告警**（2026-09-16 已 dismiss 30 条同类）。
+- 处理：**逐条 dismiss（reason = false positive）**。
+- **不要再写 `// codeql-disable`**：CodeQL / GitHub code scanning **不支持**内联抑制注释，那是无效写法，
+  只会让下一个人以为已经抑制了（7e7dc49 又加了 7 处）。
+- 想一劳永逸只有两条路，都属人的决定、不默认做：advanced setup 的 `codeql-config.yml` 里
+  `query-filters: - exclude: id: js/clear-text-logging`（等于整仓放弃该查询），或自维护一份改过 source 的查询副本。
+- 真修的例子（本轮）：`src/pages-inline-script.test.ts` 内联脚本抽取正则改 `<\/script\s*\/?>`，
+  修掉 `js/bad-tag-filter`（原来漏掉 `</script >` 这类结束标签 → 少校验一段客户端脚本）。
