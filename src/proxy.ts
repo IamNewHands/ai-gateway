@@ -1340,15 +1340,40 @@ export async function handleProxy(c: Context<AppEnv>): Promise<Response> {
     const model = body.model || ''
     context = createAnalyticsContext(c, proxyKey, proxyKeyHash, route, model, isStreamRequest(body) ? 'stream' : 'sync')
     const response = await forwardProxy(c, body, c.req.method)
-    return finalizeProxyResponse(c, response, context, route)
+    return finalizeProxyResponse(c, response, applyUpstreamAttribution(c, context), route)
   } catch (err) {
     const bodyErr = requestBodyErrorResponse(c, err)
     if (bodyErr) return bodyErr
     const error = err as Error
-    writeAnalyticsEvent(c, { context, result: 'failure', errorSummary: summarizeError(error) })
+    writeAnalyticsEvent(c, {
+      context: applyUpstreamAttribution(c, context),
+      result: 'failure',
+      errorSummary: summarizeError(error),
+    })
     return c.json({
       error: { message: error.message || '代理转发内部错误', type: 'server_error' },
     }, 500)
+  }
+}
+
+/**
+ * 把 forwardProxy 解析出的真实上游身份合并进 analytics context。
+ *
+ * context 在本函数调用 forwardProxy **之前**创建，那时 provider 还没解析出来，
+ * 写进 Analytics Engine 的 providerId/providerName/providerType/upstreamModel 会全是空串，
+ * 管理端「渠道 / 提供商」维度所有流量挤进一个空标签桶（按渠道查不到任何提供商）。
+ * forwardProxy 解析出 provider 后写进 c.get('analyticsUpstream')，这里取回补全。
+ * 未解析出 provider（如提供商不存在/禁用）时不编造，保持空值。
+ */
+function applyUpstreamAttribution(c: Context<AppEnv>, context: AnalyticsContext): AnalyticsContext {
+  const upstream = c.get('analyticsUpstream')
+  if (!upstream) return context
+  return {
+    ...context,
+    providerId: upstream.providerId,
+    providerName: upstream.providerName,
+    providerType: upstream.providerType,
+    upstreamModel: upstream.upstreamModel,
   }
 }
 
@@ -1510,6 +1535,17 @@ export async function forwardProxy(
         error: { message: `模型 "${modelId}" 已禁用`, type: 'model_disabled' },
       }, 403)
     }
+
+    // analytics 归属：context 在 handleProxy 里、调用本函数之前就已创建，那时 provider
+    // 还没解析出来，写进 Analytics Engine 的渠道/提供商字段全是空串。这里把真实身份
+    // 记到请求上下文，由 handleProxy 合并回 context（否则管理端渠道维度只有一个空桶）。
+    // unimodel 递归时由最内层命中的候选写入（后写覆盖先写），归属真实调用的提供商。
+    c.set('analyticsUpstream', {
+      providerId: provider.id,
+      providerName: provider.name,
+      providerType: provider.apiType || 'openai',
+      upstreamModel: modelId,
+    })
 
     const enabledKeys = provider.apiKeys.filter(k => k.enabled)
     const forwardBody = { ...body, model: modelId }

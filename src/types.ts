@@ -717,6 +717,24 @@ export interface AppVariables {
   proxyKeyHash?: string
   /** Cloudflare Access 校验通过后写入的登录用户邮箱（仅配置 CF_ACCESS_AUD 时存在） */
   cvAccessEmail?: string
+  /**
+   * forwardProxy 实际解析出的上游身份，供 analytics 归属使用。
+   *
+   * 背景：analytics context 在 handleProxy 里、**调用 forwardProxy 之前**创建，
+   * 那时 provider 尚未解析（getProvider 在 forwardProxy 内部），导致写入
+   * Analytics Engine 的 providerId/providerName/providerType/upstreamModel 全是空串
+   * —— 管理端「渠道 / 提供商」维度把所有流量归进一个空标签桶，按渠道找不到任何提供商
+   * （表现为"统计里不含某提供商的用量"）。forwardProxy 解析出 provider 后写这里，
+   * handleProxy 取回合并进 context。
+   *
+   * unimodel 递归转发时由最内层（真正命中的候选）写入，符合"归属实际调用方"语义。
+   */
+  analyticsUpstream?: {
+    providerId: string
+    providerName: string
+    providerType: string
+    upstreamModel: string
+  }
 }
 
 export type AppEnv = {
