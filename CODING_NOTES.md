@@ -158,6 +158,32 @@ TRAE 相关问题前先读本节。**
 ——它们是被聚合层假 `stop` 掩盖的截断样本；给任何「兜底伪装」逻辑动刀前先修样本，
 否则会把正确的回归误判成 bug。
 
+### 第二类截断：上游发了 done、正文却停在半句（2026-09-27，`fd301f9` 之后仍复现）
+
+`fd301f9` 的防线只在 `!sawDone` 时触发（`sse.ts` 收尾分支），线上却继续复现半句截断，
+且**带着 `finish_reason=stop` 到达客户端**（DSH 会话 `session-39578d55` seq 1407，
+2026-09-27 18:49:13，`finish=stop` + `turn/end=completed`）。部署已确认：`fd301f9` 新增的
+503 文案（`trae/proxy.ts` 的「TRAE SOLO 上游连接超时/中断」）在真实会话里 14:02:19 就出现，
+距提交 13:59:34 只隔 2 分 45 秒，即那批截断跑的都是新代码；235 个会话文件里防线帧
+（`upstream_no_finish` / `upstream_interrupted` / 「未发送 done」）出现 0 次。故这类截断
+**不是**「没发 done」，防线按设计抓不到——不是修复失效，是修的不是这一类。
+
+剩下两种可能，靠收尾审计（`SoloDoneAudit` / `onAudit`，日志口径 `trae-stream end=done-audit`）
+区分。**审计只记日志：不改任何下行帧、不罚号**（与 `end=runaway` 同纪律）：
+
+- `dones=1` 且 `postDoneContent=0`：上游自己就产出了这么多（模型早停，或上游半路掐断却报
+  stop）——协议上无从区分，只能在内容层做兜底
+- `postDoneContent>0` 或 `dones>1`：上游在 `done` 之后仍在发正文，而网关照发、客户端见
+  `[DONE]` 即丢弃后续帧（OpenAI 兼容客户端一律如此）→ 网关侧缺一个「done 之后停发」的刹车
+
+配套两条排除法（复查同类问题前先做，免得又绕回账号池/定时器）：截断步耗时 p50 10.5s
+（正常 9.3s，无 30/60/90s 聚集 → 不是超时定时器）；`outputTokens` p50 844（正常 902，
+且 `finish kind` 里 `max-tokens` 是独立取值 → 不是 token 上限/退化熔断）。
+
+**待查缺口**：`sse.ts` 的解析 switch 只读 `output` / `token_usage` / `done` / `error` 四种
+事件的字段；`sse.ts` 头部事件序列里列出的 `extra_info`、以及 `metadata` / `timing_cost`
+一个字段都没读——上游若把收尾原因（截断标记之类）放在 `extra_info`，现在是被静默丢掉的。
+
 ### Cline 建连超时定责（2026-09-27，改 cline 转发/超时前必读）
 
 事故现象：用户报「重试延迟 543 毫秒」，失败原因是

@@ -635,6 +635,20 @@ export async function proxyTraeChatRequest(
             + ` toolCalls=${info.sawToolCalls}`
           console.log(msg) // codeql-disable: 纯诊断日志，不含密钥/敏感 token
           writeLog(env, 'warn', msg).catch(() => { /* 日志失败不影响流 */ })
+        }, (info) => {
+          // 收尾审计（SoloDoneAudit）：把「上游发了 done、正文却停在半句」与「上游没发 done」
+          // 分开。2026-09-27 的实证是前者——截断带着 finish=stop 到达客户端，`!sawDone` 那道
+          // 防线抓不到，只能靠 done 次数与「done 之后还有多少正文」定性：
+          //   postDoneContent=0 且 dones=1 → 上游自己就产出了这么多（模型早停/上游报 stop）；
+          //   postDoneContent>0 或 dones>1 → 上游 done 之后仍在发正文，客户端按 [DONE] 丢弃。
+          // 只记日志，不改任何下行帧、不罚号；dones=0 的流已由 end=truncated 那条 warn 覆盖。
+          if (info.dones === 0) return
+          const audit = `[trae-stream] provider=${provider.id} uid=${account.uid} model=${configName}`
+            + ` end=done-audit dones=${info.dones} postDoneContent=${info.postDoneContentChars}`
+            + ` postDoneReasoning=${info.postDoneReasoningChars} postDoneToolCalls=${info.postDoneToolCalls}`
+            + ` content=${info.contentChars} reasoning=${info.reasoningChars} toolCalls=${info.sawToolCalls}`
+          console.log(audit) // codeql-disable: 纯诊断日志，不含密钥/敏感 token
+          writeLog(env, 'info', audit).catch(() => { /* 日志失败不影响流 */ })
         }),
         keepAliveMs,
         idleTimeoutMs,

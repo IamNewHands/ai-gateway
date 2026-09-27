@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest'
-import { aggregateSoloSse, aggregateWorkSse, soloStreamToOpenAIStream, type SoloStreamEndInfo } from './sse'
+import { aggregateSoloSse, aggregateWorkSse, soloStreamToOpenAIStream, type SoloDoneAudit, type SoloStreamEndInfo } from './sse'
 import { proxyTraeChatRequest } from './proxy'
 import { readTraePool, setTraeWorkCredits } from './pool'
 
@@ -413,5 +413,69 @@ describe('Trae 连接层失败与聚合截断：Work 兜底与 503 定责', () =
     } finally {
       globalThis.fetch = originalFetch
     }
+  })
+})
+
+/**
+ * 收尾审计（`onAudit` / `SoloDoneAudit`）回归：`fd301f9`（只治「没发 done」）上线后
+ * 线上仍复现半句截断，且截断带着 `finish=stop` 到达客户端——必须能区分
+ * 「上游只产出了这么多」与「上游 done 之后还在发正文（客户端按 [DONE] 丢弃）」。
+ */
+describe('Trae SOLO 收尾审计：done 次数与 done 之后的内容', () => {
+  async function auditOf(chunks: string[]): Promise<SoloDoneAudit> {
+    const audits: SoloDoneAudit[] = []
+    await drain(soloStreamToOpenAIStream(
+      upstreamOf(chunks),
+      'deepseek-v4.1-flash',
+      undefined,
+      undefined,
+      undefined,
+      (info) => audits.push(info)
+    ))
+    expect(audits).toHaveLength(1)
+    return audits[0]
+  }
+
+  it('正常收尾：dones=1，done 之后无任何内容', async () => {
+    const info = await auditOf([
+      'event: output\ndata: {"response":"完整回答"}\n\n',
+      'event: done\ndata: {"finish_reason":"stop"}\n\n',
+    ])
+    expect(info.dones).toBe(1)
+    expect(info.postDoneContentChars).toBe(0)
+    expect(info.postDoneReasoningChars).toBe(0)
+    expect(info.postDoneToolCalls).toBe(0)
+    expect(info.contentChars).toBe(4)
+  })
+
+  it('done 之后仍有正文/思考 → 审计看得见（这些帧客户端收不到）', async () => {
+    const info = await auditOf([
+      'event: output\ndata: {"response":"半句"}\n\n',
+      'event: done\ndata: {"finish_reason":"stop"}\n\n',
+      'event: output\ndata: {"response":"被丢掉的尾巴"}\n\n',
+      'event: output\ndata: {"reasoning_content":"后续思考"}\n\n',
+    ])
+    expect(info.dones).toBe(1)
+    expect(info.postDoneContentChars).toBe(6)
+    expect(info.postDoneReasoningChars).toBe(4)
+    // 全程累计与收尾日志同口径
+    expect(info.contentChars).toBe(8)
+    expect(info.reasoningChars).toBe(4)
+  })
+
+  it('上游收尾两次 → dones=2（第二套收尾同样只会被客户端丢弃）', async () => {
+    const info = await auditOf([
+      'event: output\ndata: {"response":"正文"}\n\n',
+      'event: done\ndata: {"finish_reason":"stop"}\n\n',
+      'event: done\ndata: {"finish_reason":"stop"}\n\n',
+    ])
+    expect(info.dones).toBe(2)
+    expect(info.postDoneContentChars).toBe(0)
+  })
+
+  it('没发 done 的流：审计仍触发且 dones=0（与 onTruncated 同一事实，调用方据此去重）', async () => {
+    const info = await auditOf(['event: output\ndata: {"response":"半句"}\n\n'])
+    expect(info.dones).toBe(0)
+    expect(info.contentChars).toBe(2)
   })
 })

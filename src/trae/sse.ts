@@ -364,6 +364,34 @@ export interface SoloStreamEndInfo {
 }
 
 /**
+ * 收尾审计（`onAudit`）：流正常读到 EOF 时对「上游到底收尾了几次」计数。
+ *
+ * 为什么需要它（2026-09-27，`fd301f9` 上线后仍复现半句截断）：`fd301f9` 那道防线只在
+ * `!sawDone` 时触发（见下方 `if (!sawDone)` 分支），而线上复现的截断**带着
+ * `finish_reason=stop` 到达客户端**（DSH 会话记录 2026-09-27 18:49，`finish=stop` +
+ * `turn/end=completed`），防线按设计抓不到。剩下两种可能，本计数就是把它们分开的证据：
+ *  - `dones === 1` 且 `postDone*` 全为 0：上游只产出了这么多就收尾（模型早停，或上游半路
+ *    掐断但发了 done）；网关无事可做，只能在内容层做兜底。
+ *  - `postDoneContentChars > 0`（或 `dones > 1`）：上游在 done 之后仍在发正文，而网关照发、
+ *    客户端见 `[DONE]` 即丢弃后续帧（OpenAI 兼容客户端一律如此）→ 网关侧缺一个
+ *    「done 之后停发」的刹车，属本仓可修。
+ *
+ * 只做诊断：**不改变任何下行帧**，调用方也不得据此判罚账号（与 `onRunaway` 同纪律）。
+ */
+export interface SoloDoneAudit {
+  /** 本流收到的 `done` 事件次数（上游正常收尾恒为 1；0 表示走了 `!sawDone` 兜底路径）。 */
+  dones: number
+  /** 首个 done 之后才到达的内容规模（>0 即「done 后仍有内容」）。 */
+  postDoneContentChars: number
+  postDoneReasoningChars: number
+  postDoneToolCalls: number
+  /** 全程累计（与 `SoloStreamEndInfo` 同口径，便于和收尾日志对照）。 */
+  contentChars: number
+  reasoningChars: number
+  sawToolCalls: boolean
+}
+
+/**
  * 流式转换：SOLO SSE → OpenAI SSE chunk，使用 ReadableStream 确保流正确结束。
  * 上游流内 error 事件：回调 onErr（供冷却账号/记录日志）并注入一条 error 事件。
  *
@@ -377,13 +405,17 @@ export interface SoloStreamEndInfo {
  * @param onTruncated 收尾异常回调（可选）：上游未发 done 即结束时触发一次。
  * @param onRunaway 推理退化熔断回调（可选）：命中 `runaway.ts` 的退化/预算判据并抑制后
  *   触发一次，供调用方记日志。**不要在回调里冷却账号**——退化是模型行为不是账号故障。
+ * @param onAudit 收尾审计回调（可选）：流读到 EOF 时触发一次，报告 done 次数与 done 之后
+ *   仍到达的内容规模（见 `SoloDoneAudit`）。退化熔断路径不触发，那条由 `onRunaway` 记，
+ *   两路口径不混。同样**不要据此罚号**。
  */
 export function soloStreamToOpenAIStream(
   upstream: ReadableStream<Uint8Array>,
   model: string,
   onErr?: (se: SOLOStreamError) => void,
   onTruncated?: (info: SoloStreamEndInfo) => void,
-  onRunaway?: (info: TraeRunawayInfo) => void
+  onRunaway?: (info: TraeRunawayInfo) => void,
+  onAudit?: (info: SoloDoneAudit) => void
 ): ReadableStream<Uint8Array> {
   return new ReadableStream({
     async start(controller) {
@@ -403,6 +435,11 @@ export function soloStreamToOpenAIStream(
       const guard = new TraeReasoningGuard()
       /** 已发过合成熔断终态帧：此后上游帧全部丢弃，收尾兜底也不得再补第二套收尾。 */
       let runawayTerminated = false
+      // 收尾审计（onAudit）：done 次数 + 首个 done 之后仍到达的内容规模，见 SoloDoneAudit。
+      let doneEvents = 0
+      let postDoneContentChars = 0
+      let postDoneReasoningChars = 0
+      let postDoneToolCalls = 0
 
       const writeChunk = (delta: Record<string, any>, finish: string, extra?: Record<string, unknown>): void => {
         // OpenAI 兼容客户端通常期望首块 delta 带 role（openai SDK / AI SDK 均按此解析）
@@ -465,6 +502,12 @@ export function soloStreamToOpenAIStream(
               const delta: Record<string, any> = {}
               contentChars += ev.response.length
               reasoningChars += ev.reasoning.length
+              // 审计：首个 done 之后还来 output，说明上游收尾不止一次（这段内容客户端收不到，
+              // 见 SoloDoneAudit）。只计数，不影响下发。
+              if (sawDone) {
+                postDoneContentChars += ev.response.length
+                postDoneReasoningChars += ev.reasoning.length
+              }
               // 退化防护：先投喂判定，再决定是否下发推理增量（抑制后思考面板不再被刷屏）。
               // hasProgress 用本帧更新后的计数：本帧带正文/已有工具调用时属正常链路，不做判定。
               if (ev.reasoning !== '') guard.feed(ev.reasoning, contentChars > 0 || sawToolCalls)
@@ -475,6 +518,7 @@ export function soloStreamToOpenAIStream(
                 if (tc) {
                   delta['tool_calls'] = tc
                   sawToolCalls = true
+                  if (sawDone) postDoneToolCalls += 1
                 }
               }
               if (Object.keys(delta).length > 0) writeChunk(delta, '')
@@ -491,6 +535,7 @@ export function soloStreamToOpenAIStream(
               sawUsage = true
               break
             case 'done': {
+              doneEvents += 1
               // 退化熔断优先于正常收尾：只有垃圾推理、没有正文/工具调用时，上游的 done
               // 不能当成功收尾（否则客户端把空转当完成，正是本防护要消灭的假成功）。
               if (guard.suppressed && noProgress()) {
@@ -609,6 +654,21 @@ export function soloStreamToOpenAIStream(
         } catch { /* 流已被取消 */ }
         writeChunk({}, sawToolCalls ? 'tool_calls' : 'stop')
         writeDone()
+      }
+      // 收尾审计：流正常读完时上报一次（退化熔断路径由 onRunaway 记，两路口径不混）。
+      // 只计数、不改任何下行帧；`dones=0` 的流已由 onTruncated 记过，调用方可据此去重。
+      if (!runawayTerminated && onAudit) {
+        try {
+          onAudit({
+            dones: doneEvents,
+            postDoneContentChars,
+            postDoneReasoningChars,
+            postDoneToolCalls,
+            contentChars,
+            reasoningChars,
+            sawToolCalls,
+          })
+        } catch { /* 诊断回调不得影响流 */ }
       }
       controller.close()
     },
