@@ -10,6 +10,7 @@
  *   event:token_usage data:{"prompt_tokens":21,...}
  *   event:done data:{"finish_reason":"stop"}
  */
+import { buildTraeRunawayInfo, isDegenerateReasoningText, TraeReasoningGuard, TRAE_RUNAWAY_GRACE_CHARS, traeRunawayErrorFrame, type TraeRunawayInfo } from './runaway'
 import type { SOLOEvent, SOLOStreamError } from './types'
 
 /** 解析一条事件（eventName 为 event 行值，dataLine 为 data 行值）。 */
@@ -211,6 +212,27 @@ export function aggregateSoloSse(text: string, opts?: { readError?: boolean }): 
   }
   if (upstreamErr) return { resp: null, err: upstreamErr, truncated: null }
 
+  // 推理退化（runaway.ts 的行重复判据）：非流式没有「中途抑制」的机会，只能事后处置。
+  //  - 全程无正文/工具调用 → 不是成功结果：返回 truncated（调用方按可重试失败处理，
+  //    且**不得罚号**——退化成因在模型侧）。拿垃圾推理当答案返回，就是本防护要消灭的假成功；
+  //  - 有正文 → 只剔除退化推理文本，正文照常返回（不能因为思考脏了就丢掉可用答案）。
+  if (isDegenerateReasoningText(reasoning)) {
+    if (content === '' && toolOrder.length === 0) {
+      return {
+        resp: null,
+        err: null,
+        truncated: {
+          kind: 'degenerate_reasoning',
+          contentChars: 0,
+          reasoningChars: reasoning.length,
+          sawToolCalls: false,
+          sawUsage: usage !== null,
+        },
+      }
+    }
+    reasoning = ''
+  }
+
   const message: Record<string, any> = { role: 'assistant', content }
   if (reasoning !== '') message['reasoning_content'] = reasoning
   if (toolOrder.length > 0) {
@@ -326,12 +348,15 @@ function encodeSse(data: string): Uint8Array {
  * 同一个类型服务两条路：流式 `soloStreamToOpenAIStream` 的 `onTruncated` 回调，
  * 以及非流式聚合（`aggregateSoloSse` / `aggregateWorkSse` 的 `truncated` 字段）。
  *
- * `kind` 两个取值对应两种收尾异常：
+ * `kind` 三个取值对应三类收尾异常：
  *  - `read_error`：读上游响应体时抛错（连接被掐断/重置）；
- *  - `no_done`：上游干净 EOF，但全程没发 `done`（模型早停与上游截断在协议上同形）。
+ *  - `no_done`：上游干净 EOF，但全程没发 `done`（模型早停与上游截断在协议上同形）；
+ *  - `degenerate_reasoning`：推理退化空转（`runaway.ts`），网关已抑制退化推理并提前熔断。
+ *    与上两者不同，这条路的**上游流本身是正常的**（常常还有 done）——问题出在内容质量，
+ *    因此调用方同样不得把结果当成功返回，但**不得据此罚号**（退化成因在模型侧）。
  */
 export interface SoloStreamEndInfo {
-  kind: 'read_error' | 'no_done'
+  kind: 'read_error' | 'no_done' | 'degenerate_reasoning'
   contentChars: number
   reasoningChars: number
   sawToolCalls: boolean
@@ -350,12 +375,15 @@ export interface SoloStreamEndInfo {
  * @param model 写入 chunk 的模型名（OpenAI 兼容客户端校验用）。
  * @param onErr 上游流内 error 事件回调。
  * @param onTruncated 收尾异常回调（可选）：上游未发 done 即结束时触发一次。
+ * @param onRunaway 推理退化熔断回调（可选）：命中 `runaway.ts` 的退化/预算判据并抑制后
+ *   触发一次，供调用方记日志。**不要在回调里冷却账号**——退化是模型行为不是账号故障。
  */
 export function soloStreamToOpenAIStream(
   upstream: ReadableStream<Uint8Array>,
   model: string,
   onErr?: (se: SOLOStreamError) => void,
-  onTruncated?: (info: SoloStreamEndInfo) => void
+  onTruncated?: (info: SoloStreamEndInfo) => void,
+  onRunaway?: (info: TraeRunawayInfo) => void
 ): ReadableStream<Uint8Array> {
   return new ReadableStream({
     async start(controller) {
@@ -371,8 +399,12 @@ export function soloStreamToOpenAIStream(
       let contentChars = 0
       let reasoningChars = 0
       let sawUsage = false
+      // 推理退化防护（runaway.ts）：命中后抑制推理增量，并在「既无正文也无工具调用」时熔断。
+      const guard = new TraeReasoningGuard()
+      /** 已发过合成熔断终态帧：此后上游帧全部丢弃，收尾兜底也不得再补第二套收尾。 */
+      let runawayTerminated = false
 
-      const writeChunk = (delta: Record<string, any>, finish: string): void => {
+      const writeChunk = (delta: Record<string, any>, finish: string, extra?: Record<string, unknown>): void => {
         // OpenAI 兼容客户端通常期望首块 delta 带 role（openai SDK / AI SDK 均按此解析）
         if (!sentRole && Object.keys(delta).length > 0) {
           delta['role'] = 'assistant'
@@ -390,21 +422,54 @@ export function soloStreamToOpenAIStream(
           chunk['usage'] = pendingUsage
           pendingUsage = null
         }
+        if (extra) Object.assign(chunk, extra)
         controller.enqueue(encodeSse(JSON.stringify(chunk)))
       }
       const writeDone = (): void => {
         controller.enqueue(encodeSse('[DONE]'))
       }
 
+      /** 「本轮尚未产出任何可用结果」：退化熔断与 runaway 报错都只在这种形态下触发。 */
+      const noProgress = (): boolean => contentChars === 0 && !sawToolCalls
+
+      /**
+       * 合成熔断收尾：错误帧（客户端按可重试失败处理）+ `finish_reason:"length"` + [DONE]。
+       *
+       * 为什么用 length 而不是 stop：stop 会让客户端把「只有垃圾推理、没有答案」当正常完成
+       * （这正是 2026-09-27 静默截断事故的同一类误导）。length 语义诚实：模型被掐了。
+       * `x_trae_runaway` 是网关自加的标记，用于把「护盾熔断」与上游真实的 token 上限区分开。
+       */
+      const emitRunawayTerminal = (): void => {
+        if (runawayTerminated) return
+        runawayTerminated = true
+        const info = buildTraeRunawayInfo(guard, contentChars, sawToolCalls)
+        if (onRunaway) {
+          try { onRunaway(info) } catch { /* 诊断回调不得影响流 */ }
+        }
+        // 刻意**不走** onTruncated：那一路的日志口径是「上游截断」（end=truncated），
+        // 与「上游正常收尾、只是内容退化了」是两种归因；同一次事件报两条互相矛盾的日志
+        // 会把排查带回错误方向。退化只经 onRunaway 上报（非流式路径则用 truncated.kind）。
+        try {
+          controller.enqueue(encodeSse(JSON.stringify(traeRunawayErrorFrame(info))))
+        } catch { /* 流已被取消 */ }
+        writeChunk({}, 'length', { x_trae_runaway: info.kind })
+        writeDone()
+      }
+
       const processEvents = (events: SOLOEvent[]): void => {
         for (const ev of events) {
+          // 已熔断收尾：剩余上游帧一律丢弃（含 done，避免出现第二套收尾/[DONE]）
+          if (runawayTerminated) return
           switch (ev.event) {
             case 'output': {
               const delta: Record<string, any> = {}
               contentChars += ev.response.length
               reasoningChars += ev.reasoning.length
+              // 退化防护：先投喂判定，再决定是否下发推理增量（抑制后思考面板不再被刷屏）。
+              // hasProgress 用本帧更新后的计数：本帧带正文/已有工具调用时属正常链路，不做判定。
+              if (ev.reasoning !== '') guard.feed(ev.reasoning, contentChars > 0 || sawToolCalls)
               if (ev.response !== '') delta['content'] = ev.response
-              if (ev.reasoning !== '') delta['reasoning_content'] = ev.reasoning
+              if (ev.reasoning !== '' && !guard.suppressed) delta['reasoning_content'] = ev.reasoning
               if (ev.toolCalls !== null && ev.toolCalls !== undefined && ev.toolCalls !== 'null') {
                 const tc = normalizeStreamToolCalls(ev.toolCalls)
                 if (tc) {
@@ -413,6 +478,12 @@ export function soloStreamToOpenAIStream(
                 }
               }
               if (Object.keys(delta).length > 0) writeChunk(delta, '')
+              // 提前熔断：已抑制后又空转 TRAE_RUNAWAY_GRACE_CHARS 仍无任何产出 → 立刻收尾并
+              // 取消上游读取（上游不会自己停，继续读只会烧积分）。
+              if (guard.suppressed && noProgress() && guard.graceChars >= TRAE_RUNAWAY_GRACE_CHARS) {
+                emitRunawayTerminal()
+                return
+              }
               break
             }
             case 'token_usage':
@@ -420,6 +491,12 @@ export function soloStreamToOpenAIStream(
               sawUsage = true
               break
             case 'done': {
+              // 退化熔断优先于正常收尾：只有垃圾推理、没有正文/工具调用时，上游的 done
+              // 不能当成功收尾（否则客户端把空转当完成，正是本防护要消灭的假成功）。
+              if (guard.suppressed && noProgress()) {
+                emitRunawayTerminal()
+                break
+              }
               // 上游 SOLO 的 done 常自报 finish_reason=stop，即使本回合已发起工具调用。
               // OpenAI 协议规定：消息含 tool_calls 时 finish_reason 必须是 tool_calls，
               // 否则客户端（如 opencode 用的 AI SDK runToolsTransform）收不到收尾信号，
@@ -471,6 +548,11 @@ export function soloStreamToOpenAIStream(
             if (ev) events.push(ev)
           }
           processEvents(events)
+          if (runawayTerminated) {
+            // 已熔断收尾：立刻停止读上游（上游不会自己停，继续读只烧积分）
+            await textReader.cancel().catch(() => { /* 取消失败不影响已发出的收尾帧 */ })
+            break
+          }
         }
       } catch {
         // 读体异常（连接重置/掐断）不再静默吞掉：记标记，收尾时如实上报。
@@ -504,7 +586,14 @@ export function soloStreamToOpenAIStream(
       //    （openai/core/streaming.js:49），DSH 的 pi-ai 据此走「可重试失败」而不是
       //    把半截正文当成功；
       //  - 宽松客户端仍随后拿到 stop + [DONE]，行为与修复前一致，不引入新的挂起风险。
-      if (!sawDone) {
+      if (!runawayTerminated && guard.suppressed && noProgress()) {
+        // 收尾时机兜底：抑制后上游自己结束了（无论有没有 done），而全程仍无产出 →
+        // 必须补熔断收尾。否则会落进下面的 no-done 分支，把「模型空转」误报成「上游截断」，
+        // 定责方向就错了（用户会去查网络，而真因是模型退化）。
+        emitRunawayTerminal()
+      }
+
+      if (!runawayTerminated && !sawDone) {
         const kind = readErrored ? 'upstream_interrupted' : 'upstream_no_finish'
         const detail = `content=${contentChars}, reasoning=${reasoningChars}, toolCalls=${sawToolCalls}, usage=${sawUsage}`
         const text = readErrored
@@ -577,12 +666,41 @@ function normalizeStreamToolCalls(raw: unknown): unknown[] | null {
 // ===== Work 通道流式与非流式转换 (移植自 trae2api StreamWorkToOpenAI / AggregateWork) =====
 
 /**
+ * 从 Work `done.last_assistant_response` 已解析值里取最终正文（流式与非流式共用）。
+ *
+ * 上游该字段有**三种**实测形态，此前只认第一种，另两种会被静默丢掉：
+ *  1. JSON 数组 `["答案"]`（原实现唯一覆盖的形态）；
+ *  2. **JSON 字符串** `"答案"` —— `JSON.parse` 成功返回 string，`Array.isArray` 不成立，
+ *     且因为解析成功也不会走 catch 分支 → 最终答案被无声吞掉（客户端只看到空内容）；
+ *  3. 非 JSON 裸文本（如 `答案`）—— 由调用方 catch 分支处理，不经本函数。
+ *
+ * 数组形态取**第一个非空字符串元素**（原实现固定取 `arr[0]`，`["", "答案"]` 会被丢空）。
+ * 其它类型（数字/对象/null）返回空串：宁可不发，也不把 `[object Object]` 当答案下发。
+ */
+export function pickWorkFinalAnswer(parsed: unknown): string {
+  if (typeof parsed === 'string') return parsed
+  if (Array.isArray(parsed)) {
+    for (const item of parsed) {
+      if (typeof item === 'string' && item !== '') return item
+    }
+  }
+  return ''
+}
+
+
+/**
  * 将 Work 专有通道下行 SSE 事件流转换为标准 OpenAI chat.completion.chunk SSE 流。
+ *
+ * 与 SOLO 侧同样挂推理退化防护（`runaway.ts`）：Work 的 `plan_item` 思考文本走
+ * `reasoning_content` 通道，是同一个退化现场的另一条来源。
+ *
+ * @param onRunaway 推理退化熔断回调（可选）：仅供调用方记日志，**不得**据此冷却账号。
  */
 export function workStreamToOpenAIStream(
   upstream: ReadableStream<Uint8Array>,
   model: string,
-  onErr?: (se: SOLOStreamError) => void
+  onErr?: (se: SOLOStreamError) => void,
+  onRunaway?: (info: TraeRunawayInfo) => void
 ): ReadableStream<Uint8Array> {
   return new ReadableStream({
     async start(controller) {
@@ -593,6 +711,10 @@ export function workStreamToOpenAIStream(
       let lineBuffer = ''
       let currentEvent = ''
       let fullText = ''
+      let contentChars = 0
+      // 推理退化防护（同 SOLO 侧）：Work 聚合不解析工具调用，故「产出」只以正文字符计。
+      const guard = new TraeReasoningGuard()
+      let runawayTerminated = false
 
       const handleDelta = (text: string): string => {
         if (!text) return ''
@@ -607,7 +729,7 @@ export function workStreamToOpenAIStream(
         return ''
       }
 
-      const writeChunk = (delta: Record<string, any>, finish: string): void => {
+      const writeChunk = (delta: Record<string, any>, finish: string, extra?: Record<string, unknown>): void => {
         if (!sentRole && Object.keys(delta).length > 0) {
           delta['role'] = 'assistant'
           sentRole = true
@@ -624,6 +746,7 @@ export function workStreamToOpenAIStream(
           chunk['usage'] = pendingUsage
           pendingUsage = null
         }
+        if (extra) Object.assign(chunk, extra)
         controller.enqueue(encodeSse(JSON.stringify(chunk)))
       }
 
@@ -631,7 +754,28 @@ export function workStreamToOpenAIStream(
         controller.enqueue(encodeSse('[DONE]'))
       }
 
+      /** 合成熔断收尾（语义同 SOLO 侧 `emitRunawayTerminal`）。 */
+      const writeRunawayTerminal = (): void => {
+        if (runawayTerminated) return
+        runawayTerminated = true
+        const info = buildTraeRunawayInfo(guard, contentChars, false)
+        if (onRunaway) {
+          try { onRunaway(info) } catch { /* 诊断回调不得影响流 */ }
+        }
+        try {
+          controller.enqueue(encodeSse(JSON.stringify(traeRunawayErrorFrame(info))))
+        } catch { /* 流已被取消 */ }
+        writeChunk({}, 'length', { x_trae_runaway: info.kind })
+        writeDone()
+      }
+
+      /** 提前熔断判定：已抑制后空转满 grace 字符仍无正文 → 收尾（上游不会自己停）。 */
+      const runawayGraceExhausted = (): boolean =>
+        guard.suppressed && contentChars === 0 && guard.graceChars >= TRAE_RUNAWAY_GRACE_CHARS
+
       const processLine = (line: string): void => {
+        // 已熔断收尾：剩余上游行全部丢弃（含 [DONE]，避免出现第二套收尾）
+        if (runawayTerminated) return
         const trimmed = line.trim()
         if (!trimmed) return
         if (trimmed.startsWith('event:')) {
@@ -640,9 +784,20 @@ export function workStreamToOpenAIStream(
         }
         if (!trimmed.startsWith('data:')) return
 
+        // 提前熔断：已抑制后空转满 grace 字符仍无正文 → 立刻收尾（上游不会自己停）
+        if (runawayGraceExhausted()) {
+          writeRunawayTerminal()
+          return
+        }
+
         const dataContent = trimmed.slice(5).trim()
         if (dataContent === '[DONE]') {
           sawDone = true
+          // 空转到底：只回过垃圾推理，[DONE] 不能当成功收尾
+          if (guard.suppressed && contentChars === 0) {
+            writeRunawayTerminal()
+            return
+          }
           writeDone()
           return
         }
@@ -666,12 +821,20 @@ export function workStreamToOpenAIStream(
           case 'plan_item': {
             const thoughtText = payload.reasoning_content || payload.thought || payload.plan_title
             if (thoughtText) {
+              // 退化防护投喂用的是**上游原文**而非 handleDelta 的去重结果：
+              // 上游重复下发同一段思考时 handleDelta 返回 ''（客户端看不到重复），
+              // 若只在去重结果上判退化，网关会把「上游正在空转」这一段盲掉——UI 干净了，
+              // 积分却照样在烧。判定与转发因此解耦。
+              guard.feed(String(thoughtText), contentChars > 0)
               const d = handleDelta(String(thoughtText))
-              if (d) writeChunk({ reasoning_content: d }, '')
+              if (d && !guard.suppressed) writeChunk({ reasoning_content: d }, '')
             }
             if (payload.tool_call_info?.params?.summary) {
               const d = handleDelta(String(payload.tool_call_info.params.summary))
-              if (d) writeChunk({ content: d }, '')
+              if (d) {
+                contentChars += d.length
+                writeChunk({ content: d }, '')
+              }
             }
             break
           }
@@ -680,15 +843,24 @@ export function workStreamToOpenAIStream(
               for (const choice of payload.choices) {
                 if (choice?.text && choice.text !== '[]') {
                   const d = handleDelta(String(choice.text))
-                  if (d) writeChunk({ content: d }, '')
+                  if (d) {
+                    contentChars += d.length
+                    writeChunk({ content: d }, '')
+                  }
                 }
               }
             } else if (typeof payload.response === 'string') {
               const d = handleDelta(payload.response)
-              if (d) writeChunk({ content: d }, '')
+              if (d) {
+                contentChars += d.length
+                writeChunk({ content: d }, '')
+              }
             } else if (typeof payload.text === 'string') {
               const d = handleDelta(payload.text)
-              if (d) writeChunk({ content: d }, '')
+              if (d) {
+                contentChars += d.length
+                writeChunk({ content: d }, '')
+              }
             }
             break
           }
@@ -698,16 +870,26 @@ export function workStreamToOpenAIStream(
           }
           case 'done': {
             if (payload.last_assistant_response) {
+              let finalText = ''
               try {
-                const arr = JSON.parse(payload.last_assistant_response)
-                if (Array.isArray(arr) && arr.length > 0 && typeof arr[0] === 'string') {
-                  const d = handleDelta(arr[0])
-                  if (d) writeChunk({ content: d }, '')
-                }
+                finalText = pickWorkFinalAnswer(JSON.parse(payload.last_assistant_response))
               } catch {
-                const d = handleDelta(String(payload.last_assistant_response))
-                if (d) writeChunk({ content: d }, '')
+                // 非 JSON 裸文本：按原样当正文（形态 3）
+                finalText = String(payload.last_assistant_response)
               }
+              if (finalText) {
+                const d = handleDelta(finalText)
+                if (d) {
+                  contentChars += d.length
+                  writeChunk({ content: d }, '')
+                }
+              }
+            }
+            // 退化空转：done 到了但全程没有正文（只有被抑制的垃圾推理）→ 不能当成功收尾
+            if (guard.suppressed && contentChars === 0) {
+              sawDone = true
+              writeRunawayTerminal()
+              break
             }
             writeChunk({}, 'stop')
             writeDone()
@@ -743,17 +925,27 @@ export function workStreamToOpenAIStream(
           for (const line of lines) {
             processLine(line.replace(/\r$/, ''))
           }
+          if (runawayTerminated) {
+            // 已熔断收尾：立刻停止读上游（上游不会自己停，继续读只烧积分）
+            await textReader.cancel().catch(() => { /* 取消失败不影响已发出的收尾帧 */ })
+            break
+          }
         }
         if (lineBuffer.trim()) {
           processLine(lineBuffer.replace(/\r$/, ''))
         }
       } catch (e) {
-        if (!sawDone) {
+        if (!runawayTerminated && !sawDone) {
           const errFrame = { error: { message: (e as Error).message || 'stream read error', type: 'transport_error' } }
           controller.enqueue(new TextEncoder().encode(`data: ${JSON.stringify(errFrame)}\n\n`))
         }
       } finally {
-        if (!sawDone) {
+        // 退化熔断兜底（先于 no-done 兜底）：抑制后上游自己结束/异常收尾而全程无正文时，
+        // 必须报「模型空转」而不是落进下面的 stop 兜底（那会把空转伪装成正常收尾）。
+        if (!runawayTerminated && guard.suppressed && contentChars === 0) {
+          writeRunawayTerminal()
+        }
+        if (!runawayTerminated && !sawDone) {
           writeChunk({}, 'stop')
           writeDone()
         }
@@ -863,14 +1055,15 @@ export function aggregateWorkSse(text: string, model: string, opts?: { readError
       case 'done': {
         sawDone = true
         if (payload.last_assistant_response) {
+          // 与流式路径同一提取口径（pickWorkFinalAnswer）：JSON 字符串形态也必须落地
+          let finalText = ''
           try {
-            const arr = JSON.parse(payload.last_assistant_response)
-            if (Array.isArray(arr) && arr.length > 0 && typeof arr[0] === 'string') {
-              const d = handleDelta(arr[0])
-              if (d) fullContent += d
-            }
+            finalText = pickWorkFinalAnswer(JSON.parse(payload.last_assistant_response))
           } catch {
-            const d = handleDelta(String(payload.last_assistant_response))
+            finalText = String(payload.last_assistant_response)
+          }
+          if (finalText) {
+            const d = handleDelta(finalText)
             if (d) fullContent += d
           }
         }
@@ -886,6 +1079,24 @@ export function aggregateWorkSse(text: string, model: string, opts?: { readError
   }
 
   if (upstreamErr) return { resp: null, err: upstreamErr, truncated: null }
+
+  // 推理退化（同 SOLO 聚合口径）：Work 聚合不解析工具调用，「产出」只以正文计。
+  if (isDegenerateReasoningText(fullReasoning)) {
+    if (fullContent === '') {
+      return {
+        resp: null,
+        err: null,
+        truncated: {
+          kind: 'degenerate_reasoning',
+          contentChars: 0,
+          reasoningChars: fullReasoning.length,
+          sawToolCalls: false,
+          sawUsage: usage !== null,
+        },
+      }
+    }
+    fullReasoning = ''
+  }
 
   const message: Record<string, any> = { role: 'assistant', content: fullContent }
   if (fullReasoning) message['reasoning_content'] = fullReasoning

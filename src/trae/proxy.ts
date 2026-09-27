@@ -407,7 +407,13 @@ export async function executeWorkRequest(
         }
       }
       const sseBody = withSSEKeepAlive(
-        workStreamToOpenAIStream(resp.body, workModel, onErr),
+        workStreamToOpenAIStream(resp.body, workModel, onErr, (info) => {
+          // 推理退化（plan_item 思考文本重复）熔断：同样不冷却账号（模型行为非账号故障）
+          const msg = `[trae-work-stream] provider=${provider.id} uid=${account.uid} model=${workModel}`
+            + ` end=runaway kind=${info.kind} reasoning=${info.reasoningChars} content=${info.contentChars}`
+          console.log(msg) // codeql-disable: 纯诊断日志，不含密钥/敏感 token
+          writeLog(env, 'warn', msg).catch(() => { /* 日志失败不影响流 */ })
+        }),
         keepAliveMs,
         idleTimeoutMs,
         (reason) => {
@@ -618,6 +624,15 @@ export async function proxyTraeChatRequest(
           const msg = `[trae-stream] provider=${provider.id} uid=${account.uid} model=${configName}`
             + ` end=truncated kind=${info.kind} content=${info.contentChars} reasoning=${info.reasoningChars}`
             + ` toolCalls=${info.sawToolCalls} usage=${info.sawUsage}`
+          console.log(msg) // codeql-disable: 纯诊断日志，不含密钥/敏感 token
+          writeLog(env, 'warn', msg).catch(() => { /* 日志失败不影响流 */ })
+        }, (info) => {
+          // 推理退化（思考死循环）熔断标记：与「上游截断」分开记，事后按 end=runaway 直接定位。
+          // **刻意不冷却账号**：退化是模型采样行为，不是账号故障；罚号会把健康池刷成
+          // no_healthy_account（本仓 applyChatError 的 transport/client_params 分支同纪律）。
+          const msg = `[trae-stream] provider=${provider.id} uid=${account.uid} model=${configName}`
+            + ` end=runaway kind=${info.kind} reasoning=${info.reasoningChars} content=${info.contentChars}`
+            + ` toolCalls=${info.sawToolCalls}`
           console.log(msg) // codeql-disable: 纯诊断日志，不含密钥/敏感 token
           writeLog(env, 'warn', msg).catch(() => { /* 日志失败不影响流 */ })
         }),
