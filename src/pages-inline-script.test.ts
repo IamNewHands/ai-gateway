@@ -57,10 +57,11 @@ async function render(providers: Provider[]): Promise<string> {
  */
 function inlineScripts(html: string): string[] {
   const out: string[] = []
-  // 结束标签允许 `</script >` / `</script/>`（HTML 解析器接受空白与斜杠，见
-  // script-data-end-tag-open-state）；写成 `<\/script>` 会漏掉这类块，
-  // 漏掉就等于少校验一段客户端脚本（CodeQL js/bad-tag-filter 亦会报）。
-  const re = /<script([^>]*)>([\s\S]*?)<\/script\s*\/?>/gi
+  // 结束标签按 HTML 解析器的实际行为匹配：`</script` 之后空格、斜杠、制表/换行或任意属性杂字符
+  // 直到 `>` 都算合法结束标签（script-data-end-tag-open-state → before-attribute-name），
+  // 所以用 `[^>]*`；只写 `</script>`（或只放行 `\s*\/?>`）会漏掉 `</script >`、`</script\t\n bar>`
+  // 这类块 —— 漏掉就等于少校验一段客户端脚本（CodeQL js/bad-tag-filter 亦会报）。
+  const re = /<script([^>]*)>([\s\S]*?)<\/script[^>]*>/gi
   let m: RegExpExecArray | null
   while ((m = re.exec(html)) !== null) {
     const attrs = m[1] || ''
