@@ -53,6 +53,13 @@ export interface TraeAccountState {
   activeSessions?: number
   /** 最近一次活跃会话时刻 epoch ms（特性A 空闲回收用） */
   lastActiveAt?: number
+  /**
+   * 最近一次探测到的权益包明细（含到期时间），面板「积分明细」折叠表用。
+   * 只由登录 / 签到 / 手动刷新积分写入，不在请求热路径上更新。
+   */
+  packs?: TraeEntPackInfo[]
+  /** packs 的探测时刻 epoch ms（面板展示数据新鲜度） */
+  packsAt?: number
 }
 
 /** 账号池：uid → 状态 */
@@ -75,6 +82,16 @@ export interface TraeEntPackInfo {
   isWork: boolean
   packType?: number | string
   bizType?: string
+  /** 权益包到期时刻（Unix 秒；0/缺省 = 长期有效）。上游 entitlement_base_info.end_time */
+  expireAt?: number
+  /** 权益包生效时刻（Unix 秒；0/缺省 = 未知）。上游 entitlement_base_info.start_time */
+  startAt?: number
+  /** 上游包状态（1 生效 / 0 未生效等）；缺省 = 未下发 */
+  status?: number
+  /** 上游 product_type（0 Free / 1 Pro / 4 Pro+ / 6 Ultra / 8 Lite 等） */
+  productType?: number | string
+  /** 上游 entitlement_id（面板折叠明细定位用） */
+  entitlementId?: string
 }
 
 export interface TraeEntUsageDetails {
@@ -98,6 +115,10 @@ export interface TraeAccountStatus {
   workReason?: string
   disabled: boolean
   errCount: number
+  /** 权益包明细（含到期时间），来自最近一次探测；从未探测过则缺省 */
+  packs?: TraeEntPackInfo[]
+  /** packs 探测时刻 epoch ms */
+  packsAt?: number
 }
 
 /** 单条 SOLO SSE 事件（归一化） */

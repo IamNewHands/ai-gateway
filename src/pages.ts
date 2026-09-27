@@ -2580,6 +2580,64 @@ function zcodeModels(id) {
     if (st) showResult(st, true, '已拉取 ' + entries.length + ' 个模型（' + (from === 'dynamic' ? '上游动态' : from === 'cache' ? '缓存' : '静态兜底') + '），点击 + 添加或直接保存')
   }).catch(() => { if (st) showResult(st, false, '网络错误，请重试') })
 }
+/**
+ * TRAE 权益包到期时间渲染：
+ *  - expireAt 为 0/缺省 → 「长期」（上游 end_time=0 表示不失效）
+ *  - 已过期（< now）→ 红色「已过期」+ 原始时刻
+ *  - 未过期 → 本地时间 + 剩余天数（<3 天标黄，提示即将失效）
+ * 时间戳口径为 Unix 秒（后端 normalizePackEpoch 已归一化毫秒变体）。
+ */
+function traePackExpireHtml(expireAt) {
+  if (!expireAt || !(expireAt > 0)) return '<span class="mu">长期</span>'
+  const d = new Date(expireAt * 1000)
+  if (isNaN(d.getTime())) return '<span class="mu">—</span>'
+  const txt = d.toLocaleDateString() + ' ' + d.toLocaleTimeString()
+  const days = Math.ceil((expireAt * 1000 - Date.now()) / 86400000)
+  if (days <= 0) return '<span style="color:var(--color-danger,#ef4444)" title="' + escapeHtml(txt) + '">已过期</span>'
+  const color = days <= 3 ? 'var(--color-warn,#d97706)' : 'inherit'
+  return '<span style="color:' + color + '" title="' + escapeHtml(txt) + '">' + escapeHtml(txt) + '</span><br><small class="mu">剩 ' + days + ' 天</small>'
+}
+/**
+ * TRAE 积分明细折叠表：逐包展示名称 / 到期时间 / 已用/总额 / 剩余。
+ * 按「通用包在前、Work 包在后」分组，组内已由后端按到期时间升序排好。
+ * packs 缺省（从未探测）与空数组（探测到 0 个包）语义不同，分别给不同提示。
+ */
+function traePackDetailHtml(uid, packs, packsAt, idx) {
+  if (!Array.isArray(packs)) {
+    return '<div class="mu" style="margin-top:2px">积分明细：未探测（点「刷新积分」或「全部签到」获取各包到期时间）</div>'
+  }
+  const totalRem = packs.reduce(function (s, p) { return s + (Number(p.rem) || 0) }, 0)
+  const totalLimit = packs.reduce(function (s, p) { return s + (Number(p.limit) || 0) }, 0)
+  const expiring = packs.filter(function (p) {
+    if (!p.expireAt || !(p.expireAt > 0)) return false
+    const ms = p.expireAt * 1000 - Date.now()
+    return ms > 0 && ms <= 3 * 86400000
+  }).length
+  const when = packsAt ? new Date(packsAt).toLocaleString() : ''
+  if (packs.length === 0) {
+    return '<div class="mu" style="margin-top:2px">积分明细：上游未下发权益包' + (when ? '（探测于 ' + escapeHtml(when) + '）' : '') + '</div>'
+  }
+  const aid = 'traepkg-' + escapeHtml(uid) + '-' + idx
+  const rows = packs.map(function (p) {
+    const lim = Number(p.limit) || 0
+    const used = Number(p.used) || 0
+    const rem = Number(p.rem) || 0
+    const pct = lim > 0 ? Math.round(used / lim * 100) : 0
+    const kind = p.isWork ? '<span class="bd bd-info">Work</span>' : '<span class="bd bd-off">通用</span>'
+    const zero = rem <= 0 ? ' style="opacity:.55"' : ''
+    return '<tr' + zero + '><td>' + escapeHtml(p.name || '') + ' ' + kind + '</td>' +
+      '<td>' + traePackExpireHtml(p.expireAt) + '</td>' +
+      '<td class="numeric">' + used + ' / ' + lim + (lim > 0 ? '（' + pct + '%）' : '') + '</td>' +
+      '<td class="numeric">' + rem + '</td></tr>'
+  }).join('')
+  const head = '积分明细（' + packs.length + ' 个包 · 可用 ' + totalRem + ' / 总额 ' + totalLimit + '）' +
+    (expiring > 0 ? ' · <span style="color:var(--color-warn,#d97706)">' + expiring + ' 个 3 天内到期</span>' : '')
+  return '<div class="collapse-section" style="margin-top:4px"><button class="collapse-btn" data-traepkg="' + aid + '" type="button" aria-expanded="false">' +
+    '<i class="fas fa-chevron-right collapse-icon" aria-hidden="true"></i> ' + head + '</button>' +
+    '<div id="' + aid + '" class="hd usage-log-table-wrap"><table class="usage-log-table">' +
+    '<thead><tr><th>权益包</th><th>到期时间</th><th>已用/总额度</th><th>剩余</th></tr></thead><tbody>' + rows + '</tbody></table>' +
+    (when ? '<p class="form-helper">探测于 ' + escapeHtml(when) + '</p>' : '') + '</div></div>'
+}
 function traeStatus(id) {
   const st = document.getElementById('trae-st-' + id)
   const box = document.getElementById('trae-acc-' + id)
@@ -2609,7 +2667,7 @@ function traeStatus(id) {
       box.innerHTML = preferBar +
         '<div style="max-height:260px;overflow:auto"><table class="usage-log-table" style="margin:0">' +
         '<thead><tr><th>UID</th><th>昵称</th><th>通用积分 (SOLO)</th><th>Work 积分</th><th>今日签到</th><th>通道状态</th><th>冷却至</th><th>操作</th></tr></thead><tbody>' +
-        accs.map(function (a) {
+        accs.map(function (a, ai) {
           const isDis = a.disabled
           const soloCool = a.cooling
           const workCool = a.workCooling
@@ -2648,12 +2706,19 @@ function traeStatus(id) {
           const soloBadge = '<span class="bd ' + (rawSolo > 0 ? 'bd-on' : 'bd-off') + '" title="通用积分 (SOLO 通道): ' + rawSolo + '">' + soloCredits + '</span>'
           const workBadge = '<span class="bd ' + (hasWork && (rawWork || 0) > 0 ? 'bd-on' : 'bd-off') + '" title="' + (hasWork ? 'Work 专属通道可用额度: ' + rawWork : '点击「刷新积分」或「全部签到」探测') + '">' + workVal + '</span>'
 
+          const packDetail = traePackDetailHtml(a.uid, a.packs, a.packsAt, ai)
+
           return '<tr><td><code>' + escapeHtml(a.uid) + '</code></td><td>' + escapeHtml(a.nickname || '-') + '</td>' +
             '<td>' + soloBadge + '</td><td>' + workBadge + '</td><td' + ciTip + '>' + ciTxt + '</td><td>' + stTxt + reasonHtml + '</td><td>' + until + '</td>' +
-            '<td><button class="btn btn-d btn-xs" onclick="traeRemoveAccount(\\'' + escapeJsAttr(id) + '\\',\\'' + escapeJsAttr(a.uid) + '\\')">删除</button></td></tr>'
+            '<td><button class="btn btn-d btn-xs" onclick="traeRemoveAccount(\\'' + escapeJsAttr(id) + '\\',\\'' + escapeJsAttr(a.uid) + '\\')">删除</button></td></tr>' +
+            '<tr><td colspan="8" style="border-top:none;padding-top:0">' + packDetail + '</td></tr>'
         }).join('') + '</tbody></table></div>' +
-        '<p class="form-helper">共 ' + accs.length + ' 个账号；今日已签 ' + ciOk + ' / ' + accs.length + '</p>'
+        '<p class="form-helper">共 ' + accs.length + ' 个账号；今日已签 ' + ciOk + ' / ' + accs.length + '。「积分明细」展开可见每个权益包的到期时间与用量，点「刷新积分」更新。</p>'
     }
+    // 绑定积分明细折叠按钮（与 WorkBuddy 池 / 签到区同一 toggleCollapse 交互）
+    box.querySelectorAll('[data-traepkg]').forEach(function (btn) {
+      btn.addEventListener('click', function () { toggleCollapse(btn.getAttribute('data-traepkg'), btn) })
+    })
   }).catch(() => { if (st) showResult(st, false, '网络错误，请重试') })
 }
 function traeSetPrefer(id, forcedUid) {

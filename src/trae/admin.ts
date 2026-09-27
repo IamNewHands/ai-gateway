@@ -36,6 +36,7 @@ import {
   removeTraeAccount,
   saveTraeAccount,
   setTraeCredits,
+  setTraePacks,
   setTraeWorkCredits,
 } from './pool'
 import { isTraeProvider } from './proxy'
@@ -241,6 +242,7 @@ export async function handleTraeLoginCallback(c: Context<AppEnv>) {
     }
     await setTraeCredits(c.env, id, uid, credits)
     await setTraeWorkCredits(c.env, id, uid, workCredits)
+    await setTraePacks(c.env, id, uid, details.packs)
   } catch (e) {
     console.warn(`[trae-login] ent usage failed: ${(e as Error).message}`)
   }
@@ -331,6 +333,7 @@ async function checkinTraeAccount(env: Env, provider: Provider, account: TraeAcc
     await reenableTraeIfCredits(env, provider.id, account.uid, ideRemain, workRemain)
     base.credits = ideRemain
     base.workCredits = workRemain
+    await setTraePacks(env, provider.id, account.uid, details.packs)
   } catch (e) {
     base.message += '；积分查询失败: ' + ((e as Error).message || String(e)).substring(0, 120)
   }
@@ -584,6 +587,8 @@ export async function handleTraeCreditsRefresh(c: Context<AppEnv>) {
       }
 
       await reenableTraeIfCredits(c.env, id, a.uid, ideRemain, workRemain)
+      // 权益包明细（含到期时间）落盘，面板「积分明细」折叠表据此展示
+      await setTraePacks(c.env, id, a.uid, details.packs)
       results.push({
         uid: a.uid,
         ideRemain,

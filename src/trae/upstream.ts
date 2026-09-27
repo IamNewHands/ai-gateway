@@ -501,6 +501,24 @@ export async function fetchUserEntUsage(account: TraeAccount): Promise<number> {
   return details.total
 }
 
+/**
+ * 权益包时间戳归一化为 Unix 秒。
+ * 上游 `entitlement_base_info.end_time` / `start_time` 实测为秒（如 1763038285），
+ * 但社区样本存在毫秒变体，故 >1e12 视为毫秒除以 1000（同 normalizeExpiresAt 口径）。
+ * 0 / 非数 / 负数 → 0（长期有效或未下发，由面板渲染为「长期」）。
+ */
+function normalizePackEpoch(v: unknown): number {
+  const n = Number(v)
+  if (!Number.isFinite(n) || n <= 0) return 0
+  return n > 1e12 ? Math.floor(n / 1000) : Math.floor(n)
+}
+
+/** 取可选数字：非数/NaN → undefined（不写假 0，避免面板显示误导性状态）。 */
+function toOptionalNum(v: unknown): number | undefined {
+  const n = Number(v)
+  return Number.isFinite(n) ? n : undefined
+}
+
 /** 详细查询各权益包积分，区分 ideCredits 与 workCredits */
 export async function fetchUserEntUsageDetails(account: TraeAccount): Promise<TraeEntUsageDetails> {
   const raw = await doJsonText(TRAE_CONSTANTS.UgHost + TRAE_CONSTANTS.EpEntUsage, ugHeaders(account), {})
@@ -550,6 +568,13 @@ export async function fetchUserEntUsageDetails(account: TraeAccount): Promise<Tr
       isWork: isWorkPack,
       packType: p?.pack_type ?? p?.entitlement_base_info?.pack_type,
       bizType: p?.biz_type ?? p?.entitlement_base_info?.biz_type,
+      // 到期/生效时刻：上游 entitlement_base_info.end_time / start_time（Unix 秒）。
+      // 兼容毫秒时间戳（>1e12 视为 ms）；0/非数 = 长期有效，保留 0 由面板渲染成「长期」。
+      expireAt: normalizePackEpoch(p?.entitlement_base_info?.end_time),
+      startAt: normalizePackEpoch(p?.entitlement_base_info?.start_time),
+      status: toOptionalNum(p?.status),
+      productType: p?.entitlement_base_info?.product_type ?? p?.product_type,
+      entitlementId: idStr ? String(idStr) : undefined,
     })
   }
   return { ideCredits, workCredits, total, packs: packList }

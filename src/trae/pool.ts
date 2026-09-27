@@ -18,7 +18,7 @@ import type { Env, Provider } from '../types'
 import { KV_KEYS } from '../config'
 import { parseAuth, serializeAccount } from './upstream'
 import { updateProvider } from '../storage'
-import type { TraeAccount, TraeAccountState, TraeAccountStatus, TraePool } from './types'
+import type { TraeAccount, TraeAccountState, TraeAccountStatus, TraeEntPackInfo, TraePool } from './types'
 
 // 冷却/错误阈值（与 traework2api pool.CoolPlan/CoolSoft/CoolErr 对齐）
 export const TRAE_PLAN_COOLDOWN_MS = 12 * 60 * 60 * 1000
@@ -322,6 +322,23 @@ export async function setTraeWorkCredits(env: Env, providerId: string, uid: stri
   await writeTraePool(env, providerId, pool)
 }
 
+/**
+ * 落盘最近一次探测到的权益包明细（含到期时间），供面板「积分明细」折叠表展示。
+ * 只由登录 / 签到 / 手动刷新积分调用；请求热路径不写，避免放大 KV 写。
+ * 空数组同样落盘——代表"探测成功但无包"，与"从未探测"（字段缺省）语义不同。
+ */
+export async function setTraePacks(
+  env: Env,
+  providerId: string,
+  uid: string,
+  packs: TraeEntPackInfo[],
+  at: number = Date.now()
+): Promise<void> {
+  const pool = await readTraePool(env, providerId)
+  pool[uid] = { ...(pool[uid] || {}), packs, packsAt: at }
+  await writeTraePool(env, providerId, pool)
+}
+
 /** 冷却账号至 now+ms（清零 errCount，对齐 Go pool.Cooldown）。 */
 export async function cooldownTraeAccount(env: Env, providerId: string, uid: string, ms: number, reason: string): Promise<void> {
   const pool = await readTraePool(env, providerId)
@@ -438,6 +455,17 @@ export async function reenableTraeIfCredits(
   await writeTraePool(env, providerId, pool)
 }
 
+/**
+ * 权益包排序：到期时间升序，长期有效（expireAt 为 0/缺省）排最后；同到期按名称升序。
+ * 面板折叠表据此把「最先过期」的包放在最前，便于判断额度失效节奏。
+ */
+export function compareTraePacks(a: TraeEntPackInfo, b: TraeEntPackInfo): number {
+  const ea = a.expireAt && a.expireAt > 0 ? a.expireAt : Number.MAX_SAFE_INTEGER
+  const eb = b.expireAt && b.expireAt > 0 ? b.expireAt : Number.MAX_SAFE_INTEGER
+  if (ea !== eb) return ea - eb
+  return String(a.name || '').localeCompare(String(b.name || ''))
+}
+
 /** 对外状态列表（脱敏，不含 token），按 uid 排序稳定输出。 */
 export async function listTraeStatus(env: Env, provider: Provider): Promise<TraeAccountStatus[]> {
   const accounts = getTraeAccounts(provider)
@@ -466,6 +494,10 @@ export async function listTraeStatus(env: Env, provider: Provider): Promise<Trae
       workReason: st?.workReason || '',
       disabled: st?.disabled === true,
       errCount: st?.errCount || 0,
+      // 权益包明细按「到期时间升序、长期有效排最后」排序：面板折叠表先展示最快过期的包，
+      // 便于判断哪些额度即将失效。同到期时刻按名称稳定排序，保证多次刷新顺序不抖动。
+      packs: st?.packs ? [...st.packs].sort(compareTraePacks) : undefined,
+      packsAt: st?.packsAt,
     })
   }
   return out
