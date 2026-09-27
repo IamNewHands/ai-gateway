@@ -550,8 +550,12 @@ export async function proxyTraeChatRequest(
         return traeClientParamsError((e as any).msg || (e as Error).message || '', (e as any).status || 400)
       }
 
-      // 核心容灾降级：若 SOLO 通道因额度耗尽（4008/1005 plan_limit）或限流（429 soft_rate）失败，且无自定义 tools，自动切换到 Work 通道！
-      if ((kind === 'plan_limit' || kind === 'soft_rate') && !hasTools) {
+      // 核心容灾降级：若 SOLO 通道因额度耗尽（4008/1005 plan_limit）、限流（429 soft_rate）
+      // 或连接层故障（transport：建连超时/被掐断）失败，且无自定义 tools，自动切换到 Work 通道！
+      // transport 也纳入的理由：它不罚号、也不证明账号坏（见 applyChatError），继续轮流撞
+      // 同一个建连超时只会把 30s×N 白耗完再回 503（实测 2026-09-27 连撞两个账号 62s）。
+      // Work 走的是另一条 host/协议（chatWorkStream），是同因不同路的真兜底。
+      if ((kind === 'plan_limit' || kind === 'soft_rate' || kind === 'transport') && !hasTools) {
         const fallbackResp = await executeWorkRequest(env, provider, body, configName, prompt, stream)
         if (fallbackResp) return fallbackResp
       }
@@ -580,7 +584,16 @@ export async function proxyTraeChatRequest(
       const idleTimeoutMs = perf.idleTimeoutMs || TRAE_STREAM_IDLE_TIMEOUT_MS
       const startedAt = Date.now()
       const sseBody = withSSEKeepAlive(
-        soloStreamToOpenAIStream(resp.body, configName, onErr),
+        soloStreamToOpenAIStream(resp.body, configName, onErr, (info) => {
+          // 静默截断定责标记：end=complete 既可能是上游自然收尾，也可能是「没发 done 就断」
+          // 被 sse.ts 兜底成 stop。这条日志把两者分开——事后按 end=truncated 直接定位，
+          // 不必再从客户端会话记录反推（2026-09-27 那次只能靠 DSH 会话文件才查出）。
+          const msg = `[trae-stream] provider=${provider.id} uid=${account.uid} model=${configName}`
+            + ` end=truncated kind=${info.kind} content=${info.contentChars} reasoning=${info.reasoningChars}`
+            + ` toolCalls=${info.sawToolCalls} usage=${info.sawUsage}`
+          console.log(msg) // codeql-disable: 纯诊断日志，不含密钥/敏感 token
+          writeLog(env, 'warn', msg).catch(() => { /* 日志失败不影响流 */ })
+        }),
         keepAliveMs,
         idleTimeoutMs,
         (reason) => {
@@ -639,6 +652,19 @@ export async function proxyTraeChatRequest(
   if (!hasTools) {
     const fallbackResp = await executeWorkRequest(env, provider, body, configName, prompt, stream)
     if (fallbackResp) return fallbackResp
+  }
+
+  // 连接层失败（建连超时/掐断）不会罚号（applyChatError 的 transport 分支），此时报
+  // 「所有账号 cooling/disabled」是把排查方向引到账号上——实测 2026-09-27 用户据此去查
+  // 账号池，真因却是网关↔上游的 30s 建连超时连续撞了两个账号（62s ≈ 2×
+  // TRAE_CHAT_CONNECT_TIMEOUT_MS），且 520ms 后重试即成功（池子健康）。
+  // 仍用 503（客户端按可重试 5xx 处理，不变），只把 code/文案改成真因。
+  if ((lastErr as any)?.kind === 'transport') {
+    return openaiError(
+      503,
+      'upstream_unreachable',
+      'TRAE SOLO 上游连接超时/中断（账号未被惩罚，非账号池问题）：' + (lastErr?.message || '')
+    )
   }
 
   const msg = 'all accounts unavailable (cooling/disabled)' + (lastErr ? ': ' + lastErr.message : '')

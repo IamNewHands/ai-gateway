@@ -295,15 +295,38 @@ function encodeSse(data: string): Uint8Array {
 }
 
 /**
+ * 上游流收尾诊断（供调用方记日志/告警，判定「静默截断」）。
+ *
+ * `kind` 两个取值对应两种收尾异常：
+ *  - `read_error`：读上游响应体时抛错（连接被掐断/重置）；
+ *  - `no_done`：上游干净 EOF，但全程没发 `done`（模型早停与上游截断在协议上同形）。
+ */
+export interface SoloStreamEndInfo {
+  kind: 'read_error' | 'no_done'
+  contentChars: number
+  reasoningChars: number
+  sawToolCalls: boolean
+  sawUsage: boolean
+}
+
+/**
  * 流式转换：SOLO SSE → OpenAI SSE chunk，使用 ReadableStream 确保流正确结束。
  * 上游流内 error 事件：回调 onErr（供冷却账号/记录日志）并注入一条 error 事件。
+ *
+ * 上游**没有发 `done` 就结束**（截断/连接被掐）：不再静默兜底成 stop，而是先注入一帧
+ * 具名 error（`upstream_no_finish` / `upstream_interrupted`）再照常收尾，见下方
+ * `if (!sawDone)` 分支的定责说明。
+ *
  * @param upstream 上游 SOLO SSE 响应体（ReadableStream<Uint8Array>）。
  * @param model 写入 chunk 的模型名（OpenAI 兼容客户端校验用）。
+ * @param onErr 上游流内 error 事件回调。
+ * @param onTruncated 收尾异常回调（可选）：上游未发 done 即结束时触发一次。
  */
 export function soloStreamToOpenAIStream(
   upstream: ReadableStream<Uint8Array>,
   model: string,
-  onErr?: (se: SOLOStreamError) => void
+  onErr?: (se: SOLOStreamError) => void,
+  onTruncated?: (info: SoloStreamEndInfo) => void
 ): ReadableStream<Uint8Array> {
   return new ReadableStream({
     async start(controller) {
@@ -314,6 +337,11 @@ export function soloStreamToOpenAIStream(
       let sawToolCalls = false
       let sentRole = false
       let lineBuffer = ''
+      // 收尾诊断计数：用于区分「上游正常收尾」与「上游没发 done 就断」
+      let readErrored = false
+      let contentChars = 0
+      let reasoningChars = 0
+      let sawUsage = false
 
       const writeChunk = (delta: Record<string, any>, finish: string): void => {
         // OpenAI 兼容客户端通常期望首块 delta 带 role（openai SDK / AI SDK 均按此解析）
@@ -344,6 +372,8 @@ export function soloStreamToOpenAIStream(
           switch (ev.event) {
             case 'output': {
               const delta: Record<string, any> = {}
+              contentChars += ev.response.length
+              reasoningChars += ev.reasoning.length
               if (ev.response !== '') delta['content'] = ev.response
               if (ev.reasoning !== '') delta['reasoning_content'] = ev.reasoning
               if (ev.toolCalls !== null && ev.toolCalls !== undefined && ev.toolCalls !== 'null') {
@@ -358,6 +388,7 @@ export function soloStreamToOpenAIStream(
             }
             case 'token_usage':
               pendingUsage = normalizeSoloUsage(ev.usage)
+              sawUsage = true
               break
             case 'done': {
               // 上游 SOLO 的 done 常自报 finish_reason=stop，即使本回合已发起工具调用。
@@ -412,7 +443,10 @@ export function soloStreamToOpenAIStream(
           }
           processEvents(events)
         }
-      } catch { /* stream error */ }
+      } catch {
+        // 读体异常（连接重置/掐断）不再静默吞掉：记标记，收尾时如实上报。
+        readErrored = true
+      }
 
       // 处理残留行缓冲（上游流未以 \n 结束）
       if (lineBuffer !== '') {
@@ -432,7 +466,29 @@ export function soloStreamToOpenAIStream(
       }
       // 幂等兜底：上游中断（无 done）仍写标准收尾 chunk + [DONE]，
       // 否则客户端收到 [DONE] 却无 finish_reason → "truncated: stream ended"。
+      //
+      // 但这层兜底会把「上游被掐断」伪装成正常收尾：客户端只看到半截正文 + stop，
+      // 既不报错也不重试，事后无从归因（实测 2026-09-27 trae/deepseek-v4.1-flash：
+      // 回复停在半句、DSH 记到 finish=stop、turn/end=completed，用户只能怀疑客户端）。
+      // 现在先补一帧具名 error 再照常收尾：
+      //  - OpenAI 官方 SDK 见到 `data:{"error":...}` 即抛 APIError
+      //    （openai/core/streaming.js:49），DSH 的 pi-ai 据此走「可重试失败」而不是
+      //    把半截正文当成功；
+      //  - 宽松客户端仍随后拿到 stop + [DONE]，行为与修复前一致，不引入新的挂起风险。
       if (!sawDone) {
+        const kind = readErrored ? 'upstream_interrupted' : 'upstream_no_finish'
+        const detail = `content=${contentChars}, reasoning=${reasoningChars}, toolCalls=${sawToolCalls}, usage=${sawUsage}`
+        const text = readErrored
+          ? `Trae SOLO 上游流中途断开（连接异常终止）：${detail}`
+          : `Trae SOLO 上游流未发送 done 即结束（疑似截断）：${detail}`
+        if (onTruncated) {
+          try {
+            onTruncated({ kind: readErrored ? 'read_error' : 'no_done', contentChars, reasoningChars, sawToolCalls, sawUsage })
+          } catch { /* 诊断回调不得影响流 */ }
+        }
+        try {
+          controller.enqueue(encodeSse(JSON.stringify({ error: { message: text, type: kind, code: kind } })))
+        } catch { /* 流已被取消 */ }
         writeChunk({}, sawToolCalls ? 'tool_calls' : 'stop')
         writeDone()
       }
