@@ -177,8 +177,8 @@ describe('Trae Work: 流式与非流式 SSE 协议转换 (sse.ts)', () => {
 
 describe('Trae: token_usage 归一化（SOLO 上游用 Anthropic 口径 / 顶层字段名）', () => {
   // 上游实测样本（2026-09-27，同一段 19635 token 前缀连发两次）
-  const hit = { prompt_tokens: 19635, completion_tokens: 47, total_tokens: 19682, reasoning_tokens: 45, cache_read_input_tokens: 19584 }
-  const miss = { prompt_tokens: 19635, completion_tokens: 60, total_tokens: 19695, reasoning_tokens: 58, cache_read_input_tokens: 0 }
+  const hit = { prompt_tokens: 19635, completion_tokens: 47, total_tokens: 19682, reasoning_tokens: 45, cache_read_input_tokens: 19584, cache_creation_input_tokens: 0 }
+  const miss = { prompt_tokens: 19635, completion_tokens: 60, total_tokens: 19695, reasoning_tokens: 58, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 }
 
   it('cache_read_input_tokens → 补 prompt_tokens_details.cached_tokens，原字段保留', () => {
     const out = normalizeSoloUsage(hit)
@@ -195,16 +195,28 @@ describe('Trae: token_usage 归一化（SOLO 上游用 Anthropic 口径 / 顶层
     expect(normalizeSoloUsage(miss)?.completion_tokens_details?.reasoning_tokens).toBe(58)
   })
 
+  it('cache_creation_input_tokens → 补 prompt_tokens_details.cache_write_tokens，原字段保留', () => {
+    // 实测值恒 0，用一个非零样本证明映射本身有效
+    const out = normalizeSoloUsage({ prompt_tokens: 100, cache_read_input_tokens: 64, cache_creation_input_tokens: 4096 })
+    expect(out?.prompt_tokens_details).toEqual({ cached_tokens: 64, cache_write_tokens: 4096 })
+    expect(out?.cache_creation_input_tokens).toBe(4096)
+    // 上游如实下发 0 时也补 0（"本轮无写入"是事实，不是缺失）
+    expect(normalizeSoloUsage(hit)?.prompt_tokens_details?.cache_write_tokens).toBe(0)
+    // 字段缺失 → 不补该别名
+    expect(normalizeSoloUsage({ prompt_tokens: 100 })?.prompt_tokens_details).toBeUndefined()
+  })
+
   it('已存在的嵌套 details 被合并不被覆盖；缺失的字段不补别名', () => {
     const out = normalizeSoloUsage({
       prompt_tokens: 10,
       completion_tokens: 20,
       total_tokens: 30,
       cache_read_input_tokens: 8,
+      cache_creation_input_tokens: 2,
       prompt_tokens_details: { audio_tokens: 3 },
       completion_tokens_details: { accepted_prediction_tokens: 4 },
     })
-    expect(out?.prompt_tokens_details).toEqual({ audio_tokens: 3, cached_tokens: 8 })
+    expect(out?.prompt_tokens_details).toEqual({ audio_tokens: 3, cached_tokens: 8, cache_write_tokens: 2 })
     expect(out?.completion_tokens_details?.accepted_prediction_tokens).toBe(4)
     expect(out?.completion_tokens_details?.reasoning_tokens).toBeUndefined()
     // reasoning_tokens 缺失 → 不产生 completion_tokens_details
@@ -253,6 +265,7 @@ describe('Trae: token_usage 归一化（SOLO 上游用 Anthropic 口径 / 顶层
       .map((d) => JSON.parse(d))
     expect(usageFrames.length).toBeGreaterThan(0)
     expect(usageFrames[0].usage.prompt_tokens_details.cached_tokens).toBe(19584)
+    expect(usageFrames[0].usage.prompt_tokens_details.cache_write_tokens).toBe(0)
     expect(usageFrames[0].usage.completion_tokens_details.reasoning_tokens).toBe(45)
   })
 
@@ -260,11 +273,13 @@ describe('Trae: token_usage 归一化（SOLO 上游用 Anthropic 口径 / 顶层
     const solo = `event: output\ndata: {"response":"hi"}\n\nevent: token_usage\ndata: ${JSON.stringify(hit)}\n\n`
     const soloUsage = aggregateSoloSse(solo).resp?.usage
     expect(soloUsage?.prompt_tokens_details?.cached_tokens).toBe(19584)
+    expect(soloUsage?.prompt_tokens_details?.cache_write_tokens).toBe(0)
     expect(soloUsage?.completion_tokens_details?.reasoning_tokens).toBe(45)
 
     const work = `event: output\ndata: {"text":"hi"}\n\nevent: token_usage\ndata: ${JSON.stringify(hit)}\n\n`
     const workUsage = aggregateWorkSse(work, 'm').resp?.usage
     expect(workUsage?.prompt_tokens_details?.cached_tokens).toBe(19584)
+    expect(workUsage?.prompt_tokens_details?.cache_write_tokens).toBe(0)
     expect(workUsage?.completion_tokens_details?.reasoning_tokens).toBe(45)
   })
 })

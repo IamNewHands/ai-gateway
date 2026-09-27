@@ -70,13 +70,15 @@ function asRecord(v: unknown): Record<string, any> {
  * 上游实测（2026-09-27，同一段 19635 token 前缀连发两次）：
  *  1. 缓存命中放在 Anthropic 口径 `cache_read_input_tokens`（首回合 0，次回合 19584），
  *     **没有** OpenAI 口径的 `prompt_tokens_details.cached_tokens`；
- *  2. 推理 token 放在**顶层** `reasoning_tokens`（如 58），**没有** OpenAI 口径的
+ *  2. 缓存写入放在 Anthropic 口径 `cache_creation_input_tokens`（实测恒 0，但字段确实在），
+ *     **没有** OpenAI 口径的 `prompt_tokens_details.cache_write_tokens`；
+ *  3. 推理 token 放在**顶层** `reasoning_tokens`（如 58），**没有** OpenAI 口径的
  *     `completion_tokens_details.reasoning_tokens`。
  *
  * 而 OpenAI 兼容客户端（DSH 的 pi-ai 等）分别只认
- * `prompt_tokens_details.cached_tokens`（→ prompt_cache_hit_tokens → cached_tokens）与
- * `completion_tokens_details.reasoning_tokens`，于是上游明明命中缓存 / 有推理量，
- * 客户端与管理端统计却恒显示 0。
+ * `prompt_tokens_details.cached_tokens`（→ prompt_cache_hit_tokens → cached_tokens）、
+ * `prompt_tokens_details.cache_write_tokens` 与 `completion_tokens_details.reasoning_tokens`，
+ * 于是上游明明命中缓存 / 有写入 / 有推理量，客户端与管理端统计却恒显示 0。
  *
  * 这里只补别名，不改写、不删除上游原字段（Anthropic /v1/messages 通路仍读
  * `cache_read_input_tokens`）。上游未上报对应字段（缺失 / 非数字）时不补该别名，不编造 0。
@@ -88,6 +90,11 @@ export function normalizeSoloUsage(raw: unknown): Record<string, any> | null {
   const cacheRead = toCount(usage['cache_read_input_tokens'])
   if (cacheRead !== null) {
     usage['prompt_tokens_details'] = { ...asRecord(usage['prompt_tokens_details']), cached_tokens: cacheRead }
+  }
+
+  const cacheWrite = toCount(usage['cache_creation_input_tokens'])
+  if (cacheWrite !== null) {
+    usage['prompt_tokens_details'] = { ...asRecord(usage['prompt_tokens_details']), cache_write_tokens: cacheWrite }
   }
 
   const reasoning = toCount(usage['reasoning_tokens'])
