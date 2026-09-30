@@ -37,17 +37,22 @@
 | 后台任务 | ✅ Go goroutine → Cloudflare cron（`[triggers]` 已有 4 条，可增补） |
 | Redis/Upstash 账号库 | ✅ 换成 KV（`storage.ts` 既有形态） |
 | 流式转换 | ✅ Workers ReadableStream transform；idle 看门狗用 AbortController + setTimeout |
-| **唯一硬门** | ⚠️ **Cloudflare 数据中心 IP 是否被 chat.deepseek.com 风控接受**（GitHub 上是住宅/机房混合场景，无 CF 出口的先例）。必须先做一次 Worker 上的 live probe 再决定是否全量移植。 |
+| **唯一硬门（已通过）** | ✅ Cloudflare 数据中心 IP **被上游接受**（2026-09-30 临时 Worker/HKG 实测全链路通过）。真正未解的是「自主登录」：上游硬卡密码登录，须人工注入 token。 |
 
-**逃生方案（若 IP 门失败）**：不移植，改为在 VPS/Coolify 跑 simple-chat 容器，ai-gateway 里登记为普通 `api-key` 提供商（30 分钟工作量，零代码）。
+**逃生方案（已不需要）**：原计划「IP 门失败就改在 VPS 跑 simple-chat 容器」——实测后两点都变了：① IP 门已通过，Workers 可托管；② simple-chat/ds2api 都只支持密码登录，而密码登录正是被硬卡的那条路径，所以容器方案在当前账号下同样不可用。保留此段仅为记录决策链。
 
 ## 三、架构落点（复用本仓库既有 owner）
 
 - 新目录 `src/deepseek/`，镜像 `src/trae/`、`src/kuku/` 的分层：`pow.ts` / `device.ts` / `client.ts` / `pool.ts` / `sse.ts` / `proxy.ts`（+ `admin.ts`）。
 - provider 判定：`isDeepseekAppProvider(provider)`（`provider.id === 'deepseek-app'`），在 `src/proxy.ts` 的 4 个 dispatch 点挂载（chat 流式/非流式、models、test）。
-- 账号存储：KV（`storage.ts` 加 key + CRUD），管理后台账号管理面板沿用 trae 的账号池 UI 形态。
-- 模型：`deepseek-flash`（上游只有这一个模型，`GET /v1/models` 与之对齐）。
+- **凭据形态（据实测修订）：token 注入型，不是密码型。** 上游硬卡密码登录（真实浏览器同样 `biz_code 11`），且短信登录需要浏览器侧 Shumei `rid` —— 无头进程两种都做不了。因此 provider 的「账号」= **一个 web token + 它对应的 header device id / UA**，由管理后台注入：
+  - KV 存 token 池（`token` / `headerDeviceId` / `userAgent` / `shumeiDeviceId`(备用) / `state` / `addedAt` / `expiredAt`）；
+  - 面板给**操作指引**（浏览器登录 chat.deepseek.com → DevTools → `localStorage.userToken` → 取 `value` 字段的 64 字符）+「测试」按钮（打 `users/current` 判活）；
+  - token 失效时打上 `expired` 标记并在面板提示「需重新注入」，**不静默降级**；
+  - 与 ai-gateway 既有的手工登录型 provider（kuku 扫码、trae 登录、cline OAuth）同类，不引入新范式。
+- 模型：`deepseek-flash`（上游只有一个模型，`GET /v1/models` 与之对齐）。
 - 鉴权：复用 `proxyKeyAuthMiddleware`（对齐 `DS_API_KEY` 语义）。
+- **不接线的既有产物**：`client.ts` 的密码登录路径（`login()`）保留但**不接入 provider 流程**——它是上游硬卡的死路，留在代码里只为将来上游放开时复用，并在注释里写明原因，避免后人误以为漏接。
 
 ## 四、TDD 路线
 
@@ -59,8 +64,8 @@
 > 本仓库测试统一加 `--pool=threads`：`npx vitest run --pool=threads src/deepseek/pow.test.ts`
 
 **阶段 0 — 可行性门（先做，未过则停止）**
-- [~] T0.1 本机 Node live probe：**协议层打通，风控层被拒**。见下方「阶段 0 实测结果」。
-- [ ] T0.2 Worker live probe（CF 出口 IP 门）——T0.1 未过，暂缓。
+- [x] T0.1 本机 Node live probe：**API 通路（token 模式）端到端通过**；密码登录被上游硬卡（详见「阶段 0 实测结果」）。
+- [x] T0.2 Worker live probe（CF 出口 IP 门）：**通过**（HKG 出口，completion 1333ms 拿到真实 SSE）。
 
 ### 阶段 0 实测结果（2026-09-30，本机 Node + 真账号）
 
@@ -155,6 +160,18 @@ node node_modules\wrangler\wrangler-dist\cli.js deploy --temporary --config prob
 
 判定：`ok:true` 且 `chat/completion` 阶段有 SSE 字节 ⇒ CF 边缘可托管，移植继续；被 40003/风控/连接层拒 ⇒ CF 边缘不可用，转 VPS 方案。
 
+### T0.2 实测结果：**CF 边缘通过（2026-09-30）**
+
+临时预览部署 → `https://deepseek-probe.learned-bard.workers.dev`（`request.cf.colo = HKG`，HK 出口）：
+
+| 阶段 | 结果 |
+|---|---|
+| `users/current` | ok，709ms，`biz_code 0`，账号信息正常 |
+| `chat_session/create` | ok，384ms，会话 `4b011c03-…` |
+| `chat/completion`（含 PoW 解算） | ok，**1333ms**，`text/event-stream`，1005 字节，真实产出 `"content":"你好"` + `quasi_status:"FINISHED"` |
+
+**结论**：Cloudflare 边缘出口（数据中心 IP）**不被 API 侧风控拦截**，HashV1 PoW 在 Workers 运行时被服务端接受，SSE 形态完整。**托管目标成立。** 至此阶段 0 全部通过（唯一被卡的是「自主登录」，见上）。
+
 **部署约束（2026-09-30 实测，本机）**
 - `npx wrangler` 与 `node node_modules/wrangler/wrangler-dist/cli.js` 在本沙箱内都失败：wrangler 启动器与 esbuild 都 `spawn` 子进程，沙箱禁止管道 ⇒ `spawn EPERM`。**wrangler 只能在沙箱外的普通终端跑。**
 - 本机 wrangler **未认证**（`You are not authenticated`），且无 `CLOUDFLARE_API_TOKEN` / `CLOUDFLARE_ACCOUNT_ID`。故 T0.2 的可行路径是 `wrangler deploy --temporary`（临时预览账号，真实 CF 边缘出口，无需 CF 账号），由用户在自己的终端执行；探针 Worker 写成**单文件纯 JS、零依赖**，避免 bundling。
@@ -168,12 +185,13 @@ node node_modules\wrangler\wrangler-dist\cli.js deploy --temporary --config prob
 - [x] T2.1 `device.ts`：MD5 常量、AES-CBC 铸造、UUIDv5、rangers-id、web/android channel
       → 验证：`npx vitest run --pool=threads src/deepseek/` **37/37 通过**（含 uuidV5 对 RFC 4122 附录 DNS+python.org 标准向量、device_id 用字面量密钥独立解密回放）；`npx tsc --noEmit` 干净。
 - [ ] T2.2 `client.ts`：baseHeaders、envelope/BizError、`postJSON/postEmpty/getJSON`、ban 分类（5/10/11）、IsAuthFailure/IsRetryable
-- [ ] T2.3 登录 + 懒重登 + 启动序列（`users/current`）
+- [x] T2.3 登录 + 懒重登 + 启动序列（`users/current`）
+      → **上游硬卡密码登录**（真实浏览器同样 `biz_code 11`），故此路径**实现但不接入** provider 流程；改走 token 注入（见架构落点）。
 
 **阶段 3 — 账号池**
-- [ ] T3.1 KV 账号 CRUD（`accounts.json` 字段对齐：mobile/email/password/region/channel/device_id/park_*）
-- [ ] T3.2 round-robin + 每账号 in-flight 信号量 + QueueWait
-- [ ] T3.3 park 持久化（muted 带窗口 / banned 永久 / risk 冷却）+ 自然 unpark 回写
+- [ ] T3.1 KV **token 池** CRUD（token / headerDeviceId / userAgent / shumeiDeviceId / state / addedAt / expiredAt）
+- [ ] T3.2 round-robin + 每 token in-flight 信号量 + QueueWait
+- [ ] T3.3 token 失效标记与面板提示（`users/current` 判活；失效即 `expired`，不静默降级）
 
 **阶段 4 — 补全链路**
 - [ ] T4.1 请求体构造：messages→上游 payload、thinking 开关、search 开关、图片 parts
@@ -188,7 +206,7 @@ node node_modules\wrangler\wrangler-dist\cli.js deploy --temporary --config prob
 
 **阶段 6 — 网关集成**
 - [ ] T6.1 `proxy.ts` 4 个 dispatch 点 + `GET /v1/models` + 预置 DEFAULT_PROVIDERS 条目
-- [ ] T6.2 管理后台：账号上传/列表/删除（不回显凭据）、pool 状态、park 展示
+- [ ] T6.2 管理后台：**token 注入面板**（粘贴 → 判活 → 存池）、池状态、失效提示 + 取 token 的操作指引（不回显完整 token）
 - [ ] T6.3 用量统计接入 `analytics/usage-logger.ts`
 
 **阶段 7 — 可选能力**
@@ -204,7 +222,7 @@ node node_modules\wrangler\wrangler-dist\cli.js deploy --temporary --config prob
 ## 六、工作量与风险
 
 - 代码量：Go 非测试 6,732 行 → 预计 TS 3,500–4,500 行（含测试）。分 8 个阶段，**预计 12–16 小时 agent 工时**，跨多次会话。
-- 风险 1（阻断级）：CF 出口 IP 被风控 → 见逃生方案。
+- 风险 1（**已实测排除**）：CF 出口 IP 被风控。2026-09-30 临时 Worker（HKG）实测 `users/current` / `create` / `completion(+PoW)` 全通。**真正的限制是「无法自主登录」**：须由人从浏览器注入 token，token 失效后需重新注入（有效期待测）。
 - 风险 2（已实测降级）：PoW 在 JS 里的 CPU 成本。本机实测 **86,022 次置换 = 313ms**（≈275k 置换/秒，3.6µs/次），一次 worst-case 144000 难度约 0.5s CPU，Workers Paid `cpu_ms=300000` 完全容得下。仍需按账号缓存挑战至 `expire_at`（同一 target_path 不必每次重解）。
 - 风险 3：账号封禁不可逆（biz 10 永久）——测试必须用专门的小号，且 park 持久化要在阶段 3 就位，避免测试期把主号打死。
 - 风险 4：上游协议随时变更（App 版本升级即失效）。移植不改变这一事实，只把维护面收敛到 `src/deepseek/`。
