@@ -24,7 +24,9 @@ import {
   acquireDeepseekToken,
   markDeepseekToken,
   readDeepseekPool,
+  toTokenView,
   type DeepseekTokenRecord,
+  type DeepseekTokenView,
 } from './pool'
 import { aggregateDeepseekSse } from './sse'
 import { deepseekSSEToOpenAIStream } from './stream'
@@ -224,4 +226,66 @@ export async function proxyDeepseekChatRequest(
     'no_available_account',
     'exhausted',
   )
+}
+
+export interface VerifyResult {
+  ok: boolean
+  state: 'ready' | 'expired'
+  detail: string
+  account?: Record<string, unknown>
+}
+
+/**
+ * 判活：拿这条 token 打 `users/current`。
+ * 面板「注入」与「重新判活」都走这里；结果写回池（ok → ready，鉴权失败 → expired）。
+ */
+export async function verifyDeepseekToken(
+  env: Env,
+  record: DeepseekTokenRecord,
+  deps: { fetch?: FetchLike; persist?: boolean } = {},
+): Promise<VerifyResult> {
+  const persist = deps.persist !== false
+  const client = new DeepseekClient({
+    account: { password: '' },
+    fetch: deps.fetch,
+    wire: { replaceHeaders: true, headers: webHeaders(record) },
+  })
+  try {
+    const envl = await client.usersCurrent(record.token)
+    const bizData = (envl.data?.biz_data ?? {}) as Record<string, unknown>
+    if (persist) await markDeepseekToken(env, record.id, { ok: true })
+    return {
+      ok: true,
+      state: 'ready',
+      detail: `token 可用（账号 ${String(bizData.mobile_number ?? bizData.id ?? 'unknown')}）`,
+      account: {
+        id: bizData.id,
+        mobile_number: bizData.mobile_number,
+        is_mainland: bizData.is_mainland,
+        chat: bizData.chat,
+      },
+    }
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err)
+    const expired = isAuthFailure(err)
+    if (persist) {
+      await markDeepseekToken(env, record.id, expired ? { state: 'expired', error: message } : { error: message })
+    }
+    return { ok: false, state: expired ? 'expired' : 'ready', detail: message }
+  }
+}
+
+/** 池的面板视图（脱敏）。 */
+export function deepseekPoolView(tokens: DeepseekTokenRecord[]): {
+  tokens: DeepseekTokenView[]
+  summary: { total: number; ready: number; expired: number }
+} {
+  return {
+    tokens: tokens.map(toTokenView),
+    summary: {
+      total: tokens.length,
+      ready: tokens.filter((t) => t.state === 'ready').length,
+      expired: tokens.filter((t) => t.state === 'expired').length,
+    },
+  }
 }

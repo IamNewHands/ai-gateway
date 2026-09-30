@@ -107,6 +107,12 @@ import {
   runTraeCheckins,
   refreshTraeTokens,
 } from './trae/admin'
+import {
+  handleDeepseekTokenAdd,
+  handleDeepseekTokenRemove,
+  handleDeepseekTokenVerify,
+  handleDeepseekTokensList,
+} from './deepseek/admin'
 import { M365Session } from './m365/durable'
 import { AccountFlux } from './m365/account-flux'
 import type { AppEnv, Env, Provider } from './types'
@@ -253,6 +259,12 @@ app.get('/admin/api/trae/:id/status', handleTraeStatus)
 app.post('/admin/api/trae/:id/account/remove', handleTraeAccountRemove)
 app.post('/admin/api/trae/:id/account/prefer', handleTraeSetPrefer)
 app.post('/admin/api/trae/:id/credits/refresh', handleTraeCreditsRefresh)
+
+// DeepSeek App（token 注入型）：注入 / 判活 / 删除 / 池状态
+app.get('/admin/api/deepseek/:id/tokens', handleDeepseekTokensList)
+app.post('/admin/api/deepseek/:id/tokens', handleDeepseekTokenAdd)
+app.post('/admin/api/deepseek/:id/tokens/verify', handleDeepseekTokenVerify)
+app.post('/admin/api/deepseek/:id/tokens/remove', handleDeepseekTokenRemove)
 
 // Analytics Engine 总览与详细日志
 app.get('/admin/api/analytics/overview', handleAnalyticsOverview)

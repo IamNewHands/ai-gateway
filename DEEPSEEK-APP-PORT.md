@@ -214,7 +214,10 @@ node node_modules\wrangler\wrangler-dist\cli.js deploy --temporary --config prob
       → 验证：`proxy.test.ts` **10/10**（假上游全覆盖流式/非流式/换号重试/空池/参数校验）
       → **真机端到端**：`DS_LIVE_PROBE=1 npx vitest run --pool=threads -t "live gateway chain"` → **200 + 14267 字节 OpenAI SSE + `finish_reason:stop` + `[DONE]`**（真实上游 × 完整转换链）
 - [ ] T6.1b Anthropic `/v1/messages` 与 Responses 两个分发点接线
-- [ ] T6.2 管理后台：**token 注入面板**（粘贴 → 判活 → 存池）、池状态、失效提示 + 取 token 的操作指引（不回显完整 token）
+- [x] T6.2a 管理接口：`src/deepseek/admin.ts` 四个端点（`GET/POST /admin/api/deepseek/:id/tokens`、`/tokens/verify`、`/tokens/remove`）已注册进 `index.ts`
+      → 验证：`admin.test.ts` **10/10**（空池提示 + 取 token 指引、缺失/过短 token 400、**容错解析**面板粘贴的 `{"value":"…"}` 包装、注入前先判活、判活失败也入库但标 `expired` 并明说、重复 409、列表永不回显完整 token、复检翻状态、删除）
+      → 全仓库回归：`npx vitest run --pool=threads` → **1856 passed / 0 failed**（98 文件），确认改动 `proxy.ts`/`index.ts`/`config.ts` 未影响既有功能
+- [ ] T6.2b 面板 UI（点击式注入/判活/删除 + 取 token 指引展示）——让整条链路无需 curl
 - [ ] T6.3 用量统计接入 `analytics/usage-logger.ts`
 
 **阶段 7 — 可选能力**
