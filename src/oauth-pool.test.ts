@@ -17,7 +17,10 @@ import {
   hasModelCooldown,
   __resetOauthPoolRuntimeForTests,
   __resetOauthModelCostsForTests,
+  reenableOauthIfCredits,
+  soonestOauthExpiryAt,
   type OAuthPool,
+  type OAuthPoolState,
 } from './oauth-pool'
 import type { Env, OAuthTokenState } from './types'
 import { OAUTH_POOL_KV_PREFIX } from './oauth'
@@ -561,5 +564,108 @@ describe('成本优先分层挑号测试（对齐 workbuddy2api pick.go costTier
     expect(listOauthModelCosts(now + COST_OBSERVATION_TTL_MS + 1, pid)).toHaveLength(0)
     // 指定 providerId 隔离
     expect(listOauthModelCosts(now, PROVIDER + '-other')).toHaveLength(0)
+  })
+})
+
+describe('7 天内到期积分优先挑号（2026-09-28 需求）', () => {
+  beforeEach(() => {
+    __resetOauthModelCostsForTests()
+    __resetOauthPoolRuntimeForTests()
+  })
+
+  const DAY_MS = 24 * 60 * 60 * 1000
+  /** CST 墙钟字符串（上游 ExpiredTime 口径）：epoch ms → "YYYY-MM-DD HH:mm:ss"（+08:00）。 */
+  const cstString = (ms: number): string => {
+    const d = new Date(ms + 8 * 60 * 60 * 1000)
+    const p = (n: number) => String(n).padStart(2, '0')
+    return `${d.getUTCFullYear()}-${p(d.getUTCMonth() + 1)}-${p(d.getUTCDate())} ${p(d.getUTCHours())}:${p(d.getUTCMinutes())}:${p(d.getUTCSeconds())}`
+  }
+  const pkg = (expireInMs: number | null, over: { size?: number; used?: number } = {}) => ({
+    name: 'p',
+    expireAt: expireInMs === null ? '' : cstString(Date.now() + expireInMs),
+    size: over.size ?? 100,
+    used: over.used ?? 0,
+  })
+
+  it('soonestOauthExpiryAt：窗口内最早到期且有剩余的包；长期/已用尽/窗口外 → null', () => {
+    const now = Date.now()
+    const state = (packages: ReturnType<typeof pkg>[]): OAuthPoolState => ({
+      credits: 10, disabled: false, until: 0, errCount: 0, packages,
+    })
+    expect(soonestOauthExpiryAt(state([pkg(3 * DAY_MS), pkg(1 * DAY_MS)]), now)).not.toBeNull()
+    expect(soonestOauthExpiryAt(state([pkg(8 * DAY_MS)]), now)).toBeNull()
+    expect(soonestOauthExpiryAt(state([pkg(null)]), now)).toBeNull()
+    expect(soonestOauthExpiryAt(state([pkg(1 * DAY_MS, { size: 100, used: 100 })]), now)).toBeNull()
+    // size/used 都缺省（探测不到容量）→ 不参与优先
+    expect(soonestOauthExpiryAt(state([pkg(1 * DAY_MS, { size: 0, used: 0 })]), now)).toBeNull()
+    expect(soonestOauthExpiryAt(undefined, now)).toBeNull()
+  })
+
+  it('7 天内到期（积分远低于另一号）→ 优先挑即将到期的号；窗口外 → 回落积分高低', async () => {
+    const pid = PROVIDER + '-expiry-1'
+    const kv = makeKV(pid, [
+      makeAccount('long', { state: { credits: 1000, disabled: false, until: 0, errCount: 0, packages: [pkg(null)] } }),
+      makeAccount('soon', { state: { credits: 10, disabled: false, until: 0, errCount: 0, packages: [pkg(2 * DAY_MS)] } }),
+    ])
+    const picked = await pickOauthAccount(kv.env, pid, new Set(), undefined, { rng: RNG_ZERO })
+    expect(picked?.uid).toBe('soon')
+
+    // 8 天后到期 → 窗口外，回到「积分高者/权重高者」规则（rng=0 时短名单取权重最高）
+    const pid2 = PROVIDER + '-expiry-2'
+    const kv2 = makeKV(pid2, [
+      makeAccount('long', { state: { credits: 1000, disabled: false, until: 0, errCount: 0, packages: [pkg(null)] } }),
+      makeAccount('soon', { state: { credits: 10, disabled: false, until: 0, errCount: 0, packages: [pkg(8 * DAY_MS)] } }),
+    ])
+    const picked2 = await pickOauthAccount(kv2.env, pid2, new Set(), undefined, { rng: RNG_ZERO })
+    expect(picked2?.uid).toBe('long')
+  })
+
+  it('两个号都在窗口内 → 到期更早者优先', async () => {
+    const pid = PROVIDER + '-expiry-3'
+    const kv = makeKV(pid, [
+      makeAccount('later', { state: { credits: 5000, disabled: false, until: 0, errCount: 0, packages: [pkg(5 * DAY_MS)] } }),
+      makeAccount('sooner', { state: { credits: 1, disabled: false, until: 0, errCount: 0, packages: [pkg(1 * DAY_MS)] } }),
+    ])
+    const picked = await pickOauthAccount(kv.env, pid, new Set(), undefined, { rng: RNG_ZERO })
+    expect(picked?.uid).toBe('sooner')
+  })
+
+  it('实测免费（tier 0，不消耗积分）时不套用到期优先', async () => {
+    const pid = PROVIDER + '-expiry-free'
+    const kv = makeKV(pid, [
+      // free-acc：该模型实测 0 扣费（免费层）且无到期包
+      makeAccount('free-acc', { state: { credits: 5, disabled: false, until: 0, errCount: 0 } }),
+      // soon：有 2 天内到期积分，但该模型实测收费
+      makeAccount('soon', { state: { credits: 10, disabled: false, until: 0, errCount: 0, packages: [pkg(2 * DAY_MS)] } }),
+    ])
+    recordOauthModelCost(pid, 'free-acc', 'deepseek-v4-flash', 0, 1000)
+    recordOauthModelCost(pid, 'soon', 'deepseek-v4-flash', 1.0, 1000)
+
+    const picked = await pickOauthAccount(kv.env, pid, new Set(), undefined, {
+      reqModel: 'deepseek-v4-flash',
+      rng: RNG_ZERO,
+    })
+    expect(picked?.uid).toBe('free-acc')
+  })
+
+  it('reenableOauthIfCredits 落盘 packages（空数组=清空，undefined=保持不变）', async () => {
+    const pid = PROVIDER + '-expiry-write'
+    const kv = makeKV(pid, [makeAccount('u1')])
+
+    await reenableOauthIfCredits(kv.env, pid, 'u1', 42, [pkg(2 * DAY_MS)])
+    let pool = await readOauthPool(kv.env, pid)
+    expect(pool[0].state.credits).toBe(42)
+    expect(pool[0].state.packages).toHaveLength(1)
+    expect(pool[0].state.packagesAt).toBeTypeOf('number')
+
+    // undefined → 保留旧明细（额度探测失败路径不应清空证据）
+    await reenableOauthIfCredits(kv.env, pid, 'u1', 41)
+    pool = await readOauthPool(kv.env, pid)
+    expect(pool[0].state.packages).toHaveLength(1)
+
+    // 空数组 → 清空（探测成功但无包）
+    await reenableOauthIfCredits(kv.env, pid, 'u1', 40, [])
+    pool = await readOauthPool(kv.env, pid)
+    expect(pool[0].state.packages).toEqual([])
   })
 })

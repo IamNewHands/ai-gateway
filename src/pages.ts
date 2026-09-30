@@ -631,7 +631,7 @@ ${H('管理')}
                   </div>
                   <div class="fc mt-1 field-row"><button class="btn btn-s" onclick="oauthConnect('${escapePageJsx(p.id)}')"><i class="fas fa-plug" aria-hidden="true"></i>发起连接</button><button class="btn btn-gh" onclick="fetchOauthModels('${escapePageJsx(p.id)}')"><i class="fas fa-cloud-download-alt" aria-hidden="true"></i>获取模型</button><button class="btn btn-gh" onclick="oauthStatus('${escapePageJsx(p.id)}')"><i class="fas fa-sync" aria-hidden="true"></i>状态</button><button class="btn btn-gh" onclick="oauthDisconnect('${escapePageJsx(p.id)}')"><i class="fas fa-unlink" aria-hidden="true"></i>断开</button><span id="oauth-st-${escapePageHtml(p.id)}" class="oauth-status"></span></div>
                   ${(p.oauth&&p.oauth.flowType==='browser')?`
-                  <fieldset class="form-group" id="wbp-fs-${escapePageHtml(p.id)}"><legend>WorkBuddy 多账号池</legend><span class="form-helper">浏览器登录流每次成功登录都会把该账号加入账号池（按 uid 去重，多登一个 = 多个账号）。转发按三因子加权自动挑选账号（积分 / 闲置补偿 / 成功率），429/404/余额耗尽/401 等按策略冷却或禁用并轮换其他账号；无健康账号时从冷却账号选最早到期者顶班；每日签到后积分恢复自动解冻。冷却参数留空 = 默认（plan 12h / 429 60s / 连续 5 次错误冷却 10m）。reasoning_effort 透传/降级支持档位在下方「模型」列表每行的「effort」下拉里配置。</span>
+                  <fieldset class="form-group" id="wbp-fs-${escapePageHtml(p.id)}"><legend>WorkBuddy 多账号池</legend><span class="form-helper">浏览器登录流每次成功登录都会把该账号加入账号池（按 uid 去重，多登一个 = 多个账号）。转发挑号：<b>7 天内到期的积分优先消耗</b>（到期越早越优先），窗口内没有待救积分时才按三因子加权（积分 / 闲置补偿 / 成功率）挑选；账号行上的「⏳ N 个包 7 天内到期」徽章与权益包明细里琥珀色的到期时间就是该规则的依据（到期时间按北京时间 CST 判定）。429/404/余额耗尽/401 等按策略冷却或禁用并轮换其他账号；无健康账号时从冷却账号选最早到期者顶班；每日签到后积分恢复自动解冻。冷却参数留空 = 默认（plan 12h / 429 60s / 连续 5 次错误冷却 10m）。reasoning_effort 透传/降级支持档位在下方「模型」列表每行的「effort」下拉里配置。</span>
                     <div class="fc mt-1 field-row" style="flex-wrap:wrap;gap:6px"><button class="btn btn-s" onclick="oauthPoolStatus('${escapePageJsx(p.id)}')"><i class="fas fa-sync" aria-hidden="true"></i>刷新账号池</button><button class="btn btn-s" onclick="oauthConnect('${escapePageJsx(p.id)}')"><i class="fas fa-sign-in-alt" aria-hidden="true"></i>登录新账号</button><button class="btn btn-gh btn-xs" onclick="oauthPoolExportModal('${escapePageJsx(p.id)}')"><i class="fas fa-file-export" aria-hidden="true"></i>导出凭证/Token</button><button class="btn btn-p" onclick="triggerDailyTasks('${escapePageJsx(p.id)}')"><i class="fas fa-tasks" aria-hidden="true"></i>一键日常（签到+活跃+旅行）</button><button class="btn btn-gh btn-xs" onclick="triggerActivityReport('${escapePageJsx(p.id)}')"><i class="fas fa-comments" aria-hidden="true"></i>活跃上报</button><button class="btn btn-gh btn-xs" onclick="triggerCatTravel('${escapePageJsx(p.id)}')"><i class="fas fa-cat" aria-hidden="true"></i>猫猫旅行</button><span id="wbp-st-${escapePageHtml(p.id)}" class="oauth-status"></span></div>
                     <div id="wbp-acc-${escapePageHtml(p.id)}" class="mt-1"></div>
                     <div class="fc mt-1 field-row" style="gap:8px"><input type="number" id="cd-plan-${escapePageHtml(p.id)}" value="${p.cooldown&&p.cooldown.planMs?Math.round(p.cooldown.planMs/60000):''}" style="width:88px" placeholder="plan冷却" title="余额/权益耗尽（402）的硬冷却时长（分钟）。到期到次日 04:00，签到恢复后自动解冻。"><input type="number" id="cd-soft-${escapePageHtml(p.id)}" value="${p.cooldown&&p.cooldown.softMs?Math.round(p.cooldown.softMs/1000):''}" style="width:88px" placeholder="429冷却" title="429 限流 / WAF 403 / 404 / 5xx（无 Retry-After 头时）的默认软冷却时长（秒）。"><input type="number" id="cd-err-${escapePageHtml(p.id)}" value="${p.cooldown&&p.cooldown.errThreshold?p.cooldown.errThreshold:''}" style="width:76px" placeholder="错误阈值" title="连续 5xx 错误次数阈值：达到后把该账号冷却 errMs 分钟。偶发 502 若携带 Retry-After 头会优先按其时长软冷却、不再触发本计数。"><input type="number" id="cd-errms-${escapePageHtml(p.id)}" value="${p.cooldown&&p.cooldown.errMs?Math.round(p.cooldown.errMs/60000):''}" style="width:88px" placeholder="错误冷却" title="达到错误阈值后的账号级冷却时长（分钟）。"><span class="mu" style="font-size:12px">冷却参数（保存后生效）</span></div>
@@ -2053,6 +2053,69 @@ function oauthPoolStatus(id) {
     renderOauthPoolAccounts(id, pool, ciByUid, ciByNick, ciAccounts, preferUid)
   }).catch(() => { if (st) showResult(st, false, '查询失败') })
 }
+/* WB_EXPIRY_BEGIN */
+// ===== WorkBuddy 权益包「7 天内到期」判定与渲染（纯函数；单测按标记块抽取） =====
+// 口径必须与后端挑号一致（src/credit-expiry.ts + oauth-pool.soonestOauthExpiryAt）：
+//   1) 上游 ExpiredTime 是 **CST 墙钟串**，浏览器本地时区可能是别的，必须显式按 +08:00 解释；
+//   2) 只有「剩余 = 总额 - 已用 > 0」的包才算待救积分（已用尽的空包不参与优先）；
+//   3) 窗口 7 天（含边界）；窗口内最早到期的账号在池内被优先挑中。
+const WB_EXPIRY_WINDOW_MS = 7 * 24 * 60 * 60 * 1000;
+/** "YYYY-MM-DD HH:mm:ss"（CST）→ epoch ms；非法 → NaN。与后端 parseCstWallClock 同口径。 */
+function wbParseCstWallClock(s) {
+  if (typeof s !== 'string') return NaN;
+  const t = s.trim();
+  if (!t) return NaN;
+  const m = t.match(/^(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2})(?::(\d{2}))?(?:\.\d+)?(?:\s*UTC\+8)?$/);
+  if (m) return Date.UTC(+m[1], +m[2] - 1, +m[3], +m[4] - 8, +m[5], m[6] ? +m[6] : 0);
+  const p = Date.parse(t);
+  return isNaN(p) ? NaN : p;
+}
+/** 包的剩余额度（口径同后端 packageExpiryEntry：max(0, size - used)）。 */
+function wbPackRemain(p) {
+  const size = p && typeof p.size === 'number' ? p.size : 0;
+  const used = p && typeof p.used === 'number' ? p.used : 0;
+  return size - used;
+}
+/** 7 天内到期且有剩余的包，按到期升序返回 [{name, ms, remain, days}]；无 → []。 */
+function wbPackExpiring7d(packages, nowMs) {
+  const now = typeof nowMs === 'number' ? nowMs : Date.now();
+  if (!Array.isArray(packages)) return [];
+  const out = [];
+  for (const p of packages) {
+    if (!p) continue;
+    const remain = wbPackRemain(p);
+    if (!(remain > 0)) continue;
+    const ms = wbParseCstWallClock(p.expireAt);
+    if (isNaN(ms) || ms <= now || ms - now > WB_EXPIRY_WINDOW_MS) continue;
+    out.push({ name: p.name || '', ms: ms, remain: remain, days: Math.ceil((ms - now) / 86400000) });
+  }
+  out.sort(function (a, b) { return a.ms - b.ms; });
+  return out;
+}
+/** 到期时间单元格：空 = 长期；非法 = 原样灰字；已过期 = 红；7 天内 = 琥珀 + 「剩 N 天」。 */
+function wbPackExpireHtml(expireAt) {
+  const raw = (typeof expireAt === 'string' && expireAt.trim()) ? expireAt.trim() : '';
+  if (!raw) return '<span class="mu">长期</span>';
+  const ms = wbParseCstWallClock(raw);
+  if (isNaN(ms)) return '<span class="mu">' + escapeHtml(raw) + '</span>';
+  const left = ms - Date.now();
+  if (left <= 0) return '<span style="color:var(--color-danger,#ef4444)" title="' + escapeHtml(raw) + ' (CST)">已过期</span>';
+  const days = Math.ceil(left / 86400000);
+  const color = left <= 86400000 ? 'var(--color-danger,#ef4444)'
+    : (left <= WB_EXPIRY_WINDOW_MS ? 'var(--color-warn,#d97706)' : 'inherit');
+  const tail = left <= WB_EXPIRY_WINDOW_MS ? ' · 优先消耗' : '';
+  return '<span style="color:' + color + '" title="' + escapeHtml(raw) + ' (CST)">' + escapeHtml(raw) + '</span><br><small class="mu">剩 ' + days + ' 天' + tail + '</small>';
+}
+/** 账号行徽章：「⏳ N 个包 7 天内到期」（无则空串，不刷存在感）。 */
+function wbExpiringBadge(packages) {
+  const soon = wbPackExpiring7d(packages);
+  if (!soon.length) return '';
+  const tip = soon.map(function (p) {
+    return (p.name || '权益包') + ' 剩 ' + p.days + ' 天（余 ' + p.remain + '）';
+  }).join('；');
+  return ' <span class="bd bd-warn" title="' + escapeHtml('7 天内到期，池内优先消耗：' + tip) + '">⏳ ' + soon.length + ' 个包 7 天内到期</span>';
+}
+/* WB_EXPIRY_END */
 function renderOauthPoolAccounts(id, accs, ciByUid, ciByNick, ciAccounts, preferUid) {
   const box = document.getElementById('wbp-acc-' + id)
   if (!box) return
@@ -2062,7 +2125,7 @@ function renderOauthPoolAccounts(id, accs, ciByUid, ciByNick, ciAccounts, prefer
   ciByNick = ciByNick || {}
   ciAccounts = ciAccounts || []
   // 首选账号下拉（对齐 TRAE 面板的手工指定交互）：留空 = 按剩余积分自动挑选
-  const opts = ['<option value="">自动挑选（按积分）</option>'].concat(accs.map(function (a) {
+  const opts = ['<option value="">自动挑选（即将到期优先）</option>'].concat(accs.map(function (a) {
     const sel = a.uid === preferUid ? ' selected' : ''
     return '<option value="' + escapeHtml(a.uid) + '"' + sel + '>' + escapeHtml((a.nickname || a.uid)) + '</option>'
   })).join('')
@@ -2141,23 +2204,27 @@ function renderOauthPoolAccounts(id, accs, ciByUid, ciByNick, ciAccounts, prefer
       const pct = (ci.totalSize > 0 && ci.totalUsed !== undefined && ci.totalUsed !== null) ? ' · ' + Math.round(ci.totalUsed / ci.totalSize * 100) + '%' : ''
       creditLine = '<div class="mu" style="margin-top:2px">可用 ' + ci.totalRemain + ' · 已用 ' + used + pct + ' · 额度池 ' + size + packs + '</div>'
     }
-    // 权益包明细折叠表（与签到区相同的表格结构）
+    // 权益包明细折叠表（与签到区相同的表格结构）。
+    // 数据源优先用池状态里的 packages——它就是挑号用的那一份，且比签到结果（有 TTL）活得久；
+    // 旧 KV 数据 / 尚未签到探测时回退签到结果里的同源快照。
+    const pkgs = Array.isArray(a.packages) ? a.packages : (ci && Array.isArray(ci.packages) ? ci.packages : null)
+    const expiring7d = wbPackExpiring7d(pkgs)
     let pkgHtml = ''
-    if (ci && ci.packages && ci.packages.length > 0) {
+    if (pkgs && pkgs.length > 0) {
       const aid = 'wbpkg-' + escapeHtml(id) + '-' + i
-      const rows = ci.packages.map(function(p) {
-        const exp = (p.expireAt && p.expireAt.trim()) ? escapeHtml(p.expireAt) : '长期'
+      const rows = pkgs.map(function(p) {
         const cyc = (p.cycleEndTime && p.cycleEndTime.trim()) ? escapeHtml(p.cycleEndTime) : '—'
         let qty = '—'
         if (p.size !== undefined && p.size !== null && p.size > 0) {
           const used2 = (p.used !== undefined && p.used !== null) ? p.used : 0
           qty = used2 + ' / ' + p.size + (p.unit ? ' ' + p.unit : '')
         }
-        return '<tr><td>' + escapeHtml(p.name) + '</td><td>' + exp + '</td><td>' + cyc + '</td><td class="numeric">' + qty + '</td></tr>'
+        return '<tr><td>' + escapeHtml(p.name) + '</td><td>' + wbPackExpireHtml(p.expireAt) + '</td><td>' + cyc + '</td><td class="numeric">' + qty + '</td></tr>'
       }).join('')
-      pkgHtml = '<div class="collapse-section" style="margin-top:4px"><button class="collapse-btn" data-pkg="' + aid + '" type="button" aria-expanded="false"><i class="fas fa-chevron-right collapse-icon" aria-hidden="true"></i> 权益包明细（' + ci.packages.length + '）</button><div id="' + aid + '" class="hd usage-log-table-wrap"><table class="usage-log-table"><thead><tr><th>名称</th><th>到期时间</th><th>周期结束</th><th>已用/总额度</th></tr></thead><tbody>' + rows + '</tbody></table></div></div>'
+      const pkgHead = '权益包明细（' + pkgs.length + '）' + (expiring7d.length > 0 ? ' · <span style="color:var(--color-warn,#d97706)">' + expiring7d.length + ' 个 7 天内到期</span>' : '')
+      pkgHtml = '<div class="collapse-section" style="margin-top:4px"><button class="collapse-btn" data-pkg="' + aid + '" type="button" aria-expanded="false"><i class="fas fa-chevron-right collapse-icon" aria-hidden="true"></i> ' + pkgHead + '</button><div id="' + aid + '" class="hd usage-log-table-wrap"><table class="usage-log-table"><thead><tr><th>名称</th><th>到期时间</th><th>周期结束</th><th>已用/总额度</th></tr></thead><tbody>' + rows + '</tbody></table></div></div>'
     }
-    let line = 'uid=' + escapeHtml(a.uid) + (a.nickname ? '（' + escapeHtml(a.nickname) + '）' : '') + ' · 积分=' + (a.credits || 0)
+    let line = 'uid=' + escapeHtml(a.uid) + (a.nickname ? '（' + escapeHtml(a.nickname) + '）' : '') + ' · 积分=' + (a.credits || 0) + wbExpiringBadge(pkgs)
     // 冷却状态徽章（常显，对齐 TRAE「冷却至」列）：禁用（红）> 冷却中（琥珀）> 无冷却（绿）；详情 muted 文字跟随
     const coolBadge = isOff ? '<span class="bd bd-danger">已禁用</span>'
       : (a.cooling ? '<span class="bd bd-warn">冷却中</span>' : '<span class="bd bd-on">无冷却</span>')
@@ -2584,7 +2651,7 @@ function zcodeModels(id) {
  * TRAE 权益包到期时间渲染：
  *  - expireAt 为 0/缺省 → 「长期」（上游 end_time=0 表示不失效）
  *  - 已过期（< now）→ 红色「已过期」+ 原始时刻
- *  - 未过期 → 本地时间 + 剩余天数（<3 天标黄，提示即将失效）
+ *  - 未过期 → CST 本地时间 + 剩余天数（<7 天标黄，与「7 天内到期优先消耗」的挑号窗口一致）
  * 时间戳口径为 Unix 秒（后端 normalizePackEpoch 已归一化毫秒变体）。
  */
 function traePackExpireHtml(expireAt) {
@@ -2594,7 +2661,7 @@ function traePackExpireHtml(expireAt) {
   const txt = d.toLocaleDateString() + ' ' + d.toLocaleTimeString()
   const days = Math.ceil((expireAt * 1000 - Date.now()) / 86400000)
   if (days <= 0) return '<span style="color:var(--color-danger,#ef4444)" title="' + escapeHtml(txt) + '">已过期</span>'
-  const color = days <= 3 ? 'var(--color-warn,#d97706)' : 'inherit'
+  const color = days <= 7 ? 'var(--color-warn,#d97706)' : 'inherit'
   return '<span style="color:' + color + '" title="' + escapeHtml(txt) + '">' + escapeHtml(txt) + '</span><br><small class="mu">剩 ' + days + ' 天</small>'
 }
 /**
@@ -2611,7 +2678,8 @@ function traePackDetailHtml(uid, packs, packsAt, idx) {
   const expiring = packs.filter(function (p) {
     if (!p.expireAt || !(p.expireAt > 0)) return false
     const ms = p.expireAt * 1000 - Date.now()
-    return ms > 0 && ms <= 3 * 86400000
+    // 窗口与后端挑号一致（7 天）：徽章上的数字就是"这些包正在被优先消耗"
+    return ms > 0 && ms <= 7 * 86400000
   }).length
   const when = packsAt ? new Date(packsAt).toLocaleString() : ''
   if (packs.length === 0) {
@@ -2631,7 +2699,7 @@ function traePackDetailHtml(uid, packs, packsAt, idx) {
       '<td class="numeric">' + rem + '</td></tr>'
   }).join('')
   const head = '积分明细（' + packs.length + ' 个包 · 可用 ' + totalRem + ' / 总额 ' + totalLimit + '）' +
-    (expiring > 0 ? ' · <span style="color:var(--color-warn,#d97706)">' + expiring + ' 个 3 天内到期</span>' : '')
+    (expiring > 0 ? ' · <span style="color:var(--color-warn,#d97706)">' + expiring + ' 个 7 天内到期</span>' : '')
   return '<div class="collapse-section" style="margin-top:4px"><button class="collapse-btn" data-traepkg="' + aid + '" type="button" aria-expanded="false">' +
     '<i class="fas fa-chevron-right collapse-icon" aria-hidden="true"></i> ' + head + '</button>' +
     '<div id="' + aid + '" class="hd usage-log-table-wrap"><table class="usage-log-table">' +

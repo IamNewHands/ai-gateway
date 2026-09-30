@@ -8,6 +8,10 @@
  *   - 签到成功后 credits>0 的冷却账号自动解冻（对齐 workbuddy-wild ReenableIfCredits）。
  *
  * 挑选策略（对齐 workbuddy2api pool.go pick/weightOf）：
+ *   第 0 段（2026-09-28 起）：若候选里存在「7 天内到期且仍有剩余」的权益包账号，
+ *     只在其中挑，且到期越早越优先（同到期比积分降序）——积分带到期时间，高分号若
+ *     排在低分号之后消耗，低分号的整包额度可能直接作废。窗口内没有待救积分时才走下面。
+ *     例外：该模型在候选上实测**免费**（costTier 0，不消耗积分）时不套用本段。
  *   权重 = credits 比例 ×10 + 闲置补偿（每小时 +0.5 封顶 5.0）+ 成功率 ×3
  *   - 候选按权重降序取 Top5 短名单，再在 Top5 内按同权重加权随机（credits 只是因子之一，
  *     闲置补偿与成功率同样决定谁进短名单，打散热点避免永远打同一个账号）；
@@ -23,7 +27,8 @@
  * 兼容迁移：池为空时若存在单 token（oauth:token:<id>），自动种子成池账号。
  * 冷却参数默认对齐 workbuddy-wild cooldown.*（12h / 60s / 5 次 / 10m），可被 provider.cooldown 覆盖。
  */
-import type { Env, OAuthDeviceConfig, OAuthTokenState, Provider } from './types'
+import type { Env, OAuthDeviceConfig, OAuthTokenState, PackageInfo, Provider } from './types'
+import { CREDIT_EXPIRY_WINDOW_MS, parseCstWallClock, soonestExpiringAt, type CreditExpiryEntry } from './credit-expiry'
 import { OAUTH_POOL_KV_PREFIX, decodeJwtUid, readOauthToken, refreshBrowserTokenState } from './oauth'
 import { nextDay4AMMs } from './workbuddy-upstream'
 
@@ -65,6 +70,16 @@ export interface OAuthPoolState {
 
   // ===== 12153 session dead 连续失败防抖（对齐 workbuddy2api sessionDeadThreshold = 3） =====
   sessionDeadFails?: number
+
+  // ===== 权益包到期时间（「7 天内到期积分优先」挑号用，2026-09-28） =====
+  /**
+   * 最近一次签到/额度探测得到的权益包明细（含 ExpiredTime）。
+   * 只在签到写路径更新（syncPoolCredits），请求热路径不写，避免放大 KV 写。
+   * 空数组 = 探测成功但无包（与"从未探测"的字段缺省语义不同）。
+   */
+  packages?: PackageInfo[]
+  /** packages 的探测时刻 epoch ms（面板/排查数据新鲜度） */
+  packagesAt?: number
 }
 
 /** 池内账号（凭证 + 状态），存于 KV oauth:pool:<providerId> */
@@ -215,6 +230,36 @@ function accountWeight(providerId: string, acc: OAuthPoolAccount, maxCredits: nu
     w += 1.5
   }
   return w
+}
+
+/**
+ * 单个权益包 → 到期条目：expireAt 为上游 CST 墙钟字符串（按 +08:00 解释），
+ * remain = max(0, size − used)。size/used 都缺省（探测不到容量）→ remain 0，不参与优先
+ * ——宁可回落积分规则，也不把"包还在但额度未知"当成待救积分去抢占挑号。
+ */
+export function packageExpiryEntry(p: PackageInfo): CreditExpiryEntry {
+  const size = typeof p?.size === 'number' && Number.isFinite(p.size) ? p.size : 0
+  const used = typeof p?.used === 'number' && Number.isFinite(p.used) ? p.used : 0
+  return { expireAt: parseCstWallClock(p?.expireAt), remain: size - used }
+}
+
+/**
+ * 账号「7 天内到期且仍有剩余」的最早到期时刻（epoch ms）；没有 → null。
+ * 数据来自 state.packages（签到写路径落盘），未探测过 → null，回落三因子加权挑号。
+ */
+export function soonestOauthExpiryAt(
+  state: OAuthPoolState | undefined,
+  now: number,
+  windowMs: number = CREDIT_EXPIRY_WINDOW_MS
+): number | null {
+  const pkgs = state?.packages
+  if (!pkgs || pkgs.length === 0) return null
+  const entries: CreditExpiryEntry[] = []
+  for (const p of pkgs) {
+    if (!p) continue
+    entries.push(packageExpiryEntry(p))
+  }
+  return soonestExpiringAt(entries, now, windowMs)
 }
 
 export async function readOauthPool(env: Env, providerId: string): Promise<OAuthPool> {
@@ -585,8 +630,9 @@ export async function pickOauthAccount(
       // 惰性 TTL 判定不回收条目本身）。放在挑号写路径，与模型冷却同口径。
       pruneExpiredModelCosts(now)
       // 成本分层：reqModel 非空时，按实测扣费分层只保留最优层
+      let bestTier: number | null = null
       if (reqModel) {
-        let bestTier = 2
+        bestTier = 2
         for (const c of candidates) {
           const { tier } = getOauthModelCost(providerId, c.uid, reqModel, now)
           if (tier < bestTier) bestTier = tier
@@ -620,7 +666,15 @@ export async function pickOauthAccount(
         }
         candidates = inTier
       }
-      chosen = pickWeightedTop5(providerId, candidates, now, opts?.rng)
+      // 到期优先（2026-09-28）：候选里有「7 天内到期且仍有剩余」的账号时，只在其中挑，
+      // 到期越早越优先——积分带到期时间，高分号若一直占坑，低分号的整包额度会直接作废。
+      // 例外：实测免费层（tier 0）不消耗积分，套用本段只会无谓地钉住某个号，故跳过。
+      const expiring = bestTier === 0
+        ? []
+        : candidates.filter((c) => soonestOauthExpiryAt(c.state, now) !== null)
+      chosen = expiring.length > 0
+        ? pickSoonestExpiry(providerId, expiring, now)
+        : pickWeightedTop5(providerId, candidates, now, opts?.rng)
     } else if (opts?.allowCoolingFallback) {
       chosen = pickEarliestCoolingFallback(pool, tried, now, opts?.isInFlightFull)
     }
@@ -630,6 +684,33 @@ export async function pickOauthAccount(
     touchRuntimeStats(providerId, chosen.uid).lastUsed = now
   }
   return chosen
+}
+
+/**
+ * 到期优先挑号（2026-09-28）：只在「7 天内到期且有剩余」的候选里挑，到期最早者胜出；
+ * 同到期按积分降序、再按 uid 升序（确定性，避免两次请求漂移）。
+ *
+ * 仍保留 100ms 防惊群：并发请求按到期顺序**依次发散**到下一个即将到期的号，
+ * 而不是全部撞同一个号（上游账号级限流很紧）；都刚被用过时退回最早到期的那个。
+ * 注意此处**不套三因子加权随机**——到期优先级必须压过"积分比例/闲置/成功率"权重，
+ * 否则高分长期号会持续抢走即将作废额度的消耗机会（正是本次要修的行为）。
+ */
+function pickSoonestExpiry(
+  providerId: string,
+  candidates: OAuthPoolAccount[],
+  now: number
+): OAuthPoolAccount {
+  const scored = candidates
+    .map((a) => ({ a, exp: soonestOauthExpiryAt(a.state, now) ?? Number.MAX_SAFE_INTEGER }))
+    .sort((x, y) => {
+      if (x.exp !== y.exp) return x.exp - y.exp
+      const cx = x.a.state?.credits ?? 0
+      const cy = y.a.state?.credits ?? 0
+      if (cx !== cy) return cy - cx
+      return x.a.uid < y.a.uid ? -1 : 1
+    })
+  const fresh = scored.find((s) => now - (pickRuntime.get(runtimeKey(providerId, s.a.uid))?.lastUsed ?? 0) >= MIN_PICK_GAP_MS)
+  return (fresh ?? scored[0]).a
 }
 
 /**
@@ -976,13 +1057,29 @@ export async function noteOauthSuccess(env: Env, providerId: string, uid: string
   }
 }
 
-/** 签到后解冻：仅当 remain > 0 且账号处于冷却（非禁用）时恢复。 */
-export async function reenableOauthIfCredits(env: Env, providerId: string, uid: string, remain: number): Promise<void> {
+/**
+ * 签到后解冻：仅当 remain > 0 且账号处于冷却（非禁用）时恢复。
+ *
+ * packages（可选）：本次额度探测拿到的权益包明细（含到期时间）。
+ * 传数组即视为**权威快照**并落盘（空数组 = 探测成功但无包，会清掉旧明细）；
+ * 传 undefined 保持原明细不动（额度探测失败的路径不会走到这里）。
+ * 这份明细是「7 天内到期积分优先」挑号的数据源，故与 credits 同一次 KV 写落盘。
+ */
+export async function reenableOauthIfCredits(
+  env: Env,
+  providerId: string,
+  uid: string,
+  remain: number,
+  packages?: PackageInfo[]
+): Promise<void> {
   const pool = await readOauthPool(env, providerId)
   const acc = pool.find((a) => a.uid === uid)
   if (!acc) return
   const st = acc.state || { credits: 0, disabled: false, until: 0, errCount: 0 }
   acc.state = { ...st, credits: remain }
+  if (Array.isArray(packages)) {
+    acc.state = { ...acc.state, packages, packagesAt: Date.now() }
+  }
   if (remain > 0 && !st.disabled) {
     acc.state = { ...acc.state, until: 0, reason: '', errCount: 0 }
   }
@@ -1016,6 +1113,9 @@ export async function listOauthPoolStatus(env: Env, providerId: string): Promise
     nickname: a.nickname || '',
     enabled: a.enabled !== false,
     credits: a.state?.credits ?? 0,
+    // 权益包明细 + 探测时刻：「7 天内到期优先」挑号的可见依据（面板/排查据此解释"为何选这个号"）
+    packages: a.state?.packages,
+    packagesAt: a.state?.packagesAt,
     cooling: !!(a.state?.until && a.state.until > now),
     until: a.state?.until ?? 0,
     reason: a.state?.reason || '',

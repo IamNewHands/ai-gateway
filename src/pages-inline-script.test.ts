@@ -115,3 +115,104 @@ describe('管理页内联脚本语法（pages.ts 模板转义铁律 #5）', () =
     }
   })
 })
+
+/**
+ * 抽取客户端「7 天内到期」判定纯函数块（WB_EXPIRY_BEGIN/END 标记之间），
+ * 用桩 escapeHtml 实例化后直接跑行为断言。
+ *
+ * 为什么要单独跑：这段是后端挑号规则（src/credit-expiry.ts：CST 墙钟解释 + remain>0 +
+ * 7 天窗口含边界）在浏览器侧的镜像。只做"存在性 + 语法"检查的话，口径漂移
+ * （比如把窗口写成 3 天、把 remain 判定漏掉）在 UI 上完全看不出来，但徽章会误导使用者。
+ */
+function wbExpiryApi(html: string): any {
+  const js = inlineScripts(html).join('\n')
+  const m = js.match(/\/\* WB_EXPIRY_BEGIN \*\/([\s\S]*?)\/\* WB_EXPIRY_END \*\//)
+  if (!m) throw new Error('未找到 WB_EXPIRY 标记块：客户端到期判定块被删除或改名了？')
+  const factory = new Function(
+    'escapeHtml',
+    m[1] + '\nreturn { wbParseCstWallClock, wbPackExpiring7d, wbPackExpireHtml, wbExpiringBadge, WB_EXPIRY_WINDOW_MS }'
+  )
+  return factory((s: unknown) => String(s))
+}
+
+describe('WorkBuddy 面板「即将到期」标记（客户端口径 = 后端挑号口径）', () => {
+  const DAY = 24 * 60 * 60 * 1000
+  /** 构造一个包：expireInMs=null → 长期（expireAt 空串），CST 墙钟串由 epoch 反推。 */
+  const pkg = (expireInMs: number | null, over: { name?: string; size?: number; used?: number } = {}) => {
+    const at = expireInMs === null ? '' : (() => {
+      const d = new Date(Date.now() + expireInMs + 8 * 3600_000)
+      const p = (n: number) => String(n).padStart(2, '0')
+      return `${d.getUTCFullYear()}-${p(d.getUTCMonth() + 1)}-${p(d.getUTCDate())} ${p(d.getUTCHours())}:${p(d.getUTCMinutes())}:${p(d.getUTCSeconds())}`
+    })()
+    return { name: over.name ?? '包', expireAt: at, size: over.size ?? 100, used: over.used ?? 0 }
+  }
+
+  it('到期串按 CST(+08:00) 解释，而不是浏览器本地/UTC', async () => {
+    const api = wbExpiryApi(await render([traeProvider()]))
+    expect(api.wbParseCstWallClock('2026-09-30 23:59:59')).toBe(Date.UTC(2026, 8, 30, 15, 59, 59))
+    expect(api.wbParseCstWallClock('2026-09-30 23:59:59 UTC+8')).toBe(Date.UTC(2026, 8, 30, 15, 59, 59))
+    expect(Number.isNaN(api.wbParseCstWallClock(''))).toBe(true)
+    expect(Number.isNaN(api.wbParseCstWallClock(undefined))).toBe(true)
+  })
+
+  it('窗口 7 天含边界；8 天外、长期、已用尽、已过期都不计入', async () => {
+    const api = wbExpiryApi(await render([traeProvider()]))
+    const now = Date.now()
+    const soon = api.wbPackExpiring7d([
+      pkg(2 * DAY, { name: 'soon' }),
+      pkg(api.WB_EXPIRY_WINDOW_MS + 3600_000, { name: 'out' }), // 窗口外
+      pkg(null, { name: 'long' }),                              // 长期
+      pkg(1 * DAY, { name: 'empty', size: 10, used: 10 }),       // 已用尽
+      pkg(-1 * DAY, { name: 'expired' }),                       // 已过期
+    ], now)
+    expect(soon.map((p: any) => p.name)).toEqual(['soon'])
+    // 边界：正好 7 天（略减 1 分钟抵消取整）仍算窗口内
+    const edge = api.wbPackExpiring7d([pkg(api.WB_EXPIRY_WINDOW_MS - 60_000, { name: 'edge' })], now)
+    expect(edge).toHaveLength(1)
+  })
+
+  it('按到期升序返回，徽章显示数量与最早到期包的信息', async () => {
+    const api = wbExpiryApi(await render([traeProvider()]))
+    const pkgs = [pkg(5 * DAY, { name: 'later' }), pkg(1 * DAY, { name: 'sooner' })]
+    const soon = api.wbPackExpiring7d(pkgs)
+    expect(soon.map((p: any) => p.name)).toEqual(['sooner', 'later'])
+    const badge = api.wbExpiringBadge(pkgs)
+    expect(badge).toContain('⏳ 2 个包 7 天内到期')
+    expect(badge).toContain('sooner')
+    // 无待救积分（长期 + 已用尽）→ 不渲染徽章
+    expect(api.wbExpiringBadge([pkg(null), pkg(1 * DAY, { size: 5, used: 5 })])).toBe('')
+    expect(api.wbExpiringBadge(undefined)).toBe('')
+  })
+
+  it('到期时间单元格四态：长期 / 已过期 / 7 天内琥珀+优先消耗 / 更远期无色', async () => {
+    const api = wbExpiryApi(await render([traeProvider()]))
+    expect(api.wbPackExpireHtml('')).toContain('长期')
+    expect(api.wbPackExpireHtml(pkg(-1 * DAY).expireAt)).toContain('已过期')
+    const soonHtml = api.wbPackExpireHtml(pkg(2 * DAY).expireAt)
+    expect(soonHtml).toContain('d97706')
+    expect(soonHtml).toContain('优先消耗')
+    const farHtml = api.wbPackExpireHtml(pkg(30 * DAY).expireAt)
+    expect(farHtml).toContain('inherit')
+    expect(farHtml).not.toContain('优先消耗')
+  })
+
+  it('WorkBuddy 账号行已接上徽章与新的到期渲染（折叠表 + 池状态优先）', async () => {
+    // 用 browser 登录流提供商渲染：WorkBuddy 池面板（含新文案）只在该分支出现
+    const html = await render([{
+      ...traeProvider(),
+      id: 'workbuddy',
+      name: 'WorkBuddy',
+      authType: 'oauth-device',
+      oauth: { flowType: 'browser' },
+    } as Provider])
+    const js = inlineScripts(html).join('\n')
+    expect(js).toContain('function wbExpiringBadge')
+    expect(js).toContain('function wbPackExpireHtml')
+    // 数据源：池状态 a.packages 优先，回退签到结果 ci.packages
+    expect(js).toContain('Array.isArray(a.packages) ? a.packages')
+    expect(js).toContain('wbExpiringBadge(pkgs)')
+    expect(js).toContain('wbPackExpireHtml(p.expireAt)')
+    // 静态说明文案已声明新规则
+    expect(html).toContain('7 天内到期的积分优先消耗')
+  })
+})

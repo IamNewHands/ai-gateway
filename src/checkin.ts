@@ -400,11 +400,15 @@ async function writeCheckinResult(env: Env, providerId: string, result: CheckinR
 /**
  * 把刚拉到的额度写回池账号 state.credits（对齐 workbuddy-wild ReenableIfCredits）：
  * 所有拿到额度的路径（成功/已签/global）都调用，否则池面板"积分"会一直显示 0。
+ *
+ * 同时落盘本次探测的权益包明细（含到期时间）：这是「7 天内到期积分优先」挑号的数据源。
+ * 走到这里即代表额度探测成功，故传 `[]` 也有语义（探测成功但无包）——会清掉旧明细，
+ * 避免已消失的包继续把挑号钉在某个账号上。
  */
 async function syncPoolCredits(env: Env, provider: Provider, account: OAuthPoolAccount, base: CheckinResult) {
   try {
     if (typeof base.totalRemain === 'number') {
-      await reenableOauthIfCredits(env, provider.id, account.uid, base.totalRemain)
+      await reenableOauthIfCredits(env, provider.id, account.uid, base.totalRemain, base.packages ?? [])
     }
   } catch { /* ignore */ }
   // 回写昵称到池账号：池侧 nickname 常为空（登录时未解出 JWT），签到时从

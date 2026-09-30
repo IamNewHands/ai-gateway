@@ -1,7 +1,11 @@
 /**
  * pool.ts — TRAE SOLO 账号池（移植自 traework2api/internal/pool/pool.go）。
  *
- * 挑选策略：healthy 账号中剩余积分最多者优先（SPEC §4.7）。
+ * 挑选策略（两段式，2026-09-28 起）：
+ *   1) healthy 账号中存在「7 天内到期且仍有剩余」的权益包 → 只在其中挑，到期越早越优先
+ *      （同到期再比积分高低）：积分带到期时间，高分号后消耗可能整包过期作废；
+ *   2) 否则回落到原规则：healthy 账号中剩余积分最多者优先（SPEC §4.7）。
+ *   Work 通道与 SOLO 通道**各看自己那一类包**（isWork），互不借用对方包的到期时间。
  * 冷却状态机（SPEC §4.3）：
  *   plan_limit（1005）   → 硬冷却 12h
  *   soft_rate（429）     → 短冷却 60s
@@ -15,6 +19,7 @@
  * 冷却/禁用/积分共享。
  */
 import type { Env, Provider } from '../types'
+import { CREDIT_EXPIRY_WINDOW_MS, soonestExpiringAt, type CreditExpiryEntry } from '../credit-expiry'
 import { KV_KEYS } from '../config'
 import { parseAuth, serializeAccount } from './upstream'
 import { updateProvider } from '../storage'
@@ -198,10 +203,46 @@ export async function removeTraeAccount(env: Env, providerId: string, uid: strin
 
 // ===== 挑选 / 状态机 =====
 
+/** 权益包到期时刻（Unix 秒，上游口径）→ epoch ms；0/非法 = 长期有效或未知（null）。 */
+export function packExpireAtMs(p: TraeEntPackInfo | undefined | null): number | null {
+  const v = p?.expireAt
+  if (typeof v !== 'number' || !Number.isFinite(v) || v <= 0) return null
+  return v * 1000
+}
+
 /**
- * 挑选账号：
+ * 账号「窗口期内（默认 7 天）最早到期且仍有剩余」的权益包到期时刻（epoch ms）；无 → null。
+ *
+ * work 决定看哪一类包：true 只看 Work 专属包，false 只看 SOLO（非 Work）包。
+ * 为什么必须分开看：两个通道各自消耗各自的包（upstream 按 isWork 拆分 ideCredits/workCredits），
+ * 混用会让 Work 模型去抢 SOLO 包的到期优先级（反之亦然），等于把另一个通道的额度提前烧掉。
+ *
+ * 数据来自 state.packs（登录/签到/手动刷新积分时才探测，请求热路径不写），
+ * 因此到期信息最多滞后到上一次探测；未探测过（无 packs）→ null，回落积分高低规则。
+ */
+export function soonestTraePackExpiryAt(
+  state: TraeAccountState | undefined,
+  now: number,
+  work: boolean,
+  windowMs: number = CREDIT_EXPIRY_WINDOW_MS
+): number | null {
+  const packs = state?.packs
+  if (!packs || packs.length === 0) return null
+  const entries: CreditExpiryEntry[] = []
+  for (const p of packs) {
+    if (!p) continue
+    if ((p.isWork === true) !== work) continue
+    entries.push({ expireAt: packExpireAtMs(p), remain: typeof p.rem === 'number' ? p.rem : 0 })
+  }
+  return soonestExpiringAt(entries, now, windowMs)
+}
+
+/**
+ * 挑选账号（两段式）：
  *  - 若指定 preferUid（面板手工指定），且该 uid 账号 healthy 且尚未 tried，则优先返回它；
- *  - 否则在 healthy 且未 tried 的账号中按剩余积分最多者挑选（原自动策略兜底）。
+ *  - 第二段（默认）：healthy 且未 tried 的账号中，**7 天内到期且有剩余的 SOLO 权益包**
+ *    最早者优先（同到期比积分降序）——避免高分号把低分号的即将作废额度拖到过期；
+ *  - 第三段（兜底）：窗口内没有待救积分时，按剩余积分最多者挑选（原自动策略）。
  *  - 特性A：同时传入 { concurrency, idleMs } 时，忽略并发已满的账号（activeSessions
  *    达上限），且超过 idleMs 的空闲账号可被回收（视为可用）；spec 传 null 则维持原语义
  *    （每个请求独占一个账号，不做并发判定，保证旧热路径行为完全不变）。
@@ -237,14 +278,33 @@ export async function pickTraeAccount(
   }
 
   let best: TraeAccount | null = null
-  let bestCredits = -Infinity
+  let bestExpiry: number | null = null
+  let bestExpiryCredits = -Infinity
+  // 第二段：7 天内到期的 SOLO 积分优先（到期越早越优先，同到期比积分高低）
   for (const a of accounts) {
     if (tried.has(a.uid)) continue
     if (!usable(a.uid)) continue
+    const exp = soonestTraePackExpiryAt(pool[a.uid], now, false)
+    if (exp === null) continue
     const credits = pool[a.uid]?.credits ?? 0
-    if (credits > bestCredits) {
+    if (bestExpiry === null || exp < bestExpiry || (exp === bestExpiry && credits > bestExpiryCredits)) {
       best = a
-      bestCredits = credits
+      bestExpiry = exp
+      bestExpiryCredits = credits
+    }
+  }
+
+  // 第三段：窗口内没有待救积分 → 原策略：剩余积分最多者优先
+  if (!best) {
+    let bestCredits = -Infinity
+    for (const a of accounts) {
+      if (tried.has(a.uid)) continue
+      if (!usable(a.uid)) continue
+      const credits = pool[a.uid]?.credits ?? 0
+      if (credits > bestCredits) {
+        best = a
+        bestCredits = credits
+      }
     }
   }
   // 兜底：若并发控制下没有配额剩余但存在空闲会话可回收（超过 idleMs），取一个空闲账号
@@ -262,8 +322,9 @@ export async function pickTraeAccount(
 }
 
 /**
- * 挑选 Work 专有通道健康账号：
- * 优先按可用 workCredits 降序挑选；若均未探测或为 0，返回首个未尝试的 Work 健康账号。
+ * 挑选 Work 专有通道健康账号（两段式）：
+ *   1) Work 包 7 天内到期且有剩余 → 到期最早者优先（同到期比 workCredits 降序）；
+ *   2) 否则按可用 workCredits 降序挑选；若均未探测或为 0，返回首个未尝试的 Work 健康账号。
  */
 export async function pickTraeWorkAccount(
   env: Env,
@@ -286,14 +347,32 @@ export async function pickTraeWorkAccount(
   }
 
   let best: TraeAccount | null = null
-  let bestCredits = -Infinity
+  let bestExpiry: number | null = null
+  let bestExpiryCredits = -Infinity
+  // 第一段：Work 包 7 天内到期的积分优先
   for (const a of accounts) {
     if (tried.has(a.uid)) continue
     if (!usable(a.uid)) continue
+    const exp = soonestTraePackExpiryAt(pool[a.uid], now, true)
+    if (exp === null) continue
     const credits = pool[a.uid]?.workCredits ?? 0
-    if (credits > bestCredits) {
+    if (bestExpiry === null || exp < bestExpiry || (exp === bestExpiry && credits > bestExpiryCredits)) {
       best = a
-      bestCredits = credits
+      bestExpiry = exp
+      bestExpiryCredits = credits
+    }
+  }
+
+  if (!best) {
+    let bestCredits = -Infinity
+    for (const a of accounts) {
+      if (tried.has(a.uid)) continue
+      if (!usable(a.uid)) continue
+      const credits = pool[a.uid]?.workCredits ?? 0
+      if (credits > bestCredits) {
+        best = a
+        bestCredits = credits
+      }
     }
   }
   if (!best) {

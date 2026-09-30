@@ -262,3 +262,27 @@ TRAE 思考模型在推理阶段可能 15~20s 不发数据，客户端（AI SDK 
   `query-filters: - exclude: id: js/clear-text-logging`（等于整仓放弃该查询），或自维护一份改过 source 的查询副本。
 - 真修的例子（本轮）：`src/pages-inline-script.test.ts` 内联脚本抽取正则改 `<\/script\s*\/?>`，
   修掉 `js/bad-tag-filter`（原来漏掉 `</script >` 这类结束标签 → 少校验一段客户端脚本）。
+
+## 挑号规则：7 天内到期积分优先（2026-09-28）
+
+积分带到期时间，原「积分高低」挑号会让低分号的整包额度直接过期作废。现两个池统一为两段式
+（owner：`src/credit-expiry.ts`，纯函数、两个池各自供到期数据源）：
+
+- **第 1 段**：候选里存在「窗口内（7 天，含边界）到期且仍有剩余」的积分包 → 只在其中挑，
+  **到期最早者优先**（同到期再比积分/权重）。workbuddy 还会跳过实测**免费层**（`costTier===0`
+  不消耗积分，钉住某个号没有收益）。
+- **第 2 段**：窗口内没有待救积分 → 完全回落原规则（workbuddy 三因子加权随机 /
+  trae 积分最高、Work 通道 workCredits 最高）。**未探测过 packs/packages 的账号天然走这一段**。
+- trae 的 SOLO 与 Work 通道**各看自己那一类包**（`isWork`）：混用会把另一个通道的额度提前烧掉。
+- workbuddy 到期数据落在池状态 `state.packages`（随手签到写路径落盘；`[]`＝探测成功但无包，
+  会清旧明细）；trae 落在 `state.packs`。两者都**不在请求热路径写**，最多滞后到上一次探测
+  （workbuddy cron `0 1,13 * * *` UTC 一天两次）。
+
+**不要"顺手改回去"**：窗口 7 天（后端 `CREDIT_EXPIRY_WINDOW_MS` 与面板 `WB_EXPIRY_WINDOW_MS`
+必须同值，面板 trae 侧也统一成 7 天——原先是 3 天，与挑号窗口不一致会误导）；上游 `ExpiredTime`
+是 **CST 墙钟串**，浏览器/Workers 都不是 CST，前后端都必须显式按 `+08:00` 解释。
+
+**客户端镜像逻辑要能被单测**：`pages.ts` 内的纯函数块用 `/* WB_EXPIRY_BEGIN */ … /* WB_EXPIRY_END */`
+圈出，`pages-inline-script.test.ts` 按标记抽取后用 `new Function` 实例化并直接断言行为
+（CST 解析 / 7 天边界 / 空包排除 / 徽章文案 / 到期单元格四态）。只做"存在性 + 语法"检查的话，
+口径漂移（窗口写成 3 天、漏掉 remain 判定）在 UI 上看不出来，但徽章会误导使用者。
