@@ -188,19 +188,20 @@ node node_modules\wrangler\wrangler-dist\cli.js deploy --temporary --config prob
 - [x] T2.3 登录 + 懒重登 + 启动序列（`users/current`）
       → **上游硬卡密码登录**（真实浏览器同样 `biz_code 11`），故此路径**实现但不接入** provider 流程；改走 token 注入（见架构落点）。
 
-**阶段 3 — 账号池**
-- [ ] T3.1 KV **token 池** CRUD（token / headerDeviceId / userAgent / shumeiDeviceId / state / addedAt / expiredAt）
-- [ ] T3.2 round-robin + 每 token in-flight 信号量 + QueueWait
-- [ ] T3.3 token 失效标记与面板提示（`users/current` 判活；失效即 `expired`，不静默降级）
+**阶段 3 — 账号池 → **token 池****
+- [x] T3.1 KV token 池 CRUD（`deepseek:pool` 单键整表：token / headerDeviceId / userAgent / shumeiDeviceId / state / addedAt / lastOkAt / lastError）
+- [x] T3.2 轮转 + 每 token 在飞上限（默认 2，per-isolate 内存态，与 trae/kuku 同形态）
+- [x] T3.3 token 失效标记与换号重试（40003/鉴权 → 标 `expired` 并写下 KV，面板可见；**不静默降级**）
+      → `src/deepseek/pool.ts` + `pool.test.ts`（**12/12**：脱敏视图不回显 token、空/损坏 KV 当空池、去重、状态迁移、轮转与并发上限）
 
 **阶段 4 — 补全链路**
-- [x] T4.2 SSE → OpenAI：`src/deepseek/sse.ts`（解释器逐条移植 `sse.go`：JSON-patch `{p,o,v}`、省略 p/o 沿用上次、裸增量按上次片段 type 归属、BATCH、噪声路径过滤、`event: hint`、`content_filter`）+ OpenAI chunk / 错误帧 / `[DONE]` 构造器
-      → 验证：`npx vitest run --pool=threads src/deepseek/sse.test.ts` **18/18 通过**，其中 3 例直接吃**真实上游固件**（`__fixtures__/completion-{plain,thinking,search}.sse.txt`，2026-09-30 抓取：1002/10378/7362 字节）。覆盖跨块切行、CRLF、THINK/RESPONSE 归属、搜索 hits 收集、断流不谎报 stop。
-- [x] T4.3 非流式聚合：`aggregateDeepseekSse()` + `truncated` 语义（断流标 `length`，不谎报 `stop`）
 - [x] T4.1a 上游补全请求体（10 字段 kotlinx 序、thinking/search 开关）——见 `client.ts`
 - [x] T4.1b messages → 上游单一 `prompt` 的扁平化规则（system 合并、工具残留丢弃、junk 片段过滤、thinking/search 开关、`max_completion_tokens` 别名）
       → `src/deepseek/request.ts` + `request.test.ts`（**25/25**，期望值逐条转写 Go 的 `strip_test.go` 系统合并 8 例表与 kitchen-sink 剥离用例）
-- [x] T4.2b `ReadableStream` 包装（上游流 → OpenAI SSE，含 180s idle 看门狗）→ `src/deepseek/stream.ts` + `stream.test.ts`（**9/9**：三份真固件 + 截断/hint/content_filter/idle/跨块切行）
+- [x] T4.2 SSE → OpenAI：`src/deepseek/sse.ts`（解释器逐条移植 `sse.go`：JSON-patch `{p,o,v}`、省略 p/o 沿用上次、裸增量按上次片段 type 归属、BATCH、噪声路径过滤、`event: hint`、`content_filter`）+ OpenAI chunk / 错误帧 / `[DONE]` 构造器
+      → 验证：`sse.test.ts` **18/18**，其中 3 例直接吃**真实上游固件**（`__fixtures__/completion-{plain,thinking,search}.sse.txt`，2026-09-30 抓取：1002/10378/7362 字节）。
+- [x] T4.3 非流式聚合：`aggregateDeepseekSse()` + `truncated` 语义（断流标 `length`，不谎报 `stop`）
+- [x] T4.2b `ReadableStream` 包装（上游流 → OpenAI SSE，含 180s idle 看门狗）→ `src/deepseek/stream.ts` + `stream.test.ts`（**9/9**）
       → 踩坑记录：`pull()` **必须**在返回前 enqueue 或 close，否则底层不再回调、消费者直接卡死（实测 40s 全超时 → 改成循环后 80ms 全绿）。
 
 **阶段 5 — 会话生命周期（cron）**
@@ -209,7 +210,10 @@ node node_modules\wrangler\wrangler-dist\cli.js deploy --temporary --config prob
 - [ ] T5.3 每周 purge-all（weekday/hour/宽限补跑）+ `DS_SESSION_CAP` 同步上限
 
 **阶段 6 — 网关集成**
-- [ ] T6.1 `proxy.ts` 4 个 dispatch 点 + `GET /v1/models` + 预置 DEFAULT_PROVIDERS 条目
+- [x] T6.1a `src/deepseek/proxy.ts`（`isDeepseekAppProvider` + `proxyDeepseekChatRequest`）+ 接入 `proxy.ts` 的 OpenAI chat 分发点；Anthropic 配置显式 501（不悄悄回错格式）
+      → 验证：`proxy.test.ts` **10/10**（假上游全覆盖流式/非流式/换号重试/空池/参数校验）
+      → **真机端到端**：`DS_LIVE_PROBE=1 npx vitest run --pool=threads -t "live gateway chain"` → **200 + 14267 字节 OpenAI SSE + `finish_reason:stop` + `[DONE]`**（真实上游 × 完整转换链）
+- [ ] T6.1b Anthropic `/v1/messages` 与 Responses 两个分发点接线
 - [ ] T6.2 管理后台：**token 注入面板**（粘贴 → 判活 → 存池）、池状态、失效提示 + 取 token 的操作指引（不回显完整 token）
 - [ ] T6.3 用量统计接入 `analytics/usage-logger.ts`
 

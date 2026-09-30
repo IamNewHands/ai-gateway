@@ -16,6 +16,9 @@
 
 import { describe, it, expect } from 'vitest'
 import { DEFAULT_BASE_URL, DeepseekClient, buildLoginBody, type Envelope } from './client'
+import type { Env, Provider } from '../types'
+import { DEEPSEEK_APP_PROVIDER_ID, proxyDeepseekChatRequest } from './proxy'
+import { drainStream } from './stream'
 
 interface ProbeAccount {
   mobile?: string
@@ -361,5 +364,68 @@ describe.runIf(tokenEnabled)('live token-mode probe (browser token, no login)', 
       expect(report.ok).toBe(true)
     },
     300_000,
+  )
+})
+
+/**
+ * 真机端到端：**真实上游** × **完整网关链路**（净化/扁平化 → 上游调用 → OpenAI 翻译）。
+ * 唯一没覆盖的是 Hono 路由层与鉴权（那层由 index.ts 负责）。
+ */
+describe.runIf(tokenEnabled)('live gateway chain (real upstream)', () => {
+  it(
+    'streams an OpenAI SSE answer through proxyDeepseekChatRequest',
+    async () => {
+      const session = webSession as WebSession
+      const env = { KV: { get: async () => null, put: async () => undefined } } as unknown as Env
+      const provider = {
+        id: DEEPSEEK_APP_PROVIDER_ID,
+        name: 'DeepSeek App',
+        baseUrl: 'https://chat.deepseek.com',
+        apiKeys: [],
+        models: [{ id: 'deepseek-flash', enabled: true }],
+        enabled: true,
+      } as unknown as Provider
+
+      const response = await proxyDeepseekChatRequest(
+        env,
+        provider,
+        {
+          model: 'deepseek-flash',
+          stream: true,
+          messages: [
+            { role: 'system', content: '你是简洁助手' },
+            { role: 'user', content: '只回复两个字：你好' },
+          ],
+        },
+        {
+          tokens: [
+            {
+              id: 'live',
+              token: session.token,
+              headerDeviceId: session.headerDeviceId,
+              userAgent: session.userAgent,
+              state: 'ready',
+              addedAt: Date.now(),
+            },
+          ],
+        },
+      )
+
+      expect(response.status).toBe(200)
+      const out = await drainStream(response.body as ReadableStream<Uint8Array>)
+      const summary = {
+        status: response.status,
+        bytes: out.length,
+        hasStop: out.includes('"finish_reason":"stop"'),
+        hasDone: out.endsWith('data: [DONE]\n\n'),
+        head: truncate(out, 700),
+      }
+      // eslint-disable-next-line no-console
+      console.log('[live-gateway]', JSON.stringify(summary, null, 2))
+
+      expect(summary.hasStop).toBe(true)
+      expect(summary.hasDone).toBe(true)
+    },
+    180_000,
   )
 })

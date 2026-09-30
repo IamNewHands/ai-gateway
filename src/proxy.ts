@@ -31,6 +31,7 @@ import {
 import { isTraeProvider, proxyTraeChatRequest } from './trae/proxy'
 import { isZcodeProvider, buildZcodeHeaders } from './zcode/proxy'
 import { isKukuProvider, proxyKukuChatRequest } from './kuku/proxy'
+import { isDeepseekAppProvider, proxyDeepseekChatRequest } from './deepseek/proxy'
 import { writeLog } from './admin'
 import { getPerfSettings } from './perf'
 import { applyThinkingInjection } from './thinking'
@@ -1796,6 +1797,28 @@ export async function forwardProxy(
           },
         })
       }
+      return response
+    }
+
+    // DeepSeek App（chat.deepseek.com 私有协议，**token 注入型**）：本模块直接返回
+    // OpenAI 格式（流式 SSE 或 JSON）。凭据由面板注入，上游硬卡密码登录（见
+    // DEEPSEEK-APP-PORT.md）；token 失效会在池里标 expired 并换下一条重试。
+    if (isDeepseekAppProvider(provider)) {
+      // Anthropic 格式尚未接线：宁可显式 501，也不悄悄回一个 OpenAI 体让客户端解析失败
+      if (provider.apiType === 'anthropic') {
+        return c.json(
+          { error: { message: 'deepseek-app 暂不支持 Anthropic 格式（未接线）', type: 'not_implemented', code: 'anthropic_not_wired' } },
+          501,
+        )
+      }
+      const response = await proxyDeepseekChatRequest(c.env, provider, forwardBody as Record<string, unknown>)
+      try {
+        const bodySummary = summarizeRequestBody(forwardBody)
+        c.executionCtx.waitUntil(writeLog(c.env, response.ok ? 'request' : (response.status >= 500 ? 'error' : 'warn'),
+          `[${provider.name}] ${model} → ${response.status}`,
+          JSON.stringify({ providerId, subPath, body: bodySummary }).substring(0, 4000)
+        ))
+      } catch { /* log failure must not break */ }
       return response
     }
 
