@@ -140,6 +140,21 @@
 3 .**需要 token 供给方式**：网关无法自主密码登录（biz 11），短信登录需要真人 + 浏览器侧 Shumei `rid`。可行形态是**「浏览器登录一次 → 注入 token」**——这与 ai-gateway 既有的手工登录型 provider（kuku 扫码、trae 登录、cline OAuth 回调）是同一类设计，不是新范式。
 4. **仍待测**：① token 的有效期（决定注入频率）；② **Cloudflare Workers 边缘出口**是否同样放行 API（决定「托管在 Workers」是否成立；这是 T0.2 的窄化版本，不再需要登录）。
 
+### T0.2 Cloudflare 边缘探测（探针已就绪，待用户执行）
+
+探针：`probe/worker.ts`（+ `probe/wrangler.toml`），复用 `src/deepseek/client`，**不内置凭据**，token 由请求体传入。
+
+```powershell
+# 1) 普通终端（非 DSH 沙箱）里部署 —— 临时预览账号，不需 CF 账号
+cd D:\GitHub_Clone\ai-gateway
+node node_modules\wrangler\wrangler-dist\cli.js deploy --temporary --config probe\wrangler.toml
+
+# 2) 把打印出来的 URL 交给 Agent；Agent 用本机 .secrets 里的 token 调 /probe
+#    POST <url>/probe  {"token":"…","headerDeviceId":"…","userAgent":"…"}
+```
+
+判定：`ok:true` 且 `chat/completion` 阶段有 SSE 字节 ⇒ CF 边缘可托管，移植继续；被 40003/风控/连接层拒 ⇒ CF 边缘不可用，转 VPS 方案。
+
 **部署约束（2026-09-30 实测，本机）**
 - `npx wrangler` 与 `node node_modules/wrangler/wrangler-dist/cli.js` 在本沙箱内都失败：wrangler 启动器与 esbuild 都 `spawn` 子进程，沙箱禁止管道 ⇒ `spawn EPERM`。**wrangler 只能在沙箱外的普通终端跑。**
 - 本机 wrangler **未认证**（`You are not authenticated`），且无 `CLOUDFLARE_API_TOKEN` / `CLOUDFLARE_ACCOUNT_ID`。故 T0.2 的可行路径是 `wrangler deploy --temporary`（临时预览账号，真实 CF 边缘出口，无需 CF 账号），由用户在自己的终端执行；探针 Worker 写成**单文件纯 JS、零依赖**，避免 bundling。

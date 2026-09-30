@@ -1,0 +1,13 @@
+# Cloudflare 边缘探测 Worker（一次性用，非生产）。
+#
+# 部署（在 ai-gateway 仓库根目录、普通终端里跑 —— DSH 沙箱内 wrangler/esbuild 无法
+# 起子进程，会 spawn EPERM）：
+#
+#   node node_modules\wrangler\wrangler-dist\cli.js deploy --temporary --config probe\wrangler.toml
+#
+# --temporary = 临时预览账号：不需要你有 Cloudflare 账号，出口仍是真实 CF 边缘。
+# 探针不绑定任何 KV/DO/路由，也不内置凭据（token 每次由请求体传入）。
+name = "deepseek-probe"
+main = "worker.ts"
+compatibility_date = "2025-07-01"
+compatibility_flags = ["nodejs_compat"]
