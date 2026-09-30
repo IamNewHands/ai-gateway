@@ -28,3 +28,5 @@ __pycache__/
 *accounts*.json
 .env
 .env.*
+# Local probe secrets (deepseek account) - never commit
+.secrets/

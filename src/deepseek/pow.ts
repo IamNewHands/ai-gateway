@@ -18,6 +18,8 @@
  * 前缀按 Go 版做法预吸收进 base 状态，热循环里每个 nonce 只吸收尾部一块。
  */
 
+import { base64Encode, fromHex, utf8 } from './bytes'
+
 /** Keccak 置换的 rate（SHA3-256），字节。 */
 const RATE = 136
 /** 一个 rate 块 = 17 个 64 位lane。 */
@@ -194,12 +196,8 @@ const SUPPORTED_ALGORITHMS = ['HashV1', 'DeepSeekHashV1']
 
 function hexToBytes32(hex: string): Uint8Array {
   if (hex.length !== 64) throw new Error('pow: challenge must be 64 hex chars')
-  const out = new Uint8Array(32)
-  for (let i = 0; i < 32; i++) {
-    const b = parseInt(hex.slice(i * 2, i * 2 + 2), 16)
-    if (Number.isNaN(b)) throw new Error('pow: challenge must be 64 hex chars')
-    out[i] = b
-  }
+  const out = fromHex(hex)
+  if (out.length !== 32) throw new Error('pow: challenge must be 64 hex chars')
   return out
 }
 
@@ -227,7 +225,7 @@ export function solvePow(
   const signal = options.signal
 
   // 前缀预吸收：整块直接吸收并置换，余下的尾巴留给热循环。
-  const prefix = new TextEncoder().encode(buildPrefix(salt, expireAt))
+  const prefix = utf8(buildPrefix(salt, expireAt))
   const baseLo = new Uint32Array(25)
   const baseHi = new Uint32Array(25)
   const blo = new Uint32Array(25)
@@ -310,24 +308,7 @@ export function solvePow(
   throw new Error('pow: no solution within difficulty')
 }
 
-/** 标准 base64（Workers 与 Node 都有 btoa，但这里手写以保持纯函数、可单测）。 */
-const B64 = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/'
-function base64Encode(bytes: Uint8Array): string {
-  let out = ''
-  for (let i = 0; i < bytes.length; i += 3) {
-    const b0 = bytes[i]
-    const b1 = i + 1 < bytes.length ? bytes[i + 1] : 0
-    const b2 = i + 2 < bytes.length ? bytes[i + 2] : 0
-    out += B64[b0 >> 2]
-    out += B64[((b0 & 0x03) << 4) | (b1 >> 4)]
-    out += i + 1 < bytes.length ? B64[((b1 & 0x0f) << 2) | (b2 >> 6)] : '='
-    out += i + 2 < bytes.length ? B64[b2 & 0x3f] : '='
-  }
-  return out
-}
-
-/**
- * 组装 x-ds-pow-response：base64(JSON)。字段名与顺序对齐 Go 版
+/** 组装 x-ds-pow-response：base64(JSON)。字段名与顺序对齐 Go 版
  * （difficulty / expire_at 刻意排除——带上会被上游判为篡改挑战）。
  */
 export function buildPowHeader(challenge: PowChallenge, answer: number): string {
@@ -339,7 +320,7 @@ export function buildPowHeader(challenge: PowChallenge, answer: number): string 
     signature: challenge.signature,
     target_path: challenge.target_path,
   })
-  return base64Encode(new TextEncoder().encode(payload))
+  return base64Encode(utf8(payload))
 }
 
 /** 端到端：挑战 → 应答头。difficulty 为 0 时用默认值 144000。 */

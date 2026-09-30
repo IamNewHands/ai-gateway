@@ -67,7 +67,8 @@
       → 验证：`npx vitest run --pool=threads src/deepseek/pow.test.ts` **17/17 通过**；`npx tsc --noEmit` 干净。
 
 **阶段 2 — 设备身份与客户端**
-- [ ] T2.1 `device.ts`：MD5 常量、AES-CBC 铸造、UUIDv5、rangers-id、web/android channel
+- [x] T2.1 `device.ts`：MD5 常量、AES-CBC 铸造、UUIDv5、rangers-id、web/android channel
+      → 验证：`npx vitest run --pool=threads src/deepseek/` **37/37 通过**（含 uuidV5 对 RFC 4122 附录 DNS+python.org 标准向量、device_id 用字面量密钥独立解密回放）；`npx tsc --noEmit` 干净。
 - [ ] T2.2 `client.ts`：baseHeaders、envelope/BizError、`postJSON/postEmpty/getJSON`、ban 分类（5/10/11）、IsAuthFailure/IsRetryable
 - [ ] T2.3 登录 + 懒重登 + 启动序列（`users/current`）
 
