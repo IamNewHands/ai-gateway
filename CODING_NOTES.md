@@ -297,3 +297,66 @@ TRAE 思考模型在推理阶段可能 15~20s 不发数据，客户端（AI SDK 
 - 折叠表标题的「可用 / 总额」按**全部**包统计（含被隐藏的已用完包），只是把隐藏数量标出来
   （「已用完 N 个已隐藏」）；若改成按展示行统计，账号真实额度会凭空变少。全部包都用完时
   显示「N 个包已全部用完」，不要渲染空表格（空 tbody 看起来像加载失败）。
+
+## DeepSeek App 提供商（token 注入型，2026-09-30）
+
+背景：`chat.deepseek.com` 安卓 App 私有协议（登录 / 会话 / PoW / SSE），移植自 Go 项目 simple-chat（MIT）。
+完整计划、实测证据与任务清单一律以 `DEEPSEEK-APP-PORT.md` 为准，这里只记「不要顺手改回去」的约定。
+
+### 关键决策：凭据是「浏览器注入的 token」，不是账号密码
+
+- 实测：同一账号、同一台机器，用**真实 Chrome + 真实页面 JS + 真实 Shumei device_id** 走密码登录，
+  上游照样返回 `biz_code 11 RISK_DEVICE_DETECTED`；参考实现 ds2api（utls 伪造 Safari TLS 指纹）逐字复刻同一组合也被同一码拒。
+- 短信登录同样不可用：`create_sms_verification_code` 需要浏览器侧 Shumei `shumei_verification.rid`（无头进程造不出来）。
+- 因此 `src/deepseek/client.ts` 的密码登录路径**保留但不接入 provider 流程**；凭据由面板/接口注入
+  （`/admin/api/deepseek/:id/tokens`）。token 会过期：失效即标 `expired`、写下 KV、面板标红，并换下一条重试 —— **不静默降级**。
+- 取 token 的正确姿势：浏览器登录 → DevTools → Application → Local Storage →
+  `userToken` 取 **value 里那 64 字符**（LocalStorage 里是 `{"value":"…","__version":…}` 包装，整段直接用会拿到 `code 40003`）；
+  `deepseek-device-id:chat` 取 UUID 作为 `headerDeviceId`。
+
+### 两个新踩到的坑（代码里已注释钉住）
+
+1. `ReadableStream` 的 `pull()` **必须**在返回前 `enqueue` 至少一块或 `close`。既不产出也不结束就返回，
+   底层**不会**再次回调，客户端永久挂起（实测 9 个流测试 40s 全超时）。`src/deepseek/stream.ts` 用「pull 内循环」解决。
+2. `arr?.[i++]`：`arr` 为 `undefined` 时可选链短路，**自增不执行**（测试里的假上游因此少算一轮）。
+
+### 协议要点（改之前先看）
+
+- 上游是 JSON-patch SSE：`data:` 行是 `{p,o,v}`，**省略 p/o 表示沿用上一次**；裸 `{"v":"字"}` 归到「上一次片段 type」
+  （THINK/THINKING → `reasoning_content`，其余 → `content`）。
+- 噪声路径必须丢：`quasi_status` / `fragments/-N/status` / `elapsed_secs` / `token_usage` /
+  `pending_fragment` / `conversation_mode` / `response/search_status` —— 不丢会被当正文吐给客户端。
+- 收尾诚实：只有 `event: close` / `"status":"FINISHED"` 才报 `finish_reason: "stop"`；断流报 `upstream_interrupted`，
+  非流式标 `length`（沿用 trae 截断那一轮的定责口径）。
+- PoW：HashV1 = SHA3-256 **跳过 Keccak-f 第 0 轮**，现成 SHA3 库都不可用，只能手写；JS 实现实测约 275k 次置换/秒
+  （一次 144000 难度约 0.3-0.5s CPU）。
+- 补全请求体字段序 = App 的 kotlinx descriptor 序，属于设备指纹的一部分，**不要改成 Map 或排序**。
+
+### 已知缺口（与 trae/kuku 同现状，非本轮引入）
+
+- 特殊 provider 分支不走 `finalizeProxyResponse`，因此**不写 analytics usage**（trae 也一样）。
+- 图片理解（`image_url` → `upload_file` → `fetch_files` → `ref_file_ids`）只完成了**客户端侧**
+  （`client.ts` 的 `uploadFile` / `fileStatus` / `uploadImageAndWait`）：`request.ts` 已提取图片片段、
+  `flattenMessages` 有意跳过它们，但「请求里的图片 → 上传 → `ref_file_ids`」这条线还没接。
+- 独立 `/v1/web_search` 端点未做（有意）：搜索 hits 已随 chat 响应的 `citations` 返回。
+
+### 分发点与后台维护（2026-09-30 补齐）
+
+- 三个分发点全部接线：`/v1/chat/completions`（原样返回 OpenAI）、`/v1/messages`（转 Anthropic）、
+  `/v1/responses`（`handleResponsesSpecial`，传薄包装）。
+- **薄包装不是多余**：`handleResponsesSpecial` 内部 `sanitizeUpstreamBody` 会删掉 `thinking`，而 deepseek 只认
+  thinking 开关 → 客户端用 `reasoning.effort="none"` 表达「不要思考」会被静默忽略。包装在 sanitize **之后**补回。
+  判定统一走 `src/deepseek/request.ts` 的 `isDeepseekReasoningOff()`（`minimal` 也算「关」，因为上游没有中间档）。
+- `/v1/chat/completions` + `apiType=anthropic` 这条入口**有意返回 501**：该组合在本仓真实存在
+  （`proxy.ts` 里有专门处理它的 `proxyAnthropicNativeUpstream`），但 deepseek 这条入口的 OpenAI→Anthropic 转回还没写，
+  明确报错优于悄悄回一个 OpenAI 体让客户端解析失败。
+- 会话维护（`src/deepseek/sessions.ts`）接在 `index.ts` 的 `0 * * * *` cron 上：`runSessionCleanup(env)` +
+  `runSessionPurge(env)`。**它每小时醒一次不代表每小时动手**——是否动手由模块内 KV 标记 + 抖动判定
+  （base 1h ±50%、每次 0.5 概率），面板/日志里 `reason=not-due` 是正常状态，不要去「修」。
+
+
+### 测试约定
+
+本仓 vitest 在 DSH 沙箱内必须带 `--pool=threads`（默认 forks 池会 `spawn EPERM`）。
+DeepSeek 的 SSE 测试吃的是**真实上游固件**（`src/deepseek/__fixtures__/completion-{plain,thinking,search}.sse.txt`），
+上游改协议时用 `DS_LIVE_PROBE=1 DS_LIVE_CAPTURE=1 npx vitest run --pool=threads -t captures src/deepseek/live-capture.test.ts` 重抓。

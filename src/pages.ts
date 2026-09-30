@@ -69,6 +69,10 @@ const escapePageJsx = (value: unknown) => escapePageHtml(escapePageJs(value))
 const isTraeProviderUI = (p: { id?: string; baseUrl?: string }) =>
   p.id === 'trae' || (typeof p.baseUrl === 'string' && p.baseUrl.includes('trae'))
 
+/** 是否 DeepSeek App 提供商（id 固定或用 chat.deepseek.com 域，与 src/deepseek/proxy.ts 对齐） */
+const isDeepseekAppProviderUI = (p: { id?: string; baseUrl?: string }) =>
+  p.id === 'deepseek-app' || (typeof p.baseUrl === 'string' && p.baseUrl.includes('chat.deepseek.com'))
+
 /** 是否商汤日日新（SenseNova）提供商（id 固定或用 token.sensenova.cn 域，与 src/admin.ts 对齐） */
 const isSensenovaProviderUI = (p: { id?: string; baseUrl?: string }) =>
   p.id === 'sensenova' || (typeof p.baseUrl === 'string' && p.baseUrl.includes('token.sensenova.cn'))
@@ -681,6 +685,23 @@ ${H('管理')}
                   </div>
                 </div>
               </fieldset>`:''}
+              ${isDeepseekAppProviderUI(p)?`
+              <fieldset class="form-group" id="ds-fs-${escapePageHtml(p.id)}"><legend>DeepSeek App token 池（浏览器注入）</legend>
+                <span class="form-helper">上游把密码登录硬卡成风控（真实浏览器同样返回 RISK_DEVICE_DETECTED），所以凭据只能从浏览器里取一次：① 浏览器登录 <b>chat.deepseek.com</b>；② F12 → Application → Local Storage → https://chat.deepseek.com；③ 取 <b>userToken</b> 的值（形如 {"value":"&lt;64 字符&gt;","__version":…}，只填 value 里那 64 字符，整段贴进来也能识别）；④ 取 <b>deepseek-device-id:chat</b> 的值（UUID）。token 会过期：失效的条目会标红，按提示重新注入即可。</span>
+                <div class="fc mt-1 field-row" style="gap:8px">
+                  <input type="password" id="ds-tok-${escapePageHtml(p.id)}" class="fx1" placeholder="userToken 的 value（64 字符）" aria-label="DeepSeek token">
+                </div>
+                <div class="fc mt-1 field-row" style="gap:8px">
+                  <input type="text" id="ds-dev-${escapePageHtml(p.id)}" class="fx1" placeholder="deepseek-device-id:chat（UUID）" aria-label="DeepSeek device id">
+                  <input type="text" id="ds-label-${escapePageHtml(p.id)}" style="width:150px" placeholder="备注（可选）" aria-label="备注">
+                </div>
+                <div class="fc mt-1 field-row" style="gap:8px">
+                  <button class="btn btn-s" onclick="deepseekTokenAdd('${escapePageJsx(p.id)}')"><i class="fas fa-plus" aria-hidden="true"></i>注入并判活</button>
+                  <button class="btn btn-gh" onclick="deepseekTokenList('${escapePageJsx(p.id)}')"><i class="fas fa-sync" aria-hidden="true"></i>刷新池状态</button>
+                </div>
+                <div id="ds-st-${escapePageHtml(p.id)}" class="oauth-status" aria-live="polite"></div>
+                <div id="ds-list-${escapePageHtml(p.id)}" class="mt-1"></div>
+              </fieldset>`:''}
               <div class="collapse-section">
                 <button class="collapse-btn" onclick="toggleVbCollapse('vb-fs-${escapePageJsx(p.id)}', this)" type="button" aria-expanded="false">
                   <i class="fas fa-chevron-right collapse-icon" aria-hidden="true"></i> 识图模型配置（可选）
@@ -1084,6 +1105,8 @@ function tog(id) {
   if (d.classList.contains('open') && document.getElementById('qdp-acc-' + id)) qoderPoolStatus(id)
   // WorkBuddy：展开时自动加载账号池状态
   if (d.classList.contains('open') && document.getElementById('wbp-acc-' + id)) oauthPoolStatus(id)
+  // DeepSeek App：展开时自动加载 token 池
+  if (d.classList.contains('open') && document.getElementById('ds-list-' + id)) deepseekTokenList(id)
 }
 
 // P3：M365 账号池渲染 —— 独立页并入提供商详情后按 providerId 定位容器
@@ -2775,6 +2798,74 @@ function traePackDetailHtml(uid, packs, packsAt, idx) {
     '<div id="' + aid + '" class="hd usage-log-table-wrap"><table class="usage-log-table">' +
     '<thead><tr><th>权益包</th><th>到期时间</th><th>已用/总额度</th><th>剩余</th></tr></thead><tbody>' + rows + '</tbody></table>' +
     (when ? '<p class="form-helper">探测于 ' + escapeHtml(when) + '</p>' : '') + '</div></div>'
+}
+// ===== DeepSeek App token 池（浏览器注入）=====
+function deepseekTokenList(id) {
+  const st = document.getElementById('ds-st-' + id)
+  const box = document.getElementById('ds-list-' + id)
+  if (!box) return
+  fetch('/admin/api/deepseek/' + encodeURIComponent(id) + '/tokens', { method: 'GET' }).then(r => r.json()).then(d => {
+    if (!d.success || !d.data) { if (st) showResult(st, false, d.message || '状态获取失败'); return }
+    if (st) st.textContent = ''
+    const sum = d.data.summary || { total: 0, ready: 0, expired: 0 }
+    const tokens = d.data.tokens || []
+    if (tokens.length === 0) {
+      box.innerHTML = '<p class="form-helper">池是空的。按上方步骤取一次 token 注入即可开始使用。</p>'
+      return
+    }
+    const head = '共 ' + sum.total + ' 条：可用 ' + sum.ready + ' / 失效 ' + sum.expired +
+      (d.data.notice ? '　<b>' + escapeHtml(d.data.notice) + '</b>' : '')
+    box.innerHTML = '<div class="form-helper">' + head + '</div>' +
+      '<div style="max-height:240px;overflow:auto"><table class="usage-log-table" style="margin:0">' +
+      '<thead><tr><th>备注</th><th>状态</th><th>尾号</th><th>注入时间</th><th>最近成功</th><th>最近错误</th><th>操作</th></tr></thead><tbody>' +
+      tokens.map(function (t) {
+        const stateTxt = t.state === 'ready'
+          ? '<span style="color:var(--color-success,#16a34a)">可用</span>'
+          : '<span style="color:var(--color-danger,#ef4444)">已失效</span>'
+        const when = function (ms) { return ms ? new Date(ms).toLocaleString() : '-' }
+        return '<tr><td>' + escapeHtml(t.label || '-') + '</td><td>' + stateTxt + '</td><td>…' + escapeHtml(t.tokenTail || '') + '</td>' +
+          '<td>' + when(t.addedAt) + '</td><td>' + when(t.lastOkAt) + '</td>' +
+          '<td title="' + escapeHtml(t.lastError || '') + '">' + escapeHtml(String(t.lastError || '-').slice(0, 40)) + '</td>' +
+          '<td><button class="btn btn-s btn-xs" onclick="deepseekTokenVerify(\\'' + escapeJsAttr(id) + '\\',\\'' + escapeJsAttr(t.id) + '\\')">判活</button> ' +
+          '<button class="btn btn-gh btn-xs" onclick="deepseekTokenRemove(\\'' + escapeJsAttr(id) + '\\',\\'' + escapeJsAttr(t.id) + '\\')">删除</button></td></tr>'
+      }).join('') +
+      '</tbody></table></div>'
+  }).catch(function () { if (st) showResult(st, false, '请求失败') })
+}
+function deepseekTokenAdd(id) {
+  const st = document.getElementById('ds-st-' + id)
+  const tok = document.getElementById('ds-tok-' + id)
+  const dev = document.getElementById('ds-dev-' + id)
+  const lab = document.getElementById('ds-label-' + id)
+  if (!tok || !tok.value.trim()) { if (st) showResult(st, false, '请先粘贴 userToken 的 value'); return }
+  if (st) showResult(st, true, '注入并判活中…')
+  fetch('/admin/api/deepseek/' + encodeURIComponent(id) + '/tokens', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ token: tok.value.trim(), headerDeviceId: dev ? dev.value.trim() : '', label: lab ? lab.value.trim() : '' })
+  }).then(r => r.json()).then(d => {
+    if (st) showResult(st, !!d.success, d.message || '')
+    if (d.success && tok) tok.value = ''
+    deepseekTokenList(id)
+  }).catch(function () { if (st) showResult(st, false, '请求失败') })
+}
+function deepseekTokenVerify(id, tokenId) {
+  const st = document.getElementById('ds-st-' + id)
+  fetch('/admin/api/deepseek/' + encodeURIComponent(id) + '/tokens/verify', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ tokenId: tokenId })
+  }).then(r => r.json()).then(d => {
+    if (st) showResult(st, !!d.success, d.message || '')
+    deepseekTokenList(id)
+  }).catch(function () { if (st) showResult(st, false, '请求失败') })
+}
+function deepseekTokenRemove(id, tokenId) {
+  const st = document.getElementById('ds-st-' + id)
+  fetch('/admin/api/deepseek/' + encodeURIComponent(id) + '/tokens/remove', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ tokenId: tokenId })
+  }).then(r => r.json()).then(d => {
+    if (st) showResult(st, !!d.success, d.message || '')
+    deepseekTokenList(id)
+  }).catch(function () { if (st) showResult(st, false, '请求失败') })
 }
 function traeStatus(id) {
   const st = document.getElementById('trae-st-' + id)

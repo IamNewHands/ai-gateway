@@ -1,7 +1,7 @@
 import { Context } from 'hono'
 import { getProvider, getProviders, getModelsListCache, setModelsListCache, getUnimodel, getUnimodels, resolveProviderBaseUrl, getResponseHistory, saveResponseHistory, saveResponseAlias, getResponseAlias, consumeResponseCallId } from './storage'
 import { KV_KEYS, KEY_HEALTH_COOLDOWN_MS, KEY_HEALTH_MAX_FAILURES, OAUTH_TOKEN_REFRESH_MARGIN_MS, UNIMODEL_PROVIDER_ID } from './config'
-import type { AppEnv, Env, ProxyRequestBody } from './types'
+import type { AppEnv, Env, Provider, ProxyRequestBody } from './types'
 import { RequestBodyError, readJSONLimited, MAX_AI_REQUEST_BYTES, MAX_RESPONSES_REQUEST_BYTES } from './request-body'
 import { createAnalyticsContext, normalizeAnthropicUsage, normalizeChatUsage, normalizeResponsesUsage, summarizeError } from './analytics/types'
 import type { AnalyticsContext, UsageMetrics } from './analytics/types'
@@ -32,6 +32,7 @@ import { isTraeProvider, proxyTraeChatRequest } from './trae/proxy'
 import { isZcodeProvider, buildZcodeHeaders } from './zcode/proxy'
 import { isKukuProvider, proxyKukuChatRequest } from './kuku/proxy'
 import { isDeepseekAppProvider, proxyDeepseekChatRequest } from './deepseek/proxy'
+import { isDeepseekReasoningOff } from './deepseek/request'
 import { writeLog } from './admin'
 import { getPerfSettings } from './perf'
 import { applyThinkingInjection } from './thinking'
@@ -1804,10 +1805,16 @@ export async function forwardProxy(
     // OpenAI 格式（流式 SSE 或 JSON）。凭据由面板注入，上游硬卡密码登录（见
     // DEEPSEEK-APP-PORT.md）；token 失效会在池里标 expired 并换下一条重试。
     if (isDeepseekAppProvider(provider)) {
-      // Anthropic 格式尚未接线：宁可显式 501，也不悄悄回一个 OpenAI 体让客户端解析失败
+      // 守卫保留（不是死代码）：本仓库确实存在「apiType=anthropic 的 provider 收到
+      // /v1/chat/completions」这种用法 —— apiType 只描述客户端侧暴露的格式（见 1266 行注释），
+      // 1895 行（原生 Anthropic 上游）与 1738 行（TRAE 分支）都在这个入口做 Anthropic 转换，
+      // 面板的「API 格式」下拉对任何 provider 都可选 anthropic。
+      // Anthropic 客户端的 /v1/messages 入口已接线（见下面的 deepseek 分支）；
+      // 本入口的 OpenAI→Anthropic 转回尚未实现，故仍显式 501：宁可让客户端看到明确失败，
+      // 也不悄悄回一个 OpenAI 体让它解析失败。
       if (provider.apiType === 'anthropic') {
         return c.json(
-          { error: { message: 'deepseek-app 暂不支持 Anthropic 格式（未接线）', type: 'not_implemented', code: 'anthropic_not_wired' } },
+          { error: { message: 'deepseek-app 暂不支持 Anthropic 格式（此入口未接线，Anthropic 客户端请改用 /v1/messages）', type: 'not_implemented', code: 'anthropic_not_wired' } },
           501,
         )
       }
@@ -3699,6 +3706,125 @@ async function handleAnthropicMessagesInner(c: Context<AppEnv>) {
       return c.json(anthropicResp)
     }
 
+    // DeepSeek App：注入 token 池 + 私有协议转发（proxyDeepseekChatRequest 返回 OpenAI SSE），
+    // 再按客户端 route 转回 Anthropic。与上面的 TRAE 分支同构，差别只在凭据形态
+    // （注入 token 池，而非账号池）。
+    if (isDeepseekAppProvider(provider)) {
+      // 强制流式（上游只产流式 SSE），由本层决定是否转非流式 Anthropic
+      const upstreamBody: Record<string, unknown> = { ...openaiBody, stream: true }
+      // anthropicToOpenAI 把 Anthropic 的 thinking 折成 reasoning_effort，而 deepseek 只认
+      // thinking 开关（缺省开思考）。这里把「关」的档位还原，否则客户端的
+      // thinking:{type:"disabled"} 会被静默忽略、仍收到 thinking 增量。
+      // 有意不调用 sanitizeUpstreamBody：它会同时删掉 thinking 与 reasoning_effort。
+      if (isDeepseekReasoningOff(upstreamBody)) {
+        upstreamBody['thinking'] = { type: 'disabled' }
+      }
+      const response = await proxyDeepseekChatRequest(c.env, provider, upstreamBody)
+      if (!response.ok) {
+        const errText = await response.text()
+        try {
+          c.executionCtx.waitUntil(writeLog(c.env, 'error', `[anthropic] ${model} → ${response.status} deepseek-app`, JSON.stringify({ error: errText, body: summarizeRequestBody(openaiBody) }).substring(0, 4000)))
+        } catch { /* log failure must not break request */ }
+        return c.json({
+          type: 'error',
+          error: { type: 'upstream_error', message: `Upstream error: ${sanitizeUpstreamError(errText)}` },
+        }, response.status as Parameters<typeof c.json>[1])
+      }
+      try { c.executionCtx.waitUntil(writeLog(c.env, 'request', `[anthropic] ${model} → 200 deepseek-app`, `stream=${originalStream}`)) } catch {}
+
+      // 流式：OpenAI SSE → Anthropic SSE 实时转换
+      if (originalStream && response.body) {
+        const acc = createAnthropicSSEAccumulator()
+        const readable = new ReadableStream({
+          async start(controller) {
+            const decoder = new TextDecoderStream()
+            const textReader = response.body!.pipeThrough(decoder).getReader()
+            let lineBuffer = ''
+            try {
+              while (true) {
+                const { done, value } = await textReader.read()
+                if (done) break
+                const combined = lineBuffer + value
+                const lines = combined.split('\n')
+                lineBuffer = lines.pop() || ''
+                for (const line of lines) {
+                  const trimmed = line.trim()
+                  if (!trimmed.startsWith('data:')) continue
+                  const data = trimmed.slice(5).trim()
+                  if (!data || data === '[DONE]') continue
+                  try {
+                    const chunk = JSON.parse(data)
+                    cleanChunkDelta(chunk)
+                    const anthropicSSE = openAIChunkToAnthropicSSE(chunk, acc)
+                    if (anthropicSSE) controller.enqueue(new TextEncoder().encode(anthropicSSE))
+                  } catch { /* skip malformed */ }
+                }
+              }
+              if (lineBuffer.trim().startsWith('data:')) {
+                const data = lineBuffer.trim().slice(5).trim()
+                if (data && data !== '[DONE]') {
+                  try {
+                    const chunk = JSON.parse(data)
+                    cleanChunkDelta(chunk)
+                    const anthropicSSE = openAIChunkToAnthropicSSE(chunk, acc)
+                    if (anthropicSSE) controller.enqueue(new TextEncoder().encode(anthropicSSE))
+                  } catch { /* skip */ }
+                }
+              }
+            } catch { /* stream error */ }
+            const finalizeDiag = diagnoseAnthropicAccumulator(acc)
+            const finalized = finalizeAnthropicStream(acc)
+            if (finalized) {
+              try { controller.enqueue(new TextEncoder().encode(finalized)) } catch { /* enqueue failed */ }
+              try {
+                c.executionCtx.waitUntil(writeLog(c.env, 'warn',
+                  `[anthropic] 流结束兜底触发 ${model} (deepseek-app)`,
+                  JSON.stringify({ providerId: provider.id, model, ...finalizeDiag })
+                ))
+              } catch { /* log failure must not break */ }
+            }
+            controller.close()
+          },
+        })
+        return new Response(withSSEKeepAlive(readable, SSE_KEEPALIVE_MS, SSE_IDLE_TIMEOUT_MS), {
+          status: 200,
+          headers: {
+            'Content-Type': 'text/event-stream',
+            'Cache-Control': 'no-store',
+            'X-Accel-Buffering': 'no',
+          },
+        })
+      }
+
+      // 非流式：收集所有 OpenAI SSE → 聚合 → Anthropic
+      const allChunks: any[] = []
+      const decoder2 = new TextDecoderStream()
+      const textReader2 = response.body!.pipeThrough(decoder2).getReader()
+      let lineBuffer2 = ''
+      try {
+        while (true) {
+          const { done, value } = await textReader2.read()
+          if (done) break
+          const combined = lineBuffer2 + value
+          const lines = combined.split('\n')
+          lineBuffer2 = lines.pop() || ''
+          for (const line of lines) {
+            const trimmed = line.trim()
+            if (!trimmed.startsWith('data:')) continue
+            const data = trimmed.slice(5).trim()
+            if (!data || data === '[DONE]') continue
+            try {
+              const chunk = JSON.parse(data)
+              cleanChunkDelta(chunk)
+              allChunks.push(chunk)
+            } catch { /* skip */ }
+          }
+        }
+      } catch { /* stream error */ }
+      const anthropicResp = aggregateOpenAIToAnthropic(allChunks)
+      return c.json(anthropicResp)
+    }
+
     // Anthropic 原生上游（provider.apiType === 'anthropic'，如 api.anthropic.com）：
     // 请求体/认证头/路径都转成 Anthropic 原生格式，响应原样透传（Anthropic → Anthropic，保真度最高）
     if (provider.apiType === 'anthropic') {
@@ -4587,6 +4713,20 @@ async function handleResponsesInner(c: Context<AppEnv>) {
     // TRAE SOLO：账号池 + SOLO 协议转发（proxyTraeChatRequest 返回 OpenAI SSE），再转回 Responses 格式。
     if (isTraeProvider(provider)) {
       return handleResponsesSpecial(c, provider, model, openaiBody, originalStream, proxyTraeChatRequest, 'TRAE', g5Base, g5Save)
+    }
+
+    // DeepSeek App：注入 token 池 + 私有协议转发（proxyDeepseekChatRequest 返回 OpenAI SSE），
+    // 再转回 Responses 格式。handleResponsesSpecial 只需 (env, provider, body) 三参回调
+    // （SpecialChatProxy），与 proxyDeepseekChatRequest(env, provider, body, deps?) 兼容。
+    //
+    // 用薄包装而不是直接传函数：handleResponsesSpecial 内部会 sanitizeUpstreamBody 删掉 thinking，
+    // 而 deepseek 只认 thinking 开关——Responses 客户端用 reasoning.effort=none 表达「不要思考」，
+    // 不补回来就会被静默忽略、仍旧返回思考内容。包装在 sanitize **之后**执行，所以补得进去。
+    if (isDeepseekAppProvider(provider)) {
+      const reasoningOff = isDeepseekReasoningOff(openaiBody)
+      const deepseekResponsesProxy = (env: Env, p: Provider, body: Record<string, unknown>) =>
+        proxyDeepseekChatRequest(env, p, reasoningOff ? { ...body, thinking: { type: 'disabled' } } : body)
+      return handleResponsesSpecial(c, provider, model, openaiBody, originalStream, deepseekResponsesProxy, 'DeepSeek App', g5Base, g5Save)
     }
 
     // Cline：refreshToken 账号池转发（proxyClineChatRequest 返回 OpenAI SSE），再转回 Responses 格式。

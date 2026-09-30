@@ -31,6 +31,37 @@ export const PREFLIGHT_TIMEOUT_MS = 60_000
 /** 补全流的空闲窗口：这段时间没有字节即判定上游哑掉。 */
 export const STREAM_IDLE_TIMEOUT_MS = 180_000
 
+/** 上传端点（Go 版 client.go:998/1014）。PoW 的 target_path 必须与此串逐字相同。 */
+export const UPLOAD_FILE_PATH = '/api/v0/file/upload_file'
+
+/** 文件状态查询端点（Go 版 client.go:1061 —— GET + query，不是 POST）。 */
+export const FILE_STATUS_PATH = '/api/v0/file/fetch_files'
+
+/** 解析完成的终态（Go 版 client.go:981，比较时统一大写）。 */
+export const UPLOAD_READY_STATUSES = ['SUCCESS', 'COMPLETED'] as const
+
+/** 不可恢复的失败终态（Go 版 client.go:983）。 */
+export const UPLOAD_FAILED_STATUSES = ['FAILED', 'ERROR', 'PARSE_FAILED', 'CONTENT_EMPTY'] as const
+
+/** 上传后就绪轮询的总预算（Go 版 client.go:974 的 `deadline = now + 30s`）。 */
+export const UPLOAD_READY_TIMEOUT_MS = 30_000
+
+/** 就绪轮询间隔（Go 版 client.go:992 的 `time.After(time.Second)`）。 */
+export const UPLOAD_POLL_INTERVAL_MS = 1_000
+
+/**
+ * uploadImageAndWait 的轮询参数。Go 版是硬编码常量，这里开放出来是为了让调用方
+ * （批量上传）能收紧预算，同时让测试不必真等 30 秒。
+ */
+export interface UploadImageOptions {
+  /** 上传返回 file id 之后的总等待预算（ms）。默认 UPLOAD_READY_TIMEOUT_MS。 */
+  totalTimeoutMs?: number
+  /** 两次 fetch_files 之间的间隔（ms）。默认 UPLOAD_POLL_INTERVAL_MS。 */
+  pollIntervalMs?: number
+  /** 对齐 Go 版的 `ctx.Done()`：中止即停轮询并抛错，不等超时。只作用于轮询阶段。 */
+  signal?: AbortSignal
+}
+
 // ===== 模拟的安卓设备指纹（apk-alignment.md §2/§11，功能性常量）=====
 export const APP_CLIENT_VERSION = '2.5.3'
 export const APP_USER_AGENT = 'DeepSeek/2.5.3 Android/35'
@@ -548,9 +579,16 @@ export class DeepseekClient {
     return env
   }
 
-  /** GET /api/v0/chat_session/fetch_page —— 会话抽屉第一页。 */
-  async fetchSessionPage(token: string): Promise<Envelope> {
-    const env = await this.getJSON('/api/v0/chat_session/fetch_page', token)
+  /**
+   * GET /api/v0/chat_session/fetch_page —— 会话抽屉一页。
+   *
+   * cursor 为空 = 参数全无的第一页（App 首次拉开抽屉的形状）；非空 = 上一页最老
+   * 条目的 `lte_cursor.pinned=<bool>&lte_cursor.updated_at=<epoch秒>` 查询串
+   * （t72 游标语义，上游只返回严格更老的会话）。见 sessions.ts 的分页走查。
+   */
+  async fetchSessionPage(token: string, cursor?: string): Promise<Envelope> {
+    const path = cursor ? `/api/v0/chat_session/fetch_page?${cursor}` : '/api/v0/chat_session/fetch_page'
+    const env = await this.getJSON(path, token)
     checkEnv(env)
     return env
   }
@@ -558,6 +596,149 @@ export class DeepseekClient {
   /** UTF-8 便捷入口（登录体等由调用方自建时的编码一致性）。 */
   encodeBody(text: string): Uint8Array {
     return utf8(text)
+  }
+
+  /**
+   * POST /api/v0/file/upload_file（multipart/form-data）→ 上游 file id。
+   * 移植自 Go 版 client.go:997-1056。三个线上要点：
+   *
+   *  - 上传**每次都要单独解一次 PoW**（client.go:998 `PowHeader(..., "/api/v0/file/upload_file")`）：
+   *    应答是一次性的，复用会被上游回 40301 INVALID_POW_RESPONSE；
+   *  - 表单字段名是 `file`（client.go:1004 `CreateFormFile("file", filename)`）。part 的
+   *    Content-Type 在 Go 里由 CreateFormFile 固定为 application/octet-stream，故此处
+   *    缺省也是它——上游按**文件名后缀**判类型（client.go:967），不看 part 的 MIME；
+   *  - 除指纹块外还带 X-DS-PoW-Response / X-Thinking-Enabled:"0" / x-file-size
+   *    （client.go:1023-1025，源自 qy1.java:174-189；App 的混合大小写照抄）。
+   *    **不设** Content-Type：让 fetch 自己生成 multipart boundary。
+   *
+   * 与 Go 版一致，这条路径不重试（传输层失败直接抛）。
+   */
+  async uploadFile(
+    token: string,
+    bytes: Uint8Array,
+    filename: string,
+    contentType?: string,
+  ): Promise<string> {
+    const powValue = await this.powHeader(token, UPLOAD_FILE_PATH)
+
+    // 不用 new File(...)：Workers 运行时不保证有 File 构造器。
+    const form = new FormData()
+    form.append('file', new Blob([bytes], { type: contentType ?? 'application/octet-stream' }), filename)
+
+    const headers: Record<string, string> = {
+      ...(await this.baseHeaders()),
+      Authorization: `Bearer ${token}`,
+      'X-DS-PoW-Response': powValue,
+      'X-Thinking-Enabled': '0',
+      'x-file-size': String(bytes.length),
+    }
+
+    const controller = new AbortController()
+    const timer = setTimeout(() => controller.abort(), this.preflightTimeoutMs)
+    let status = 0
+    let text = ''
+    try {
+      const resp = await this.fetchImpl(`${this.baseUrl}${UPLOAD_FILE_PATH}`, {
+        method: 'POST',
+        headers,
+        body: form,
+        signal: controller.signal,
+      })
+      status = resp.status
+      text = await resp.text()
+    } finally {
+      clearTimeout(timer)
+    }
+
+    let env: Envelope
+    try {
+      env = JSON.parse(text) as Envelope
+    } catch {
+      throw new Error(`upstream: bad upload response: ${text.slice(0, 200)}`)
+    }
+    if (status !== 200) {
+      throw new BizError({
+        httpStatus: status,
+        code: env.code,
+        msg: env.msg,
+        bizCode: env.data?.biz_code ?? 0,
+        bizMsg: env.data?.biz_msg ?? '',
+      })
+    }
+    checkEnv(env)
+    // Go 版结构体同时声明了 id 与 file_id，但只校验/返回 id（client.go:1045-1055）。
+    // 这里保留 id 优先、file_id 兜底：既与 Go 一致，又不会在上游换字段时静默拿到空 id。
+    const id = pickString(env.data?.biz_data, 'id') || pickString(env.data?.biz_data, 'file_id')
+    if (!id) throw new Error(`upstream: upload response missing id: ${text.slice(0, 200)}`)
+    return id
+  }
+
+  /**
+   * GET /api/v0/file/fetch_files?file_ids=<id> → 上游给出的状态串（原样返回，不归一化）。
+   * 移植自 Go 版 client.go:1059-1101：GET + query、取 `biz_data.files[]` 中 id 匹配的那条；
+   * 上游没回这个 id 时抛错（Go 也不返回空状态糊过去）。
+   */
+  async fileStatus(token: string, fileId: string): Promise<string> {
+    const env = await this.getJSON(`${FILE_STATUS_PATH}?file_ids=${encodeURIComponent(fileId)}`, token)
+    checkEnv(env)
+    const files = asRecord(env.data?.biz_data).files
+    if (Array.isArray(files)) {
+      for (const entry of files) {
+        const rec = asRecord(entry)
+        if (rec.id === fileId && typeof rec.status === 'string') return rec.status
+      }
+    }
+    throw new Error(`upstream: file ${fileId} missing from fetch_files`)
+  }
+
+  /**
+   * 上传 + 轮询到就绪 → file id（给 completion 的 ref_file_ids 用）。
+   * 移植自 Go 版 client.go:965-995：先上传，再按 1s 间隔查状态，直到终态；
+   * 就绪 = SUCCESS/COMPLETED（大小写不敏感），失败终态立即抛错，其余状态等满
+   * 总预算后抛 `stuck in <status>`——**绝不静默返回空 id**。
+   */
+  async uploadImageAndWait(
+    token: string,
+    bytes: Uint8Array,
+    filename: string,
+    opts: UploadImageOptions = {},
+  ): Promise<string> {
+    const fileId = await this.uploadFile(token, bytes, filename)
+
+    const totalTimeoutMs = opts.totalTimeoutMs ?? UPLOAD_READY_TIMEOUT_MS
+    const pollIntervalMs = opts.pollIntervalMs ?? UPLOAD_POLL_INTERVAL_MS
+    const deadline = Date.now() + totalTimeoutMs
+
+    for (;;) {
+      const status = await this.fileStatus(token, fileId)
+      const upper = status.toUpperCase()
+      if ((UPLOAD_READY_STATUSES as readonly string[]).includes(upper)) return fileId
+      if ((UPLOAD_FAILED_STATUSES as readonly string[]).includes(upper)) {
+        throw new Error(`upstream: file ${fileId} failed to parse (status ${status})`)
+      }
+      // Go 在 sleep 之前判超时（client.go:986），故最后一次查询仍会被计入。
+      if (Date.now() > deadline) {
+        throw new Error(`upstream: file ${fileId} stuck in ${status}`)
+      }
+      await this.sleep(pollIntervalMs, opts.signal, fileId)
+    }
+  }
+
+  /** 可被 AbortSignal 打断的 sleep（对齐 Go 版 `select { <-ctx.Done() ... }`）。 */
+  private sleep(ms: number, signal: AbortSignal | undefined, fileId: string): Promise<void> {
+    const aborted = () => new Error(`upstream: wait for file ${fileId} aborted`)
+    if (signal?.aborted) return Promise.reject(aborted())
+    return new Promise<void>((resolve, reject) => {
+      const onAbort = () => {
+        clearTimeout(timer)
+        reject(aborted())
+      }
+      const timer = setTimeout(() => {
+        signal?.removeEventListener('abort', onAbort)
+        resolve()
+      }, ms)
+      signal?.addEventListener('abort', onAbort, { once: true })
+    })
   }
 }
 

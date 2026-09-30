@@ -237,8 +237,29 @@ export function parseSearchSwitch(raw: unknown): boolean {
   throw new DeepseekRequestError(`invalid "search.type" "${type}": expected "enabled" or "disabled"`)
 }
 
-/** 解析并净化 `/v1/chat/completions` 请求体。 */
-export function parseDeepseekRequest(
+/**
+ * 客户端是否显式要求「不要思考」。
+ *
+ * 上游的 thinking 是二值的（`thinking:{type:"enabled"|"disabled"}`，缺省开），而不同客户端用
+ * **不同措辞**表达「关」：Anthropic 的 `thinking:{type:...}` 与 Responses 的 `reasoning.effort`
+ * 在本仓都会被折成 `reasoning_effort`（见 `src/formats.ts`），所以两种写法都要认。
+ *
+ * `minimal` 也按「关」处理：上游没有中间档，取最省思考的一侧（与 Anthropic 分支同一取舍）。
+ * 该函数同时被 `/v1/messages` 与 `/v1/responses` 两条分发点使用，避免两处口径漂移。
+ */
+export function isDeepseekReasoningOff(body: Record<string, unknown>): boolean {
+  const direct = typeof body['reasoning_effort'] === 'string' ? body['reasoning_effort'] : ''
+  const reasoning = body['reasoning']
+  const nested =
+    reasoning !== null && typeof reasoning === 'object'
+      ? String((reasoning as Record<string, unknown>).effort ?? '')
+      : ''
+  return [direct, nested].some((v) =>
+    ['none', 'off', 'disabled', 'minimal'].includes(String(v).trim().toLowerCase()),
+  )
+}
+
+/** 解析并净化 `/v1/chat/completions` 请求体。 */export function parseDeepseekRequest(
   body: unknown,
   options: ParseOptions = {},
 ): ParsedDeepseekRequest {

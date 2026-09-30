@@ -51,8 +51,11 @@ function jsonError(status: number, message: string, type = 'invalid_request_erro
   })
 }
 
-/** 用注入的 token 记录拼出实测得到的 web 线上指纹。 */
-function webHeaders(rec: DeepseekTokenRecord): Record<string, string> {
+/**
+ * 用注入的 token 记录拼出实测得到的 web 线上指纹。
+ * 导出以便 sessions.ts（后台会话维护）复用同一份指纹常量，避免两处漂移。
+ */
+export function webHeaders(rec: DeepseekTokenRecord): Record<string, string> {
   return {
     Accept: '*/*',
     'Content-Type': 'application/json',

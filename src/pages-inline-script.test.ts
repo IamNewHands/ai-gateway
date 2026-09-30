@@ -268,3 +268,68 @@ describe('WorkBuddy 面板「即将到期」标记（客户端口径 = 后端挑
     expect(js).toContain('个包已全部用完')
   })
 })
+
+/**
+ * DeepSeek App（token 注入型）面板：上游硬卡密码登录，凭据只能从浏览器取一次。
+ * 面板必须把「怎么取 token」讲清楚，否则这个 provider 无法被使用。
+ */
+function deepseekProvider(): Provider {
+  return {
+    id: 'deepseek-app',
+    name: 'DeepSeek App',
+    baseUrl: 'https://chat.deepseek.com',
+    apiType: 'openai',
+    apiKeys: [],
+    models: [{ id: 'deepseek-flash', enabled: true }],
+    enabled: true,
+    createdAt: 'a',
+    updatedAt: 'a',
+  }
+}
+
+describe('DeepSeek App token 注入面板', () => {
+  it('为 deepseek-app 渲染面板，且把取 token 的四步写进界面', async () => {
+    const html = await render([deepseekProvider()])
+    expect(html).toContain('id="ds-fs-deepseek-app"')
+    // 四步指引的要点必须在页面上（少一步用户就取不到凭据）
+    expect(html).toContain('Local Storage')
+    expect(html).toContain('userToken')
+    expect(html).toContain('deepseek-device-id:chat')
+    // 按钮绑定
+    expect(html).toContain("deepseekTokenAdd('deepseek-app')")
+    expect(html).toContain("deepseekTokenList('deepseek-app')")
+    // 列表容器（展开时自动加载依赖它）
+    expect(html).toContain('id="ds-list-deepseek-app"')
+  })
+
+  it('客户端函数与展开自动加载钩子都在脚本里', async () => {
+    const js = inlineScripts(await render([deepseekProvider()])).join('\n')
+    for (const fn of ['deepseekTokenList', 'deepseekTokenAdd', 'deepseekTokenVerify', 'deepseekTokenRemove']) {
+      expect(js).toContain(`function ${fn}`)
+    }
+    expect(js).toContain("document.getElementById('ds-list-' + id)")
+    // 面板走的是管理接口，不能拼错路径
+    expect(js).toContain("'/admin/api/deepseek/' + encodeURIComponent(id) + '/tokens'")
+    expect(js).toContain("'/tokens/verify'")
+    expect(js).toContain("'/tokens/remove'")
+  })
+
+  it('含 DeepSeek 提供商时内联脚本仍能通过 JS 解析（\\\' 转义铁律）', async () => {
+    const html = await render([deepseekProvider(), traeProvider()])
+    const scripts = inlineScripts(html)
+    expect(scripts.length).toBeGreaterThan(0)
+    for (let i = 0; i < scripts.length; i++) {
+      expect(() => new Function(scripts[i]), `内联 script #${i} 语法错误`).not.toThrow()
+    }
+  })
+
+  it('非 DeepSeek 提供商不渲染该面板（不误伤别的 provider）', async () => {
+    const html = await render([{
+      id: 'plain', name: 'plain', baseUrl: 'https://example.com/v1', apiType: 'openai',
+      apiKeys: [], models: [{ id: 'm1', enabled: true }], enabled: true, createdAt: 'a', updatedAt: 'a',
+    }])
+    expect(html).not.toContain('id="ds-fs-plain"')
+    // 但函数仍在脚本里（共享脚本），语法必须合法
+    for (const s of inlineScripts(html)) expect(() => new Function(s)).not.toThrow()
+  })
+})

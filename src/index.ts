@@ -113,6 +113,7 @@ import {
   handleDeepseekTokenVerify,
   handleDeepseekTokensList,
 } from './deepseek/admin'
+import { runSessionCleanup, runSessionPurge } from './deepseek/sessions'
 import { M365Session } from './m365/durable'
 import { AccountFlux } from './m365/account-flux'
 import type { AppEnv, Env, Provider } from './types'
@@ -528,6 +529,18 @@ async function scheduled(event: ScheduledEvent, env: Env, ctx: ExecutionContext)
     // M365 对话自动清理
     const result = await autoCleanupAll(env)
     console.log(`[auto-cleanup] cron done: total=${result.total} providers=${result.providers} errors=${result.errors}`)
+    // DeepSeek App 会话维护：每小时醒一次，但**是否真的动手**由 sessions.ts 内部的
+    // KV 标记 + 抖动决定（人类节奏清理：base 1h ±50%，且每次只有 0.5 概率动一个账号）；
+    // purge 同一入口处理「窗口到期」与「启动补跑」（错过 24h 内补一次，失败不风暴重试）。
+    try {
+      const dsCleanup = await runSessionCleanup(env)
+      console.log(`[deepseek-cleanup] cron done: reason=${dsCleanup.reason} ran=${dsCleanup.ran} deleted=${dsCleanup.deleted} accounts=${dsCleanup.outcomes.length}`)
+      const dsPurge = await runSessionPurge(env)
+      console.log(`[deepseek-purge] cron done: reason=${dsPurge.reason} ran=${dsPurge.ran} purged=${dsPurge.purged} failed=${dsPurge.failed}`)
+    } catch (err) {
+      // 维护失败绝不能影响同一 cron 上的其他任务
+      console.error(`[deepseek-maintenance] cron failed: ${err instanceof Error ? err.message : String(err)}`)
+    }
     return
   }
   if (event.cron === '0 20 * * *') {

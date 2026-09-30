@@ -11,6 +11,7 @@ import {
   SYSTEM_MERGE_SEPARATOR as SEP,
   DeepseekRequestError,
   flattenMessages,
+  isDeepseekReasoningOff,
   parseDeepseekRequest,
   parseSearchSwitch,
   parseThinkingSwitch,
@@ -254,6 +255,23 @@ describe('field stripping', () => {
 })
 
 describe('switches', () => {
+  it('detects an explicit "no thinking" request across both client spellings', () => {
+    // Anthropic 折成 reasoning_effort；Responses 用 reasoning.effort
+    expect(isDeepseekReasoningOff({ reasoning_effort: 'none' })).toBe(true)
+    expect(isDeepseekReasoningOff({ reasoning_effort: 'off' })).toBe(true)
+    expect(isDeepseekReasoningOff({ reasoning_effort: 'disabled' })).toBe(true)
+    expect(isDeepseekReasoningOff({ reasoning_effort: 'MINIMAL' })).toBe(true)
+    expect(isDeepseekReasoningOff({ reasoning_effort: ' minimal ' })).toBe(true)
+    expect(isDeepseekReasoningOff({ reasoning: { effort: 'none' } })).toBe(true)
+    expect(isDeepseekReasoningOff({ reasoning: { effort: 'minimal' } })).toBe(true)
+    // 未表态 / 明确要高推理：都不算「关」，走上游缺省（开）
+    expect(isDeepseekReasoningOff({})).toBe(false)
+    expect(isDeepseekReasoningOff({ reasoning_effort: 'high' })).toBe(false)
+    expect(isDeepseekReasoningOff({ reasoning: { effort: 'medium' } })).toBe(false)
+    expect(isDeepseekReasoningOff({ reasoning: null })).toBe(false)
+    expect(isDeepseekReasoningOff({ reasoning_effort: 5 })).toBe(false)
+  })
+
   it('defaults thinking ON and search OFF', () => {
     const req = parseDeepseekRequest(body([{ role: 'user', content: 'hi' }]))
     expect(req.thinkingEnabled).toBe(true)

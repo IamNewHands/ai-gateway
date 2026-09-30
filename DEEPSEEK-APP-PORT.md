@@ -205,30 +205,95 @@ node node_modules\wrangler\wrangler-dist\cli.js deploy --temporary --config prob
       → 踩坑记录：`pull()` **必须**在返回前 enqueue 或 close，否则底层不再回调、消费者直接卡死（实测 40s 全超时 → 改成循环后 80ms 全绿）。
 
 **阶段 5 — 会话生命周期（cron）**
-- [ ] T5.1 `chat_session/create`+`delete` 包装、`fetch_page` 列表
-- [ ] T5.2 人类节奏清理（抖动 ±50%、floor、batch 1–3）
-- [ ] T5.3 每周 purge-all（weekday/hour/宽限补跑）+ `DS_SESSION_CAP` 同步上限
+- [x] T5.1~T5.3 `src/deepseek/sessions.ts`（942 行）+ `sessions.test.ts`（**50/50**）：50 页游标抽屉列表、
+      人类节奏清理（唤醒 base 1h ±50% + 0.5 概率、只列未置顶、≤floor(5) 不动、删最老 1–3 个、删除间隔 1–6s 抖动）、
+      每周清空（周日 04:00 ±30m、24h 补跑窗口、补跑延迟 2–12s、失败只试一次不风暴）、`DEEPSEEK_SESSION_CAP` 同步上限
+      → Workers 差异（有意）：无常驻 loop（`nextFireAt` + KV 标记判定到期）、无 async deleter（顺序 await）、
+      补跑用 KV 标记保证「只补一次」（每次 cron 都是新 isolate）、时区默认 UTC（`opts.utcOffsetMinutes` 可切北京）、
+      非法配置回退默认 + warning（Go 是 Fatalf）。
+- [x] T5.4 cron 接线：`index.ts` 的 `0 * * * *` 分支调 `runSessionCleanup(env)` + `runSessionPurge(env)`（内部判定到期/补跑）
+
 
 **阶段 6 — 网关集成**
 - [x] T6.1a `src/deepseek/proxy.ts`（`isDeepseekAppProvider` + `proxyDeepseekChatRequest`）+ 接入 `proxy.ts` 的 OpenAI chat 分发点；Anthropic 配置显式 501（不悄悄回错格式）
       → 验证：`proxy.test.ts` **10/10**（假上游全覆盖流式/非流式/换号重试/空池/参数校验）
       → **真机端到端**：`DS_LIVE_PROBE=1 npx vitest run --pool=threads -t "live gateway chain"` → **200 + 14267 字节 OpenAI SSE + `finish_reason:stop` + `[DONE]`**（真实上游 × 完整转换链）
-- [ ] T6.1b Anthropic `/v1/messages` 与 Responses 两个分发点接线
+- [x] T6.1b Anthropic `/v1/messages` 与 Responses 两个分发点接线（`src/deepseek/dispatch.test.ts` **8/8**，走真实 Hono 路由 + 假上游）
+      → 附带修掉一个真缺口：`handleResponsesSpecial` 内部会 `sanitizeUpstreamBody` 删掉 `thinking`，
+        导致 `reasoning.effort="none"` 的客户端仍收到思考内容；改为薄包装在 sanitize **之后**补回 `thinking:{type:"disabled"}`，
+        判定抽成 `isDeepseekReasoningOff()`（`request.ts`，Anthropic 与 Responses 共用口径）。
+      → 501 守卫（`apiType=anthropic` + `/v1/chat/completions`）**有意保留**：仓库确实存在该组合用法（`proxy.ts:1895` 专门处理），
+        这条入口的 OpenAI→Anthropic 转回未接线，显式 501 优于悄悄回错格式。
 - [x] T6.2a 管理接口：`src/deepseek/admin.ts` 四个端点（`GET/POST /admin/api/deepseek/:id/tokens`、`/tokens/verify`、`/tokens/remove`）已注册进 `index.ts`
       → 验证：`admin.test.ts` **10/10**（空池提示 + 取 token 指引、缺失/过短 token 400、**容错解析**面板粘贴的 `{"value":"…"}` 包装、注入前先判活、判活失败也入库但标 `expired` 并明说、重复 409、列表永不回显完整 token、复检翻状态、删除）
       → 全仓库回归：`npx vitest run --pool=threads` → **1856 passed / 0 failed**（98 文件），确认改动 `proxy.ts`/`index.ts`/`config.ts` 未影响既有功能
-- [ ] T6.2b 面板 UI（点击式注入/判活/删除 + 取 token 指引展示）——让整条链路无需 curl
-- [ ] T6.3 用量统计接入 `analytics/usage-logger.ts`
+- [x] T6.2b 面板 UI：`pages.ts` 新增「DeepSeek App token 池」fieldset（取 token 四步指引 + 注入/判活/刷新/删除按钮 + 池表格）
+      + 客户端函数 `deepseekTokenList/Add/Verify/Remove` + 展开自动加载钩子
+      → `pages-inline-script.test.ts` **14/14**（含「面板必须把取 token 的四步写进界面」与内联脚本 `new Function` 语法校验）
+- [ ] T6.3 用量统计接入 `analytics/usage-logger.ts` —— **有意不做**（见「已知缺口」#2：与 trae/kuku 同现状，需把 analytics context 传进 `forwardProxy`）
 
 **阶段 7 — 可选能力**
-- [ ] T7.1 `search: {type: enabled}` + 独立 `POST /v1/web_search`
-- [ ] T7.2 图片：`image_url`（http/base64）→ upload_file → fetch_files 轮询
+- [x] T7.1 `search: {type: enabled}` 端到端可用（请求开关落到上游 `search_enabled`，命中随 `citations` 返回）；
+      独立 `POST /v1/web_search` **有意不做**（非 OpenAI 标准端点，且 hits 已随 chat 响应返回）
+- [x] T7.2 图片上传与就绪轮询（**客户端侧**）：`client.ts` 新增 `uploadFile` / `fileStatus` / `uploadImageAndWait`
+      （表单字段 `file`、`X-DS-PoW-Response`、`x-file-size`、30s 总超时 / 1s 轮询、失败状态集与超时抛错全部对齐 Go 源码行号）
+      → `client.test.ts` **11/11**（PoW 真被解算、multipart 逐位字节、轮询次数、超时/中止路径）
+      → **未接线**：请求里的 `image_url` → 上传 → `ref_file_ids` 这条线还没接（见「已知缺口」#3）
+
+### 已知缺口（本轮交付后仍需处理，按价值排序）
+
+1. **`parallel_chat_limit` 的重试只覆盖了一部分**：`proxy.ts` 预检 catch 里的判断条件
+   （`err instanceof BizError && err.bizCode === 0 && err.msg.includes('parallel')`）实际是死代码——该错误以 **流内 `event: hint`** 形式到达，
+   不会在预检阶段抛 BizError。现状：**非流式**可以由聚合后的 `state.error.isParallelLimit` 判出并换号重试（尚未接线）；
+   **流式**一旦返回 200 就无法回头重试。simple-chat 的做法是「先缓冲首块/首个终态再交给客户端」，
+   本仓 cline 也有同款（「截断 → 冷却换号重试，第 2 次完整流才交给客户端」）。要做就照那条路。
+2. **analytics usage 未写**（与 trae/kuku 同现状，需要把 analytics context 传进 `forwardProxy`）。
+3. **图片理解未接线**：`request.ts` 已提取 `image_url` 片段且 `flattenMessages` 有意跳过，客户端侧上传/轮询已移植（T7.2），
+   但「请求里的图片 → 上传 → `ref_file_ids`」这条线还没接。
+4. **SSE 心跳未包**：`stream.ts` 有 180s idle 看门狗，但没有 `withSSEKeepAlive` 的 `: keep-alive` 注释行注入。
+   思考模型静默期长（本仓 trae 的教训：15~20s 无数据会被严格客户端判为断流），建议照 `SSE_KEEPALIVE_MS = 8000` 包一层。
+5. **独立 `/v1/web_search` 端点不做**（有意）：搜索 hits 已随 chat 响应 `citations` 返回。
 
 **阶段 8 — 验证与入库**
-- [ ] T8.1 全量 `vitest run` + `tsc` 通过
-- [ ] T8.2 本机 live probe（Node + 真账号，绕开 CF IP 单独验证协议正确性）
-- [ ] T8.3 Worker 部署 live probe（阶段 0 的正式版）
-- [ ] T8.4 `CODING_NOTES.md` 记录决策与风险，推送 main
+- [x] T8.1 全量 `vitest run --pool=threads` + `tsc` 通过（deepseek 侧 122+ 例；全仓库 1856 例）
+- [x] T8.2 本机 live probe（Node + 真 token，绕开 CF 单独验证协议与转换链）
+- [x] T8.3 Worker 部署 live probe（阶段 0 探针 + `live gateway chain` 真机端到端）
+- [x] T8.4 `CODING_NOTES.md` 记录决策与风险 —— **已完成**（见文末「DeepSeek App 提供商」一节）
+- [ ] T8.5 推送 main（CF 自动部署）→ 线上注入 token → 线上 curl 验证
+
+### 线上/本地端到端验证步骤（交给用户执行，2026-09-30）
+
+**路线 A：推送后线上验证（与本仓既有习惯一致，CF 自动部署）**
+
+1. 推送 main 后等 CF 自动部署完成。
+2. 打开管理后台 → **添加提供商**：ID `deepseek-app`、Base URL `https://chat.deepseek.com`、模型 `deepseek-flash`、启用。
+3. 展开该提供商卡片 → 「DeepSeek App token 池」→ 按面板指引从浏览器取 `userToken` 的 value（64 字符）与 `deepseek-device-id:chat`（UUID）→ **注入并判活**（成功会显示账号尾号，失败会显示上游原文）。
+4. 「代理 Key」页面建一个 `sk_cf_…` Key。
+5. 请求：
+
+```powershell
+# PowerShell 下不要把 JSON 内联在命令行（引号会被吃掉导致 INVALID_JSON）：写文件再 --data-binary
+'{ "model":"deepseek-flash", "stream":true, "messages":[{"role":"system","content":"你是简洁助手"},{"role":"user","content":"只回复两个字：你好"}] }' | Set-Content -Path .\ds-body.json -Encoding utf8
+curl.exe -N -sS https://<你的域名>/v1/chat/completions `
+  -H "Authorization: Bearer sk_cf_..." -H "Content-Type: application/json" `
+  --data-binary "@.\ds-body.json"
+```
+
+预期：OpenAI SSE（`chat.completion.chunk`），答案以 `delta.content` 流出，最后 `finish_reason:"stop"` + usage + `data: [DONE]`。
+
+**路线 B：本机 `wrangler dev`（本地 miniflare，不需要 Cloudflare 账号）**
+
+```powershell
+cd D:\GitHub_Clone\ai-gateway
+# 首次需要管理后台凭据（.dev.vars 已被 gitignore）
+"ADMIN_USERNAME = `"admin`"`nADMIN_PASSWORD = `"<自定>`"" | Set-Content .\.dev.vars -Encoding utf8
+npx wrangler dev          # 打开 http://localhost:8787/admin 登录后重复上面第 2–5 步（域名换 localhost:8787）
+```
+
+注意：`wrangler.toml` 的 KV 绑定只写了 `binding = "KV"`（靠名字自动解析）。若本地模式因此报错，直接用路线 A。
+**wrangler 必须在沙箱外的普通终端跑**（DSH 沙箱内 esbuild/wrangler 无法起子进程，报 `spawn EPERM`）。
+
+
 
 ## 六、工作量与风险
 
