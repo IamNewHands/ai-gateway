@@ -27,18 +27,32 @@ const nodeEnv: Record<string, string | undefined> =
   (globalThis as { process?: { env?: Record<string, string | undefined> } }).process?.env ?? {}
 
 const PROBE_CREDENTIALS_PATH = '.secrets/deepseek.json'
+const PROBE_WEB_SESSION_PATH = '.secrets/deepseek-web-session.json'
 
-async function loadProbeAccount(): Promise<ProbeAccount | null> {
+/** 从本地 secrets 目录读一个 JSON（浏览器侧用 CDP 抓出来的会话也走这里）。 */
+async function loadJsonFile<T>(path: string): Promise<T | null> {
   try {
     const fs = (await import('node:fs' as string)) as {
       readFileSync: (path: string, encoding: string) => string
     }
-    const parsed = JSON.parse(fs.readFileSync(PROBE_CREDENTIALS_PATH, 'utf8')) as ProbeAccount
-    if (!parsed.password || (!parsed.mobile && !parsed.email)) return null
-    return parsed
+    return JSON.parse(fs.readFileSync(path, 'utf8')) as T
   } catch {
     return null
   }
+}
+
+async function loadProbeAccount(): Promise<ProbeAccount | null> {
+  const parsed = await loadJsonFile<ProbeAccount>(PROBE_CREDENTIALS_PATH)
+  if (!parsed || !parsed.password || (!parsed.mobile && !parsed.email)) return null
+  return parsed
+}
+
+/** 浏览器抓下来的会话：token + 真实 web 指纹（用于「无登录复用 token」探测）。 */
+interface WebSession {
+  token: string
+  headerDeviceId: string
+  userAgent: string
+  shumeiDeviceId?: string
 }
 
 const account = await loadProbeAccount()
@@ -261,3 +275,91 @@ describe.runIf(enabled)('live upstream wire variants', () => {
 
 /** 让 Envelope 类型在本文件被引用（便于后续扩展断言）。 */
 export type { Envelope }
+
+/**
+ * token 模式探测：**不做登录**，直接复用浏览器里抓到的 token + 真实 web 指纹，
+ * 看服务端是否接受「非浏览器进程」的 API 调用。这一条决定移植是否还有任何可行形态：
+ *   - 若 API 调用也按设备/IP 判风险 → 即使密码问题解决了，Workers 也活不下来；
+ *   - 若只有登录被卡，API 放行 → 才有可能讨论「抓一次 token 用一阵」的降级形态。
+ */
+const webSession = await loadJsonFile<WebSession>(PROBE_WEB_SESSION_PATH)
+const tokenEnabled =
+  nodeEnv.DS_LIVE_PROBE === '1' && webSession !== null && Boolean(webSession?.token)
+
+describe.runIf(tokenEnabled)('live token-mode probe (browser token, no login)', () => {
+  it(
+    'reuses the browser token for users/current + session + PoW + completion',
+    async () => {
+      const session = webSession as WebSession
+      const client = new DeepseekClient({
+        account: (account as ProbeAccount) ?? { password: '' },
+        wire: {
+          replaceHeaders: true,
+          headers: {
+            Accept: '*/*',
+            'Content-Type': 'application/json',
+            'User-Agent': session.userAgent,
+            'x-client-platform': 'web',
+            'x-client-version': '2.5.0',
+            'x-client-locale': 'zh_CN',
+            'x-client-timezone-offset': '28800',
+            'x-client-bundle-id': 'com.deepseek.chat',
+            'x-device-model': '',
+            'x-device-id': session.headerDeviceId,
+          },
+        },
+      })
+
+      const report: Record<string, unknown> = {}
+      const stage = (name: string) => {
+        report.lastStage = name
+      }
+
+      try {
+        stage('users/current')
+        const current = await client.usersCurrent(session.token)
+        report.usersCurrent = truncate(JSON.stringify(current.data?.biz_data ?? {}), 500)
+
+        stage('chat_session/create')
+        const sessionId = await client.createSession(session.token)
+        report.sessionId = sessionId
+
+        stage('chat/completion')
+        const resp = await client.completion(session.token, {
+          sessionId,
+          prompt: '只回复两个字：你好',
+          thinkingDisabled: true,
+        })
+        report.contentType = resp.headers.get('Content-Type')
+
+        const reader = resp.body?.getReader()
+        let raw = ''
+        if (reader) {
+          const decoder = new TextDecoder()
+          const deadline = Date.now() + 90_000
+          for (;;) {
+            if (Date.now() > deadline) break
+            const { value, done } = await reader.read()
+            if (done) break
+            raw += decoder.decode(value, { stream: true })
+            if (raw.includes('event: done') || raw.length > 20_000) break
+          }
+          await reader.cancel().catch(() => undefined)
+        }
+        report.streamBytes = raw.length
+        report.streamHead = truncate(raw, 600)
+        report.ok = true
+      } catch (err) {
+        report.ok = false
+        const cause = (err as { cause?: unknown })?.cause
+        report.error = err instanceof Error ? `${err.name}: ${err.message}` : String(err)
+        report.cause = cause instanceof Error ? `${cause.name}: ${cause.message}` : String(cause ?? '')
+      }
+
+      // eslint-disable-next-line no-console
+      console.log('[token-probe report]', JSON.stringify(report, null, 2))
+      expect(report.ok).toBe(true)
+    },
+    300_000,
+  )
+})

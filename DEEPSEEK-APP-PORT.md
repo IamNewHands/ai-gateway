@@ -123,6 +123,23 @@
 
 **唯一待确认项**：这个账号的密码到底是 `qwzas120` 吗？是「从未设过密码、一直短信登录」吗？这一项决定移植是否还有任何可行路径。
 
+### token 模式实测：**API 通路全部打通（端到端真机验证）**（2026-09-30）
+
+从浏览器取出 `localStorage.userToken`（注意：它是 `{"value":"<64 字符 token>","__version":…}` 的包装，**92 字符是包装后的长度**，直接用会得到 `code 40003 Authorization Failed`），配上实测的 web 指纹，**从 Node 进程**（非浏览器）依次调用：
+
+| 步骤 | 结果 |
+|---|---|
+| `GET /api/v0/users/current` | 200，返回账号信息（`is_mainland:true`、`chat.is_muted:0`） |
+| `POST /api/v0/chat_session/create` | 200，会话 id `fd6b277e-…` |
+| `POST /api/v0/chat/create_pow_challenge` → 解算 → `POST /api/v0/chat/completion` | **200 `text/event-stream`**，真实产出：`event: ready` → `{"v":{"response":{…,"fragments":[{"id":2,"type":"RESPONSE","content":"你好"…` |
+
+**结论修订（重要）**：
+
+1. **协议移植本身成立且已被真实上游验证**：HashV1 PoW 被服务端接受、会话创建可用、SSE 形态与 `simple-chat` 的 `sse.go` 描述一致。T1/T2 的移植产物（pow / device / client）不是纸面正确，而是**打通过真实上游**。
+2. **风控只卡「登录」，不卡 API**：一旦有 token，session / pow / completion 从非浏览器进程访问完全放行（至少从本机出口是这样）。
+3 .**需要 token 供给方式**：网关无法自主密码登录（biz 11），短信登录需要真人 + 浏览器侧 Shumei `rid`。可行形态是**「浏览器登录一次 → 注入 token」**——这与 ai-gateway 既有的手工登录型 provider（kuku 扫码、trae 登录、cline OAuth 回调）是同一类设计，不是新范式。
+4. **仍待测**：① token 的有效期（决定注入频率）；② **Cloudflare Workers 边缘出口**是否同样放行 API（决定「托管在 Workers」是否成立；这是 T0.2 的窄化版本，不再需要登录）。
+
 **部署约束（2026-09-30 实测，本机）**
 - `npx wrangler` 与 `node node_modules/wrangler/wrangler-dist/cli.js` 在本沙箱内都失败：wrangler 启动器与 esbuild 都 `spawn` 子进程，沙箱禁止管道 ⇒ `spawn EPERM`。**wrangler 只能在沙箱外的普通终端跑。**
 - 本机 wrangler **未认证**（`You are not authenticated`），且无 `CLOUDFLARE_API_TOKEN` / `CLOUDFLARE_ACCOUNT_ID`。故 T0.2 的可行路径是 `wrangler deploy --temporary`（临时预览账号，真实 CF 边缘出口，无需 CF 账号），由用户在自己的终端执行；探针 Worker 写成**单文件纯 JS、零依赖**，避免 bundling。
