@@ -130,7 +130,7 @@ function wbExpiryApi(html: string): any {
   if (!m) throw new Error('未找到 WB_EXPIRY 标记块：客户端到期判定块被删除或改名了？')
   const factory = new Function(
     'escapeHtml',
-    m[1] + '\nreturn { wbParseCstWallClock, wbPackExpiring7d, wbPackExpireHtml, wbExpiringBadge, WB_EXPIRY_WINDOW_MS }'
+    m[1] + '\nreturn { wbParseCstWallClock, wbPackExpiring7d, wbPackExpireHtml, wbExpiringBadge, wbPackageDisplayList, traePackDisplayList, WB_EXPIRY_WINDOW_MS }'
   )
   return factory((s: unknown) => String(s))
 }
@@ -214,5 +214,57 @@ describe('WorkBuddy 面板「即将到期」标记（客户端口径 = 后端挑
     expect(js).toContain('wbPackExpireHtml(p.expireAt)')
     // 静态说明文案已声明新规则
     expect(html).toContain('7 天内到期的积分优先消耗')
+  })
+
+  it('展示列表：已用完的包被隐藏，快到期的排最上面（两个面板同口径）', async () => {
+    const api = wbExpiryApi(await render([traeProvider()]))
+
+    // ---- WorkBuddy：size>0 且无剩余 = 已用完 → 隐藏；容量未下发（size 0）不隐藏 ----
+    const wbPacks = [
+      pkg(30 * DAY, { name: '远期' }),
+      pkg(2 * DAY, { name: '即将到期' }),
+      pkg(null, { name: '长期' }),
+      pkg(1 * DAY, { name: '用完了', size: 100, used: 100 }),
+      pkg(1 * DAY, { name: '超额用完', size: 100, used: 130 }),
+      pkg(3 * DAY, { name: '容量未下发', size: 0, used: 0 }),
+    ]
+    const wb = api.wbPackageDisplayList(wbPacks)
+    expect(wb.total).toBe(6)
+    expect(wb.hidden).toBe(2)
+    // 到期升序、长期最后；容量未下发（无到期键 → 长期）排在长期组
+    expect(wb.rows.map((p: any) => p.name)).toEqual(['即将到期', '容量未下发', '远期', '长期'])
+    // 不改入参（renderOauthPoolAccounts 复用同一数组算徽章）
+    expect(wbPacks).toHaveLength(6)
+    // 全部用完 → 展示列表为空（面板据此显示「已全部用完」而不是空表）
+    expect(api.wbPackageDisplayList([pkg(1 * DAY, { size: 10, used: 10 })]).rows).toEqual([])
+
+    // ---- TRAE：limit>0 且剩余<=0 = 已用完 → 隐藏；limit 未下发（0）不隐藏 ----
+    const traePacks = [
+      { name: '远期', limit: 100, used: 0, rem: 100, isWork: false, expireAt: 3000 },
+      { name: '即将到期', limit: 100, used: 0, rem: 100, isWork: false, expireAt: 1000 },
+      { name: '长期', limit: 100, used: 0, rem: 100, isWork: false, expireAt: 0 },
+      { name: '用完了', limit: 100, used: 100, rem: 0, isWork: false, expireAt: 1200 },
+      { name: '容量未下发', limit: 0, used: 0, rem: 0, isWork: true, expireAt: 2000 },
+    ]
+    const tr = api.traePackDisplayList(traePacks)
+    expect(tr.total).toBe(5)
+    expect(tr.hidden).toBe(1)
+    expect(tr.rows.map((p: any) => p.name)).toEqual(['即将到期', '容量未下发', '远期', '长期'])
+    expect(traePacks).toHaveLength(5)
+
+    // 空 / 缺省 / 脏数据不炸
+    expect(api.wbPackageDisplayList(null)).toEqual({ rows: [], hidden: 0, total: 0 })
+    expect(api.traePackDisplayList(undefined)).toEqual({ rows: [], hidden: 0, total: 0 })
+  })
+
+  it('两个面板已改用展示列表（隐藏已用完 + 到期优先排序 + 隐藏计数提示）', async () => {
+    const html = await render([{
+      ...traeProvider(), id: 'workbuddy', name: 'WorkBuddy', authType: 'oauth-device', oauth: { flowType: 'browser' },
+    } as Provider])
+    const js = inlineScripts(html).join('\n')
+    expect(js).toContain('const pkgDisp = wbPackageDisplayList(pkgs)')
+    expect(js).toContain('const disp = traePackDisplayList(packs)')
+    expect(js).toContain('个已隐藏')
+    expect(js).toContain('个包已全部用完')
   })
 })
