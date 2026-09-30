@@ -99,6 +99,30 @@
 
 **下一步判定**：改用同一标签页的**短信验证码登录**。若短信能登进去 ⇒ 账号与出口 IP 都没问题，只是密码流程/密码本身有问题（或密码错误被上游统一回成风控）；若短信也被拒 ⇒ 账号或 IP 被风控盯上，移植继续无意义。
 
+### 短信登录实测：账号没问题，密码登录路径是唯一被拒的一环（2026-09-30）
+
+在同一个真实浏览器里走短信：**成功登入**（页面落到 `/`，`localStorage.userToken` 92 字符）。
+
+抓到的完整 web 频道线上格式（比 Go 注释更权威，移植可直接照用）：
+
+| 步骤 | 端点 | 请求体要点 | 结果 |
+|---|---|---|---|
+| 通讯录/配置 | `GET /api/v0/client/settings?did=<UUID>&scope=…` | `did` = localStorage `__ds_remote_feature_did` | 200 |
+| 密码登录 | `POST /api/v0/users/login` | `{email:"",mobile,password,area_code:"+86",device_id:"B…==",os:"web"}` | **`biz_code 11`** |
+| 取短信 guest 挑战 | `POST /api/v0/users/create_guest_challenge` | — | 200，`{algorithm:"DeepSeekHashV1",challenge:"…"}` |
+| 发短信 | `POST /api/v0/users/create_sms_verification_code` | `{locale:"zh_CN",turnstile_token:"",`**`shumei_verification:{region:"CN",rid:"20260930…"}`**`,device_id:"B…==",scenario:"login",mobile_number}` | 200，`send_window_secs:60` |
+| 短信登录 | `POST /api/v0/users/login_by_mobile_sms` | `{region:"CN",locale:"zh_CN",mobile_number,area_code:"+86",sms_verification_code,device_id:"B…==",os:"web"}` | 200，`biz_code 1 LOGIN_TO_EXISTING_ACCOUNT` + `user.token` |
+
+**三个决定性结论**：
+
+1. **账号与出口 IP 都没问题**（短信登录直接拿到 token）；被拒的只有**密码登录**这一条路径——而且是在**真实浏览器 + 真实页面 JS + 真实 Shumei device_id** 下被拒。⇒ biz 11 与我们的代码、TLS、HTTP 线格式全部无关，最可能是**密码本身不对**（CN 平台常把凭证错误统一回成风控文案以防撞库），或该账号走的是「注册即短信、从未设密码」。
+2. **发短信需要 `shumei_verification.rid`**（Shumei SDK 在浏览器里生成的设备风险令牌）⇒ **无头客户端根本无法走短信路径**，无论是 Workers 还是 VPS。
+3. 页面里 12 次 `gator.volces.com`（火山引擎埋点/SDK）全部网络层失败（status 0），但既不阻止发码也不阻止登录 ⇒ 与本问题无关。
+
+**对「逃生方案」的连带影响**：simple-chat 与 ds2api 都**只支持密码登录**（`accounts.json` = mobile/email + password）。也就是说，只要这个账号的密码路径走不通，**换成 VPS 跑容器也一样不可用**——两者共用同一个前置条件。
+
+**唯一待确认项**：这个账号的密码到底是 `qwzas120` 吗？是「从未设过密码、一直短信登录」吗？这一项决定移植是否还有任何可行路径。
+
 **部署约束（2026-09-30 实测，本机）**
 - `npx wrangler` 与 `node node_modules/wrangler/wrangler-dist/cli.js` 在本沙箱内都失败：wrangler 启动器与 esbuild 都 `spawn` 子进程，沙箱禁止管道 ⇒ `spawn EPERM`。**wrangler 只能在沙箱外的普通终端跑。**
 - 本机 wrangler **未认证**（`You are not authenticated`），且无 `CLOUDFLARE_API_TOKEN` / `CLOUDFLARE_ACCOUNT_ID`。故 T0.2 的可行路径是 `wrangler deploy --temporary`（临时预览账号，真实 CF 边缘出口，无需 CF 账号），由用户在自己的终端执行；探针 Worker 写成**单文件纯 JS、零依赖**，避免 bundling。
