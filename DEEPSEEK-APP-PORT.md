@@ -198,8 +198,10 @@ node node_modules\wrangler\wrangler-dist\cli.js deploy --temporary --config prob
       → 验证：`npx vitest run --pool=threads src/deepseek/sse.test.ts` **18/18 通过**，其中 3 例直接吃**真实上游固件**（`__fixtures__/completion-{plain,thinking,search}.sse.txt`，2026-09-30 抓取：1002/10378/7362 字节）。覆盖跨块切行、CRLF、THINK/RESPONSE 归属、搜索 hits 收集、断流不谎报 stop。
 - [x] T4.3 非流式聚合：`aggregateDeepseekSse()` + `truncated` 语义（断流标 `length`，不谎报 `stop`）
 - [x] T4.1a 上游补全请求体（10 字段 kotlinx 序、thinking/search 开关）——见 `client.ts`
-- [ ] T4.1b messages → 上游单一 `prompt` 的扁平化规则（system/多轮/角色前缀，移植 `openai.go`）
-- [ ] T4.2b `ReadableStream` 包装（上游流 → OpenAI SSE 响应体，含 idle 看门狗）——与 T6.1 接线一起做
+- [x] T4.1b messages → 上游单一 `prompt` 的扁平化规则（system 合并、工具残留丢弃、junk 片段过滤、thinking/search 开关、`max_completion_tokens` 别名）
+      → `src/deepseek/request.ts` + `request.test.ts`（**25/25**，期望值逐条转写 Go 的 `strip_test.go` 系统合并 8 例表与 kitchen-sink 剥离用例）
+- [x] T4.2b `ReadableStream` 包装（上游流 → OpenAI SSE，含 180s idle 看门狗）→ `src/deepseek/stream.ts` + `stream.test.ts`（**9/9**：三份真固件 + 截断/hint/content_filter/idle/跨块切行）
+      → 踩坑记录：`pull()` **必须**在返回前 enqueue 或 close，否则底层不再回调、消费者直接卡死（实测 40s 全超时 → 改成循环后 80ms 全绿）。
 
 **阶段 5 — 会话生命周期（cron）**
 - [ ] T5.1 `chat_session/create`+`delete` 包装、`fetch_page` 列表
