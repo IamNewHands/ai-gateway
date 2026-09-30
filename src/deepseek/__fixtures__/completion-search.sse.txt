@@ -1,0 +1,91 @@
+event: ready
+data: {"request_message_id":1,"response_message_id":2,"model_type":"default"}
+
+event: update_session
+data: {"updated_at":1790778945.334286}
+
+data: {"v":{"response":{"message_id":2,"parent_id":1,"model":"","role":"ASSISTANT","thinking_enabled":false,"ban_edit":false,"ban_regenerate":false,"status":"WIP","incomplete_message":null,"accumulated_token_usage":0,"feedback":null,"inserted_at":1790778945.324889,"search_enabled":true,"fragments":[{"id":2,"type":"SEARCH","status":"WIP","content":null,"queries":[{"query":"2026年9月30日有哪些科技新闻"},{"query":"2026年9月30日IT科技新闻盘点"}],"results":[]}],"conversation_mode":"DEFAULT","has_pending_fragment":false,"auto_continue":false,"search_triggered":true,"extra_search_providers":[]}}}
+
+data: {"p":"response/fragments/-1/results","v":[{"url":"https://www.news.cn/world/20260930/6044583b589c4e4d90def6c95ce75568/c.html","title":"白宫与美AI巨头签协议 涉及内外部审查","snippet":"白宫与美AI巨头签协议 涉及内外部审查 ... 美国总统特朗普9月29日对媒体说，他在白宫会见多家科技企业负责人，讨论人工智能发展，并共同签署一份相关协议文件。当天稍晚时候...","cite_index":1,"published_at":1790697600.0,"site_icon":"https://cdn.deepseek.com/site-icons/news.cn","site_name":"新华网","query_indexes":[0],"provider":null},{"url":"https://www.ithome.com/1/008/561.htm","title":"IT早报 0930：华为 Mate 90 定档 10 月 1 日发布并开售；OpenAI 发布 GPT-6.1 Sol；123 云盘就空间调整致歉；5999 元起 iQOO 16 手机发布...","snippet":"华为 Mate 90 定档 10 月 1 日发布并开售；OpenAI 发布 GPT-6.1 Sol ... 5999 元起 iQOO 16 手机发布... IT早报 2026/9/30 7:57:06 责编：梦泽 ... 大家好，现在是 2026 年 9 月 30 日星期三 ... 定档 10 月 1 日正式发布并开售 ... 同性能下最高性价比 AI 模型...","cite_index":2,"published_at":1790697600.0,"site_icon":"https://cdn.deepseek.com/site-icons/ithome.com","site_name":"IT之家","query_indexes":[1,0],"provider":null},{"url":"https://finance.sina.com.cn/roll/2026-09-30/doc-initpxxr2433470.shtml?cre=tianyi&mod=pcpager_fintoutiao&loc=22&r=0&rfunc=84&tj=cxvertical_pc_pager_spt&tr=12","title":"特朗普会见多家科企负责人 签署人工智能相关文件","snippet":"【特朗普会见多家科企负责人 签署人工智能相关文件】财联社9月30日电，美国总统特朗普29日对媒体说，他在白宫会见多家科技企业负责人，讨论人工智能发展，并共同签署一份相关协议文件。当天稍晚时候...","cite_index":3,"published_at":1790697600.0,"site_icon":"https://cdn.deepseek.com/site-icons/sina.com.cn","site_name":"新浪财经","query_indexes":[0],"provider":null},{"url":"https://www.thecover.cn/news/Eg2l3ZPMyz2H90qSdq8Jkw==","title":"特努斯期望重塑苹果 “用更少人做更多的事”；我国生成式人工智能用户规模突破7亿人｜早资道","snippet":"特努斯期望重塑苹果 “用更少人做更多的事”；我国生成式人工智能用户规模突破7亿人｜早资道 封面新闻 2026-09-30 11 ... AMD拟收购李飞飞创办的AI初创公司，交易金额82亿美元","cite_index":4,"published_at":1790697600.0,"site_icon":"https://cdn.deepseek.com/site-icons/thecover.cn","site_name":"封面新闻","query_indexes":[1,0],"provider":null},{"url":"https://m.gmw.cn/2026-09/30/content_1304570116.htm","title":"特朗普会见多家科技企业负责人 签署人工智能相关文件","snippet":"特朗普会见多家科技企业负责人 签署人工智能相关文件 2026-09-30 09:25来源： 央视新闻客户端 ... 当地时间9月29日，美国总统特朗普表示，他在白宫会见多家科技企业负责人，讨论人工智能发展，并共同签署一份相关协议文件。当天稍晚时候...","cite_index":5,"published_at":1790697600.0,"site_icon":"https://cdn.deepseek.com/site-icons/gmw.cn","site_name":"光明网","query_indexes":[0],"provider":null},{"url":"https://www.zysbs.cn/html/zhuanti/atcj/2026_09/30/66264131.html","title":"中国AI大模型调用量连续二十周领跑；美国科技巨头甲骨文爆雷，市值蒸发近1500亿","snippet":"中国AI大模型调用量连续二十周领跑；美国科技巨头甲骨文爆雷，市值蒸发近1500亿 ... 2026-09-30 09 ... 美国科技巨头甲骨文爆雷 市值蒸发近1500亿","cite_index":6,"published_at":1790697600.0,"site_icon":"https://cdn.deepseek.com/site-icons/zysbs.cn","site_name":"中原新闻网","query_indexes":[1],"provider":null},{"url":"https://fund.eastmoney.com/a/202609303887106760.html","title":"AI早报 | AMD拟收购李飞飞公司World Labs，交易金额82亿美元；Anthropic与英伟达就智能体安全问题展开合作","snippet":"AI早报 | AMD拟收购李飞飞公司World Labs，交易金额82亿美元；Anthropic与英伟达就智能体安全问题展开合作 2026年09月30日 08:15","cite_index":7,"published_at":1790697600.0,"site_icon":"https://cdn.deepseek.com/site-icons/eastmoney.com","site_name":"eastmoney.com","query_indexes":[1],"provider":null},{"url":"https://h.xinhuaxmt.com/vh512/app/13309959","title":"新华社分享页","snippet":"特朗普会见多家科企负责人 签署人工智能相关文件 2026-09-30 06 ... 新华社华盛顿9月29日电 美国总统特朗普29日对媒体说，他在白宫会见多家科技企业负责人，讨论人工智能发展，并共同签署一份相关协议文件。当天稍晚时候...","cite_index":8,"published_at":1790697600.0,"site_icon":"https://cdn.deepseek.com/site-icons/xinhuaxmt.com","site_name":"xinhuaxmt.com","query_indexes":[0],"provider":null},{"url":"https://exame.com/tecnologia/corrida-da-inteligencia-artificial-em-setembro-o-que-mudou-em-ia-apple-e-big-techs/","title":"'Me acorde quando setembro acabar': como a corrida da IA tirou o sono da tecnologia","snippet":"A OpenAI e Anthropic lançaram juntas oito modelos de IA em 29 dias, enquanto os próprios criadores da tecnologia passaram a alertar publicamente sobre os riscos de uma evolução difícil de controlar. ... Setembro termina nesta quarta-feira, 30, deixando uma indústria em movimento acelerado.","cite_index":9,"published_at":1790697600.0,"site_icon":"https://cdn.deepseek.com/site-icons/exame.com","site_name":"Exame","query_indexes":[1],"provider":null},{"url":"https://www.cnfin.com/hs-lb/detail/20260930/4476693_1.html","title":"白宫与美AI巨头签协议 涉及内外部审查","snippet":"白宫与美AI巨头签协议 涉及内外部审查 新华社|2026年09月30日 ... 美国总统特朗普9月29日对媒体说，他在白宫会见多家科技企业负责人，讨论人工智能发展，并共同签署一份相关协议文件。","cite_index":10,"published_at":1790697600.0,"site_icon":"https://cdn.deepseek.com/site-icons/cnfin.com","site_name":"中国金融信息网","query_indexes":[0],"provider":null},{"url":"https://caifuhao.eastmoney.com/news/20260930061341260212950","title":"9月30日外盘头条：特朗普会晤人工智能业界领袖 OpenAI发布个人AI助手Dots 苹果新任CEO推进内部改革","snippet":"特朗普会晤人工智能业界领袖 OpenAI发布个人AI助手Dots 苹果新任CEO推进内部改革 ... 特朗普推出AI驱动的新网站America.gov 打造政府服务一站式入口 ... 3、特朗普会晤人工智能业界领袖 反对新增联邦安全监管 4、OpenAI推出始终在线的智能体Dots 月费新增500美元一档 5、特努斯期望重塑苹果 “用更少人做更多的事”","cite_index":11,"published_at":1790697600.0,"site_icon":"https://cdn.deepseek.com/site-icons/eastmoney.com","site_name":"财富号","query_indexes":[1],"provider":null},{"url":"https://news.zgw.com/newsDetail/2550940","title":"金十数据整理：每日科技要闻速递（9月30日）","snippet":"1. 特朗普与AI巨头签署“具有道德约束力”的人工智能文件，还改名AI为SI。 2. OpenAI推出GPT-6.1 Sol模型 ... 6. 马斯克与黄仁勋已改口称AI为SI ... OpenAI将成立澳大利亚AI网络风险工作组。","cite_index":12,"published_at":1790697600.0,"site_icon":"https://cdn.deepseek.com/site-icons/zgw.com","site_name":"zgw.com","query_indexes":[1],"provider":null}]}
+
+data: {"p":"response/fragments/-1","o":"BATCH","v":[{"p":"status","v":"FINISHED"},{"p":"content","v":"搜索到 12 个网页"}]}
+
+data: {"p":"response/conversation_mode","o":"SET","v":"SEARCH"}
+
+data: {"p":"response/has_pending_fragment","v":true}
+
+data: {"p":"response","o":"BATCH","v":[{"p":"fragments","o":"APPEND","v":[{"id":3,"type":"RESPONSE","content":"Open","references":[],"stage_id":2}]},{"p":"has_pending_fragment","o":"SET","v":false}]}
+
+data: {"p":"response/fragments/-1/content","o":"APPEND","v":"AI"}
+
+data: {"v":"发布"}
+
+data: {"v":"GPT"}
+
+data: {"v":"-"}
+
+data: {"v":"6"}
+
+data: {"v":"."}
+
+data: {"v":"1"}
+
+data: {"v":" Sol"}
+
+data: {"v":"模型"}
+
+data: {"v":"，"}
+
+data: {"v":"性能"}
+
+data: {"v":"接近"}
+
+data: {"v":"A"}
+
+data: {"v":"stra"}
+
+data: {"v":"但"}
+
+data: {"v":"费用"}
+
+data: {"v":"仅为"}
+
+data: {"v":"后"}
+
+data: {"v":"者的"}
+
+data: {"v":"五"}
+
+data: {"v":"分之一"}
+
+data: {"v":"，"}
+
+data: {"v":"号称"}
+
+data: {"v":"同"}
+
+data: {"v":"性能"}
+
+data: {"v":"下"}
+
+data: {"v":"性价比"}
+
+data: {"v":"最高"}
+
+data: {"v":"[citation:2]"}
+
+data: {"v":"。"}
+
+data: {"p":"response","o":"BATCH","v":[{"p":"accumulated_token_usage","v":71},{"p":"quasi_status","v":"FINISHED"}]}
+
+data: {"p":"response/status","o":"SET","v":"FINISHED"}
+
+event: update_session
+data: {"updated_at":1790778946.26436}
+
+event: title
+data: {"content":"今日科技新闻一句话"}
+
+event: close
+data: {"click_behavior":"none","auto_resume":false}
+

@@ -194,10 +194,12 @@ node node_modules\wrangler\wrangler-dist\cli.js deploy --temporary --config prob
 - [ ] T3.3 token 失效标记与面板提示（`users/current` 判活；失效即 `expired`，不静默降级）
 
 **阶段 4 — 补全链路**
-- [ ] T4.1 请求体构造：messages→上游 payload、thinking 开关、search 开关、图片 parts
-- [ ] T4.2 SSE → OpenAI：`delta.reasoning_content` 先行、`delta.content`、`citations`、finish 诚实收尾
-- [ ] T4.3 非流式聚合（sawDone/truncated 语义对齐 trae 的既有教训）
-- [ ] T4.4 重试阶梯 + idle 看门狗 + 错误映射（不罚号/不谎报 stop）
+- [x] T4.2 SSE → OpenAI：`src/deepseek/sse.ts`（解释器逐条移植 `sse.go`：JSON-patch `{p,o,v}`、省略 p/o 沿用上次、裸增量按上次片段 type 归属、BATCH、噪声路径过滤、`event: hint`、`content_filter`）+ OpenAI chunk / 错误帧 / `[DONE]` 构造器
+      → 验证：`npx vitest run --pool=threads src/deepseek/sse.test.ts` **18/18 通过**，其中 3 例直接吃**真实上游固件**（`__fixtures__/completion-{plain,thinking,search}.sse.txt`，2026-09-30 抓取：1002/10378/7362 字节）。覆盖跨块切行、CRLF、THINK/RESPONSE 归属、搜索 hits 收集、断流不谎报 stop。
+- [x] T4.3 非流式聚合：`aggregateDeepseekSse()` + `truncated` 语义（断流标 `length`，不谎报 `stop`）
+- [x] T4.1a 上游补全请求体（10 字段 kotlinx 序、thinking/search 开关）——见 `client.ts`
+- [ ] T4.1b messages → 上游单一 `prompt` 的扁平化规则（system/多轮/角色前缀，移植 `openai.go`）
+- [ ] T4.2b `ReadableStream` 包装（上游流 → OpenAI SSE 响应体，含 idle 看门狗）——与 T6.1 接线一起做
 
 **阶段 5 — 会话生命周期（cron）**
 - [ ] T5.1 `chat_session/create`+`delete` 包装、`fetch_page` 列表
