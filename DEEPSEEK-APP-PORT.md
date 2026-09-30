@@ -59,7 +59,30 @@
 > 本仓库测试统一加 `--pool=threads`：`npx vitest run --pool=threads src/deepseek/pow.test.ts`
 
 **阶段 0 — 可行性门（先做，未过则停止）**
-- [ ] T0.1 Worker 上最小 probe：登录 → 取 PoW 挑战 → 解 → 补全一段话。(需真实账号凭据 + 一次 deploy 授权)
+- [~] T0.1 本机 Node live probe：**协议层打通，风控层被拒**。见下方「阶段 0 实测结果」。
+- [ ] T0.2 Worker live probe（CF 出口 IP 门）——T0.1 未过，暂缓。
+
+### 阶段 0 实测结果（2026-09-30，本机 Node + 真账号）
+
+| 尝试 | 指纹 | 结果 |
+|---|---|---|
+| 1 | App 2.5.3 完整头块 + 按账号铸造的 App 形状 device_id | `biz_code 11 RISK_DEVICE_DETECTED` |
+| 2 | **ds2api 生产用线**（极简头 + 字面量 `device_id:"deepseek_to_api"`） | `biz_code 11 RISK_DEVICE_DETECTED` |
+| 3–5 | 其余两个组合 | `code 40029 TOO_MANY_REQUESTS`（被限流，不再构成证据） |
+
+关键事实：
+- **协议层是对的**：请求穿过 WAF 并拿到正常 JSON 信封（HTTP 200 + 结构化 `biz_code`），说明 URL/方法/头部形状/编码都没问题；PoW、device_id 铸造、信封解析均在单测里用 golden vector 钉死。
+- **拦截点在风控**，且**不是 HTTP 层指纹**：连参考实现（ds2api）**逐字**的线上组合也被同一个 biz_code 拒。
+- 参考实现能跑通的三个额外条件（本机/Workers 都不具备或不可控）：
+  1. **TLS 指纹伪造**：ds2api 用 `refraction-networking/utls` 的 `HelloSafari_Auto`（Safari ClientHello，强制 HTTP/1.1）；Fly143 用 `curl_cffi` 的 Chrome/iOS 指纹。**Cloudflare Workers 的 `fetch()` 无法控制 TLS ClientHello**——这是架构级不可控项。
+  2. **出口 IP 信誉**：Fly143 的运维手册把「代理是否开启」列为风控要素；CF 边缘 IP 是国内风控的重点关照对象。
+  3. **设备信任**：Fly143 用**私有 device_ids 池**，并明确「公共 device_ids 池会被整体标记」→ device_id 是一类会被烧掉的资源。
+
+**待判定的未知量**：biz 11 究竟来自「TLS/客户端指纹」还是「账号信任 / 本机出口 IP」。一次浏览器侧实验即可分离。在判定前，T3 之后的移植（账号池、SSE、会话生命周期）都属于「协议已备、通路未证」，不建议继续投入。
+
+**部署约束（2026-09-30 实测，本机）**
+- `npx wrangler` 与 `node node_modules/wrangler/wrangler-dist/cli.js` 在本沙箱内都失败：wrangler 启动器与 esbuild 都 `spawn` 子进程，沙箱禁止管道 ⇒ `spawn EPERM`。**wrangler 只能在沙箱外的普通终端跑。**
+- 本机 wrangler **未认证**（`You are not authenticated`），且无 `CLOUDFLARE_API_TOKEN` / `CLOUDFLARE_ACCOUNT_ID`。故 T0.2 的可行路径是 `wrangler deploy --temporary`（临时预览账号，真实 CF 边缘出口，无需 CF 账号），由用户在自己的终端执行；探针 Worker 写成**单文件纯 JS、零依赖**，避免 bundling。
 
 **阶段 1 — 纯计算（无凭据、可离线验证）**
 - [x] T1.1 `src/deepseek/pow.ts`：Keccak-f23/HashV1 + SolvePow + `BuildPowHeader`
