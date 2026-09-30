@@ -80,6 +80,25 @@
 
 **待判定的未知量**：biz 11 究竟来自「TLS/客户端指纹」还是「账号信任 / 本机出口 IP」。一次浏览器侧实验即可分离。在判定前，T3 之后的移植（账号池、SSE、会话生命周期）都属于「协议已备、通路未证」，不建议继续投入。
 
+### 浏览器侧判定实验（2026-09-30，用户真实 Chrome + 真实页面）
+
+做法：CDP 驱动用户日常 Chrome，打开 `chat.deepseek.com`（未登录，落到 `/sign_in`），切到密码登录，用同一账号提交；同时 hook `fetch`/XHR 抓下真实请求与响应。
+
+结果：**`{"code":0,"data":{"biz_code":11,"biz_msg":"RISK_DEVICE_DETECTED"}}`——与 Node/Workers 侧完全一致。**
+
+**结论（关键）**：真实浏览器 + 真实页面 JS + 真实 Shumei device_id + 用户本机出口 IP，同样被风控拒。**问题不在我们的客户端指纹、不在 TLS、也不在 HTTP 线格式**，而在**账号本身或这条网络出口**。
+
+顺带拿到**web 频道的权威线上格式**（对移植有独立价值，之前只能靠 Go 注释推测）：
+
+| 项 | 实测值 |
+|---|---|
+| 端点 | `POST /api/v0/users/login` |
+| 头 | `x-client-platform: web`、`x-client-version: 2.5.0`、`x-client-locale: zh_CN`、`x-client-timezone-offset: 28800`、`x-client-bundle-id: com.deepseek.chat`、`x-device-model: ""`、`x-device-id: <UUID>`（来自 localStorage `deepseek-device-id:chat`）、`accept: */*` |
+| 体 | `{email:"", mobile, password, area_code:"+86", device_id:"B…==", os:"web"}` |
+| 备注 | web 频道 `area_code` 是 **"+86"**（不是 null，安卓路径才是 null）；体里的 `device_id` 是 Shumei SMSdk 的 base64（`B…`），与 `x-device-id` 的 UUID 是两个不同的值——与 simple-chat 的 `region.go` 描述一致 |
+
+**下一步判定**：改用同一标签页的**短信验证码登录**。若短信能登进去 ⇒ 账号与出口 IP 都没问题，只是密码流程/密码本身有问题（或密码错误被上游统一回成风控）；若短信也被拒 ⇒ 账号或 IP 被风控盯上，移植继续无意义。
+
 **部署约束（2026-09-30 实测，本机）**
 - `npx wrangler` 与 `node node_modules/wrangler/wrangler-dist/cli.js` 在本沙箱内都失败：wrangler 启动器与 esbuild 都 `spawn` 子进程，沙箱禁止管道 ⇒ `spawn EPERM`。**wrangler 只能在沙箱外的普通终端跑。**
 - 本机 wrangler **未认证**（`You are not authenticated`），且无 `CLOUDFLARE_API_TOKEN` / `CLOUDFLARE_ACCOUNT_ID`。故 T0.2 的可行路径是 `wrangler deploy --temporary`（临时预览账号，真实 CF 边缘出口，无需 CF 账号），由用户在自己的终端执行；探针 Worker 写成**单文件纯 JS、零依赖**，避免 bundling。
