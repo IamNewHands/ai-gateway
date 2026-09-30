@@ -259,7 +259,9 @@ node node_modules\wrangler\wrangler-dist\cli.js deploy --temporary --config prob
 - [x] T8.2 本机 live probe（Node + 真 token，绕开 CF 单独验证协议与转换链）
 - [x] T8.3 Worker 部署 live probe（阶段 0 探针 + `live gateway chain` 真机端到端）
 - [x] T8.4 `CODING_NOTES.md` 记录决策与风险 —— **已完成**（见文末「DeepSeek App 提供商」一节）
-- [ ] T8.5 推送 main（CF 自动部署）→ 线上注入 token → 线上 curl 验证
+- [x] T8.5 推送 main（CF 自动部署）→ 线上注入 token → 线上 curl 验证
+      → 已推送 `db8f43d..6ebbcd4`（本次会话共 13 个提交），`git rev-parse HEAD origin/main` 两者一致、`rev-list --left-right --count` = `0	0`
+      → **待你执行**：CF 自动部署完成后，按上方「线上/本地端到端验证步骤」在面板注入 token 并 curl 一次（我无法代做：需要你的管理员登录）
 
 ### 线上/本地端到端验证步骤（交给用户执行，2026-09-30）
 
