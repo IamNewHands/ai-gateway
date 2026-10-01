@@ -706,6 +706,10 @@ ${H('管理')}
                 </div>
                 <div id="ds-st-${escapePageHtml(p.id)}" class="oauth-status" aria-live="polite"></div>
                 <div id="ds-list-${escapePageHtml(p.id)}" class="mt-1"></div>
+              </fieldset>
+              <fieldset class="form-group" id="ds-think-fs-${escapePageHtml(p.id)}"><legend>深度思考模式</legend>
+                <label class="switch-label"><span>默认关闭深度思考（走快路径，适合翻译/改写等轻量任务）</span><span class="tg"><input type="checkbox" id="ds-thinkoff-${escapePageHtml(p.id)}" ${p.deepseekThinkingOff?'checked':''}><span class="sl"></span></span></label>
+                <span class="form-helper">上游默认<b>开</b>思考：思考期间首字节明显更慢，且思考内容会以 <code>reasoning_content</code> 一起返回。勾上后本提供商默认发 <code>thinking_enabled:false</code>。<br><b>优先级：客户端显式声明 &gt; 本开关 &gt; 内置默认（开）</b>——客户端发 <code>thinking:{type:"enabled"}</code> 或非 none 的 <code>reasoning_effort</code> 时本开关不生效，所以需要思考的个别请求仍可单独开。<br>翻译场景建议：勾上本开关，并确认客户端不主动传 reasoning 参数。</span>
               </fieldset>`:''}
               <div class="collapse-section">
                 <button class="collapse-btn" onclick="toggleVbCollapse('vb-fs-${escapePageJsx(p.id)}', this)" type="button" aria-expanded="false">
@@ -3391,6 +3395,9 @@ async function save(id) {
   const promptMode = pEl ? (pEl.value === 'custom' ? 'custom' : pEl.value === 'append' ? 'append' : 'passthrough') : undefined
   const ptextEl = document.getElementById('ptext-' + id)
   const promptText = ptextEl ? (ptextEl.value.trim() || undefined) : undefined
+  // DeepSeek App 深度思考开关：仅该提供商有此复选框，其余提供商读到 null → 不改动
+  const dsThinkEl = document.getElementById('ds-thinkoff-' + id)
+  const deepseekThinkingOff = dsThinkEl ? dsThinkEl.checked === true : undefined
   if (authType === 'oauth-device') {
     // 国际版必须带 Global 发起端点，否则发起登录会静默走国内端点
     if (oauth.loginRealm === 'global' && !oauth.globalDeviceCodeUrl) {
@@ -3416,7 +3423,7 @@ async function save(id) {
     const r = await fetch('/admin/api/providers/' + encodeURIComponent(id), {
       method: 'PUT',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ name: nm, baseUrl: url, apiType, authType, oauth: authType === 'oauth-device' ? oauth : undefined, apiKeys: keys, models, enabled, toolBridge: (document.getElementById('atb-' + id)||{}).checked === true, allowUnlistedModels: (document.getElementById('aum-' + id)||{}).checked === true, reasoningEffort: ((document.getElementById('re-' + id)||{}).value || null), thinkingInject, cachePrefixInject, cooldown: collectCooldown(id), type: providerType, kukuThinkMode, visionBridge: vb, geminiBaseUrl: ((document.getElementById('gbu-' + id)||{}).value || '').trim() || null, traeEnableRemoteBudget, traeRemoteOnlyModels, traeMaxMessages, traeMaxHistoryChars, traeMaxToolSchemaChars, accountSpread: (document.getElementById('m365-spread-' + id)||{}).checked === true, promptMode, promptText })
+      body: JSON.stringify({ name: nm, baseUrl: url, apiType, authType, oauth: authType === 'oauth-device' ? oauth : undefined, apiKeys: keys, models, enabled, toolBridge: (document.getElementById('atb-' + id)||{}).checked === true, allowUnlistedModels: (document.getElementById('aum-' + id)||{}).checked === true, reasoningEffort: ((document.getElementById('re-' + id)||{}).value || null), deepseekThinkingOff, thinkingInject, cachePrefixInject, cooldown: collectCooldown(id), type: providerType, kukuThinkMode, visionBridge: vb, geminiBaseUrl: ((document.getElementById('gbu-' + id)||{}).value || '').trim() || null, traeEnableRemoteBudget, traeRemoteOnlyModels, traeMaxMessages, traeMaxHistoryChars, traeMaxToolSchemaChars, accountSpread: (document.getElementById('m365-spread-' + id)||{}).checked === true, promptMode, promptText })
     })
     const d = await r.json()
     if (d.success) { toast('已保存', 'success'); reloadAdmin() }

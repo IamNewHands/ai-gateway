@@ -290,6 +290,7 @@ export async function handleCreateProvider(c: Context<AppEnv>) {
     allowUnlistedModels: body.allowUnlistedModels,
     reasoningEffort: normalizeReasoningEffort(body.reasoningEffort),
     reasoningEffortByModel: normalizeReasoningEffortByModel(body.reasoningEffortByModel),
+    deepseekThinkingOff: body.deepseekThinkingOff,
     thinkingInject: body.thinkingInject,
     cachePrefixInject: body.cachePrefixInject,
     geminiBaseUrl: body.geminiBaseUrl?.replace(/\/$/, ''),
@@ -353,6 +354,7 @@ export async function handleUpdateProvider(c: Context<AppEnv>) {
   if (body.allowUnlistedModels !== undefined) updates.allowUnlistedModels = body.allowUnlistedModels
   if (body.reasoningEffort !== undefined) updates.reasoningEffort = normalizeReasoningEffort(body.reasoningEffort)
   if (body.reasoningEffortByModel !== undefined) updates.reasoningEffortByModel = normalizeReasoningEffortByModel(body.reasoningEffortByModel)
+  if (body.deepseekThinkingOff !== undefined) updates.deepseekThinkingOff = body.deepseekThinkingOff ?? undefined
   if (body.thinkingInject !== undefined) updates.thinkingInject = body.thinkingInject ?? undefined
   if (body.cachePrefixInject !== undefined) updates.cachePrefixInject = body.cachePrefixInject ?? undefined
   if (body.geminiBaseUrl !== undefined) {
@@ -457,6 +459,7 @@ export async function handleUpsertProvider(c: Context<AppEnv>) {
       cachePrefixInject: body.cachePrefixInject,
       reasoningEffort: normalizeReasoningEffort(body.reasoningEffort),
       reasoningEffortByModel: normalizeReasoningEffortByModel(body.reasoningEffortByModel),
+      deepseekThinkingOff: body.deepseekThinkingOff,
       geminiBaseUrl: body.geminiBaseUrl?.replace(/\/$/, ''),
       traeEnableRemoteBudget: body.traeEnableRemoteBudget,
       traeRemoteOnlyModels: body.traeRemoteOnlyModels,

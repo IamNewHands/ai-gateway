@@ -332,6 +332,27 @@ describe('DeepSeek App token 注入面板', () => {
     // 但函数仍在脚本里（共享脚本），语法必须合法
     for (const s of inlineScripts(html)) expect(() => new Function(s)).not.toThrow()
   })
+
+  it('渲染「默认关闭深度思考」开关，且说明优先级', async () => {
+    const html = await render([deepseekProvider()])
+    expect(html).toContain('id="ds-thinkoff-deepseek-app"')
+    expect(html).toContain('默认关闭深度思考')
+    // 优先级必须写在界面上：否则用户勾了之后不知道个别请求还能开回来
+    expect(html).toContain('客户端显式声明')
+  })
+
+  it('开关状态回显已保存的值（勾上后刷新仍是勾上）', async () => {
+    const on = await render([{ ...deepseekProvider(), deepseekThinkingOff: true } as Provider])
+    expect(on).toMatch(/id="ds-thinkoff-deepseek-app"[^>]*checked/)
+    const off = await render([deepseekProvider()])
+    expect(off).not.toMatch(/id="ds-thinkoff-deepseek-app"[^>]*checked/)
+  })
+
+  it('保存时把开关值发给后端（否则勾选丢失）', async () => {
+    const js = inlineScripts(await render([deepseekProvider()])).join('\n')
+    expect(js).toContain("document.getElementById('ds-thinkoff-' + id)")
+    expect(js).toContain('deepseekThinkingOff')
+  })
 })
 
 /**

@@ -182,6 +182,65 @@ describe('streaming path', () => {
     expect(payload.thinking_enabled).toBe(false)
     expect(payload.search_enabled).toBe(true)
   })
+
+  /**
+   * provider 级「默认关思考」（面板开关）：翻译这类轻量任务的快路径。
+   * 断言两件事：默认确实关掉上游 thinking_enabled；客户端显式要思考时能开回来。
+   */
+  it('provider 默认关思考时，上游收到 thinking_enabled:false', async () => {
+    const offProvider = { ...provider, deepseekThinkingOff: true } as unknown as Provider
+    const { fetchImpl, seen } = makeFetch()
+    await proxyDeepseekChatRequest({ KV: mockKV() } as unknown as Env, offProvider, {
+      model: 'deepseek-flash',
+      stream: true,
+      messages: [{ role: 'user', content: 'translate this' }],
+    }, { fetch: fetchImpl, tokens: [tokenRecord('a')], persist: false })
+    const payload = JSON.parse(seen.find((s) => s.path.endsWith('/chat/completion'))!.body)
+    expect(payload.thinking_enabled).toBe(false)
+  })
+
+  it('provider 默认关思考，但客户端显式 thinking=enabled 时仍开思考', async () => {
+    const offProvider = { ...provider, deepseekThinkingOff: true } as unknown as Provider
+    const { fetchImpl, seen } = makeFetch()
+    await proxyDeepseekChatRequest({ KV: mockKV() } as unknown as Env, offProvider, {
+      model: 'deepseek-flash',
+      stream: true,
+      thinking: { type: 'enabled' },
+      messages: [{ role: 'user', content: 'solve this' }],
+    }, { fetch: fetchImpl, tokens: [tokenRecord('a')], persist: false })
+    const payload = JSON.parse(seen.find((s) => s.path.endsWith('/chat/completion'))!.body)
+    expect(payload.thinking_enabled).toBe(true)
+  })
+
+  /**
+   * 关思考时上游偶尔仍推 THINK 片段（thinking fixture 里有）：必须丢弃，
+   * 否则客户端会收到 reasoning_content，「关思考」看起来没生效。
+   */
+  it('关思考时抑制残留的 reasoning_content 增量', async () => {
+    const { fetchImpl } = makeFetch({ completionSse: fixture('completion-thinking.sse.txt') })
+    const resp = await proxyDeepseekChatRequest({ KV: mockKV() } as unknown as Env, provider, {
+      model: 'deepseek-flash',
+      stream: true,
+      thinking: { type: 'disabled' },
+      messages: [{ role: 'user', content: 'hi' }],
+    }, { fetch: fetchImpl, tokens: [tokenRecord('a')], persist: false })
+    const out = await drainStream(resp.body as ReadableStream<Uint8Array>)
+    expect(out).not.toContain('reasoning_content')
+    // 正文与收尾照常（不能因为丢弃思考就把回答也丢了）
+    expect(out).toContain('"finish_reason":"stop"')
+    expect(out.endsWith('data: [DONE]\n\n')).toBe(true)
+  })
+
+  it('默认（思考开）时 reasoning_content 照常下发，不被误抑制', async () => {
+    const { fetchImpl } = makeFetch({ completionSse: fixture('completion-thinking.sse.txt') })
+    const resp = await proxyDeepseekChatRequest({ KV: mockKV() } as unknown as Env, provider, {
+      model: 'deepseek-flash',
+      stream: true,
+      messages: [{ role: 'user', content: 'hi' }],
+    }, { fetch: fetchImpl, tokens: [tokenRecord('a')], persist: false })
+    const out = await drainStream(resp.body as ReadableStream<Uint8Array>)
+    expect(out).toContain('reasoning_content')
+  })
 })
 
 describe('non-stream path', () => {
@@ -211,6 +270,21 @@ describe('non-stream path', () => {
     const body = await resp.json() as Record<string, any>
     expect(Array.isArray(body.choices[0].message.citations)).toBe(true)
     expect(body.choices[0].message.citations.length).toBeGreaterThan(0)
+  })
+
+  /** 非流式路径同样要在关思考时丢掉 reasoning_content（与流式同一口径）。 */
+  it('关思考时非流式响应不含 reasoning_content，且正文完整', async () => {
+    const { fetchImpl } = makeFetch({ completionSse: fixture('completion-thinking.sse.txt') })
+    const resp = await proxyDeepseekChatRequest({ KV: mockKV() } as unknown as Env, provider, {
+      model: 'deepseek-flash',
+      stream: false,
+      thinking: { type: 'disabled' },
+      messages: [{ role: 'user', content: 'hi' }],
+    }, { fetch: fetchImpl, tokens: [tokenRecord('a')], persist: false })
+    const body = await resp.json() as Record<string, any>
+    expect(body.choices[0].message.reasoning_content).toBeUndefined()
+    expect(body.choices[0].finish_reason).toBe('stop')
+    expect(typeof body.choices[0].message.content).toBe('string')
   })
 })
 

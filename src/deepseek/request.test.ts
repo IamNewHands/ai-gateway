@@ -15,6 +15,7 @@ import {
   parseDeepseekRequest,
   parseSearchSwitch,
   parseThinkingSwitch,
+  resolveDeepseekThinking,
   type DeepseekContentPart,
   type DeepseekMessage,
 } from './request'
@@ -292,6 +293,75 @@ describe('switches', () => {
     expect(() => parseThinkingSwitch({})).toThrow(/invalid "thinking" field/)
     expect(() => parseThinkingSwitch('enabled')).toThrow(/invalid "thinking" field/)
     expect(() => parseSearchSwitch({ type: 'nope' })).toThrow(/invalid "search.type" "nope"/)
+  })
+})
+
+/**
+ * provider 级「默认关思考」的优先级：**客户端显式声明 > provider 默认 > 内置默认(开)**。
+ *
+ * 事故背景：上游 thinking_enabled 缺省是开，翻译这类轻量任务白等思考时间。
+ * 但开关只能单向覆盖就成了陷阱——勾了默认关之后必须有办法在个别请求上开回来，
+ * 所以「客户端显式 enabled / 非 none 的 reasoning_effort」必须压过 provider 默认。
+ */
+describe('深度思考开关的优先级（provider 默认 vs 客户端显式声明）', () => {
+  const user = [{ role: 'user', content: 'hi' }]
+
+  it('provider 默认关：客户端没表态时关思考', () => {
+    const req = parseDeepseekRequest(body(user), { thinkingDefaultOff: true })
+    expect(req.thinkingEnabled).toBe(false)
+  })
+
+  it('provider 默认关但客户端显式要思考 → 以客户端为准（开关不能锁死功能）', () => {
+    expect(
+      parseDeepseekRequest(body(user, { thinking: { type: 'enabled' } }), { thinkingDefaultOff: true })
+        .thinkingEnabled,
+    ).toBe(true)
+    expect(
+      parseDeepseekRequest(body(user, { reasoning_effort: 'high' }), { thinkingDefaultOff: true })
+        .thinkingEnabled,
+    ).toBe(true)
+    expect(
+      parseDeepseekRequest(body(user, { reasoning: { effort: 'medium' } }), { thinkingDefaultOff: true })
+        .thinkingEnabled,
+    ).toBe(true)
+  })
+
+  it('provider 默认关 + 客户端显式关 → 仍是关', () => {
+    expect(
+      parseDeepseekRequest(body(user, { thinking: { type: 'disabled' } }), { thinkingDefaultOff: true })
+        .thinkingEnabled,
+    ).toBe(false)
+    expect(
+      parseDeepseekRequest(body(user, { reasoning_effort: 'none' }), { thinkingDefaultOff: true })
+        .thinkingEnabled,
+    ).toBe(false)
+  })
+
+  it('provider 默认关但客户端 reasoning_effort=none/minimal → 关（与 isDeepseekReasoningOff 同口径）', () => {
+    for (const effort of ['none', 'off', 'disabled', 'minimal']) {
+      expect(
+        parseDeepseekRequest(body(user, { reasoning_effort: effort }), { thinkingDefaultOff: true })
+          .thinkingEnabled,
+        `reasoning_effort=${effort} 应判为关思考`,
+      ).toBe(false)
+    }
+  })
+
+  it('provider 未设默认（undefined/false）时保持内置默认开', () => {
+    expect(parseDeepseekRequest(body(user)).thinkingEnabled).toBe(true)
+    expect(parseDeepseekRequest(body(user), { thinkingDefaultOff: false }).thinkingEnabled).toBe(true)
+    expect(parseDeepseekRequest(body(user), { thinkingDefaultOff: undefined }).thinkingEnabled).toBe(true)
+  })
+
+  it('provider 默认关时，客户端显式关思考仍然有效（两路都指向关，不能互相覆盖成开）', () => {
+    expect(resolveDeepseekThinking({ thinking: { type: 'disabled' } }, true)).toBe(false)
+    expect(resolveDeepseekThinking({}, true)).toBe(false)
+    expect(resolveDeepseekThinking({}, undefined)).toBe(true)
+  })
+
+  it('非法 thinking 值在 provider 默认关时仍报错（不被默认值掩盖）', () => {
+    expect(() => parseDeepseekRequest(body(user, { thinking: { type: 'banana' } }), { thinkingDefaultOff: true }))
+      .toThrow(/invalid "thinking.type" "banana"/)
   })
 })
 

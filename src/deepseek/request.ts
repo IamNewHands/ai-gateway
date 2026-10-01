@@ -63,6 +63,11 @@ export interface ParsedDeepseekRequest {
 export interface ParseOptions {
   /** 仅测试用：给定时期望模型名必须完全匹配。生产由 provider 配置校验。 */
   enforceModel?: string
+  /**
+   * provider 级「默认关思考」（见 Provider.deepseekThinkingOff）。
+   * 客户端显式声明优先于它；未表态时才生效。
+   */
+  thinkingDefaultOff?: boolean
 }
 
 const JUNK_FIELDS = [
@@ -259,6 +264,55 @@ export function isDeepseekReasoningOff(body: Record<string, unknown>): boolean {
   )
 }
 
+/** 客户端 `thinking` 字段的显式取值：'enabled' / 'disabled' / null（未表态或非法）。 */
+function thinkingField(body: Record<string, unknown>): 'enabled' | 'disabled' | null {
+  const thinking = body['thinking']
+  if (thinking === null || typeof thinking !== 'object' || Array.isArray(thinking)) return null
+  const type = (thinking as Record<string, unknown>).type
+  return type === 'enabled' || type === 'disabled' ? type : null
+}
+
+/** 客户端是否**显式**要求思考（用于「显式声明 > provider 默认」的优先级判定）。 */
+export function isDeepseekReasoningExplicitlyOn(body: Record<string, unknown>): boolean {
+  if (thinkingField(body) === 'enabled') return true
+  const direct = typeof body['reasoning_effort'] === 'string' ? body['reasoning_effort'] : ''
+  const reasoning = body['reasoning']
+  const nested =
+    reasoning !== null && typeof reasoning === 'object'
+      ? String((reasoning as Record<string, unknown>).effort ?? '')
+      : ''
+  // 非「关」的档位（low/medium/high/…）都是显式要求思考。
+  return [direct, nested].some((v) => {
+    const s = String(v).trim().toLowerCase()
+    return s !== '' && !['none', 'off', 'disabled', 'minimal'].includes(s)
+  })
+}
+
+/**
+ * 解析「本次是否思考」，按 **客户端显式声明 > provider 默认 > 内置默认(开)** 排序。
+ *
+ * 为什么要 provider 默认：上游 `thinking_enabled` 缺省是开，思考期首字节明显更慢。
+ * 轻量任务（翻译/改写/分类）希望整条 provider 默认走快路径，而不是要求每个客户端
+ * 各自发 `thinking:{type:"disabled"}`。
+ *
+ * 为什么客户端显式「开」必须压过 provider 默认：否则用户勾了默认关思考后，
+ * 就再也没法在个别请求上开思考——一个只能单向覆盖的开关等于把功能锁死。
+ *
+ * 注意：`thinking` 字段的合法性由 `parseDeepseekRequest` 里的 `parseThinkingSwitch`
+ * 负责报错，这里只做优先级判定，不重复校验。
+ */
+export function resolveDeepseekThinking(
+  body: Record<string, unknown>,
+  providerDefaultOff: boolean | undefined,
+): boolean {
+  // 客户端显式关：thinking.type=disabled，或 reasoning_effort/reasoning.effort ∈ {none,off,disabled,minimal}
+  if (thinkingField(body) === 'disabled' || isDeepseekReasoningOff(body)) return false
+  // 客户端显式开：thinking.type=enabled，或非 none 的 reasoning 档位
+  if (isDeepseekReasoningExplicitlyOn(body)) return true
+  // 客户端未表态：provider 默认关思考则关，否则沿用上游内置默认（开）。
+  return providerDefaultOff !== true
+}
+
 /** 解析并净化 `/v1/chat/completions` 请求体。 */export function parseDeepseekRequest(
   body: unknown,
   options: ParseOptions = {},
@@ -310,6 +364,10 @@ export function isDeepseekReasoningOff(body: Record<string, unknown>): boolean {
     typeof raw.max_completion_tokens === 'number' ? raw.max_completion_tokens : 0,
   )
 
+  // thinking 字段本身必须先校验合法性（非法值报错，与 Go 版一致），
+  // 再按优先级解析最终取值——校验与取值分开，避免非法值被默认值悄悄掩盖。
+  parseThinkingSwitch(raw.thinking)
+
   return {
     model,
     messages: sanitized.messages,
@@ -317,7 +375,7 @@ export function isDeepseekReasoningOff(body: Record<string, unknown>): boolean {
     temperature: typeof raw.temperature === 'number' ? raw.temperature : 0,
     topP: typeof raw.top_p === 'number' ? raw.top_p : 0,
     maxTokens,
-    thinkingEnabled: parseThinkingSwitch(raw.thinking),
+    thinkingEnabled: resolveDeepseekThinking(raw, options.thinkingDefaultOff),
     searchEnabled: parseSearchSwitch(raw.search),
     stripped: sanitized.stripped,
   }

@@ -425,7 +425,7 @@ export interface DeepseekCompletion {
  */
 export function aggregateDeepseekSse(
   raw: string,
-  opts: { id: string; model: string },
+  opts: { id: string; model: string; suppressReasoning?: boolean },
 ): { response: DeepseekCompletion; state: DeepseekInterpreterState; truncated: boolean } {
   const it = new DeepseekSSEInterpreter()
   it.feed(raw)
@@ -437,7 +437,8 @@ export function aggregateDeepseekSse(
     role: 'assistant',
     content: state.text,
   }
-  if (state.reasoning) message.reasoning_content = state.reasoning
+  // 关思考时不回填 reasoning_content（与流式路径同一口径：不把思考漏给明确关掉它的客户端）。
+  if (state.reasoning && opts.suppressReasoning !== true) message.reasoning_content = state.reasoning
   if (state.searchResults.length > 0) message.citations = state.searchResults
 
   return {

@@ -111,7 +111,7 @@ export async function proxyDeepseekChatRequest(
 ): Promise<Response> {
   let parsed: ParsedDeepseekRequest
   try {
-    parsed = parseDeepseekRequest(body)
+    parsed = parseDeepseekRequest(body, { thinkingDefaultOff: provider.deepseekThinkingOff === true })
   } catch (err) {
     if (err instanceof DeepseekRequestError) return jsonError(400, err.message)
     throw err
@@ -176,7 +176,11 @@ export async function proxyDeepseekChatRequest(
 
       if (parsed.stream) {
         return new Response(
-          deepseekSSEToOpenAIStream(upstream.body as ReadableStream<Uint8Array>, { id: newId(), model }),
+          deepseekSSEToOpenAIStream(upstream.body as ReadableStream<Uint8Array>, {
+            id: newId(),
+            model,
+            suppressReasoning: !parsed.thinkingEnabled,
+          }),
           {
             status: 200,
             headers: {
@@ -189,7 +193,11 @@ export async function proxyDeepseekChatRequest(
       }
 
       const raw = await collectUpstream(upstream)
-      const { response, state, truncated } = aggregateDeepseekSse(raw, { id: newId(), model })
+      const { response, state, truncated } = aggregateDeepseekSse(raw, {
+        id: newId(),
+        model,
+        suppressReasoning: !parsed.thinkingEnabled,
+      })
       if (state.contentFilter) {
         return jsonError(400, `上游拒绝该提示词（content_filter）：${state.contentFilter}`, 'invalid_request_error', 'content_filter')
       }

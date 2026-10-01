@@ -72,6 +72,18 @@ export interface Provider {
    * 客户端已显式声明 reasoning_effort / reasoning.effort 时一律不覆盖；none = 显式关思考。
    */
   reasoningEffort?: string
+  /**
+   * DeepSeek App 提供商级「默认关闭深度思考」（仅 deepseek-app 消费）。
+   *
+   * 上游 `thinking_enabled` 缺省是**开**，思考期间静默期长、首字节慢。轻量任务
+   * （翻译、改写、分类）勾上这个开关即可整条 provider 默认走快路径，无需每个客户端
+   * 各自发 `thinking:{type:"disabled"}`。
+   *
+   * 优先级：**客户端显式声明 > 本开关 > 内置默认（开）**。客户端发
+   * `thinking:{type:"enabled"}` 或非 none 的 `reasoning_effort` 时本开关不生效——
+   * 否则用户无法在需要时单独开思考。
+   */
+  deepseekThinkingOff?: boolean
   /** 按模型覆盖 reasoningEffort（key = 模型 ID）。仅 opencode 提供商消费。 */
   reasoningEffortByModel?: Record<string, string>
   createdAt: string
@@ -443,6 +455,8 @@ export interface CreateProviderRequest {
   /** OpenCode 提供商默认 reasoning 档位（见 Provider.reasoningEffort） */
   reasoningEffort?: string
   reasoningEffortByModel?: Record<string, string>
+  /** DeepSeek App 提供商级默认关闭深度思考（见 Provider.deepseekThinkingOff） */
+  deepseekThinkingOff?: boolean
   thinkingInject?: string[]
   cachePrefixInject?: string[]
   geminiBaseUrl?: string
@@ -479,6 +493,8 @@ export interface UpdateProviderRequest {
   /** OpenCode 默认 reasoning 档位（传 null/'' 清除） */
   reasoningEffort?: string | null
   reasoningEffortByModel?: Record<string, string> | null
+  /** DeepSeek App 默认关闭深度思考（传 false/null 关闭该默认） */
+  deepseekThinkingOff?: boolean | null
   /** 传空数组可清空思维引导注入选择 */
   thinkingInject?: string[] | null
   /** 传空数组可清空缓存前缀注入选择 */
@@ -523,6 +539,8 @@ export interface UpsertProviderRequest {
   allowUnlistedModels?: boolean
   reasoningEffort?: string
   reasoningEffortByModel?: Record<string, string>
+  /** DeepSeek App 默认关闭深度思考（见 Provider.deepseekThinkingOff） */
+  deepseekThinkingOff?: boolean
   thinkingInject?: string[]
   cachePrefixInject?: string[]
   geminiBaseUrl?: string

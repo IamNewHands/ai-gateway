@@ -27,6 +27,14 @@ export interface DeepseekStreamOptions {
   model: string
   /** 静默窗口（ms）。默认 180s。 */
   idleTimeoutMs?: number
+  /**
+   * 客户端/provider 已声明不要思考：抑制任何残留的 THINK 增量。
+   *
+   * 为什么需要这层兜底：上游偶尔在 `thinking_enabled:false` 时仍推 THINK 片段
+   * （移植自 simple-chat 的同名处理：宁可丢弃，也不要把 reasoning_content 漏给
+   * 明确关掉思考的客户端——那会让「关思考」看起来没生效）。与 Go 版行为一致。
+   */
+  suppressReasoning?: boolean
   /** 流结束（正常或异常）后的回调，用于日志/用量统计。 */
   onFinish?: (info: { state: DeepseekInterpreterState; ok: boolean; reason: string }) => void
 }
@@ -71,20 +79,25 @@ export function deepseekSSEToOpenAIStream(
   let finished = false
 
   interpreter.onDelta((d) => {
+    // 关思考时丢掉 THINK 增量（上游偶尔在 thinking_enabled:false 下仍推）。
+    const reasoning = opts.suppressReasoning ? '' : d.reasoning
     if (!roleSent) {
+      // 首块若被抑制后什么都不剩，就**不要**占用 role 位——否则会先发一条空
+      // delta 再发正文，严格客户端会把空 role 块当成「已开始回答」。
+      if (!reasoning && !d.text) return
       roleSent = true
       pending.push(
         openAIDeepseekChunk({
           id: opts.id,
           model: opts.model,
           role: 'assistant',
-          reasoning: d.reasoning,
+          reasoning,
           content: d.text,
         }),
       )
       return
     }
-    if (d.reasoning) pending.push(openAIDeepseekChunk({ id: opts.id, model: opts.model, reasoning: d.reasoning }))
+    if (reasoning) pending.push(openAIDeepseekChunk({ id: opts.id, model: opts.model, reasoning }))
     else if (d.text) pending.push(openAIDeepseekChunk({ id: opts.id, model: opts.model, content: d.text }))
   })
 
