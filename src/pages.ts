@@ -149,6 +149,11 @@ function opencodeEffortSelectHtml(selectId: string, selected: string | undefined
 // 注入为页面 script 常量，消除服务端/客户端两套重复预设表。
 const PROVIDER_PRESETS: Record<string, { name: string; id: string; baseUrl: string; apiType: string; authType?: string; oauthPreset?: string; models?: string[]; toolBridge?: boolean; type?: 'kuku'; kukuThinkMode?: number }> = {
   deepseek:     { name: 'DeepSeek',           id: 'deepseek',     baseUrl: 'https://api.deepseek.com',                          apiType: 'openai' },
+  // DeepSeek App：凭据不是 API Key，而是浏览器里取的 userToken（token 注入型，见 DEEPSEEK-APP-PORT.md）。
+  // 上游只有一个模型，预置填好避免用户手填错 ID / 地址（两处判定见 isDeepseekAppProviderUI）。
+  'deepseek-app': { name: 'DeepSeek App (token 注入)', id: 'deepseek-app', baseUrl: 'https://chat.deepseek.com', apiType: 'openai',
+    models: ['deepseek-flash'],
+  },
   openai:       { name: 'OpenAI',             id: 'openai',       baseUrl: 'https://api.openai.com/v1',                         apiType: 'openai' },
   anthropic:    { name: 'Anthropic',          id: 'anthropic',    baseUrl: 'https://api.anthropic.com',                         apiType: 'anthropic' },
   zhipu:        { name: '智谱 AI',             id: 'zhipu',        baseUrl: 'https://open.bigmodel.cn/api/paas/v4',              apiType: 'openai' },
@@ -1834,6 +1839,10 @@ function applyProviderPreset(name) {
     // TRAE SOLO：Key 区填登录凭证（登录后自动写入），预填实测模型
     applyTraeKeyHint(true)
     if (p.models && p.models.length) fillPresetModels(p.models)
+  } else if (p.id === 'deepseek-app') {
+    // token 注入型：创建时这里没有 Key 可填，凭据要创建后到详情页的面板里注入
+    applyDeepseekKeyHint(true)
+    if (p.models && p.models.length) fillPresetModels(p.models)
   } else {
     applyClineKeyHint(false)
   }
@@ -1888,6 +1897,17 @@ function applyTraeKeyHint(on) {
   if (hint) hint.textContent = on ? 'TRAE SOLO 账号凭证为登录后自动写入的 JSON（也可粘贴 trae 登录脚本落盘的 trae-*.json 内容）。每个账号一行；创建后点「登录账号」可一键登录，额度用尽自动冷却轮换。' : ''
   const legend = document.getElementById('akey-legend')
   if (legend) legend.textContent = on ? 'TRAE 账号凭证（每个账号一行 JSON）' : '上游 API Keys'
+}
+/**
+ * DeepSeek App：凭据不是 API Key 而是浏览器里取的 userToken。
+ * 创建表单里没有注入入口（面板只在已存在的提供商详情页渲染），所以这里必须
+ * 明确说「留空即可，创建后去详情页面板注入」，否则用户会以为漏填了 Key。
+ */
+function applyDeepseekKeyHint(on) {
+  const hint = document.getElementById('akey-hint')
+  if (hint) hint.textContent = on ? '这里留空——DeepSeek App 不用 API Key，凭据是浏览器里取的 userToken。点「创建提供商」后，展开该提供商，在「DeepSeek App token 池」面板里按四步指引注入并判活。' : ''
+  const legend = document.getElementById('akey-legend')
+  if (legend) legend.textContent = on ? '上游 API Keys（DeepSeek App 留空，创建后在详情页注入 token）' : '上游 API Keys'
 }
 
 /**

@@ -333,3 +333,35 @@ describe('DeepSeek App token 注入面板', () => {
     for (const s of inlineScripts(html)) expect(() => new Function(s)).not.toThrow()
   })
 })
+
+/**
+ * 「厂商预设」下拉里必须有 deepseek-app。
+ *
+ * 事故背景（2026-09-30 线上）：deepseek-app 的 token 注入面板只在**已存在的**提供商
+ * 详情页渲染，而它当时没被加进 PROVIDER_PRESETS —— 于是「添加提供商」界面上根本没有
+ * 这个入口，用户无从创建，功能等于不可用。这类「模块齐了但入口没接」的缺口不会被
+ * 类型检查发现，只能由断言下拉内容来兜住。
+ */
+describe('厂商预设下拉必须包含 deepseek-app（添加入口不可缺失）', () => {
+  it('SSR 下拉里出现 DeepSeek App 选项', async () => {
+    const html = await render([deepseekProvider()])
+    // 预设 select 的 option 由 PROVIDER_PRESETS 渲染，value 用预设键名
+    expect(html).toContain('<option value="deepseek-app">')
+    expect(html).toContain('DeepSeek App')
+  })
+
+  it('预置了唯一的模型 deepseek-flash，避免用户手填错 ID', async () => {
+    const js = inlineScripts(await render([deepseekProvider()])).join('\n')
+    // 预设数据注入到客户端脚本，供 applyProviderPreset 消费
+    expect(js).toContain('"deepseek-app"')
+    expect(js).toContain('deepseek-flash')
+    // 选中预设后要给出「创建后去详情页注入 token」的提示，而不是让 Key 留空无解释
+    expect(js).toContain('function applyDeepseekKeyHint')
+  })
+
+  it('选中预设后填好 ID / 地址，创建时无需手填', async () => {
+    const js = inlineScripts(await render([deepseekProvider()])).join('\n')
+    // baseUrl 必须落在 isDeepseekAppProviderUI / isDeepseekAppProvider 的判定域内
+    expect(js).toContain('https://chat.deepseek.com')
+  })
+})
