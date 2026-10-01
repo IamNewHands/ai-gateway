@@ -233,6 +233,13 @@ DSH 的 retry policy 是 `initialDelayMs=500` + `jitterRatio=0.1`（`dsh-llm/lib
 
 ### 已知缺口
 
+- **上下文超限不是账号故障**（2026-10-01，`isTraeRequestSideError` 扩充）：上游把上下文超限
+  报成 400/413（措辞 `context_length_exceeded` / `context_window_exceeded` /
+  `model_context_window_exceeded` / `prompt_too_long` / `prompt is too long` /
+  `maximum context length`）。此前这些落 `client` → `noteTraeError` 累计 3 次冷却账号
+  10 分钟，把「该缩短请求」误报成「账号坏了」。现与 `4027 invalid_parameter` 同判为
+  `client_params`：**4xx 终态原样回传、不罚号、不轮转**（同一 body 换任何账号必撞同一上限）。
+  判据仍刻意收窄——无关 4xx 依旧是 `client`，见 `src/trae/request-side.test.ts`。
 - ~~`/v1/responses`（Responses API）无 TRAE 分支~~ **已支持**：`handleResponses` 内加
   `isTraeProvider` / `isClineProvider` 分支，复用 `handleResponsesSpecial`（OpenAI 请求体 →
   专门转发函数拿 OpenAI SSE → `openAIChunkToResponsesSSE` 转 Responses SSE / `aggregateOpenAIToResponses` 聚合）。

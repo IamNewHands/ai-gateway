@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest'
-import { isTraeRequestSideError } from './upstream'
+import { classifyTraeError, isTraeRequestSideError } from './upstream'
 import { readTraePool } from './pool'
 import { proxyTraeChatRequest } from './proxy'
 
@@ -64,6 +64,22 @@ describe('isTraeRequestSideError：请求侧错误判据（同一 body 换任何
     expect(isTraeRequestSideError(500, 'internal error')).toBe(false)
     expect(isTraeRequestSideError(401, 'token expired')).toBe(false)
   })
+
+  it('上下文超限判为请求侧（换账号必撞同一上限，罚号会把健康池刷空）', () => {
+    expect(isTraeRequestSideError(400, '{"code":400,"message":"context_length_exceeded: reduce the length of the messages"}')).toBe(true)
+    expect(isTraeRequestSideError(400, 'model_context_window_exceeded')).toBe(true)
+    expect(isTraeRequestSideError(400, 'context_window_exceeded')).toBe(true)
+    expect(isTraeRequestSideError(400, 'prompt_too_long')).toBe(true)
+    expect(isTraeRequestSideError(413, 'Prompt is too long: 210000 tokens')).toBe(true)
+    expect(isTraeRequestSideError(400, 'maximum context length is 200000 tokens')).toBe(true)
+  })
+
+  it('判据保持收窄：无关 4xx 仍归账号侧 client（不吞掉真故障）', () => {
+    expect(classifyTraeError(400, '{"code":400,"message":"unknown_field"}')).toBe('client')
+    expect(classifyTraeError(400, 'rate limit on this model')).toBe('client')
+    // 分类不变：超限走 client_params（4xx 终态、不罚号），不是 client
+    expect(classifyTraeError(400, 'context_length_exceeded')).toBe('client_params')
+  })
 })
 
 describe('TRAE 请求侧错误：不罚号、不轮转（对齐 WorkBuddy bad_params 语义）', () => {
@@ -124,6 +140,69 @@ describe('TRAE 请求侧错误：不罚号、不轮转（对齐 WorkBuddy bad_pa
       const pool = await readTraePool(env, PROVIDER_ID)
       expect(pool[UID]?.errCount ?? 0).toBe(0)
       expect(pool[UID]?.until ?? 0).toBe(0)
+    } finally {
+      globalThis.fetch = originalFetch
+    }
+  })
+
+  it('HTTP 400 上下文超限 → 4xx 终态（invalid_request_error）且不罚号', async () => {
+    const originalFetch = globalThis.fetch
+    let soloCalls = 0
+    globalThis.fetch = async (input: any) => {
+      if (String(input).includes('/api/agent/v3/llm_utils_chat')) {
+        soloCalls++
+        return new Response(JSON.stringify({
+          code: 400,
+          message: 'context_length_exceeded: reduce the length of the messages',
+        }), { status: 400, headers: { 'Content-Type': 'application/json' } })
+      }
+      return new Response('not found', { status: 404 })
+    }
+    try {
+      const env = makeEnv()
+      const provider = makeProvider()
+      const resp = await proxyTraeChatRequest(env, provider, {
+        model: 'glm-5.2',
+        messages: [{ role: 'user', content: 'hi' }],
+        stream: false,
+      })
+      // 终态 4xx：换账号无用（同一 body 必撞同一上下文上限）→ 不轮转
+      expect(resp.status).toBe(400)
+      expect(soloCalls).toBe(1)
+      const body = await resp.json() as any
+      expect(body?.error?.type).toBe('invalid_request_error')
+      expect(body?.error?.code).toBe('client_params')
+      // 不罚号（这是本修复的目的：超限不再把健康账号冷却 10 分钟）
+      const pool = await readTraePool(env, PROVIDER_ID)
+      expect(pool[UID]?.errCount ?? 0).toBe(0)
+      expect(pool[UID]?.until ?? 0).toBe(0)
+    } finally {
+      globalThis.fetch = originalFetch
+    }
+  })
+
+  it('HTTP 413 上下文超限 → 保留 413 状态码（不降级成 400）', async () => {
+    const originalFetch = globalThis.fetch
+    globalThis.fetch = async (input: any) => {
+      if (String(input).includes('/api/agent/v3/llm_utils_chat')) {
+        return new Response(JSON.stringify({ message: 'Prompt is too long: 210000 tokens' }), {
+          status: 413,
+          headers: { 'Content-Type': 'application/json' },
+        })
+      }
+      return new Response('not found', { status: 404 })
+    }
+    try {
+      const env = makeEnv()
+      const provider = makeProvider()
+      const resp = await proxyTraeChatRequest(env, provider, {
+        model: 'glm-5.2',
+        messages: [{ role: 'user', content: 'hi' }],
+        stream: false,
+      })
+      expect(resp.status).toBe(413)
+      const pool = await readTraePool(env, PROVIDER_ID)
+      expect(pool[UID]?.errCount ?? 0).toBe(0)
     } finally {
       globalThis.fetch = originalFetch
     }

@@ -11,21 +11,38 @@ import type { TraeAccount, TraeCreditsSnapshot, TraeEntPackInfo, TraeEntUsageDet
 const sessionDeadMarkers = ['login', 'token 失效', 'token invalid', 'session', 'unauthorized', '401']
 
 /**
+ * 上下文超限文案例外（OpenAI / Trae 两种口径的实测措辞）。
+ *
+ * 与 `invalid_parameter` 同性质：同一 body 换任何账号都会超限，属**请求侧**问题。
+ * 若不认，上游 400/413 会落 `client` → `noteTraeError` 累计 3 次冷却账号 10 分钟
+ * （`proxy.ts` applyChatError 的 default 分支），即把「该缩短请求」误导成「账号坏了」。
+ */
+const contextOverflowMarkers = [
+  'context_length_exceeded',
+  'context_window_exceeded', // 覆盖 model_context_window_exceeded
+  'prompt_too_long',
+  'prompt is too long',
+  'maximum context length',
+]
+
+/**
  * 是否为**请求侧**错误（同一 body 换任何账号都会撞同一个校验）。
  *
  * 判据（对齐 WorkBuddy 通路 bad_params / prompt_too_long / image_invalid 的哲学：
  * 请求的问题不是账号的问题——轮转只会白扔健康号配额，罚号更会把整个池刷成不可用）：
  *  - SOLO 业务码 4027：上游参数校验失败（实测 `developer` 角色被拒时返回
  *    `tool call failed: invalid_parameter_error:developer is not one of [...]`）；
- *  - 文案含 `invalid_parameter` / `invalid parameter`（HTTP 形态的同类错误）。
+ *  - 文案含 `invalid_parameter` / `invalid parameter`（HTTP 形态的同类错误）；
+ *  - 文案含 `contextOverflowMarkers` 之一（上下文超限，见上）。
  *
- * **刻意只认这两条**：账号级故障（1005 plan / 4008 配额 / 401 session / 429 限流 / 5xx）
+ * **刻意只认这三类**：账号级故障（1005 plan / 4008 配额 / 401 session / 429 限流 / 5xx）
  * 全部不命中，罚号与轮转语义保持不变。
  */
 export function isTraeRequestSideError(code: number, msg: string): boolean {
   if (code === 4027) return true
   const lower = String(msg || '').toLowerCase()
-  return lower.includes('invalid_parameter') || lower.includes('invalid parameter')
+  if (lower.includes('invalid_parameter') || lower.includes('invalid parameter')) return true
+  return contextOverflowMarkers.some((m) => lower.includes(m))
 }
 
 /** 按 HTTP 状态码 + body 判定错误类别。 */
