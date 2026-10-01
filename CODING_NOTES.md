@@ -353,13 +353,50 @@ TRAE 思考模型在推理阶段可能 15~20s 不发数据，客户端（AI SDK 
   （一次 144000 难度约 0.3-0.5s CPU）。
 - 补全请求体字段序 = App 的 kotlinx descriptor 序，属于设备指纹的一部分，**不要改成 Map 或排序**。
 
-### 已知缺口（与 trae/kuku 同现状，非本轮引入）
+### 已知缺口
 
-- 特殊 provider 分支不走 `finalizeProxyResponse`，因此**不写 analytics usage**（trae 也一样）。
-- 图片理解（`image_url` → `upload_file` → `fetch_files` → `ref_file_ids`）只完成了**客户端侧**
-  （`client.ts` 的 `uploadFile` / `fileStatus` / `uploadImageAndWait`）：`request.ts` 已提取图片片段、
-  `flattenMessages` 有意跳过它们，但「请求里的图片 → 上传 → `ref_file_ids`」这条线还没接。
+- ~~特殊 provider 分支不走 `finalizeProxyResponse`，因此**不写 analytics usage**（trae 也一样）。~~
+  **2026-10-01 实测纠正**：deepseek 分支**确实**走 `finalizeProxyResponse`（`handleProxy` 统一出口），
+  用量正常落库。原判断是凭印象写的，已补 3 例回归测试钉住（`dispatch.test.ts` 的「analytics 用量落库」）。
+  教训：缺口清单也要有断言兜着，否则会照着错误清单返工。
 - 独立 `/v1/web_search` 端点未做（有意）：搜索 hits 已随 chat 响应的 `citations` 返回。
+
+### 风控 park（2026-10-01 接线，**这是本 provider 最重要的安全阀**）
+
+- **为什么必须有**：上游对禁言/封禁账号有「再次违规就加重」的行为。不 park 的话下一次请求会继续挑到
+  同一账号，上游看到它又来了就**续期窗口甚至升级处罚**（simple-chat 注释里的实测：6h 禁言 → 3 天封禁）。
+- 映射：biz **10** → `banned`（**永久**，只能人工解除）；biz **5** → `muted`（用上游 `mute_until`，
+  缺失或已过期退化为 **6h** 兜底）；biz **11** → `risk`（固定 **10min** 冷却）。常量在 `pool.ts`。
+- **处罚判定必须优先于鉴权判定**：biz 5/10/11 的信封常带「login」类文案，若先走 `isAuthFailure`
+  就会把账号标 `expired` 而**不 park**，下一次请求又打上去，处罚形同虚设。`proxy.ts` 里每个 catch
+  都先 `parkFromError(err)` 再判 `isAuthFailure`。
+- park 的账号**零流量**，包括后台维护：`sessions.ts` 的 `readyTokens` 也过滤 park
+  （对应 Go 的 `TestCleanupSkipsParkedAccounts`）。只要还有一条后台路径碰它，park 就等于没做。
+- 自然解禁：`muted`/`risk` 到期自动回到轮转；`clearExpiredDeepseekParks` 会把过期 park 从 KV 清掉
+  （**必须回写**，否则重启会把过期 park 重新装载）。`markDeepseekToken({ok:true})` 也清 park。
+- 客户端错误形状（对齐 Go `writeUpstreamError`）：banned **502** `account_banned`；muted **429**
+  `account_muted` + `Retry-After`（按真实 `mute_until` 算，兜底 60s、上限 24h）；risk **503**
+  `upstream_unavailable`（账号在冷却但网关继续服务，客户端该重试而不是以为请求有问题）。
+- 面板：池表格显示处罚状态与解禁时刻，「解除停用」按钮走 `POST /admin/api/deepseek/:id/tokens/unpark`。
+  封禁是永久 park，**这个按钮是唯一出路**（否则只能删掉重新去浏览器取 token）。
+
+### 图片理解（2026-10-01 接线）
+
+- `src/deepseek/images.ts`：data URL 就地解码 / http(s) 服务端抓取（10MB 上限、30s 超时、MIME→后缀）。
+  上传文件名**必须带受支持后缀**——上游按后缀判类型，不看 part 的 MIME。
+- 图片在**取号之前**解析：抓外部图床的耗时不能占着池槽位。上传在 attempt 内做，file id 进 `ref_file_ids`。
+- 失败语义：抓取失败 → 400 `image_fetch_failed`（且零出站）；上传失败 → 502 `upload_failed`，
+  **不**标 token 失效（账号没问题，只是这张图没上去）。
+- **与 Go 版的有意差异**：Go 的 `decodeDataURL` 对「不受支持 MIME / base64 损坏 / 超 10MB」静默跳过，
+  这与它自己「绝不静默丢图」的契约矛盾（静默丢图会产出一个「客户端以为带了图」的回答）。本仓按契约报错。
+
+### 其它两条本轮补上的护栏
+
+- **超长 prompt**：`assertPromptLength`（上限 200 万字符）在**取号之前**校验，回 400
+  `context_length_exceeded`。不校验的话客户端拿到的是归因错误的 502「上游出错」，而真因是请求太长。
+  口径按 JS 字符串长度（UTF-16 code unit），与 Go 的字节数**不同**（中文 Go 会先触发）——这是有意的，别「修」。
+- **SSE 心跳**：deepseek 流式响应已包 `withSSEKeepAlive`（8s 心跳 / 180s idle 兜底）。开着思考时
+  首字节前静默可以很久，不包会被中间层或严格客户端判成断流。日志写在包裹**之前**。
 
 ### 分发点与后台维护（2026-09-30 补齐）
 

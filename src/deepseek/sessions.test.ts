@@ -9,6 +9,7 @@ import { describe, it, expect, beforeEach } from 'vitest'
 import type { Env } from '../types'
 import { BizError, DeepseekClient } from './client'
 import { writeDeepseekPool, type DeepseekTokenRecord } from './pool'
+import { isDeepseekTokenParked } from './pool'
 import { webHeaders } from './proxy'
 import {
   DEEPSEEK_CLEANUP_DEFAULT_FLOOR,
@@ -84,6 +85,11 @@ interface FakeUpstreamInit {
   authFailTokens?: string[]
   /** 永远 has_more=true（测分页上限）。 */
   alwaysHasMore?: boolean
+  /** fetch_page 回指定 biz_code（测处罚：5 禁言 / 10 封禁 / 11 设备风险）。 */
+  listBizCode?: number
+  listBizMsg?: string
+  /** fetch_page 回信封里带 mute_until（biz 5 时上游可能给窗口）。 */
+  listMuteUntil?: string
 }
 
 /** 假上游：fetch_page 游标抽屉 + delete / delete_all 记账。 */
@@ -105,6 +111,19 @@ function fakeUpstream(init: FakeUpstreamInit = {}) {
       if (!token) throw new Error('fake upstream: fetch_page without token')
       if (init.authFailTokens?.includes(token)) return json(envelope(null, 0, 40003))
       if (init.failListTokens?.includes(token)) return new Response('upstream down', { status: 500 })
+      if (init.listBizCode) {
+        return json(
+          JSON.stringify({
+            code: 0,
+            msg: '',
+            data: {
+              biz_code: init.listBizCode,
+              biz_msg: init.listBizMsg ?? 'refused',
+              biz_data: init.listMuteUntil ? { mute_until: init.listMuteUntil } : null,
+            },
+          }),
+        )
+      }
       state.pageQueries.push(url.search)
       if (init.alwaysHasMore) {
         // 永远 has_more 且每页同一条（Go 的 bounded-walk 测试同形）
@@ -679,6 +698,74 @@ describe('runSessionCleanup', () => {
     })
     expect(res.outcomes).toEqual([])
     expect(up.state.listCalls).toBe(0)
+  })
+
+  /**
+   * 被上游处罚 park 的账号必须收到**零**后台流量（Go 版
+   * `TestCleanupSkipsParkedAccounts` 的契约）。
+   *
+   * 为什么这条比「跳过 expired」更关键：后台维护也会打上游，而被禁言的账号每被碰一次
+   * 都可能让上游续期窗口甚至升级处罚。park 的全部意义就是让这个账号彻底冷下来——
+   * 只要还有一条后台路径碰它，park 就等于没做。
+   */
+  it('被 park 的 token 收到零后台流量（禁言账号必须彻底冷下来）', async () => {
+    const up = fakeUpstream({ sessions: eightOldestFirst() })
+    const res = await runSessionCleanup(mockEnv(mockKV()), {
+      tokens: [{ ...rec('a'), park: { kind: 'muted', until: Date.now() + 3600_000, reason: 'muted', at: Date.now() } }],
+      fetch: up.fetch,
+      schedule: false,
+      probability: 1,
+      random: () => 0,
+    })
+    expect(res.outcomes).toEqual([])
+    expect(up.state.listCalls).toBe(0)
+  })
+
+  it('永久封禁的 token 同样零后台流量', async () => {
+    const up = fakeUpstream({ sessions: eightOldestFirst() })
+    const res = await runSessionCleanup(mockEnv(mockKV()), {
+      tokens: [{ ...rec('a'), park: { kind: 'banned', reason: 'USER_IS_BANNED', at: Date.now() } }],
+      fetch: up.fetch,
+      schedule: false,
+      probability: 1,
+      random: () => 0,
+    })
+    expect(res.outcomes).toEqual([])
+    expect(up.state.listCalls).toBe(0)
+  })
+
+  it('park 已过期则重新参与维护（自然解禁）', async () => {
+    const up = fakeUpstream({ sessions: eightOldestFirst() })
+    const res = await runSessionCleanup(mockEnv(mockKV()), {
+      tokens: [{ ...rec('a'), park: { kind: 'muted', until: Date.now() - 1000, reason: 'stale', at: 1 } }],
+      fetch: up.fetch,
+      schedule: false,
+      probability: 1,
+      random: () => 0,
+    })
+    expect(res.outcomes).toHaveLength(1)
+    expect(up.state.listCalls).toBeGreaterThan(0)
+  })
+
+  /** 后台维护撞上处罚也要 park：否则下一轮维护还会选中它，继续把窗口续下去。 */
+  it('维护期间遇到 biz 5 禁言 → park 该 token（持久化到池）', async () => {
+    const kv = mockKV()
+    const env = mockEnv(kv)
+    const up = fakeUpstream({
+      sessions: eightOldestFirst(),
+      listBizCode: 5,
+      listBizMsg: 'user is muted',
+    })
+    await writeDeepseekPool(env, [rec('a')])
+
+    const res = await runSessionCleanup(env, { fetch: up.fetch, schedule: false, probability: 1, random: () => 0 })
+    expect(res.outcomes).toHaveLength(1)
+
+    const stored = (JSON.parse(kv.map.get('deepseek:pool')!) as { tokens: DeepseekTokenRecord[] }).tokens[0]
+    expect(stored.park?.kind).toBe('muted')
+    expect(isDeepseekTokenParked(stored)).toBe(true)
+    // 没被误标成失效：处罚不是鉴权问题
+    expect(stored.state).toBe('ready')
   })
 
   it('interval=0（DEEPSEEK_CLEANUP_INTERVAL=0）→ 关闭，不发起任何请求', async () => {

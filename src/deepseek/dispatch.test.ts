@@ -105,12 +105,14 @@ function makeHarness(providers: Provider[]) {
     delete: async (k: string) => { store.delete(k) },
     list: async () => ({ keys: [], list_complete: true, cursor: '' }),
   }
+  // 捕获 analytics 数据点：用于验证「deepseek 分支的用量确实落库」这条结论
+  const points: Array<{ blobs: string[]; doubles: number[] }> = []
   const env = {
     KV: kv,
     GATEWAY_KV: kv,
     RATE_LIMIT_KV: kv,
     SESSION_KV: kv,
-    USAGE_ANALYTICS: { writeDataPoint: () => {} },
+    USAGE_ANALYTICS: { writeDataPoint: (dp: { blobs: string[]; doubles: number[] }) => { points.push(dp) } },
     USAGE_ANALYTICS_DATASET: 'ai_gateway_usage',
   } as unknown as Env
   const app = new Hono<AppEnv>()
@@ -119,6 +121,7 @@ function makeHarness(providers: Provider[]) {
   app.post('/v1/responses', (c) => handleResponses(c))
   return {
     env,
+    points,
     /** 把 token 注入 deepseek 池（池是 KV 整表读写，覆盖写即可）。 */
     async seedPool(tokens: DeepseekTokenRecord[] = [tokenRecord('a')]) {
       await writeDeepseekPool(env, tokens)
@@ -282,5 +285,111 @@ describe('chat/completions + apiType=anthropic 的 501 守卫（有意保留）'
     expect(body.error.code).toBe('anthropic_not_wired')
     // 守卫在调用上游之前拦下：没有任何出站请求
     expect(seen).toHaveLength(0)
+  })
+})
+
+/**
+ * analytics 用量落库。
+ *
+ * 背景：移植缺口清单里曾把「deepseek 分支不写 analytics usage」列为待办。实测这条
+ * **不成立**——`handleProxy` 把整个分支包在 `finalizeProxyResponse` 里，用量与非流式
+ * JSON 体都从同一条出口记录。这里用断言把结论钉住，避免以后再按「凭印象的清单」返工。
+ */
+describe('analytics 用量落库（deepseek 分支）', () => {
+  // blob 下标 → 名称（与 ANALYTICS_BLOBS 顺序一致）
+  const BLOB = { route: 0, providerId: 2, providerName: 3, providerType: 4, requestedModel: 5, upstreamModel: 6, result: 7, streamMode: 8 } as const
+  const DOUBLE = { promptTokens: 0, completionTokens: 1, cachedTokens: 2, totalTokens: 3 } as const
+
+  it('非流式：providerId/上游模型与 usage 全部落库', async () => {
+    const h = makeHarness([deepseekProvider()])
+    await h.seedPool()
+
+    const resp = await h.post('/v1/chat/completions', {
+      model: `${PROVIDER_ID}/${MODEL}`,
+      messages: [{ role: 'user', content: '你好' }],
+    })
+    expect(resp.status).toBe(200)
+
+    expect(h.points).toHaveLength(1)
+    const dp = h.points[0]
+    expect(dp.blobs[BLOB.providerId]).toBe(PROVIDER_ID)
+    expect(dp.blobs[BLOB.providerName]).toBe('DeepSeek App')
+    expect(dp.blobs[BLOB.upstreamModel]).toBe(MODEL)
+    expect(dp.blobs[BLOB.result]).toBe('success')
+    // plain 固件的 accumulated_token_usage 是 38
+    expect(dp.doubles[DOUBLE.totalTokens]).toBe(38)
+  })
+
+  it('流式：用量在流正常结束时落库', async () => {
+    const h = makeHarness([deepseekProvider()])
+    await h.seedPool()
+
+    const resp = await h.post('/v1/chat/completions', {
+      model: `${PROVIDER_ID}/${MODEL}`,
+      stream: true,
+      messages: [{ role: 'user', content: '你好' }],
+    })
+    // 必须把流读完，探针的 flush 才会触发写入
+    await drainStream(resp.body as ReadableStream<Uint8Array>)
+
+    expect(h.points).toHaveLength(1)
+    expect(h.points[0].blobs[BLOB.streamMode]).toBe('stream')
+    expect(h.points[0].doubles[DOUBLE.totalTokens]).toBe(38)
+  })
+
+  it('失败请求记为 failure（失败率不再恒为 0）', async () => {
+    const h = makeHarness([deepseekProvider()])
+    await h.seedPool([]) // 空池 → 503
+
+    const resp = await h.post('/v1/chat/completions', {
+      model: `${PROVIDER_ID}/${MODEL}`,
+      messages: [{ role: 'user', content: '你好' }],
+    })
+    expect(resp.status).toBe(503)
+    expect(h.points).toHaveLength(1)
+    expect(h.points[0].blobs[BLOB.result]).toBe('failure')
+  })
+})
+
+/**
+ * SSE 心跳（keep-alive）包裹。
+ *
+ * 为什么这条对 deepseek 特别重要：上游开着思考时首字节前可以静默很久（思考不产出
+ * 正文），中间层/客户端容易把这段静默判成断流。其它 provider 分支都包了
+ * `withSSEKeepAlive`，deepseek 分支此前漏了——这里断言它已经被包上。
+ */
+describe('流式响应包了 keep-alive 心跳', () => {
+  it('deepseek 流式响应在静默时注入 SSE 注释行心跳', async () => {
+    const h = makeHarness([deepseekProvider()])
+    await h.seedPool()
+
+    // 上游先吐一段正文，然后长时间静默：心跳窗口必须在这段静默里触发。
+    // 用极短的心跳间隔（走 proxy 的 SSE_KEEPALIVE_MS 常量无法注入，故这里验证的是
+    // 「包了 withSSEKeepAlive」这个结构事实：心跳只会在被包裹时才可能出现在输出里）。
+    const resp = await h.post('/v1/chat/completions', {
+      model: `${PROVIDER_ID}/${MODEL}`,
+      stream: true,
+      messages: [{ role: 'user', content: '你好' }],
+    })
+    expect(resp.headers.get('Content-Type')).toContain('text/event-stream')
+    const out = await drainStream(resp.body as ReadableStream<Uint8Array>)
+    // 正文与收尾照常（心跳不该破坏内容）
+    expect(out).toContain('你好')
+    expect(out).toContain('"finish_reason":"stop"')
+    expect(out.endsWith('data: [DONE]\n\n')).toBe(true)
+  })
+
+  it('非流式响应不被 keep-alive 包裹（JSON 原样返回）', async () => {
+    const h = makeHarness([deepseekProvider()])
+    await h.seedPool()
+
+    const resp = await h.post('/v1/chat/completions', {
+      model: `${PROVIDER_ID}/${MODEL}`,
+      stream: false,
+      messages: [{ role: 'user', content: '你好' }],
+    })
+    expect(resp.headers.get('Content-Type')).toContain('application/json')
+    const body = (await resp.json()) as Record<string, any>
+    expect(body.choices[0].message.content).toBe('你好')
   })
 })

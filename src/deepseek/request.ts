@@ -21,10 +21,30 @@
 /** `system` 合并块与首个 user 内容之间的分隔符（与 Go 版逐字节一致）。 */
 export const SYSTEM_MERGE_SEPARATOR = '\n\n---\n\n'
 
+/**
+ * 摊平后 prompt 的字符上限（移植自 Go 版 `DefaultMaxPromptChars = 2_000_000`）。
+ *
+ * 为什么需要前置校验：上游对超长 prompt 的拒绝方式不明确（多半是流内错误或连接断开），
+ * 于是客户端会拿到一个**归因错误**的 502「上游出错」，而真正的原因是自己的请求太长。
+ * 在本地按 400 `context_length_exceeded` 拒绝，客户端才知道要改的是请求。
+ */
+export const DEEPSEEK_MAX_PROMPT_CHARS = 2_000_000
+
 export class DeepseekRequestError extends Error {
   constructor(message: string) {
     super(message)
     this.name = 'DeepseekRequestError'
+  }
+  /** 归因用的错误码（面板/客户端据此分支；默认 `bad_request`）。 */
+  code = 'bad_request'
+}
+
+/** 超长 prompt 的专用错误：与「请求格式错」区分开，客户端才能正确归因。 */
+export class DeepseekPromptTooLongError extends DeepseekRequestError {
+  constructor(actual: number, limit: number) {
+    super(`prompt is too long: ${actual} characters exceeds the ${limit}-character limit`)
+    this.name = 'DeepseekPromptTooLongError'
+    this.code = 'context_length_exceeded'
   }
 }
 
@@ -399,4 +419,15 @@ export function flattenMessages(msgs: DeepseekMessage[]): string {
     out += '\n'
   }
   return out
+}
+
+/**
+ * 超长 prompt 前置校验：超限抛 `DeepseekPromptTooLongError`（→ 400 `context_length_exceeded`）。
+ *
+ * 计数口径与 Go 版一致：**JS 字符串长度**（UTF-16 code unit），不是字节数也不是码点数。
+ * 这不是「精确的 token 预算」，而是一条远高于正常用量的护栏——它的职责是拦住病态请求，
+ * 让客户端拿到可归因的 400，而不是把上游的模糊失败原样转成 502。
+ */
+export function assertPromptLength(prompt: string, limit = DEEPSEEK_MAX_PROMPT_CHARS): void {
+  if (limit > 0 && prompt.length > limit) throw new DeepseekPromptTooLongError(prompt.length, limit)
 }

@@ -17,6 +17,7 @@
  *   POST   /tokens              注入一条（注入后立即判活）
  *   POST   /tokens/verify       重新判活（body.tokenId）
  *   POST   /tokens/remove       删除（body.tokenId）
+ *   POST   /tokens/unpark       人工解除上游处罚 park（body.tokenId）
  */
 
 import { Context } from 'hono'
@@ -27,6 +28,7 @@ import {
   addDeepseekToken,
   readDeepseekPool,
   removeDeepseekToken,
+  unparkDeepseekToken,
   type DeepseekTokenRecord,
 } from './pool'
 import { deepseekPoolView, verifyDeepseekToken } from './proxy'
@@ -59,13 +61,17 @@ export async function handleDeepseekTokensList(c: Context<AppEnv>) {
       providerId: provider!.id,
       ...view,
       howto: DEEPSEEK_TOKEN_HOWTO,
-      // 失效提示：池里只要有 expired，就把「需重新注入」明确说出来，不静默
+      // 失效/处罚提示：都要明确说出来，不静默——否则用户只会看到随机失败
       notice:
         view.summary.total === 0
           ? '池是空的：请按 howto 注入一条 token'
-          : view.summary.expired > 0
-            ? `有 ${view.summary.expired} 条 token 已失效，请删除后重新注入`
-            : '',
+          : view.summary.parked === view.summary.total
+            ? `池里 ${view.summary.parked} 条全部被上游处罚停用（park），当前无可用账号`
+            : view.summary.parked > 0
+              ? `有 ${view.summary.parked} 条被上游处罚停用（park），窗口到期会自动恢复`
+              : view.summary.expired > 0
+                ? `有 ${view.summary.expired} 条 token 已失效，请删除后重新注入`
+                : '',
     },
   })
 }
@@ -189,5 +195,32 @@ export async function handleDeepseekTokenRemove(c: Context<AppEnv>) {
     success: true,
     message: '已删除',
     data: { id: removed.id, removedTail: removed.token.slice(-6) },
+  })
+}
+
+/**
+ * POST /admin/api/deepseek/:id/tokens/unpark —— 人工解除处罚 park。
+ *
+ * 为什么需要这个入口：封禁（banned）是**永久** park，只有人工能解除。没有这个按钮时，
+ * 唯一出路是删掉再重新注入 token（要回浏览器重取一次凭据），对一个「账号可能已经解封」
+ * 的场景来说代价过高。这里只是清掉 park 字段，不判活——用户点完可以立刻按「判活」复核。
+ */
+export async function handleDeepseekTokenUnpark(c: Context<AppEnv>) {
+  const id = c.req.param('id') || ''
+  const { provider, error } = await requireProvider(c, id)
+  if (error) return error
+  const body = await readOptionalJSONLimited<{ tokenId?: string }>(c.req.raw, MAX_ADMIN_REQUEST_BYTES)
+  const tokenId = (body.tokenId || '').trim()
+  if (!tokenId) return c.json<ApiResponse>({ success: false, message: '缺少 tokenId' }, 400)
+
+  const before = (await readDeepseekPool(c.env)).find((t) => t.id === tokenId)
+  if (!before) return c.json<ApiResponse>({ success: false, message: 'token 不存在' }, 404)
+  const wasKind = before.park?.kind
+
+  const rec = await unparkDeepseekToken(c.env, tokenId)
+  return c.json<ApiResponse>({
+    success: true,
+    message: wasKind ? `已解除 park（原处罚：${wasKind}），建议点「判活」复核` : '该 token 本来就没有 park',
+    data: { id: tokenId, releasedKind: wasKind ?? null },
   })
 }

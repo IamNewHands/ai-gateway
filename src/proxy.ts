@@ -1819,6 +1819,7 @@ export async function forwardProxy(
         )
       }
       const response = await proxyDeepseekChatRequest(c.env, provider, forwardBody as Record<string, unknown>)
+      // 日志先于 keepalive 包裹：包了之后 response.status/ok 就不该再被读（body 已被接管）。
       try {
         const bodySummary = summarizeRequestBody(forwardBody)
         c.executionCtx.waitUntil(writeLog(c.env, response.ok ? 'request' : (response.status >= 500 ? 'error' : 'warn'),
@@ -1826,6 +1827,18 @@ export async function forwardProxy(
           JSON.stringify({ providerId, subPath, body: bodySummary }).substring(0, 4000)
         ))
       } catch { /* log failure must not break */ }
+      // 流式响应包一层心跳：上游开着思考时首字节前静默可以很久（思考不产出正文），
+      // 中间层/客户端容易把这个静默判成断流。与 M365 分支同一处理。
+      if (isEventStreamResponse(response)) {
+        return new Response(withSSEKeepAlive(response.body as ReadableStream, SSE_KEEPALIVE_MS, SSE_IDLE_TIMEOUT_MS), {
+          status: response.status,
+          headers: {
+            'Content-Type': 'text/event-stream',
+            'Cache-Control': 'no-store',
+            'X-Accel-Buffering': 'no',
+          },
+        })
+      }
       return response
     }
 

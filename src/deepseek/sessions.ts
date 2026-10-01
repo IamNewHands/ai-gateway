@@ -26,8 +26,8 @@
 
 import type { Env } from '../types'
 import { DeepseekClient, isAuthFailure, type Envelope, type FetchLike } from './client'
-import { markDeepseekToken, readDeepseekPool, type DeepseekTokenRecord } from './pool'
-import { webHeaders } from './proxy'
+import { isDeepseekTokenParked, markDeepseekToken, parkDeepseekToken, readDeepseekPool, type DeepseekTokenRecord } from './pool'
+import { parkFromError, webHeaders } from './proxy'
 
 // ===== 常量（对齐 Go 版 Default* 常量）=====
 
@@ -509,16 +509,29 @@ function makeRunner(opts: RunnerOptions): Runner {
   }
 }
 
+/**
+ * 可用于后台维护的 token：状态 ready **且不在 park 窗口内**。
+ *
+ * 为什么 park 的账号必须零后台流量（Go 版 `TestCleanupSkipsParkedAccounts` 的契约）：
+ * 后台维护也会打上游，而被禁言的账号每被碰一次都可能让上游**续期窗口甚至升级处罚**。
+ * 「冷下来」必须是彻底的——这也是 park 存在的全部意义。
+ */
 async function readyTokens(env: Env, opts: { tokens?: DeepseekTokenRecord[] }): Promise<DeepseekTokenRecord[]> {
   const all = opts.tokens ?? (await readDeepseekPool(env))
-  return all.filter((t) => t.state === 'ready')
+  const now = Date.now()
+  return all.filter((t) => t.state === 'ready' && !isDeepseekTokenParked(t, now))
 }
 
 function tokenLabel(rec: DeepseekTokenRecord): string {
   return rec.label ? `${rec.id}(${rec.label})` : rec.id
 }
 
-/** 上游会话维护期间的鉴权失效：显式标记（与 proxy.ts 一致，不静默降级）。 */
+/**
+ * 上游会话维护期间的失败归类：鉴权失效 → 标 expired；处罚（biz 5/10/11）→ park。
+ * 两者都显式写回，不静默降级（与 proxy.ts 同一口径）。
+ *
+ * 后台维护撞上处罚同样要 park：否则这个账号下一轮维护还会被选中，继续把窗口续下去。
+ */
 async function noteAuthFailure(
   env: Env,
   r: Runner,
@@ -526,6 +539,12 @@ async function noteAuthFailure(
   where: string,
   err: unknown,
 ): Promise<void> {
+  const ban = parkFromError(err)
+  if (ban) {
+    if (r.persist) await parkDeepseekToken(env, rec.id, ban.park)
+    r.log(`token ${tokenLabel(rec)} parked (${ban.kind}) by ${where}: ${ban.park.reason}`)
+    return
+  }
   if (!isAuthFailure(err)) return
   if (r.persist) await markDeepseekToken(env, rec.id, { state: 'expired', error: `token expired (${where})` })
   r.log(`token ${tokenLabel(rec)} marked expired (${where})`)

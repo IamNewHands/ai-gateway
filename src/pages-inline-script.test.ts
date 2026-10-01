@@ -353,6 +353,39 @@ describe('DeepSeek App token 注入面板', () => {
     expect(js).toContain("document.getElementById('ds-thinkoff-' + id)")
     expect(js).toContain('deepseekThinkingOff')
   })
+
+  /**
+   * 处罚 park 的面板呈现。
+   *
+   * 为什么必须渲染：被封禁的 token 是**永久**停用，只有人工能解除。如果界面不显示
+   * 「已封禁」和「解除停用」按钮，用户看到的只是「请求一直失败」，没有任何出路提示。
+   */
+  it('池列表渲染处罚状态与「解除停用」按钮（封禁只能人工解除）', async () => {
+    const js = inlineScripts(await render([deepseekProvider()])).join('\n')
+    expect(js).toContain('function deepseekTokenUnpark')
+    expect(js).toContain("'/tokens/unpark'")
+    expect(js).toContain('解除停用')
+    // 三种处罚要分别显示成中文，而不是把 kind 原样吐出来
+    expect(js).toContain('已封禁')
+    expect(js).toContain('已禁言')
+    expect(js).toContain('设备风险')
+    // 永久 park 必须明确说「永久」，否则用户会等一个永远不来的解禁
+    expect(js).toContain('永久')
+    // 只有 park 的条目才出现解除按钮
+    expect(js).toContain('t.parked ?')
+  })
+
+  it('池摘要里显示「已停用」计数与 park 提示', async () => {
+    const js = inlineScripts(await render([deepseekProvider()])).join('\n')
+    expect(js).toContain('已停用')
+    expect(js).toContain('sum.parked')
+  })
+
+  it('面板说明里讲清「自动停用」机制与封禁需人工解除', async () => {
+    const html = await render([deepseekProvider()])
+    expect(html).toContain('禁言/封禁/判设备风险')
+    expect(html).toContain('解除停用')
+  })
 })
 
 /**

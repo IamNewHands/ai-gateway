@@ -8,8 +8,11 @@
 
 import { describe, it, expect } from 'vitest'
 import {
+  DEEPSEEK_MAX_PROMPT_CHARS,
   SYSTEM_MERGE_SEPARATOR as SEP,
+  DeepseekPromptTooLongError,
   DeepseekRequestError,
+  assertPromptLength,
   flattenMessages,
   isDeepseekReasoningOff,
   parseDeepseekRequest,
@@ -410,5 +413,54 @@ describe('envelope errors', () => {
     expect(
       parseDeepseekRequest(body([{ role: 'user', content: 'hi' }]), { enforceModel: 'deepseek-flash' }).model,
     ).toBe('deepseek-flash')
+  })
+})
+
+/**
+ * 超长 prompt 前置校验（移植自 Go 版 `DefaultMaxPromptChars = 2_000_000`）。
+ *
+ * 计数口径是 JS 字符串长度（UTF-16 code unit），与 Go 的 `len(prompt)`（字节数）**不同**：
+ * 对中文来说 Go 会把 1 个字符算成 3 字节，所以同样文本 Go 会先触发。这是有意的——
+ * 上限的职责是拦住病态请求，不是精确 token 预算；真正的目的是让客户端拿到可归因的 400
+ * 而不是上游的模糊 502。这里把这个口径写进断言，避免以后被误当成 bug「修正」。
+ */
+describe('prompt 长度上限', () => {
+  it('上限常量与 Go 版一致（200 万字符）', () => {
+    expect(DEEPSEEK_MAX_PROMPT_CHARS).toBe(2_000_000)
+  })
+
+  it('恰好等于上限不报错，超一个字符就报错', () => {
+    expect(() => assertPromptLength('x'.repeat(2_000_000))).not.toThrow()
+    expect(() => assertPromptLength('x'.repeat(2_000_001))).toThrow(DeepseekPromptTooLongError)
+  })
+
+  it('错误带上实际长度与上限，且 code 是 context_length_exceeded', () => {
+    try {
+      assertPromptLength('x'.repeat(2_000_005))
+      throw new Error('should have thrown')
+    } catch (err) {
+      expect(err).toBeInstanceOf(DeepseekPromptTooLongError)
+      const e = err as DeepseekPromptTooLongError
+      expect(e.code).toBe('context_length_exceeded')
+      expect(e.message).toContain('2000005')
+      expect(e.message).toContain('2000000')
+    }
+  })
+
+  it('limit <= 0 表示关闭校验（Go 的 DS_MAX_PROMPT_CHARS=0 语义）', () => {
+    expect(() => assertPromptLength('x'.repeat(10), 0)).not.toThrow()
+    expect(() => assertPromptLength('x'.repeat(10), -1)).not.toThrow()
+  })
+
+  it('自定义上限可收紧（测试与未来配置化用）', () => {
+    expect(() => assertPromptLength('x'.repeat(11), 10)).toThrow(DeepseekPromptTooLongError)
+  })
+
+  /** 上限是按**摊平后**的 prompt 算的：角色标签与分隔符都计入。 */
+  it('按摊平后的长度判定（角色标签计入）', () => {
+    const msgs = parseDeepseekRequest(body([{ role: 'user', content: 'x'.repeat(2_000_000) }])).messages
+    const flat = flattenMessages(msgs)
+    expect(flat.length).toBeGreaterThan(2_000_000) // "user: " 前缀 + 结尾换行
+    expect(() => assertPromptLength(flat)).toThrow(DeepseekPromptTooLongError)
   })
 })

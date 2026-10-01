@@ -230,7 +230,7 @@ node node_modules\wrangler\wrangler-dist\cli.js deploy --temporary --config prob
 - [x] T6.2b 面板 UI：`pages.ts` 新增「DeepSeek App token 池」fieldset（取 token 四步指引 + 注入/判活/刷新/删除按钮 + 池表格）
       + 客户端函数 `deepseekTokenList/Add/Verify/Remove` + 展开自动加载钩子
       → `pages-inline-script.test.ts` **14/14**（含「面板必须把取 token 的四步写进界面」与内联脚本 `new Function` 语法校验）
-- [ ] T6.3 用量统计接入 `analytics/usage-logger.ts` —— **有意不做**（见「已知缺口」#2：与 trae/kuku 同现状，需把 analytics context 传进 `forwardProxy`）
+- [ ] T6.3 用量统计接入 `analytics/usage-logger.ts` —— **实测无需接线**（见「已知缺口」#2：`handleProxy` 已把本分支包在 `finalizeProxyResponse` 里，用量正常落库；已补回归测试钉住）
 
 **阶段 7 — 可选能力**
 - [x] T7.1 `search: {type: enabled}` 端到端可用（请求开关落到上游 `search_enabled`，命中随 `citations` 返回）；
@@ -238,7 +238,7 @@ node node_modules\wrangler\wrangler-dist\cli.js deploy --temporary --config prob
 - [x] T7.2 图片上传与就绪轮询（**客户端侧**）：`client.ts` 新增 `uploadFile` / `fileStatus` / `uploadImageAndWait`
       （表单字段 `file`、`X-DS-PoW-Response`、`x-file-size`、30s 总超时 / 1s 轮询、失败状态集与超时抛错全部对齐 Go 源码行号）
       → `client.test.ts` **11/11**（PoW 真被解算、multipart 逐位字节、轮询次数、超时/中止路径）
-      → **未接线**：请求里的 `image_url` → 上传 → `ref_file_ids` 这条线还没接（见「已知缺口」#3）
+      → **第二轮已接线**：新增 `images.ts` + `proxy.ts` 上传拿 `ref_file_ids`（见下方「已知缺口 → 已全部关闭」#3）
 - [x] T7.3 **深度思考开关（provider 级，面板可配）**：`Provider.deepseekThinkingOff`
       → 优先级 **客户端显式声明 > provider 默认 > 内置默认(开)**（`request.ts` 的 `resolveDeepseekThinking`）
       → 关思考时 `stream.ts` / `sse.ts` 抑制残留 THINK 增量与 `reasoning_content`
@@ -248,31 +248,78 @@ node node_modules\wrangler\wrangler-dist\cli.js deploy --temporary --config prob
         流式/非流式抑制、思考开时不被误抑制）+ `pages-inline-script.test.ts` 3 例（渲染/回显/提交）
       → 设计取舍：客户端显式「开」必须压过 provider 默认——单向开关会让用户勾了之后无法在个别请求开回来
 
-### 已知缺口（本轮交付后仍需处理，按价值排序）
+### 已知缺口 → 已在第二轮（2026-10-01）全部关闭
 
-0. **风控 park 语义未接线**：`client.ts` 有 `banKind()`（biz 5 禁言 / 10 封禁 / 11 设备风险）与
-   `parseMuteUntil()`，但**没有任何调用方**——`proxy.ts` 只区分「鉴权失败 → expired」与「其他 → 记 lastError」。
-   后果：禁言/封禁账号不会被 park，下一个请求仍会打它，上游会**续期禁言窗口甚至升级成封禁**
-   （simple-chat 的注释实测：6h 禁言 → 3 天封禁）。Go 版为此专门做了 park 持久化 + `Retry-After`。
-   要做：token 池加 `parked` 状态（kind + until），`banKind` 命中时 park 并跳过，面板可见；
-   禁言时按 `mute_until` 回 `Retry-After`（Go 版兜底 60s、上限 24h）。**这是当前风险最高的一项**。
-1. **`parallel_chat_limit` 的重试只覆盖了一部分**：`proxy.ts` 预检 catch 里的判断条件
-   （`err instanceof BizError && err.bizCode === 0 && err.msg.includes('parallel')`）实际是死代码——该错误以 **流内 `event: hint`** 形式到达，
-   不会在预检阶段抛 BizError。现状：**非流式**可以由聚合后的 `state.error.isParallelLimit` 判出并换号重试（尚未接线）；
-   **流式**一旦返回 200 就无法回头重试。simple-chat 的做法是「先缓冲首块/首个终态再交给客户端」，
-   本仓 cline 也有同款（「截断 → 冷却换号重试，第 2 次完整流才交给客户端」）。要做就照那条路。
-2. **analytics usage 未写**（与 trae/kuku 同现状，需要把 analytics context 传进 `forwardProxy`）。
-3. **图片理解未接线**：`request.ts` 已提取 `image_url` 片段且 `flattenMessages` 有意跳过，客户端侧上传/轮询已移植（T7.2），
-   但「请求里的图片 → 上传 → `ref_file_ids`」这条线还没接。
-4. **SSE 心跳未包**：`stream.ts` 有 180s idle 看门狗，但 `proxy.ts` 的 deepseek 分支**没有**用
-   `withSSEKeepAlive` 包一层（其他 provider 都包了：`SSE_KEEPALIVE_MS = 8000`）。
-   思考模型静默期长（本仓 trae 的教训：15~20s 无数据会被严格客户端判为断流）——
-   虽然新加的「默认关思考」开关能显著缩短静默期，但**开着思考时这条缺口仍在**。
-5. **独立 `/v1/web_search` 端点不做**（有意）：搜索 hits 已随 chat 响应 `citations` 返回。
-6. **提示词长度上限未实现**：simple-chat 有 `DefaultMaxPromptChars = 2_000_000` 的 400
-   `context_length_exceeded` 前置校验；本仓 deepseek 分支不校验，超长 prompt 直接打上游。
-   风险低（上游自己会拒），但错误归因会变成 502 而不是 400。
-7. **密码登录路径有意不接线**：上游硬卡（真实浏览器同样 biz 11），`client.login()` 保留但不接入。
+第二轮把上一轮列出的 6 项逐条做完（第 7 项「密码登录」仍有意不做），并按「先做会越用越坏的那项」排序。
+
+**#0 风控 park 语义（最高风险，已接线）**
+- `pool.ts` 新增 `DeepseekPark{kind, until?, reason, at}`；`isDeepseekTokenParked` / `computeDeepseekPark`
+  / `parkDeepseekToken` / `unparkDeepseekToken` / `clearExpiredDeepseekParks`
+- `acquireDeepseekToken` 跳过 park 中的 token；`countReady` 同步排除
+- `proxy.ts`：`parkFromError` 把 biz 10/5/11 映射成 park，`banErrorResponse` 给出处罚专属形状
+  （banned 502 / muted 429+`Retry-After` / risk 503 `upstream_unavailable`），`pickDominantPark` 在
+  全池被 park 时挑「最快恢复」的那条来报 `Retry-After`
+- 窗口规则对齐 Go 版：banned 永久；muted 用上游 `mute_until`，缺失/已过期退化为 **6h**；risk 固定 **10min**
+- `sessions.ts` 的 `readyTokens` 排除 park → 被禁言账号**零后台流量**（Go `TestCleanupSkipsParkedAccounts` 契约）
+- 面板：池表格显示「已封禁/已禁言/设备风险（到 X 解禁 / 永久）」+「解除停用」按钮；
+  新增 `POST /admin/api/deepseek/:id/tokens/unpark`
+- 设计取舍：**处罚判定优先于鉴权判定**——biz 5/10/11 常带「login」类文案，先走 `isAuthFailure`
+  会把账号标 expired 而**不 park**，处罚形同虚设
+- 用例：`pool.test.ts` 14 例 + `proxy.test.ts` 14 例 + `admin.test.ts` 6 例 + `sessions.test.ts` 5 例
+
+**#1 `parallel_chat_limit` 非流式重试（已接线）**
+- 该错误以**流内 `event: hint`** 到达（不是抛错），非流式此时还没回任何字节 → 可换号重试
+- `proxy.ts` 非流式分支：`state.error.isParallelLimit && attempt + 1 < maxAttempts` → `continue`
+- 流式仍不可重试（返回 200 后无法回头）；要做需照 cline「先缓冲首块再交给客户端」那条路，本轮未做
+
+**#2 analytics usage（实测已覆盖，原缺口判断有误）**
+- 原清单说「未写」，实测**不成立**：`handleProxy` 把整个 deepseek 分支包在 `finalizeProxyResponse` 里，
+  用量与非流式 JSON 体都从同一条出口记录
+- 已补 3 例回归测试钉住结论（`dispatch.test.ts`），避免以后按「凭印象的清单」返工
+
+**#3 图片理解（已接线）**
+- 新增 `src/deepseek/images.ts`（移植 Go `ExtractImages`/`decodeDataURL`/`fetchImage`）：
+  data URL 就地解码、http(s) 服务端抓取、10MB 上限、30s 超时、MIME→后缀（上传文件名必须带后缀）
+- `proxy.ts`：图片在**取号之前**解析（抓外部图床不占池槽位），attempt 内上传拿 `ref_file_ids`
+- 失败语义：抓取失败 → 400 `image_fetch_failed`；上传失败 → 502 `upload_failed` 且**不**标 token 失效
+- **有意的行为差异**：Go 的 `decodeDataURL` 对「不受支持 MIME / base64 损坏 / 超 10MB」静默跳过，
+  这与它自己「绝不静默丢图」的契约矛盾，本仓按契约改成报错（非 data / 非 http(s) 仍静默跳过）
+- 用例：`images.test.ts` 22 例 + `proxy.test.ts` 5 例
+
+**#4 SSE 心跳（已包）**
+- `proxy.ts` deepseek 分支流式响应包 `withSSEKeepAlive(readable, SSE_KEEPALIVE_MS, SSE_IDLE_TIMEOUT_MS)`
+- 日志写在包裹**之前**（包了之后 body 已被接管，不该再读 `response.status`）
+- 用例：`dispatch.test.ts` 2 例
+
+**#5 提示词长度上限（已实现）**
+- `request.ts` 新增 `DEEPSEEK_MAX_PROMPT_CHARS = 2_000_000`、`assertPromptLength`、
+  `DeepseekPromptTooLongError`（`code = 'context_length_exceeded'`）；`DeepseekRequestError` 加 `code` 字段
+- 校验放在**取号之前**：超长是请求本身的问题，空池也应是 400 而不是 503
+- 口径说明：按 JS 字符串长度（UTF-16 code unit）算，与 Go 的 `len()`（字节数）**不同**——
+  对中文 Go 会先触发。这是有意的：上限职责是拦病态请求，不是精确 token 预算
+- 用例：`request.test.ts` 6 例 + `proxy.test.ts` 3 例
+
+**#6 独立 `/v1/web_search` / #7 密码登录 —— 仍有意不做**
+- 搜索 hits 已随 chat 响应 `citations` 返回；密码登录上游硬卡（真实浏览器同样 biz 11），`client.login()` 保留不接线
+
+**第二轮验证证据**
+- `npx tsc --noEmit` 干净
+- `npx vitest run --pool=threads` → **2046 passed / 7 skipped, 0 failed**（105 文件，较第一轮 1948 增 98 例）
+
+**面板新增可见项（部署后需刷新页面）**
+- 池表格：处罚状态列（已封禁/已禁言/设备风险 + 解禁时刻）、「解除停用」按钮、摘要「已停用 N」
+- 面板说明补上「账号被禁言/封禁/判风险时自动停用，期间完全不打上游」的机制解释
+
+### 上一轮（第一轮）的缺口清单（保留作对照，均已关闭）
+
+0. ~~**风控 park 语义未接线**~~ → 见上方 #0
+1. ~~**`parallel_chat_limit` 的重试只覆盖了一部分**~~ → 见上方 #1（非流式已接，流式仍不可重试）
+2. ~~**analytics usage 未写**~~ → 见上方 #2（原判断有误，实测已覆盖）
+3. ~~**图片理解未接线**~~ → 见上方 #3
+4. ~~**SSE 心跳未包**~~ → 见上方 #4
+5. ~~**独立 `/v1/web_search` 端点不做**~~（有意保留）
+6. ~~**提示词长度上限未实现**~~ → 见上方 #5
+7. ~~**密码登录路径有意不接线**~~（有意保留）
 
 **阶段 8 — 验证与入库**
 - [x] T8.1 全量 `vitest run --pool=threads` + `tsc` 通过（deepseek 侧 122+ 例；全仓库 1856 例）

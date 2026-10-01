@@ -12,12 +12,38 @@
  *  - 运行态（游标、每 token 在飞数）留在 isolate 内存，与 trae/kuku/cnb 同形态；
  *    Workers 多 isolate 下轮转是「每 isolate 各自轮」，不影响正确性。
  *  - token 失效**必须显式标记**并让面板可见，不做静默降级（否则用户会看到随机失败）。
+ *  - 被上游禁言/封禁/判风险的 token 必须 **park**（停用一段时间），见下方 park 段：
+ *    不 park 就会在下一次请求里继续打同一账号，上游会**续期窗口甚至升级处罚**
+ *    （Go 版注释里的实测：6h 禁言 → 3 天封禁）。
  */
 
 import { KV_KEYS } from '../config'
 import type { Env } from '../types'
 
 export type DeepseekTokenState = 'ready' | 'expired'
+
+/** park 种类，与上游 `biz_code` 一一对应（10/5/11）。 */
+export type DeepseekParkKind = 'banned' | 'muted' | 'risk'
+
+/**
+ * 一次 park：该 token 在 `until` 之前不参与轮转。
+ *
+ * `until` 缺省 = **永久**（只有 `banned` 会这样）：上游封禁没有窗口，只能人工处理。
+ */
+export interface DeepseekPark {
+  kind: DeepseekParkKind
+  /** 到期时刻（ms epoch）。省略 = 永久 park。 */
+  until?: number
+  reason: string
+  /** park 发生时刻（ms epoch），面板展示用。 */
+  at: number
+}
+
+/** 禁言 park 的兜底时长：上游常不给 `mute_until`。与 Go 版 `MuteParkDefault` 一致（6h）。 */
+export const DEEPSEEK_MUTE_PARK_DEFAULT_MS = 6 * 60 * 60 * 1000
+
+/** 设备风险 park 的冷却时长。与 Go 版 `RiskCooldown` 一致（10min）。 */
+export const DEEPSEEK_RISK_COOLDOWN_MS = 10 * 60 * 1000
 
 /** 池里的一条 token 凭据。 */
 export interface DeepseekTokenRecord {
@@ -33,6 +59,8 @@ export interface DeepseekTokenRecord {
   /** 人可读备注（如「主号」）。 */
   label?: string
   state: DeepseekTokenState
+  /** 上游处罚窗口；缺省 = 未被 park。过期的 park 会被惰性清除（= 自然解禁）。 */
+  park?: DeepseekPark
   addedAt: number
   lastOkAt?: number
   lastErrorAt?: number
@@ -44,6 +72,9 @@ export interface DeepseekTokenView {
   id: string
   label?: string
   state: DeepseekTokenState
+  park?: DeepseekPark
+  /** 该 token 是否正处于 park 窗口内（过期的 park 不算）。 */
+  parked: boolean
   tokenTail: string
   addedAt: number
   lastOkAt?: number
@@ -51,17 +82,107 @@ export interface DeepseekTokenView {
   lastError?: string
 }
 
-export function toTokenView(rec: DeepseekTokenRecord): DeepseekTokenView {
+export function toTokenView(rec: DeepseekTokenRecord, now = Date.now()): DeepseekTokenView {
   return {
     id: rec.id,
     label: rec.label,
     state: rec.state,
+    park: rec.park,
+    parked: isDeepseekTokenParked(rec, now),
     tokenTail: rec.token.slice(-6),
     addedAt: rec.addedAt,
     lastOkAt: rec.lastOkAt,
     lastErrorAt: rec.lastErrorAt,
     lastError: rec.lastError,
   }
+}
+
+// ===== park 语义（移植自 simple-chat `internal/upstream/pool.go`）=====
+
+/**
+ * 该 token 现在是否被 park。
+ *
+ * 过期即「自然解禁」（Go 的 `healthNow` 同语义）：`banned` 永久；`muted`/`risk`
+ * 以 `until` 为准，缺省 `until` 视作**已过期**——一条 `until` 缺失的禁言记录
+ * 不该把账号永久锁死。
+ */
+export function isDeepseekTokenParked(rec: DeepseekTokenRecord, now = Date.now()): boolean {
+  const park = rec.park
+  if (!park) return false
+  if (park.kind === 'banned') return true
+  if (park.until === undefined) return false
+  return park.until > now
+}
+
+/**
+ * 由上游错误算出一条 park（**纯函数**，便于测试与「先本地生效、再落 KV」）。
+ *
+ * 窗口规则逐条对齐 Go 版 `Lease.NoteError`：
+ *  - `banned`：永久（无 `until`）；
+ *  - `muted`：用上游 `mute_until`；缺失或已过期则退化为 `MUTE_PARK_DEFAULT_MS`；
+ *  - `risk`：固定 `RISK_COOLDOWN_MS`（上游不给窗口）。
+ */
+export function computeDeepseekPark(
+  kind: DeepseekParkKind,
+  opts: { until?: Date | null; reason: string; now?: number } = { reason: '' },
+): DeepseekPark {
+  const now = opts.now ?? Date.now()
+  const park: DeepseekPark = { kind, reason: opts.reason, at: now }
+  if (kind === 'banned') return park
+  if (kind === 'risk') {
+    park.until = now + DEEPSEEK_RISK_COOLDOWN_MS
+    return park
+  }
+  const until = opts.until ?? null
+  const untilMs = until ? until.getTime() : NaN
+  park.until = Number.isFinite(untilMs) && untilMs > now ? untilMs : now + DEEPSEEK_MUTE_PARK_DEFAULT_MS
+  return park
+}
+
+/** 把一条 park 写进池（按面板 id）。返回更新后的记录，未命中返回 null。 */
+export async function parkDeepseekToken(
+  env: Env,
+  id: string,
+  park: DeepseekPark,
+): Promise<DeepseekTokenRecord | null> {
+  const tokens = await readDeepseekPool(env)
+  const rec = tokens.find((t) => t.id === id)
+  if (!rec) return null
+  rec.park = park
+  rec.lastError = park.reason
+  rec.lastErrorAt = park.at
+  await writeDeepseekPool(env, tokens)
+  return rec
+}
+
+/** 人工解除 park（面板「解除」按钮；Go 版对应手工删 accounts.json 里的 park 字段）。 */
+export async function unparkDeepseekToken(env: Env, id: string): Promise<DeepseekTokenRecord | null> {
+  const tokens = await readDeepseekPool(env)
+  const rec = tokens.find((t) => t.id === id)
+  if (!rec) return null
+  if (rec.park === undefined) return rec
+  delete rec.park
+  await writeDeepseekPool(env, tokens)
+  return rec
+}
+
+/**
+ * 清除**已过期**的 park（惰性、幂等）。
+ *
+ * 为什么必须回写：过期 park 留在 KV 里，重启后会被当成「仍在 park」重新装载
+ * （Go 版 `TestRestartExpiredParkRotatesNormally` 测的正是这条）。返回被清掉的条数，
+ * 只有真的清了才写 KV。
+ */
+export async function clearExpiredDeepseekParks(
+  env: Env,
+  tokens: DeepseekTokenRecord[],
+  now = Date.now(),
+): Promise<number> {
+  const expired = tokens.filter((t) => t.park !== undefined && !isDeepseekTokenParked(t, now))
+  if (expired.length === 0) return 0
+  for (const t of expired) delete t.park
+  await writeDeepseekPool(env, tokens)
+  return expired.length
 }
 
 /** 读取整池。键不存在/内容损坏都当空池处理——空池是合法状态（面板会提示注入）。 */
@@ -135,7 +256,13 @@ export async function removeDeepseekToken(env: Env, id: string): Promise<Deepsee
   return removed
 }
 
-/** 标记失效（40003/token 过期）。重复标记安全。 */
+/**
+ * 标记状态/错误（40003/token 过期）。重复标记安全。
+ *
+ * `ok: true` 时同时清掉 park：能成功就说明处罚窗口已经过去（park 期间根本不会被
+ * 取到，所以走到这里只可能是「已过期但字段还在」）——这正是 Go 版的「自然解禁
+ * 要回写持久层」那条，否则重启会把过期 park 重新装载。
+ */
 export async function markDeepseekToken(
   env: Env,
   id: string,
@@ -155,14 +282,15 @@ export async function markDeepseekToken(
     rec.lastError = undefined
     rec.lastErrorAt = undefined
     rec.state = 'ready'
+    delete rec.park
   }
   await writeDeepseekPool(env, tokens)
   return rec
 }
 
-/** 池内失效 token 数（面板提示用）。 */
-export function countReady(tokens: DeepseekTokenRecord[]): number {
-  return tokens.filter((t) => t.state === 'ready').length
+/** 池内可用 token 数（面板提示用）：状态 ready 且不在 park 窗口内。 */
+export function countReady(tokens: DeepseekTokenRecord[], now = Date.now()): number {
+  return tokens.filter((t) => t.state === 'ready' && !isDeepseekTokenParked(t, now)).length
 }
 
 // ===== 运行态轮转（per isolate）=====
@@ -183,15 +311,18 @@ export interface AcquiredToken {
 }
 
 /**
- * 取一条可用 token（严格轮转 + 每 token 在飞上限）。
- * 无可用 token（空池/全部失效/全部在飞）返回 null，由调用方给出明确错误。
+ * 取一条可用 token（严格轮转 + 每 token 在飞上限 + **跳过 park 中的 token**）。
+ * 无可用 token（空池/全部失效/全部 park/全部在飞）返回 null，由调用方给出明确错误。
+ *
+ * `now` 可注入：park 到期判定要能被测试固定（与 Go 版 `healthNow(pa, now)` 同形态）。
  */
 export function acquireDeepseekToken(
   poolKey: string,
   tokens: DeepseekTokenRecord[],
   maxInflight = DEEPSEEK_DEFAULT_MAX_INFLIGHT,
+  now = Date.now(),
 ): AcquiredToken | null {
-  const ready = tokens.filter((t) => t.state === 'ready')
+  const ready = tokens.filter((t) => t.state === 'ready' && !isDeepseekTokenParked(t, now))
   if (ready.length === 0) return null
 
   let state = rotatorStates.get(poolKey)

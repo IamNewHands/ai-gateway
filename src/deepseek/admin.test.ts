@@ -8,10 +8,11 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
 import { Hono } from 'hono'
 import type { AppEnv, Provider } from '../types'
 import { setProviders } from '../storage'
-import { readDeepseekPool, resetDeepseekRotatorForTest } from './pool'
+import { readDeepseekPool, resetDeepseekRotatorForTest, parkDeepseekToken } from './pool'
 import {
   handleDeepseekTokenAdd,
   handleDeepseekTokenRemove,
+  handleDeepseekTokenUnpark,
   handleDeepseekTokenVerify,
   handleDeepseekTokensList,
 } from './admin'
@@ -53,6 +54,7 @@ function buildApp() {
   app.post('/admin/api/deepseek/:id/tokens', handleDeepseekTokenAdd)
   app.post('/admin/api/deepseek/:id/tokens/verify', handleDeepseekTokenVerify)
   app.post('/admin/api/deepseek/:id/tokens/remove', handleDeepseekTokenRemove)
+  app.post('/admin/api/deepseek/:id/tokens/unpark', handleDeepseekTokenUnpark)
   return app
 }
 
@@ -232,5 +234,99 @@ describe('verify / remove', () => {
     const res = await post(app, `/admin/api/deepseek/${PROVIDER_ID}/tokens/remove`, env, { tokenId: id })
     expect(res.status).toBe(200)
     expect(await readDeepseekPool(env as never)).toHaveLength(0)
+  })
+})
+
+/**
+ * 处罚 park 在管理面上的可见性与人工解除。
+ *
+ * 为什么需要「解除停用」这个入口：封禁是**永久** park，只有人工能解除。没有它时
+ * 唯一出路是删掉再重新注入（要回浏览器重取凭据），对一个「账号可能已经解封」的
+ * 场景代价过高。
+ */
+describe('处罚 park 的面板可见性与人工解除', () => {
+  async function seedParked(park: { kind: 'banned' | 'muted' | 'risk'; until?: number; reason: string }) {
+    const env = makeEnv()
+    await seed(env, [provider()])
+    stubUpstream(usableAccount)
+    await post(buildApp(), `/admin/api/deepseek/${PROVIDER_ID}/tokens`, env, { token: VALID_TOKEN, headerDeviceId: 'd' })
+    const id = (await readDeepseekPool(env as never))[0].id
+    await parkDeepseekToken(env as never, id, { ...park, at: Date.now() })
+    return { env, id }
+  }
+
+  it('列表把 park 的 token 标出来，并给出对应 notice 与 summary.parked', async () => {
+    const { env } = await seedParked({ kind: 'banned', reason: 'USER_IS_BANNED' })
+    const res = await buildApp().request(`/admin/api/deepseek/${PROVIDER_ID}/tokens`, {}, env as never)
+    const body = (await res.json()) as Record<string, any>
+
+    expect(body.data.summary.parked).toBe(1)
+    // 全池被停用时必须明说「当前无可用账号」，否则用户只看到随机失败
+    expect(body.data.notice).toContain('全部被上游处罚停用')
+    expect(body.data.tokens[0].parked).toBe(true)
+    expect(body.data.tokens[0].park.kind).toBe('banned')
+    expect(body.data.tokens[0].park.reason).toBe('USER_IS_BANNED')
+  })
+
+  it('部分被 park 时 notice 说明「到期会自动恢复」', async () => {
+    const env = makeEnv()
+    await seed(env, [provider()])
+    stubUpstream(usableAccount)
+    const app = buildApp()
+    await post(app, `/admin/api/deepseek/${PROVIDER_ID}/tokens`, env, { token: VALID_TOKEN, headerDeviceId: 'd1' })
+    await post(app, `/admin/api/deepseek/${PROVIDER_ID}/tokens`, env, { token: 'y'.repeat(64), headerDeviceId: 'd2' })
+    const list = await readDeepseekPool(env as never)
+    await parkDeepseekToken(env as never, list[0].id, {
+      kind: 'muted', until: Date.now() + 3600_000, reason: 'muted', at: Date.now(),
+    })
+
+    const res = await app.request(`/admin/api/deepseek/${PROVIDER_ID}/tokens`, {}, env as never)
+    const body = (await res.json()) as Record<string, any>
+    expect(body.data.summary.parked).toBe(1)
+    expect(body.data.summary.ready).toBe(1)
+    expect(body.data.notice).toContain('到期会自动恢复')
+  })
+
+  it('已过期的 park 不算 parked（自然解禁后界面立刻恢复）', async () => {
+    const { env } = await seedParked({ kind: 'muted', until: Date.now() - 1000, reason: 'stale' })
+    const res = await buildApp().request(`/admin/api/deepseek/${PROVIDER_ID}/tokens`, {}, env as never)
+    const body = (await res.json()) as Record<string, any>
+    expect(body.data.summary.parked).toBe(0)
+    expect(body.data.tokens[0].parked).toBe(false)
+    expect(body.data.notice).toBe('')
+  })
+
+  it('unpark 清掉处罚并回报原处罚种类（建议复核）', async () => {
+    const { env, id } = await seedParked({ kind: 'banned', reason: 'USER_IS_BANNED' })
+    const res = await post(buildApp(), `/admin/api/deepseek/${PROVIDER_ID}/tokens/unpark`, env, { tokenId: id })
+    expect(res.status).toBe(200)
+    const body = (await res.json()) as Record<string, any>
+    expect(body.success).toBe(true)
+    expect(body.data.releasedKind).toBe('banned')
+    expect(body.message).toContain('判活')
+
+    expect((await readDeepseekPool(env as never))[0].park).toBeUndefined()
+  })
+
+  it('unpark 幂等：本来没 park 也成功，且明确告知', async () => {
+    const env = makeEnv()
+    await seed(env, [provider()])
+    stubUpstream(usableAccount)
+    await post(buildApp(), `/admin/api/deepseek/${PROVIDER_ID}/tokens`, env, { token: VALID_TOKEN, headerDeviceId: 'd' })
+    const id = (await readDeepseekPool(env as never))[0].id
+
+    const res = await post(buildApp(), `/admin/api/deepseek/${PROVIDER_ID}/tokens/unpark`, env, { tokenId: id })
+    const body = (await res.json()) as Record<string, any>
+    expect(body.success).toBe(true)
+    expect(body.data.releasedKind).toBeNull()
+    expect(body.message).toContain('本来就没有')
+  })
+
+  it('unpark 校验参数：缺 tokenId 400，未知 id 404', async () => {
+    const env = makeEnv()
+    await seed(env, [provider()])
+    const app = buildApp()
+    expect((await post(app, `/admin/api/deepseek/${PROVIDER_ID}/tokens/unpark`, env, {})).status).toBe(400)
+    expect((await post(app, `/admin/api/deepseek/${PROVIDER_ID}/tokens/unpark`, env, { tokenId: 'nope' })).status).toBe(404)
   })
 })
