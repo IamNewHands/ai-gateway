@@ -1631,7 +1631,14 @@ export async function forwardProxy(
     // Cline（cline2api）：refreshToken 换 accessToken 转发到 api.cline.bot，
     // 账号池在 cline/proxy.ts 内部管理（多账号自动切换），不走普通 API Key 逻辑。
     if (isClineProvider(providerId)) {
-      const response = await proxyClineChatRequest(c.env, provider, forwardBody as Record<string, unknown>)
+      // 传入站 signal：客户端断开时立刻中止上游 fetch，且不记任何冷却
+      // （移植 cline2api `4265b29`；详见 src/cline/proxy.ts 的 ClineProxyOptions.signal）
+      const response = await proxyClineChatRequest(
+        c.env,
+        provider,
+        forwardBody as Record<string, unknown>,
+        { signal: c.req.raw.signal },
+      )
       const logLevel = response.ok ? 'request' : (response.status >= 500 ? 'error' : 'warn')
       try {
         const bodySummary = summarizeRequestBody(forwardBody)

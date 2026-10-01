@@ -458,19 +458,30 @@ export function withSSEKeepAlive(
 export async function streamFetchWithTimeout(
   url: string,
   init: RequestInit,
-  opts?: { connectTimeoutMs?: number; idleTimeoutMs?: number; keepAliveMs?: number },
+  opts?: { connectTimeoutMs?: number; idleTimeoutMs?: number; keepAliveMs?: number; signal?: AbortSignal },
 ): Promise<Response> {
   const connectTimeoutMs = opts?.connectTimeoutMs ?? OPENCODE_CONNECT_TIMEOUT_MS
   const controller = new AbortController()
   const timer = setTimeout(() => controller.abort(), connectTimeoutMs)
+  // 外部信号（入站请求）联动：客户端断开时立刻中止上游 fetch，
+  // 否则 Workers 侧会继续把这一轮读完（上游白烧、网关侧还会当成模型故障去罚冷却）。
+  const outer = opts?.signal
+  const onOuterAbort = () => controller.abort(outer?.reason)
+  if (outer) {
+    if (outer.aborted) controller.abort(outer.reason)
+    else outer.addEventListener('abort', onOuterAbort, { once: true })
+  }
+  const detach = () => outer?.removeEventListener('abort', onOuterAbort)
   let response: Response
   try {
     response = await fetch(url, { ...init, signal: controller.signal })
   } catch (err) {
     clearTimeout(timer)
+    detach()
     throw err
   }
   clearTimeout(timer)
+  detach()
   if (response.body) {
     // 心跳注释行只对严格 SSE（text/event-stream）注入；NDJSON 等格式注入会破坏逐行解析
     const body = withSSEKeepAlive(

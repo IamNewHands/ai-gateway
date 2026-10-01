@@ -133,7 +133,7 @@ export const CLINE_CHAT_CONNECT_TIMEOUT_MS = 30_000
  * 池类保持原 500，避免把「账号池不可用」伪装成「网络故障」。
  */
 interface ClineTransportError extends Error {
-  kind?: 'transport'
+  kind?: 'transport' | 'client'
 }
 
 /**
@@ -171,6 +171,65 @@ const CLINE_MIN_UPSTREAM_MAX_TOKENS = 16
  */
 export const CLINE_MAX_TOKENS = 32768          // 客户端未指定 max_tokens 时的护栏默认（原 128000 过激进）
 const CLINE_DEFAULT_REASONING_EFFORT = 'medium'  // 免费通道默认档位（原 high 过激进）
+
+/**
+ * SSE 心跳间隔：超过这么久没往客户端写任何字节就补一条注释行（2026-10-05，
+ * 移植 luawei1/cline2api `a055b13`）。与 opencode 侧 OPENCODE_KEEPALIVE_MS 同值同形态。
+ * 背景：探测期此前一个字节都不写，慢首 token（长 reasoning / 上游排队）会被中间层
+ * 读超时掐掉（上游实测 Cloudflare 隧道 120s read timeout → 524）。
+ */
+export const CLINE_KEEPALIVE_MS = 15000
+
+/**
+ * 探测期时间上限：到点仍未做出放行/拦截判定就先放行，让响应头在中间层读超时前出去
+ * （Cloudflare 边缘对「迟迟不出响应头」的连接会回 524）。远小于边缘超时，留足余量。
+ */
+export const CLINE_PROBE_MAX_MS = 10000
+
+/**
+ * 已知模型的 **输出硬上限**（`maxOutputTokens` / `max_tokens` 的合法取值上界）。
+ *
+ * 移植 luawei1/cline2api `3f72255`：Cline 官方的 recommended-models 接口**不带**
+ * context/maxTokens 元数据，客户端（大量 OpenAI 兼容 SDK 默认 `max_tokens: 128000`）的值
+ * 会原样透传，超过模型硬上限时上游直接 400，而 400 落在「参数错误原样透传、不降级」分支
+ * （见 clineModelFallbackChain 注释）——用户直接吃硬失败，且日志看不出是预算超限。
+ * 上游 A/B 实测：gemini-3.8-flash 上 128000 必现 400，65536 全部成功。
+ *
+ * 键为**基名**（剥掉 `cline-free/` `cline-pass/` `google/` 等路由前缀后匹配）。
+ * **未收录的模型一律不封顶**：宁可漏封顶（回落原有行为），也不误伤长输出模型。
+ */
+export const CLINE_MODEL_MAX_OUTPUT: Record<string, number> = {
+  'gemini-3.8-flash': 65536,
+}
+
+/** 取模型基名：剥掉路由前缀（cline-free/ cline-pass/ google/ vendor/model 等）。 */
+function clineModelBaseName(id: string): string {
+  const tail = id.includes('/') ? id.slice(id.lastIndexOf('/') + 1) : id
+  return tail.toLowerCase()
+}
+
+/** 模型的输出预算硬上限；未收录返回 null（不封顶）。 */
+export function clineMaxOutputLimit(model: string): number | null {
+  return CLINE_MODEL_MAX_OUTPUT[clineModelBaseName(model)] ?? null
+}
+
+/** 出站 body 是否发生过 max_tokens 封顶（buildUpstreamBody 把事实挂在不可枚举属性上）。 */
+export function clineMaxTokensClamp(
+  body: Record<string, unknown>
+): { from: number; to: number } | null {
+  const v = (body as { __maxTokensClamp?: { from: number; to: number } | null }).__maxTokensClamp
+  return v ?? null
+}
+
+/** 给响应加上「输出预算被封顶」的可归因标记（不改变 body 与状态码）。 */
+function withMaxTokensClampHeader(
+  resp: Response,
+  clamp: { from: number; to: number } | null
+): Response {
+  if (!clamp) return resp
+  resp.headers.set('X-Cline-Max-Tokens-Clamped', `${clamp.from}->${clamp.to}`)
+  return resp
+}
 
 /**
  * 判定一次聚合结果是否为「推理空转被截断」：finish_reason=length 且几乎没有真实正文，
@@ -487,7 +546,8 @@ async function clineFetch(
   path: string,
   bodyObj: Record<string, unknown>,
   sessionId: string,
-  retried = false
+  retried = false,
+  clientSignal?: AbortSignal
 ): Promise<Response> {
   const model = String((bodyObj as Record<string, unknown>).model || '')
   const token = await getAccessToken(pool, model || undefined)
@@ -507,8 +567,14 @@ async function clineFetch(
       method: 'POST',
       headers,
       body: JSON.stringify(bodyObj),
-    }, { connectTimeoutMs: CLINE_CHAT_CONNECT_TIMEOUT_MS })
+    }, { connectTimeoutMs: CLINE_CHAT_CONNECT_TIMEOUT_MS, signal: clientSignal })
   } catch (e) {
+    // 客户端主动断开不算传输故障：定责为 client_closed，调用方据此放弃本轮且不罚冷却。
+    if (clientSignal?.aborted) {
+      const err = new Error('client disconnected') as ClineTransportError
+      err.kind = 'client'
+      throw err
+    }
     const err = new Error(
       `cline transport error: ${(e as Error).message || String(e)}`
     ) as ClineTransportError
@@ -518,7 +584,7 @@ async function clineFetch(
   // token 失效：标记当前账号冷却，强制重试（会用别的账号/刷新）
   if (resp.status === 401 && !retried) {
     if (pool.current) cooldownAccount(pool.current, CLINE_COOLDOWN_401_MS)
-    return clineFetch(pool, path, bodyObj, sessionId, true)
+    return clineFetch(pool, path, bodyObj, sessionId, true, clientSignal)
   }
   return resp
 }
@@ -545,17 +611,22 @@ async function clineFetchWithRetry(
   bodyObj: Record<string, unknown>,
   sessionId: string,
   isStream: boolean,
-  maxRetries = 4
+  maxRetries = 4,
+  clientSignal?: AbortSignal
 ): Promise<Response> {
   const model = String((bodyObj as Record<string, unknown>).model || '')
   // 冷却当前账号：优先模型级（该账号还能跑其它模型），无模型上下文则整体冷却。
+  // 客户端已断开时不冷却：Esc 中断 / 客户端重连不是模型的失败，冷却会把用户点名的
+  // 模型拉黑，后续请求被静默赶到回退链上（移植 luawei1/cline2api `4265b29`）。
   const applyCooldown = (ms: number) => {
+    if (clientSignal?.aborted) return
     if (!pool.current) return
     if (model) pool.current.modelCooldowns.set(model, Date.now() + Math.max(ms, 60 * 1000))
     else cooldownAccount(pool.current, ms)
   }
   for (let attempt = 0; attempt <= maxRetries; attempt++) {
-    const resp = await enqueue(() => clineFetch(pool, path, bodyObj, sessionId))
+    if (clientSignal?.aborted) throw clientAbortedError()
+    const resp = await enqueue(() => clineFetch(pool, path, bodyObj, sessionId, false, clientSignal))
     // 余额/权益耗尽（402）：该模型走 credits 计费档，而当前账号余额不足。
     // 只做**模型级**冷却（账号仍可跑免费模型），换号重试可能命中有余额的账号；
     // 全账号都不可用时立刻回 402，由调用方沿免费链换模型（移植 luawei1 169fd9d 语义）。
@@ -598,7 +669,14 @@ async function clineFetchWithRetry(
     }
     return resp
   }
-  return enqueue(() => clineFetch(pool, path, bodyObj, sessionId))
+  return enqueue(() => clineFetch(pool, path, bodyObj, sessionId, false, clientSignal))
+}
+
+/** 客户端主动断开：不是模型故障，调用方据此放弃本轮（不冷却、不降级、不定责 5xx）。 */
+function clientAbortedError(): ClineTransportError {
+  const err = new Error('client disconnected') as ClineTransportError
+  err.kind = 'client'
+  return err
 }
 
 // ===== 请求体构造 =====
@@ -658,11 +736,25 @@ export function buildUpstreamBody(
   }
   // max_tokens 分档（见 CLINE_MAX_TOKENS 文档）：免费档剥离，非免费档保留并兜下限。
   // 免费判定用 free 列表成员（不是前缀）——stealth/space-bunny-alpha 无 cline-free/ 前缀。
+  let clamped = false
+  let lower = 0
   if (!isFreeClineModel(model, freeSet)) {
     const rawMax = forwardBody.max_tokens ?? forwardBody.max_completion_tokens
     const parsed = rawMax != null && rawMax !== '' ? Math.floor(Number(rawMax)) || 0 : 0
-    body.max_tokens = parsed >= CLINE_MIN_UPSTREAM_MAX_TOKENS ? parsed : CLINE_MAX_TOKENS
+    lower = parsed >= CLINE_MIN_UPSTREAM_MAX_TOKENS ? parsed : CLINE_MAX_TOKENS
+    // 上限封顶（移植 3f72255）：客户端默认值（常见 128000）超过模型硬上限时上游必 400，
+    // 且 400 不会被降级链兜住。未收录模型不封顶。
+    const limit = clineMaxOutputLimit(model)
+    const finalMax = limit !== null && lower > limit ? limit : lower
+    clamped = finalMax !== lower
+    body.max_tokens = finalMax
   }
+  // 封顶事实挂成**不可枚举**属性：JSON.stringify 自动忽略，不会把内部标记发给上游；
+  // 供响应侧加可归因响应头（withMaxTokensClampHeader）与测试断言使用。
+  Object.defineProperty(body, '__maxTokensClamp', {
+    value: clamped ? { from: lower, to: body.max_tokens as number } : null,
+    enumerable: false,
+  })
   if (isStream) body.stream = true
   const passthrough = [
     'temperature', 'top_p', 'tools', 'tool_choice', 'stop',
@@ -781,14 +873,49 @@ export async function pumpStreamAttempt(
   const probeDeltas: string[] = []   // 探测期收集的 reasoning delta
   const buffered: string[] = []      // 探测期缓冲的原始帧，放行时一次性写回
 
+  // ---- 探测期时间上限 + 续流期心跳（2026-10-05，移植 luawei1/cline2api `a055b13`）----
+  // 背景：探测期此前**一个字节都不写给客户端**（Response 直到 flushHealthy 才构造），
+  // 慢首 token（长 reasoning / 上游排队）时中间层读超时会掐掉连接
+  // （上游实测 Cloudflare 隧道 120s read timeout → 524）。
+  // 处置分两段：
+  //   1. 探测期最多等 CLINE_PROBE_MAX_MS：到点仍没判定，就按「当前证据不构成退化」放行，
+  //      让响应头先出去；此后由续流阶段的滚动退化监控接管（routeToStream 会抑制垃圾
+  //      reasoning 并在收尾发 upstream_runaway），退化保护不丢。
+  //   2. 续流阶段超过 CLINE_KEEPALIVE_MS 没往客户端写字节就补一条 SSE 注释行 `: keep-alive`
+  //      （与 withSSEKeepAlive 同形态），防上游中途长时间静默被中间层掐断。
+  let lastEmitAt = Date.now()
+  let heartbeatTimer: ReturnType<typeof setTimeout> | null = null
+  const stopHeartbeat = () => {
+    if (heartbeatTimer) {
+      clearTimeout(heartbeatTimer)
+      heartbeatTimer = null
+    }
+  }
+  const armHeartbeat = (w: WritableStreamDefaultWriter<Uint8Array>) => {
+    if (CLINE_KEEPALIVE_MS <= 0) return
+    if (heartbeatTimer) clearTimeout(heartbeatTimer)
+    heartbeatTimer = setTimeout(() => {
+      if (Date.now() - lastEmitAt >= CLINE_KEEPALIVE_MS) {
+        lastEmitAt = Date.now()
+        // 写失败只可能是流已关闭（客户端断开），忽略即可。
+        void w.write(encoder.encode(': keep-alive\n\n')).catch(() => { /* 流已关闭 */ })
+      }
+      armHeartbeat(w)
+    }, CLINE_KEEPALIVE_MS)
+  }
+
   /** 把单行 SSE 帧路由到 writer（供后台续流用），含退化监控 + 抑制 + 空转报错。 */
   const routeToStream = async (line: string, w: WritableStreamDefaultWriter<Uint8Array>): Promise<void> => {
     if (!line.startsWith('data:')) {
-      if (line !== '') await w.write(encoder.encode(line + '\n'))
+      if (line !== '') {
+        lastEmitAt = Date.now() // 交到客户端侧流就算「有输出」（TransformStream 写要等读方才 resolve）
+        await w.write(encoder.encode(line + '\n'))
+      }
       return
     }
     const payload = line.slice(5).trim()
     if (payload === '' || payload === '[DONE]') {
+      lastEmitAt = Date.now()
       await w.write(encoder.encode(line + '\n\n'))
       return
     }
@@ -823,18 +950,28 @@ export async function pumpStreamAttempt(
       const errMsg = { error: { message: 'Cline 推理退化空转：全程未产出正文，已抑制垃圾 reasoning', type: 'upstream_runaway' } }
       await w.write(encoder.encode('data: ' + JSON.stringify(errMsg) + '\n\n'))
     }
+    lastEmitAt = Date.now()
     await w.write(encoder.encode('data: ' + JSON.stringify(obj ?? payload) + '\n\n'))
   }
 
   /** 健康放行：立即返回 Response，缓冲帧与后续上游帧都在后台任务里写入（reader 挂上后再写，避免背压死锁）。 */
-  const flushHealthy = (continuationBuf: string): StreamAttemptOutcome => {
+  // firstRead：探测期超时放行时，那次仍在飞的 read 交给续流任务消费——
+  // 丢掉它会让续流阶段的第一个 read 变成「下一块」，已入队的首帧永久丢失。
+  const flushHealthy = (
+    continuationBuf: string,
+    firstRead?: Promise<ReadableStreamReadResult<Uint8Array>>
+  ): StreamAttemptOutcome => {
     const { ts, writer: w } = newStream()
     const initial = buffered.slice()
     buffered.length = 0
     state.ring = probeDeltas.slice(-RING_SIZE)
     void (async () => {
+      armHeartbeat(w)
       // 先写探测期缓冲的帧
-      for (const f of initial) await w.write(encoder.encode(f))
+      for (const f of initial) {
+        lastEmitAt = Date.now()
+        await w.write(encoder.encode(f))
+      }
       let cbuf = continuationBuf
       // 排空探测期已读入但尚未处理的整行
       let ci: number
@@ -844,9 +981,13 @@ export async function pumpStreamAttempt(
         await routeToStream(line, w)
       }
       let abnormal = false
+      // 探测期超时放行时那次仍在飞的 read 排在本轮队首，必须先消费它
+      let carried: Promise<ReadableStreamReadResult<Uint8Array>> | null = firstRead ?? null
       try {
         while (true) {
-          const { done, value } = await reader.read()
+          const r = carried ?? reader.read()
+          carried = null
+          const { done, value } = await r
           if (done) break
           cbuf += decoder.decode(value, { stream: true })
           let idx: number
@@ -877,8 +1018,11 @@ export async function pumpStreamAttempt(
         }
         await w.write(encoder.encode('data: ' + JSON.stringify(errMsg) + '\n\n')).catch(() => {})
       }
+      stopHeartbeat()
       await w.close().catch(() => {})
-    })()
+    })().catch(() => {
+      // 客户端在续流途中断开：TransformStream 写入会 reject，属正常收尾，不外抛
+    })
     return { kind: 'healthy', response: new Response(ts.readable, { status: 200, headers: sseHeaders }) }
   }
 
@@ -894,10 +1038,38 @@ export async function pumpStreamAttempt(
   }
 
   // ---- 探测阶段：读行直到能做出放行/拦截判定 ----
+  // 探测最多等 CLINE_PROBE_MAX_MS：到点仍未判定就放行（响应头先出去，防 524）。
+  // 到点时若证据已构成退化，仍按 degenerate 拦截——空白洪泛通常在几百字符内就够判，
+  // 慢的是「正常长思考」，那种本来就该早点放行给客户端看。
   let probeErrored = false
+  let probeTimer: ReturnType<typeof setTimeout> | null = null
+  const PROBE_TIMEOUT = Symbol('probe-timeout')
+  /** 探测期唯一在飞的 read：超时放行时必须交给续流任务，否则首帧会被跳过。 */
+  let pendingRead: Promise<ReadableStreamReadResult<Uint8Array>> | null = null
   try {
     while (true) {
-      const { done, value } = await reader.read()
+      const readOnce = pendingRead ?? (pendingRead = reader.read())
+      const raced = await Promise.race([
+        readOnce,
+        new Promise<typeof PROBE_TIMEOUT>((resolve) => {
+          probeTimer = setTimeout(() => resolve(PROBE_TIMEOUT), CLINE_PROBE_MAX_MS)
+        }),
+      ])
+      if (probeTimer) {
+        clearTimeout(probeTimer)
+        probeTimer = null
+      }
+      // 到点：只放行缓冲帧交给续流监控；退化证据已足则照旧拦截
+      if (raced === PROBE_TIMEOUT) {
+        const { chars: tChars, ratio: tRatio } = probeWsRatio()
+        if (tChars >= DEGENERATE_MIN_CHARS && tRatio >= DEGENERATE_MAX_WS_RATIO) {
+          await reader.cancel().catch(() => {})
+          return { kind: 'degenerate' }
+        }
+        return flushHealthy(buf, readOnce)
+      }
+      pendingRead = null
+      const { done, value } = raced
       if (done) break
       buf += decoder.decode(value, { stream: true })
       let idx: number
@@ -991,7 +1163,9 @@ export async function pumpStreamAttempt(
 }
 
 /** 模型级冷却（与 clineFetchWithRetry 同语义：有 model 上下文时只冷却该账号的该模型）。 */
-function applyModelCooldown(pool: Pool, model: string, ms: number) {
+function applyModelCooldown(pool: Pool, model: string, ms: number, clientSignal?: AbortSignal) {
+  // 客户端已断开不是模型故障（移植 4265b29）：不冷却，否则单账号池下用户配置的模型被拉黑。
+  if (clientSignal?.aborted) return
   if (!pool.current) return
   if (model) pool.current.modelCooldowns.set(model, Date.now() + Math.max(ms, 60 * 1000))
   else cooldownAccount(pool.current, ms)
@@ -1004,11 +1178,13 @@ function applyModelCooldown(pool: Pool, model: string, ms: number) {
 async function proxyStreamChat(
   pool: Pool,
   body: Record<string, unknown>,
-  sessionId: string
+  sessionId: string,
+  clientSignal?: AbortSignal
 ): Promise<Response> {
   const model = String((body as Record<string, unknown>).model || '')
   for (let attempt = 0; attempt < 3; attempt++) {
-    const resp = await clineFetchWithRetry(pool, '/chat/completions', body, sessionId, true)
+    if (clientSignal?.aborted) throw clientAbortedError()
+    const resp = await clineFetchWithRetry(pool, '/chat/completions', body, sessionId, true, 4, clientSignal)
     if (!resp.ok) {
       // 402 余额耗尽是我们自己合成的响应（已带明确 message 与 type），原样透传不二次包装
       if (resp.headers.get('X-Cline-Plan-Exhausted')) return resp
@@ -1018,9 +1194,14 @@ async function proxyStreamChat(
         resp.status || 502
       )
     }
-    const outcome = await pumpStreamAttempt(resp, () => applyModelCooldown(pool, model, CLINE_COOLDOWN_RUNAWAY_MS))
+    const outcome = await pumpStreamAttempt(
+      resp,
+      () => applyModelCooldown(pool, model, CLINE_COOLDOWN_RUNAWAY_MS, clientSignal)
+    )
     if (outcome.kind === 'healthy') return outcome.response!
-    applyModelCooldown(pool, model, outcome.kind === 'degenerate' ? CLINE_COOLDOWN_RUNAWAY_MS : CLINE_COOLDOWN_EMPTY_MS)
+    // 客户端已断开：不再冷却、不再重试，直接放弃本轮（上游白烧的代价已止住）
+    if (clientSignal?.aborted) throw clientAbortedError()
+    applyModelCooldown(pool, model, outcome.kind === 'degenerate' ? CLINE_COOLDOWN_RUNAWAY_MS : CLINE_COOLDOWN_EMPTY_MS, clientSignal)
     await sleep(500 + Math.random() * 500)
   }
   return jsonResponse(
@@ -1074,6 +1255,10 @@ interface AggregatedChat {
   toolCalls: Array<{ id: string; name: string; arguments: string }>
   usage: Record<string, unknown> | null
   finishReason: string
+  /** 是否见到上游的正常收尾标记（`[DONE]` 或带 finish_reason 的帧）。 */
+  sawDone: boolean
+  /** 上游在 200 之后于流内下发的具名错误帧（代理常把 502/504 这样塞进 SSE）。 */
+  streamError: string
 }
 
 /** 读取整段上游 SSE，累积 content / reasoning / tool_calls / usage，返回聚合后的 chat 状态。 */
@@ -1081,7 +1266,7 @@ async function aggregateStream(upstream: Response): Promise<AggregatedChat> {
   const reader = upstream.body!.getReader()
   const decoder = new TextDecoder()
   const toolIndex = new Map<number, number>()
-  const acc: AggregatedChat = { id: '', model: '', created: 0, content: '', reasoning: '', toolCalls: [], usage: null, finishReason: '' }
+  const acc: AggregatedChat = { id: '', model: '', created: 0, content: '', reasoning: '', toolCalls: [], usage: null, finishReason: '', sawDone: false, streamError: '' }
   let buf = ''
   while (true) {
     const { done, value } = await reader.read()
@@ -1093,10 +1278,22 @@ async function aggregateStream(upstream: Response): Promise<AggregatedChat> {
       buf = buf.slice(idx + 1)
       if (!line.startsWith('data:')) continue
       const payload = line.slice(5).trim()
-      if (payload === '' || payload === '[DONE]') continue
+      if (payload === '') continue
+      if (payload === '[DONE]') {
+        acc.sawDone = true
+        continue
+      }
       try {
         const obj = JSON.parse(payload) as Record<string, unknown>
         const o = unwrapData(obj) as Record<string, unknown>
+        // 流内错误帧：上游以 HTTP 200 + SSE error 的形式下发（排队超时 / 空闲 504 / 早断流）。
+        // 此前整帧被当作无 choices 的普通帧忽略 → 最终回 200 + 空 content，客户端无从归因。
+        const err = o.error as Record<string, unknown> | undefined
+        if (err && typeof err === 'object') {
+          const msg = err.message
+          acc.streamError = typeof msg === 'string' && msg ? msg : 'upstream stream error'
+          continue
+        }
         if (o.id) acc.id = String(o.id)
         if (o.model) acc.model = String(o.model)
         if (o.created) acc.created = Number(o.created)
@@ -1147,16 +1344,19 @@ function chatCompletionFromAgg(a: AggregatedChat): Record<string, unknown> {
 }
 
 /**
- * 非流式转发：上游已是 SSE，聚合成非流式。content 为空时冷却当前账号切号重试（最多 3 次），
- * 最后仍空则把 reasoning 兜底拼进 content，避免"静默不回复"（item5）。
+ * 非流式转发：上游已是 SSE，聚合成非流式。
+ * - 流内错误帧 / 中途截断（既无 finish_reason 也无 [DONE]）→ 直接 502 具名错误，不冷却账号、不谎报 200；
+ * - 正常收尾但正文为空（含推理空转被 length 截断）→ 冷却切号重试（最多 3 次），
+ *   最后仍空则把 reasoning 兜底拼进 content，避免"静默不回复"（item5）。
  */
-async function proxyNonStreamChat(pool: Pool, body: Record<string, unknown>, sessionId: string): Promise<Response> {
+async function proxyNonStreamChat(pool: Pool, body: Record<string, unknown>, sessionId: string, clientSignal?: AbortSignal): Promise<Response> {
   // 恒流式前置：无论调用方 body 是否带 stream，一律强制 stream:true，
   // 否则免费通道非流式返回 500 "empty response content"（item4 修复测试/直连等手工 body 场景）。
   body['stream'] = true
   let last: AggregatedChat | null = null
   for (let attempt = 0; attempt < 3; attempt++) {
-    const resp = await clineFetchWithRetry(pool, '/chat/completions', body, sessionId, true)
+    if (clientSignal?.aborted) throw clientAbortedError()
+    const resp = await clineFetchWithRetry(pool, '/chat/completions', body, sessionId, true, 4, clientSignal)
     if (!resp.ok) {
       // 402 余额耗尽是我们自己合成的响应（已带明确 message 与 type），原样透传不二次包装
       if (resp.headers.get('X-Cline-Plan-Exhausted')) return resp
@@ -1168,6 +1368,28 @@ async function proxyNonStreamChat(pool: Pool, body: Record<string, unknown>, ses
     }
     const agg = await aggregateStream(resp)
     last = agg
+    // 上游流内错误帧：200 里塞的具名失败（排队超时 / 空闲 504）。此前整帧被忽略，
+    // 结果是回 200 + 空 content，客户端看到「成功但什么都没说」。
+    if (agg.streamError) {
+      return jsonResponse(
+        { error: { message: `Cline 上游流内报错：${agg.streamError.slice(0, 300)}`, type: 'upstream_stream_error' } },
+        502,
+      )
+    }
+    // 流被中途截断（全程既没见 [DONE] 也没有 finish_reason）：**即使已有部分正文也不谎报成功**，
+    // 与流式路径同口径（探测期丢弃半截帧、交给上层重试，见 pumpStreamAttempt 的截断分支）。
+    // 不冷却账号：截断多来自网关/中间层掐连接，不是账号本身的问题，冷却只会连坐好号。
+    if (!agg.sawDone && !agg.finishReason) {
+      return jsonResponse(
+        {
+          error: {
+            message: `Cline 上游流未发送 finish_reason/[DONE] 即结束（疑似截断）：chars=${agg.content.length}, reasoning=${agg.reasoning.length}, toolCalls=${agg.toolCalls.length}`,
+            type: 'upstream_truncated',
+          },
+        },
+        502,
+      )
+    }
     if (agg.content) return jsonResponse(chatCompletionFromAgg(agg), 200)
     // 推理空转被截断（length + 无正文/无工具调用）：预算烧在 reasoning 上未产出 → 冷却切号重试
     if (isRunawayReasoningCutoff(agg.content, agg.toolCalls, agg.finishReason)) {
@@ -1177,6 +1399,8 @@ async function proxyNonStreamChat(pool: Pool, body: Record<string, unknown>, ses
     }
     // 有正常结束原因但无文本：不空转重试（如 stop/tool_calls 但 content 空，属合法但不该重试）
     if (agg.finishReason) break
+    // 客户端已断开：放弃本轮且不冷却账号（移植 4265b29）
+    if (clientSignal?.aborted) throw clientAbortedError()
     if (pool.current) cooldownAccount(pool.current, CLINE_COOLDOWN_EMPTY_MS)
     await sleep(500 + Math.random() * 500)
   }
@@ -1189,6 +1413,12 @@ async function proxyNonStreamChat(pool: Pool, body: Record<string, unknown>, ses
 export interface ClineProxyOptions {
   /** 客户端是否要求流式（false 时聚合为非流式 chat.completion） */
   stream?: boolean
+  /**
+   * 入站请求的 signal（客户端断开时 abort）。用于两处纪律（移植 luawei1/cline2api `4265b29`）：
+   *   - 立刻中止上游 fetch，不再把整轮读完；
+   *   - 断开**不**记任何账号/模型冷却——Esc 中断与客户端重连不是模型失败。
+   */
+  signal?: AbortSignal
 }
 
 /**
@@ -1224,8 +1454,8 @@ export async function proxyClineChatRequest(
     const body = buildUpstreamBody({ ...forwardBody, model }, true, sessionId, freeSet)
     try {
       const resp = wantStream
-        ? await proxyStreamChat(pool, body, sessionId)
-        : await proxyNonStreamChat(pool, body, sessionId)
+        ? await proxyStreamChat(pool, body, sessionId, opts?.signal)
+        : await proxyNonStreamChat(pool, body, sessionId, opts?.signal)
       // 402/429 = 「该模型在当前账号池上不可用」→ 沿免费链换模型（移植 169fd9d）。
       // 其余错误（400/403/5xx）原样透传：不把参数错误伪装成「换个模型就好了」。
       if ((resp.status === 402 || resp.status === 429) && !isLast) {
@@ -1235,8 +1465,14 @@ export async function proxyClineChatRequest(
       if (model !== requested) {
         console.log(`[cline-fallback] model ${requested} unavailable on all accounts, served via ${model}`)
       }
-      return resp
+      const clamp = clineMaxTokensClamp(body)
+      if (clamp) console.log(`[cline-max-tokens] ${model} 输出预算被封顶 ${clamp.from}->${clamp.to}（模型硬上限）`)
+      return withMaxTokensClampHeader(resp, clamp)
     } catch (err) {
+      // 客户端已断开：没人要这个响应了，也不该定责成任何错误码（更不能罚冷却）。
+      if ((err as ClineTransportError).kind === 'client') {
+        return new Response(null, { status: 499 })
+      }
       // 传输层故障（建连/首字节失败，见 clineFetch 的 ClineTransportError）→ 按 trae 口径定责：
       // 503 `upstream_unreachable`，文案点明「账号未被惩罚，非账号池问题」。
       // 用 503 而非 500：客户端（DSH/pi-ai）对 5xx 一样可重试，但 code 与文案把排查方向

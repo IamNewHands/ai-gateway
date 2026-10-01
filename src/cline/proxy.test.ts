@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
-import { parseCooldownMs, fetchClineModels, isRunawayReasoningCutoff, isDegenerateReasoningDeltas, isWhitespaceOnlyReasoningDelta, normalizeReasoningDeltaForUI, pumpStreamAttempt, sanitizeClineMessages, isFreeClineModel, clineModelFallbackChain, buildUpstreamBody, proxyClineChatRequest, __resetClineCatalogCacheForTests, CLINE_MAX_TOKENS, CLINE_FREE_WHITELIST, CLINE_CHAT_CONNECT_TIMEOUT_MS, DEFAULT_MODEL } from './proxy'
+import { parseCooldownMs, fetchClineModels, isRunawayReasoningCutoff, isDegenerateReasoningDeltas, isWhitespaceOnlyReasoningDelta, normalizeReasoningDeltaForUI, pumpStreamAttempt, sanitizeClineMessages, isFreeClineModel, clineModelFallbackChain, buildUpstreamBody, clineMaxOutputLimit, clineMaxTokensClamp, proxyClineChatRequest, __resetClineCatalogCacheForTests, CLINE_MAX_TOKENS, CLINE_FREE_WHITELIST, CLINE_CHAT_CONNECT_TIMEOUT_MS, CLINE_PROBE_MAX_MS, CLINE_KEEPALIVE_MS, DEFAULT_MODEL } from './proxy'
 import type { Provider } from '../types'
 
 /** 读取一个 Response 的完整文本（用于流式结果断言）。 */
@@ -170,6 +170,114 @@ describe('流式转发 pumpStreamAttempt（2026-09-05 流式语义回归保护�
     expect(outcome.kind).toBe('healthy')
     const text = await readAll(outcome.response!)
     expect(text).toContain('Done')
+  })
+})
+
+// 探测期时间上限 + 续流心跳（2026-10-05，移植 luawei1/cline2api `a055b13`）：
+// 探测期此前一个字节都不写给客户端，Response 直到判定完成才构造——慢首 token
+// （长 reasoning / 上游排队）会被中间层读超时掐成 524。现在到点即放行，
+// 退化保护交给续流阶段的滚动监控（routeToStream 抑制 + upstream_runaway）。
+describe('探测期上限与续流心跳（防 524）', () => {
+  /** 可控上游：enqueue 决定何时吐帧，close 决定何时 EOF。 */
+  function controlledUpstream() {
+    const enc = new TextEncoder()
+    let c: ReadableStreamDefaultController<Uint8Array>
+    const stream = new ReadableStream<Uint8Array>({
+      start(cc) { c = cc },
+    })
+    return {
+      resp: new Response(stream, { status: 200 }),
+      push: (s: string) => c!.enqueue(enc.encode(s)),
+      close: () => c!.close(),
+    }
+  }
+
+  it('上游迟迟不吐内容 → 探测到 CLINE_PROBE_MAX_MS 就放行（Response 不再被扣住）', async () => {
+    vi.useFakeTimers()
+    try {
+      const up = controlledUpstream()
+      const pending = pumpStreamAttempt(up.resp)
+      await vi.advanceTimersByTimeAsync(CLINE_PROBE_MAX_MS + 50)
+      const outcome = await pending
+      expect(outcome.kind).toBe('healthy')
+      expect(outcome.response).toBeDefined()
+      up.push(dataFrame({ content: 'hi' }) + dataFrame({}, 'stop') + doneFrame())
+      up.close()
+      expect(await readAll(outcome.response!)).toContain('"content":"hi"')
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('到点时若空白洪泛证据已足，仍按 degenerate 拦截（退化保护不被上限削弱）', async () => {
+    vi.useFakeTimers()
+    try {
+      const up = controlledUpstream()
+      // 先灌够退化判定的空白字符量（≥250 且空白占比 ≥0.55）
+      for (let i = 0; i < 100; i++) up.push(dataFrame({ reasoning_content: ' \n ' }))
+      const pending = pumpStreamAttempt(up.resp)
+      await vi.advanceTimersByTimeAsync(CLINE_PROBE_MAX_MS + 50)
+      const outcome = await pending
+      expect(outcome.kind).toBe('degenerate')
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('慢思考（正常 reasoning、无正文）到点放行，续流期补 : keep-alive 心跳', async () => {
+    vi.useFakeTimers()
+    try {
+      const up = controlledUpstream()
+      const pending = pumpStreamAttempt(up.resp)
+      await vi.advanceTimersByTimeAsync(CLINE_PROBE_MAX_MS + 50)
+      const outcome = await pending
+      expect(outcome.kind).toBe('healthy')
+      // 上游此后长时间静默：应出现心跳注释行，且不含任何 data 帧
+      await vi.advanceTimersByTimeAsync(CLINE_KEEPALIVE_MS * 2 + 50)
+      up.push(dataFrame({ content: 'hi' }) + dataFrame({}, 'stop') + doneFrame())
+      up.close()
+      const text = await readAll(outcome.response!)
+      expect(text).toContain(': keep-alive')
+      expect(text).not.toContain('upstream_no_finish')
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('上游持续出帧时不产生心跳（不会在正文中间插注释行）', async () => {
+    vi.useFakeTimers()
+    try {
+      const up = controlledUpstream()
+      const pending = pumpStreamAttempt(up.resp)
+      up.push(dataFrame({ content: 'a' }))
+      const outcome = await pending
+      expect(outcome.kind).toBe('healthy')
+      // 与生产一致：客户端一直在读（TransformStream 的写要等读方才 resolve）
+      const parts: string[] = []
+      const dec = new TextDecoder()
+      const consume = (async () => {
+        const reader = outcome.response!.body!.getReader()
+        for (;;) {
+          const { done, value } = await reader.read()
+          if (done) break
+          parts.push(dec.decode(value, { stream: true }))
+        }
+      })()
+      for (let i = 0; i < 4; i++) {
+        await vi.advanceTimersByTimeAsync(0) // 让续流任务把这一帧写出去（刷新 lastEmitAt）
+        await vi.advanceTimersByTimeAsync(CLINE_KEEPALIVE_MS - 1000)
+        up.push(dataFrame({ content: 'b' }))
+      }
+      await vi.advanceTimersByTimeAsync(0)
+      up.push(dataFrame({}, 'stop') + doneFrame())
+      up.close()
+      await vi.advanceTimersByTimeAsync(0)
+      await consume
+      expect(parts.join('')).not.toContain(': keep-alive')
+      expect(parts.join('')).toContain('"content":"a"')
+    } finally {
+      vi.useRealTimers()
+    }
   })
 })
 
@@ -501,6 +609,62 @@ describe('buildUpstreamBody max_tokens 通道分档', () => {
     )
     const msgs = body.messages as Array<Record<string, unknown>>
     expect('tool_calls' in msgs[0]).toBe(false)
+  })
+})
+
+// 输出预算的模型级硬上限（2026-10-05，移植 luawei1/cline2api `3f72255`）：
+// Cline 官方接口不带 maxTokens 元数据，客户端默认的 128000 会原样透传，超过模型硬上限时
+// 上游 400，而 400 属于「原样透传、不降级」分支（clineModelFallbackChain 注释）——
+// 用户直接吃硬失败，且日志里看不出是预算超限。上游 A/B：128000 必现 400，65536 全成功。
+describe('max_tokens 模型级硬上限封顶（移植 3f72255）', () => {
+  const freeSet = new Set([DEFAULT_MODEL])
+
+  it('客户端 128000 + 命中硬上限表 → 封到表值，并记录封顶事实', () => {
+    const body = buildUpstreamBody({ model: 'cline-free/gemini-3.8-flash', max_tokens: 128000 }, true, 's1', freeSet)
+    expect(body.max_tokens).toBe(65536)
+    expect(clineMaxTokensClamp(body)).toEqual({ from: 128000, to: 65536 })
+  })
+
+  it('路由前缀不影响匹配（基名比对）：cline-free/ google/ 两种写法都封顶', () => {
+    for (const id of ['gemini-3.8-flash', 'cline-free/gemini-3.8-flash', 'google/gemini-3.8-flash', 'cline-pass/gemini-3.8-flash']) {
+      expect(clineMaxOutputLimit(id)).toBe(65536)
+    }
+  })
+
+  it('未收录模型一律不封顶（不误伤长输出模型）', () => {
+    const body = buildUpstreamBody({ model: PAID_MODEL, max_tokens: 128000 }, true, 's1', freeSet)
+    expect(body.max_tokens).toBe(128000)
+    expect(clineMaxTokensClamp(body)).toBeNull()
+    expect(clineMaxOutputLimit(PAID_MODEL)).toBeNull()
+  })
+
+  it('未超上限的值原样透传，不记封顶', () => {
+    const body = buildUpstreamBody({ model: 'cline-free/gemini-3.8-flash', max_tokens: 32768 }, true, 's1', freeSet)
+    expect(body.max_tokens).toBe(32768)
+    expect(clineMaxTokensClamp(body)).toBeNull()
+  })
+
+  it('低于硬下限的兜底值也再受上限约束（32768 < 65536，不受影响）', () => {
+    const body = buildUpstreamBody({ model: 'cline-free/gemini-3.8-flash', max_tokens: 8 }, true, 's1', freeSet)
+    expect(body.max_tokens).toBe(CLINE_MAX_TOKENS)
+    expect(clineMaxTokensClamp(body)).toBeNull()
+  })
+
+  it('封顶标记不可枚举，不会泄漏到上游请求体', () => {
+    const body = buildUpstreamBody({ model: 'cline-free/gemini-3.8-flash', max_tokens: 128000 }, true, 's1', freeSet)
+    expect(JSON.parse(JSON.stringify(body))).not.toHaveProperty('__maxTokensClamp')
+  })
+
+  it('端到端：响应带 X-Cline-Max-Tokens-Clamped 头', async () => {
+    installFetch(() => sseOkResp())
+    const resp = await proxyClineChatRequest(
+      undefined,
+      clineProvider([REFRESH_TOKEN]),
+      { model: 'cline-free/gemini-3.8-flash', max_tokens: 128000, messages: [{ role: 'user', content: 'hi' }] },
+      { stream: false },
+    )
+    expect(resp.headers.get('X-Cline-Max-Tokens-Clamped')).toBe('128000->65536')
+    await resp.text()
   })
 })
 
@@ -867,4 +1031,161 @@ describe('传输层故障定责（503 upstream_unreachable + 30s 建连超时）
       vi.useRealTimers()
     }
   })
+})
+
+// 非流式聚合的「截断即失败」语义（2026-10-05，移植 luawei1/cline2api `a055b13`）：
+// 此前 3 次尝试都判为空后落到 `chatCompletionFromAgg`，而它把缺失的 finish_reason
+// 兜成 "stop" → 客户端收到 200 + `content:""` + `finish_reason:"stop"`，
+// 一个「成功但什么都没说」的回复，既不可归因也不可重试。
+// 现在对齐 opencode 侧 `aggregateOpenCodeStream` 的 sawDone 口径（src/opencode.ts:805）。
+describe('非流式截断与流内错误帧（不谎报 finish_reason=stop）', () => {
+  it('空流 + 无 [DONE]/finish_reason → 502 upstream_truncated（不是 200/stop）', async () => {
+    installFetch(() => sseResp(''))
+    const resp = await proxyClineChatRequest(
+      undefined,
+      clineProvider([REFRESH_TOKEN]),
+      { model: DEFAULT_MODEL, messages: [{ role: 'user', content: 'hi' }] },
+      { stream: false },
+    )
+    expect(resp.status).toBe(502)
+    const data = (await resp.json()) as { error: { type: string } }
+    expect(data.error.type).toBe('upstream_truncated')
+  })
+
+  it('有部分正文但中途截断 → 同样 502，不把半截内容当成功交付', async () => {
+    installFetch(() => sseResp(dataFrame({ content: 'half-an-' })))
+    const resp = await proxyClineChatRequest(
+      undefined,
+      clineProvider([REFRESH_TOKEN]),
+      { model: DEFAULT_MODEL, messages: [{ role: 'user', content: 'hi' }] },
+      { stream: false },
+    )
+    expect(resp.status).toBe(502)
+    const data = (await resp.json()) as { error: { type: string } }
+    expect(data.error.type).toBe('upstream_truncated')
+  })
+
+  it('截断只试一次就定责，不连烧 3 次账号、也不冷却账号', async () => {
+    const { bodies } = installFetch(() => sseResp(dataFrame({ content: 'half' })))
+    const resp = await proxyClineChatRequest(
+      undefined,
+      clineProvider([REFRESH_TOKEN]),
+      { model: DEFAULT_MODEL, messages: [{ role: 'user', content: 'hi' }] },
+      { stream: false },
+    )
+    expect(resp.status).toBe(502)
+    expect(bodies).toHaveLength(1)
+  })
+
+  it('200 里塞的 SSE 错误帧 → 502 upstream_stream_error，带上上游原文', async () => {
+    installFetch(() =>
+      sseResp('data: {"error":{"message":"Upstream idle timeout exceeded"}}\n\n'),
+    )
+    const resp = await proxyClineChatRequest(
+      undefined,
+      clineProvider([REFRESH_TOKEN]),
+      { model: DEFAULT_MODEL, messages: [{ role: 'user', content: 'hi' }] },
+      { stream: false },
+    )
+    expect(resp.status).toBe(502)
+    const data = (await resp.json()) as { error: { type: string; message: string } }
+    expect(data.error.type).toBe('upstream_stream_error')
+    expect(data.error.message).toContain('Upstream idle timeout exceeded')
+  })
+
+  // 含 3 次重试 + 退避 sleep，超过默认 5s 上限
+  it('只有 [DONE] 没有 finish_reason 帧 → 算正常收尾，仍走既有空回复重试语义', async () => {
+    const { bodies } = installFetch(() => sseResp(doneFrame()))
+    const resp = await proxyClineChatRequest(
+      undefined,
+      clineProvider([REFRESH_TOKEN]),
+      { model: DEFAULT_MODEL, messages: [{ role: 'user', content: 'hi' }] },
+      { stream: false },
+    )
+    // 3 次都是「正常收尾但空」→ 保持旧行为：重试到上限后回 200 空回复（reasoning 兜底位留空）
+    expect(resp.status).toBe(200)
+    expect(bodies.length).toBe(3)
+    const data = (await resp.json()) as { choices: Array<{ finish_reason: string; message: { content: string } }> }
+    expect(data.choices[0].finish_reason).toBe('stop')
+    expect(data.choices[0].message.content).toBe('')
+  }, 20000)
+
+  it('正常流（正文 + finish_reason + [DONE]）不受影响', async () => {
+    installFetch(() => sseOkResp())
+    const resp = await proxyClineChatRequest(
+      undefined,
+      clineProvider([REFRESH_TOKEN]),
+      { model: DEFAULT_MODEL, messages: [{ role: 'user', content: 'hi' }] },
+      { stream: false },
+    )
+    expect(resp.status).toBe(200)
+    const data = (await resp.json()) as { choices: Array<{ finish_reason: string; message: { content: string } }> }
+    expect(data.choices[0].finish_reason).toBe('stop')
+    expect(data.choices[0].message.content).toBe('hi')
+  })
+})
+
+// 客户端主动断开不罚模型（2026-10-05，移植 luawei1/cline2api `4265b29`）：
+// Esc 中断 / 客户端重连不是模型失败。断开时中止上游 fetch、放弃本轮（499 空响应），
+// 且不记账号/模型冷却——否则单账号池下用户点名的模型被拉黑，后续请求被静默
+// 赶到回退链上，表现为「配置了模型却总走 fallback」。
+describe('客户端断开不罚模型（移植 4265b29）', () => {
+  it('signal 已 abort → 立刻放弃，不打上游、不冷却', async () => {
+    const { bodies } = installFetch(() => sseOkResp())
+    const ctrl = new AbortController()
+    ctrl.abort()
+    const resp = await proxyClineChatRequest(
+      undefined,
+      clineProvider([REFRESH_TOKEN]),
+      { model: DEFAULT_MODEL, messages: [{ role: 'user', content: 'hi' }], stream: true },
+      { stream: true, signal: ctrl.signal },
+    )
+    expect(resp.status).toBe(499)
+    expect(bodies).toHaveLength(0)
+  })
+
+  it('流式途中断开：上游 fetch 被 abort，本轮不再重试第二次', async () => {
+    let calls = 0
+    const enc = new TextEncoder()
+    const ctrl = new AbortController()
+    const fn = vi.fn(async (input: unknown, init?: RequestInit) => {
+      const url = String(input)
+      if (url.includes('recommended-models')) return jsonResp({ recommended: [], free: [{ id: DEFAULT_MODEL }], clinePass: [] })
+      if (url.endsWith('/v1/models')) return jsonResp({ data: [] })
+      if (url.includes('/auth/refresh')) return jsonResp({ data: { accessToken: 'tok-1', expiresAt: Date.now() + 3_600_000 } })
+      if (url.includes('/chat/completions')) {
+        calls++
+        return new Response(
+          new ReadableStream<Uint8Array>({
+            start(c) {
+              // 吐一帧 reasoning 后静默——模拟「模型正在想，客户端此时按了 Esc」
+              c.enqueue(enc.encode(dataFrame({ reasoning_content: 'thinking' })))
+              const signal = init?.signal
+              signal?.addEventListener('abort', () => {
+                try { c.error(new Error('aborted')) } catch { /* already closed */ }
+              }, { once: true })
+              if (signal?.aborted) c.error(new Error('aborted'))
+            },
+          }),
+          { status: 200, headers: { 'Content-Type': 'text/event-stream' } },
+        )
+      }
+      throw new Error('unexpected url: ' + url)
+    })
+    vi.stubGlobal('fetch', fn)
+    const pending = proxyClineChatRequest(
+      undefined,
+      clineProvider([REFRESH_TOKEN]),
+      { model: DEFAULT_MODEL, messages: [{ role: 'user', content: 'hi' }], stream: true },
+      { stream: true, signal: ctrl.signal },
+    )
+    // 探测期上游在静默，等过 CLINE_PROBE_MAX_MS 放行后客户端断开
+    await new Promise((r) => setTimeout(r, CLINE_PROBE_MAX_MS + 200))
+    ctrl.abort()
+    const resp = await pending
+    expect([499, 200]).toContain(resp.status)
+    // 关键：断开后不因「空响应」重试第二轮
+    expect(calls).toBe(1)
+    if (resp.status === 200) await resp.body?.cancel()
+  }, 20000)
 })
