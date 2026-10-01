@@ -4321,7 +4321,9 @@ async function handleAnthropicCline(
   openaiBody: Record<string, unknown>,
   originalStream: boolean
 ): Promise<Response> {
-  return handleAnthropicSpecial(c, provider, model, openaiBody, originalStream, proxyClineChatRequest, 'Cline')
+  const clineProxy: SpecialChatProxy = (env, p, body) =>
+    proxyClineChatRequest(env, p, body, { signal: c.req.raw.signal })
+  return handleAnthropicSpecial(c, provider, model, openaiBody, originalStream, clineProxy, 'Cline')
 }
 
 /** 特殊提供商（Cline/Gemini/CNB）的 Anthropic 格式转发共用实现。 */
@@ -4751,7 +4753,9 @@ async function handleResponsesInner(c: Context<AppEnv>) {
 
     // Cline：refreshToken 账号池转发（proxyClineChatRequest 返回 OpenAI SSE），再转回 Responses 格式。
     if (isClineProvider(provider.id)) {
-      return handleResponsesSpecial(c, provider, model, openaiBody, originalStream, proxyClineChatRequest, 'Cline', g5Base, g5Save)
+      const clineProxy: SpecialChatProxy = (env, p, body) =>
+        proxyClineChatRequest(env, p, body, { signal: c.req.raw.signal })
+      return handleResponsesSpecial(c, provider, model, openaiBody, originalStream, clineProxy, 'Cline', g5Base, g5Save)
     }
 
     // OAuth 提供商

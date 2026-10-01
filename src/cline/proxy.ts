@@ -108,21 +108,20 @@ const CLINE_COOLDOWN_PLAN_MS = 12 * 3600 * 1000
 /**
  * Cline chat 的建连/首字节超时（**cline 专属，不继承全局 OPENCODE_CONNECT_TIMEOUT_MS**）。
  *
- * 为什么从全局默认 90s 收到 30s（2026-09-27 定责，证据来自 DSH 会话记录）：
- * 一次线上请求在 `/chat/completions` 上 90 秒不吐响应头，`streamFetchWithTimeout` 的
- * 90s 定时器 abort → AbortError("The operation was aborted") 被本文件旧 catch 原样包成
- * `500 {"message":"The operation was aborted","type":"api_error"}`（无 code、无分类）。
- * DSH 把 "500" 归类成 SERVER 并按其退避策略重试 5 次（`dsh-llm-pi-ai/lib/index.js:1372`），
- * 而退避上限只有 8s（`dsh-llm/lib/types/retry-policy.js:12-15`）——于是单次尝试烧 90s、
- * 5 次重试 ≈ 7.5 分钟全撞同一个卡死的上游，用户看到的现象却是「重试延迟 543ms」（其实是
- * 正常的 500ms×抖动，真病在 90s）。实测时序（会话 f634b209）：step/start → 91.0s → 183.5s
- * → 292.0s → 385.1s，每次恰好 +92s，与 90s 建连超时吻合。
- *
- * 30s 与 trae 通道一致（`TRAE_CHAT_CONNECT_TIMEOUT_MS`，src/trae/constants.ts:75）：
- * 把单次失败成本从 91s 压到 31s，同时保留思考模型首字节前的合理等待。
- * **可调**：若线上出现「30s 内合法未出首字节」的误杀，改这一个常量即可。
+ * 从原 30s 放宽到 60s（2026-10-01）：
+ * 现代思考模型（长 reasoning / 上游排队 / 复杂提示词）在高峰期生成首个 chunk 常需 30-50s，
+ * 30s 硬超时在线上产生了一定比例的「合法思考未出首字节」误杀。放宽到 60s 留足合理等待窗口，
+ * 同时相较全局默认 90s 仍保持 30s 保护，兼顾推理排队容限与失败止损。
+ * **可调**：若线上出现「60s 内合法未出首字节」的误杀，改这一个常量即可。
  */
-export const CLINE_CHAT_CONNECT_TIMEOUT_MS = 30_000
+export const CLINE_CHAT_CONNECT_TIMEOUT_MS = 60_000
+
+/**
+ * 传输层故障内部最多重试尝试次数（与 trae 通道 MAX_TRANSPORT_ATTEMPTS=2 同纪律）。
+ * 建连超时或传输抖动时，第 1 次失败不惩罚账号，短暂退避后做 1 次内部重试；撞满 2 次即跳出，
+ * 避免在死链路上无休止空转。
+ */
+export const CLINE_MAX_TRANSPORT_ATTEMPTS = 2
 
 /**
  * 传输层故障标记（与 trae 同口径：`src/trae/upstream.ts:605-613` 给建连失败打 `kind='transport'`）。
@@ -624,9 +623,26 @@ async function clineFetchWithRetry(
     if (model) pool.current.modelCooldowns.set(model, Date.now() + Math.max(ms, 60 * 1000))
     else cooldownAccount(pool.current, ms)
   }
+  let transportAttempts = 0
   for (let attempt = 0; attempt <= maxRetries; attempt++) {
     if (clientSignal?.aborted) throw clientAbortedError()
-    const resp = await enqueue(() => clineFetch(pool, path, bodyObj, sessionId, false, clientSignal))
+    let resp: Response
+    try {
+      resp = await enqueue(() => clineFetch(pool, path, bodyObj, sessionId, false, clientSignal))
+    } catch (err) {
+      if ((err as ClineTransportError).kind === 'client' || clientSignal?.aborted) {
+        throw err
+      }
+      if ((err as ClineTransportError).kind === 'transport') {
+        transportAttempts++
+        if (transportAttempts < CLINE_MAX_TRANSPORT_ATTEMPTS && attempt < maxRetries) {
+          // 传输抖动/超时：不惩罚账号（与 trae 同纪律），短暂退避后重试 1 次（兼顾偶发抖动自愈与失败止损）
+          await sleep(500 + Math.random() * 500)
+          continue
+        }
+      }
+      throw err
+    }
     // 余额/权益耗尽（402）：该模型走 credits 计费档，而当前账号余额不足。
     // 只做**模型级**冷却（账号仍可跑免费模型），换号重试可能命中有余额的账号；
     // 全账号都不可用时立刻回 402，由调用方沿免费链换模型（移植 luawei1 169fd9d 语义）。
@@ -1443,6 +1459,7 @@ export async function proxyClineChatRequest(
   const { models, freeSet } = await getClineCatalog()
   const chain = clineModelFallbackChain(requested, models)
   let last: Response | null = null
+  let lastTransportErr: ClineTransportError | null = null
 
   for (let i = 0; i < chain.length; i++) {
     const model = chain[i]
@@ -1480,6 +1497,11 @@ export async function proxyClineChatRequest(
       // 去查重试延迟而不是 90s 建连超时（trae 侧同类修复见 src/trae/proxy.ts:733-738）。
       const transport = (err as ClineTransportError).kind === 'transport'
       if (transport) {
+        lastTransportErr = err as ClineTransportError
+        if (!isLast) {
+          console.warn(`[cline-fallback] model ${model} transport error (${(err as Error).message}), trying next candidate...`)
+          continue
+        }
         return jsonResponse({
           error: {
             message: 'Cline 上游连接超时/中断（账号未被惩罚，非账号池问题）：' + ((err as Error).message || ''),
@@ -1490,6 +1512,15 @@ export async function proxyClineChatRequest(
       }
       return jsonResponse({ error: { message: (err as Error).message || 'Cline 转发失败', type: 'api_error' } }, 500)
     }
+  }
+  if (lastTransportErr) {
+    return jsonResponse({
+      error: {
+        message: 'Cline 上游连接超时/中断（账号未被惩罚，非账号池问题）：' + (lastTransportErr.message || ''),
+        type: 'api_error',
+        code: 'upstream_unreachable',
+      },
+    }, 503)
   }
   return last ?? jsonResponse({ error: { message: 'Cline 全部候选模型均不可用', type: 'upstream_unavailable' } }, 502)
 }

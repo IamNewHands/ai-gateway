@@ -219,9 +219,13 @@ DSH 的 retry policy 是 `initialDelayMs=500` + `jitterRatio=0.1`（`dsh-llm/lib
   （同 trae `applyChatError` 的 transport 分支纪律：一次网络抖动不该刷空账号池）
 - `proxyClineChatRequest` 的 catch 分流：transport → **503 `upstream_unreachable`**，
   文案写明「账号未被惩罚，非账号池问题」；其余保持 500 `api_error`
-- `CLINE_CHAT_CONNECT_TIMEOUT_MS = 30_000`，经 `streamFetchWithTimeout` 的
-  `connectTimeoutMs` 显式传入（**不继承全局 90s**）。与 `TRAE_CHAT_CONNECT_TIMEOUT_MS` 一致，
-  单次失败成本 91s → 31s
+- `CLINE_CHAT_CONNECT_TIMEOUT_MS = 60_000`（2026-10-01 从 30s 放宽）：长思考与排队场景下
+  30s 首字节容易误杀合法请求，放宽到 60s 留出充足推理计算时间，同时比全局 90s 仍有 30s 保护
+- `CLINE_MAX_TRANSPORT_ATTEMPTS = 2`：`clineFetchWithRetry` 内对 transport 异常捕获并进行 1 次
+  内部退避重试（网络偶发抖动自愈）；撞满 2 次跳出当前模型，不罚号也不死循环
+- **回退链遇 transport 故障放行**：`proxyClineChatRequest` 遇 transport 且存在后续候选模型时，
+  `continue` 尝试下一个候选模型，真正发挥回退链容灾能力
+- **入站 signal 穿透**：Anthropic / Responses 协议入口以闭包向 `proxyClineChatRequest` 注入入站请求 signal
 
 **有意的取舍（不要"顺手改回去"）**：
 
@@ -229,7 +233,7 @@ DSH 的 retry policy 是 `initialDelayMs=500` + `jitterRatio=0.1`（`dsh-llm/lib
   token 刷新失败）**不带标记**，出口不变 —— 把池问题伪装成网络故障是反向误导
 - 全局 `OPENCODE_CONNECT_TIMEOUT_MS` 保持 90s 不动：其它 provider（含长思考）依赖它，
   cline 单独收紧，可回退面最小
-- 30s 是**可调常量**：若线上出现「30s 内合法未出首字节」的误杀，只改这一个值
+- 60s 是**可调常量**：若线上出现「60s 内合法未出首字节」的误杀，改这一个值
 
 ### 已知缺口
 
