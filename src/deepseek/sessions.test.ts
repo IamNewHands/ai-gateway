@@ -187,6 +187,40 @@ describe('env 配置（DS_* → DEEPSEEK_*）', () => {
     expect(parseDurationMs('')).toBeNull()
   })
 
+  /**
+   * 与旧正则实现逐字对齐的边界（手写扫描替代正则后必须保持同语义，否则 env 解析口径漂移）：
+   * 段间空隙、单位最长匹配（ms 先于 m/s）、负号、小数点位、尾随数字都要与原先一致。
+   */
+  it('parseDurationMs 的边界语义与旧正则一致', () => {
+    expect(parseDurationMs('1h30m500ms')).toBe(90 * 60 * 1000 + 500)
+    expect(parseDurationMs('  90m  ')).toBe(90 * 60 * 1000) // 外层空白允许
+    expect(parseDurationMs('-90m')).toBe(-90 * 60 * 1000) // 负时长（Go 允许）
+    expect(parseDurationMs('500ms')).toBe(500) // ms 不得被 m 抢先吃掉
+    expect(parseDurationMs('1us')).toBe(0.001)
+    expect(parseDurationMs('1ns')).toBe(1e-6)
+    expect(parseDurationMs('1µs')).toBe(0.001)
+    for (const bad of ['1h 30m', '90 m', '1.', '.5h', '1e3s', '--90m', '+90m', '90m30', 'h', 'm1', '1hh']) {
+      expect(parseDurationMs(bad), bad).toBeNull()
+    }
+  })
+
+  /**
+   * CodeQL js/polynomial-redos（#78）回归：旧实现在「超长数字串 + 缺单位」上按起始位置
+   * 反复回溯（O(n²)）。纯数字串走 `^-?\d+$` 快路径，压不到正则；必须带一个非法尾字符才
+   * 进扫描循环。这里给 5 万位数字 + 非法尾字符——线性实现瞬时返回 null；
+   * 若有人改回正则回溯形状，本用例会超时失败（vitest 默认 5s）。
+   */
+  it('parseDurationMs 对超长数字串是线性时间（ReDoS 回归）', () => {
+    const bomb = '0'.repeat(50_000)
+    const t0 = Date.now()
+    expect(parseDurationMs(`${bomb}x`)).toBeNull() // 5 万位 + 非法单位：旧实现 O(n²) 卡死
+    expect(parseDurationMs(`${bomb}.`)).toBeNull() // 尾随小数点
+    expect(Date.now() - t0).toBeLessThan(1000)
+    // 纯数字串是「秒」快路径（与 Go strconv.Atoi 回退一致），不进扫描循环
+    expect(parseDurationMs(bomb)).toBe(0)
+    expect(parseDurationMs(`${bomb}m`)).toBe(0)
+  })
+
   it('清理配置默认值 = 1h / floor 5 / p 0.5 / gap 1–6s', () => {
     const cfg = resolveCleanupConfig(mockEnv(mockKV()))
     expect(cfg).toMatchObject({

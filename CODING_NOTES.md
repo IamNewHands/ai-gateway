@@ -263,6 +263,27 @@ TRAE 思考模型在推理阶段可能 15~20s 不发数据，客户端（AI SDK 
 - 真修的例子（本轮）：`src/pages-inline-script.test.ts` 内联脚本抽取正则改 `<\/script\s*\/?>`，
   修掉 `js/bad-tag-filter`（原来漏掉 `</script >` 这类结束标签 → 少校验一段客户端脚本）。
 
+## CodeQL 2026-10-01 轮：URL 子串判定 / ReDoS / 栈信息外泄（真修，非 dismiss）
+
+- **`js/incomplete-url-substring-sanitization`（#80 `src/deepseek/proxy.ts`、#81 `src/pages.ts`）**：
+  `baseUrl.includes('chat.deepseek.com')` 会被 `https://chat.deepseek.com.evil.com` 与
+  `https://evil.com/?u=chat.deepseek.com` 骗过（CWE-20）——前者会把**别人家的上游**路由进
+  deepseek 模块并渲染成「自家上游」面板。
+  处理：统一走 **`src/url-host.ts` 的 `baseUrlHostIs(baseUrl, host)`**（解析后 hostname 精确比对；
+  空串/非字符串/不可解析一律 false，不猜）。`src/kuku/proxy.ts` 早先已按同一思路手写实现，新代码一律用这个 helper。
+  **不要再写子串域名判定**；`pages.ts` 里 `includes('trae')` / `includes('cnb.cool')` 等同类写法尚未被报，
+  但属同一族隐患（`includes('trae')` 连 `xtraefoo` 都算命中）。
+- **`js/polynomial-redos`（#78 `src/deepseek/sessions.ts`）**：`parseDurationMs` 原用
+  `/(-?\d+(?:\.\d+)?)(ns|us|µs|ms|s|m|h)/g` 逐段 exec，超长数字串 + 非法单位会按起始位置反复回溯。
+  处理：改**手写线性扫描**，语义与旧正则逐字对齐（段间不许空隙、单位最长匹配优先 `ms` 先于 `m`/`s`、
+  负号/小数点边界、纯数字走「秒」快路径）。回归用例含 5 万位数字串——改回正则形状会超时失败。
+- **`js/stack-trace-exposure`（#79 `probe/worker.ts`）**：原把 `err.message` / `cause.message` 直接
+  拼进 HTTP 响应体。处理：新增 `describeError()`，只回**结构化枚举字段**（BizError 的 `bizCode`/`code`/
+  `httpStatus`、HttpStatusError 的 `status`、连接层 `cause.code`），完整 message 只写 `console.error`。
+  ⚠️ **该查询的 source 是 catch 参数本身**（不是 `.stack`），barrier 是「读非 `stack` 属性」——
+  所以「只取结构化字段」能真正消警，而「把 message 脱敏后再回」**不能**。
+  探针的判定能力靠数字码（40003/风控 vs ENOTFOUND 连接层），不靠 message 文本，诊断力不损失。
+
 ## 挑号规则：7 天内到期积分优先（2026-09-28）
 
 积分带到期时间，原「积分高低」挑号会让低分号的整包额度直接过期作废。现两个池统一为两段式

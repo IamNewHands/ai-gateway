@@ -125,6 +125,27 @@ describe('provider detection', () => {
     expect(isDeepseekAppProvider({ id: 'trae', baseUrl: 'https://x' } as never)).toBe(false)
     expect(isDeepseekAppProvider(undefined)).toBe(false)
   })
+
+  /**
+   * 域名判定必须是 hostname 精确比对（CodeQL js/incomplete-url-substring-sanitization）：
+   * 子串写法会把「别人家的域名里带 chat.deepseek.com」也认成自家上游。
+   */
+  it('域名判定拒绝子串伪装的 baseUrl', () => {
+    for (const evil of [
+      'https://chat.deepseek.com.evil.com/v1',
+      'https://evil.com/?u=chat.deepseek.com',
+      'https://evil.com/chat.deepseek.com',
+      'https://notchat.deepseek.com.evil.com',
+    ]) {
+      expect(isDeepseekAppProvider({ id: 'x', baseUrl: evil } as never), evil).toBe(false)
+    }
+    // 合法形态仍要命中：带路径 / 端口 / 大小写 / 尾部斜杠
+    expect(isDeepseekAppProvider({ id: 'x', baseUrl: 'https://chat.deepseek.com/api/v0' } as never)).toBe(true)
+    expect(isDeepseekAppProvider({ id: 'x', baseUrl: 'https://CHAT.DeepSeek.com:443' } as never)).toBe(true)
+    // 无法解析的 baseUrl 不猜
+    expect(isDeepseekAppProvider({ id: 'x', baseUrl: 'chat.deepseek.com' } as never)).toBe(false)
+    expect(isDeepseekAppProvider({ id: 'x', baseUrl: '' } as never)).toBe(false)
+  })
 })
 
 describe('streaming path', () => {

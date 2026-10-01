@@ -13,6 +13,7 @@
  */
 
 import type { Env, Provider } from '../types'
+import { baseUrlHostIs } from '../url-host'
 import { BizError, DeepseekClient, isAuthFailure, type FetchLike } from './client'
 import {
   DeepseekRequestError,
@@ -35,13 +36,14 @@ export const DEEPSEEK_APP_PROVIDER_ID = 'deepseek-app'
 /** 上游只有一个模型。 */
 export const DEEPSEEK_APP_MODEL = 'deepseek-flash'
 
+/** 上游固定主机。用 hostname 精确比对（见 url-host.ts），子串判定会被
+ * `https://evil.com/?u=chat.deepseek.com` / `https://chat.deepseek.com.evil.com` 骗过。 */
+const DEEPSEEK_APP_HOST = 'chat.deepseek.com'
+
 /** 该 provider 是否由本模块处理（camelCase/域名双判定，便于「测试连通性」时也能路由）。 */
 export function isDeepseekAppProvider(provider: Pick<Provider, 'id' | 'baseUrl'> | undefined | null): boolean {
   if (!provider) return false
-  return Boolean(
-    provider.id === DEEPSEEK_APP_PROVIDER_ID ||
-      (provider.baseUrl && provider.baseUrl.includes('chat.deepseek.com')),
-  )
+  return provider.id === DEEPSEEK_APP_PROVIDER_ID || baseUrlHostIs(provider.baseUrl, DEEPSEEK_APP_HOST)
 }
 
 function jsonError(status: number, message: string, type = 'invalid_request_error', code = ''): Response {

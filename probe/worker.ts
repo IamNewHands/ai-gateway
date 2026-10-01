@@ -18,7 +18,7 @@
  * 复用 src/deepseek 的移植产物（wrangler 会打包 TS，无需手抄一份 PoW）。
  */
 
-import { DeepseekClient } from '../src/deepseek/client'
+import { BizError, DeepseekClient, HttpStatusError } from '../src/deepseek/client'
 
 interface ProbeConfig {
   token?: string
@@ -36,6 +36,39 @@ function json(data: unknown, status = 200): Response {
 
 function clip(s: string, n: number): string {
   return s.length > n ? `${s.slice(0, n)}…(+${s.length - n})` : s
+}
+
+/**
+ * 把异常转成**结构化**字段回给调用方，不回 `err.message` / `cause.message`（CodeQL
+ * js/stack-trace-exposure #79：catch 到的错误文本直接进 HTTP 响应 = 内部细节外泄）。
+ *
+ * 判定能力不受损：本探针要回答的是「被 40003/风控拒了，还是连接层不通」——
+ * 前者是数字 `bizCode`，后者是 `cause.code`（ENOTFOUND / ECONNRESET…），都在这里。
+ * 完整 message / stack 只写 console（wrangler tail / CF 面板可见），不出 HTTP。
+ */
+export function describeError(err: unknown): Record<string, unknown> {
+  const out: Record<string, unknown> = { errorName: err instanceof Error ? err.name : typeof err }
+  if (err instanceof BizError) {
+    out.bizCode = err.bizCode
+    out.code = err.code
+    out.httpStatus = err.httpStatus
+  } else if (err instanceof HttpStatusError) {
+    out.httpStatus = err.status
+  }
+  // 连接层错误码（DNS/TLS/连接重置）：只取枚举式的 code，不取自由文本
+  const causeCode = (err as { cause?: { code?: unknown } })?.cause?.code
+  if (typeof causeCode === 'string' || typeof causeCode === 'number') out.causeCode = causeCode
+  return out
+}
+
+/** 完整错误详情只进 Worker 日志（服务端可见），供 operator 用 wrangler tail 定位。 */
+function logError(scope: string, err: unknown): void {
+  const cause = (err as { cause?: unknown })?.cause
+  console.error(
+    `[probe] ${scope} failed:`,
+    err instanceof Error ? `${err.name}: ${err.message}` : String(err),
+    cause instanceof Error ? `cause ${cause.name}: ${cause.message}` : cause ? `cause ${String(cause)}` : '',
+  )
 }
 
 async function runProbe(cfg: ProbeConfig, cf: unknown): Promise<Record<string, unknown>> {
@@ -71,13 +104,12 @@ async function runProbe(cfg: ProbeConfig, cf: unknown): Promise<Record<string, u
       stages.push({ stage: name, ok: true, ms: Date.now() - t0, ...out })
       return out
     } catch (err) {
-      const cause = (err as { cause?: unknown })?.cause
+      logError(name, err)
       stages.push({
         stage: name,
         ok: false,
         ms: Date.now() - t0,
-        error: err instanceof Error ? `${err.name}: ${err.message}` : String(err),
-        cause: cause instanceof Error ? `${cause.name}: ${cause.message}` : String(cause ?? ''),
+        ...describeError(err),
       })
       throw err
     }
@@ -139,16 +171,8 @@ export default {
       const report = await runProbe(cfg, cf)
       return json(report)
     } catch (err) {
-      const cause = (err as { cause?: unknown })?.cause
-      return json(
-        {
-          ok: false,
-          edge: cf,
-          error: err instanceof Error ? `${err.name}: ${err.message}` : String(err),
-          cause: cause instanceof Error ? `${cause.name}: ${cause.message}` : String(cause ?? ''),
-        },
-        502,
-      )
+      logError('fetch', err)
+      return json({ ok: false, edge: cf, ...describeError(err) }, 502)
     }
   },
 }

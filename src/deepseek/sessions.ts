@@ -200,21 +200,39 @@ const UNIT_MS: Record<string, number> = {
 /**
  * Go 风格时长解析：`90m` / `1h30m` / `1.5h` / `500ms`，或纯整数（= 秒，Go 的
  * `strconv.Atoi` 回退分支，`DEEPSEEK_CLEANUP_INTERVAL=3600` 即 1h）。无法解析返回 null。
+ *
+ * 手写扫描而非正则：原实现用 `/(-?\d+(?:\.\d+)?)(ns|us|µs|ms|s|m|h)/g` 逐段 exec，
+ * 该形状对「超长数字串 + 无单位」会按起始位置反复回溯（多项式，CodeQL
+ * js/polynomial-redos）；输入来自 env/cron 配置，解析必须是线性时间。
+ * 语义与旧正则逐字对齐：段间不允许空隙、单位最长匹配优先（ms 先于 m/s）、
+ * 数字不接受 `+`/前导点/尾随点/指数。
  */
 export function parseDurationMs(raw: string): number | null {
   const s = (raw ?? '').trim()
   if (!s) return null
   if (/^-?\d+$/.test(s)) return Number(s) * 1000
-  const re = /(-?\d+(?:\.\d+)?)(ns|us|µs|ms|s|m|h)/g
+  const isDigit = (c: string | undefined): boolean => c !== undefined && c >= '0' && c <= '9'
   let total = 0
-  let consumed = 0
-  let m: RegExpExecArray | null
-  while ((m = re.exec(s)) !== null) {
-    if (m.index !== consumed) return null // 段之间有空隙 → 不是合法时长
-    total += Number(m[1]) * UNIT_MS[m[2]]
-    consumed += m[0].length
+  let i = 0
+  while (i < s.length) {
+    const numStart = i
+    if (s[i] === '-') i++
+    const intStart = i
+    while (isDigit(s[i])) i++
+    if (i === intStart) return null // 段首不是数字 → 非法（也覆盖段间空隙）
+    if (s[i] === '.') {
+      i++
+      const fracStart = i
+      while (isDigit(s[i])) i++
+      if (i === fracStart) return null // `1.` 不是合法数字
+    }
+    // 单位最长匹配优先：两字符单位（ns/us/µs/ms）先试，再试单字符（s/m/h）
+    const two = s.slice(i, i + 2)
+    const unit = UNIT_MS[two] !== undefined ? two : UNIT_MS[s[i]] !== undefined ? s[i] : ''
+    if (!unit) return null
+    i += unit.length
+    total += Number(s.slice(numStart, i - unit.length)) * UNIT_MS[unit]
   }
-  if (consumed === 0 || consumed !== s.length) return null
   return total
 }
 

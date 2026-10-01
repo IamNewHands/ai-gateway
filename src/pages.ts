@@ -3,6 +3,7 @@ import { getProviders, getProxyKeys, getMcps, getUnimodels } from './storage'
 import { SITE_CONFIG, OPENCODE_DEFAULT_URL } from './config'
 import type { AppEnv, OAuthDeviceConfig } from './types'
 import { CSS_CONTENT } from './pages.css'
+import { baseUrlHostIs } from './url-host'
 import { SHARED_JS, renderSiteFooter } from './shared.js'
 import { ANALYTICS_JS } from './analytics-ui.js'
 
@@ -69,9 +70,11 @@ const escapePageJsx = (value: unknown) => escapePageHtml(escapePageJs(value))
 const isTraeProviderUI = (p: { id?: string; baseUrl?: string }) =>
   p.id === 'trae' || (typeof p.baseUrl === 'string' && p.baseUrl.includes('trae'))
 
-/** 是否 DeepSeek App 提供商（id 固定或用 chat.deepseek.com 域，与 src/deepseek/proxy.ts 对齐） */
+/** 是否 DeepSeek App 提供商（id 固定或用 chat.deepseek.com 域，与 src/deepseek/proxy.ts 对齐）。
+ * 域名判定必须解析后比对 hostname（url-host.ts）：`includes('chat.deepseek.com')` 会把
+ * `https://chat.deepseek.com.evil.com` 也认成自家上游。 */
 const isDeepseekAppProviderUI = (p: { id?: string; baseUrl?: string }) =>
-  p.id === 'deepseek-app' || (typeof p.baseUrl === 'string' && p.baseUrl.includes('chat.deepseek.com'))
+  p.id === 'deepseek-app' || baseUrlHostIs(p.baseUrl, 'chat.deepseek.com')
 
 /** 是否商汤日日新（SenseNova）提供商（id 固定或用 token.sensenova.cn 域，与 src/admin.ts 对齐） */
 const isSensenovaProviderUI = (p: { id?: string; baseUrl?: string }) =>
