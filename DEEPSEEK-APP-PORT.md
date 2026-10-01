@@ -239,9 +239,23 @@ node node_modules\wrangler\wrangler-dist\cli.js deploy --temporary --config prob
       （表单字段 `file`、`X-DS-PoW-Response`、`x-file-size`、30s 总超时 / 1s 轮询、失败状态集与超时抛错全部对齐 Go 源码行号）
       → `client.test.ts` **11/11**（PoW 真被解算、multipart 逐位字节、轮询次数、超时/中止路径）
       → **未接线**：请求里的 `image_url` → 上传 → `ref_file_ids` 这条线还没接（见「已知缺口」#3）
+- [x] T7.3 **深度思考开关（provider 级，面板可配）**：`Provider.deepseekThinkingOff`
+      → 优先级 **客户端显式声明 > provider 默认 > 内置默认(开)**（`request.ts` 的 `resolveDeepseekThinking`）
+      → 关思考时 `stream.ts` / `sse.ts` 抑制残留 THINK 增量与 `reasoning_content`
+        （上游偶尔在 `thinking_enabled:false` 下仍推 THINK，与 simple-chat 同名处理一致）
+      → 面板新增「深度思考模式」fieldset（含优先级说明）；admin 创建/更新/upsert 三条路径读写
+      → 用例：`request.test.ts` 7 例优先级 + `proxy.test.ts` 5 例（上游 `thinking_enabled` 落值、
+        流式/非流式抑制、思考开时不被误抑制）+ `pages-inline-script.test.ts` 3 例（渲染/回显/提交）
+      → 设计取舍：客户端显式「开」必须压过 provider 默认——单向开关会让用户勾了之后无法在个别请求开回来
 
 ### 已知缺口（本轮交付后仍需处理，按价值排序）
 
+0. **风控 park 语义未接线**：`client.ts` 有 `banKind()`（biz 5 禁言 / 10 封禁 / 11 设备风险）与
+   `parseMuteUntil()`，但**没有任何调用方**——`proxy.ts` 只区分「鉴权失败 → expired」与「其他 → 记 lastError」。
+   后果：禁言/封禁账号不会被 park，下一个请求仍会打它，上游会**续期禁言窗口甚至升级成封禁**
+   （simple-chat 的注释实测：6h 禁言 → 3 天封禁）。Go 版为此专门做了 park 持久化 + `Retry-After`。
+   要做：token 池加 `parked` 状态（kind + until），`banKind` 命中时 park 并跳过，面板可见；
+   禁言时按 `mute_until` 回 `Retry-After`（Go 版兜底 60s、上限 24h）。**这是当前风险最高的一项**。
 1. **`parallel_chat_limit` 的重试只覆盖了一部分**：`proxy.ts` 预检 catch 里的判断条件
    （`err instanceof BizError && err.bizCode === 0 && err.msg.includes('parallel')`）实际是死代码——该错误以 **流内 `event: hint`** 形式到达，
    不会在预检阶段抛 BizError。现状：**非流式**可以由聚合后的 `state.error.isParallelLimit` 判出并换号重试（尚未接线）；
@@ -250,9 +264,15 @@ node node_modules\wrangler\wrangler-dist\cli.js deploy --temporary --config prob
 2. **analytics usage 未写**（与 trae/kuku 同现状，需要把 analytics context 传进 `forwardProxy`）。
 3. **图片理解未接线**：`request.ts` 已提取 `image_url` 片段且 `flattenMessages` 有意跳过，客户端侧上传/轮询已移植（T7.2），
    但「请求里的图片 → 上传 → `ref_file_ids`」这条线还没接。
-4. **SSE 心跳未包**：`stream.ts` 有 180s idle 看门狗，但没有 `withSSEKeepAlive` 的 `: keep-alive` 注释行注入。
-   思考模型静默期长（本仓 trae 的教训：15~20s 无数据会被严格客户端判为断流），建议照 `SSE_KEEPALIVE_MS = 8000` 包一层。
+4. **SSE 心跳未包**：`stream.ts` 有 180s idle 看门狗，但 `proxy.ts` 的 deepseek 分支**没有**用
+   `withSSEKeepAlive` 包一层（其他 provider 都包了：`SSE_KEEPALIVE_MS = 8000`）。
+   思考模型静默期长（本仓 trae 的教训：15~20s 无数据会被严格客户端判为断流）——
+   虽然新加的「默认关思考」开关能显著缩短静默期，但**开着思考时这条缺口仍在**。
 5. **独立 `/v1/web_search` 端点不做**（有意）：搜索 hits 已随 chat 响应 `citations` 返回。
+6. **提示词长度上限未实现**：simple-chat 有 `DefaultMaxPromptChars = 2_000_000` 的 400
+   `context_length_exceeded` 前置校验；本仓 deepseek 分支不校验，超长 prompt 直接打上游。
+   风险低（上游自己会拒），但错误归因会变成 502 而不是 400。
+7. **密码登录路径有意不接线**：上游硬卡（真实浏览器同样 biz 11），`client.login()` 保留但不接入。
 
 **阶段 8 — 验证与入库**
 - [x] T8.1 全量 `vitest run --pool=threads` + `tsc` 通过（deepseek 侧 122+ 例；全仓库 1856 例）
