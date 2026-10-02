@@ -812,9 +812,13 @@ if (-not $exe) {
 }
 Write-Host ('[OK] runtime-info.exe: ' + $exe)
 
-# 2) run it (no account on stdin; the last stdout line is the device JSON)
+# 2) run it (no account on stdin; the last stdout line is the device JSON).
+#    The empty pipe below is LOAD-BEARING: --account-stdin makes the exe read stdin, and in an
+#    interactive console stdin is the keyboard, so it blocks forever waiting for input (the
+#    script just sits there after printing the exe path). '' gives it an immediate EOF - the
+#    same thing Python's subprocess(input=b"") does. Do not "clean up" this pipe.
 $ri = @{}
-$raw = &amp; $exe --account-stdin 2>$null
+$raw = '' | &amp; $exe --account-stdin 2>$null
 $line = ($raw | Where-Object { $_.Trim() } | Select-Object -Last 1)
 if ($line) {
   try { $ri = $line | ConvertFrom-Json } catch { Write-Host ('[X] runtime-info output is not JSON: ' + $line); exit 1 }

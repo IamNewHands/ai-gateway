@@ -349,6 +349,9 @@ describe('内置提取脚本（防止后续忘记怎么提取）', () => {
     // 调用运算符必须还原成 &（源里写的是 &amp;，textContent 会解回 &）
     expect(script).toContain('& $exe --account-stdin')
     expect(script).not.toContain('&amp;')
+    // 空管道是**承重结构**：--account-stdin 会读 stdin，交互式控制台下 stdin 是键盘，
+    // 没有它脚本会一直卡在「刚打印完 exe 路径」那里（2026-10-02 用户实测卡死）。
+    expect(script).toContain("'' | & $exe --account-stdin")
   })
 
   /**
