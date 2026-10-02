@@ -5135,6 +5135,7 @@ adminNavLinks.forEach(function (link) {
 window.addEventListener('hashchange', function () { maybeLoadPerf(location.hash) })
 setTimeout(loadPerfSettings, 100)
 // ===== Qoder 真机设备身份（原 COSY_* Secret，改为面板配置） =====
+/* QODER_DEV_BEGIN */
 var qoderDeviceFields = []
 function qoderDeviceInputs() {
   var out = []
@@ -5172,6 +5173,7 @@ function qoderDeviceFillFromJson() {
   if (out) { out.style.color = ''; out.textContent = filled ? ('已填充 ' + filled + ' 个字段，核对后点「保存」') : '没识别到任何字段，请检查粘贴内容' }
   if (!filled) toast('没识别到任何字段', 'error')
 }
+/* QODER_DEV_END */
 async function loadQoderDevice() {
   var st = document.getElementById('qoder-device-state')
   try {

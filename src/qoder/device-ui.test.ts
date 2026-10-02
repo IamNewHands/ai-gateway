@@ -91,3 +91,119 @@ describe('管理后台「Qoder 设备身份」区块', () => {
     expect(js).toContain('setTimeout(loadQoderDevice, 100)')
   })
 })
+
+/**
+ * 「从 JSON 填充」的行为验证（DOM 替身驱动客户端代码）。
+ *
+ * 为什么必须跑行为而不只查存在性：用户手上就一份 `config.json`，这个按钮是他唯一的输入路径。
+ * 键名归一写错（比如没去掉 `COSY_` 前缀、没认 `productVersion`）时按钮**不报错也不填充**，
+ * 表现成「我明明粘了，怎么什么都没进去」，从语法/存在性断言里完全看不出来。
+ */
+function makeQoderDevApi(html: string) {
+  const js = inlineScripts(html).join('\n')
+  const m = js.match(/\/\* QODER_DEV_BEGIN \*\/([\s\S]*?)\/\* QODER_DEV_END \*\//)
+  if (!m) throw new Error('未找到 QODER_DEV 标记块：面板填充块被删除或改名了？')
+  const inputs = new Map<string, { id: string; value: string }>()
+  for (const f of QODER_DEVICE_FIELDS) inputs.set('qd-' + f.key, { id: 'qd-' + f.key, value: '' })
+  const ta = { value: '' }
+  const out = { textContent: '', style: { color: '' } }
+  const document = {
+    getElementById: (id: string) => (id === 'qoder-device-json' ? ta : (id === 'qoder-device-result' ? out : inputs.get(id) ?? null)),
+  }
+  const toasts: string[] = []
+  const factory = new Function(
+    'document', 'toast',
+    m[1] + '\nreturn {' +
+      ' fill: qoderDeviceFillFromJson,' +
+      ' key: qoderDeviceKey,' +
+      ' setFields: function (f) { qoderDeviceFields = f } }'
+  )
+  const api = factory(document, (msg: string) => { toasts.push(String(msg)) })
+  return {
+    ...api,
+    ta, out, toasts,
+    val: (key: string) => inputs.get('qd-' + key)?.value ?? null,
+    all: () => QODER_DEVICE_FIELDS.map((f) => inputs.get('qd-' + f.key)!.value),
+  }
+}
+
+describe('「从 JSON 填充」：键名归一与填充行为', () => {
+  it('键名归一同时接受 config.json 的 camelCase、COSY_* 大写与 productVersion', async () => {
+    const api = makeQoderDevApi(await render([]))
+    expect(api.key('machineToken')).toBe('machinetoken')
+    expect(api.key('COSY_MACHINE_TOKEN')).toBe('machinetoken')
+    expect(api.key('cosy-machine-code')).toBe('machinecode')
+    expect(api.key('  MachineOS  ')).toBe('machineos')
+    expect(api.key('productVersion')).toBe('version')
+    expect(api.key('version')).toBe('version')
+    expect(api.key(null)).toBe('')
+    expect(api.key(undefined)).toBe('')
+  })
+
+  it('整段粘贴 config.json（含 device 块）→ 8 个字段全部填上', async () => {
+    const api = makeQoderDevApi(await render([]))
+    api.setFields(QODER_DEVICE_FIELDS)
+    api.ta.value = JSON.stringify({
+      device: {
+        clientType: '10',
+        machineOS: 'x86_64_windows',
+        machineHostname: 'HUAWEI-MACBOOK',
+        machineId: '0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0',
+        machineToken: 'dev-machine-token-placeholder',
+        machineCode: '00112233445566aabb',
+        machineType: 'aabbccddeeff001122',
+        version: '0.4.3',
+      },
+    })
+    api.fill()
+    expect(api.all()).toEqual([
+      '10', '0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0', 'dev-machine-token-placeholder',
+      'aabbccddeeff001122', '00112233445566aabb', 'x86_64_windows', 'HUAWEI-MACBOOK', '0.4.3',
+    ])
+    expect(api.out.textContent).toContain('已填充 8 个字段')
+    expect(api.toasts).toEqual([])
+  })
+
+  it('只贴 device 块本身、或贴 COSY_* 形式的键，同样能填充', async () => {
+    const bare = makeQoderDevApi(await render([]))
+    bare.setFields(QODER_DEVICE_FIELDS)
+    bare.ta.value = '{"machineToken":"tok","machineCode":"abc"}'
+    bare.fill()
+    expect(bare.val('machineToken')).toBe('tok')
+    expect(bare.val('machineCode')).toBe('abc')
+    // 没给的字段保持原值（不清空用户已填的内容）
+    expect(bare.val('clientType')).toBe('')
+
+    const envStyle = makeQoderDevApi(await render([]))
+    envStyle.setFields(QODER_DEVICE_FIELDS)
+    envStyle.ta.value = '{"COSY_MACHINE_TOKEN":"tok2","COSY_VERSION":"0.4.3"}'
+    envStyle.fill()
+    expect(envStyle.val('machineToken')).toBe('tok2')
+    expect(envStyle.val('version')).toBe('0.4.3')
+  })
+
+  it('非空值 trim 后填入（粘贴时常见的尾随空白不会变成头里的脏字符）', async () => {
+    const api = makeQoderDevApi(await render([]))
+    api.setFields(QODER_DEVICE_FIELDS)
+    api.ta.value = '{"machineToken":"  tok  ","machineCode":"   "}'
+    api.fill()
+    expect(api.val('machineToken')).toBe('tok')
+    expect(api.val('machineCode')).toBe('')
+  })
+
+  it('非法 JSON / 没有 device 对象 / 一个字段都没识别到 → 明确报错，不假装填充成功', async () => {
+    const bad = makeQoderDevApi(await render([]))
+    bad.setFields(QODER_DEVICE_FIELDS)
+    bad.ta.value = '{not json'
+    bad.fill()
+    expect(bad.toasts[0]).toContain('JSON 解析失败')
+    expect(bad.all().every((v: string) => v === '')).toBe(true)
+
+    const other = makeQoderDevApi(await render([]))
+    other.setFields(QODER_DEVICE_FIELDS)
+    other.ta.value = '{"accounts":[{"uid":"u1"}]}'
+    other.fill()
+    expect(other.out.textContent).toContain('没识别到任何字段')
+    expect(other.toasts[0]).toContain('没识别到任何字段')
+  })
+})
