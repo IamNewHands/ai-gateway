@@ -968,10 +968,10 @@ describe('降级链中间失败日志（issue #32 附带发现）', () => {
     expect(summary!.details).toContain('probe-eof-no-frames')
   }, 20000)
 
-  // 2026-10-02 线上：cline-free/deepseek-v4.1-flash 连续三轮都只回「1 个空壳帧 + 无 finish_reason」
-  // （确定性，不是账号问题），免费链里另外两个候选模型是好的，请求却被三合一 502 判死。
-  // 免费链存在的意义就是扛住单个模型挂掉，所以 runaway 必须和 402/429/transport 一样走链。
-  it('流式三轮全拦截 → 沿免费链换下一个候选模型，不再直接 502', async () => {
+  // 用户明确决定（2026-10-02）：**不做自动切换免费路由**——只服务点名的模型；它产不出流就
+  // 按既有语义试满 3 轮，仍失败直接把 502 交给客户端，由客户端决定重试或换模型。
+  // 这条测试是回归保护：别再把「三轮全拦截」接进链上 continue（网关不得偷偷换模型）。
+  it('流式三轮全拦截 → 只报错，绝不把请求转给链上其它候选模型', async () => {
     __resetClineCatalogCacheForTests()
     const CANDIDATE_1 = 'cline-free/deepseek-v4.1-flash'
     const CANDIDATE_2 = 'cline-free/gemini-3.8-flash'
@@ -990,26 +990,24 @@ describe('降级链中间失败日志（issue #32 附带发现）', () => {
         if (body.model === CANDIDATE_1) {
           return new Response(dataFrame({}) + doneFrame(), { status: 200, headers: { 'Content-Type': 'text/event-stream' } })
         }
+        // 候选 2 是健康的，但按用户决定**不该被调用**
         return sseOkResp()
       }
       throw new Error('unexpected url: ' + url)
     })
     vi.stubGlobal('fetch', fn)
-    const logs = await captureLogs(async () => {
-      const resp = await proxyClineChatRequest(
-        undefined,
-        clineProvider([REFRESH_TOKEN]),
-        { model: CANDIDATE_1, messages: [{ role: 'user', content: 'hi' }] },
-        { stream: true },
-      )
-      expect(resp.status).toBe(200)
-      const text = await readAll(resp)
-      expect(text).toContain('"content":"hi"')
-    })
-    // 首选模型仍试满 3 轮才换（保持「空响应冷却换号重试」既有语义），随后由候选 2 服务
-    expect(calls.filter((m) => m === CANDIDATE_1)).toHaveLength(3)
-    expect(calls).toContain(CANDIDATE_2)
-    expect(logs.some((l) => l.includes('换下一个候选') && l.includes(CANDIDATE_1))).toBe(true)
+    const resp = await proxyClineChatRequest(
+      undefined,
+      clineProvider([REFRESH_TOKEN]),
+      { model: CANDIDATE_1, messages: [{ role: 'user', content: 'hi' }] },
+      { stream: true },
+    )
+    expect(resp.status).toBe(502)
+    const data = (await resp.json()) as { error: { type: string } }
+    expect(data.error.type).toBe('upstream_runaway')
+    // 点名模型试满 3 轮，且链上其它候选一个都没碰
+    expect(calls).toEqual([CANDIDATE_1, CANDIDATE_1, CANDIDATE_1])
+    expect(calls).not.toContain(CANDIDATE_2)
   }, 30000)
 })
 

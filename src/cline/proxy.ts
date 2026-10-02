@@ -1341,19 +1341,18 @@ async function proxyStreamChat(
     `[cline-attempt] model=${model} 三轮全拦截 → 502 upstream_runaway，明细=[${failedKinds.join(', ')}]`,
     JSON.stringify({ model, attempts: failedKinds }),
   )
-  // X-Cline-Runaway：告诉调用方「这个模型在当前账号池上产不出可用流」是**模型级不可用**，
-  // 与 402/429 同类，可沿免费链换下一个候选（见 proxyClineChatRequest）。
+  // 不带任何换模型标记：客户端拿到的就是「点名模型三轮产不出可用流」这个事实
+  // （用户决定不做自动切换免费路由，见 proxyClineChatRequest 的注释）。
   return jsonResponse(
     { error: { message: 'Cline 推理退化/空响应/上游截断连续 3 次未产出可用流，已冷却换号仍失败', type: 'upstream_runaway' } },
-    502,
-    { 'X-Cline-Runaway': '1' }
+    502
   )
 }
 
-function jsonResponse(obj: unknown, status: number, headers?: Record<string, string>): Response {
+function jsonResponse(obj: unknown, status: number): Response {
   return new Response(JSON.stringify(obj), {
     status,
-    headers: { 'Content-Type': 'application/json; charset=utf-8', ...(headers || {}) },
+    headers: { 'Content-Type': 'application/json; charset=utf-8' },
   })
 }
 
@@ -1632,19 +1631,9 @@ export async function proxyClineChatRequest(
         last = resp
         continue
       }
-      // 流式三轮全拦截（`upstream_runaway`）= 该模型在当前账号池上**产不出可用流**，
-      // 属模型级不可用，与 402/429 同类：沿免费链换下一个候选，而不是把三合一 502 直接
-      // 甩给客户端。免费链存在的意义就是扛住单个模型挂掉，而此前只有 402/429/transport
-      // 会走链——2026-10-02 实测 cline-free/deepseek-v4.1-flash 连续三轮返回「1 个空壳帧
-      // + 无 finish_reason」（确定性，非账号问题），三个候选模型里另外两个是好的，
-      // 请求却被直接判死。
-      if (resp.headers.get('X-Cline-Runaway') === '1' && !isLast) {
-        void resp.clone().text().then((t) => {
-          console.warn(`[cline-fallback] model ${model} 三轮未产出可用流（upstream_runaway），换下一个候选（已试 ${i + 1}/${chain.length}）：${summarizeClineUpstreamError(t)}`)
-        }).catch(() => {})
-        last = resp
-        continue
-      }
+      // 明确**不**沿链换模型（用户决定，2026-10-02）：只服务点名的模型。它三轮产不出可用流
+      // 就直接把 502 upstream_runaway 交给客户端，由客户端决定重试或换模型——网关不偷偷换模型。
+      // 回归保护见 proxy.test.ts「流式三轮全拦截 → 只报错，绝不把请求转给链上其它候选模型」。
       // 「served via」只在真的把内容交给客户端时才说。链尾候选自身 402/429 走到这里时
       // resp 是错误响应，原措辞会把失败记成成功——按错误码分叉。
       if (model !== requested) {

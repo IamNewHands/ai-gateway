@@ -270,27 +270,31 @@ fire-and-forget，换「响应返回时日志已落盘」的确定性）。
 否则又回到「只有三合一文案」的不可归因状态。对客户端响应体一个字没改（仍是原 502 文案），
 避免客户端按 message 做匹配的逻辑被打破。
 
-### Cline `upstream_runaway` 走免费链 + 空壳帧形状摘录（2026-10-02）
+### Cline 空壳帧定性 + 「不自动切换免费路由」决定（2026-10-02）
 
 面板 KV 日志实测定性（15:38）：`detail=probe-eof-no-finish frames=1 content=0 reasoning=0
 buffered=2 sawFinish=false probeReadError=false`，**三轮完全一致**。含义：上游 200 → 只回
 **1 个零正文帧** → 干净 EOF（无 finish_reason）。确定性复现 ⇒ 重试同一模型纯属白烧。
 
-两处修复：
+**用户决定（2026-10-02，明确要求）：不做自动切换免费路由。** 只服务点名的模型；它产不出流就
+按既有语义试满 3 轮，仍失败直接把 `502 upstream_runaway` 交给客户端，由客户端决定重试或换模型。
+**网关不得偷偷换模型。**
 
-1. **`upstream_runaway` 沿免费链换模型**（`proxyStreamChat` 的 502 加 `X-Cline-Runaway: 1`，
-   `proxyClineChatRequest` 见到该头且 `!isLast` 时 `continue`）。免费链存在的意义就是扛住
-   单个模型挂掉，而此前只有 402/429/transport 会走链——首选模型确定性产不出流时，
-   链上另外两个候选模型是好的，请求却被三合一 502 判死。首选模型仍试满 3 轮才换，
-   保持「空响应冷却换号重试」既有语义（多账号场景靠它换号）。
-2. **`frameSkeleton` 形状摘录**（`describeFrameSkeleton`，进 `stats` 与日志 `firstFrame=`）：
-   `frames=1 content=0` 只能说明「回了一帧空壳」，说不出是**错误帧**（`{"error":…}`）、
-   **role-only 帧**（模型拒答）还是 **usage-only 帧**（只结算），而三者处置完全不同。
-   摘录只取键名 / delta 键名 / finish_reason / error.message，不落正文，可安全进 KV。
+- 曾短暂实现过「三轮全拦截 → 沿免费链 `continue` 到下一个候选」（`X-Cline-Runaway` 头 + 链上
+  分支），**已按用户要求撤回**，并留下回归测试
+  `流式三轮全拦截 → 只报错，绝不把请求转给链上其它候选模型`（断言请求体只出现点名模型 3 次、
+  链上其它候选一个都没碰）。**不要**再把 `upstream_runaway` 接进链上 `continue`。
+- 仍保留的换模型路径只有**既有**两条（均早于本次讨论，未改动）：402/429 沿免费链降级
+  （移植 `169fd9d`）、transport 故障切下一个候选（`456d6ce`）。是否也按同一决定收掉，待用户定。
+- 保留的诊断：**`frameSkeleton` 形状摘录**（`describeFrameSkeleton`，进 `stats` 与日志
+  `firstFrame=`）：`frames=1 content=0` 只能说明「回了一帧空壳」，说不出是**错误帧**
+  （`{"error":…}`）、**role-only 帧**（模型拒答）还是 **usage-only 帧**（只结算），而三者
+  处置完全不同。摘录只取键名 / delta 键名 / finish_reason / error.message，不落正文，可安全进 KV。
+  它是本轮唯一还没收口的证据，拿到 `firstFrame=` 后即可决定是否保留（调试插桩拿到结论就该删）。
 
 **注意**：`probe-eof-no-finish` 目前同时覆盖「真截断」与「上游主动收尾但零正文」——流式探测期
-不认 `[DONE]` 为收尾标志（非流式聚合路径已有 `sawDone` 口径）。要分开二者需再加
-`sawDone` 标志位；本次未做，因为两者的处置（换号重试 → 换模型）相同。
+不认 `[DONE]` 为收尾标志（非流式聚合路径已有 `sawDone` 口径）。要分开二者需再加 `sawDone`
+标志位；本次未做，因为两者处置相同（都是试满 3 轮后报错）。
 
 ### 已知缺口
 
