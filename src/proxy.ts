@@ -15,7 +15,7 @@ import {
   isEventStreamResponse,
   OPENCODE_STREAM_IDLE_TIMEOUT_MS,
 } from './opencode'
-import { isQoderProvider, proxyQoderChatRequest } from './qoder/proxy'
+import { isQoderFlow, proxyQoderChatRequest } from './qoder/proxy'
 import { isClineProvider, proxyClineChatRequest } from './cline/proxy'
 import { isVisionBridgeProvider, buildVisionBridgeRequestBody } from './vision/bridge'
 import { isGeminiProvider, proxyGeminiChatRequest } from './gemini/proxy'
@@ -1611,7 +1611,10 @@ export async function forwardProxy(
 
     // QoderWork：COSY 签名转发（flowType=qoder）。与 opencode 一样需记录日志，
     // 否则请求成功但后台无记录。
-    if (isQoderProvider(providerId)) {
+    // 判定必须用 isQoderFlow：只看 id 会让「自定义 id + Qoder 授权」的提供商落到
+    // 下面的通用 OpenAI 转发，POST 到 {baseUrl}/chat/completions（不是 Qoder 接口），
+    // 边缘 ALB 回 503 HTML —— 真实推理同样会中招，不只是测试按钮。
+    if (isQoderFlow(provider)) {
       // 账号固定：客户端可带 X-Qoder-Account 请求头强制使用指定池账号（uid）
       const preferUid = (c.req.header('X-Qoder-Account') || '').trim() || undefined
       const response = await proxyQoderChatRequest(c.env, provider, forwardBody as Record<string, unknown>, {
@@ -3314,7 +3317,7 @@ async function handleAnthropicMessagesInner(c: Context<AppEnv>) {
 
     // QoderWork：COSY 签名转发（Anthropic 格式）。上游只收 OpenAI 格式流式，
     // 由 proxyQoderChatRequest 转发后返回 OpenAI SSE，这里再转回 Anthropic SSE。
-    if (isQoderProvider(provider.id)) {
+    if (isQoderFlow(provider)) {
       return await handleAnthropicQoder(c, provider, model, openaiBody, originalStream)
     }
 

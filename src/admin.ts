@@ -29,7 +29,7 @@ import { probeMcpServers } from './mcp-gateway'
 import { MAX_ADMIN_REQUEST_BYTES, readOptionalJSONLimited, readStrictJSONLimited } from './request-body'
 import { isTraeProvider, testTraeCredential, testTraeModel } from './trae/proxy'
 import { diagnoseOpenCodeKey, fetchOpenCodeModels, isOpenCodeProvider, resolveOpenCodeUrls, testOpenCodeModel } from './opencode'
-import { isQoderProvider, fetchQoderModels, testQoderModel } from './qoder/proxy'
+import { isQoderFlow, fetchQoderModels, testQoderModel } from './qoder/proxy'
 import { isClineProvider, fetchClineRecommendedModels, testClineChat, testClineRefreshToken, probeClineAccount, startClineOAuth, pollClineOAuth } from './cline/proxy'
 import { isGeminiProvider, testGeminiModel, GEMINI_MODELS } from './gemini/proxy'
 import { fetchGeminiQuota } from './gemini/quota'
@@ -56,6 +56,7 @@ import type {
   Env,
   ApiResponse,
   Provider,
+  ClinePinConfig,
   ApiKeyEntry,
   Model,
   CreateProviderRequest,
@@ -232,6 +233,32 @@ function normalizeReasoningEffortByModel(value: unknown): Record<string, string>
 }
 
 /**
+ * 归一 Cline 上游钉住表（移植 cline-pass-switcher）：丢弃非法 pinMode/sort 与空 key，
+ * `upstreams` 只留非空字符串并去重；既无渠道又无排序的空配置不落库。
+ * 无有效项返回 undefined（= 完全注入，回落网关自动选渠道）。
+ */
+function normalizeClinePinByModel(value: unknown): Record<string, ClinePinConfig> | undefined {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined
+  const out: Record<string, ClinePinConfig> = {}
+  for (const [model, raw] of Object.entries(value as Record<string, unknown>)) {
+    if (!model || !raw || typeof raw !== 'object' || Array.isArray(raw)) continue
+    const cfg = raw as Record<string, unknown>
+    const upstreams = Array.isArray(cfg.upstreams)
+      ? [...new Set(cfg.upstreams.filter((u) => typeof u === 'string' && u.trim() !== '').map((u) => String(u).trim()))]
+      : []
+    const pinMode = cfg.pinMode === 'preferred' ? 'preferred' : cfg.pinMode === 'strict' ? 'strict' : undefined
+    const sort = cfg.sort === 'cost' || cfg.sort === 'ttft' || cfg.sort === 'tps' ? cfg.sort : undefined
+    if (upstreams.length === 0 && !sort) continue
+    const entry: ClinePinConfig = {}
+    if (upstreams.length > 0) entry.upstreams = upstreams
+    if (pinMode) entry.pinMode = pinMode
+    if (sort) entry.sort = sort
+    out[model] = entry
+  }
+  return Object.keys(out).length > 0 ? out : undefined
+}
+
+/**
  * opencode 的 `/admin/api/test-key` 意图判定：只有显式 `intent='diagnose'` 且带了 key
  * 才跑单 key 推理诊断；其余（含缺省）一律返回模型列表。
  *
@@ -290,6 +317,7 @@ export async function handleCreateProvider(c: Context<AppEnv>) {
     allowUnlistedModels: body.allowUnlistedModels,
     reasoningEffort: normalizeReasoningEffort(body.reasoningEffort),
     reasoningEffortByModel: normalizeReasoningEffortByModel(body.reasoningEffortByModel),
+    clinePinByModel: normalizeClinePinByModel(body.clinePinByModel),
     deepseekThinkingOff: body.deepseekThinkingOff,
     thinkingInject: body.thinkingInject,
     cachePrefixInject: body.cachePrefixInject,
@@ -354,6 +382,7 @@ export async function handleUpdateProvider(c: Context<AppEnv>) {
   if (body.allowUnlistedModels !== undefined) updates.allowUnlistedModels = body.allowUnlistedModels
   if (body.reasoningEffort !== undefined) updates.reasoningEffort = normalizeReasoningEffort(body.reasoningEffort)
   if (body.reasoningEffortByModel !== undefined) updates.reasoningEffortByModel = normalizeReasoningEffortByModel(body.reasoningEffortByModel)
+  if (body.clinePinByModel !== undefined) updates.clinePinByModel = normalizeClinePinByModel(body.clinePinByModel)
   if (body.deepseekThinkingOff !== undefined) updates.deepseekThinkingOff = body.deepseekThinkingOff ?? undefined
   if (body.thinkingInject !== undefined) updates.thinkingInject = body.thinkingInject ?? undefined
   if (body.cachePrefixInject !== undefined) updates.cachePrefixInject = body.cachePrefixInject ?? undefined
@@ -459,6 +488,7 @@ export async function handleUpsertProvider(c: Context<AppEnv>) {
       cachePrefixInject: body.cachePrefixInject,
       reasoningEffort: normalizeReasoningEffort(body.reasoningEffort),
       reasoningEffortByModel: normalizeReasoningEffortByModel(body.reasoningEffortByModel),
+      clinePinByModel: normalizeClinePinByModel(body.clinePinByModel),
       deepseekThinkingOff: body.deepseekThinkingOff,
       geminiBaseUrl: body.geminiBaseUrl?.replace(/\/$/, ''),
       traeEnableRemoteBudget: body.traeEnableRemoteBudget,
@@ -505,6 +535,7 @@ export async function handleUpsertProvider(c: Context<AppEnv>) {
   if (body.cachePrefixInject !== undefined) updates.cachePrefixInject = body.cachePrefixInject
   if (body.reasoningEffort !== undefined) updates.reasoningEffort = normalizeReasoningEffort(body.reasoningEffort)
   if (body.reasoningEffortByModel !== undefined) updates.reasoningEffortByModel = normalizeReasoningEffortByModel(body.reasoningEffortByModel)
+  if (body.clinePinByModel !== undefined) updates.clinePinByModel = normalizeClinePinByModel(body.clinePinByModel)
   if (body.enabled !== undefined) updates.enabled = body.enabled
   if (body.traeEnableRemoteBudget !== undefined) updates.traeEnableRemoteBudget = body.traeEnableRemoteBudget ?? undefined
   if (body.traeRemoteOnlyModels !== undefined) updates.traeRemoteOnlyModels = body.traeRemoteOnlyModels ?? undefined
@@ -597,7 +628,7 @@ export async function handleTestModel(c: Context<AppEnv>) {
   // 通用分支会 POST ${baseUrl}/chat/completions（gateway.qoder.com.cn/chat/completions），
   // 该路径不是 Qoder 接口，边缘 ALB 直接回 503 HTML 错误页（与账号可用性无关）。
   // 真实链路是 /algo/api/v2/service/pro/sse/agent_chat_generation + COSY 签名。
-  if (isQoderProvider(provider.id) || provider.oauth?.flowType === 'qoder') {
+  if (isQoderFlow(provider)) {
     const result = await testQoderModel(c.env, provider, modelId)
     if (!result.success) {
       try {
@@ -1515,7 +1546,7 @@ export async function handleOAuthStatus(c: Context<AppEnv>) {
     data.preferUid = provider.preferOauthUid || ''
   }
   // QoderWork 多账号池：返回池账号状态（脱敏）供面板展示
-  if (provider.oauth?.flowType === 'qoder' || isQoderProvider(provider.id)) {
+  if (isQoderFlow(provider)) {
     try { await seedQoderPoolFromSingle(c.env, id) } catch { /* ignore */ }
     const qpool = await listQoderPoolStatus(c.env, id)
     data.pool = qpool
@@ -1531,7 +1562,7 @@ export async function handleOAuthPoolRemove(c: Context<AppEnv>) {
   if (!id) return c.json<ApiResponse>({ success: false, message: '缺少 id 参数' }, 400)
   const provider = await getProvider(c.env, id)
   if (!provider) return c.json<ApiResponse>({ success: false, message: '提供商不存在' }, 404)
-  const isQoder = provider.oauth?.flowType === 'qoder' || isQoderProvider(provider.id)
+  const isQoder = isQoderFlow(provider)
   if (!isOAuthPoolProvider(provider) && !isQoder) {
     return c.json<ApiResponse>({ success: false, message: '该提供商不是多账号池模式' }, 400)
   }
@@ -1551,7 +1582,7 @@ export async function handleOAuthPoolSetPrefer(c: Context<AppEnv>) {
   if (!id) return c.json<ApiResponse>({ success: false, message: '缺少 id 参数' }, 400)
   const provider = await getProvider(c.env, id)
   if (!provider) return c.json<ApiResponse>({ success: false, message: '提供商不存在' }, 404)
-  const isQoder = provider.oauth?.flowType === 'qoder' || isQoderProvider(provider.id)
+  const isQoder = isQoderFlow(provider)
   if (!isOAuthPoolProvider(provider) && !isQoder) {
     return c.json<ApiResponse>({ success: false, message: '该提供商不是多账号池模式' }, 400)
   }
@@ -1576,7 +1607,7 @@ export async function handleOAuthPoolExport(c: Context<AppEnv>) {
   const provider = await getProvider(c.env, id)
   if (!provider) return c.json<ApiResponse>({ success: false, message: '提供商不存在' }, 404)
 
-  const isQoder = provider.oauth?.flowType === 'qoder' || isQoderProvider(provider.id)
+  const isQoder = isQoderFlow(provider)
   const isWb = isOAuthPoolProvider(provider)
 
   let rawList: Array<{ uid: string; nickname?: string; token?: OAuthTokenState }> = []
@@ -2161,7 +2192,7 @@ export async function handleOAuthModels(c: Context<AppEnv>) {
 
   // QoderWork：模型发现走 COSY 签名的网关端点（GET /algo/api/v2/model/list），
   // 返回 {chat:[{key,display_name,enable}]}，只取启用模型。
-  if (isQoderProvider(provider.id) || cfg.flowType === 'qoder' || (provider.baseUrl && provider.baseUrl.includes('qoder'))) {
+  if (isQoderFlow(provider)) {
     try {
       const result = await fetchQoderModels(c.env, provider)
       if (!result.ok) {

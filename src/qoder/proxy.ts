@@ -60,6 +60,30 @@ export function isQoderProvider(providerId: string): boolean {
   return providerId === QODER_PROVIDER_ID
 }
 
+/**
+ * QoderWork 提供商的**唯一**判定入口（路由/签到/模型/测试都必须用它）。
+ *
+ * 为什么必须集中成一个 owner：同一件事此前有 **3 套写法分布在 8 处**——
+ *   1. `isQoderProvider(id)`（只看 id）
+ *   2. `isQoderProvider(id) || oauth.flowType === 'qoder'`
+ *   3. 上面两条再加 `baseUrl.includes('qoder')`
+ * 判定不一致会造成「一半走 COSY、一半走通用 OpenAI」的撕裂：模型列表用写法 3
+ * 命中（所以能拉到模型），而推理/测试用写法 1 未命中，于是 POST 到
+ * `{baseUrl}/chat/completions`（**不是** Qoder 接口），边缘 ALB 直接回自己的
+ * 503 HTML 页 —— 表现为「账号坏了」的**假阴性**，实际是路由判错。
+ *
+ * 三个信号都是真实存在的用户配置形态：
+ *   - 预置模板：`id === 'qoder'`
+ *   - 自定义 id 但走了 Qoder 设备授权：`oauth.flowType === 'qoder'`
+ *   - 手工填了 Qoder 域名但没选授权流程：`baseUrl` 含 qoder
+ */
+export function isQoderFlow(provider: { id?: string; baseUrl?: string; oauth?: { flowType?: string } } | null | undefined): boolean {
+  if (!provider) return false
+  if (provider.id === QODER_PROVIDER_ID) return true
+  if (provider.oauth?.flowType === 'qoder') return true
+  return String(provider.baseUrl || '').toLowerCase().includes('qoder')
+}
+
 /** 去掉 "qoder/" 前缀，留下裸模型名（与插件 stripProviderPrefix 一致）。 */
 function stripProviderPrefix(model: string): string {
   const i = model.indexOf('/')
@@ -787,7 +811,7 @@ export async function testQoderModel(
   }
 
   if (resp.ok) {
-    return { success: true, message: `连接成功（${model}）`, statusCode: resp.status }
+    return { success: true, message: `连接成功（${model}，COSY 链路）`, statusCode: resp.status }
   }
   const text = await resp.text().catch(() => '')
   let msg = text.substring(0, 300)
@@ -795,7 +819,10 @@ export async function testQoderModel(
     const j = JSON.parse(text)
     msg = j?.error?.message || j?.message || msg
   } catch { /* 非 JSON：原样回显（如上游 HTML 错误页） */ }
-  return { success: false, message: msg || `HTTP ${resp.status}`, statusCode: resp.status }
+  // 前缀是**部署自证**：管理后台出现「[COSY 链路]」即说明跑的是含本分支的构建。
+  // 若仍显示裸的「HTTP 503：<html>…alb…」，说明请求走的是通用 oauth-device 分支
+  // （旧构建，或 isQoderFlow 未命中）——两种情况要采取的动作完全不同，不能靠猜。
+  return { success: false, message: `[COSY 链路] ${msg || `HTTP ${resp.status}`}`, statusCode: resp.status }
 }
 
 /**

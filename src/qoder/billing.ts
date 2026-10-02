@@ -218,6 +218,41 @@ export interface QoderCheckinOutcome {
   already?: boolean
   /** 命中的活动 key，便于排查是哪个活动发的积分 */
   campaignKey?: string
+  /**
+   * 诊断详情（供签到日志落盘；**绝不含 token 原文**）。
+   *
+   * 为什么必须带出来：线上出现「提示签到成功但积分没增加」，而面板只显示一句
+   * message —— 无法区分「服务端返回 replayed=true（本就已领，不会再加分）」、
+   * 「claim 返回 CLAIMED 但 benefit.amount 缺失」、「活动其实不可领」这三种情况。
+   * 把上游原始字段原样落进日志，下一次反馈就能直接定位，不必再靠猜。
+   */
+  debug?: QoderCheckinDebug
+}
+
+/** 一次签到的上游诊断快照（写入系统日志）。 */
+export interface QoderCheckinDebug {
+  realm: QoderRealm
+  /** campaigns 列表 HTTP 状态码 */
+  campaignsHttp: number
+  /** 上游 showCampaign（false = 本客户端设备身份未被认可，活动被过滤） */
+  showCampaign: unknown
+  /** 上游 claimable 汇总标记 */
+  claimable: unknown
+  campaignCount: number
+  /** 每个活动的关键字段（原样，便于人工比对） */
+  campaigns: Array<{
+    key: string
+    action: string
+    status: string
+    kind: string
+    amount: number
+    reason: string
+    achievement?: string
+  }>
+  /** claim 请求的 HTTP 状态码（未发起领取时缺省） */
+  claimHttp?: number
+  /** claim 响应原始体（截断，便于看 replayed/benefit 到底有没有值） */
+  claimBody?: string
 }
 
 /**
@@ -254,6 +289,23 @@ export async function performQoderCheckin(token: string, realm: QoderRealm = 'cn
   }
 
   const raw = Array.isArray(list.campaigns) ? (list.campaigns as QoderCampaign[]) : []
+  // 诊断快照：上游原始字段原样留档，供「签到成功但积分没增加」这类问题定位
+  const dbg: QoderCheckinDebug = {
+    realm,
+    campaignsHttp: res.status,
+    showCampaign: list.showCampaign,
+    claimable: list.claimable,
+    campaignCount: raw.length,
+    campaigns: raw.map((c) => ({
+      key: String(c?.campaignKey || c?.campaignId || ''),
+      action: String(c?.actionType || ''),
+      status: String(c?.claimStatus || ''),
+      kind: String(c?.benefit?.kind || ''),
+      amount: typeof c?.benefit?.amount === 'number' ? c.benefit.amount : 0,
+      reason: String(c?.unavailableReason || ''),
+      achievement: c?.requiredAchievementKey ? String(c.requiredAchievementKey) : undefined,
+    })),
+  }
   let target: QoderCampaign | null = null
   let alreadyClaimed = false
   /** 非 CLAIMABLE/CLAIMED 的活动：带原因码，用于把「领不到」讲清楚 */
@@ -272,7 +324,7 @@ export async function performQoderCheckin(token: string, realm: QoderRealm = 'cn
   }
 
   if (!target) {
-    if (alreadyClaimed) return { success: true, already: true, message: '今日已领取' }
+    if (alreadyClaimed) return { success: true, already: true, message: '今日已领取', debug: dbg }
     // 区分两种「没活动」：真的没有活动 vs 服务端把本客户端判定为非官方身份而过滤掉全部活动。
     // hub qoder_accounts.py:929-1005 用 showCampaign 标记这一点，并靠刷新机器身份重试；
     // 不区分就会把「身份被过滤」误报成「今天没活动」，让人以为签到正常。
@@ -283,6 +335,7 @@ export async function performQoderCheckin(token: string, realm: QoderRealm = 'cn
         message:
           '活动列表被上游按机器身份过滤（showCampaign=false）：服务端未认可本客户端的设备身份，' +
           '故「每日领取 Credits」等设备定向活动未下发。这不是「今天没有活动」。',
+        debug: dbg,
       }
     }
     // 有活动但都不可领：把上游原因码如实带出来（hub qoder_accounts.py:1145-1148 同样分类：
@@ -305,36 +358,40 @@ export async function performQoderCheckin(token: string, realm: QoderRealm = 'cn
       return {
         success: false,
         message: `签到活动暂不可领取（共 ${raw.length} 个活动，${notClaimable.length} 个奖励类活动均不可领）—— ${detail}`,
+        debug: dbg,
       }
     }
     return {
       success: false,
       message: `无可用签到活动（${raw.length} 个活动里没有 CLAIMABLE 的 CLAIM_BENEFIT）`,
+      debug: dbg,
     }
   }
   const campaignId = target.campaignId
-  if (!campaignId) return { success: false, message: '签到活动缺少 campaignId' }
+  if (!campaignId) return { success: false, message: '签到活动缺少 campaignId', debug: dbg }
 
   let claimRes: Response
   try {
     claimRes = await checkinRequest('POST', `/sash/api/v1/me/campaigns/${campaignId}/claim`, token, realm, s)
   } catch (e) {
-    return { success: false, message: (e as Error).message || '网络请求失败' }
+    return { success: false, message: (e as Error).message || '网络请求失败', debug: dbg }
   }
   const claimText = await claimRes.text().catch(() => '')
+  dbg.claimHttp = claimRes.status
+  dbg.claimBody = claimText.substring(0, 500)
   if (!claimRes.ok) {
-    return { success: false, message: `领取失败 http ${claimRes.status}: ${claimText.substring(0, 200)}` }
+    return { success: false, message: `领取失败 http ${claimRes.status}: ${claimText.substring(0, 200)}`, debug: dbg }
   }
   let cr: QoderClaimResponse
   try {
     cr = claimText ? JSON.parse(claimText) : {}
   } catch {
-    return { success: false, message: `领取响应格式异常: ${claimText.substring(0, 200)}` }
+    return { success: false, message: `领取响应格式异常: ${claimText.substring(0, 200)}`, debug: dbg }
   }
 
   if (cr.status === 'CLAIMED') {
     if (cr.replayed) {
-      return { success: true, already: true, message: '今日已领取', campaignKey: target.campaignKey }
+      return { success: true, already: true, message: '今日已领取', campaignKey: target.campaignKey, debug: dbg }
     }
     const amount = typeof cr.benefit?.amount === 'number' ? cr.benefit.amount : undefined
     return {
@@ -342,9 +399,10 @@ export async function performQoderCheckin(token: string, realm: QoderRealm = 'cn
       message: amount ? `领取成功 +${amount} ${target.campaignKey || ''}`.trim() : '签到成功',
       rewardCredits: amount,
       campaignKey: target.campaignKey,
+      debug: dbg,
     }
   }
-  return { success: false, message: `未知状态: ${cr.status || '(空)'}` }
+  return { success: false, message: `未知状态: ${cr.status || '(空)'}`, debug: dbg }
 }
 
 /** GET /api/v2/quota/usage 响应。 */
@@ -369,16 +427,21 @@ export async function fetchQoderUserResource(token: string, realm: QoderRealm = 
   totalUsed: number
   totalSize: number
   packCount: number
+  /** 上游原始响应体（截断）。面板出现「可用 0 · 已用 0」时，需要它来区分
+   *  「账号确实没额度」与「字段名/结构变了导致解析成 0」。 */
+  raw?: string
 } | null> {
   const res = await fetch(QODER_OPENAPI[realm] + '/api/v2/quota/usage', {
     method: 'GET',
     headers: billingHeaders(token),
     signal: AbortSignal.timeout(10000),
   })
+  const bodyText = await res.text().catch(() => '')
   if (!res.ok) {
-    throw new Error(`quota/usage http ${res.status} body=${(await res.text().catch(() => '')).substring(0, 200)}`)
+    throw new Error(`quota/usage http ${res.status} body=${bodyText.substring(0, 200)}`)
   }
-  const q = (await res.json().catch(() => null)) as QoderQuotaUsage | null
+  let q: QoderQuotaUsage | null = null
+  try { q = bodyText ? (JSON.parse(bodyText) as QoderQuotaUsage) : null } catch { q = null }
   if (!q) return null
   const uq = q.userQuota || {}
   const aq = q.addOnQuota || {}
@@ -390,6 +453,7 @@ export async function fetchQoderUserResource(token: string, realm: QoderRealm = 
     totalUsed: base.used + addon.used,
     totalSize: base.size + addon.size,
     packCount: 2,
+    raw: bodyText.substring(0, 500),
   }
 }
 

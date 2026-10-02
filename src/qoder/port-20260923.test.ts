@@ -9,7 +9,7 @@ import { cosySessionFor, cosyHeaders } from './cosy'
 import { buildQoderBody, cpaToUpstreamKey, fallbackUnknownModel, pickQoderModels } from './body'
 import { performQoderCheckin, normalizeQoderRealm, realmHasLegacyCheckin, QODER_OPENAPI, fetchQoderUserResource } from './billing'
 import { classifyQoderError } from './classify'
-import { proxyQoderChatRequest } from './proxy'
+import { proxyQoderChatRequest, isQoderFlow, testQoderModel } from './proxy'
 import type { Env, Provider } from '../types'
 
 const CHAT_URL = 'https://gateway.qoder.com.cn/algo/api/v2/service/pro/sse/agent_chat_generation?Encode=1'
@@ -469,6 +469,78 @@ describe('活动领取：空 actionType 视为奖励类，不可领取时如实�
     const r = await performQoderCheckin('dt-c', 'cn', 'u1')
     expect(r.success).toBe(false)
     expect(fetchMock.mock.calls.some((c) => String(c[0]).includes('/claim'))).toBe(false)
+  })
+})
+
+// ===== Qoder 判定收敛到单一 owner（修「测试/推理走通用 OpenAI 路径撞 ALB 503」） =====
+describe('isQoderFlow：Qoder 判定只有一处 owner', () => {
+  it('三个真实配置形态都判为 Qoder', () => {
+    expect(isQoderFlow({ id: 'qoder' })).toBe(true)
+    expect(isQoderFlow({ id: 'my-qoder', oauth: { flowType: 'qoder' } })).toBe(true)
+    // 手工填了 Qoder 域名但没选授权流程：模型列表此前就是靠这条命中的，
+    // 而推理/测试只认 id → 撕裂成「模型能拉、推理打错端点」。
+    expect(isQoderFlow({ id: 'custom', baseUrl: 'https://gateway.qoder.com.cn' })).toBe(true)
+    expect(isQoderFlow({ id: 'custom', baseUrl: 'https://openapi.qoder.sh' })).toBe(true)
+  })
+
+  it('非 Qoder 提供商不受影响（大小写不敏感但仍需真的含 qoder）', () => {
+    expect(isQoderFlow({ id: 'workbuddy', baseUrl: 'https://copilot.tencent.com/v2', oauth: { flowType: 'browser' } })).toBe(false)
+    expect(isQoderFlow({ id: 'gemini', baseUrl: 'https://cloudcode-pa.googleapis.com' })).toBe(false)
+    expect(isQoderFlow(null)).toBe(false)
+    expect(isQoderFlow(undefined)).toBe(false)
+  })
+})
+
+describe('testQoderModel：结果自带链路标识（区分旧构建与真失败）', () => {
+  it('失败信息带 [COSY 链路] 前缀，且绝不请求 /chat/completions', async () => {
+    const fetchMock = vi.fn(async () => new Response('{}', { status: 200 }))
+    vi.stubGlobal('fetch', fetchMock)
+    // 空 env + 无 oauth：拿不到会话 → 如实报未连接，而不是去打通用端点
+    const r = await testQoderModel({} as Env, { id: 'qoder' } as Provider, 'qmodel_38max')
+    expect(r.success).toBe(false)
+    expect(r.message).toContain('[COSY 链路]')
+    expect(fetchMock.mock.calls.some((c) => String(c[0]).includes('/chat/completions'))).toBe(false)
+  })
+})
+
+describe('签到诊断快照：把上游原始字段留档（定位「提示成功但积分没增加」）', () => {
+  it('debug 带 campaigns / showCampaign / claim 原始体', async () => {
+    vi.stubGlobal('fetch', vi.fn(async (input: unknown) => {
+      const url = String(input)
+      if (url.endsWith('/me/campaigns')) {
+        return new Response(JSON.stringify({
+          showCampaign: true, claimable: true,
+          campaigns: [{
+            campaignId: 'c1', campaignKey: 'daily', actionType: 'CLAIM_BENEFIT',
+            claimStatus: 'CLAIMABLE', benefit: { kind: 'CREDITS', amount: 100 },
+          }],
+        }), { status: 200 })
+      }
+      return new Response(JSON.stringify({ status: 'CLAIMED', replayed: false, benefit: { amount: 100 } }), { status: 200 })
+    }))
+    const r = await performQoderCheckin('dt-c', 'cn', 'u1')
+    expect(r.debug?.campaignsHttp).toBe(200)
+    expect(r.debug?.showCampaign).toBe(true)
+    expect(r.debug?.campaigns[0]).toMatchObject({ key: 'daily', action: 'CLAIM_BENEFIT', status: 'CLAIMABLE', kind: 'CREDITS', amount: 100 })
+    expect(r.debug?.claimHttp).toBe(200)
+    // replayed 到底有没有值，必须能从日志直接看出来（这是「已领不加分」的判据）
+    expect(r.debug?.claimBody).toContain('replayed')
+  })
+
+  it('不可领取时 debug 仍带出每个活动的状态与原因码', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify({
+      showCampaign: true,
+      campaigns: [{
+        campaignId: 'c2', campaignKey: 'act-locked', actionType: 'CLAIM_BENEFIT',
+        claimStatus: 'NOT_ELIGIBLE', unavailableReason: 'ACHIEVEMENT_NOT_COMPLETED',
+        requiredAchievementKey: 'sites_first_use',
+      }],
+    }), { status: 200 })))
+    const r = await performQoderCheckin('dt-c', 'cn', 'u1')
+    expect(r.success).toBe(false)
+    expect(r.debug?.campaigns[0]).toMatchObject({
+      key: 'act-locked', status: 'NOT_ELIGIBLE', reason: 'ACHIEVEMENT_NOT_COMPLETED', achievement: 'sites_first_use',
+    })
   })
 })
 

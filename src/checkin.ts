@@ -20,7 +20,7 @@ import { KV_KEYS, CHECKIN_RESULT_TTL_SEC, OAUTH_TOKEN_REFRESH_MARGIN_MS } from '
 import { getProviders } from './storage'
 import { getOauthAccessToken, detectTokenRealm, refreshQoderTokenPair } from './oauth'
 import { writeLog } from './admin'
-import { isQoderProvider } from './qoder/proxy'
+import { isQoderFlow } from './qoder/proxy'
 import { fetchQoderCheckinStatus, performQoderCheckin, fetchQoderUserResource, fetchQoderPaymentType, normalizeQoderRealm, realmHasLegacyCheckin, type QoderRealm } from './qoder/billing'
 import {
   readQoderPool,
@@ -190,8 +190,10 @@ async function fillCredits(env: Env, base: CheckinResult, token: string, realm: 
 
 // ===== QoderWork 签到（flowType=qoder，dt- token） =====
 
-/** 拉取 Qoder 额度 + 套餐填充到 base（失败只写日志，不影响签到结果）。 */
-async function fillQoderCredits(env: Env, base: CheckinResult, token: string, realm: QoderRealm) {
+/** 拉取 Qoder 额度 + 套餐填充到 base（失败只写日志，不影响签到结果）。
+ *  返回额度接口的原始响应体（截断），供签到日志区分「真没额度」与「解析成 0」。 */
+async function fillQoderCredits(env: Env, base: CheckinResult, token: string, realm: QoderRealm): Promise<string | undefined> {
+  let quotaRaw: string | undefined
   try {
     const credits = await fetchQoderUserResource(token, realm)
     if (credits) {
@@ -199,6 +201,7 @@ async function fillQoderCredits(env: Env, base: CheckinResult, token: string, re
       base.totalUsed = credits.totalUsed
       base.totalSize = credits.totalSize
       base.packCount = credits.packCount
+      quotaRaw = credits.raw
     } else {
       try { await writeLog(env, 'warn', `[checkin] ${base.name} 额度无数据（quota/usage 响应为空）`, '') } catch { /* ignore */ }
     }
@@ -209,6 +212,7 @@ async function fillQoderCredits(env: Env, base: CheckinResult, token: string, re
     const pt = await fetchQoderPaymentType(token, realm)
     if (pt) base.paymentType = pt
   } catch { /* ignore */ }
+  return quotaRaw
 }
 
 /**
@@ -292,8 +296,37 @@ async function checkinQoderPoolAccount(env: Env, provider: Provider, account: Qo
   }
 
   // 签到成功后额度已变化，拉最新额度
-  await fillQoderCredits(env, base, token, realm)
+  const quotaRaw = await fillQoderCredits(env, base, token, realm)
   await syncQoderPoolCredits(env, provider.id, account, base)
+
+  // ===== 签到日志（落系统日志，供「提示成功但积分没增加」定位） =====
+  // 关键是把**前后额度差**与**上游原始字段**一起留档：只有 message 时无法区分
+  // 「服务端 replayed=true（本就已领，不会加分）」「claim 返回 CLAIMED 但
+  // benefit.amount 缺失」「活动不可领」三种情况，只能靠猜。
+  const creditsBefore = typeof account.state?.credits === 'number' ? account.state.credits : null
+  const creditsAfter = typeof base.totalRemain === 'number' ? base.totalRemain : null
+  const creditsDelta = creditsBefore !== null && creditsAfter !== null ? creditsAfter - creditsBefore : null
+  if (res.success && !res.already && creditsDelta === 0) {
+    // 真正可疑的状态：服务端说领到了，但额度没动。直接写进面板文案，不必翻日志。
+    base.message = `${base.message}（注意：额度未变化 可用 ${creditsBefore} → ${creditsAfter}）`
+  }
+  try {
+    await writeLog(
+      env,
+      res.success ? 'request' : 'warn',
+      `[qoder-checkin] ${account.nickname || account.uid} → ${res.success ? (res.already ? 'already' : 'claimed') : 'fail'}` +
+        (creditsDelta !== null ? ` 额度 ${creditsBefore} → ${creditsAfter}（Δ${creditsDelta >= 0 ? '+' : ''}${creditsDelta}）` : ''),
+      JSON.stringify({
+        providerId: provider.id,
+        uid: account.uid,
+        realm,
+        outcome: { success: res.success, already: res.already, rewardCredits: res.rewardCredits, campaignKey: res.campaignKey },
+        credits: { before: creditsBefore, after: creditsAfter, delta: creditsDelta },
+        debug: res.debug,
+        quotaRaw,
+      }).substring(0, 4000)
+    )
+  } catch { /* 日志失败不影响签到结果 */ }
   return base
 }
 
@@ -732,7 +765,7 @@ export async function checkinOneAccount(
   }
 
   // QoderWork 多账号池：遍历池内所有账号各自签到，返回带 accounts 的汇总结果
-  if (provider.oauth?.flowType === 'qoder' || isQoderProvider(provider.id)) {
+  if (isQoderFlow(provider)) {
     return checkinQoderPoolAccounts(env, provider)
   }
 
