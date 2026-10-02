@@ -315,7 +315,8 @@ function makePanel(html: string) {
     pure[1] + '\n' + ui[1] + '\nreturn {' +
       ' setData: function (d) { _clineUpData["cline"] = d },' +
       ' pins: function () { return _clineUpData["cline"].pins },' +
-      ' render: clineUpstreamsRender, save: clineUpstreamsSave, bulk: clineUpstreamsBulk }'
+      ' render: clineUpstreamsRender, save: clineUpstreamsSave, bulk: clineUpstreamsBulk,' +
+      ' queue: queueProviderWrite }'
   )
   const api = factory(document, fetchStub, (s: string) => String(s))
   return { api, box, status, net, badges: () => badgeEls }
@@ -411,6 +412,46 @@ describe('Cline 面板：渲染回显与即时保存（DOM 替身驱动客户端
     p.api.bulk('cline', 'clear')
     expect(p.api.pins().M.upstreams).toEqual([])
     expect(p.api.pins().M.exclude).toEqual([])
+  })
+
+  // 2026-10-06 用户实测：「选完模式页面自动保存了，再点下面的保存更改，这次改动就丢了」。
+  // 根因不是字段被覆盖，而是**丢更新**：服务端 PUT 是整份 providers 数组的读-改-写
+  // （storage.ts updateProvider: getProvidersFresh → merge → setProviders），同页面两次并发 PUT
+  // 中后写的那次带着先读的旧快照，把对方刚改的字段整块抹掉。修法：providers blob 的所有写者
+  // 共用一条串行队列（面板即时保存 / 卡片「保存更改」/ 启用开关）。
+  it('providers 的两次写必须串行：后一次要等前一次完成（否则并发 PUT 会丢更新）', async () => {
+    const p = makePanel(await render([traeProvider()]))
+    const order: string[] = []
+    let release: () => void = () => {}
+    const gate = new Promise<void>((r) => { release = r })
+
+    const first = p.api.queue(async () => { order.push('a-start'); await gate; order.push('a-end') })
+    const second = p.api.queue(async () => { order.push('b-start') })
+    await flush()
+    expect(order).toEqual(['a-start']) // 第二次必须还没开始
+
+    release()
+    await Promise.all([first, second])
+    expect(order).toEqual(['a-start', 'a-end', 'b-start'])
+  })
+
+  it('面板即时保存走同一条写队列（被前一次写挡住时不发 PUT，放行后只发一次）', async () => {
+    const p = makePanel(await render([traeProvider()]))
+    p.api.setData({ models: ['M'], pins: { M: { upstreams: ['alibaba'] } }, probes: probe(['alibaba']), checks: {} })
+    let release: () => void = () => {}
+    const gate = new Promise<void>((r) => { release = r })
+    const blocker = p.api.queue(() => gate)
+    await flush()
+
+    p.api.save('cline')
+    await flush()
+    expect(p.net.calls).toHaveLength(0) // 队列被占，PUT 还没发出去
+
+    release()
+    await blocker
+    await flush()
+    expect(p.net.calls).toHaveLength(1)
+    expect(p.net.calls[0].body).toEqual({ clinePinByModel: { M: { upstreams: ['alibaba'], pinMode: 'strict' } } })
   })
 })
 

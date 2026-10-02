@@ -125,7 +125,7 @@ const keyRowHtml = (p: { id?: string }, k: { key: string; enabled: boolean; labe
  * 「行为没变」到底是没部署、没刷新，还是代码就是错的，只能靠来回猜（2026-10-06 已经为这个
  * 浪费过一轮）。用户只要比对刷新前后这一行是否变化，就能自证加载的是不是新脚本。
  */
-export const CLINE_UP_UI_VERSION = '2026-10-06-multi'
+export const CLINE_UP_UI_VERSION = '2026-10-06-multi2'
 
 /**
  * Cline「上游渠道与固定」区块（移植 cline-pass-switcher 的控制台能力）。
@@ -3400,6 +3400,25 @@ var _clineUpData = {}
 var _clineUpSaving = {}
 var _clineUpDirty = {}
 
+/**
+ * 提供商配置的**全局写队列**（面板的即时保存与详情卡片的「保存更改」共用）。
+ *
+ * 为什么必须有（2026-10-06 用户报「改完模式再点下面的保存更改，这次改动就丢了」）：
+ * /admin/api/providers/:id 的 PUT 在服务端是**整份 providers 数组的读-改-写**
+ * （storage.ts updateProvider: getProvidersFresh → merge → setProviders）。同一页面里两次
+ * 并发 PUT 会互相覆盖：后写的那次带着先读的旧快照，把对方刚改的字段整块抹掉——典型丢更新。
+ * 面板的即时保存与卡片保存写的是同一条记录，所以**必须串行**。
+ *
+ * 队列按全局而不是按 id：KV 里所有提供商共用同一个 blob，跨提供商的并发 PUT 同样会互相覆盖。
+ * 有意不做失败短路：前一次失败也要放行后一次（否则一次网络错误会卡死整条队列）。
+ */
+var _provWriteTail = Promise.resolve()
+function queueProviderWrite(fn) {
+  var next = _provWriteTail.then(fn, fn)
+  _provWriteTail = next.then(function () {}, function () {})
+  return next
+}
+
 function clineUpEl(id, name) { return document.getElementById('cu-' + name + '-' + id) }
 function clineUpStatus(id, text) { var el = clineUpEl(id, 'st'); if (el) el.textContent = text || '' }
 /** 该模型的本地固定配置（渲染与保存的唯一状态源；表格控件都写这里，重渲染不丢改动）。 */
@@ -3643,25 +3662,28 @@ function clineUpstreamsSave(id) {
   })
   _clineUpSaving[id] = true
   clineUpStatus(id, '保存中…')
-  return fetch('/admin/api/providers/' + encodeURIComponent(id), {
-    method: 'PUT',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ clinePinByModel: map }),
-  }).then(function (r) { return r.json() }).then(function (d) {
-    if (!d || !d.success) {
-      clineUpStatus(id, '保存失败：' + ((d && d.message) || '未知错误') + '（改动未存，请重试）')
+  // 走全局写队列：详情卡片的「保存更改」写同一条记录，并发会让这次改动被旧快照抹掉
+  return queueProviderWrite(function () {
+    return fetch('/admin/api/providers/' + encodeURIComponent(id), {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ clinePinByModel: map }),
+    }).then(function (r) { return r.json() }).then(function (d) {
+      if (!d || !d.success) {
+        clineUpStatus(id, '保存失败：' + ((d && d.message) || '未知错误') + '（改动未存，请重试）')
+        return false
+      }
+      var cur = _clineUpData[id] || data
+      cur.pins = (d.data && d.data.clinePinByModel) || {}
+      _clineUpData[id] = cur
+      clineUpstreamsRender(id)
+      var n = Object.keys(cur.pins).length
+      clineUpStatus(id, n ? ('已保存 ' + n + ' 个模型的渠道设置') : '已保存：全部回到网关自动选')
+      return true
+    }).catch(function () {
+      clineUpStatus(id, '网络错误，改动未存（请重试）')
       return false
-    }
-    var cur = _clineUpData[id] || data
-    cur.pins = (d.data && d.data.clinePinByModel) || {}
-    _clineUpData[id] = cur
-    clineUpstreamsRender(id)
-    var n = Object.keys(cur.pins).length
-    clineUpStatus(id, n ? ('已保存 ' + n + ' 个模型的渠道设置') : '已保存：全部回到网关自动选')
-    return true
-  }).catch(function () {
-    clineUpStatus(id, '网络错误，改动未存（请重试）')
-    return false
+    })
   }).then(function (ok) {
     _clineUpSaving[id] = false
     if (_clineUpDirty[id]) { _clineUpDirty[id] = false; return clineUpstreamsSave(id) }
@@ -4094,10 +4116,14 @@ async function save(id) {
   adminSubmitting = true
   busyBtn(btn)
   try {
-    const r = await fetch('/admin/api/providers/' + encodeURIComponent(id), {
-      method: 'PUT',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ name: nm, baseUrl: url, apiType, authType, oauth: authType === 'oauth-device' ? oauth : undefined, apiKeys: keys, models, enabled, toolBridge: (document.getElementById('atb-' + id)||{}).checked === true, allowUnlistedModels: (document.getElementById('aum-' + id)||{}).checked === true, reasoningEffort: ((document.getElementById('re-' + id)||{}).value || null), deepseekThinkingOff, thinkingInject, cachePrefixInject, cooldown: collectCooldown(id), type: providerType, kukuThinkMode, visionBridge: vb, geminiBaseUrl: ((document.getElementById('gbu-' + id)||{}).value || '').trim() || null, traeEnableRemoteBudget, traeRemoteOnlyModels, traeMaxMessages, traeMaxHistoryChars, traeMaxToolSchemaChars, accountSpread: (document.getElementById('m365-spread-' + id)||{}).checked === true, promptMode, promptText })
+    // 走全局写队列（见 queueProviderWrite）：服务端 PUT 是整份 providers 数组的读-改-写，
+    // 与面板的即时保存并发会互相覆盖——用户实测「改完模式再点这里，这次改动就丢了」。
+    const r = await queueProviderWrite(function () {
+      return fetch('/admin/api/providers/' + encodeURIComponent(id), {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name: nm, baseUrl: url, apiType, authType, oauth: authType === 'oauth-device' ? oauth : undefined, apiKeys: keys, models, enabled, toolBridge: (document.getElementById('atb-' + id)||{}).checked === true, allowUnlistedModels: (document.getElementById('aum-' + id)||{}).checked === true, reasoningEffort: ((document.getElementById('re-' + id)||{}).value || null), deepseekThinkingOff, thinkingInject, cachePrefixInject, cooldown: collectCooldown(id), type: providerType, kukuThinkMode, visionBridge: vb, geminiBaseUrl: ((document.getElementById('gbu-' + id)||{}).value || '').trim() || null, traeEnableRemoteBudget, traeRemoteOnlyModels, traeMaxMessages, traeMaxHistoryChars, traeMaxToolSchemaChars, accountSpread: (document.getElementById('m365-spread-' + id)||{}).checked === true, promptMode, promptText })
+      })
     })
     const d = await r.json()
     if (d.success) {
@@ -4364,10 +4390,13 @@ async function togglePb(id, checked) {
   if (!pi) return
   const b = pi.querySelector('.ps .bd')
   if (b) { b.textContent = checked ? '已启用' : '未启用'; b.className = 'bd ' + (checked ? 'bd-on' : 'bd-off') }
-  const r = await fetch('/admin/api/providers/' + encodeURIComponent(id), {
-    method: 'PUT',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ enabled: checked })
+  // 同样走全局写队列：这也是 providers blob 的写者，与面板即时保存/卡片保存并发会互相覆盖
+  const r = await queueProviderWrite(function () {
+    return fetch('/admin/api/providers/' + encodeURIComponent(id), {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ enabled: checked })
+    })
   })
   const d = await r.json()
   if (!d.success) toast(d.message || '操作失败', 'error')
