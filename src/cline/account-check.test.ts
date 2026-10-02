@@ -223,6 +223,20 @@ describe('Cline 面板：账号行 + 检测按钮', () => {
     expect(panel).toContain('onblur="clineSaveLabel(\'cline\',0)"')
   })
 
+  it('Cline：账号行是独立一行，不挤占 RefreshToken 输入框（.field-row 是 flex-wrap: nowrap）', async () => {
+    const env = makeEnv()
+    await setProviders(env as never, [clineProvider([{ key: RT_A, enabled: true }])])
+    const html = await renderHtml(env)
+    const start = html.indexOf('id="dt-cline"')
+    const panel = html.slice(start, html.indexOf('</article>', start))
+    // 每行只能有一个 [data-kidx]，否则 getKeys 会把同一个 token 收集两次
+    expect((panel.match(/data-kidx="0"/g) || []).length).toBe(1)
+    // 账号行在 token 行的 field-row 闭合之后（不是它的 flex 兄弟节点）
+    expect(panel).toMatch(/id="k-cline-0"[\s\S]*?<\/div>[\s\S]*?id="kst-cline-0"/)
+    expect(panel).toContain('class="cline-key-row" data-kidx="0"><div class="fc field-row">')
+    expect(panel).not.toMatch(/<div class="fc mb-3 field-row" data-kidx="0"[^>]*id="kst-cline-0"/)
+  })
+
   it('非 Cline 提供商：不注入账号行', async () => {
     const env = makeEnv()
     await setProviders(env as never, [{
