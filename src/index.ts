@@ -78,6 +78,8 @@ import {
   handleSetCachePrefix,
   handleGetPerfSettings,
   handleSetPerfSettings,
+  handleGetQoderDevice,
+  handleSetQoderDevice,
 } from './admin'
 import { handleMcpJsonRpc, handleMcpHealth } from './mcp-gateway'
 import { renderLoginPage, renderAdminPage } from './pages'
@@ -321,6 +323,9 @@ app.get('/admin/api/cache-prefix', handleGetCachePrefix)
 app.put('/admin/api/cache-prefix', handleSetCachePrefix)
 app.get('/admin/api/perf-settings', handleGetPerfSettings)
 app.put('/admin/api/perf-settings', handleSetPerfSettings)
+// Qoder 真机设备身份（原 COSY_* Secret，改为 KV + 面板配置）
+app.get('/admin/api/qoder-device', handleGetQoderDevice)
+app.put('/admin/api/qoder-device', handleSetQoderDevice)
 
 // 签到（浏览器面板用，需 session 认证）
 app.get('/admin/api/checkin/status', handleCheckinStatus)

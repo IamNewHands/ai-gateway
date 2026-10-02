@@ -36,14 +36,19 @@ export const QODER_OPENAPI: Record<'cn' | 'global', string> = {
 /** 账号域类型（缺省 cn）。 */
 export type QoderRealm = 'cn' | 'global'
 
-/** 桌面端 cosy-version（qoder2api-hub qoder_sign.py:502-505 实测可用于模型列表与推理）。 */
-const DESKTOP_COSY_VERSION = '1.1.64'
-/** 桌面端 Cosy-ClientType（hub qoder_accounts.py:650：桌面端 10、CLI 5、QoderWork 6）。 */
-const DESKTOP_CLIENT_TYPE = '10'
-/** 桌面端 machine-os（hub qoder_accounts.py:652 实测值；与推理路径的 x86_64_windows 不同）。 */
-const DESKTOP_MACHINE_OS = 'x86_64_win32'
-/** 桌面端 machine-hostname（hub qoder_accounts.py:653）。 */
-const DESKTOP_MACHINE_HOSTNAME = 'DESKTOP-QODER'
+/**
+ * 桌面端出站身份的内置默认值——管理后台「Qoder 设备身份」面板里留空的字段回退到这些值。
+ * 来源：hub qoder_sign.py:502-505（cosy-version）+ qoder_accounts.py:650-653（其余）。
+ *
+ * 注意 machineOS 的默认是 hub 实测的 `x86_64_win32`；而提取脚本（chevy222 的 01_extract.py）
+ * 给出的是 `x86_64_windows`。两者都能用，真机身份会覆盖默认值。
+ */
+export const QODER_DESKTOP_DEFAULTS = {
+  clientType: '10',
+  version: '1.1.64',
+  machineOS: 'x86_64_win32',
+  machineHostname: 'DESKTOP-QODER',
+} as const
 
 /** 规范化账号域：只认 'global'，其余一律 cn。 */
 export function normalizeQoderRealm(realm: unknown): QoderRealm {
@@ -69,9 +74,9 @@ function billingHeaders(token: string): Record<string, string> {
 }
 
 /**
- * 真机设备身份（`COSY_*` Secret）。Cloudflare Workers **跑不了** Qoder 桌面端自带的
- * 原生风控桥 `runtime-info.exe`，所以真机身份只能由用户在装了桌面端的 Windows 机上
- * 一次性提取后配进网关。
+ * 真机设备身份。Cloudflare Workers **跑不了** Qoder 桌面端自带的原生风控桥
+ * `runtime-info.exe`，所以真机身份只能由用户在装了桌面端的 Windows 机上一次性提取后
+ * 填进管理后台——存储、归一与读取在 qoder/device.ts（KV key `qoder:device`）。
  *
  * 为什么必须支持它（2026-10-02 调研四个同类项目 + hub 源码，结论一致）：
  *   1. 官方 **2026-09-26 起要求请求携带设备标识才下发每日活动**。缺 `Cosy-ClientType: 10`
@@ -99,43 +104,6 @@ export interface QoderDeviceIdentity {
   version?: string
 }
 
-/** `COSY_*` 环境变量视图（与 chevy222/qoder-cf-checkin 同名，便于直接复用其提取脚本输出）。 */
-export interface QoderDeviceEnv {
-  COSY_CLIENT_TYPE?: string
-  COSY_MACHINE_ID?: string
-  COSY_MACHINE_TOKEN?: string
-  COSY_MACHINE_TYPE?: string
-  COSY_MACHINE_CODE?: string
-  COSY_MACHINE_OS?: string
-  COSY_MACHINE_HOSTNAME?: string
-  COSY_VERSION?: string
-}
-
-/**
- * 从 Worker 环境读真机设备身份；一个都没配时返回 undefined（调用方据此走派生路径）。
- *
- * 身份是**机器级**的、不是账号级的（app-cf-checkin 设计文档 §7.1：「这是一台机器的身份，
- * 所以是 config 而不是 creds——多个账号共用一份」），故这里不按 uid 取。
- */
-export function qoderDeviceFromEnv(env: QoderDeviceEnv | undefined): QoderDeviceIdentity | undefined {
-  if (!env) return undefined
-  const pick = (v: unknown): string | undefined => {
-    const s = typeof v === 'string' ? v.trim() : ''
-    return s || undefined
-  }
-  const device: QoderDeviceIdentity = {
-    clientType: pick(env.COSY_CLIENT_TYPE),
-    machineId: pick(env.COSY_MACHINE_ID),
-    machineToken: pick(env.COSY_MACHINE_TOKEN),
-    machineType: pick(env.COSY_MACHINE_TYPE),
-    machineCode: pick(env.COSY_MACHINE_CODE),
-    machineOS: pick(env.COSY_MACHINE_OS),
-    machineHostname: pick(env.COSY_MACHINE_HOSTNAME),
-    version: pick(env.COSY_VERSION),
-  }
-  return Object.values(device).some(Boolean) ? device : undefined
-}
-
 /**
  * 签到专用头 = 官方桌面端 0.4.3 同款出站头（qoder2api-hub qoder_accounts.py:655-686）。
  *
@@ -148,7 +116,8 @@ export function qoderDeviceFromEnv(env: QoderDeviceEnv | undefined): QoderDevice
  *   Cosy-Version / Cosy-MachineOS / MachineHostname / MachineId / MachineToken /
  *   MachineType / MachineCode
  *
- * 机器身份优先级：真机 `COSY_*`（`device`，见 QoderDeviceIdentity）> uid 派生值（`sess`）。
+ * 机器身份优先级：真机身份（`device`，管理后台「Qoder 设备身份」配置，见 qoder/device.ts）
+ * > uid 派生值（`sess`）；两者都没有的字段再回退 QODER_DESKTOP_DEFAULTS。
  * 注：hub 优先用官方 runtime-info.exe 取**真**身份，Workers 跑不了原生二进制，
  * 故只能用调用方注入的 `device` 或派生值——派生值拿不到每日活动，这是已知上限。
  *
@@ -163,16 +132,16 @@ function checkinHeaders(token: string, sess: CosySession, device?: QoderDeviceId
     accept: 'application/json, text/plain, */*',
     'accept-language': 'zh-CN',
     'user-agent': 'Qoder',
-    'cosy-clienttype': device?.clientType || DESKTOP_CLIENT_TYPE,
-    'cosy-version': device?.version || DESKTOP_COSY_VERSION,
+    'cosy-clienttype': device?.clientType || QODER_DESKTOP_DEFAULTS.clientType,
+    'cosy-version': device?.version || QODER_DESKTOP_DEFAULTS.version,
     'cosy-machineid': device?.machineId || sess.machineId,
     'cosy-machinetoken': device?.machineToken || sess.machineToken,
     'cosy-machinetype': device?.machineType || sess.machineType,
     // 真机 machineCode 与 machineType 同为 18 位十六进制（wallechfox 提交的真机 config.json）；
     // hub 与那四个项目都发这个头，缺它会让本客户端比真机少一个身份字段。
     'cosy-machinecode': device?.machineCode || sess.machineCode,
-    'cosy-machineos': device?.machineOS || DESKTOP_MACHINE_OS,
-    'cosy-machinehostname': device?.machineHostname || DESKTOP_MACHINE_HOSTNAME,
+    'cosy-machineos': device?.machineOS || QODER_DESKTOP_DEFAULTS.machineOS,
+    'cosy-machinehostname': device?.machineHostname || QODER_DESKTOP_DEFAULTS.machineHostname,
   }
 }
 

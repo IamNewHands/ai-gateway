@@ -7,7 +7,8 @@
 import { describe, it, expect, vi, afterEach } from 'vitest'
 import { cosySessionFor, cosyHeaders } from './cosy'
 import { buildQoderBody, cpaToUpstreamKey, fallbackUnknownModel, pickQoderModels } from './body'
-import { performQoderCheckin, qoderDeviceFromEnv, normalizeQoderRealm, realmHasLegacyCheckin, QODER_OPENAPI, fetchQoderUserResource } from './billing'
+import { performQoderCheckin, normalizeQoderRealm, realmHasLegacyCheckin, QODER_OPENAPI, fetchQoderUserResource, type QoderDeviceIdentity } from './billing'
+import { QODER_DEVICE_FIELDS } from './device'
 import { classifyQoderError, type QoderClassified } from './classify'
 import { proxyQoderChatRequest, isQoderFlow, testQoderModel, markQoderAccountClassified, isQoderSessionDead } from './proxy'
 import type { Env, Provider } from '../types'
@@ -406,13 +407,15 @@ describe('国际版/国内版签到分域', () => {
   })
 })
 
-// ===== 真机设备身份（COSY_*）优先于 uid 派生值 =====
+// ===== 真机设备身份优先于 uid 派生值 =====
 // 官方 2026-09-26 起要求请求携带设备标识才下发每日活动；四个同类项目
 // （wallechfox/qoder-checkin、sunp-1/qoder-checkin、chevy222 的 qoder-cf-checkin 与
 // app-cf-checkin）全部把从 Qoder 桌面端 runtime-info.exe 抄来的真机身份当固定常量回放，
 // 没有一个是随机/派生的。hub qoder_accounts.py:128-130 对照实验：派生假身份不报错，
 // 但活动列表会静默少掉「每日领取 100 Credits」。
-describe('真机设备身份（COSY_*）优先于 uid 派生值', () => {
+// 身份的**存储与配置**在管理后台（KV `qoder:device`，见 device.ts / device.test.ts），
+// 这里只负责「给了身份就一定要发出去、且与面板字段一一对应」。
+describe('真机设备身份优先于 uid 派生值', () => {
   it('签到头补上 cosy-machinecode（真机与 hub 都发这个头，旧实现漏发）', async () => {
     const fetchMock = vi.fn(async (_input: unknown, _init?: RequestInit) =>
       new Response(JSON.stringify({ campaigns: [] }), { status: 200 }))
@@ -470,32 +473,21 @@ describe('真机设备身份（COSY_*）优先于 uid 派生值', () => {
   })
 })
 
-describe('qoderDeviceFromEnv：只认非空值，一个都没配时回退派生路径', () => {
-  it('未配置 / 空对象 / 全空白串 → undefined（不假装已配真机身份）', () => {
-    expect(qoderDeviceFromEnv(undefined)).toBeUndefined()
-    expect(qoderDeviceFromEnv({})).toBeUndefined()
-    expect(qoderDeviceFromEnv({ COSY_MACHINE_TOKEN: '', COSY_MACHINE_CODE: '   ' })).toBeUndefined()
-  })
-
-  it('只配 machineToken 也认（其余留空由派生值补齐，绝不发出空头）', () => {
-    expect(qoderDeviceFromEnv({ COSY_MACHINE_TOKEN: ' t ', COSY_MACHINE_CODE: '' }))
-      .toEqual({ machineToken: 't' })
-  })
-
-  it('八个 COSY_* 全部映射到对应字段', () => {
-    expect(qoderDeviceFromEnv({
-      COSY_CLIENT_TYPE: '10',
-      COSY_MACHINE_ID: 'mid',
-      COSY_MACHINE_TOKEN: 'mtok',
-      COSY_MACHINE_TYPE: 'mtype',
-      COSY_MACHINE_CODE: 'mcode',
-      COSY_MACHINE_OS: 'x86_64_windows',
-      COSY_MACHINE_HOSTNAME: 'HOST',
-      COSY_VERSION: '0.3.4',
-    })).toEqual({
-      clientType: '10', machineId: 'mid', machineToken: 'mtok', machineType: 'mtype',
-      machineCode: 'mcode', machineOS: 'x86_64_windows', machineHostname: 'HOST', version: '0.3.4',
-    })
+describe('面板字段清单与实际发出的头一一对应（防面板/实现漂移）', () => {
+  // 面板渲染、KV 归一、实际发头三处共用 QODER_DEVICE_FIELDS。这条用例是它们的粘合点：
+  // 只要有人「给面板加了个字段却没发出去」或「发了个面板没有的头」，立刻红。
+  it('八个字段的 header 名全部出现在出站头里，且不多发任何 cosy-* 头', async () => {
+    const fetchMock = vi.fn(async (_input: unknown, _init?: RequestInit) =>
+      new Response(JSON.stringify({ campaigns: [] }), { status: 200 }))
+    vi.stubGlobal('fetch', fetchMock)
+    const device: QoderDeviceIdentity = {}
+    QODER_DEVICE_FIELDS.forEach((f, i) => { device[f.key] = 'v' + i })
+    await performQoderCheckin('dt-c', 'cn', 'uid-fields', undefined, device)
+    const headers = (fetchMock.mock.calls[0][1] as RequestInit).headers as Record<string, string>
+    for (const f of QODER_DEVICE_FIELDS) {
+      expect(headers[f.header.toLowerCase()]).toBe(device[f.key])
+    }
+    expect(Object.keys(headers).filter((k) => k.startsWith('cosy-'))).toHaveLength(QODER_DEVICE_FIELDS.length)
   })
 })
 

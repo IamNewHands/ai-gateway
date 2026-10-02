@@ -45,6 +45,8 @@ export const KV_KEYS = {
   TRAE_MODELS_PREFIX: 'trae:models:',
   // QoderWork 账号池（多账号轮转 + 冷却）
   QODER_POOL_PREFIX: 'qoder:pool:',
+  /** Qoder 真机设备身份（管理后台「Qoder 设备身份」配置；见 src/qoder/device.ts） */
+  QODER_DEVICE: 'qoder:device',
   // DeepSeek App（chat.deepseek.com 私有协议）token 池：浏览器登录后注入的 web token
   DEEPSEEK_POOL: 'deepseek:pool',
   THINKING_PROMPT: 'thinking:prompt',

@@ -3220,3 +3220,31 @@ export async function handleSetPerfSettings(c: Context<AppEnv>) {
   await setPerfSettings(c.env, settings)
   return c.json<ApiResponse>({ success: true, message: '已保存（最多 10s 生效）' })
 }
+
+// ===== Qoder 真机设备身份（KV 存储，管理后台可配置）=====
+
+/**
+ * 读取 Qoder 设备身份配置。
+ *
+ * 这些值原本要求用户配 8 个 `COSY_*` Secret（改一次要重新部署，且面板上完全看不到当前
+ * 生效的是真机身份还是 uid 派生值）。改成 KV + 面板后：不重新部署即可改，且 `isCustom`
+ * 直接告诉面板「现在发的是真机身份」。
+ *
+ * `isCustom` 由 `hasQoderDevice` 判定——与签到判定「走真机还是派生」是**同一个函数**，
+ * 所以不会出现「面板说已配置、签到却在发派生值」这种自相矛盾。
+ */
+export async function handleGetQoderDevice(c: Context<AppEnv>) {
+  const { getQoderDeviceConfig, hasQoderDevice, QODER_DEVICE_FIELDS } = await import('./qoder/device')
+  const device = await getQoderDeviceConfig(c.env)
+  // 字段元数据随响应返回：面板的 8 个输入框与「留空时用什么」的说明都由它渲染，
+  // 避免服务端/客户端各写一份字段清单而漂移。
+  return c.json<ApiResponse>({ success: true, data: { device, isCustom: hasQoderDevice(device), fields: QODER_DEVICE_FIELDS } })
+}
+
+/** 保存 Qoder 设备身份（覆盖式；全空 → 清空 KV，回退 uid 派生值）。 */
+export async function handleSetQoderDevice(c: Context<AppEnv>) {
+  const { setQoderDevice } = await import('./qoder/device')
+  const body = await readStrictJSONLimited<{ device?: Record<string, unknown> }>(c.req.raw, MAX_ADMIN_REQUEST_BYTES)
+  await setQoderDevice(c.env, body?.device ?? {})
+  return c.json<ApiResponse>({ success: true, message: '已保存' })
+}

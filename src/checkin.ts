@@ -21,7 +21,8 @@ import { getProviders } from './storage'
 import { getOauthAccessToken, detectTokenRealm, refreshQoderTokenPair } from './oauth'
 import { writeLog } from './admin'
 import { isQoderFlow } from './qoder/proxy'
-import { fetchQoderCheckinStatus, performQoderCheckin, qoderDeviceFromEnv, fetchQoderUserResource, fetchQoderPaymentType, normalizeQoderRealm, realmHasLegacyCheckin, type QoderRealm } from './qoder/billing'
+import { fetchQoderCheckinStatus, performQoderCheckin, fetchQoderUserResource, fetchQoderPaymentType, normalizeQoderRealm, realmHasLegacyCheckin, type QoderRealm } from './qoder/billing'
+import { getQoderDevice } from './qoder/device'
 import {
   readQoderPool,
   seedQoderPoolFromSingle,
@@ -283,9 +284,10 @@ async function checkinQoderPoolAccount(env: Env, provider: Provider, account: Qo
   }
 
   // 执行签到（campaigns 流程；legacy daily-check-in/claim 已 DISABLED，不再使用）
-  // 真机设备身份（COSY_*）优先：官方 2026-09-26 起要求带设备标识才下发每日活动；
-  // 未配置时回退 uid 派生值——派生值拿不到「每日领取 100 Credits」，日志里标出是哪一种。
-  const device = qoderDeviceFromEnv(env)
+  // 真机设备身份优先（管理后台「Qoder 设备身份」配置，存 KV）：官方 2026-09-26 起要求带
+  // 设备标识才下发每日活动；未配置时回退 uid 派生值——派生值拿不到「每日领取 100 Credits」，
+  // 日志里标出是哪一种。
+  const device = await getQoderDevice(env)
   const res = await performQoderCheckin(token, realm, account.uid, undefined, device)
   base.success = res.success
   base.message = res.message
@@ -327,7 +329,7 @@ async function checkinQoderPoolAccount(env: Env, provider: Provider, account: Qo
         credits: { before: creditsBefore, after: creditsAfter, delta: creditsDelta },
         debug: res.debug,
         quotaRaw,
-        // native = 已配 COSY_* 真机身份；derived = 回退 uid 派生值（拿不到设备定向活动）
+        // native = 已在管理后台配置真机身份；derived = 回退 uid 派生值（拿不到设备定向活动）
         deviceIdentity: device ? 'native' : 'derived',
       }).substring(0, 4000)
     )
