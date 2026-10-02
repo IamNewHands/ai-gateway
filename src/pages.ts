@@ -590,8 +590,6 @@ ${H('管理')}
       <a class="admin-nav__link" href="#cache"><i class="fas fa-memory" aria-hidden="true"></i><span>内存缓存</span></a>
       <a class="admin-nav__link" href="#cache-prefix"><i class="fas fa-database" aria-hidden="true"></i><span>缓存前缀</span></a>
       <a class="admin-nav__link" href="#perf"><i class="fas fa-tachometer-alt" aria-hidden="true"></i><span>性能设置</span></a>
-      <p class="admin-nav__group" aria-hidden="true">提供商凭据</p>
-      <a class="admin-nav__link" href="#qoder-device"><i class="fas fa-fingerprint" aria-hidden="true"></i><span>Qoder 设备身份</span></a>
     </nav>
     <div class="admin-rail__foot">
       <a href="javascript:void(0)" onclick="doLogout()" class="admin-nav__link"><i class="fas fa-sign-out-alt" aria-hidden="true"></i><span>退出登录</span></a>
@@ -601,7 +599,7 @@ ${H('管理')}
   <div class="admin-main">
     <header class="admin-topbar">
       <a class="brand" href="/admin"><span class="brand__mark" aria-hidden="true"><i class="fas fa-cloud"></i></span><span class="brand__name">${SITE_CONFIG.title}</span></a>
-      <nav aria-label="移动端控制台导航"><a href="#overview">概览</a><a href="#providers">提供商</a><a href="#proxy-keys">Key</a><a href="#analytics">统计</a><a href="#usage-logs">日志</a><a href="#logs">系统日志</a><a href="#mcps">MCP</a><a href="#unimodels">联合</a><a href="#thinking">思维引导</a><a href="#cache">缓存</a><a href="#cache-prefix">缓存前缀</a><a href="#perf">性能</a><a href="#qoder-device">Qoder 设备</a></nav>
+      <nav aria-label="移动端控制台导航"><a href="#overview">概览</a><a href="#providers">提供商</a><a href="#proxy-keys">Key</a><a href="#analytics">统计</a><a href="#usage-logs">日志</a><a href="#logs">系统日志</a><a href="#mcps">MCP</a><a href="#unimodels">联合</a><a href="#thinking">思维引导</a><a href="#cache">缓存</a><a href="#cache-prefix">缓存前缀</a><a href="#perf">性能</a></nav>
       <a class="icon-btn" href="javascript:void(0)" onclick="doLogout()" aria-label="退出登录"><i class="fas fa-sign-out-alt" aria-hidden="true"></i></a>
     </header>
 
@@ -762,6 +760,32 @@ ${H('管理')}
                     <div class="fc mt-1 field-row"><button class="btn btn-s" onclick="qoderPoolStatus('${escapePageJsx(p.id)}')"><i class="fas fa-sync" aria-hidden="true"></i>刷新账号池</button><button class="btn btn-s" onclick="oauthConnect('${escapePageJsx(p.id)}')"><i class="fas fa-sign-in-alt" aria-hidden="true"></i>登录新账号</button><button class="btn btn-gh btn-xs" onclick="oauthPoolExportModal('${escapePageJsx(p.id)}')"><i class="fas fa-file-export" aria-hidden="true"></i>导出凭证/Token</button><button class="btn btn-p" onclick="triggerCheckin('${escapePageJsx(p.id)}')"><i class="fas fa-calendar-check" aria-hidden="true"></i>立即签到</button><span id="qdp-st-${escapePageHtml(p.id)}" class="oauth-status"></span></div>
                     <div id="qdp-acc-${escapePageHtml(p.id)}" class="mt-1"></div>
                     <div class="fc mt-1 field-row" style="gap:8px"><input type="number" id="cd-plan-${escapePageHtml(p.id)}" value="${p.cooldown&&p.cooldown.planMs?Math.round(p.cooldown.planMs/60000):''}" style="width:88px" placeholder="额度耗尽冷却" title="额度/权益耗尽（402）的硬冷却时长（分钟）。到期到次日 04:00，签到恢复后自动解冻。"><input type="number" id="cd-soft-${escapePageHtml(p.id)}" value="${p.cooldown&&p.cooldown.softMs?Math.round(p.cooldown.softMs/1000):''}" style="width:88px" placeholder="429冷却" title="429 限流的默认软冷却时长（秒）。"><input type="number" id="cd-err-${escapePageHtml(p.id)}" value="${p.cooldown&&p.cooldown.errThreshold?p.cooldown.errThreshold:''}" style="width:76px" placeholder="错误阈值" title="连续错误次数阈值：达到后把该账号冷却「错误冷却」时长。"><input type="number" id="cd-errms-${escapePageHtml(p.id)}" value="${p.cooldown&&p.cooldown.errMs?Math.round(p.cooldown.errMs/60000):''}" style="width:88px" placeholder="错误冷却" title="达到错误阈值后的账号级冷却时长（分钟）。"><span class="mu" style="font-size:12px">冷却参数（保存后生效）</span></div>
+                    <div class="qoder-device-block" data-qoder-device="${escapePageHtml(p.id)}" style="margin-top:10px;border-top:1px solid var(--border,#e5e7eb);padding-top:8px">
+                      <div class="fc field-row" style="align-items:center;justify-content:space-between;gap:8px"><b style="font-size:13px">真机设备身份</b><span class="mu qoder-device-state" style="font-size:12px"></span></div>
+                      <span class="form-helper">官方 2026-09-26 起要求请求携带设备标识才下发「每日领取 100 Credits」；用 uid 派生的假身份<b>不报错</b>，但活动列表里会静默少掉这条活动（表现就是「无可用签到活动」）。在装了 Qoder 桌面端的机器上跑 <code>runtime-info.exe --account-stdin</code> 提取一次，把 JSON 贴进来即可（机器级常量、抄来即可，<b>所有 Qoder 提供商共用这一份</b>；存 KV，保存后下次签到生效，无需重新部署）。</span>
+                      <label class="fg" style="margin-top:6px">
+                        <span>粘贴提取脚本输出的 JSON（整段 <code>config.json</code> 或只贴 <code>device</code> 块）</span>
+                        <textarea class="fx1 qoder-device-json" rows="4" style="white-space:pre-wrap;font-family:monospace;font-size:12px" placeholder='{"device":{"clientType":"10","machineId":"...","machineToken":"...","machineType":"...","machineCode":"...","machineOS":"x86_64_windows","machineHostname":"...","version":"0.4.3"}}' spellcheck="false"></textarea>
+                      </label>
+                      <div class="fc mt-1 field-row">
+                        <button class="btn btn-gh btn-xs" onclick="qoderDeviceFillFromJson(this)"><i class="fas fa-file-import" aria-hidden="true"></i>从 JSON 填充</button>
+                        <span class="form-helper">键名大小写/下划线不敏感，<code>COSY_MACHINE_TOKEN</code>、<code>productVersion</code> 这类写法也认。</span>
+                      </div>
+                      <div class="form-grid">
+                        ${QODER_DEVICE_FIELDS.map((f) => `
+                        <label class="fg">
+                          <span>${escapePageHtml(f.header)}</span>
+                          <input type="text" class="fx1 qoder-device-input" data-key="${escapePageHtml(f.key)}" autocomplete="off" spellcheck="false" placeholder="${escapePageHtml(f.placeholder)}">
+                          <small class="form-helper" style="display:block">${escapePageHtml(f.hint)}</small>
+                        </label>`).join('')}
+                      </div>
+                      <div class="fc mt-1 field-row">
+                        <button class="btn btn-p btn-xs" onclick="saveQoderDevice(this)"><i class="fas fa-save" aria-hidden="true"></i>保存</button>
+                        <button class="btn btn-gh btn-xs" onclick="resetQoderDevice(this)"><i class="fas fa-undo" aria-hidden="true"></i>清空</button>
+                        <span class="form-helper">留空字段的后果：<code>Cosy-ClientType / MachineOS / MachineHostname / Version</code> 回退内置默认值；<code>MachineId / MachineToken / MachineType / MachineCode</code> 回退 uid 派生值——<b>派生值拿不到每日活动</b>。保存后签到日志里 <code>deviceIdentity</code> 会从 <code>derived</code> 变成 <code>native</code>。</span>
+                      </div>
+                      <div class="mu mt-1 qoder-device-result" aria-live="polite"></div>
+                    </div>
                   </fieldset>`:''}
                   ${(p.oauth&&(p.oauth.flowType==='m365-pkce'||p.oauth.flowType==='m365-ropc'))?`
                   <fieldset class="form-group" id="m365-fs-${escapePageHtml(p.id)}"><legend>M365 账号池</legend><span class="form-helper">本提供商可挂多个订阅账号（授权码/账密各连一次即入池）。网关按健康自动选择，限流/超限自动切换。每个账号默认串行（并发上限 1，可选 M365_ACCOUNT_DEFAULT_CONCURRENCY 调整），两次调用间至少间隔 1 秒。</span>
@@ -1073,38 +1097,6 @@ ${H('管理')}
           <span class="form-helper">调低连接超时可更快失败切换；长思考/agent 场景请保持 idle 超时较大；心跳 0 时不注入，避免干扰私有 SSE 解析器。</span>
         </div>
         <div id="perf-result" class="mt-1" aria-live="polite"></div>
-      </section>
-
-      <!-- ===== Qoder 真机设备身份（原 COSY_* Secret，改为面板配置） ===== -->
-      <section id="qoder-device" class="workspace-section" aria-labelledby="qoder-device-title">
-        <div class="section-heading section-heading--admin">
-          <div><h2 id="qoder-device-title">Qoder 设备身份</h2><p>官方 2026-09-26 起要求请求携带设备标识才下发「每日领取 100 Credits」；用 uid 派生的假身份<b>不报错</b>，但活动列表里会静默少掉这条活动（表现就是「无可用签到活动」）。下面填的是在装了 Qoder 桌面端的机器上跑 <code>runtime-info.exe --account-stdin</code> 提取出的真机常量：机器级、多账号共用一份、抄来即可。存 KV，保存后下次签到立即生效（无需重新部署）。</p></div>
-          <div><span class="mu" id="qoder-device-state" style="font-size:12px"></span></div>
-        </div>
-        <div class="form-group">
-          <label class="fg">
-            <span>粘贴提取脚本输出的 JSON（整段 <code>config.json</code> 或只贴 <code>device</code> 块，点右侧按钮自动填充）</span>
-            <textarea id="qoder-device-json" rows="6" class="fx1" style="white-space:pre-wrap;font-family:monospace;font-size:12px" placeholder='{"device":{"clientType":"10","machineId":"...","machineToken":"...","machineType":"...","machineCode":"...","machineOS":"x86_64_windows","machineHostname":"...","version":"0.4.3"}}' spellcheck="false"></textarea>
-          </label>
-          <div class="fc mt-1 field-row">
-            <button class="btn btn-gh btn-xs" onclick="qoderDeviceFillFromJson()"><i class="fas fa-file-import" aria-hidden="true"></i>从 JSON 填充</button>
-            <span class="form-helper">键名大小写/下划线不敏感，<code>COSY_MACHINE_TOKEN</code>、<code>productVersion</code> 这类写法也认。</span>
-          </div>
-        </div>
-        <div class="form-grid">
-          ${QODER_DEVICE_FIELDS.map((f) => `
-          <label class="fg">
-            <span>${f.header}</span>
-            <input type="text" id="qd-${f.key}" class="fx1" autocomplete="off" spellcheck="false" placeholder="${escapePageHtml(f.placeholder)}">
-            <small class="form-helper" style="display:block">${escapePageHtml(f.hint)}</small>
-          </label>`).join('')}
-        </div>
-        <div class="fc mt-1 field-row">
-          <button class="btn btn-p btn-xs" onclick="saveQoderDevice()"><i class="fas fa-save" aria-hidden="true"></i>保存</button>
-          <button class="btn btn-gh btn-xs" onclick="resetQoderDevice()"><i class="fas fa-undo" aria-hidden="true"></i>清空</button>
-          <span class="form-helper">留空字段的后果：<code>Cosy-ClientType / MachineOS / MachineHostname / Version</code> 回退内置默认值；<code>MachineId / MachineToken / MachineType / MachineCode</code> 回退 uid 派生值——<b>派生值拿不到每日活动</b>。保存后签到日志里 <code>deviceIdentity</code> 会从 <code>derived</code> 变成 <code>native</code>。</span>
-        </div>
-        <div id="qoder-device-result" class="mt-1" aria-live="polite"></div>
       </section>
     </main>
 
@@ -3421,6 +3413,27 @@ function clineUpExcludeUnresolved(pin, probe) {
   var exc = (pin && pin.exclude) || []
   return exc.length > 0 && !((((probe || {}).upstreams) || []).length)
 }
+/**
+ * 「钉住是否真的生效」的结论映射（口径与后端 judgeClinePinVerify 一致）。
+ * 五种结论必须一眼可分，尤其是 unknown 与 ok 的区别——**读不到路由信息不等于生效**；
+ * 把它显示成"成功"就是把"没验证"伪装成"已验证"，正是这套东西要消灭的东西。
+ */
+function clineUpVerdict(v) {
+  var map = {
+    ok: ['bd-on', '生效'],
+    fallback: ['bd-warn', '走了兜底'],
+    mismatch: ['bd-danger', '未生效'],
+    unpinned: ['bd-off', '未配钉住'],
+    unknown: ['bd-off', '读不到路由信息'],
+  }
+  return map[v] || map.unknown
+}
+/** 结论的说明文案（不含结论标签本身，标签由 clineUpVerdict 给）。 */
+function clineUpVerifyText(res) {
+  if (!res) return ''
+  var when = res.verifiedAt ? new Date(res.verifiedAt).toLocaleTimeString() : ''
+  return (res.note || '') + (when ? '（' + when + '）' : '')
+}
 /* CLINE_UP_END */
 
 /* CLINE_UP_UI_BEGIN */
@@ -5193,16 +5206,18 @@ adminNavLinks.forEach(function (link) {
 })
 window.addEventListener('hashchange', function () { maybeLoadPerf(location.hash) })
 setTimeout(loadPerfSettings, 100)
-// ===== Qoder 真机设备身份（原 COSY_* Secret，改为面板配置） =====
+// ===== Qoder 真机设备身份（原 COSY_* Secret；配置块挂在 Qoder 提供商卡片里，无独立菜单） =====
 /* QODER_DEV_BEGIN */
-var qoderDeviceFields = []
-function qoderDeviceInputs() {
-  var out = []
-  for (var i = 0; i < qoderDeviceFields.length; i++) {
-    var el = document.getElementById('qd-' + qoderDeviceFields[i].key)
-    if (el) out.push(el)
-  }
-  return out
+// 设备身份是**机器级全局配置**（KV qoder:device），不按提供商存值：一个 Qoder 卡片保存后，
+// 另一张卡片重新加载看到的是同一份。作用域一律按容器（[data-qoder-device]）找，而不是固定 id——
+// 旧实现用固定 id（qd- 前缀 + 字段名），页面上一旦出现第二个 Qoder 提供商就会撞 id（后者覆盖前者，
+// 用户改的其实是同一份数据却看到两个不同的框）。
+function qoderDeviceBlock(btn) {
+  return (btn && btn.closest) ? btn.closest('[data-qoder-device]') : null
+}
+function qoderDeviceInputs(block) {
+  if (!block) return []
+  return Array.prototype.slice.call(block.querySelectorAll('.qoder-device-input'))
 }
 // 键名归一：去掉 cosy 前缀与非字母数字，于是 config.json 的 camelCase、
 // COSY_MACHINE_TOKEN 这类环境变量写法、build-manifest.json 的 productVersion 都能对上。
@@ -5212,9 +5227,11 @@ function qoderDeviceKey(v) {
   if (k === 'productversion' || k === 'clientversion' || k === 'appversion') k = 'version'
   return k
 }
-function qoderDeviceFillFromJson() {
-  var ta = document.getElementById('qoder-device-json')
-  var out = document.getElementById('qoder-device-result')
+function qoderDeviceFillFromJson(btn) {
+  var block = qoderDeviceBlock(btn)
+  if (!block) return
+  var ta = block.querySelector('.qoder-device-json')
+  var out = block.querySelector('.qoder-device-result')
   if (!ta) return
   var parsed
   try { parsed = JSON.parse(ta.value) } catch (e) { toast('JSON 解析失败：' + e.message, 'error'); return }
@@ -5223,8 +5240,8 @@ function qoderDeviceFillFromJson() {
   var map = {}
   Object.keys(src).forEach(function (k) { map[qoderDeviceKey(k)] = src[k] })
   var filled = 0
-  qoderDeviceInputs().forEach(function (el) {
-    var v = map[qoderDeviceKey(el.id.slice(3))]
+  qoderDeviceInputs(block).forEach(function (el) {
+    var v = map[qoderDeviceKey(el.getAttribute('data-key'))]
     if (typeof v !== 'string' || !v.trim()) return
     el.value = v.trim()
     filled++
@@ -5233,23 +5250,29 @@ function qoderDeviceFillFromJson() {
   if (!filled) toast('没识别到任何字段', 'error')
 }
 /* QODER_DEV_END */
-async function loadQoderDevice() {
-  var st = document.getElementById('qoder-device-state')
+async function loadQoderDeviceBlock(block) {
+  if (!block) return
+  var st = block.querySelector('.qoder-device-state')
   try {
     var r = await fetch('/admin/api/qoder-device')
     var d = await r.json()
     if (!d.success) { if (st) st.textContent = '加载失败'; return }
-    qoderDeviceFields = (d.data && d.data.fields) || []
     var dev = (d.data && d.data.device) || {}
-    qoderDeviceInputs().forEach(function (el) { el.value = dev[el.id.slice(3)] || '' })
+    qoderDeviceInputs(block).forEach(function (el) { el.value = dev[qoderDeviceKey(el.getAttribute('data-key'))] || '' })
     if (st) st.textContent = (d.data && d.data.isCustom) ? '已配置真机身份（签到日志 deviceIdentity=native）' : '未配置：正在用 uid 派生值，拿不到每日活动'
   } catch (e) { if (st) st.textContent = '加载失败' }
 }
-async function saveQoderDevice() {
-  var out = document.getElementById('qoder-device-result')
+// 页面加载即拉取：配置块在提供商卡片里，卡片可能处于折叠状态——元素仍在 DOM 中，直接填即可。
+function loadQoderDevices() {
+  document.querySelectorAll('[data-qoder-device]').forEach(function (block) { loadQoderDeviceBlock(block) })
+}
+async function saveQoderDevice(btn) {
+  var block = qoderDeviceBlock(btn)
+  if (!block) return
+  var out = block.querySelector('.qoder-device-result')
   if (out) { out.textContent = ''; out.style.color = '' }
   var device = {}
-  qoderDeviceInputs().forEach(function (el) { device[el.id.slice(3)] = el.value })
+  qoderDeviceInputs(block).forEach(function (el) { device[qoderDeviceKey(el.getAttribute('data-key'))] = el.value })
   try {
     var r = await fetch('/admin/api/qoder-device', {
       method: 'PUT',
@@ -5257,27 +5280,22 @@ async function saveQoderDevice() {
       body: JSON.stringify({ device: device })
     })
     var d = await r.json()
-    if (d.success) { toast('已保存（下次签到生效）', 'success'); loadQoderDevice() }
+    if (d.success) { toast('已保存（下次签到生效）', 'success'); loadQoderDeviceBlock(block) }
     else toast(d.message || '保存失败', 'error')
   } catch (e) { toast('保存失败', 'error') }
 }
-function resetQoderDevice() {
+function resetQoderDevice(btn) {
+  var block = qoderDeviceBlock(btn)
+  if (!block) return
   cM('清空 Qoder 设备身份？清空后回退 uid 派生值，拿不到「每日领取 100 Credits」。').then(function (ok) {
     if (!ok) return
-    qoderDeviceInputs().forEach(function (el) { el.value = '' })
-    var ta = document.getElementById('qoder-device-json')
+    qoderDeviceInputs(block).forEach(function (el) { el.value = '' })
+    var ta = block.querySelector('.qoder-device-json')
     if (ta) ta.value = ''
-    saveQoderDevice()
+    saveQoderDevice(btn)
   })
 }
-function maybeLoadQoderDevice(hash) { if (hash === '#qoder-device') loadQoderDevice() }
-adminNavLinks.forEach(function (link) {
-  if (link.getAttribute('href') === '#qoder-device') {
-    link.addEventListener('click', function () { setTimeout(loadQoderDevice, 50) })
-  }
-})
-window.addEventListener('hashchange', function () { maybeLoadQoderDevice(location.hash) })
-setTimeout(loadQoderDevice, 100)
+setTimeout(loadQoderDevices, 100)
 setTimeout(loadCache, 0)
 </script>
 </body></html>`)
