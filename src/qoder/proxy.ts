@@ -129,15 +129,30 @@ async function buildQoderAccountSession(
 }
 
 /**
+ * 会话死亡标记（与 hub qoder_accounts.py:303 `SESSION_DEAD_MARKERS` 同口径）。
+ *
+ * 上游主动吊销离线会话，此时刷新 token 已无意义，必须停用账号等重新登录；
+ * 而**其余** 401/403 只是权限抖动/风控瞬时拒绝，冷却后换号重试即可。
+ * 把两者混为一谈的代价是：一次瞬时 403 就把好账号永久禁用（签到也不会解冻）。
+ */
+const QODER_SESSION_DEAD_MARKERS = ['TOKEN_EXPIRE', '12153', 'Offline user session not found']
+
+/** 上游错误文本（消息或 code）是否表明会话已被吊销。 */
+export function isQoderSessionDead(text: string): boolean {
+  return QODER_SESSION_DEAD_MARKERS.some((m) => text.includes(m))
+}
+
+/**
  * 按错误分类对池账号施加冷却/禁用（对齐 cli2api pool.MarkClassified 语义）：
  *   quota      → 长冷却（planMs，签到恢复积分后自动解冻）
- *   rate_limit → 短冷却（Retry-After 优先，回退 softMs）
- *   auth       → 禁用（需重新登录）
+ *   rate_limit → 短冷却（上游 retryAfterSeconds / Retry-After 优先，回退 softMs）
+ *   auth       → **只有会话被上游吊销才停用**；其余 401/403 冷却 60s 后轮换
+ *                （hub qoder_proxy.py:2642-2656 口径：dead→300s+停用，非 dead→60s）
  *   content_policy → **不记任何状态**：这是客户端输入被审核拒绝，账号本身没问题；
  *                    记错误会让连续几次敏感输入把好账号冷却掉
  *   其余       → 分类器给出的冷却时长（>0 时），并记一次连续错误
  */
-async function markQoderAccountClassified(
+export async function markQoderAccountClassified(
   env: Env,
   provider: Provider,
   uid: string,
@@ -152,7 +167,23 @@ async function markQoderAccountClassified(
       await cooldownQoderAccount(env, provider.id, uid, cd.planMs, '额度耗尽（' + c.message.substring(0, 80) + '）')
       break
     case 'auth':
-      await disableQoderAccount(env, provider.id, uid, '鉴权失败：' + c.message.substring(0, 80))
+      // 只有会话被吊销才停用账号（hub qoder_proxy.py:2642-2656）：
+      //   dead（TOKEN_EXPIRE / 12153 / Offline user session not found）→ 停用，需重新登录；
+      //   其余 401/403（权限抖动、风控瞬时拒绝）→ 冷却 60s 后轮换，账号本身没问题。
+      // 旧实现一律 disableQoderAccount：一次瞬时 403 就把账号永久打死，且签到不会解冻。
+      // 安全网：token 真过期时 buildQoderAccountSession 刷新失败也会走停用分支（见池循环）。
+      if (isQoderSessionDead(`${c.code} ${c.message}`)) {
+        await disableQoderAccount(env, provider.id, uid, '鉴权失败（会话已失效，需重新登录）：' + c.message.substring(0, 80))
+      } else {
+        await cooldownQoderAccount(
+          env,
+          provider.id,
+          uid,
+          // 基准 60s（hub 同值）；上游若给了更长的 Retry-After 则从长，不缩短
+          Math.max(60, c.cooldownSeconds) * 1000,
+          '鉴权被拒（非会话失效，冷却后轮换）：' + c.message.substring(0, 60)
+        )
+      }
       break
     case 'rate_limit':
       await cooldownQoderAccount(env, provider.id, uid, (c.cooldownSeconds || 0) * 1000 || cd.softMs, '限流（429）')

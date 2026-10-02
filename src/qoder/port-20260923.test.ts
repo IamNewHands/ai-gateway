@@ -8,8 +8,8 @@ import { describe, it, expect, vi, afterEach } from 'vitest'
 import { cosySessionFor, cosyHeaders } from './cosy'
 import { buildQoderBody, cpaToUpstreamKey, fallbackUnknownModel, pickQoderModels } from './body'
 import { performQoderCheckin, normalizeQoderRealm, realmHasLegacyCheckin, QODER_OPENAPI, fetchQoderUserResource } from './billing'
-import { classifyQoderError } from './classify'
-import { proxyQoderChatRequest, isQoderFlow, testQoderModel } from './proxy'
+import { classifyQoderError, type QoderClassified } from './classify'
+import { proxyQoderChatRequest, isQoderFlow, testQoderModel, markQoderAccountClassified, isQoderSessionDead } from './proxy'
 import type { Env, Provider } from '../types'
 
 const CHAT_URL = 'https://gateway.qoder.com.cn/algo/api/v2/service/pro/sse/agent_chat_generation?Encode=1'
@@ -744,5 +744,107 @@ describe('上游排队已满（10605 / isQueued）归为限流，绝不按鉴权
     expect(body).toContain('排队已满')
     expect(body).toContain('upstream_queue_full')
     expect(body).not.toContain('unauthorized')
+  })
+})
+
+// ===== 池策略：401/403 只在会话被吊销时停用账号 =====
+// 源：qoder2api-hub qoder_proxy.py:2618-2659 `_handle_envelope_account_cooldown`
+// （dead → 停用；非 dead 的 401/403 → 60s 冷却后轮换）。
+describe('池策略：401/403 只在会话被吊销时停用账号，其余冷却 60s 后轮换', () => {
+  let seq = 0
+
+  /** 建一个只带 KV 的 env，并在独立 providerId 下预置一个池账号（避开 pool.ts 的 1s 进程内缓存）。 */
+  function makePoolEnv(uid: string) {
+    const pid = `pq${++seq}`
+    const key = `qoder:pool:${pid}`
+    const store = new Map<string, string>()
+    store.set(key, JSON.stringify([{
+      uid,
+      nickname: 'n',
+      token: { access_token: 'dt-x', refresh_token: 'drt-x', expires_at: Date.now() + 3600_000 },
+      enabled: true,
+      state: { credits: 0, disabled: false, until: 0, errCount: 0 },
+      updatedAt: Date.now(),
+      realm: 'cn',
+    }]))
+    const env = {
+      KV: {
+        get: async (k: string) => store.get(k) ?? null,
+        put: async (k: string, v: string) => { store.set(k, v) },
+      },
+    } as unknown as Env
+    const state = () => (JSON.parse(store.get(key) || '[]')[0] || {}).state as
+      { disabled: boolean; until: number; reason?: string } | undefined
+    return { env, provider: { id: pid } as Provider, state }
+  }
+
+  /** 与上一节相同的上游原文（信封 403 + 10605 排队）。 */
+  const QUEUE_BODY = JSON.stringify({
+    code: '10605',
+    message: JSON.stringify({ isQueued: true, modelKey: 'qfmodel', queueType: 'p3', retryAfterSeconds: 30, serviceAvailable: false }),
+  })
+
+  const classified = (over: Partial<QoderClassified> = {}): QoderClassified => ({
+    status: 403,
+    kind: 'auth',
+    failover: true,
+    cooldownSeconds: 30,
+    message: 'permission denied',
+    code: 'unauthorized',
+    type: 'api_error',
+    ...over,
+  })
+
+  it('会话死亡标记（TOKEN_EXPIRE / 12153 / Offline user session not found）→ 停用账号', async () => {
+    const cases: Array<[string, string]> = [
+      ['TOKEN_EXPIRE', 'unauthorized'],
+      ['session gone', '12153'],
+      ['Offline user session not found', 'unauthorized'],
+    ]
+    for (const [msg, code] of cases) {
+      const uid = `u-dead-${code}-${msg.length}`
+      const { env, provider, state } = makePoolEnv(uid)
+      await markQoderAccountClassified(env, provider, uid, classified({ status: 401, message: msg, code }))
+      expect(state()?.disabled).toBe(true)
+    }
+  })
+
+  it('普通 403（无死亡标记）→ 不停用，只冷却 60s 后轮换', async () => {
+    const uid = 'u-plain-403'
+    const { env, provider, state } = makePoolEnv(uid)
+    const before = Date.now()
+    await markQoderAccountClassified(env, provider, uid, classified())
+    const st = state()
+    // 旧实现这里会 disabled=true：一次瞬时 403 就把账号永久打死
+    expect(st?.disabled).toBe(false)
+    expect(st!.until - before).toBeGreaterThanOrEqual(60_000)
+    expect(st!.until - before).toBeLessThan(65_000)
+  })
+
+  it('上游给了更长的 Retry-After 时从长，不缩短', async () => {
+    const uid = 'u-long-retry'
+    const { env, provider, state } = makePoolEnv(uid)
+    const before = Date.now()
+    await markQoderAccountClassified(env, provider, uid, classified({ cooldownSeconds: 300 }))
+    expect(state()!.until - before).toBeGreaterThanOrEqual(300_000)
+  })
+
+  it('排队满（rate_limit 30s）→ 只冷却不停用（分类与池策略串起来验）', async () => {
+    const uid = 'u-queue'
+    const { env, provider, state } = makePoolEnv(uid)
+    const before = Date.now()
+    await markQoderAccountClassified(env, provider, uid, classifyQoderError({ status: 403, body: QUEUE_BODY }))
+    const st = state()
+    expect(st?.disabled).toBe(false)
+    expect(st!.until - before).toBeGreaterThanOrEqual(30_000)
+    expect(st!.until - before).toBeLessThan(35_000)
+  })
+
+  it('isQoderSessionDead 只认上游吊销标记，不误伤普通权限错误', () => {
+    expect(isQoderSessionDead('TOKEN_EXPIRE')).toBe(true)
+    expect(isQoderSessionDead('12153')).toBe(true)
+    expect(isQoderSessionDead('Offline user session not found')).toBe(true)
+    expect(isQoderSessionDead('permission denied')).toBe(false)
+    expect(isQoderSessionDead(QUEUE_BODY)).toBe(false)
   })
 })
