@@ -32,6 +32,10 @@ import { diagnoseOpenCodeKey, fetchOpenCodeModels, isOpenCodeProvider, resolveOp
 import { isQoderFlow, fetchQoderModels, testQoderModel } from './qoder/proxy'
 import { isClineProvider, fetchClineRecommendedModels, testClineChat, testClineRefreshToken, probeClineAccount, startClineOAuth, pollClineOAuth, probeClineProviderUpstream, validateClineProviderUpstream, verifyClineProviderUpstream, readClineUpstreamCache, readClineTraffic, MIN_GAP_MS, DEFAULT_MODEL } from './cline/proxy'
 import type { ClineTrafficRecord } from './cline/proxy'
+// 账号冷却/额度耗尽状态：留档在 KV、展示在本面板。口径与渲染文案都由 account-state 提供，
+// 面板与服务端不各算一套（时间、标签、过期判定只有一处实现）。
+import { describeClineAccountState, maskClineToken, readClineAccountStates, rekeyClineAccountState } from './cline/account-state'
+import type { ClineAccountStateKind } from './cline/account-state'
 import { isGeminiProvider, testGeminiModel, GEMINI_MODELS } from './gemini/proxy'
 import { fetchGeminiQuota } from './gemini/quota'
 import { isCnbProvider, testCnbConnection, CNB_MODELS } from './cnb/proxy'
@@ -1953,11 +1957,8 @@ export function normalizeApiKeyLabel(v: unknown): string | undefined {
   return s ? s : undefined
 }
 
-/** 面板用掩码：只露末 4 位，绝不回传完整 refreshToken。 */
-function maskSecret(key: string): string {
-  const k = (key || '').trim()
-  return k.length > 4 ? `****${k.slice(-4)}` : '****'
-}
+/** 面板用掩码：只露末 4 位，绝不回传完整 refreshToken。口径与状态留档共用一处（account-state）。 */
+const maskSecret = maskClineToken
 
 /** 并发受限的 map，避免几十个账号同时打上游被限流。 */
 async function mapWithLimit<T, R>(items: T[], limit: number, fn: (item: T, index: number) => Promise<R>): Promise<R[]> {
@@ -1987,6 +1988,55 @@ export interface ClineAccountRow {
   /** 显示名来源：'manual' 手工填 | 'auto' 自动关联 | 'none' 未关联。 */
   labelSource: 'manual' | 'auto' | 'none'
   message: string
+  /**
+   * 该账号此刻是否处于冷却（额度耗尽 / 限流 / 凭据失效 / 推理空转）。
+   *
+   * 来源是**冷却发生时落下的 KV 留档**（见 cline/account-state.ts），不是面板当场的探测：
+   * 探测只能证明 token 能不能换，证明不了账号有没有被流量打上冷却。
+   */
+  cooling: boolean
+  /** 冷却分类；未冷却时为 null。面板用它决定徽章颜色。 */
+  stateKind: ClineAccountStateKind | null
+  /** 面板徽章文案（如「额度耗尽 · 冷却 52s」）；未冷却时为空串。文案由服务端生成，见 describeClineAccountState。 */
+  stateLabel: string
+  /** 徽章 tooltip：原因 + 模型 + 冷却截止时刻，并点明它不等于额度恢复时刻。 */
+  stateTitle: string
+}
+
+/**
+ * GET /admin/api/providers/:id/cline-account-states
+ *
+ * 只读冷却留档（KV），**不打上游**：面板展开 Cline 卡片时调用，让「额度耗尽被冷却」一眼可见，
+ * 不必先点「检测全部账号」——那个动作会用每个 refreshToken 换一次 accessToken，属于有副作用的探测，
+ * 不该是「看一眼状态」的代价。
+ */
+export async function handleClineAccountStates(c: Context<AppEnv>) {
+  const id = c.req.param('id')
+  if (!id) return c.json<ApiResponse>({ success: false, message: '缺少 id 参数' }, 400)
+  const provider = await getProvider(c.env, id)
+  if (!provider) return c.json<ApiResponse>({ success: false, message: '提供商不存在' }, 404)
+  if (!isClineProvider(provider.id)) {
+    return c.json<ApiResponse>({ success: false, message: '仅支持 Cline 提供商' }, 400)
+  }
+  const states = await readClineAccountStates(c.env, id)
+  const byIndex = new Map(states.map((s) => [s.index, s]))
+  const now = Date.now()
+  const keys = provider.apiKeys || []
+  const accounts = keys.map((k, i) => {
+    const masked = maskSecret(k.key)
+    const state = byIndex.get(i)
+    // 掩码不符 = 这行已经换过号，那条留档讲的是别的账号，丢弃（与检测端点同一判据）
+    const view = state && state.masked === masked ? describeClineAccountState(state, now) : null
+    return {
+      index: i,
+      enabled: !!k.enabled,
+      cooling: !!view?.active,
+      stateKind: view?.active ? state!.kind : null,
+      stateLabel: view?.label || '',
+      stateTitle: view?.detail || '',
+    }
+  })
+  return c.json<ApiResponse>({ success: true, data: { accounts, checkedAt: now } })
 }
 
 /**
@@ -2005,11 +2055,22 @@ export async function handleClineAccountCheck(c: Context<AppEnv>) {
 
   const keys = provider.apiKeys || []
   const probes = await mapWithLimit(keys, 4, (k) => probeClineAccount(k.key))
+  // 冷却留档一次读全（按提供商单键），再按 index + 掩码逐行匹配：留档里的掩码与当前 token
+  // 不符说明这行已经被换过号，那条记录讲的是**另一个账号**，必须丢弃而不是硬套（面板不猜）。
+  //
+  // 例外：**上游轮换**（probe.rotatedTo）是同一个账号换了钥匙，不是换号——那时按旧掩码匹配，
+  // 并把留档改写成新掩码（rekey），否则一次轮换就会把「额度耗尽被冷却」显示成健康。
+  const states = await readClineAccountStates(c.env, id)
+  const stateByIndex = new Map(states.map((s) => [s.index, s]))
+  const now = Date.now()
   let apiKeys = keys
   const dirty = new Set<number>()
+  /** 需要改写掩码的留档：index → 新掩码（轮换后）。 */
+  const rekeys = new Map<number, string>()
   const rows: ClineAccountRow[] = keys.map((k, i) => {
     const probe = probes[i]
     const entry: ApiKeyEntry = { ...k }
+    const maskedBefore = maskSecret(k.key)
     // 轮换：探测本身就可能让旧 token 失效，必须立刻写回，否则下次就是 invalid_grant
     if (probe.rotatedTo) {
       entry.key = probe.rotatedTo
@@ -2021,15 +2082,25 @@ export async function handleClineAccountCheck(c: Context<AppEnv>) {
       dirty.add(i)
     }
     if (dirty.has(i)) apiKeys = apiKeys.map((cur, idx) => (idx === i ? entry : cur))
+    const masked = maskSecret(entry.key)
+    const state = stateByIndex.get(i)
+    const stateMask = probe.rotatedTo ? maskedBefore : masked
+    const matched = state && state.masked === stateMask ? state : null
+    if (matched && probe.rotatedTo && masked !== stateMask) rekeys.set(i, masked)
+    const view = matched ? describeClineAccountState(matched, now) : null
     return {
       index: i,
-      masked: maskSecret(entry.key),
+      masked,
       enabled: !!k.enabled,
       valid: probe.valid,
       email: probe.email,
       label: entry.label || '',
       labelSource: !entry.label ? 'none' : (entry.label === probe.email && probe.email ? 'auto' : 'manual'),
       message: probe.message,
+      cooling: !!view?.active,
+      stateKind: view?.active ? matched!.kind : null,
+      stateLabel: view?.label || '',
+      stateTitle: view?.detail || '',
     }
   })
 
@@ -2041,14 +2112,25 @@ export async function handleClineAccountCheck(c: Context<AppEnv>) {
       console.error(`[cline-check] 回写 provider ${id} 失败：${err instanceof Error ? err.message : String(err)}`)
     }
   }
+  // 轮换后把留档的掩码改成新值（同一个账号、同一份冷却），否则下次读留档会认不出它
+  for (const [index, masked] of rekeys) await rekeyClineAccountState(c.env, id, index, masked)
 
   const valid = rows.filter((r) => r.valid).length
+  const disabled = rows.filter((r) => !r.enabled).length
+  const cooling = rows.filter((r) => r.cooling).length
+  const quotaCooling = rows.filter((r) => r.cooling && r.stateKind === 'quota_empty').length
+  // 汇总顺序按「影响可用性的强弱」排：失效/禁用 > 冷却（额度耗尽单独点数，因为它是免费档最常见的死法）
+  const extra = [
+    disabled ? `已禁用 ${disabled}` : '',
+    cooling ? `冷却中 ${cooling}${quotaCooling ? `（额度耗尽 ${quotaCooling}）` : ''}` : '',
+    rows.length - valid ? `失效或不可达 ${rows.length - valid}` : '',
+  ].filter(Boolean)
   return c.json<ApiResponse>({
     success: true,
     data: {
       accounts: rows,
       checkedAt: Date.now(),
-      summary: `有效 ${valid} / 共 ${rows.length}${rows.length - valid ? `，失效或不可达 ${rows.length - valid}` : ''}`,
+      summary: `有效 ${valid} / 共 ${rows.length}${extra.length ? `，${extra.join('，')}` : ''}`,
     },
   })
 }

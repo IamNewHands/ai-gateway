@@ -40,6 +40,7 @@ import {
   handleClineOAuthConnect,
   handleClineOAuthPoll,
   handleClineAccountCheck,
+  handleClineAccountStates,
   handleClineAccountLabel,
   handleClineUpstreams,
   handleClineUpstreamProbe,
@@ -261,6 +262,8 @@ app.post('/admin/api/cline/oauth/:id/connect', handleClineOAuthConnect)
 app.post('/admin/api/cline/oauth/:id/poll', handleClineOAuthPoll)
 // Cline 账号检测：探测每个 refreshToken 的有效性并关联账号 email / 手工补账号名
 app.post('/admin/api/providers/:id/cline-accounts/check', handleClineAccountCheck)
+// Cline 账号冷却/额度留档：只读 KV，不打上游（面板展开卡片时调用）
+app.get('/admin/api/providers/:id/cline-account-states', handleClineAccountStates)
 app.post('/admin/api/providers/:id/cline-accounts/label', handleClineAccountLabel)
 // Cline 上游渠道探测与固定：读留档（GET，不打上游）/ 探测单模型渠道 / 校验该模型全部渠道 /
 // 验证已保存的钉住配置是否真的生效（读响应路由元数据）

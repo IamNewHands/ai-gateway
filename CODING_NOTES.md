@@ -310,6 +310,45 @@ buffered=2 sawFinish=false probeReadError=false`，**三轮完全一致**。含�
 不认 `[DONE]` 为收尾标志（非流式聚合路径已有 `sawDone` 口径）。要分开二者需再加 `sawDone`
 标志位；本次未做，因为两者处置相同（都是试满 3 轮后报错）。
 
+### Cline 账号冷却/额度状态显示（2026-10-02，改面板账号行前必读）
+
+**用户报的问题**：面板上看不出某个 Cline 账号已经「额度耗尽被冷却」——`kst-` 徽章只回答
+「这条 refreshToken 能不能换 accessToken」，一个 token 有效但免费额度耗尽被冷却 12 小时的账号，
+与健康账号长得一模一样。
+
+**为什么必须落 KV（不能直接读内存池）**：冷却状态（`Account.cooldownUntil` / `modelCooldowns`）
+原本只存在 **isolate 内存** 的 `pools` 对象里。面板请求与业务流量不保证同 isolate，重启/部署即清零
+——直接读内存的后果是「账号正被冷却，面板显示一切正常」。所以冷却发生时就把事实写进
+`cline:acctstate:<providerId>`（`src/cline/account-state.ts`），面板从 KV 读。
+
+**设计要点**（每条都有用例钉住）：
+
+| 要点 | 做法 | 理由 |
+|---|---|---|
+| 谁被冷却 | 留档带 `index` + `masked`（末 4 位）；读取时两者都要匹配 | 换过号的行不硬套别人的记录（面板不猜） |
+| 过期判定 | 读时比较 `until`，不靠 KV TTL | TTL 只保证记录最终消失，保证不了「到期即显示正常」 |
+| 写配额 | 同账号同原因 30 秒内只落一次盘（`CLINE_ACCOUNT_STATE_WRITE_GAP_MS`） | KV 写配额全功能共享；冷却中的号**每个请求**都会失败一次，逐次落盘会把配额写爆 |
+| `until` 单调 | 同原因只许写长，旧写不许把冷却改短 | 并发/乱序下不许把「已冷却」写回「没冷却」 |
+| 清档时机 | 只在**真的交付了健康结果**时清（流式 `pumpStreamAttempt` healthy / 非流式拿到 `agg.content`） | 上游额度耗尽的一种形态就是 **200 + 零帧流**；按 HTTP 200 清档会让刚判定的耗尽当场被抹掉 |
+| 429 分类 | 文案命中 `daily free (model )?limit` 等 → `quota_empty`（额度耗尽），否则 `rate_limited` | 官方 429 文案是 `Daily free limit reached on model X. Try again in 23h 59m`，两者要分开显示；`until` 取上游给的倒计时（`cooldownFromResponse` 解析，6h 封顶） |
+
+**口径提醒**：面板上的 `until` 是**网关的禁入窗口**，不是上游额度恢复时刻（tooltip 已写明）。
+免费档每日额度的重置时间只有上游文案里的 `Try again in …` 一个来源，我们照抄并封顶 6h。
+
+**上游事实（2026-10-02 源码取证）**：Cline **没有**「剩余免费额度」查询接口。可查的只有
+`/api/v1/users/{uid}/balance`（微积分）、`/users/{uid}/usages`（逐笔，免费档 `creditsUsed=0`）、
+`/users/me/plan/usage-limits`（**仅 ClinePass**，免费账号 404）。免费档每日限额只在被拒时以 429
+文案暴露。参考实现 `bouderer/cline2api`（GitHub，**无 license，只能借鉴语义不能抄代码**）。
+
+**端点与界面**：
+
+- `GET /admin/api/providers/:id/cline-account-states`：只读 KV、**不打上游**（面板展开卡片即调用，
+  让状态一眼可见，不必先点按钮）；`POST .../cline-accounts/check` 的每行也带同样的字段。
+- 面板：账号行 `krun-<pid>-<idx>` 徽章。**已禁用**当场显示（本地事实，无需请求）；冷却状态来自留档。
+  红 = 额度耗尽/余额不足/凭据失效（现在真的不可用），琥珀 = 限流/推理空转（多为短时）。
+  画法只有一处（`clinePaintRunBadge`），两个数据源共用。
+- 客户端脚本版本戳：`CLINE_UP_UI_VERSION = '2026-10-06-acct-state'`（改这块客户端行为必须 bump）。
+
 ### 已知缺口
 
 - **上下文超限不是账号故障**（2026-10-01，`isTraeRequestSideError` 扩充）：上游把上下文超限

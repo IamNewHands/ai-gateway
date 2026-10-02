@@ -1,6 +1,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { parseCooldownMs, fetchClineModels, isRunawayReasoningCutoff, isDegenerateReasoningDeltas, isWhitespaceOnlyReasoningDelta, normalizeReasoningDeltaForUI, pumpStreamAttempt, sanitizeClineMessages, isFreeClineModel, buildUpstreamBody, injectClineUpstreamPrefs, clinePinDecision, clinePinDecisionText, shouldLogClinePin, __resetClinePinLogForTests, __resetClineTrafficForTests, clineMaxOutputLimit, clineMaxTokensClamp, proxyClineChatRequest, __resetClineCatalogCacheForTests, CLINE_MAX_TOKENS, CLINE_FREE_WHITELIST, CLINE_CHAT_CONNECT_TIMEOUT_MS, CLINE_MAX_TRANSPORT_ATTEMPTS, CLINE_PROBE_MAX_MS, CLINE_KEEPALIVE_MS, DEFAULT_MODEL } from './proxy'
 import type { ClineTrafficRecord } from './proxy'
+import { __resetClineAccountStateForTests } from './account-state'
 import type { Provider } from '../types'
 
 /** 读取一个 Response 的完整文本（用于流式结果断言）。 */
@@ -1917,5 +1918,172 @@ describe('客户端断开不罚模型（移植 4265b29）', () => {
     // 关键：断开后不因「空响应」重试第二轮
     expect(calls).toBe(1)
     if (resp.status === 200) await resp.body?.cancel()
+  }, 20000)
+})
+
+// ============================================================================
+// 账号冷却状态落 KV（面板「额度耗尽 / 限流 / 凭据失效」的唯一来源）
+//
+// 为什么必须端到端测接线：冷却本来就在内存里生效（路由行为不依赖本次改动），所以"忘了落档"
+// 不会让任何既有用例变红——面板却会一直显示账号健康。这组用例断言的是**KV 里到底有没有这条事实**。
+// ============================================================================
+describe('账号冷却状态落 KV：面板据此显示「额度耗尽 / 限流」', () => {
+  /** 计数型 KV：暴露 map 以便断言留档内容，暴露 puts 以便断言节流真的生效。 */
+  function stateEnv() {
+    const map = new Map<string, string>()
+    const puts: string[] = []
+    const env = {
+      KV: {
+        get: async (k: string) => map.get(k) ?? null,
+        put: async (k: string, v: string) => { puts.push(k); map.set(k, v) },
+        delete: async (k: string) => { map.delete(k) },
+        list: async () => ({ keys: [] }),
+      },
+    }
+    const states = (providerId: string) => {
+      const raw = map.get('cline:acctstate:' + providerId)
+      if (!raw) return [] as Array<Record<string, unknown>>
+      return (JSON.parse(raw) as { states: Array<Record<string, unknown>> }).states
+    }
+    return { env, map, puts, states }
+  }
+
+  it('402 余额不足 → 留档 plan_exhausted，带模型名与 12h 冷却截止', async () => {
+    __resetClineAccountStateForTests()
+    const { env, states } = stateEnv()
+    const provider = clineProvider([REFRESH_TOKEN])
+    installFetch(() => jsonResp({ error: { code: 'insufficient_credits', message: 'Insufficient balance' } }, 402))
+
+    const before = Date.now()
+    const resp = await proxyClineChatRequest(
+      env as never, provider,
+      { model: PAID_MODEL, messages: [{ role: 'user', content: 'hi' }] },
+      { stream: false },
+    )
+    expect(resp.status).toBe(402)
+    const rows = states(provider.id)
+    expect(rows).toHaveLength(1)
+    expect(rows[0].kind).toBe('plan_exhausted')
+    expect(rows[0].index).toBe(0)
+    // 掩码只留末 4 位：面板能对号入座，同时不把 refreshToken 写进 KV
+    expect(rows[0].masked).toBe('****mnop')
+    // 这是模型级冷却：面板必须能说清"哪个模型"不可用，否则会被读成整个账号报废
+    expect(rows[0].model).toBe(PAID_MODEL)
+    const until = Number(rows[0].until)
+    expect(until).toBeGreaterThanOrEqual(before + 12 * 3600_000 - 5000)
+    expect(String(rows[0].reason)).toContain('insufficient_credits')
+  }, 20000)
+
+  it('429 + 官方免费额度文案 → 归类「额度耗尽」（不是普通限流），并带上上游的重置倒计时', async () => {
+    __resetClineAccountStateForTests()
+    const { env, states } = stateEnv()
+    const provider = clineProvider([REFRESH_TOKEN])
+    installFetch(() => jsonResp({
+      error: { message: 'Daily free limit reached on model deepseek/deepseek-v4-flash. Try again in 2h 30m' },
+    }, 429))
+
+    const before = Date.now()
+    const resp = await proxyClineChatRequest(
+      env as never, provider,
+      { model: DEFAULT_MODEL, messages: [{ role: 'user', content: 'hi' }] },
+      { stream: false },
+    )
+    expect(resp.status).toBe(429)
+    const rows = states(provider.id)
+    expect(rows.length).toBeGreaterThan(0)
+    expect(rows[0].kind).toBe('quota_empty')
+    // 「Try again in 2h 30m」必须被解析成真实冷却时长：面板显示的就是上游给的倒计时
+    const until = Number(rows[0].until)
+    expect(until).toBeGreaterThan(before + 2 * 3600_000 + 25 * 60_000)
+    expect(until).toBeLessThan(before + 2 * 3600_000 + 35 * 60_000)
+    expect(String(rows[0].reason)).toContain('Try again in 2h 30m')
+  }, 20000)
+
+  it('普通 429（无免费额度文案）→ 归类限流，不与额度耗尽混淆', async () => {
+    __resetClineAccountStateForTests()
+    const { env, states } = stateEnv()
+    const provider = clineProvider([REFRESH_TOKEN])
+    installFetch(() => jsonResp({ error: { message: 'Rate limit exceeded, slow down.' } }, 429))
+
+    await proxyClineChatRequest(
+      env as never, provider,
+      { model: DEFAULT_MODEL, messages: [{ role: 'user', content: 'hi' }] },
+      { stream: false },
+    )
+    expect(states(provider.id)[0].kind).toBe('rate_limited')
+  }, 20000)
+
+  it('免费档零帧空流（上游 200 但一帧不出）→ 留档额度耗尽', async () => {
+    __resetClineAccountStateForTests()
+    const { env, states } = stateEnv()
+    const provider = clineProvider([REFRESH_TOKEN])
+    // 网关对上游**恒定强制流式**（buildUpstreamBody 第二参 true），所以"免费额度耗尽"的真实形态
+    // 是 200 + 零帧 SSE，而不是 JSON 体——JSON 里带 error 会被 aggregateStream 当流内错误帧。
+    installFetch(() => new Response('', { status: 200, headers: { 'Content-Type': 'text/event-stream' } }))
+
+    await proxyClineChatRequest(
+      env as never, provider,
+      { model: DEFAULT_MODEL, messages: [{ role: 'user', content: 'hi' }] },
+      { stream: true },
+    )
+    const rows = states(provider.id)
+    expect(rows.length).toBeGreaterThan(0)
+    expect(rows[0].kind).toBe('quota_empty')
+    expect(rows[0].model).toBe(DEFAULT_MODEL)
+  }, 20000)
+
+  it('同原因重复冷却只落一次盘（KV 写配额是全功能共享的），但结论始终在', async () => {
+    __resetClineAccountStateForTests()
+    const { env, states, puts } = stateEnv()
+    const provider = clineProvider([REFRESH_TOKEN])
+    installFetch(() => new Response('', { status: 200, headers: { 'Content-Type': 'text/event-stream' } }))
+
+    await proxyClineChatRequest(
+      env as never, provider,
+      { model: DEFAULT_MODEL, messages: [{ role: 'user', content: 'hi' }] },
+      { stream: true },
+    )
+    const writesAfterFirst = puts.filter((k) => k.startsWith('cline:acctstate:')).length
+    // 一次请求内部会重试三轮，每轮都触发冷却——这正是会把 KV 写爆的形态
+    expect(writesAfterFirst).toBe(1)
+    expect(states(provider.id)[0].kind).toBe('quota_empty')
+  }, 20000)
+
+  it('账号随后成功产出响应 → 留档被清除（不把已恢复的账号长期显示成"额度耗尽"）', async () => {
+    __resetClineAccountStateForTests()
+    const { env, states } = stateEnv()
+    const provider = clineProvider([REFRESH_TOKEN])
+    // 第一轮：402 计费档模型 → 该模型被冷却并留档
+    installFetch(() => jsonResp({ error: { code: 'insufficient_credits', message: 'Insufficient balance' } }, 402))
+    await proxyClineChatRequest(
+      env as never, provider,
+      { model: PAID_MODEL, messages: [{ role: 'user', content: 'hi' }] },
+      { stream: false },
+    )
+    expect(states(provider.id)).toHaveLength(1)
+
+    // 第二轮：换免费档模型（402 是模型级冷却，账号本身仍可用）→ 成功即清档
+    installFetch(() => sseOkResp())
+    const ok = await proxyClineChatRequest(
+      env as never, provider,
+      { model: DEFAULT_MODEL, messages: [{ role: 'user', content: 'hi' }], stream: true },
+      { stream: true },
+    )
+    expect(ok.status).toBe(200)
+    await readAll(ok)
+    expect(states(provider.id)).toHaveLength(0)
+  }, 20000)
+
+  it('没有 KV 绑定（本地/测试）时只做内存冷却，不抛错', async () => {
+    __resetClineAccountStateForTests()
+    const provider = clineProvider([REFRESH_TOKEN])
+    installFetch(() => jsonResp({ error: 'empty response content' }, 200))
+    const resp = await proxyClineChatRequest(
+      undefined, provider,
+      { model: DEFAULT_MODEL, messages: [{ role: 'user', content: 'hi' }] },
+      { stream: false },
+    )
+    // 不因留档缺失而改变响应语义
+    expect([200, 429, 502, 503]).toContain(resp.status)
   }, 20000)
 })

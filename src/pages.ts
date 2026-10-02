@@ -94,8 +94,24 @@ const isCnbProviderUI = (p: { id?: string; baseUrl?: string }) =>
  * 会把 token 输入框挤成一条缝——所以这里用 .cline-key-row 覆盖成 wrap，
  * 并给 token/账号两个输入框各自的 flex 基准（见 pages.css.ts）。
  */
-const clineAcctFieldsHtml = (pid: string, idx: number, label?: string) =>
+/**
+ * Cline 账号的运行状态徽章：冷却（额度耗尽 / 限流 / 凭据失效 / 推理空转）与「已禁用」。
+ *
+ * 为什么要单独一个徽章而不是再接一段文字：`kst-` 只说明「这条 token 能不能换 accessToken」，
+ * 而用户真正要回答的是「这个账号现在能不能被用来转发」——一个 token 完全有效、但正在因为
+ * 免费额度耗尽被冷却 12 小时的账号，旧的账号行里看不出任何异常（2026-10-02 反馈）。
+ *
+ * 为什么初始渲染只画「已禁用」：启用开关是页面上的本地事实，不用等任何请求；而冷却状态来自
+ * KV 留档，只有点过「检测全部账号」才拿得到——拿不到就不画，绝不用猜测的绿/灰充数。
+ */
+const clineRunBadgeHtml = (pid: string, idx: number, enabled: boolean) =>
+  enabled
+    ? `<span class="bd bd-off" id="krun-${pid}-${idx}" style="display:none" title="该账号被冷却时在此显示原因与剩余时间"></span>`
+    : `<span class="bd bd-off" id="krun-${pid}-${idx}" title="该密钥已禁用，不参与转发；勾选左侧开关即可启用">已禁用</span>`
+
+const clineAcctFieldsHtml = (pid: string, idx: number, label?: string, enabled = true) =>
   `<span class="bd bd-off" id="kst-${escapePageHtml(pid)}-${idx}" title="点「测试」或「检测全部账号」后显示该 RefreshToken 是否仍可用">未检测</span>` +
+  clineRunBadgeHtml(escapePageHtml(pid), idx, enabled) +
   `<input type="text" class="cline-lbl" id="klbl-${escapePageHtml(pid)}-${idx}" value="${escapePageHtml(label || '')}" placeholder="账号（自动关联邮箱；关联不到可手填）" aria-label="账号名（仅显示用）" onblur="clineSaveLabel('${escapePageJsx(pid)}',${idx})">` +
   `<span class="mu" style="font-size:12px" id="kmsg-${escapePageHtml(pid)}-${idx}"></span>`
 
@@ -115,7 +131,7 @@ const keyRowHtml = (p: { id?: string }, k: { key: string; enabled: boolean; labe
   if (p.id !== 'cline') {
     return `<div class="fc mb-3 field-row" data-kidx="${ki}">${controls}</div>`
   }
-  return `<div class="fc mb-3 field-row cline-key-row" data-kidx="${ki}">${controls}${clineAcctFieldsHtml(p.id!, ki, k.label)}` +
+  return `<div class="fc mb-3 field-row cline-key-row" data-kidx="${ki}">${controls}${clineAcctFieldsHtml(p.id!, ki, k.label, k.enabled)}` +
     `<span class="trt" id="ktr-${pid}-${ki}" aria-live="polite"></span></div>`
 }
 
@@ -125,7 +141,7 @@ const keyRowHtml = (p: { id?: string }, k: { key: string; enabled: boolean; labe
  * 「行为没变」到底是没部署、没刷新，还是代码就是错的，只能靠来回猜（2026-10-06 已经为这个
  * 浪费过一轮）。用户只要比对刷新前后这一行是否变化，就能自证加载的是不是新脚本。
  */
-export const CLINE_UP_UI_VERSION = '2026-10-06-traffic'
+export const CLINE_UP_UI_VERSION = '2026-10-06-acct-state'
 
 /**
  * Cline「上游渠道与固定」区块（移植 cline-pass-switcher 的控制台能力）。
@@ -1382,9 +1398,11 @@ function tog(id) {
   if (d.classList.contains('open') && document.getElementById('wbp-acc-' + id)) oauthPoolStatus(id)
   // DeepSeek App：展开时自动加载 token 池
   if (d.classList.contains('open') && document.getElementById('ds-list-' + id)) deepseekTokenList(id)
-  // Cline：保存/一键授权后标记过「待检测」的账号，展开时自动跑一次（否则只留手动按钮）
-  if (d.classList.contains('open') && document.getElementById('cline-chk-' + id) && (window._clineStale || {})[id]) {
-    clineCheckAccounts(id, { silent: true })
+  // Cline：展开时**先读一次只读留档**（不打上游），让"额度耗尽被冷却"一眼可见；
+  // 保存/一键授权后标记过「待检测」的账号再多跑一次真实检测（那时需要拿新 token 关联账号）。
+  if (d.classList.contains('open') && document.getElementById('cline-chk-' + id)) {
+    if ((window._clineStale || {})[id]) clineCheckAccounts(id, { silent: true })
+    else clineLoadStates(id)
   }
 }
 
@@ -4060,6 +4078,51 @@ function clineUpstreamsBulk(id, mode) {
 }
 /* CLINE_UP_UI_END */
 
+/**
+ * 画一行账号的运行状态徽章。两个数据源共用（检测端点与只读留档端点），画法只有一处实现。
+ *
+ * 优先级：已禁用 > 冷却。禁用是页面上的本地事实，即使在冷却也先说禁用——那才是它不参与转发的原因。
+ * 颜色：额度耗尽/余额不足/凭据失效 = 红（这个号现在真的不可用）；限流/推理空转 = 琥珀（多为短时）。
+ */
+function clinePaintRunBadge(id, a) {
+  var rb = document.getElementById('krun-' + id + '-' + a.index)
+  if (!rb) return
+  var sl = a.stateLabel || ''
+  if (!a.enabled) {
+    rb.textContent = sl ? '已禁用 · ' + sl : '已禁用'
+    rb.className = 'bd bd-off'
+    rb.title = (sl ? (a.stateTitle || '') + ' ｜ ' : '') + '该密钥已禁用，不参与转发'
+    rb.style.display = ''
+  } else if (a.cooling && sl) {
+    rb.textContent = sl
+    var hard = a.stateKind === 'quota_empty' || a.stateKind === 'plan_exhausted' || a.stateKind === 'auth'
+    rb.className = 'bd ' + (hard ? 'bd-danger' : 'bd-warn')
+    rb.title = a.stateTitle || ''
+    rb.style.display = ''
+  } else {
+    rb.textContent = ''
+    rb.style.display = 'none'
+  }
+}
+
+/**
+ * 只读冷却/额度留档（不打上游）：展开 Cline 卡片时调用。
+ *
+ * 为什么不复用那个会逐个换 token 的按钮：它给每个 refreshToken 换一次 accessToken（有副作用的探测），
+ * 而「看一眼这个号是不是额度耗尽被冷却了」不该付这个代价，也不该等用户先想到去点它。
+ */
+function clineLoadStates(id) {
+  return fetch('/admin/api/providers/' + encodeURIComponent(id) + '/cline-account-states')
+    .then(function (r) { return r.json() })
+    .then(function (d) {
+      if (!d || !d.success) return false
+      var accs = (d.data && d.data.accounts) || []
+      accs.forEach(function (a) { clinePaintRunBadge(id, a) })
+      return true
+    })
+    .catch(function () { return false })
+}
+
 function clineCheckAccounts(id, opts) {
   const silent = !!(opts && opts.silent)
   const st = document.getElementById('cline-chk-' + id)
@@ -4089,8 +4152,11 @@ function clineCheckAccounts(id, opts) {
         if (m) {
           var src = a.labelSource === 'none' ? '未关联到账号，可手工填写账号名'
             : a.labelSource === 'auto' ? '已自动关联邮箱' : '手工填写的账号名'
-          m.textContent = (a.enabled ? '' : '（已禁用）') + src
+          m.textContent = src
         }
+        // 运行状态徽章：冷却（额度耗尽/限流/凭据失效）优先于"有效"——一个 token 有效但被冷却的
+        // 账号同样不能转发，而 kst- 徽章只会显示"有效"，看不出这件事。
+        clinePaintRunBadge(id, a)
         // 只在账号框为空时自动回填邮箱；用户手填的名字绝不被覆盖
         var lbl = document.getElementById('klbl-' + id + '-' + a.index)
         if (lbl && !lbl.value.trim() && a.label) lbl.value = a.label

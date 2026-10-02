@@ -30,6 +30,15 @@ import { cleanupOrphanToolCalls } from '../workbuddy-upstream'
 // 不再只进 CF 仪表盘。admin 亦 import 本模块，但 writeLog 只在运行期调用，无循环初始化问题
 // （与 src/trae/proxy.ts 同一既有口径）。
 import { writeLog } from '../admin'
+// 账号冷却状态的 KV 留档（面板据此显示「额度耗尽 / 限流 / 凭据失效」）。与 admin 之间没有循环
+// 初始化问题：account-state 只依赖 types 与 env.KV，运行期才用（与 writeLog 同一既有口径）。
+import {
+  classifyClineCooldownKind,
+  clearClineAccountState,
+  maskClineToken,
+  recordClineAccountState,
+} from './account-state'
+import type { ClineAccountStateKind } from './account-state'
 
 export const CLINE_PROVIDER_ID = 'cline'
 export const CLINE_API_BASE = 'https://api.cline.bot/api/v1'
@@ -362,6 +371,10 @@ interface Pool {
   current: Account | null
   /** refreshToken 轮换回调：上游换发新 refreshToken 时触发，用于持久化到 KV，避免下次 invalid_grant。 */
   onRotate?: (oldRt: string, newRt: string) => void
+  /** 提供商 id：冷却留档写 KV 时要按提供商分键（面板也按它查）。 */
+  providerId: string
+  /** 冷却留档需要 KV 绑定；未注入（如测试路径 `__cline_test__`）时只做内存冷却。 */
+  env?: Env
 }
 
 const pools = new Map<string, Pool>()
@@ -380,6 +393,7 @@ function getPool(providerId: string, refreshTokens: string[]): Pool {
       accounts: tokens.map((rt) => ({ refreshToken: rt, accessToken: null, expiry: 0, cooldownUntil: 0, modelCooldowns: new Map() })),
       accountIndex: 0,
       current: null,
+      providerId,
     }
     pools.set(providerId, pool)
   }
@@ -392,6 +406,8 @@ function poolFromProvider(provider: Provider, env?: Env): Pool {
   const pool = getPool(provider.id, tokens)
   // refreshToken 轮换时回写 KV，避免下次 invalid_grant（永久 key 更新持久）。
   if (env) pool.onRotate = (oldRt, newRt) => { void persistClineRotation(env, provider, oldRt, newRt) }
+  // env 每次都刷新：同一 isolate 先后用不同 env（测试常见）时不能沿用上一次的绑定
+  pool.env = env
   return pool
 }
 
@@ -435,11 +451,55 @@ function cooldownFromResponse(resp: Response, text: string, fallbackMs: number):
   return fallbackMs
 }
 
-/** 冷却一个账号（整体冷却）。 */
-function cooldownAccount(acc: Account, ms: number) {
+/** 冷却一个账号（整体冷却）。返回冷却截止时刻，供状态留档与面板显示共用同一个真值。 */
+function cooldownAccount(acc: Account, ms: number): number {
   acc.cooldownUntil = Date.now() + ms
   acc.accessToken = null
   acc.expiry = 0
+  return acc.cooldownUntil
+}
+
+/**
+ * 在冷却生效之后，把「哪个账号、为什么、到什么时候」写到 KV，供面板显示。
+ *
+ * 为什么统一走一个入口：「账号为什么现在不可用」在同一次请求里有多个触发点（401/402/429/
+ * 空响应/推理空转），各写各的必然分叉。落档口径只此一处，且**必须在内存冷却之后**——
+ * KV 写失败只影响面板可见性，绝不影响路由行为。
+ */
+async function recordCooldownState(
+  pool: Pool | undefined,
+  acc: Account | null,
+  until: number,
+  kind: ClineAccountStateKind,
+  model: string | null,
+  reason: string
+): Promise<void> {
+  if (!pool || !acc) return
+  const index = pool.accounts.indexOf(acc)
+  if (index < 0) return
+  await recordClineAccountState(pool.env, pool.providerId, {
+    index,
+    masked: maskClineToken(acc.refreshToken),
+    kind,
+    until,
+    at: Date.now(),
+    model,
+    reason,
+  })
+}
+
+/**
+ * 清除某账号的冷却留档——**只在网关确定要交付一个健康结果时调用**。
+ *
+ * 为什么不放在「HTTP 200」上：上游对免费档额度耗尽的一种形态就是 **200 + 零帧流**（网关恒定强制
+ * 流式，见 proxyClineFetchWithRetry 注释）。按 200 清档会让「刚判定的额度耗尽」当场被抹掉，
+ * 面板继续显示健康——正是要消灭的谎报。清除的判据只能是"这一轮真的产出了可用内容"。
+ */
+async function clearCooldownState(pool: Pool | undefined, acc: Account | null): Promise<void> {
+  if (!pool || !acc) return
+  const index = pool.accounts.indexOf(acc)
+  if (index < 0) return
+  await clearClineAccountState(pool.env, pool.providerId, index)
 }
 
 /**
@@ -483,12 +543,15 @@ async function getAccountToken(account: Account, pool?: Pool): Promise<string> {
   })
   if (!resp.ok) {
     account.cooldownUntil = now + CLINE_COOLDOWN_401_MS
+    // 刷新失败 = 这条凭据现在换不出 token：落档，「凭据失效」必须在面板上看得见（面板据此提示重新授权）
+    await recordCooldownState(pool, account, account.cooldownUntil, 'auth', null, `刷新 accessToken 失败：HTTP ${resp.status}`)
     throw new Error('refresh_failed')
   }
   const data = (await resp.json()) as { data?: { accessToken?: string; refreshToken?: string; expiresAt?: number | string } }
   const accessToken = data?.data?.accessToken
   if (!accessToken) {
     account.cooldownUntil = now + CLINE_COOLDOWN_401_MS
+    await recordCooldownState(pool, account, account.cooldownUntil, 'auth', null, '刷新接口未返回 accessToken')
     throw new Error('refresh_no_token')
   }
   account.accessToken = accessToken
@@ -585,7 +648,10 @@ async function clineFetch(
   // token 失效：标记当前账号冷却，强制重试（会用别的账号/刷新）
   if (resp.status === 401 && !retried) {
     // 探测/校验不罚号：诊断动作不该把账号拉进冷却（同「客户端断开不罚号」纪律）
-    if (!opts?.skipCooldown && pool.current) cooldownAccount(pool.current, CLINE_COOLDOWN_401_MS)
+    if (!opts?.skipCooldown && pool.current) {
+      const until = cooldownAccount(pool.current, CLINE_COOLDOWN_401_MS)
+      await recordCooldownState(pool, pool.current, until, 'auth', null, '上游 HTTP 401（凭据失效，需重新授权）')
+    }
     return clineFetch(pool, path, bodyObj, sessionId, true, clientSignal, opts)
   }
   return resp
@@ -620,11 +686,19 @@ async function clineFetchWithRetry(
   // 冷却当前账号：优先模型级（该账号还能跑其它模型），无模型上下文则整体冷却。
   // 客户端已断开时不冷却：Esc 中断 / 客户端重连不是模型的失败，冷却会把用户点名的
   // 模型拉黑，后续请求被静默赶到回退链上（移植 luawei1/cline2api `4265b29`）。
-  const applyCooldown = (ms: number) => {
+  // 每条冷却同时落 KV 状态留档（面板显示「额度耗尽 / 限流 / 凭据失效」的唯一来源）。
+  const applyCooldown = async (ms: number, kind: ClineAccountStateKind, reason: string) => {
     if (clientSignal?.aborted) return
     if (!pool.current) return
-    if (model) pool.current.modelCooldowns.set(model, Date.now() + Math.max(ms, 60 * 1000))
-    else cooldownAccount(pool.current, ms)
+    const acc = pool.current
+    if (model) {
+      const until = Date.now() + Math.max(ms, 60 * 1000)
+      acc.modelCooldowns.set(model, until)
+      await recordCooldownState(pool, acc, until, kind, model, reason)
+    } else {
+      const until = cooldownAccount(acc, ms)
+      await recordCooldownState(pool, acc, until, kind, null, reason)
+    }
   }
   let transportAttempts = 0
   for (let attempt = 0; attempt <= maxRetries; attempt++) {
@@ -651,15 +725,21 @@ async function clineFetchWithRetry(
     // 全账号都不可用时立刻回 402，由调用方沿免费链换模型（移植 luawei1 169fd9d 语义）。
     if (resp.status === 402) {
       const text = await resp.clone().text().catch(() => '')
-      applyCooldown(cooldownFromResponse(resp, text, CLINE_COOLDOWN_PLAN_MS))
+      await applyCooldown(cooldownFromResponse(resp, text, CLINE_COOLDOWN_PLAN_MS), 'plan_exhausted', text)
       if (!hasAvailableAccount(pool, model)) return planExhaustedResponse(text)
       await sleep(500 + Math.floor(Math.random() * 500))
       continue
     }
-    // 明确限流：冷却 + 切号重试
+    // 明确限流：冷却 + 切号重试。同为 429，**免费额度耗尽**与普通限流必须分开归类：
+    // 官方 429 文案固定为 `Daily free limit reached on model X. Try again in 23h 59m`，
+    // 面板据此显示「额度耗尽」并带上上游给的重置倒计时（官方客户端就是这么解析的）。
     if (resp.status === 429) {
       const text = await resp.clone().text().catch(() => '')
-      applyCooldown(cooldownFromResponse(resp, text, CLINE_COOLDOWN_LIMIT_MS))
+      await applyCooldown(
+        cooldownFromResponse(resp, text, CLINE_COOLDOWN_LIMIT_MS),
+        classifyClineCooldownKind(429, text),
+        text
+      )
       const short = 500 + Math.floor(Math.random() * 500)
       await sleep(short)
       continue
@@ -669,7 +749,7 @@ async function clineFetchWithRetry(
         const text = await resp.clone().text()
         if (!text.includes('empty response content')) return resp
         // 免费额度耗尽空响应：冷却 + 切号
-        applyCooldown(cooldownFromResponse(resp, text, CLINE_COOLDOWN_EMPTY_MS))
+        await applyCooldown(cooldownFromResponse(resp, text, CLINE_COOLDOWN_EMPTY_MS), 'quota_empty', text)
         await sleep(500 + Math.random() * 500)
         continue
       }
@@ -682,7 +762,7 @@ async function clineFetchWithRetry(
     const errText = await resp.clone().text().catch(() => '')
     if (errText.includes('empty response content')) {
       // 5xx + 空响应：额度耗尽，冷却 + 切号
-      applyCooldown(cooldownFromResponse(resp, errText, CLINE_COOLDOWN_EMPTY_MS))
+      await applyCooldown(cooldownFromResponse(resp, errText, CLINE_COOLDOWN_EMPTY_MS), 'quota_empty', errText)
       await sleep(500 + Math.random() * 500)
       continue
     }
@@ -1055,7 +1135,8 @@ interface StreamAttemptOutcome {
 /** @internal 流式尝试的探测 + 后台续流（导出供测试验证流式语义）。 */
 export async function pumpStreamAttempt(
   resp: Response,
-  onRunaway?: () => void,
+  /** 退化回调：允许返回 Promise（冷却同时要落 KV 状态留档），由本函数 await 后再继续。 */
+  onRunaway?: () => void | Promise<void>,
   /** 真实流量留档上下文：给了才会把"上游实际走了哪个渠道"落库（面板的流量视图）。 */
   traffic?: ClineTrafficContext
 ): Promise<StreamAttemptOutcome> {  const reader = resp.body!.getReader()
@@ -1189,7 +1270,7 @@ export async function pumpStreamAttempt(
     // 只改写转发帧；facts/probeDeltas/ring 里留的是原始 delta，退化判定不受影响。
     if (isReasoning && obj) patchReasoningDeltaForUI(obj)
     if (facts.finishReason && state.suppress && state.contentChars === 0 && !state.hasToolCalls) {
-      onRunaway?.()
+      await onRunaway?.()
       const errMsg = { error: { message: 'Cline 推理退化空转：全程未产出正文，已抑制垃圾 reasoning', type: 'upstream_runaway' } }
       await w.write(encoder.encode('data: ' + JSON.stringify(errMsg) + '\n\n'))
     }
@@ -1438,13 +1519,30 @@ export async function pumpStreamAttempt(
   return flushHealthy(buf)
 }
 
-/** 模型级冷却（与 clineFetchWithRetry 同语义：有 model 上下文时只冷却该账号的该模型）。 */
-function applyModelCooldown(pool: Pool, model: string, ms: number, clientSignal?: AbortSignal) {
+/**
+ * 模型级冷却（与 clineFetchWithRetry 同语义：有 model 上下文时只冷却该账号的该模型）。
+ * 流式路径的拦截出口（退化/空流）也经此落 KV 状态，面板才能看到「这个号为什么被换掉」。
+ */
+async function applyModelCooldown(
+  pool: Pool,
+  model: string,
+  ms: number,
+  kind: ClineAccountStateKind,
+  reason: string,
+  clientSignal?: AbortSignal
+) {
   // 客户端已断开不是模型故障（移植 4265b29）：不冷却，否则单账号池下用户配置的模型被拉黑。
   if (clientSignal?.aborted) return
   if (!pool.current) return
-  if (model) pool.current.modelCooldowns.set(model, Date.now() + Math.max(ms, 60 * 1000))
-  else cooldownAccount(pool.current, ms)
+  const acc = pool.current
+  if (model) {
+    const until = Date.now() + Math.max(ms, 60 * 1000)
+    acc.modelCooldowns.set(model, until)
+    await recordCooldownState(pool, acc, until, kind, model, reason)
+  } else {
+    const until = cooldownAccount(acc, ms)
+    await recordCooldownState(pool, acc, until, kind, null, reason)
+  }
 }
 
 /**
@@ -1542,14 +1640,26 @@ async function proxyStreamChat(
     }
     const outcome = await pumpStreamAttempt(
       resp,
-      () => applyModelCooldown(pool, model, CLINE_COOLDOWN_RUNAWAY_MS, clientSignal),
+      () => applyModelCooldown(pool, model, CLINE_COOLDOWN_RUNAWAY_MS, 'runaway', '推理退化空转：全程未产出正文', clientSignal),
       traffic
     )
-    if (outcome.kind === 'healthy') return outcome.response!
+    if (outcome.kind === 'healthy') {
+      // 真的产出了可用流 = 这个账号此刻确实能用，清掉它的冷却留档（面板不再挂着过期结论）
+      await clearCooldownState(pool, pool.current)
+      return outcome.response!
+    }
     // 客户端已断开：不再冷却、不再重试，直接放弃本轮（上游白烧的代价已止住）
     if (clientSignal?.aborted) throw clientAbortedError()
     const cooldownReqMs = outcome.kind === 'degenerate' ? CLINE_COOLDOWN_RUNAWAY_MS : CLINE_COOLDOWN_EMPTY_MS
-    applyModelCooldown(pool, model, cooldownReqMs, clientSignal)
+    await applyModelCooldown(
+      pool,
+      model,
+      cooldownReqMs,
+      // degenerate = 模型输出退化（空转/噪声），empty = 上游零帧或截断，后者是免费额度耗尽的典型形态
+      outcome.kind === 'degenerate' ? 'runaway' : 'quota_empty',
+      `流式尝试被拦截：${outcome.kind}:${outcome.detail || 'unknown'}`,
+      clientSignal
+    )
     // 逐尝试归因日志：三轮全失败时客户端只拿到三合一的 502 文案，分辨不了中了哪一种
     // （退化 / 零帧 / 截断无 finish / 探测期读错误）。detail 是 pumpStreamAttempt 拦截出口
     // 唯一给出的定性字段；stats 计数（尤其 frames=0 与 sawFinish）用于区分「上游空响应」
@@ -1777,10 +1887,18 @@ async function proxyNonStreamChat(
           502,
         )
       }
-      if (agg.content) return jsonResponse(chatCompletionFromAgg(agg), 200)
+      if (agg.content) {
+        // 非流式路径：真拿到正文才算这个账号可用，清掉冷却留档（200 但无正文不算）
+        await clearCooldownState(pool, pool.current)
+        return jsonResponse(chatCompletionFromAgg(agg), 200)
+      }
       // 推理空转被截断（length + 无正文/无工具调用）：预算烧在 reasoning 上未产出 → 冷却切号重试
       if (isRunawayReasoningCutoff(agg.content, agg.toolCalls, agg.finishReason)) {
-        if (pool.current) cooldownAccount(pool.current, CLINE_COOLDOWN_RUNAWAY_MS)
+        if (pool.current) {
+          const until = cooldownAccount(pool.current, CLINE_COOLDOWN_RUNAWAY_MS)
+          // model 传 null：这是**账号级**冷却，留档里写模型会让面板把「整个账号被禁入」误读成「只有该模型不可用」
+          await recordCooldownState(pool, pool.current, until, 'runaway', null, '推理空转被 length 截断，未产出正文')
+        }
         await sleep(500 + Math.random() * 500)
         continue
       }
@@ -1788,7 +1906,11 @@ async function proxyNonStreamChat(
       if (agg.finishReason) break
       // 客户端已断开：放弃本轮且不冷却账号（移植 4265b29）
       if (clientSignal?.aborted) throw clientAbortedError()
-      if (pool.current) cooldownAccount(pool.current, CLINE_COOLDOWN_EMPTY_MS)
+      if (pool.current) {
+        // 无 finish_reason 且无正文 = 上游零帧/空响应，免费额度耗尽的典型形态（账号级冷却）
+        const until = cooldownAccount(pool.current, CLINE_COOLDOWN_EMPTY_MS)
+        await recordCooldownState(pool, pool.current, until, 'quota_empty', null, '上游零帧空响应（免费额度可能已耗尽）')
+      }
       await sleep(500 + Math.random() * 500)
     }
     if (last && last.content === '' && last.reasoning) last.content = last.reasoning
@@ -2772,12 +2894,16 @@ export async function healthCheckClineAll(env: Env): Promise<ClineHealthSummary>
       if (enabled.length === 0) continue
       const pool = getPool(p.id, enabled.map((k) => k.key))
       pool.onRotate = (oldRt, newRt) => { void persistClineRotation(env, p, oldRt, newRt) }
+      pool.env = env
       for (const acc of pool.accounts) {
         accounts++
         acc.cooldownUntil = 0 // 探活忽略既有冷却，尝试复活
         try {
           await getAccountToken(acc, pool)
           ok++
+          // 复活成功即清掉冷却留档：否则面板会一直显示一个已经被证明不成立的结论
+          const idx = pool.accounts.indexOf(acc)
+          if (idx >= 0) await clearClineAccountState(env, p.id, idx)
         } catch {
           failed++ // getAccountToken 失败时已标记冷却
         }
