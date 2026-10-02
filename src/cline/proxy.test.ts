@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
-import { parseCooldownMs, fetchClineModels, isRunawayReasoningCutoff, isDegenerateReasoningDeltas, isWhitespaceOnlyReasoningDelta, normalizeReasoningDeltaForUI, pumpStreamAttempt, sanitizeClineMessages, isFreeClineModel, clineModelFallbackChain, buildUpstreamBody, clineMaxOutputLimit, clineMaxTokensClamp, proxyClineChatRequest, __resetClineCatalogCacheForTests, CLINE_MAX_TOKENS, CLINE_FREE_WHITELIST, CLINE_CHAT_CONNECT_TIMEOUT_MS, CLINE_MAX_TRANSPORT_ATTEMPTS, CLINE_PROBE_MAX_MS, CLINE_KEEPALIVE_MS, DEFAULT_MODEL, summarizeClineUpstreamError } from './proxy'
+import { parseCooldownMs, fetchClineModels, isRunawayReasoningCutoff, isDegenerateReasoningDeltas, isWhitespaceOnlyReasoningDelta, normalizeReasoningDeltaForUI, pumpStreamAttempt, sanitizeClineMessages, isFreeClineModel, buildUpstreamBody, clineMaxOutputLimit, clineMaxTokensClamp, proxyClineChatRequest, __resetClineCatalogCacheForTests, CLINE_MAX_TOKENS, CLINE_FREE_WHITELIST, CLINE_CHAT_CONNECT_TIMEOUT_MS, CLINE_MAX_TRANSPORT_ATTEMPTS, CLINE_PROBE_MAX_MS, CLINE_KEEPALIVE_MS, DEFAULT_MODEL } from './proxy'
 import type { Provider } from '../types'
 
 /** 读取一个 Response 的完整文本（用于流式结果断言）。 */
@@ -646,7 +646,7 @@ describe('buildUpstreamBody reasoning_effort=none 不下发（移植 cline2api p
 
 // 输出预算的模型级硬上限（2026-10-05，移植 luawei1/cline2api `3f72255`）：
 // Cline 官方接口不带 maxTokens 元数据，客户端默认的 128000 会原样透传，超过模型硬上限时
-// 上游 400，而 400 属于「原样透传、不降级」分支（clineModelFallbackChain 注释）——
+// 上游 400，而 400 属于「原样透传、不换模型」分支（proxyClineChatRequest 的「只服务点名模型」注释）——
 // 用户直接吃硬失败，且日志里看不出是预算超限。上游 A/B：128000 必现 400，65536 全成功。
 describe('max_tokens 模型级硬上限封顶（移植 3f72255）', () => {
   const freeSet = new Set([DEFAULT_MODEL])
@@ -700,51 +700,14 @@ describe('max_tokens 模型级硬上限封顶（移植 3f72255）', () => {
   })
 })
 
-describe('clineModelFallbackChain（移植 169fd9d）', () => {
-  it('点名模型优先，其后是默认免费档与目录免费模型，付费档不进链，且去重', () => {
-    const chain = clineModelFallbackChain(PAID_MODEL, [
-      { id: DEFAULT_MODEL, cost: 'free' },
-      { id: 'stealth/space-bunny-alpha', cost: 'free' },
-      { id: 'cline-pass/glm-5.3', cost: 'pass' },
-    ])
-    expect(chain[0]).toBe(PAID_MODEL)
-    expect(chain).toContain(DEFAULT_MODEL)
-    expect(chain).toContain('stealth/space-bunny-alpha')
-    expect(chain).not.toContain('cline-pass/glm-5.3')
-    expect(new Set(chain).size).toBe(chain.length)
-  })
-
-  it('点名模型本身是免费档时不产生重复项', () => {
-    const chain = clineModelFallbackChain(DEFAULT_MODEL, [{ id: DEFAULT_MODEL, cost: 'free' }])
-    expect(chain.filter((m) => m === DEFAULT_MODEL)).toHaveLength(1)
-  })
-})
-
-describe('402 余额耗尽与免费链降级', () => {
-  it('402 计费档模型 → 沿免费链换模型并返回成功（移植 169fd9d）', async () => {
-    const { bodies } = installFetch((body) =>
-      body.model === PAID_MODEL
-        ? jsonResp({ error: { code: 'insufficient_credits', message: 'Insufficient balance. Your Cline Credits balance is $0.01' } }, 402)
-        : sseOkResp(),
+describe('只服务点名模型：402/429/5xx/400 一律原样报错，不换模型', () => {
+  // 用户决定（2026-10-02）：**不做任何模型级自动替换**。曾经的免费链降级（402/429 → 换免费
+  // 模型，移植 169fd9d）与 transport 换候选（456d6ce）已退役；本 describe 是回归保护——
+  // 任何一条自动换模型路径复活都会红（断言请求体里只出现点名的那个模型）。
+  it('402 计费档模型 → 原样 402 upstream_plan_exhausted，请求体只出现点名模型', async () => {
+    const { bodies } = installFetch(() =>
+      jsonResp({ error: { code: 'insufficient_credits', message: 'Insufficient balance. Your Cline Credits balance is $0.01' } }, 402),
     )
-    const resp = await proxyClineChatRequest(
-      undefined,
-      clineProvider([REFRESH_TOKEN]),
-      { model: PAID_MODEL, messages: [{ role: 'user', content: 'hi' }] },
-      { stream: false },
-    )
-    expect(resp.status).toBe(200)
-    // 第一次打计费档，第二次换成免费档
-    expect(bodies.map((b) => b.model)).toEqual([PAID_MODEL, DEFAULT_MODEL])
-    // 计费档带 max_tokens，免费档被剥离
-    expect(bodies[0].max_tokens).toBe(CLINE_MAX_TOKENS)
-    expect(bodies[1].max_tokens).toBeUndefined()
-    const data = (await resp.json()) as { choices: Array<{ message: { content: string } }> }
-    expect(data.choices[0].message.content).toBe('hi')
-  })
-
-  it('整条链都 402 → 明确 402 upstream_plan_exhausted（不再静默透传上游原文）', async () => {
-    installFetch(() => jsonResp({ error: { code: 'insufficient_credits', message: 'Insufficient balance' } }, 402))
     const resp = await proxyClineChatRequest(
       undefined,
       clineProvider([REFRESH_TOKEN]),
@@ -755,9 +718,52 @@ describe('402 余额耗尽与免费链降级', () => {
     const data = (await resp.json()) as { error: { type: string; message: string } }
     expect(data.error.type).toBe('upstream_plan_exhausted')
     expect(data.error.message).toContain('insufficient_credits')
+    // 关键：不再落到免费档
+    expect(bodies.map((b) => b.model)).toEqual([PAID_MODEL])
   })
 
-  it('5xx 不触发模型降级，原样透传（169fd9d 语义）', async () => {
+  it('429 原样透传，不换模型', async () => {
+    const { bodies } = installFetch(() => jsonResp({ error: 'rate limited upstream' }, 429))
+    const resp = await proxyClineChatRequest(
+      undefined,
+      clineProvider([REFRESH_TOKEN]),
+      { model: PAID_MODEL, messages: [{ role: 'user', content: 'hi' }] },
+      { stream: false },
+    )
+    expect(resp.status).toBe(429)
+    expect(new Set(bodies.map((b) => b.model))).toEqual(new Set([PAID_MODEL]))
+    // 429 会按退避重试多次（3×500~1000ms），默认 5s 超时不够
+  }, 20000)
+
+  it('点名模型在所有账号上冷却中 → 502 upstream_unavailable，且不再打上游', async () => {
+    const { bodies } = installFetch(() =>
+      jsonResp({ error: { code: 'insufficient_credits', message: 'Insufficient balance' } }, 402),
+    )
+    const provider = clineProvider([REFRESH_TOKEN])
+    // 一次 402 会把「账号 × 该模型」冷却 12h（CLINE_COOLDOWN_PLAN_MS）
+    const first = await proxyClineChatRequest(
+      undefined,
+      provider,
+      { model: PAID_MODEL, messages: [{ role: 'user', content: 'hi' }] },
+      { stream: false },
+    )
+    expect(first.status).toBe(402)
+    const callsAfterFirst = bodies.length
+    const second = await proxyClineChatRequest(
+      undefined,
+      provider,
+      { model: PAID_MODEL, messages: [{ role: 'user', content: 'hi' }] },
+      { stream: false },
+    )
+    expect(second.status).toBe(502)
+    const data = (await second.json()) as { error: { type: string; message: string } }
+    expect(data.error.type).toBe('upstream_unavailable')
+    expect(data.error.message).toContain(PAID_MODEL)
+    // 冷却中直接报错，不再空转打上游（此前会换下一个模型继续打）
+    expect(bodies.length).toBe(callsAfterFirst)
+  })
+
+  it('5xx 不触发模型降级，原样透传', async () => {
     const { bodies } = installFetch(() => jsonResp({ error: 'boom' }, 500))
     const resp = await proxyClineChatRequest(
       undefined,
@@ -796,10 +802,11 @@ describe('402 余额耗尽与免费链降级', () => {
   })
 })
 
-// 降级链的中间失败必须留痕（移植 luawei1/cline2api issue #32 附带发现）：
-// 否则客户端只看到链尾模型的错误，首选模型被掩盖的真实原因在日志里完全看不见。
-describe('降级链中间失败日志（issue #32 附带发现）', () => {
-  /** 抓 console.warn/log 输出，等待微任务队列排空（摘录是 clone().text().then 里异步打的）。 */
+// Cline 流式拦截的归因日志（[cline-attempt]）：三轮全失败时客户端只拿到三合一 502 文案，
+// 分辨不了退化 / 零帧 / 截断无 finish / 探测期读错误，线上排查只能靠猜。
+// 归因同时落 console 与 KV 系统日志（管理面板「系统日志」可搜 `[cline-attempt]`）。
+describe('Cline 流式拦截归因日志（[cline-attempt]）', () => {
+  /** 抓 console.warn/log 输出，等待微任务队列排空（部分日志在异步回调里打）。 */
   async function captureLogs(fn: () => Promise<void>): Promise<string[]> {
     const out: string[] = []
     const spyWarn = vi.spyOn(console, 'warn').mockImplementation((...a: unknown[]) => { out.push(a.map(String).join(' ')) })
@@ -813,91 +820,6 @@ describe('降级链中间失败日志（issue #32 附带发现）', () => {
     }
     return out
   }
-
-  it('首选模型 402 时打出该模型名 + 状态码 + 上游错误摘录', async () => {
-    const logs = await captureLogs(async () => {
-      installFetch((body) =>
-        body.model === PAID_MODEL
-          ? jsonResp({ error: { code: 'insufficient_credits', message: 'Insufficient balance. balance is $0.01' } }, 402)
-          : sseOkResp(),
-      )
-      const resp = await proxyClineChatRequest(
-        undefined,
-        clineProvider([REFRESH_TOKEN]),
-        { model: PAID_MODEL, messages: [{ role: 'user', content: 'hi' }] },
-        { stream: false },
-      )
-      await resp.text()
-    })
-    const line = logs.find((l) => l.includes(String(PAID_MODEL)) && l.includes('402'))
-    expect(line).toBeDefined()
-    // 真实失败原因（Insufficient balance）必须在日志里，不能只剩链尾模型的错误
-    expect(line).toContain('Insufficient balance')
-  })
-
-  it('429 同样留痕', async () => {
-    const logs = await captureLogs(async () => {
-      installFetch((body) => (body.model === PAID_MODEL ? jsonResp({ error: 'rate limited upstream' }, 429) : sseOkResp()))
-      const resp = await proxyClineChatRequest(
-        undefined,
-        clineProvider([REFRESH_TOKEN]),
-        { model: PAID_MODEL, messages: [{ role: 'user', content: 'hi' }] },
-        { stream: false },
-      )
-      await resp.text()
-    })
-    expect(logs.some((l) => l.includes(String(PAID_MODEL)) && l.includes('429'))).toBe(true)
-    expect(logs.some((l) => l.includes('rate limited upstream'))).toBe(true)
-    // 429 会置账号冷却并按退避重试多次（3×500~1000ms），默认 5s 超时不够
-  }, 20000)
-
-  it('读摘录不消费响应体：客户端仍能拿到原错误 body（clone 而非直接读）', async () => {
-    await captureLogs(async () => {
-      installFetch((body) =>
-        body.model === PAID_MODEL ? jsonResp({ error: { code: 'insufficient_credits', message: 'Insufficient balance' } }, 402) : sseOkResp(),
-      )
-      const resp = await proxyClineChatRequest(
-        undefined,
-        clineProvider([REFRESH_TOKEN]),
-        { model: PAID_MODEL, messages: [{ role: 'user', content: 'hi' }] },
-        { stream: false },
-      )
-      expect(resp.status).toBe(200)
-      const data = (await resp.json()) as { choices: Array<{ message: { content: string } }> }
-      expect(data.choices[0].message.content).toBe('hi')
-    })
-  })
-
-  it('链尾候选自身 402 时不说"served via"（原措辞会把失败记成成功）', async () => {
-    const logs = await captureLogs(async () => {
-      // 只让首选模型 402，链尾走成功——但点名模型与兜底不同，需构造链尾失败：
-      // 让所有模型都402，此时最后一条走 exhausted 分支。
-      installFetch(() => jsonResp({ error: { code: 'insufficient_credits', message: 'Insufficient balance' } }, 402))
-      const resp = await proxyClineChatRequest(
-        undefined,
-        clineProvider([REFRESH_TOKEN]),
-        { model: PAID_MODEL, messages: [{ role: 'user', content: 'hi' }] },
-        { stream: false },
-      )
-      expect(resp.status).toBe(402)
-      await resp.text()
-    })
-    expect(logs.some((l) => l.includes('served via') && l.includes('402'))).toBe(false)
-  })
-
-  it('成功降级仍然说 served via（回归保护：不能把成功日志也一起去掉）', async () => {
-    const logs = await captureLogs(async () => {
-      installFetch((body) => (body.model === PAID_MODEL ? jsonResp({ error: 'nope' }, 402) : sseOkResp()))
-      const resp = await proxyClineChatRequest(
-        undefined,
-        clineProvider([REFRESH_TOKEN]),
-        { model: PAID_MODEL, messages: [{ role: 'user', content: 'hi' }] },
-        { stream: false },
-      )
-      await resp.text()
-    })
-    expect(logs.some((l) => l.includes('served via') && l.includes(String(DEFAULT_MODEL)))).toBe(true)
-  })
 
   // 流式三轮拦截的归因（2026-10-02）：客户端此前只拿到三合一 502 文案，无法分辨
   // 退化 / 零帧 / 截断无 finish / 探测期读错误，线上排查只能靠猜。
@@ -1009,29 +931,6 @@ describe('降级链中间失败日志（issue #32 附带发现）', () => {
     expect(calls).toEqual([CANDIDATE_1, CANDIDATE_1, CANDIDATE_1])
     expect(calls).not.toContain(CANDIDATE_2)
   }, 30000)
-})
-
-describe('summarizeClineUpstreamError 摘录解析', () => {
-  it('取 {error:{message}}', () => {
-    expect(summarizeClineUpstreamError('{"error":{"message":"Insufficient balance"}}')).toBe('Insufficient balance')
-  })
-  it('取 {error:"字符串"}', () => {
-    expect(summarizeClineUpstreamError('{"error":"boom"}')).toBe('boom')
-  })
-  it('取 {message} 与 {detail}', () => {
-    expect(summarizeClineUpstreamError('{"message":"rate limited"}')).toBe('rate limited')
-    expect(summarizeClineUpstreamError('{"detail":"try later"}')).toBe('try later')
-  })
-  it('非 JSON 退回首行纯文本并压空白', () => {
-    expect(summarizeClineUpstreamError('Too Many\n  Requests')).toBe('Too Many Requests')
-  })
-  it('空 body → 明确标记，不打印空白', () => {
-    expect(summarizeClineUpstreamError('')).toBe('(空 body)')
-    expect(summarizeClineUpstreamError('   ')).toBe('(空 body)')
-  })
-  it('超长截断到 200 字符', () => {
-    expect(summarizeClineUpstreamError('x'.repeat(500))).toHaveLength(200)
-  })
 })
 
 // opts.stream 语义回归（2026-09-27）：wantStream 曾写成 `opts ? !!opts.stream : body.stream`，
@@ -1364,7 +1263,9 @@ describe('传输层故障定责（503 upstream_unreachable + 30s 建连超时）
     expect(chatCalls).toBe(2)
   })
 
-  it('回退链遇 transport 故障自动切换至下一个候选模型', async () => {
+  // 用户决定（2026-10-02）：transport 故障**不再**切下一个候选模型（456d6ce 的容灾已退役）。
+  // 只服务点名的模型：撞满内部 transport 重试就报 503，由客户端决定重试或自己换模型。
+  it('transport 故障撞满内部重试 → 503 upstream_unreachable，绝不换模型', async () => {
     __resetClineCatalogCacheForTests()
     const CANDIDATE_1 = 'cline-free/deepseek-v4.1-flash'
     const CANDIDATE_2 = 'cline-free/gemini-3.8-flash'
@@ -1393,10 +1294,12 @@ describe('传输层故障定责（503 upstream_unreachable + 30s 建连超时）
       { model: CANDIDATE_1, messages: [{ role: 'user', content: 'hi' }] },
       { stream: true },
     )
-    expect(resp.status).toBe(200)
-    await readAll(resp)
-    // 第 1 个模型撞满 2 次 transport，回退链自动尝试第 2 个模型成功
-    expect(calls).toEqual([CANDIDATE_1, CANDIDATE_1, CANDIDATE_2])
+    expect(resp.status).toBe(503)
+    const data = (await resp.json()) as { error: { code: string } }
+    expect(data.error.code).toBe('upstream_unreachable')
+    // 点名模型撞满 2 次 transport 后直接报错，候选 2 一次都没被调用
+    expect(calls).toEqual([CANDIDATE_1, CANDIDATE_1])
+    expect(calls).not.toContain(CANDIDATE_2)
   })
 })
 

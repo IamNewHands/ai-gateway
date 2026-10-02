@@ -69,9 +69,6 @@ export const CLINE_FREE_WHITELIST: readonly string[] = [
   'cline-free/solar-pro4',
 ]
 
-/** 免费链末位兜底（对齐上游 freeModelLastResort）。 */
-export const CLINE_FREE_LAST_RESORT = 'cline-free/deepseek-v4.1-flash'
-
 export function isClineProvider(providerId: string): boolean {
   return providerId === CLINE_PROVIDER_ID
 }
@@ -194,8 +191,8 @@ export const CLINE_PROBE_MAX_MS = 10000
  *
  * 移植 luawei1/cline2api `3f72255`：Cline 官方的 recommended-models 接口**不带**
  * context/maxTokens 元数据，客户端（大量 OpenAI 兼容 SDK 默认 `max_tokens: 128000`）的值
- * 会原样透传，超过模型硬上限时上游直接 400，而 400 落在「参数错误原样透传、不降级」分支
- * （见 clineModelFallbackChain 注释）——用户直接吃硬失败，且日志看不出是预算超限。
+ * 会原样透传，超过模型硬上限时上游直接 400，而 400 落在「参数错误原样透传」分支
+ * （见 proxyClineChatRequest 的「只服务点名模型」注释）——用户直接吃硬失败，且日志看不出是预算超限。
  * 上游 A/B 实测：gemini-3.8-flash 上 128000 必现 400，65536 全部成功。
  *
  * 键为**基名**（剥掉 `cline-free/` `cline-pass/` `google/` 等路由前缀后匹配）。
@@ -1357,28 +1354,6 @@ function jsonResponse(obj: unknown, status: number): Response {
 }
 
 /**
- * 把上游错误 body 压成一行可读摘录，供降级链日志用。
- *
- * 上游错误体形状不统一（有的是 `{"error":{"message":...}}`，有的是 `{"message":...}`，
- * 有的是纯文本 429 提示），全量打进日志既吵又可能带凭据，所以只取 message/error
- * 字段并截断到 200 字符；解析不出来就退回首行纯文本。
- */
-export function summarizeClineUpstreamError(text: string): string {
-  const t = (text || '').trim()
-  if (t === '') return '(空 body)'
-  try {
-    const obj = JSON.parse(t) as Record<string, unknown>
-    const err = obj?.error
-    let msg: string | undefined
-    if (typeof err === 'string') msg = err
-    else if (err && typeof err === 'object') msg = String((err as Record<string, unknown>).message ?? '')
-    if (!msg) msg = String(obj?.message ?? obj?.detail ?? '')
-    if (msg) return msg.replace(/\s+/g, ' ').slice(0, 200)
-  } catch { /* 非 JSON：走下面的纯文本分支 */ }
-  return t.replace(/\s+/g, ' ').slice(0, 200)
-}
-
-/**
  * 402 余额耗尽、且该模型在全部账号上都不可用时的响应。
  *
  * 状态码保留 402（上层与客户端能按「余额」语义识别、可与 429 区分），
@@ -1600,92 +1575,52 @@ export async function proxyClineChatRequest(
   // 解析得到 0 个 chunk，报 "Stream ended without finish_reason"（TRANSPORT）并白重试 5 次。
   const wantStream = opts?.stream ?? forwardBody.stream === true
   const sessionId = 'sess_' + Date.now()
-  const requested = String(forwardBody.model || DEFAULT_MODEL)
-  const { models, freeSet } = await getClineCatalog()
-  const chain = clineModelFallbackChain(requested, models)
-  let last: Response | null = null
-  let lastTransportErr: ClineTransportError | null = null
-
-  for (let i = 0; i < chain.length; i++) {
-    const model = chain[i]
-    const isLast = i === chain.length - 1
-    // 该模型在所有账号上都冷却中（含 402 余额耗尽的模型级冷却）→ 直接换下一个模型，不打上游
-    if (!hasAvailableAccount(pool, model)) continue
-    // 上游恒定强制流式（item4）：免费通道非流式返回 500 "empty response content"，
-    // 统一以流式取数，客户端要非流式时再聚合成 chat.completion。
-    const body = buildUpstreamBody({ ...forwardBody, model }, true, sessionId, freeSet)
-    try {
-      const resp = wantStream
-        ? await proxyStreamChat(pool, body, sessionId, opts?.signal, _env as Env | undefined)
-        : await proxyNonStreamChat(pool, body, sessionId, opts?.signal)
-      // 402/429 = 「该模型在当前账号池上不可用」→ 沿免费链换模型（移植 169fd9d）。
-      // 其余错误（400/403/5xx）原样透传：不把参数错误伪装成「换个模型就好了」。
-      if ((resp.status === 402 || resp.status === 429) && !isLast) {
-        // 中间失败必须留痕（移植 luawei1/cline2api issue #32 附带发现）：不记的话，
-        // 客户端最终只看到链上**最后一个**模型的错误，首选模型的真实失败原因被完全掩盖
-        // （实测：链落到 muse-spark-1.3-contributor 返回 403 region 限制，而真正的首选
-        // 模型早已 402下架，日志里一片空白）。clone 读一份 body 取摘录，last 仍原样返回。
-        void resp.clone().text().then((t) => {
-          console.warn(`[cline-fallback] model ${model} → ${resp.status}，换下一个候选（已试 ${i + 1}/${chain.length}）：${summarizeClineUpstreamError(t)}`)
-        }).catch(() => {})
-        last = resp
-        continue
-      }
-      // 明确**不**沿链换模型（用户决定，2026-10-02）：只服务点名的模型。它三轮产不出可用流
-      // 就直接把 502 upstream_runaway 交给客户端，由客户端决定重试或换模型——网关不偷偷换模型。
-      // 回归保护见 proxy.test.ts「流式三轮全拦截 → 只报错，绝不把请求转给链上其它候选模型」。
-      // 「served via」只在真的把内容交给客户端时才说。链尾候选自身 402/429 走到这里时
-      // resp 是错误响应，原措辞会把失败记成成功——按错误码分叉。
-      if (model !== requested) {
-        if (resp.ok) {
-          console.log(`[cline-fallback] model ${requested} unavailable on all accounts, served via ${model}`)
-        } else {
-          void resp.clone().text().then((t) => {
-            console.warn(`[cline-fallback] 候选链耗尽，最终仍由 ${model} 返回 ${resp.status}（请求的是 ${requested}）：${summarizeClineUpstreamError(t)}`)
-          }).catch(() => {})
-        }
-      }
-      const clamp = clineMaxTokensClamp(body)
-      if (clamp) console.log(`[cline-max-tokens] ${model} 输出预算被封顶 ${clamp.from}->${clamp.to}（模型硬上限）`)
-      return withMaxTokensClampHeader(resp, clamp)
-    } catch (err) {
-      // 客户端已断开：没人要这个响应了，也不该定责成任何错误码（更不能罚冷却）。
-      if ((err as ClineTransportError).kind === 'client') {
-        return new Response(null, { status: 499 })
-      }
-      // 传输层故障（建连/首字节失败，见 clineFetch 的 ClineTransportError）→ 按 trae 口径定责：
-      // 503 `upstream_unreachable`，文案点明「账号未被惩罚，非账号池问题」。
-      // 用 503 而非 500：客户端（DSH/pi-ai）对 5xx 一样可重试，但 code 与文案把排查方向
-      // 从「账号池」引回「网关↔上游连接」——2026-09-27 那次用户正是被 500 api_error 引偏，
-      // 去查重试延迟而不是 90s 建连超时（trae 侧同类修复见 src/trae/proxy.ts:733-738）。
-      const transport = (err as ClineTransportError).kind === 'transport'
-      if (transport) {
-        lastTransportErr = err as ClineTransportError
-        if (!isLast) {
-          console.warn(`[cline-fallback] model ${model} transport error (${(err as Error).message}), trying next candidate...`)
-          continue
-        }
-        return jsonResponse({
-          error: {
-            message: 'Cline 上游连接超时/中断（账号未被惩罚，非账号池问题）：' + ((err as Error).message || ''),
-            type: 'api_error',
-            code: 'upstream_unreachable',
-          },
-        }, 503)
-      }
-      return jsonResponse({ error: { message: (err as Error).message || 'Cline 转发失败', type: 'api_error' } }, 500)
-    }
-  }
-  if (lastTransportErr) {
+  const model = String(forwardBody.model || DEFAULT_MODEL)
+  const { freeSet } = await getClineCatalog()
+  // 只服务点名的模型（用户决定，2026-10-02）：**不做任何模型级自动替换**。
+  // 402/429（余额耗尽/限流）、连接故障、三轮产不出可用流，一律原样报错，由客户端决定
+  // 重试还是自己换模型。曾经的两条自动换模型路径——免费链降级（移植 169fd9d）与
+  // transport 换候选（456d6ce）——已按同一决定退役，回归保护见 proxy.test.ts。
+  // 该模型在所有账号上都冷却中（余额耗尽/限流的模型级冷却）→ 直接报错，不打上游。
+  if (!hasAvailableAccount(pool, model)) {
     return jsonResponse({
       error: {
-        message: 'Cline 上游连接超时/中断（账号未被惩罚，非账号池问题）：' + (lastTransportErr.message || ''),
-        type: 'api_error',
-        code: 'upstream_unreachable',
+        message: `Cline 点名模型 ${model} 在当前账号池上均处于冷却中（余额耗尽/限流），请稍后重试或自行更换模型`,
+        type: 'upstream_unavailable',
       },
-    }, 503)
+    }, 502)
   }
-  return last ?? jsonResponse({ error: { message: 'Cline 全部候选模型均不可用', type: 'upstream_unavailable' } }, 502)
+  // 上游恒定强制流式（item4）：免费通道非流式返回 500 "empty response content"，
+  // 统一以流式取数，客户端要非流式时再聚合成 chat.completion。
+  const body = buildUpstreamBody({ ...forwardBody, model }, true, sessionId, freeSet)
+  try {
+    const resp = wantStream
+      ? await proxyStreamChat(pool, body, sessionId, opts?.signal, _env as Env | undefined)
+      : await proxyNonStreamChat(pool, body, sessionId, opts?.signal)
+    const clamp = clineMaxTokensClamp(body)
+    if (clamp) console.log(`[cline-max-tokens] ${model} 输出预算被封顶 ${clamp.from}->${clamp.to}（模型硬上限）`)
+    return withMaxTokensClampHeader(resp, clamp)
+  } catch (err) {
+    // 客户端已断开：没人要这个响应了，也不该定责成任何错误码（更不能罚冷却）。
+    if ((err as ClineTransportError).kind === 'client') {
+      return new Response(null, { status: 499 })
+    }
+    // 传输层故障（建连/首字节失败，见 clineFetch 的 ClineTransportError）→ 按 trae 口径定责：
+    // 503 `upstream_unreachable`，文案点明「账号未被惩罚，非账号池问题」。
+    // 用 503 而非 500：客户端（DSH/pi-ai）对 5xx 一样可重试，但 code 与文案把排查方向
+    // 从「账号池」引回「网关↔上游连接」——2026-09-27 那次用户正是被 500 api_error 引偏，
+    // 去查重试延迟而不是 90s 建连超时（trae 侧同类修复见 src/trae/proxy.ts:733-738）。
+    if ((err as ClineTransportError).kind === 'transport') {
+      return jsonResponse({
+        error: {
+          message: 'Cline 上游连接超时/中断（账号未被惩罚，非账号池问题）：' + ((err as Error).message || ''),
+          type: 'api_error',
+          code: 'upstream_unreachable',
+        },
+      }, 503)
+    }
+    return jsonResponse({ error: { message: (err as Error).message || 'Cline 转发失败', type: 'api_error' } }, 500)
+  }
 }
 
 /** 返回 Cline 实测可用模型列表（普通 JSON，供管理面板拉取模型）。 */
@@ -1814,22 +1749,9 @@ export function isFreeClineModel(id: string, freeSet?: Set<string>): boolean {
   return id.startsWith('cline-free/') || CLINE_FREE_WHITELIST.includes(id)
 }
 
-/**
- * 免费模型降级链（移植 luawei1/cline2api `modelFallbackChain`，169fd9d）：
- * 点名模型优先，其后是默认免费档与目录内全部免费模型，末位兜底 CLINE_FREE_LAST_RESORT。
- *
- * 上游语义：**只有 429/402 才降级**（模型级不可用）；400/403/5xx 等原样透传，
- * 避免把参数错误伪装成「换模型就好了」。
- */
-export function clineModelFallbackChain(requested: string, models: RemoteClineModel[]): string[] {
-  const chain: string[] = []
-  const push = (id: string) => { if (id && !chain.includes(id)) chain.push(id) }
-  push(requested)
-  push(DEFAULT_MODEL)
-  for (const m of models) if (m.cost === 'free') push(m.id)
-  push(CLINE_FREE_LAST_RESORT)
-  return chain
-}
+// 已退役（2026-10-02，用户决定）：`clineModelFallbackChain` / `CLINE_FREE_LAST_RESORT`
+// ——「点名模型全账号不可用时沿免费链降级」不再存在。网关只服务点名的模型，402/429/连接故障/
+// 三轮产不出流一律原样报错。若要恢复，请先确认这是产品决定而不是顺手加回来的 fallback。
 
 // ===== 每日健康检查（item10，移植自 Go 版冷却自愈：探活并刷新过期 token） =====
 
