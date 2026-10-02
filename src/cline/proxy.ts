@@ -1849,6 +1849,11 @@ export const CLINE_PROBE_UPSTREAM = '__cline_probe__'
  */
 const CLINE_PROBE_READ_BYTES = 8192
 const CLINE_PROBE_READ_MS = 20000
+/**
+ * 「验证钉住」的读体上限：路由元数据帧在流的前几帧，但真实 completion 的正文也在同一段里，
+ * 给到 32KB 足以覆盖"元数据 + 少量正文"，又不必把整轮读进来。
+ */
+const CLINE_VERIFY_READ_BYTES = 32768
 
 export interface ClineUpstreamProbeResult {
   model: string
@@ -1869,9 +1874,38 @@ export interface ClineUpstreamCheck {
   ms: number
 }
 
+/**
+ * 「钉住是否真的生效」的判定结论。
+ * - `ok`：实际渠道落在你钉住/勾选的范围内（硬约束满足）
+ * - `fallback`：实际走了范围外的兜底渠道——**只在「优先」模式且没配排除时合法**
+ * - `mismatch`：违反了硬约束（实际渠道不在 only 白名单里）
+ * - `unpinned`：该模型没配钉住，无事可验
+ * - `unknown`：没读到路由元数据，无法判定（**不等于生效**）
+ */
+export type ClinePinVerdict = 'ok' | 'fallback' | 'mismatch' | 'unpinned' | 'unknown'
+
+export interface ClinePinVerifyResult {
+  model: string
+  verdict: ClinePinVerdict
+  /** 上游实际选用的渠道（响应帧 provider_metadata.gateway.routing.finalProvider） */
+  finalProvider: string | null
+  /** 网关侧仍可回退的渠道；strict 生效时应为空数组 */
+  fallbacksAvailable: string[] | null
+  /** 已保存配置里的期望（面板回显用） */
+  expected: { upstreams: string[]; exclude: string[]; pinMode: 'strict' | 'preferred' }
+  /** 出站请求体里**实际下发**的偏好（自证"我们确实发了什么"，与 expected 可能不同） */
+  sent: { only: string[]; order: string[]; sort: string | null }
+  note: string
+  status: number
+  ms: number
+  verifiedAt: number
+}
+
 export interface ClineUpstreamCache {
   probes: Record<string, ClineUpstreamProbeResult>
   checks: Record<string, Record<string, ClineUpstreamCheck>>
+  /** 上次「验证钉住」的结论：重载面板后仍能看到，不必重新发请求 */
+  verifies?: Record<string, ClinePinVerifyResult>
   updatedAt: number
 }
 
@@ -2011,7 +2045,7 @@ const CLINE_UPSTREAM_CACHE_PREFIX = 'cline:upstreams:'
 const CLINE_UPSTREAM_CACHE_TTL_SEC = 7 * 24 * 3600
 
 export async function readClineUpstreamCache(env: Env | undefined, providerId: string): Promise<ClineUpstreamCache> {
-  const empty: ClineUpstreamCache = { probes: {}, checks: {}, updatedAt: 0 }
+  const empty: ClineUpstreamCache = { probes: {}, checks: {}, verifies: {}, updatedAt: 0 }
   if (!env?.KV) return empty
   try {
     const raw = await env.KV.get(CLINE_UPSTREAM_CACHE_PREFIX + providerId)
@@ -2020,6 +2054,7 @@ export async function readClineUpstreamCache(env: Env | undefined, providerId: s
     return {
       probes: parsed.probes && typeof parsed.probes === 'object' ? parsed.probes : {},
       checks: parsed.checks && typeof parsed.checks === 'object' ? parsed.checks : {},
+      verifies: parsed.verifies && typeof parsed.verifies === 'object' ? parsed.verifies : {},
       updatedAt: typeof parsed.updatedAt === 'number' ? parsed.updatedAt : 0,
     }
   } catch { return empty }
@@ -2070,6 +2105,173 @@ export async function validateClineProviderUpstream(
   }
   await writeClineUpstreamCache(env, provider.id, merged)
   return { model, checks, total: upstreams.length }
+}
+
+/**
+ * 从响应帧里抽「上游实际用了哪个渠道」。
+ *
+ * 为什么必须读它：出站偏好是我们自己拼的，日志只能证明**我们发出去了**；而规划器管道会
+ * **静默丢弃**顶层 provider.only（照常 200 出流、不报错、也看不出你钉过），所以"没报错"
+ * 与"日志有 [cline-pin]"都不能当验收。唯一硬证据是响应里的路由元数据。
+ *
+ * 字段位置与名字按 2026-10-02 真机实测（见 `_port-analysis/cps-premise-probe.mjs`）：
+ * `provider_metadata.gateway.routing.finalProvider`，同段里还有 `fallbacksAvailable`。
+ * 逐帧解析而不是正则抓全文——routing 是嵌套对象，正则容易跨对象误匹配。
+ * `resolvedProvider` 是同一段的另一个字段名，作为兜底（不同管道用词不同）。
+ */
+export function parseClineRoutingMeta(text: string): {
+  finalProvider: string | null
+  fallbacksAvailable: string[] | null
+} {
+  const out = { finalProvider: null as string | null, fallbacksAvailable: null as string[] | null }
+  const seen = (node: unknown): void => {
+    if (!node || typeof node !== 'object') return
+    for (const [k, v] of Object.entries(node as Record<string, unknown>)) {
+      if (k === 'gateway' && v && typeof v === 'object') {
+        const routing = (v as Record<string, unknown>).routing
+        if (routing && typeof routing === 'object') {
+          const rt = routing as Record<string, unknown>
+          const fp = rt.finalProvider ?? rt.resolvedProvider
+          if (typeof fp === 'string' && fp) out.finalProvider = fp
+          if (Array.isArray(rt.fallbacksAvailable)) {
+            out.fallbacksAvailable = rt.fallbacksAvailable.filter((x): x is string => typeof x === 'string')
+          }
+        }
+      }
+      if (v && typeof v === 'object') seen(v)
+    }
+  }
+  const raw = String(text || '')
+  for (const line of raw.split('\n')) {
+    const t = line.trim()
+    if (!t.startsWith('data:')) continue
+    const payload = t.slice(5).trim()
+    if (!payload || payload === '[DONE]') continue
+    try { seen(JSON.parse(payload)) } catch { /* 非 JSON 帧忽略 */ }
+  }
+  // 非流式/无 data: 前缀的实现也兜一下（整段就是一个 JSON 对象）
+  if (out.finalProvider === null && out.fallbacksAvailable === null) {
+    try { seen(JSON.parse(raw)) } catch { /* 不是 JSON，保持未知 */ }
+  }
+  return out
+}
+
+/**
+ * 判定「钉住是否生效」。**纯函数**，便于直接把判定矩阵钉在测试里。
+ * 判定口径以**实际下发的偏好**（sent）为准，而不是配置（expected）——两者在 exclude 清单缺失时
+ * 并不相同，拿配置去判会得出"应该生效"的假结论。
+ */
+export function judgeClinePinVerify(
+  sent: { only: string[]; order: string[] },
+  finalProvider: string | null,
+  fallbacksAvailable: string[] | null
+): { verdict: ClinePinVerdict; note: string } {
+  const fb = fallbacksAvailable === null ? '回退清单未读到' : (fallbacksAvailable.length ? `仍可回退 [${fallbacksAvailable.join(',')}]` : '回退已清空')
+  if (!sent.only.length && !sent.order.length) {
+    return {
+      verdict: 'unpinned',
+      note: '该模型未配钉住（网关自动选）' + (finalProvider ? `，本次实际走 ${finalProvider}` : ''),
+    }
+  }
+  if (!finalProvider) {
+    return { verdict: 'unknown', note: '未读到路由元数据，无法判定（这**不等于**生效）' }
+  }
+  if (sent.only.length) {
+    const hit = sent.only.includes(finalProvider)
+    return hit
+      ? { verdict: 'ok', note: `实际走 ${finalProvider}，落在白名单 [${sent.only.join(',')}] 内（${fb}）` }
+      : { verdict: 'mismatch', note: `实际走 ${finalProvider}，不在白名单 [${sent.only.join(',')}] 内——钉住没生效` }
+  }
+  // 只下发了 order（优先模式且没配排除）：范围外的兜底是**允许**的，不能算失败
+  if (finalProvider === sent.order[0]) {
+    return { verdict: 'ok', note: `实际走 ${finalProvider}，正是优先序列首位（${fb}）` }
+  }
+  if (sent.order.includes(finalProvider)) {
+    return { verdict: 'ok', note: `实际走 ${finalProvider}，在你勾选的序列 [${sent.order.join(',')}] 内（${fb}）` }
+  }
+  return { verdict: 'fallback', note: `实际走 ${finalProvider}，不在优先序列 [${sent.order.join(',')}] 内（优先模式允许兜底，非失败）` }
+}
+
+/**
+ * 验证「**已保存的**钉住配置」是否真的生效：发 1 次最小真实请求，读回路由元数据再判定。
+ *
+ * 为什么按已保存配置而不是面板的本地状态：面板是即时保存的，本地状态与存储一致；但"验证"
+ * 这个动作的语义是**验收存下来的东西**，所以从 provider 读，避免验证了一个没存住的配置。
+ *
+ * 成本：每模型 1 次真实请求（约几百毫秒 + 极少量 token），且走共享串行队列（免费通道并发 >1
+ * 会返回空响应）。不罚号（skipCooldown）——诊断动作不该让账号进冷却。
+ */
+export async function verifyClineProviderUpstream(
+  env: Env,
+  provider: Provider,
+  model: string
+): Promise<ClinePinVerifyResult> {
+  const pin = provider.clinePinByModel?.[model] || null
+  // 与热路径同一口径：只有配了 exclude 才需要渠道清单来换算 only 白名单
+  const knownUpstreams = pin?.exclude?.length
+    ? (await readClineUpstreamCache(env, provider.id)).probes[model]?.upstreams || []
+    : []
+  const { freeSet } = await getClineCatalog()
+  const sessionId = 'sess_verify_' + Date.now()
+  const body = buildUpstreamBody(
+    { model, messages: [{ role: 'user', content: 'hi' }], max_tokens: 8 },
+    true,
+    sessionId,
+    freeSet,
+    pin,
+    knownUpstreams
+  )
+  const decision = clinePinDecision(body)
+  const sent = {
+    only: decision?.only ? decision.only.slice() : [],
+    order: decision?.order ? decision.order.slice() : [],
+    sort: decision?.sort ?? null,
+  }
+  const expected = {
+    upstreams: (pin?.upstreams || []).filter(Boolean),
+    exclude: (pin?.exclude || []).filter(Boolean),
+    pinMode: (pin?.pinMode === 'preferred' ? 'preferred' : 'strict') as 'strict' | 'preferred',
+  }
+  const pool = poolFromProvider(provider, env)
+  const t0 = Date.now()
+  let status = 0
+  let text = ''
+  try {
+    const resp = await enqueue(() =>
+      clineFetch(pool, '/chat/completions', body, sessionId, false, undefined, { skipCooldown: true })
+    )
+    status = resp.status
+    // 元数据帧在流的前几帧就该到；给足上限但不读完整轮（验证不该把整段 completion 读进来）
+    text = await readTextCapped(resp, CLINE_VERIFY_READ_BYTES, CLINE_PROBE_READ_MS)
+  } catch (err) {
+    const judged = { verdict: 'unknown' as ClinePinVerdict, note: `请求失败，无法判定：${(err as Error).message || String(err)}` }
+    return {
+      model, ...judged, finalProvider: null, fallbacksAvailable: null,
+      expected, sent, status, ms: Date.now() - t0, verifiedAt: Date.now(),
+    }
+  }
+  const meta = parseClineRoutingMeta(text)
+  const judged = judgeClinePinVerify(sent, meta.finalProvider, meta.fallbacksAvailable)
+  const result: ClinePinVerifyResult = {
+    model,
+    verdict: judged.verdict,
+    finalProvider: meta.finalProvider,
+    fallbacksAvailable: meta.fallbacksAvailable,
+    expected,
+    sent,
+    // HTTP 非 200 时把状态码带上：此时"没读到元数据"的原因通常就在这儿
+    note: judged.verdict === 'unknown' && status !== 200 ? `HTTP ${status}：${probeNote(text) || '无响应正文'}` : judged.note,
+    status,
+    ms: Date.now() - t0,
+    verifiedAt: Date.now(),
+  }
+  const cache = await readClineUpstreamCache(env, provider.id)
+  await writeClineUpstreamCache(env, provider.id, {
+    ...cache,
+    verifies: { ...(cache.verifies || {}), [model]: result },
+    updatedAt: Date.now(),
+  })
+  return result
 }
 
 /** 返回 Cline 实测可用模型列表（普通 JSON，供管理面板拉取模型）。 */

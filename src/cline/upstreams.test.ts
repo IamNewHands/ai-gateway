@@ -4,13 +4,16 @@ import type { Env, Provider } from '../types'
 import {
   parseClineUpstreamList,
   classifyClineUpstreamError,
+  parseClineRoutingMeta,
+  judgeClinePinVerify,
   probeClineProviderUpstream,
   validateClineProviderUpstream,
+  verifyClineProviderUpstream,
   readClineUpstreamCache,
   CLINE_PROBE_UPSTREAM,
   MIN_GAP_MS,
 } from './proxy'
-import { handleClineUpstreams, handleClineUpstreamProbe, handleClineUpstreamValidate, normalizeClinePinByModel } from '../admin'
+import { handleClineUpstreams, handleClineUpstreamProbe, handleClineUpstreamValidate, handleClineUpstreamVerify, normalizeClinePinByModel } from '../admin'
 import { setProviders } from '../storage'
 
 /** 内存 KV（暴露 map 以便断言留档写入）。 */
@@ -304,6 +307,189 @@ describe('面板端点：GET 留档 / probe / validate', () => {
     expect(d.data.total).toBe(4)
     expect(d.data.checks).toHaveLength(4)
     expect(d.data.summary).toContain('可用 4 / 共 4')
+  })
+})
+
+// ===== 「钉住是否真的生效」：读回上游实际路由（2026-10-06） =====
+// 为什么需要：出站偏好是网关自己拼的，[cline-pin] 日志只能证明**我们发出去了**；规划器管道会
+// 静默丢弃顶层 provider.only（照常 200 出流、不报错、routing 里也看不出你钉过）。唯一硬证据是
+// 响应里的 provider_metadata.gateway.routing.finalProvider。
+describe('parseClineRoutingMeta：从响应帧里读上游实际路由', () => {
+  it('实测形态：provider_metadata.gateway.routing 里的 finalProvider + fallbacksAvailable', () => {
+    const t = 'data: {"id":"c1","provider_metadata":{"gateway":{"routing":{"finalProvider":"alibaba","fallbacksAvailable":[]}}}}\n\n'
+    expect(parseClineRoutingMeta(t)).toEqual({ finalProvider: 'alibaba', fallbacksAvailable: [] })
+  })
+
+  it('resolvedProvider 是同一段的另一个字段名，作为兜底', () => {
+    const t = 'data: {"provider_metadata":{"gateway":{"routing":{"resolvedProvider":"baseten"}}}}'
+    expect(parseClineRoutingMeta(t).finalProvider).toBe('baseten')
+  })
+
+  it('元数据在后面某一帧才出现也能读到（不只看第一帧）', () => {
+    const t = 'data: {"choices":[{"delta":{"content":"hi"}}]}\n\n' +
+      'data: {"provider_metadata":{"gateway":{"routing":{"finalProvider":"gmicloud"}}}}\n\n' +
+      'data: [DONE]\n\n'
+    expect(parseClineRoutingMeta(t).finalProvider).toBe('gmicloud')
+  })
+
+  it('只认 gateway.routing 段：别处同名字段不算（逐层走对象，不做跨对象正则）', () => {
+    const t = 'data: {"finalProvider":"wrong","provider_metadata":{"gateway":{"routing":{"finalProvider":"alibaba"}}}}'
+    expect(parseClineRoutingMeta(t).finalProvider).toBe('alibaba')
+  })
+
+  it('非流式（整段一个 JSON，无 data: 前缀）也能读出来', () => {
+    const t = '{"provider_metadata":{"gateway":{"routing":{"finalProvider":"novita","fallbacksAvailable":["wafer"]}}}}'
+    expect(parseClineRoutingMeta(t)).toEqual({ finalProvider: 'novita', fallbacksAvailable: ['wafer'] })
+  })
+
+  it('没有路由信息 → 两个字段都是 null（**不猜**，由判定层给 unknown）', () => {
+    expect(parseClineRoutingMeta('data: {"choices":[{"delta":{"content":"hi"}}]}\n\ndata: [DONE]\n\n'))
+      .toEqual({ finalProvider: null, fallbacksAvailable: null })
+    expect(parseClineRoutingMeta('')).toEqual({ finalProvider: null, fallbacksAvailable: null })
+    expect(parseClineRoutingMeta('data: not-json\n\n')).toEqual({ finalProvider: null, fallbacksAvailable: null })
+  })
+})
+
+describe('judgeClinePinVerify：钉住是否生效的判定矩阵', () => {
+  const S = (only: string[], order: string[]) => ({ only, order })
+
+  it('没配钉住 → unpinned（无事可验，不假装失败也不假装成功）', () => {
+    expect(judgeClinePinVerify(S([], []), 'alibaba', []).verdict).toBe('unpinned')
+  })
+
+  it('读不到路由信息 → unknown，**绝不判成 ok**（否则"没验证"会伪装成"已验证"）', () => {
+    const r = judgeClinePinVerify(S(['alibaba'], []), null, null)
+    expect(r.verdict).toBe('unknown')
+    expect(r.note).toContain('不等于')
+  })
+
+  it('白名单（strict/排除）：实际落在 only 内 → ok；落在外面 → mismatch', () => {
+    expect(judgeClinePinVerify(S(['alibaba'], []), 'alibaba', []).verdict).toBe('ok')
+    expect(judgeClinePinVerify(S(['alibaba'], []), 'baseten', []).verdict).toBe('mismatch')
+    // 多选白名单：落在其中任一个都算生效
+    expect(judgeClinePinVerify(S(['alibaba', 'novita'], []), 'novita', []).verdict).toBe('ok')
+  })
+
+  it('strict 生效时回退被清空（源项目实测口径），结论文案里带出来', () => {
+    expect(judgeClinePinVerify(S(['alibaba'], []), 'alibaba', []).note).toContain('回退已清空')
+    expect(judgeClinePinVerify(S(['alibaba'], []), 'alibaba', ['baseten']).note).toContain('仍可回退')
+  })
+
+  it('优先模式：走首位/在序列内 → ok；走序列外 → fallback（**允许兜底，不算失败**）', () => {
+    expect(judgeClinePinVerify(S([], ['alibaba', 'novita']), 'alibaba', ['baseten']).verdict).toBe('ok')
+    expect(judgeClinePinVerify(S([], ['alibaba', 'novita']), 'novita', ['baseten']).verdict).toBe('ok')
+    const fb = judgeClinePinVerify(S([], ['alibaba', 'novita']), 'baseten', ['alibaba'])
+    expect(fb.verdict).toBe('fallback')
+    expect(fb.note).toContain('非失败')
+  })
+})
+
+/** 一条带上游路由元数据的真实形态流。 */
+const ROUTING_OK =
+  'data: {"id":"c1","provider_metadata":{"gateway":{"routing":{"finalProvider":"alibaba","fallbacksAvailable":[]}}}}\n\n' +
+  'data: {"choices":[{"delta":{"content":"hi"}}]}\n\n' +
+  'data: [DONE]\n\n'
+
+describe('verifyClineProviderUpstream：发一次真实请求读回实际渠道', () => {
+  it('已保存 strict 钉 alibaba → 实际也是 alibaba，判定生效', async () => {
+    const { env } = makeEnv()
+    const provider = clineProvider({ clinePinByModel: { M: { upstreams: ['alibaba'], pinMode: 'strict' } } })
+    const seen: Array<Record<string, unknown>> = []
+    installFetch((body) => { seen.push(body); return sseResp(ROUTING_OK) })
+
+    const r = await verifyClineProviderUpstream(env, provider, 'M')
+    expect(r.verdict).toBe('ok')
+    expect(r.finalProvider).toBe('alibaba')
+    expect(r.fallbacksAvailable).toEqual([])
+    expect(r.sent.only).toEqual(['alibaba'])
+    expect(r.expected).toEqual({ upstreams: ['alibaba'], exclude: [], pinMode: 'strict' })
+    // 自证"我们确实发了什么"：真正那次 chat 请求体里带着偏好
+    // （seen 里还有目录请求，按 messages 认 chat 那次）
+    const chatBody = seen.find((b) => Array.isArray(b.messages))!
+    expect((chatBody.providerOptions as { gateway: { only: string[] } }).gateway.only).toEqual(['alibaba'])
+  })
+
+  it('实际走了别的渠道 → mismatch（这才是"没生效"的证据）', async () => {
+    const { env } = makeEnv()
+    const provider = clineProvider({ clinePinByModel: { M: { upstreams: ['alibaba'] } } })
+    installFetch(() => sseResp('data: {"provider_metadata":{"gateway":{"routing":{"finalProvider":"baseten"}}}}\n\n'))
+    const r = await verifyClineProviderUpstream(env, provider, 'M')
+    expect(r.verdict).toBe('mismatch')
+    expect(r.note).toContain('baseten')
+  })
+
+  it('exclude 换算出的白名单参与判定，且结论落留档（重载面板不必重验）', async () => {
+    const { env, map } = makeEnv()
+    map.set('cline:upstreams:cline', JSON.stringify({
+      probes: {
+        M: {
+          model: 'M', ok: true, pipeline: 'planner', upstreams: ['alibaba', 'baseten', 'novita'],
+          status: 200, note: '', ms: 1, probedAt: 1,
+        },
+      },
+      checks: {}, updatedAt: 1,
+    }))
+    const provider = clineProvider({ clinePinByModel: { M: { exclude: ['baseten'] } } })
+    installFetch(() => sseResp('data: {"provider_metadata":{"gateway":{"routing":{"finalProvider":"novita"}}}}\n\n'))
+
+    const r = await verifyClineProviderUpstream(env, provider, 'M')
+    expect(r.sent.only).toEqual(['alibaba', 'novita'])
+    expect(r.verdict).toBe('ok')
+    const cache = await readClineUpstreamCache(env, 'cline')
+    expect(cache.verifies?.M.verdict).toBe('ok')
+    expect(cache.verifies?.M.finalProvider).toBe('novita')
+  })
+
+  it('请求失败 → unknown（不判成失败也不判成生效）', async () => {
+    const { env } = makeEnv()
+    const provider = clineProvider({ clinePinByModel: { M: { upstreams: ['alibaba'] } } })
+    installFetch(() => { throw new Error('boom') })
+    const r = await verifyClineProviderUpstream(env, provider, 'M')
+    expect(r.verdict).toBe('unknown')
+    expect(r.note).toContain('无法判定')
+  })
+})
+
+describe('面板端点：POST cline-upstreams/verify', () => {
+  function mountVerify() {
+    const app = new Hono()
+    app.post('/admin/api/providers/:id/cline-upstreams/verify', handleClineUpstreamVerify)
+    return app
+  }
+  const post = (app: Hono, path: string, body: unknown, env: unknown) =>
+    app.request(path, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }, env as never)
+
+  it('缺 model 400；没有启用账号 400；非 cline 提供商 400', async () => {
+    const { env } = makeEnv()
+    await setProviders(env, [clineProvider()])
+    const app = mountVerify()
+
+    const noModel = await post(app, '/admin/api/providers/cline/cline-upstreams/verify', {}, env)
+    expect(noModel.status).toBe(400)
+
+    await setProviders(env, [clineProvider({ apiKeys: [{ key: RT_A, enabled: false }] })])
+    const noKey = await post(app, '/admin/api/providers/cline/cline-upstreams/verify', { model: 'M' }, env)
+    expect(noKey.status).toBe(400)
+    expect((await noKey.json() as { message: string }).message).toContain('没有启用的 Cline 账号')
+
+    await setProviders(env, [clineProvider({ id: 'deepseek' })])
+    const bad = await post(app, '/admin/api/providers/deepseek/cline-upstreams/verify', { model: 'M' }, env)
+    expect(bad.status).toBe(400)
+    expect((await bad.json() as { message: string }).message).toContain('仅支持 Cline')
+  })
+
+  it('正常时回结论（面板据此渲染"生效/未生效"）', async () => {
+    const { env } = makeEnv()
+    await setProviders(env, [clineProvider({ clinePinByModel: { M: { upstreams: ['alibaba'] } } })])
+    installFetch(() => sseResp(ROUTING_OK))
+    const app = mountVerify()
+
+    const ok = await post(app, '/admin/api/providers/cline/cline-upstreams/verify', { model: 'M' }, env)
+    expect(ok.status).toBe(200)
+    const d = await ok.json() as { success: boolean; data: { verdict: string; finalProvider: string } }
+    expect(d.success).toBe(true)
+    expect(d.data.verdict).toBe('ok')
+    expect(d.data.finalProvider).toBe('alibaba')
   })
 })
 

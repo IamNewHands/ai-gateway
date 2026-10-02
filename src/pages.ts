@@ -125,7 +125,7 @@ const keyRowHtml = (p: { id?: string }, k: { key: string; enabled: boolean; labe
  * 「行为没变」到底是没部署、没刷新，还是代码就是错的，只能靠来回猜（2026-10-06 已经为这个
  * 浪费过一轮）。用户只要比对刷新前后这一行是否变化，就能自证加载的是不是新脚本。
  */
-export const CLINE_UP_UI_VERSION = '2026-10-06-multi2'
+export const CLINE_UP_UI_VERSION = '2026-10-06-verify'
 
 /**
  * Cline「上游渠道与固定」区块（移植 cline-pass-switcher 的控制台能力）。
@@ -157,11 +157,12 @@ const clineUpstreamSectionHtml = (p: { id?: string }) => {
     `<button class="btn btn-s btn-xs" onclick="clineUpstreamsLoad('${js}')" title="读取留档的渠道清单与渠道设置；不打上游"><i class="fas fa-list" aria-hidden="true"></i><span>显示已留档</span></button>` +
     `<button class="btn btn-s btn-xs" onclick="clineUpstreamsProbeAll('${js}')" title="逐个模型发一次假渠道请求，让网关回吐可用渠道清单（零 token、每模型约 0.3 秒）"><i class="fas fa-satellite-dish" aria-hidden="true"></i><span>探测全部渠道</span></button>` +
     `<button class="btn btn-gh btn-xs" onclick="clineUpstreamsValidateAll('${js}')" title="对每个模型已探测到的渠道逐个发最小真实请求实测可用性；点击后会先告知请求数与预计耗时"><i class="fas fa-vial" aria-hidden="true"></i><span>校验全部渠道</span></button>` +
+    `<button class="btn btn-s btn-xs" onclick="clineUpstreamsVerifyAll('${js}')" title="验证已保存的钉住是否真的生效：对每个已配钉住的模型发 1 次最小真实请求，读回上游实际走的渠道（消耗少量 token）"><i class="fas fa-shield-halved" aria-hidden="true"></i><span>验证钉住</span></button>` +
     `<button class="btn btn-gh btn-xs" onclick="clineUpstreamsBulk('${js}','all')" title="把每个模型已探测到的渠道按可用状态排序全部勾选（顺序 = 推荐优先级）"><i class="fas fa-check-double" aria-hidden="true"></i><span>全选</span></button>` +
     `<button class="btn btn-gh btn-xs" onclick="clineUpstreamsBulk('${js}','clear')" title="清空全部勾选与排除（回到网关自动选）"><i class="fas fa-eraser" aria-hidden="true"></i><span>清空</span></button>` +
     `<span class="mu" id="cu-st-${pid}" aria-live="polite" style="font-size:12px"></span></div>` +
     `<div id="cu-tb-${pid}"></div>` +
-    `<span class="form-helper">钉住发生在 Cline 网关之后的路由层。<b>改动即时保存，不需要点保存按钮</b>（状态行会显示「已保存」）。<b>点渠道徽章切换三态</b>：勾选 → 排除 → 自动。勾选的渠道带序号（序号 = 优先顺序）：<b>只用这几个</b>模式下网关只在这几个里选、不再兜底（全挂即失败）；<b>优先</b>模式下它们最优先、其余仍可兜底。排除 = 永不使用（划线），是<b>否决权</b>，优先级高于勾选。一个都不勾 = 网关自动选。校验中「限流」只代表当前共享池暂时繁忙，渠道本身可用。<span class="mu" style="font-size:11px">面板脚本 ${CLINE_UP_UI_VERSION}</span></span>` +
+    `<span class="form-helper">钉住发生在 Cline 网关之后的路由层。<b>改动即时保存，不需要点保存按钮</b>（状态行会显示「已保存」）。<b>点渠道徽章切换三态</b>：勾选 → 排除 → 自动。勾选的渠道带序号（序号 = 优先顺序）：<b>只用这几个</b>模式下网关只在这几个里选、不再兜底（全挂即失败）；<b>优先</b>模式下它们最优先、其余仍可兜底。排除 = 永不使用（划线），是<b>否决权</b>，优先级高于勾选。一个都不勾 = 网关自动选。<b>「验证钉住」是唯一能证明"上游真的照做了"的动作</b>：它发 1 次最小真实请求，读回上游实际走的渠道——日志里的 <code>[cline-pin]</code> 只能证明网关把偏好发出去了，证明不了上游认了它（规划器管道会静默丢弃）。校验中「限流」只代表当前共享池暂时繁忙，渠道本身可用。<span class="mu" style="font-size:11px">面板脚本 ${CLINE_UP_UI_VERSION}</span></span>` +
     `</fieldset></div>`
 }
 
@@ -3442,6 +3443,8 @@ var _clineUpData = {}
 /** 保存中标记 / 保存期间又有改动：并发点击合并成一次「存完再存」，避免后写覆盖先写。 */
 var _clineUpSaving = {}
 var _clineUpDirty = {}
+/** 最近一次保存的 promise：验证钉住前要等它落库（验证的语义是"验收存下来的配置"）。 */
+var _clineUpInflight = {}
 
 /**
  * 提供商配置的**全局写队列**（面板的即时保存与详情卡片的「保存更改」共用）。
@@ -3506,6 +3509,7 @@ function clineUpstreamsRender(id) {
   var probes = data.probes || {}
   var checks = data.checks || {}
   var pins = data.pins || {}
+  var verifies = data.verifies || {}
   /** 每行的渠道顺序，供事件委托按 (行, 列) 反查渠道名——渠道名拼进选择器不安全。 */
   var badgeRows = []
   var body = models.map(function (m, i) {
@@ -3531,6 +3535,13 @@ function clineUpstreamsRender(id) {
     if (badgeList.length && clineUpExcludeUnresolved(pin, probe)) {
       badges += '<div class="mu" style="font-size:11px;color:var(--color-danger)">已配排除但渠道清单缺失 → <b>排除暂未生效</b>，请重新探测</div>'
     }
+    // 上次「验证钉住」的结论：重载后仍在（后端落 KV），否则用户每次都要重新验证才看得到
+    var vfy = verifies[m]
+    if (vfy) {
+      var vb = clineUpVerdict(vfy.verdict)
+      badges += '<div style="font-size:11px;margin-top:4px"><span class="bd ' + vb[0] + '">' + escapeHtml(vb[1]) + '</span>' +
+        ' <span class="mu">' + escapeHtml(clineUpVerifyText(vfy)) + '</span></div>'
+    }
     var pipe = probe.pipeline && probe.pipeline !== 'unknown' ? probe.pipeline : '—'
     var modeSel = '<select id="cu-md-' + id + '-' + i + '" data-cu-row="' + i + '" aria-label="固定模式">' +
       '<option value="strict"' + ((pin.pinMode || 'strict') === 'strict' ? ' selected' : '') + '>只用勾选的</option>' +
@@ -3545,7 +3556,8 @@ function clineUpstreamsRender(id) {
       '<td class="cell-fit">' + modeSel + '</td>' +
       '<td class="cell-fit">' + sortSel + '</td>' +
       '<td class="cell-fit"><button class="btn btn-gh btn-xs" data-cu-probe="' + i + '" title="重新探测该模型的渠道清单"><i class="fas fa-satellite-dish"></i></button>' +
-      '<button class="btn btn-gh btn-xs" data-cu-check="' + i + '" title="实测该模型全部渠道的可用性"><i class="fas fa-vial"></i></button></td></tr>'
+      '<button class="btn btn-gh btn-xs" data-cu-check="' + i + '" title="实测该模型全部渠道的可用性"><i class="fas fa-vial"></i></button>' +
+      '<button class="btn btn-gh btn-xs" data-cu-verify="' + i + '" title="验证钉住是否真的生效：发 1 次最小真实请求，读回上游实际走的渠道"><i class="fas fa-shield-halved"></i></button></td></tr>'
   }).join('')
   box.innerHTML = '<div style="max-height:320px;overflow:auto"><table class="tbl"><thead><tr>' +
     '<th>模型</th><th>渠道（点徽章切换：勾选 → 排除 → 自动）</th><th>模式</th><th>排序</th><th>操作</th>' +
@@ -3556,6 +3568,9 @@ function clineUpstreamsRender(id) {
   })
   Array.prototype.forEach.call(box.querySelectorAll('[data-cu-check]'), function (btn) {
     btn.onclick = function () { clineUpstreamsValidateOne(id, models[Number(btn.getAttribute('data-cu-check'))]) }
+  })
+  Array.prototype.forEach.call(box.querySelectorAll('[data-cu-verify]'), function (btn) {
+    btn.onclick = function () { clineUpstreamsVerifyOne(id, models[Number(btn.getAttribute('data-cu-verify'))]) }
   })
   Array.prototype.forEach.call(box.querySelectorAll('[data-cu-ch]'), function (btn) {
     btn.onclick = function () {
@@ -3706,7 +3721,7 @@ function clineUpstreamsSave(id) {
   _clineUpSaving[id] = true
   clineUpStatus(id, '保存中…')
   // 走全局写队列：详情卡片的「保存更改」写同一条记录，并发会让这次改动被旧快照抹掉
-  return queueProviderWrite(function () {
+  var run = queueProviderWrite(function () {
     return fetch('/admin/api/providers/' + encodeURIComponent(id), {
       method: 'PUT',
       headers: { 'Content-Type': 'application/json' },
@@ -3732,6 +3747,76 @@ function clineUpstreamsSave(id) {
     if (_clineUpDirty[id]) { _clineUpDirty[id] = false; return clineUpstreamsSave(id) }
     return ok
   })
+  _clineUpInflight[id] = run
+  return run
+}
+
+/**
+ * 验证「已保存的钉住配置」是否真的生效：发 1 次最小真实请求，由后端读回上游实际渠道再判定。
+ *
+ * 为什么必须有这一步：出站偏好是网关自己拼的，[cline-pin] 日志只能证明**我们发出去了**；
+ * 规划器管道会静默丢弃顶层 provider.only（照常 200 出流、不报错），所以"没报错"不是证据。
+ * 唯一硬证据是响应里的路由元数据——面板上这一行就是把它变成可读的结论。
+ */
+function clineUpstreamsVerifyOne(id, model) {
+  var data = _clineUpData[id] || {}
+  var pin = (data.pins || {})[model]
+  if (!pin || (!(pin.upstreams || []).length && !(pin.exclude || []).length && !pin.sort)) {
+    clineUpStatus(id, '该模型还没配钉住：先在渠道徽章上勾选（或排除）再验证')
+    return Promise.resolve()
+  }
+  function fire() {
+    clineUpStatus(id, '验证中：' + model + '（发 1 次最小真实请求）')
+    return clineUpPost(id, '/cline-upstreams/verify', { model: model }).then(function (d) {
+      if (!d || !d.success) { clineUpStatus(id, '验证失败：' + ((d && d.message) || '未知错误')); return }
+      var cur = _clineUpData[id] || { models: [], pins: {}, probes: {}, checks: {}, verifies: {} }
+      cur.verifies = cur.verifies || {}
+      cur.verifies[model] = d.data
+      _clineUpData[id] = cur
+      clineUpstreamsRender(id)
+      clineUpStatus(id, model + '：' + clineUpVerdict(d.data.verdict)[1] + '——' + (d.data.note || ''))
+    }).catch(function () { clineUpStatus(id, '网络错误，请重试') })
+  }
+  // 正在保存就先等它落库，否则验的是"上一次存下来的配置"，结论没有意义
+  return Promise.resolve(_clineUpInflight[id]).then(fire)
+}
+
+/** 逐个验证**已配钉住**的模型（没配钉住的模型发了也是白花一次请求）。 */
+function clineUpstreamsVerifyAll(id) {
+  function run() {
+    var data = _clineUpData[id] || {}
+    var pins = data.pins || {}
+    var targets = (data.models || []).filter(function (m) {
+      var p = pins[m] || {}
+      return (p.upstreams || []).length || (p.exclude || []).length || p.sort
+    })
+    if (!targets.length) {
+      clineUpStatus(id, '还没有任何模型配了钉住/排除，先在渠道徽章上勾选')
+      return Promise.resolve()
+    }
+    if (typeof confirm === 'function' &&
+        !confirm('验证 ' + targets.length + ' 个已配钉住的模型：' + clineUpCostText(targets.length, data.minGapMs) +
+                 '。每次会读回上游实际渠道，消耗少量 token。继续？')) return Promise.resolve()
+    var i = 0
+    var tally = {}
+    function step() {
+      if (i >= targets.length) {
+        var parts = Object.keys(tally).map(function (k) { return clineUpVerdict(k)[1] + ' ' + tally[k] })
+        clineUpStatus(id, '验证完成：' + (parts.length ? parts.join('，') : '无结果'))
+        return Promise.resolve()
+      }
+      var m = targets[i]
+      return clineUpstreamsVerifyOne(id, m).then(function () {
+        var v = ((_clineUpData[id] || {}).verifies || {})[m]
+        if (v) tally[v.verdict] = (tally[v.verdict] || 0) + 1
+        i++
+        return step()
+      })
+    }
+    return step()
+  }
+  if (!_clineUpData[id]) return clineUpstreamsLoad(id).then(run)
+  return run()
 }
 
 /**

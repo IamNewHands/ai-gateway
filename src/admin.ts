@@ -30,7 +30,7 @@ import { MAX_ADMIN_REQUEST_BYTES, readOptionalJSONLimited, readStrictJSONLimited
 import { isTraeProvider, testTraeCredential, testTraeModel } from './trae/proxy'
 import { diagnoseOpenCodeKey, fetchOpenCodeModels, isOpenCodeProvider, resolveOpenCodeUrls, testOpenCodeModel } from './opencode'
 import { isQoderFlow, fetchQoderModels, testQoderModel } from './qoder/proxy'
-import { isClineProvider, fetchClineRecommendedModels, testClineChat, testClineRefreshToken, probeClineAccount, startClineOAuth, pollClineOAuth, probeClineProviderUpstream, validateClineProviderUpstream, readClineUpstreamCache, MIN_GAP_MS, DEFAULT_MODEL } from './cline/proxy'
+import { isClineProvider, fetchClineRecommendedModels, testClineChat, testClineRefreshToken, probeClineAccount, startClineOAuth, pollClineOAuth, probeClineProviderUpstream, validateClineProviderUpstream, verifyClineProviderUpstream, readClineUpstreamCache, MIN_GAP_MS, DEFAULT_MODEL } from './cline/proxy'
 import { isGeminiProvider, testGeminiModel, GEMINI_MODELS } from './gemini/proxy'
 import { fetchGeminiQuota } from './gemini/quota'
 import { isCnbProvider, testCnbConnection, CNB_MODELS } from './cnb/proxy'
@@ -2072,10 +2072,39 @@ export async function handleClineUpstreams(c: Context<AppEnv>) {
       pins: provider.clinePinByModel || {},
       probes: cache.probes,
       checks: cache.checks,
+      verifies: cache.verifies || {},
       updatedAt: cache.updatedAt,
       minGapMs: MIN_GAP_MS,
     },
   })
+}
+
+/**
+ * POST /admin/api/providers/:id/cline-upstreams/verify  body: { model }
+ * 验证「**已保存的**钉住配置」是否真的生效：发 1 次最小真实请求，读回响应里的路由元数据
+ * （`provider_metadata.gateway.routing.finalProvider`）再判定。
+ *
+ * 为什么必须有这个动作：出站偏好是网关自己拼的，`[cline-pin]` 日志只能证明**我们发出去了**；
+ * 而规划器管道会静默丢弃顶层 provider.only（照常 200 出流、不报错、routing 里也看不出你钉过），
+ * 所以"没报错"不能当验收。唯一硬证据是响应里的路由元数据——只有这里能看到。
+ */
+export async function handleClineUpstreamVerify(c: Context<AppEnv>) {
+  const id = c.req.param('id')
+  if (!id) return c.json<ApiResponse>({ success: false, message: '缺少 id 参数' }, 400)
+  const body = await readOptionalJSONLimited<{ model?: unknown }>(c.req.raw, MAX_ADMIN_REQUEST_BYTES)
+  const model = typeof body?.model === 'string' ? body.model.trim() : ''
+  const provider = await getProvider(c.env, id)
+  if (!provider) return c.json<ApiResponse>({ success: false, message: '提供商不存在' }, 404)
+  if (!isClineProvider(provider.id)) {
+    return c.json<ApiResponse>({ success: false, message: '仅支持 Cline 提供商' }, 400)
+  }
+  if (!model) return c.json<ApiResponse>({ success: false, message: '缺少 model 参数' }, 400)
+  if (!(provider.apiKeys || []).some((k) => k.enabled)) {
+    return c.json<ApiResponse>({ success: false, message: '该提供商没有启用的 Cline 账号，无法验证钉住' }, 400)
+  }
+  // 结论由 verifyClineProviderUpstream 落 KV（缓存里的 verifies）：重载面板后仍能看到上次结论
+  const result = await verifyClineProviderUpstream(c.env, provider, model)
+  return c.json<ApiResponse>({ success: true, data: result })
 }
 
 /**

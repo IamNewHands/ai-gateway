@@ -161,7 +161,7 @@ function clineUpApi(html: string): any {
   const js = inlineScripts(html).join('\n')
   const m = js.match(/\/\* CLINE_UP_BEGIN \*\/([\s\S]*?)\/\* CLINE_UP_END \*\//)
   if (!m) throw new Error('未找到 CLINE_UP 标记块：客户端渠道映射块被删除或改名了？')
-  const factory = new Function(m[1] + '\nreturn { clineUpBadge, clineUpCostText, clineUpPinSummary, clineUpState, clineUpNextState, clineUpApplyState, clineUpChannelBadge, clineUpChannelTitle, clineUpExcludeUnresolved }')
+  const factory = new Function(m[1] + '\nreturn { clineUpBadge, clineUpCostText, clineUpPinSummary, clineUpState, clineUpNextState, clineUpApplyState, clineUpChannelBadge, clineUpChannelTitle, clineUpExcludeUnresolved, clineUpVerdict, clineUpVerifyText }')
   return factory()
 }
 
@@ -243,6 +243,20 @@ describe('Cline 面板「上游渠道与固定」客户端映射', () => {
     expect(api.clineUpExcludeUnresolved(null, {})).toBe(false)
   })
 
+  it('「验证钉住」的结论映射：unknown 绝不能显示成生效（那是把"没验证"伪装成"已验证"）', async () => {
+    const api = clineUpApi(await render([traeProvider()]))
+    expect(api.clineUpVerdict('ok')).toEqual(['bd-on', '生效'])
+    expect(api.clineUpVerdict('mismatch')).toEqual(['bd-danger', '未生效'])
+    expect(api.clineUpVerdict('fallback')).toEqual(['bd-warn', '走了兜底'])
+    expect(api.clineUpVerdict('unpinned')[0]).toBe('bd-off')
+    // 读不到路由信息 → 中性徽章，且与 ok 明显不同
+    expect(api.clineUpVerdict('unknown')[0]).toBe('bd-off')
+    expect(api.clineUpVerdict('unknown')[1]).not.toBe(api.clineUpVerdict('ok')[1])
+    expect(api.clineUpVerdict('nonsense')).toEqual(api.clineUpVerdict('unknown'))
+    expect(api.clineUpVerifyText(null)).toBe('')
+    expect(api.clineUpVerifyText({ note: '实际走 alibaba', verifiedAt: 0 })).toBe('实际走 alibaba')
+  })
+
   // 2026-10-06 用户反馈：「固定到 / 模式 / 排序 三个字段选字框里字显示不全」。
   // 根因是全局 select{width:100%} 撞上 .tbl td{min-width:0}，在 auto 表格布局里被压到比选中项还窄。
   it('面板表格里的下拉按内容自适应，且控件列按内容定宽（否则选中项又被裁）', async () => {
@@ -287,13 +301,14 @@ function makePanel(html: string) {
   const net = {
     /** 默认 null = 回显请求载荷（模拟「存下来的就是发上去的」）；用例可覆盖成归一后的结果。 */
     reply: null as any,
+    /** /verify 的响应（与保存分开，验证回的是结论而不是整表）。 */
+    verifyReply: null as any,
     calls: [] as Array<{ url: string; body: any }>,
   }
-  // 徽章按钮替身：从渲染出的 HTML 里抠出 data-cu-* 属性，渲染时挂上的 onclick 会被保留在
+  // 行内按钮替身：从渲染出的 HTML 里抠出 data-cu-* 属性，渲染时挂上的 onclick 会被保留在
   // 这些对象上（每次 querySelectorAll 返回同一批引用），测试才能真的「点」它们。
-  let badgeEls: any[] = []
-  box.querySelectorAll = (sel: string) => {
-    if (sel !== '[data-cu-ch]') return []
+  /** 徽章替身：渲染时的 onclick 会读 data-cu-row 与 data-cu-ch 两个属性，两个都得给。 */
+  const grabBadges = () => {
     const out: any[] = []
     const re = /data-cu-row="(\d+)" data-cu-ch="(\d+)"/g
     let mm: RegExpExecArray | null
@@ -301,12 +316,31 @@ function makePanel(html: string) {
       const attrs: Record<string, string> = { 'data-cu-row': mm[1], 'data-cu-ch': mm[2] }
       out.push({ getAttribute: (k: string) => attrs[k] ?? null })
     }
-    badgeEls = out
     return out
+  }
+  const grabVerify = () => {
+    const out: any[] = []
+    const re = /data-cu-verify="(\d+)"/g
+    let mm: RegExpExecArray | null
+    while ((mm = re.exec(box.innerHTML)) !== null) {
+      const idx = mm[1]
+      out.push({ getAttribute: (k: string) => (k === 'data-cu-verify' ? idx : null) })
+    }
+    return out
+  }
+  let badgeEls: any[] = []
+  let verifyEls: any[] = []
+  box.querySelectorAll = (sel: string) => {
+    if (sel === '[data-cu-ch]') { badgeEls = grabBadges(); return badgeEls }
+    if (sel === '[data-cu-verify]') { verifyEls = grabVerify(); return verifyEls }
+    return []
   }
   const fetchStub = (url: string, init: any) => {
     const body = JSON.parse(String(init?.body || '{}'))
     net.calls.push({ url, body })
+    if (String(url).includes('/verify')) {
+      return Promise.resolve({ json: async () => net.verifyReply ?? { success: true, data: {} } })
+    }
     const reply = net.reply ?? { success: true, data: { clinePinByModel: body.clinePinByModel } }
     return Promise.resolve({ json: async () => reply })
   }
@@ -319,7 +353,7 @@ function makePanel(html: string) {
       ' queue: queueProviderWrite }'
   )
   const api = factory(document, fetchStub, (s: string) => String(s))
-  return { api, box, status, net, badges: () => badgeEls }
+  return { api, box, status, net, badges: () => badgeEls, verifies: () => verifyEls }
 }
 
 describe('Cline 面板：渲染回显与即时保存（DOM 替身驱动客户端代码）', () => {
@@ -452,6 +486,60 @@ describe('Cline 面板：渲染回显与即时保存（DOM 替身驱动客户端
     await flush()
     expect(p.net.calls).toHaveLength(1)
     expect(p.net.calls[0].body).toEqual({ clinePinByModel: { M: { upstreams: ['alibaba'], pinMode: 'strict' } } })
+  })
+
+  // 「验证钉住」：唯一能证明"上游真的照做了"的动作（日志只能证明我们发出去了）
+  it('点「验证」把后端结论渲染到该行（未生效要显示成未生效）', async () => {
+    const p = makePanel(await render([traeProvider()]))
+    p.api.setData({ models: ['M'], pins: { M: { upstreams: ['alibaba'] } }, probes: probe(['alibaba']), checks: {} })
+    p.net.verifyReply = {
+      success: true,
+      data: {
+        model: 'M', verdict: 'mismatch', finalProvider: 'baseten', fallbacksAvailable: [],
+        note: '实际走 baseten，不在白名单 [alibaba] 内——钉住没生效', verifiedAt: 0,
+      },
+    }
+    p.api.render('cline')
+    expect(p.verifies()).toHaveLength(1)
+    p.verifies()[0].onclick()
+    await flush()
+    expect(p.net.calls.some((c) => c.url.includes('/cline-upstreams/verify'))).toBe(true)
+    expect(p.box.innerHTML).toContain('未生效')
+    expect(p.box.innerHTML).toContain('baseten')
+    expect(p.status.textContent).toContain('未生效')
+  })
+
+  it('没配钉住的模型不发验证请求（省一次真实请求，并明确告诉用户先去勾选）', async () => {
+    const p = makePanel(await render([traeProvider()]))
+    p.api.setData({ models: ['M'], pins: {}, probes: probe(['alibaba']), checks: {} })
+    p.api.render('cline')
+    p.verifies()[0].onclick()
+    await flush()
+    expect(p.net.calls).toHaveLength(0)
+    expect(p.status.textContent).toContain('还没配钉住')
+  })
+
+  it('验证前先等保存落库（否则验的是上一次存下来的配置，结论没有意义）', async () => {
+    const p = makePanel(await render([traeProvider()]))
+    p.api.setData({ models: ['M'], pins: { M: { upstreams: ['alibaba'] } }, probes: probe(['alibaba']), checks: {} })
+    p.net.verifyReply = { success: true, data: { model: 'M', verdict: 'ok', note: '实际走 alibaba', verifiedAt: 0 } }
+    p.api.render('cline')
+
+    let release: () => void = () => {}
+    const gate = new Promise<void>((r) => { release = r })
+    const blocker = p.api.queue(() => gate)
+    await flush()
+    p.api.save('cline') // 占住队列 = 保存中
+    await flush()
+
+    p.verifies()[0].onclick()
+    await flush()
+    expect(p.net.calls.some((c) => c.url.includes('/verify'))).toBe(false) // 被保存挡住，还没验
+
+    release()
+    await blocker
+    await flush()
+    expect(p.net.calls.some((c) => c.url.includes('/verify'))).toBe(true)
   })
 })
 
