@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
-import { parseCooldownMs, fetchClineModels, isRunawayReasoningCutoff, isDegenerateReasoningDeltas, isWhitespaceOnlyReasoningDelta, normalizeReasoningDeltaForUI, pumpStreamAttempt, sanitizeClineMessages, isFreeClineModel, clineModelFallbackChain, buildUpstreamBody, clineMaxOutputLimit, clineMaxTokensClamp, proxyClineChatRequest, __resetClineCatalogCacheForTests, CLINE_MAX_TOKENS, CLINE_FREE_WHITELIST, CLINE_CHAT_CONNECT_TIMEOUT_MS, CLINE_MAX_TRANSPORT_ATTEMPTS, CLINE_PROBE_MAX_MS, CLINE_KEEPALIVE_MS, DEFAULT_MODEL } from './proxy'
+import { parseCooldownMs, fetchClineModels, isRunawayReasoningCutoff, isDegenerateReasoningDeltas, isWhitespaceOnlyReasoningDelta, normalizeReasoningDeltaForUI, pumpStreamAttempt, sanitizeClineMessages, isFreeClineModel, clineModelFallbackChain, buildUpstreamBody, clineMaxOutputLimit, clineMaxTokensClamp, proxyClineChatRequest, __resetClineCatalogCacheForTests, CLINE_MAX_TOKENS, CLINE_FREE_WHITELIST, CLINE_CHAT_CONNECT_TIMEOUT_MS, CLINE_MAX_TRANSPORT_ATTEMPTS, CLINE_PROBE_MAX_MS, CLINE_KEEPALIVE_MS, DEFAULT_MODEL, summarizeClineUpstreamError } from './proxy'
 import type { Provider } from '../types'
 
 /** 读取一个 Response 的完整文本（用于流式结果断言）。 */
@@ -793,6 +793,133 @@ describe('402 余额耗尽与免费链降级', () => {
     expect(bodies).toHaveLength(1)
     expect(bodies[0].model).toBe(DEFAULT_MODEL)
     expect(bodies[0].max_tokens).toBeUndefined()
+  })
+})
+
+// 降级链的中间失败必须留痕（移植 luawei1/cline2api issue #32 附带发现）：
+// 否则客户端只看到链尾模型的错误，首选模型被掩盖的真实原因在日志里完全看不见。
+describe('降级链中间失败日志（issue #32 附带发现）', () => {
+  /** 抓 console.warn/log 输出，等待微任务队列排空（摘录是 clone().text().then 里异步打的）。 */
+  async function captureLogs(fn: () => Promise<void>): Promise<string[]> {
+    const out: string[] = []
+    const spyWarn = vi.spyOn(console, 'warn').mockImplementation((...a: unknown[]) => { out.push(a.map(String).join(' ')) })
+    const spyLog = vi.spyOn(console, 'log').mockImplementation((...a: unknown[]) => { out.push(a.map(String).join(' ')) })
+    try {
+      await fn()
+      await new Promise((r) => setTimeout(r, 0)) // 让 clone().text().then 回调跑完
+    } finally {
+      spyWarn.mockRestore()
+      spyLog.mockRestore()
+    }
+    return out
+  }
+
+  it('首选模型 402 时打出该模型名 + 状态码 + 上游错误摘录', async () => {
+    const logs = await captureLogs(async () => {
+      installFetch((body) =>
+        body.model === PAID_MODEL
+          ? jsonResp({ error: { code: 'insufficient_credits', message: 'Insufficient balance. balance is $0.01' } }, 402)
+          : sseOkResp(),
+      )
+      const resp = await proxyClineChatRequest(
+        undefined,
+        clineProvider([REFRESH_TOKEN]),
+        { model: PAID_MODEL, messages: [{ role: 'user', content: 'hi' }] },
+        { stream: false },
+      )
+      await resp.text()
+    })
+    const line = logs.find((l) => l.includes(String(PAID_MODEL)) && l.includes('402'))
+    expect(line).toBeDefined()
+    // 真实失败原因（Insufficient balance）必须在日志里，不能只剩链尾模型的错误
+    expect(line).toContain('Insufficient balance')
+  })
+
+  it('429 同样留痕', async () => {
+    const logs = await captureLogs(async () => {
+      installFetch((body) => (body.model === PAID_MODEL ? jsonResp({ error: 'rate limited upstream' }, 429) : sseOkResp()))
+      const resp = await proxyClineChatRequest(
+        undefined,
+        clineProvider([REFRESH_TOKEN]),
+        { model: PAID_MODEL, messages: [{ role: 'user', content: 'hi' }] },
+        { stream: false },
+      )
+      await resp.text()
+    })
+    expect(logs.some((l) => l.includes(String(PAID_MODEL)) && l.includes('429'))).toBe(true)
+    expect(logs.some((l) => l.includes('rate limited upstream'))).toBe(true)
+    // 429 会置账号冷却并按退避重试多次（3×500~1000ms），默认 5s 超时不够
+  }, 20000)
+
+  it('读摘录不消费响应体：客户端仍能拿到原错误 body（clone 而非直接读）', async () => {
+    await captureLogs(async () => {
+      installFetch((body) =>
+        body.model === PAID_MODEL ? jsonResp({ error: { code: 'insufficient_credits', message: 'Insufficient balance' } }, 402) : sseOkResp(),
+      )
+      const resp = await proxyClineChatRequest(
+        undefined,
+        clineProvider([REFRESH_TOKEN]),
+        { model: PAID_MODEL, messages: [{ role: 'user', content: 'hi' }] },
+        { stream: false },
+      )
+      expect(resp.status).toBe(200)
+      const data = (await resp.json()) as { choices: Array<{ message: { content: string } }> }
+      expect(data.choices[0].message.content).toBe('hi')
+    })
+  })
+
+  it('链尾候选自身 402 时不说"served via"（原措辞会把失败记成成功）', async () => {
+    const logs = await captureLogs(async () => {
+      // 只让首选模型 402，链尾走成功——但点名模型与兜底不同，需构造链尾失败：
+      // 让所有模型都402，此时最后一条走 exhausted 分支。
+      installFetch(() => jsonResp({ error: { code: 'insufficient_credits', message: 'Insufficient balance' } }, 402))
+      const resp = await proxyClineChatRequest(
+        undefined,
+        clineProvider([REFRESH_TOKEN]),
+        { model: PAID_MODEL, messages: [{ role: 'user', content: 'hi' }] },
+        { stream: false },
+      )
+      expect(resp.status).toBe(402)
+      await resp.text()
+    })
+    expect(logs.some((l) => l.includes('served via') && l.includes('402'))).toBe(false)
+  })
+
+  it('成功降级仍然说 served via（回归保护：不能把成功日志也一起去掉）', async () => {
+    const logs = await captureLogs(async () => {
+      installFetch((body) => (body.model === PAID_MODEL ? jsonResp({ error: 'nope' }, 402) : sseOkResp()))
+      const resp = await proxyClineChatRequest(
+        undefined,
+        clineProvider([REFRESH_TOKEN]),
+        { model: PAID_MODEL, messages: [{ role: 'user', content: 'hi' }] },
+        { stream: false },
+      )
+      await resp.text()
+    })
+    expect(logs.some((l) => l.includes('served via') && l.includes(String(DEFAULT_MODEL)))).toBe(true)
+  })
+})
+
+describe('summarizeClineUpstreamError 摘录解析', () => {
+  it('取 {error:{message}}', () => {
+    expect(summarizeClineUpstreamError('{"error":{"message":"Insufficient balance"}}')).toBe('Insufficient balance')
+  })
+  it('取 {error:"字符串"}', () => {
+    expect(summarizeClineUpstreamError('{"error":"boom"}')).toBe('boom')
+  })
+  it('取 {message} 与 {detail}', () => {
+    expect(summarizeClineUpstreamError('{"message":"rate limited"}')).toBe('rate limited')
+    expect(summarizeClineUpstreamError('{"detail":"try later"}')).toBe('try later')
+  })
+  it('非 JSON 退回首行纯文本并压空白', () => {
+    expect(summarizeClineUpstreamError('Too Many\n  Requests')).toBe('Too Many Requests')
+  })
+  it('空 body → 明确标记，不打印空白', () => {
+    expect(summarizeClineUpstreamError('')).toBe('(空 body)')
+    expect(summarizeClineUpstreamError('   ')).toBe('(空 body)')
+  })
+  it('超长截断到 200 字符', () => {
+    expect(summarizeClineUpstreamError('x'.repeat(500))).toHaveLength(200)
   })
 })
 

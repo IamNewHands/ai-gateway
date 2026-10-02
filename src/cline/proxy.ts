@@ -1240,6 +1240,28 @@ function jsonResponse(obj: unknown, status: number): Response {
 }
 
 /**
+ * 把上游错误 body 压成一行可读摘录，供降级链日志用。
+ *
+ * 上游错误体形状不统一（有的是 `{"error":{"message":...}}`，有的是 `{"message":...}`，
+ * 有的是纯文本 429 提示），全量打进日志既吵又可能带凭据，所以只取 message/error
+ * 字段并截断到 200 字符；解析不出来就退回首行纯文本。
+ */
+export function summarizeClineUpstreamError(text: string): string {
+  const t = (text || '').trim()
+  if (t === '') return '(空 body)'
+  try {
+    const obj = JSON.parse(t) as Record<string, unknown>
+    const err = obj?.error
+    let msg: string | undefined
+    if (typeof err === 'string') msg = err
+    else if (err && typeof err === 'object') msg = String((err as Record<string, unknown>).message ?? '')
+    if (!msg) msg = String(obj?.message ?? obj?.detail ?? '')
+    if (msg) return msg.replace(/\s+/g, ' ').slice(0, 200)
+  } catch { /* 非 JSON：走下面的纯文本分支 */ }
+  return t.replace(/\s+/g, ' ').slice(0, 200)
+}
+
+/**
  * 402 余额耗尽、且该模型在全部账号上都不可用时的响应。
  *
  * 状态码保留 402（上层与客户端能按「余额」语义识别、可与 429 区分），
@@ -1482,11 +1504,26 @@ export async function proxyClineChatRequest(
       // 402/429 = 「该模型在当前账号池上不可用」→ 沿免费链换模型（移植 169fd9d）。
       // 其余错误（400/403/5xx）原样透传：不把参数错误伪装成「换个模型就好了」。
       if ((resp.status === 402 || resp.status === 429) && !isLast) {
+        // 中间失败必须留痕（移植 luawei1/cline2api issue #32 附带发现）：不记的话，
+        // 客户端最终只看到链上**最后一个**模型的错误，首选模型的真实失败原因被完全掩盖
+        // （实测：链落到 muse-spark-1.3-contributor 返回 403 region 限制，而真正的首选
+        // 模型早已 402下架，日志里一片空白）。clone 读一份 body 取摘录，last 仍原样返回。
+        void resp.clone().text().then((t) => {
+          console.warn(`[cline-fallback] model ${model} → ${resp.status}，换下一个候选（已试 ${i + 1}/${chain.length}）：${summarizeClineUpstreamError(t)}`)
+        }).catch(() => {})
         last = resp
         continue
       }
+      // 「served via」只在真的把内容交给客户端时才说。链尾候选自身 402/429 走到这里时
+      // resp 是错误响应，原措辞会把失败记成成功——按错误码分叉。
       if (model !== requested) {
-        console.log(`[cline-fallback] model ${requested} unavailable on all accounts, served via ${model}`)
+        if (resp.ok) {
+          console.log(`[cline-fallback] model ${requested} unavailable on all accounts, served via ${model}`)
+        } else {
+          void resp.clone().text().then((t) => {
+            console.warn(`[cline-fallback] 候选链耗尽，最终仍由 ${model} 返回 ${resp.status}（请求的是 ${requested}）：${summarizeClineUpstreamError(t)}`)
+          }).catch(() => {})
+        }
       }
       const clamp = clineMaxTokensClamp(body)
       if (clamp) console.log(`[cline-max-tokens] ${model} 输出预算被封顶 ${clamp.from}->${clamp.to}（模型硬上限）`)
