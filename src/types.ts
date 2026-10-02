@@ -30,6 +30,31 @@ export interface ApiKeyEntry {
   label?: string
 }
 
+/**
+ * Cline 上游渠道钉住（移植 `munmunjaklin458-afk/cline-pass-switcher` 的 injectPrefs）。
+ *
+ * 背景（2026-10-02 真机实测，free 账号）：Cline 网关后面有两个路由后端，钉住写法完全不同——
+ *   - 规划器管道（Vercel AI Gateway，实测免费档走这条，与 cline-pass 相同）：
+ *     只有 `providerOptions.gateway.{only,order,sort}` 会被透传；
+ *   - 直连管道（OpenRouter）：只有顶层 `provider.{only,order,sort}` 生效。
+ * 管道归属由 Cline 侧决定且会漂移，所以两种形态**同时注入**，各自取用、互不干扰。
+ * 实测负例：顶层 `provider.only` 在规划器管道上被 Cline **静默丢弃**（照常出流、不报错，
+ * 也不出现在 routing 元数据里）——因此不能靠"没报错"判断生效，只能用假渠道探测验证。
+ */
+export interface ClinePinConfig {
+  /**
+   * 要钉住/偏好的上游渠道，按顺序（如 `['baseten']` 或 `['alibaba','baseten']`）。
+   * - `strict`：只用第一个，其余忽略（网关侧回退被清空，钉住的渠道一挂即硬失败）；
+   * - `preferred`：第一个最优先，其余作为网关侧回退顺序（保留兜底）。
+   * 留空 = 不钉渠道，保持网关自动选（原有行为）。
+   */
+  upstreams?: string[]
+  /** `strict`（缺省）= 只钉第一个；`preferred` = 钉住但保留回退顺序。 */
+  pinMode?: 'strict' | 'preferred'
+  /** 渠道排序偏好。Vercel 原生支持这三个值；OpenRouter 侧映射为 price/latency/throughput。 */
+  sort?: 'cost' | 'ttft' | 'tps'
+}
+
 export interface Provider {
   id: string
   name: string
@@ -92,6 +117,11 @@ export interface Provider {
   deepseekThinkingOff?: boolean
   /** 按模型覆盖 reasoningEffort（key = 模型 ID）。仅 opencode 提供商消费。 */
   reasoningEffortByModel?: Record<string, string>
+  /**
+   * Cline 上游渠道钉住：键 = 模型 ID（点名发往上游的那个 ID），值 = 钉住配置。
+   * 不配 = 完全不注入，保持网关自动选渠道（默认行为，零影响）。仅 cline 提供商消费。
+   */
+  clinePinByModel?: Record<string, ClinePinConfig>
   createdAt: string
   updatedAt: string
   /**
@@ -461,6 +491,8 @@ export interface CreateProviderRequest {
   /** OpenCode 提供商默认 reasoning 档位（见 Provider.reasoningEffort） */
   reasoningEffort?: string
   reasoningEffortByModel?: Record<string, string>
+  /** Cline 上游渠道钉住（见 Provider.clinePinByModel） */
+  clinePinByModel?: Record<string, ClinePinConfig>
   /** DeepSeek App 提供商级默认关闭深度思考（见 Provider.deepseekThinkingOff） */
   deepseekThinkingOff?: boolean
   thinkingInject?: string[]
@@ -499,6 +531,8 @@ export interface UpdateProviderRequest {
   /** OpenCode 默认 reasoning 档位（传 null/'' 清除） */
   reasoningEffort?: string | null
   reasoningEffortByModel?: Record<string, string> | null
+  /** Cline 上游渠道钉住（传 null 清除；见 Provider.clinePinByModel） */
+  clinePinByModel?: Record<string, ClinePinConfig> | null
   /** DeepSeek App 默认关闭深度思考（传 false/null 关闭该默认） */
   deepseekThinkingOff?: boolean | null
   /** 传空数组可清空思维引导注入选择 */
@@ -545,6 +579,8 @@ export interface UpsertProviderRequest {
   allowUnlistedModels?: boolean
   reasoningEffort?: string
   reasoningEffortByModel?: Record<string, string>
+  /** Cline 上游渠道钉住（见 Provider.clinePinByModel） */
+  clinePinByModel?: Record<string, ClinePinConfig>
   /** DeepSeek App 默认关闭深度思考（见 Provider.deepseekThinkingOff） */
   deepseekThinkingOff?: boolean
   thinkingInject?: string[]

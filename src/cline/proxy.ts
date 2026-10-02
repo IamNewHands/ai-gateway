@@ -20,7 +20,7 @@
  *    但没有 cline-free/ 前缀，前缀判定会把它当计费档 → 402。
  */
 
-import type { Env, Provider } from '../types'
+import type { ClinePinConfig, Env, Provider } from '../types'
 import { updateProvider, getProviders } from '../storage'
 import { streamFetchWithTimeout } from '../opencode'
 // 通用 tool 配对工具（纯函数、与提供商无关）：Cline 出站历史同样需要清孤儿 tool 结果。
@@ -738,11 +738,76 @@ export function sanitizeClineMessages(messages: unknown): unknown {
   return cleanupOrphanToolCalls(messages).messages
 }
 
+// ===== 上游渠道钉住（移植 munmunjaklin458-afk/cline-pass-switcher 的 injectPrefs） =====
+//
+// 为什么必须"双注入"（2026-10-02 free 账号真机实测，证据见
+// _port-analysis/cline-pass-switcher-porting-analysis.md）：
+//   - 规划器管道（Vercel AI Gateway，实测免费档走这条，与 cline-pass 相同）：
+//     只有嵌套 `providerOptions.gateway` 被透传；顶层 `provider` 被**静默丢弃**——
+//     请求照常 200 出流，routing 元数据里也看不出你钉过，所以别用"没报错"验收；
+//   - 直连管道（OpenRouter）：只有顶层 `provider` 生效，`providerOptions` 被忽略。
+// 管道归属由 Cline 侧按模型决定且会漂移，因此两种形态同时写，各自取用、互不干扰。
+//
+// 有意不移植源项目的 `runChatChain`（按渠道顺序逐个重试）：本仓 2026-10-02 已决定
+// 「只服务点名模型、不做任何自动替换」（见 proxyClineChatRequest 注释），再加一层渠道级
+// 自动重试与该决定冲突，且会把 cline-pass 的订阅额度按候选数放大。
+/** OpenRouter 顶层 `provider.sort` 的枚举名与 Vercel 不同，需要映射。 */
+const CLINE_OR_SORT: Record<string, string> = { cost: 'price', ttft: 'latency', tps: 'throughput' }
+
+/**
+ * 把渠道钉住偏好注入出站请求体。**原地改 `body` 并返回同一个对象**：
+ * `buildUpstreamBody` 把 max_tokens 封顶事实挂在**不可枚举**属性 `__maxTokensClamp` 上，
+ * 换成 spread 复制会把它丢掉，响应侧的 `X-Cline-Max-Tokens-Clamped` 归因头随之失效。
+ *
+ * @param pin 该模型的钉住配置；未配置 / 空配置时**零改动**（保持网关自动选渠道）
+ */
+export function injectClineUpstreamPrefs(
+  body: Record<string, unknown>,
+  pin?: ClinePinConfig | null
+): Record<string, unknown> {
+  const raw = pin && Array.isArray(pin.upstreams) ? pin.upstreams : []
+  const list = [...new Set(raw.filter((u) => typeof u === 'string' && u.trim() !== '').map((u) => u.trim()))]
+  const strict = (pin?.pinMode || 'strict') === 'strict'
+  const sort = pin?.sort
+  if (list.length === 0 && !sort) return body
+
+  const primary = list[0]
+  const rest = list.slice(1)
+
+  // 规划器管道（Vercel AI Gateway）
+  const gw: Record<string, unknown> = {}
+  // strict → only（回退被清空）；preferred → order（保留网关兜底，单渠道也用 order，与源项目一致）
+  if (primary) {
+    if (strict) gw.only = [primary]
+    else gw.order = [primary, ...rest]
+  }
+  if (sort) gw.sort = sort
+  if (Object.keys(gw).length > 0) {
+    const prev = (body.providerOptions as Record<string, unknown> | undefined) || {}
+    const prevGw = (prev.gateway as Record<string, unknown> | undefined) || {}
+    body.providerOptions = { ...prev, gateway: { ...prevGw, ...gw } }
+  }
+
+  // 直连管道（OpenRouter）
+  const or: Record<string, unknown> = {}
+  if (primary) {
+    if (strict) or.only = [primary]
+    else or.order = [primary, ...rest]
+  }
+  if (sort) or.sort = CLINE_OR_SORT[sort] || sort
+  if (Object.keys(or).length > 0) {
+    const prev = (body.provider as Record<string, unknown> | undefined) || {}
+    body.provider = { ...prev, ...or }
+  }
+  return body
+}
+
 export function buildUpstreamBody(
   forwardBody: Record<string, unknown>,
   isStream: boolean,
   sessionId: string,
-  freeSet?: Set<string>
+  freeSet?: Set<string>,
+  pin?: ClinePinConfig | null
 ): Record<string, unknown> {
   const model = (forwardBody.model as string) || DEFAULT_MODEL
   const body: Record<string, unknown> = {
@@ -786,6 +851,10 @@ export function buildUpstreamBody(
   for (const k of passthrough) {
     if ((forwardBody as Record<string, unknown>)[k] !== undefined) body[k] = (forwardBody as Record<string, unknown>)[k]
   }
+  // 渠道钉住放最后：必须在 `__maxTokensClamp` defineProperty 之后，且只能原地改（见函数注释）。
+  // 客户端自带的 provider / providerOptions 不参与透传（不在 passthrough 清单里），
+  // 出站路由偏好**只由网关配置决定**，避免客户端绕过钉住。
+  injectClineUpstreamPrefs(body, pin)
   return body
 }
 
@@ -1592,7 +1661,16 @@ export async function proxyClineChatRequest(
   }
   // 上游恒定强制流式（item4）：免费通道非流式返回 500 "empty response content"，
   // 统一以流式取数，客户端要非流式时再聚合成 chat.completion。
-  const body = buildUpstreamBody({ ...forwardBody, model }, true, sessionId, freeSet)
+  // 渠道钉住按**点名模型**取配置：本仓不做模型级替换，所以这里的 model 就是发给上游的 model。
+  const pin = provider.clinePinByModel?.[model] || null
+  const body = buildUpstreamBody({ ...forwardBody, model }, true, sessionId, freeSet, pin)
+  // 归因：钉住是配置驱动的路由改写，出问题时必须能一眼看出「这条请求被谁钉到哪」。
+  if (pin && ((pin.upstreams?.length ?? 0) > 0 || pin.sort)) {
+    console.log(
+      `[cline-pin] model=${model} mode=${pin.pinMode || 'strict'} ` +
+        `upstreams=[${(pin.upstreams || []).join(',')}] sort=${pin.sort || '-'}`
+    )
+  }
   try {
     const resp = wantStream
       ? await proxyStreamChat(pool, body, sessionId, opts?.signal, _env as Env | undefined)

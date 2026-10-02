@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
-import { parseCooldownMs, fetchClineModels, isRunawayReasoningCutoff, isDegenerateReasoningDeltas, isWhitespaceOnlyReasoningDelta, normalizeReasoningDeltaForUI, pumpStreamAttempt, sanitizeClineMessages, isFreeClineModel, buildUpstreamBody, clineMaxOutputLimit, clineMaxTokensClamp, proxyClineChatRequest, __resetClineCatalogCacheForTests, CLINE_MAX_TOKENS, CLINE_FREE_WHITELIST, CLINE_CHAT_CONNECT_TIMEOUT_MS, CLINE_MAX_TRANSPORT_ATTEMPTS, CLINE_PROBE_MAX_MS, CLINE_KEEPALIVE_MS, DEFAULT_MODEL } from './proxy'
+import { parseCooldownMs, fetchClineModels, isRunawayReasoningCutoff, isDegenerateReasoningDeltas, isWhitespaceOnlyReasoningDelta, normalizeReasoningDeltaForUI, pumpStreamAttempt, sanitizeClineMessages, isFreeClineModel, buildUpstreamBody, injectClineUpstreamPrefs, clineMaxOutputLimit, clineMaxTokensClamp, proxyClineChatRequest, __resetClineCatalogCacheForTests, CLINE_MAX_TOKENS, CLINE_FREE_WHITELIST, CLINE_CHAT_CONNECT_TIMEOUT_MS, CLINE_MAX_TRANSPORT_ATTEMPTS, CLINE_PROBE_MAX_MS, CLINE_KEEPALIVE_MS, DEFAULT_MODEL } from './proxy'
 import type { Provider } from '../types'
 
 /** 读取一个 Response 的完整文本（用于流式结果断言）。 */
@@ -641,6 +641,122 @@ describe('buildUpstreamBody reasoning_effort=none 不下发（移植 cline2api p
   it('none 时出站 JSON 里不含该键（不会被不可枚举标记之外的东西带出去）', () => {
     const body = buildUpstreamBody({ model: PAID_MODEL, reasoning_effort: 'none' }, true, 's1', freeSet)
     expect(JSON.stringify(body)).not.toContain('reasoning_effort')
+  })
+})
+
+// 上游渠道钉住（移植 munmunjaklin458-afk/cline-pass-switcher 的 injectPrefs）。
+// 2026-10-02 free 账号真机实测：免费档走**规划器管道**（Vercel AI Gateway），只有
+// `providerOptions.gateway` 被透传，顶层 `provider` 被 Cline **静默丢弃**（照常 200 出流）；
+// 直连管道则相反。管道会漂移，所以两种形态必须同时注入。证据见
+// _port-analysis/cline-pass-switcher-porting-analysis.md。
+describe('injectClineUpstreamPrefs：上游渠道钉住双注入', () => {
+  it('未配置 pin → 零改动（不产生 provider / providerOptions 键）', () => {
+    const body: Record<string, unknown> = { model: 'm', messages: [] }
+    expect(injectClineUpstreamPrefs(body, null)).toBe(body)
+    expect(body).not.toHaveProperty('provider')
+    expect(body).not.toHaveProperty('providerOptions')
+    expect(injectClineUpstreamPrefs({ model: 'm' }, {})).not.toHaveProperty('provider')
+  })
+
+  it('strict 单渠道 → 两侧都写 only（网关回退被清空）', () => {
+    const body = injectClineUpstreamPrefs({}, { upstreams: ['baseten'] })
+    expect(body.providerOptions).toEqual({ gateway: { only: ['baseten'] } })
+    expect(body.provider).toEqual({ only: ['baseten'] })
+  })
+
+  it('strict 多渠道 → 只取第一个，其余忽略', () => {
+    const body = injectClineUpstreamPrefs({}, { upstreams: ['alibaba', 'baseten'], pinMode: 'strict' })
+    expect((body.providerOptions as any).gateway).toEqual({ only: ['alibaba'] })
+    expect(body.provider).toEqual({ only: ['alibaba'] })
+  })
+
+  it('preferred 多渠道 → 两侧都写 order（保留网关兜底）', () => {
+    const body = injectClineUpstreamPrefs({}, { upstreams: ['alibaba', 'baseten'], pinMode: 'preferred' })
+    expect((body.providerOptions as any).gateway).toEqual({ order: ['alibaba', 'baseten'] })
+    expect(body.provider).toEqual({ order: ['alibaba', 'baseten'] })
+  })
+
+  it('preferred 单渠道也用 order（与源项目一致：钉住但留兜底）', () => {
+    const body = injectClineUpstreamPrefs({}, { upstreams: ['alibaba'], pinMode: 'preferred' })
+    expect((body.providerOptions as any).gateway).toEqual({ order: ['alibaba'] })
+    expect(body.provider).toEqual({ order: ['alibaba'] })
+  })
+
+  it('只配 sort（不钉渠道）→ 两侧都写；OpenRouter 侧枚举名需映射', () => {
+    const pairs = [['cost', 'price'], ['ttft', 'latency'], ['tps', 'throughput']] as const
+    for (const [sort, orSort] of pairs) {
+      const body = injectClineUpstreamPrefs({}, { sort })
+      expect((body.providerOptions as any).gateway.sort).toBe(sort)
+      expect((body.provider as any).sort).toBe(orSort)
+    }
+  })
+
+  it('空 upstreams + 无 sort → 零改动（不写空配置）', () => {
+    const body = injectClineUpstreamPrefs({ model: 'm' }, { upstreams: [] })
+    expect(body).not.toHaveProperty('provider')
+    expect(body).not.toHaveProperty('providerOptions')
+  })
+
+  it('渠道名去重并 trim（避免 order 里出现重复/空白项）', () => {
+    const body = injectClineUpstreamPrefs({}, { upstreams: [' a ', 'a', 'b', ''], pinMode: 'preferred' })
+    expect((body.provider as any).order).toEqual(['a', 'b'])
+  })
+
+  it('已有 providerOptions 的其他键不被覆盖', () => {
+    const body = injectClineUpstreamPrefs(
+      { providerOptions: { other: 1, gateway: { keep: true } } },
+      { upstreams: ['x'] }
+    )
+    expect(body.providerOptions).toEqual({ other: 1, gateway: { keep: true, only: ['x'] } })
+  })
+})
+
+describe('渠道钉住接线（buildUpstreamBody 第 5 参）', () => {
+  const freeSet = new Set([DEFAULT_MODEL])
+
+  it('带 pin 时注入生效', () => {
+    const body = buildUpstreamBody({ model: PAID_MODEL }, true, 's1', freeSet, { upstreams: ['baseten'] })
+    expect(body.provider).toEqual({ only: ['baseten'] })
+    expect((body.providerOptions as any).gateway).toEqual({ only: ['baseten'] })
+  })
+
+  it('回归：注入不得丢掉不可枚举的 __maxTokensClamp（封顶响应头归因依赖它）', () => {
+    const body = buildUpstreamBody(
+      { model: 'cline-free/gemini-3.8-flash', max_tokens: 128000 },
+      true,
+      's1',
+      freeSet,
+      { upstreams: ['baseten'] }
+    )
+    expect(clineMaxTokensClamp(body)).toEqual({ from: 128000, to: 65536 })
+    expect(JSON.parse(JSON.stringify(body))).not.toHaveProperty('__maxTokensClamp')
+  })
+
+  it('客户端自带的 provider / providerOptions 不透传（不能绕过网关钉住配置）', () => {
+    const body = buildUpstreamBody(
+      {
+        model: PAID_MODEL,
+        provider: { only: ['client-evil'] },
+        providerOptions: { gateway: { only: ['client-evil'] } },
+      },
+      true,
+      's1',
+      freeSet,
+      null
+    )
+    expect(body).not.toHaveProperty('provider')
+    expect(body).not.toHaveProperty('providerOptions')
+  })
+
+  it('客户端自带路由偏好 + 网关已配 pin → 以网关配置为准', () => {
+    const body = buildUpstreamBody(
+      { model: PAID_MODEL, provider: { only: ['client-evil'] } },
+      true,
+      's1',
+      freeSet,
+      { upstreams: ['baseten'] }
+    )
+    expect(body.provider).toEqual({ only: ['baseten'] })
   })
 })
 
