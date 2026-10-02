@@ -69,6 +69,74 @@ function billingHeaders(token: string): Record<string, string> {
 }
 
 /**
+ * 真机设备身份（`COSY_*` Secret）。Cloudflare Workers **跑不了** Qoder 桌面端自带的
+ * 原生风控桥 `runtime-info.exe`，所以真机身份只能由用户在装了桌面端的 Windows 机上
+ * 一次性提取后配进网关。
+ *
+ * 为什么必须支持它（2026-10-02 调研四个同类项目 + hub 源码，结论一致）：
+ *   1. 官方 **2026-09-26 起要求请求携带设备标识才下发每日活动**。缺 `Cosy-ClientType: 10`
+ *      时服务端返回 `{"showCampaign":false,"campaigns":[]}`（sunp-1 历史 README 抓包原文）；
+ *   2. 身份是**抄来的常量、不是算出来的**：wallechfox/qoder-checkin、sunp-1/qoder-checkin、
+ *      chevy222/qoder-cf-checkin、chevy222/app-cf-checkin 四个项目全部在本机跑
+ *      `runtime-info.exe --account-stdin` 取 machineToken/machineCode/machineType、读
+ *      `auth.machine-id` 取 machineId、读 `build-manifest.json` 取 version，然后当固定值
+ *      长期回放；**没有一个是随机或派生的**；
+ *   3. hub 做过对照实验（qoder_accounts.py:128-130）：「派生的假身份不会报错，但活动列表里
+ *      会**静默少掉**『每日领取 100 Credits』这类条目（实测：换用原生身份后立刻出现
+ *      CLAIMABLE 活动）」——这正是我们「无可用签到活动」的根因。
+ *
+ * 未配置时回退 uid 派生值（行为与旧版一致），但派生值拿不到设备定向活动。
+ */
+export interface QoderDeviceIdentity {
+  /** Cosy-ClientType：桌面端 10、CLI 5、QoderWork 6 */
+  clientType?: string
+  machineId?: string
+  machineToken?: string
+  machineType?: string
+  machineCode?: string
+  machineOS?: string
+  machineHostname?: string
+  version?: string
+}
+
+/** `COSY_*` 环境变量视图（与 chevy222/qoder-cf-checkin 同名，便于直接复用其提取脚本输出）。 */
+export interface QoderDeviceEnv {
+  COSY_CLIENT_TYPE?: string
+  COSY_MACHINE_ID?: string
+  COSY_MACHINE_TOKEN?: string
+  COSY_MACHINE_TYPE?: string
+  COSY_MACHINE_CODE?: string
+  COSY_MACHINE_OS?: string
+  COSY_MACHINE_HOSTNAME?: string
+  COSY_VERSION?: string
+}
+
+/**
+ * 从 Worker 环境读真机设备身份；一个都没配时返回 undefined（调用方据此走派生路径）。
+ *
+ * 身份是**机器级**的、不是账号级的（app-cf-checkin 设计文档 §7.1：「这是一台机器的身份，
+ * 所以是 config 而不是 creds——多个账号共用一份」），故这里不按 uid 取。
+ */
+export function qoderDeviceFromEnv(env: QoderDeviceEnv | undefined): QoderDeviceIdentity | undefined {
+  if (!env) return undefined
+  const pick = (v: unknown): string | undefined => {
+    const s = typeof v === 'string' ? v.trim() : ''
+    return s || undefined
+  }
+  const device: QoderDeviceIdentity = {
+    clientType: pick(env.COSY_CLIENT_TYPE),
+    machineId: pick(env.COSY_MACHINE_ID),
+    machineToken: pick(env.COSY_MACHINE_TOKEN),
+    machineType: pick(env.COSY_MACHINE_TYPE),
+    machineCode: pick(env.COSY_MACHINE_CODE),
+    machineOS: pick(env.COSY_MACHINE_OS),
+    machineHostname: pick(env.COSY_MACHINE_HOSTNAME),
+    version: pick(env.COSY_VERSION),
+  }
+  return Object.values(device).some(Boolean) ? device : undefined
+}
+
+/**
  * 签到专用头 = 官方桌面端 0.4.3 同款出站头（qoder2api-hub qoder_accounts.py:655-686）。
  *
  * 这是**功能必需**，不是可选装饰。hub 实测记录的两层坑：
@@ -80,24 +148,31 @@ function billingHeaders(token: string): Record<string, string> {
  *   Cosy-Version / Cosy-MachineOS / MachineHostname / MachineId / MachineToken /
  *   MachineType / MachineCode
  *
- * 机器身份复用推理路径的 uid 派生值（与 qoder_sign.py 同一派生式），
- * 保证同一账号在两条路径上呈现同一台设备。
+ * 机器身份优先级：真机 `COSY_*`（`device`，见 QoderDeviceIdentity）> uid 派生值（`sess`）。
  * 注：hub 优先用官方 runtime-info.exe 取**真**身份，Workers 跑不了原生二进制，
- * 故只能用派生值——若签到始终领不到，这是下一个怀疑点。
+ * 故只能用调用方注入的 `device` 或派生值——派生值拿不到每日活动，这是已知上限。
+ *
+ * User-Agent 保持 `Qoder`（**不跟随**那四个项目的 `Qoder/claim`）：`Qoder/claim` 是脚本
+ * 自己起的名字（"claim" 即脚本名），不是抓包值；`Qoder` 有两个独立来源（本文件早前的
+ * 抓包记录 + hub qoder_accounts.py:645 CLIENT_UA）。且那四个项目在「无真机身份」时同样
+ * 发 `Qoder/claim` 却拿到空列表，说明 UA 不是活动是否下发的判别项——改它属于无据变更。
  */
-function checkinHeaders(token: string, sess: CosySession): Record<string, string> {
+function checkinHeaders(token: string, sess: CosySession, device?: QoderDeviceIdentity): Record<string, string> {
   return {
     authorization: `Bearer ${token}`,
     accept: 'application/json, text/plain, */*',
     'accept-language': 'zh-CN',
     'user-agent': 'Qoder',
-    'cosy-clienttype': DESKTOP_CLIENT_TYPE,
-    'cosy-version': DESKTOP_COSY_VERSION,
-    'cosy-machineid': sess.machineId,
-    'cosy-machinetoken': sess.machineToken,
-    'cosy-machinetype': sess.machineType,
-    'cosy-machineos': DESKTOP_MACHINE_OS,
-    'cosy-machinehostname': DESKTOP_MACHINE_HOSTNAME,
+    'cosy-clienttype': device?.clientType || DESKTOP_CLIENT_TYPE,
+    'cosy-version': device?.version || DESKTOP_COSY_VERSION,
+    'cosy-machineid': device?.machineId || sess.machineId,
+    'cosy-machinetoken': device?.machineToken || sess.machineToken,
+    'cosy-machinetype': device?.machineType || sess.machineType,
+    // 真机 machineCode 与 machineType 同为 18 位十六进制（wallechfox 提交的真机 config.json）；
+    // hub 与那四个项目都发这个头，缺它会让本客户端比真机少一个身份字段。
+    'cosy-machinecode': device?.machineCode || sess.machineCode,
+    'cosy-machineos': device?.machineOS || DESKTOP_MACHINE_OS,
+    'cosy-machinehostname': device?.machineHostname || DESKTOP_MACHINE_HOSTNAME,
   }
 }
 
@@ -112,10 +187,11 @@ async function checkinRequest(
   path: string,
   token: string,
   realm: QoderRealm,
-  sess: CosySession
+  sess: CosySession,
+  device?: QoderDeviceIdentity
 ): Promise<Response> {
   const base = QODER_OPENAPI[realm]
-  const headers = checkinHeaders(token, sess)
+  const headers = checkinHeaders(token, sess, device)
   if (method === 'POST') headers.origin = base
   return fetch(base + path, {
     method,
@@ -269,11 +345,17 @@ export interface QoderCheckinDebug {
  * 活动平台**双区域通用**（qoder2api-hub qoder_accounts.py:929「双区域通用」）：
  * 国际版账号同样走这里，只是 openapi 基地址换成 openapi.qoder.sh。
  */
-export async function performQoderCheckin(token: string, realm: QoderRealm = 'cn', uid = '', sess?: CosySession): Promise<QoderCheckinOutcome> {
+export async function performQoderCheckin(
+  token: string,
+  realm: QoderRealm = 'cn',
+  uid = '',
+  sess?: CosySession,
+  device?: QoderDeviceIdentity
+): Promise<QoderCheckinOutcome> {
   const s = await checkinSession(token, uid, sess)
   let res: Response
   try {
-    res = await checkinRequest('GET', '/sash/api/v1/me/campaigns', token, realm, s)
+    res = await checkinRequest('GET', '/sash/api/v1/me/campaigns', token, realm, s, device)
   } catch (e) {
     return { success: false, message: (e as Error).message || '网络请求失败' }
   }
@@ -372,7 +454,7 @@ export async function performQoderCheckin(token: string, realm: QoderRealm = 'cn
 
   let claimRes: Response
   try {
-    claimRes = await checkinRequest('POST', `/sash/api/v1/me/campaigns/${campaignId}/claim`, token, realm, s)
+    claimRes = await checkinRequest('POST', `/sash/api/v1/me/campaigns/${campaignId}/claim`, token, realm, s, device)
   } catch (e) {
     return { success: false, message: (e as Error).message || '网络请求失败', debug: dbg }
   }

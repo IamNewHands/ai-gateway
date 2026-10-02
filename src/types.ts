@@ -761,6 +761,24 @@ export interface Env {
   M365_DEBUG_SSE?: string
   /** M365 SSE 调试日志单条采样字符数（默认 2000），防止长文档/长回答写爆日志 */
   M365_DEBUG_SSE_SAMPLE?: string
+  /**
+   * Qoder 真机设备身份（可选，8 个 `COSY_*` Secret；与 chevy222/qoder-cf-checkin 同名，
+   * 可直接复用该项目的 Windows 提取脚本输出）。
+   *
+   * 官方 2026-09-26 起要求请求携带设备标识才下发「每日领取 100 Credits」活动；这些值
+   * 只能由装了 Qoder 桌面端的机器跑 `runtime-info.exe --account-stdin` 取真值——
+   * Cloudflare Workers 跑不了原生二进制。**未配置时回退 uid 派生值，但派生值拿不到
+   * 设备定向活动**（hub qoder_accounts.py:128-130 对照实验）。身份是机器级、非账号级，
+   * 多账号共用一份。
+   */
+  COSY_CLIENT_TYPE?: string
+  COSY_MACHINE_ID?: string
+  COSY_MACHINE_TOKEN?: string
+  COSY_MACHINE_TYPE?: string
+  COSY_MACHINE_CODE?: string
+  COSY_MACHINE_OS?: string
+  COSY_MACHINE_HOSTNAME?: string
+  COSY_VERSION?: string
 }
 
 export interface AnalyticsEngineDatasetBinding {

@@ -21,7 +21,7 @@ import { getProviders } from './storage'
 import { getOauthAccessToken, detectTokenRealm, refreshQoderTokenPair } from './oauth'
 import { writeLog } from './admin'
 import { isQoderFlow } from './qoder/proxy'
-import { fetchQoderCheckinStatus, performQoderCheckin, fetchQoderUserResource, fetchQoderPaymentType, normalizeQoderRealm, realmHasLegacyCheckin, type QoderRealm } from './qoder/billing'
+import { fetchQoderCheckinStatus, performQoderCheckin, qoderDeviceFromEnv, fetchQoderUserResource, fetchQoderPaymentType, normalizeQoderRealm, realmHasLegacyCheckin, type QoderRealm } from './qoder/billing'
 import {
   readQoderPool,
   seedQoderPoolFromSingle,
@@ -283,7 +283,10 @@ async function checkinQoderPoolAccount(env: Env, provider: Provider, account: Qo
   }
 
   // 执行签到（campaigns 流程；legacy daily-check-in/claim 已 DISABLED，不再使用）
-  const res = await performQoderCheckin(token, realm, account.uid)
+  // 真机设备身份（COSY_*）优先：官方 2026-09-26 起要求带设备标识才下发每日活动；
+  // 未配置时回退 uid 派生值——派生值拿不到「每日领取 100 Credits」，日志里标出是哪一种。
+  const device = qoderDeviceFromEnv(env)
+  const res = await performQoderCheckin(token, realm, account.uid, undefined, device)
   base.success = res.success
   base.message = res.message
   // already = 今日已领取（replayed / 列表 CLAIMED），与「本次新领」区分开：
@@ -324,6 +327,8 @@ async function checkinQoderPoolAccount(env: Env, provider: Provider, account: Qo
         credits: { before: creditsBefore, after: creditsAfter, delta: creditsDelta },
         debug: res.debug,
         quotaRaw,
+        // native = 已配 COSY_* 真机身份；derived = 回退 uid 派生值（拿不到设备定向活动）
+        deviceIdentity: device ? 'native' : 'derived',
       }).substring(0, 4000)
     )
   } catch { /* 日志失败不影响签到结果 */ }

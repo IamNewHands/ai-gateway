@@ -228,6 +228,7 @@ export interface CosySession {
   machineId: string
   machineToken: string
   machineType: string
+  machineCode: string
   tempKey: string
   cosyKey: string
   info: string
@@ -257,13 +258,21 @@ export interface CosyIdentity {
  * 派生式（与 hub 逐字节同构，同一 seed 产出相同值）：
  *   machineId    = md5("machine:" + seed)                  → 32 位十六进制
  *   machineType  = md5("machinetype:" + seed)[:18]
+ *   machineCode  = md5("machinecode:" + seed)[:18]
  *   machineToken = base64url(sha512("machinetoken:" + seed))[:43]
  * 种子优先 uid；uid 未知时回退 accessToken 前 16 位（保证同凭证跨次一致）。
+ *
+ * machineCode 截断到 18 位的依据：真机取到的 machineCode 与 machineType **同为 18 位
+ * 十六进制**（wallechfox/qoder-checkin 提交的真机 config.json：machineCode
+ * `38a381520034aac850`、machineType `13fc94419140c338cf`），与 hub 自身
+ * `derive_machine_type` 的截断口径一致；hub 内联的 `derive_id(uid,"machinecode")`
+ * 取的是全量 32 位 md5，与其 machineType 口径自相矛盾，故不跟随。
  */
 async function newCosySession(id: CosyIdentity): Promise<CosySession> {
   const seed = id.uid || id.securityOauthToken.slice(0, 16)
   const machineID = md5Hex('machine:' + seed)
   const machineType = md5Hex('machinetype:' + seed).slice(0, 18)
+  const machineCode = md5Hex('machinecode:' + seed).slice(0, 18)
   const machineToken = await deriveMachineToken(seed)
   const tempKey = uuid().replace(/-/g, '').slice(0, 16)
 
@@ -293,6 +302,7 @@ async function newCosySession(id: CosyIdentity): Promise<CosySession> {
     machineId: machineID,
     machineToken,
     machineType,
+    machineCode,
     tempKey,
     cosyKey,
     info,

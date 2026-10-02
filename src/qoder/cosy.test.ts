@@ -54,16 +54,26 @@ describe('COSY 对齐 keirouter（身份字段/指纹常量/头集）', () => {
     expect(b.machineId).toBe(a.machineId)
     expect(b.machineToken).toBe(a.machineToken)
     expect(b.machineType).toBe(a.machineType)
+    expect(b.machineCode).toBe(a.machineCode)
     // 不同账号必须彼此独立（阻断跨账号关联）
     const c = await cosySessionFor('dt-other', 'drt', 'uid-other-2', 'n')
     expect(c.machineId).not.toBe(a.machineId)
   })
 
-  it('machineId=md5("machine:"+seed) 32 位、machineType 18 位、machineToken 43 位', async () => {
+  it('machineId=md5("machine:"+seed) 32 位、machineType/machineCode 18 位、machineToken 43 位', async () => {
     const sess = await cosySessionFor('dt-test1', 'drt', 'u1', 'n')
     expect(sess.machineId).toMatch(/^[0-9a-f]{32}$/)
     expect(sess.machineType).toMatch(/^[0-9a-f]{18}$/)
     expect(sess.machineToken).toMatch(/^[A-Za-z0-9_-]{43}$/)
+    // 真机 machineCode 与 machineType 同为 18 位十六进制
+    // （wallechfox/qoder-checkin 提交的真机 config.json：38a381520034aac850 / 13fc94419140c338cf）
+    expect(sess.machineCode).toMatch(/^[0-9a-f]{18}$/)
+  })
+
+  it('machineCode 与 machineType 同为 18 位但各自独立派生（不同盐，不相等）', async () => {
+    const sess = await cosySessionFor('dt-test1', 'drt', 'u1', 'n')
+    expect(sess.machineCode).not.toBe(sess.machineType)
+    expect(sess.machineCode).toBe(md5Hex('machinecode:u1').slice(0, 18))
   })
 
   it('GET 签名覆盖空串：签 qoderEncode("{}") 会与服务端重算不匹配（403 Signature invalid）', async () => {
