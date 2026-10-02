@@ -235,6 +235,33 @@ DSH 的 retry policy 是 `initialDelayMs=500` + `jitterRatio=0.1`（`dsh-llm/lib
   cline 单独收紧，可回退面最小
 - 60s 是**可调常量**：若线上出现「60s 内合法未出首字节」的误杀，改这一个值
 
+### Cline 流式三轮拦截的逐尝试归因日志（2026-10-02）
+
+事故现象：用户报「重试延迟 1020 毫秒」+ `502 {"message":"Cline 推理退化/空响应/上游截断连续 3 次未产出可用流","type":"upstream_runaway"}`。
+
+取证（本会话 DSH 会话记录 `session-1dd262ad`）：`turn2/step23` 与 `turn3/step3` 各两次 502，
+`delayMs` = 471 / 1020（DSH `initialDelayMs=500` + `jitterRatio=0.1` 的正常区间，**不是故障信号**），
+两次都在第 3 次重试成功。按周期耗时反推单次尝试仅 2–9 秒即结束 → 排除建连超时（那是 503
+`upstream_unreachable`）、排除 402 额度（`upstream_plan_exhausted`）、排除传输故障（503），
+剩「上游 200 之后几秒内空流 / 截断结束」。**与图片无关**：turn2 那次发生在发图之前。
+
+缺口：`proxyStreamChat` 三轮拦截只有三合一聚合 502，**一行日志都不打**，线上无法分辨
+退化 / 零帧空流 / 截断无 finish / 探测期读错误（与 cline2api issue #32 的「中间失败无日志」同类）。
+
+修复：
+
+- `pumpStreamAttempt` 新增拦截出口统一构造器 `failed(kind, detail)`，7 个拦截分支各自给出
+  稳定 `detail` 值（`probe-timeout-ws-ratio` / `probe-ws-ratio` / `probe-finish-ws-ratio` /
+  `probe-finish-length-no-content` / `probe-eof-ws-ratio` / `probe-eof-no-frames` /
+  `probe-eof-no-finish`），并附带现场计数 `stats`（`frames` / `content` / `reasoning` /
+  `buffered` / `sawFinish` / `probeReadError`）
+- `proxyStreamChat` 每次拦截打一行 console（CF 仪表盘可查，与 `[cline-fallback]` /
+  `[cline-max-tokens]` 同一口径）：`[cline-attempt] model=… attempt=n/3 kind=… detail=… frames=… content=… reasoning=… buffered=… sawFinish=… probeReadError=… cooldownReqMs=…`
+
+**有意的取舍**：`detail` 是唯一能定性的字段，**新增拦截分支必须给出新的 detail 值**，
+否则又回到「只有三合一文案」的不可归因状态。对客户端响应体一个字没改（仍是原 502 文案），
+避免客户端按 message 做匹配的逻辑被打破。
+
 ### 已知缺口
 
 - **上下文超限不是账号故障**（2026-10-01，`isTraeRequestSideError` 扩充）：上游把上下文超限

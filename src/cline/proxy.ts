@@ -835,9 +835,29 @@ function inspectFrame(obj: Record<string, unknown> | null): FrameFacts {
   return facts
 }
 
+/** 拦截失败时的现场计数（探测期口径）：定性 502 归因用。 */
+interface StreamAttemptStats {
+  /** 探测期已解析的 SSE data 帧数（0 = 上游一个可用帧都没有）。 */
+  frames: number
+  /** 探测期见到的正文字符数。 */
+  content: number
+  /** 探测期见到的 reasoning 字符数。 */
+  reasoning: number
+  /** 放行缓冲里的帧数（拦截时这些帧会被丢弃）。 */
+  buffered: number
+  /** 是否见过带 finish_reason 的帧（false = 上游未正常收尾）。 */
+  sawFinish: boolean
+  /** 探测期读上游是否抛过异常（区分「干净 EOF」与「读错误」）。 */
+  probeReadError: boolean
+}
+
 interface StreamAttemptOutcome {
   kind: 'healthy' | 'degenerate' | 'empty'
   response?: Response
+  /** 失败归因：在 pumpStreamAttempt 的哪个分支被判拦截（唯一定性点，见 failed()）。 */
+  detail?: string
+  /** 失败现场计数（探测期已见的帧/字符），供 proxyStreamChat 逐尝试记日志。 */
+  stats?: StreamAttemptStats
 }
 
 /**
@@ -1068,6 +1088,23 @@ export async function pumpStreamAttempt(
   const PROBE_TIMEOUT = Symbol('probe-timeout')
   /** 探测期唯一在飞的 read：超时放行时必须交给续流任务，否则首帧会被跳过。 */
   let pendingRead: Promise<ReadableStreamReadResult<Uint8Array>> | null = null
+  /**
+   * 拦截出口统一构造器：除 kind 外附带 detail（命中分支）+ 现场计数。
+   * 此前只有聚合 502（「退化/空响应/截断」三合一文案），线上无法分辨到底中了哪一种；
+   * detail 是唯一能定性的字段，新增拦截分支时**必须**给出新的 detail 值。
+   */
+  const failed = (kind: 'degenerate' | 'empty', detail: string): StreamAttemptOutcome => ({
+    kind,
+    detail,
+    stats: {
+      frames: state.frames,
+      content: state.contentChars,
+      reasoning: state.reasoningChars,
+      buffered: buffered.length,
+      sawFinish: state.sawFinish,
+      probeReadError: probeErrored,
+    },
+  })
   try {
     while (true) {
       const readOnce = pendingRead ?? (pendingRead = reader.read())
@@ -1086,7 +1123,7 @@ export async function pumpStreamAttempt(
         const { chars: tChars, ratio: tRatio } = probeWsRatio()
         if (tChars >= DEGENERATE_MIN_CHARS && tRatio >= DEGENERATE_MAX_WS_RATIO) {
           await reader.cancel().catch(() => {})
-          return { kind: 'degenerate' }
+          return failed('degenerate', 'probe-timeout-ws-ratio')
         }
         return flushHealthy(buf, readOnce)
       }
@@ -1130,7 +1167,7 @@ export async function pumpStreamAttempt(
         // 已缓冲足够 reasoning 且空白占绝对主导（≥0.55 持续）→ 退化空转，拦截重试
         if (pChars >= DEGENERATE_MIN_CHARS && pRatio >= DEGENERATE_MAX_WS_RATIO) {
           await reader.cancel().catch(() => {})
-          return { kind: 'degenerate' }
+          return failed('degenerate', 'probe-ws-ratio')
         }
         // 窗口满且空白未占主导 → 是正常（可能一词一行）的思考，健康放行
         if (probeDeltas.length >= PROBE_MAX_DELTAS && pRatio < DEGENERATE_MAX_WS_RATIO) {
@@ -1141,11 +1178,11 @@ export async function pumpStreamAttempt(
         if (facts.finishReason) {
           if (pRatio >= DEGENERATE_MAX_WS_RATIO && pChars >= DEGENERATE_MIN_CHARS) {
             await reader.cancel().catch(() => {})
-            return { kind: 'degenerate' }
+            return failed('degenerate', 'probe-finish-ws-ratio')
           }
           if (facts.finishReason === 'length' && state.contentChars === 0 && !state.hasToolCalls) {
             await reader.cancel().catch(() => {})
-            return { kind: 'empty' }
+            return failed('empty', 'probe-finish-length-no-content')
           }
           if (!noiseFrame) buffered.push(frame)
           return flushHealthy(buf)
@@ -1162,11 +1199,11 @@ export async function pumpStreamAttempt(
   const { chars: tailChars, ratio: tailRatio } = probeWsRatio()
   if (tailChars >= DEGENERATE_MIN_CHARS && tailRatio >= DEGENERATE_MAX_WS_RATIO) {
     await reader.cancel().catch(() => {})
-    return { kind: 'degenerate' }
+    return failed('degenerate', 'probe-eof-ws-ratio')
   }
   if (buffered.length === 0) {
     await reader.cancel().catch(() => {})
-    return { kind: 'empty' }
+    return failed('empty', 'probe-eof-no-frames')
   }
   // 有帧、但全程没见过 finish_reason：上游是「截断结束」而不是正常收尾。
   // 此刻还一字节都没写给客户端（探测期的帧全在 buffered 里），所以可以安全丢弃重试——
@@ -1179,7 +1216,7 @@ export async function pumpStreamAttempt(
   // 没收到任何具名错误帧），所以这个范围足够覆盖它。
   if (!probeErrored && !state.sawFinish) {
     await reader.cancel().catch(() => {})
-    return { kind: 'empty' }
+    return failed('empty', 'probe-eof-no-finish')
   }
   return flushHealthy(buf)
 }
@@ -1223,7 +1260,19 @@ async function proxyStreamChat(
     if (outcome.kind === 'healthy') return outcome.response!
     // 客户端已断开：不再冷却、不再重试，直接放弃本轮（上游白烧的代价已止住）
     if (clientSignal?.aborted) throw clientAbortedError()
-    applyModelCooldown(pool, model, outcome.kind === 'degenerate' ? CLINE_COOLDOWN_RUNAWAY_MS : CLINE_COOLDOWN_EMPTY_MS, clientSignal)
+    const cooldownReqMs = outcome.kind === 'degenerate' ? CLINE_COOLDOWN_RUNAWAY_MS : CLINE_COOLDOWN_EMPTY_MS
+    applyModelCooldown(pool, model, cooldownReqMs, clientSignal)
+    // 逐尝试归因日志：三轮全失败时客户端只拿到三合一的 502 文案，分辨不了中了哪一种
+    // （退化 / 零帧 / 截断无 finish / 探测期读错误）。detail 是 pumpStreamAttempt 拦截出口
+    // 唯一给出的定性字段；stats 计数（尤其 frames=0 与 sawFinish）用于区分「上游空响应」
+    // 与「上游截断」。与 [cline-fallback]/[cline-max-tokens] 同一 console 口径，进 CF 仪表盘日志。
+    console.log(
+      `[cline-attempt] model=${model} attempt=${attempt + 1}/3 kind=${outcome.kind} ` +
+      `detail=${outcome.detail || 'unknown'} frames=${outcome.stats?.frames ?? '?'} ` +
+      `content=${outcome.stats?.content ?? '?'} reasoning=${outcome.stats?.reasoning ?? '?'} ` +
+      `buffered=${outcome.stats?.buffered ?? '?'} sawFinish=${outcome.stats?.sawFinish ?? '?'} ` +
+      `probeReadError=${outcome.stats?.probeReadError ?? '?'} cooldownReqMs=${cooldownReqMs}`
+    )
     await sleep(500 + Math.random() * 500)
   }
   return jsonResponse(

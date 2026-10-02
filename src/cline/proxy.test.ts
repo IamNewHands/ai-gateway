@@ -898,6 +898,34 @@ describe('降级链中间失败日志（issue #32 附带发现）', () => {
     })
     expect(logs.some((l) => l.includes('served via') && l.includes(String(DEFAULT_MODEL)))).toBe(true)
   })
+
+  // 流式三轮拦截的归因（2026-10-02）：客户端此前只拿到三合一 502 文案，无法分辨
+  // 退化 / 零帧 / 截断无 finish / 探测期读错误，线上排查只能靠猜。
+  it('流式三轮全拦截 → 每轮打 [cline-attempt] 归因行，聚合 502 可定性', async () => {
+    const logs = await captureLogs(async () => {
+      // 上游 200 空流（零帧）→ 预期三条 detail=probe-eof-no-frames
+      installFetch(() => new Response('', { status: 200, headers: { 'Content-Type': 'text/event-stream' } }))
+      const resp = await proxyClineChatRequest(
+        undefined,
+        clineProvider([REFRESH_TOKEN]),
+        { model: DEFAULT_MODEL, messages: [{ role: 'user', content: 'hi' }] },
+        { stream: true },
+      )
+      expect(resp.status).toBe(502)
+      const data = (await resp.json()) as { error: { type: string } }
+      expect(data.error.type).toBe('upstream_runaway')
+    })
+    const attempts = logs.filter((l) => l.includes('[cline-attempt]'))
+    expect(attempts).toHaveLength(3)
+    expect(attempts.map((l) => /attempt=(\d)\/3/.exec(l)?.[1])).toEqual(['1', '2', '3'])
+    for (const l of attempts) {
+      expect(l).toContain('kind=empty')
+      expect(l).toContain('detail=probe-eof-no-frames')
+      expect(l).toContain('frames=0')
+      expect(l).toContain('sawFinish=false')
+    }
+    expect(attempts[0]).toContain(`model=${DEFAULT_MODEL}`)
+  }, 20000)
 })
 
 describe('summarizeClineUpstreamError 摘录解析', () => {
@@ -1022,6 +1050,16 @@ describe('上游流未发 finish_reason 的截断兜底（2026-09-25）', () => 
     const outcome = await pumpStreamAttempt(sseResp(dataFrame({ reasoning_content: 'think' })))
     expect(outcome.kind).toBe('empty')
     expect(outcome.response).toBeUndefined()
+    // 归因字段（2026-10-02）：干净 EOF 且见过帧但无 finish_reason → 截断，不是零帧空流
+    expect(outcome.detail).toBe('probe-eof-no-finish')
+    expect(outcome.stats).toMatchObject({ frames: 1, content: 0, reasoning: 5, buffered: 1, sawFinish: false, probeReadError: false })
+  })
+
+  it('上游 200 但一个 data 帧都没有 → 判 empty，detail 与截断区分开（frames=0）', async () => {
+    const outcome = await pumpStreamAttempt(new Response('', { status: 200 }))
+    expect(outcome.kind).toBe('empty')
+    expect(outcome.detail).toBe('probe-eof-no-frames')
+    expect(outcome.stats).toMatchObject({ frames: 0, buffered: 0, sawFinish: false, probeReadError: false })
   })
 
   it('截断 → proxyStreamChat 冷却换号重试，第 2 次完整流才交给客户端', async () => {
