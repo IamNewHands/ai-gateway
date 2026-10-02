@@ -6,6 +6,7 @@ import { CSS_CONTENT } from './pages.css'
 import { baseUrlHostIs } from './url-host'
 import { SHARED_JS, renderSiteFooter } from './shared.js'
 import { ANALYTICS_JS } from './analytics-ui.js'
+import { QODER_DEVICE_FIELDS } from './qoder/device'
 
 // ============================================================================
 // ⚠️ SSR 内联 JS 转义铁律（多次踩坑，改本文件前必读）
@@ -119,6 +120,14 @@ const keyRowHtml = (p: { id?: string }, k: { key: string; enabled: boolean; labe
 }
 
 /**
+ * 面板脚本版本戳：**改这一块的客户端行为就 bump 它**。
+ * 为什么需要：面板 JS 是内联在页面里的，改完要等 CF 部署 + 浏览器刷新才生效；没有版本戳时
+ * 「行为没变」到底是没部署、没刷新，还是代码就是错的，只能靠来回猜（2026-10-06 已经为这个
+ * 浪费过一轮）。用户只要比对刷新前后这一行是否变化，就能自证加载的是不是新脚本。
+ */
+export const CLINE_UP_UI_VERSION = '2026-10-06-multi'
+
+/**
  * Cline「上游渠道与固定」区块（移植 cline-pass-switcher 的控制台能力）。
  *
  * 交互基线（为什么这样排）：
@@ -126,14 +135,16 @@ const keyRowHtml = (p: { id?: string }, k: { key: string; enabled: boolean; labe
  *    在路由层回吐清单，零 token、约 0.3s；校验则是**每个渠道一次真实最小请求**，而且免费通道
  *    并发 >1 会返回空响应，必须串行（间隔 800ms），16 个渠道约占用队列 13s、期间其它 Cline
  *    请求排队。所以校验一律由用户显式发起，并在确认框里写明将要发起的请求数，绝不"顺手全跑"。
- *  - 表格与选择器都由脚本按接口数据渲染；「显示已留档」只读 KV，不打上游。
- *  - 固定设置的保存走通用 PUT /admin/api/providers/:id：clinePinByModel 是**整表替换**语义，
- *    所以前端每次都提交完整的表（未选的模型即视为取消固定）。
- *  - 渠道徽章即「排除」开关：排除是否决权（永不使用该渠道），而不只是白名单的另一面。网关两侧
- *    都不认 exclude/ignore 字段（源项目实测被静默忽略），排除由后端结合渠道清单换算成 only
- *    白名单下发——所以清单缺失时排除会失效，面板必须显式标出（见 clineUpExcludeUnresolved）。
- *  - 三个下拉与徽章的改动都写进本地 `pins`，再按它重渲染：否则探测/校验触发的重渲染会把用户
- *    尚未保存的选择弹回旧值，看起来像「点了没反应」。
+ *  - 表格由脚本按接口数据渲染；「显示已留档」只读 KV，不打上游。
+ *  - 渠道徽章是**三态开关**（勾选 → 排除 → 自动），取代了早期的「固定到」单选下拉：多选是
+ *    真实需求（只用这几个 / 优先这几个），而单选下拉表达不了；两个列表天然互斥，也就不可能
+ *    配出「既勾选又排除」的矛盾状态。排除是否决权，网关两侧都不认 exclude/ignore 字段
+ *    （源项目实测被静默忽略），由后端结合渠道清单换算成 only 白名单下发——清单缺失时排除会
+ *    失效，面板必须显式标出（见 clineUpExcludeUnresolved）。
+ *  - **没有「保存」按钮**：改动即时 PUT 保存，成功后用服务端归一结果回渲染。批式保存的失败模式
+ *    （漏点、请求被中断、归一化丢弃）在用户侧一律表现为「保存不生效」且无从判断，索性消掉这一步。
+ *  - 保存走通用 PUT /admin/api/providers/:id：clinePinByModel 是**整表替换**语义，所以每次都提交
+ *    完整的表（没有设置的模型即视为回到网关自动选）。
  */
 const clineUpstreamSectionHtml = (p: { id?: string }) => {
   const pid = escapePageHtml(p.id)
@@ -143,13 +154,14 @@ const clineUpstreamSectionHtml = (p: { id?: string }) => {
     `<i class="fas fa-chevron-right collapse-icon" aria-hidden="true"></i> 上游渠道与固定（把模型钉在指定渠道上）</button>` +
     `<fieldset class="form-group hd" id="cu-fs-${pid}"><legend>上游渠道与固定</legend>` +
     `<div class="fc mt-1 field-row">` +
-    `<button class="btn btn-s btn-xs" onclick="clineUpstreamsLoad('${js}')" title="读取留档的渠道清单与固定设置；不打上游"><i class="fas fa-list" aria-hidden="true"></i><span>显示已留档</span></button>` +
+    `<button class="btn btn-s btn-xs" onclick="clineUpstreamsLoad('${js}')" title="读取留档的渠道清单与渠道设置；不打上游"><i class="fas fa-list" aria-hidden="true"></i><span>显示已留档</span></button>` +
     `<button class="btn btn-s btn-xs" onclick="clineUpstreamsProbeAll('${js}')" title="逐个模型发一次假渠道请求，让网关回吐可用渠道清单（零 token、每模型约 0.3 秒）"><i class="fas fa-satellite-dish" aria-hidden="true"></i><span>探测全部渠道</span></button>` +
     `<button class="btn btn-gh btn-xs" onclick="clineUpstreamsValidateAll('${js}')" title="对每个模型已探测到的渠道逐个发最小真实请求实测可用性；点击后会先告知请求数与预计耗时"><i class="fas fa-vial" aria-hidden="true"></i><span>校验全部渠道</span></button>` +
-    `<button class="btn btn-p btn-xs" onclick="clineUpstreamsSave('${js}')" title="保存下面每个模型选定的渠道与模式"><i class="fas fa-save" aria-hidden="true"></i><span>保存固定设置</span></button>` +
+    `<button class="btn btn-gh btn-xs" onclick="clineUpstreamsBulk('${js}','all')" title="把每个模型已探测到的渠道按可用状态排序全部勾选（顺序 = 推荐优先级）"><i class="fas fa-check-double" aria-hidden="true"></i><span>全选</span></button>` +
+    `<button class="btn btn-gh btn-xs" onclick="clineUpstreamsBulk('${js}','clear')" title="清空全部勾选与排除（回到网关自动选）"><i class="fas fa-eraser" aria-hidden="true"></i><span>清空</span></button>` +
     `<span class="mu" id="cu-st-${pid}" aria-live="polite" style="font-size:12px"></span></div>` +
     `<div id="cu-tb-${pid}"></div>` +
-    `<span class="form-helper">钉住发生在 Cline 网关之后的路由层：<b>严格</b>只用你选的渠道（网关不再兜底，该渠道一挂即失败）；<b>优先</b>按你排的顺序优先、仍保留网关兜底。<b>点渠道徽章 = 排除</b>（划线即已排除）：排除是<b>否决权</b>，优先级高于「固定到」，「不固定 + 排除几个坏渠道」是最省心的用法。选「不固定」且不排除 = 保持网关自动选。校验中「限流」只代表当前共享池暂时繁忙，渠道本身可用。</span>` +
+    `<span class="form-helper">钉住发生在 Cline 网关之后的路由层。<b>改动即时保存，不需要点保存按钮</b>（状态行会显示「已保存」）。<b>点渠道徽章切换三态</b>：勾选 → 排除 → 自动。勾选的渠道带序号（序号 = 优先顺序）：<b>只用这几个</b>模式下网关只在这几个里选、不再兜底（全挂即失败）；<b>优先</b>模式下它们最优先、其余仍可兜底。排除 = 永不使用（划线），是<b>否决权</b>，优先级高于勾选。一个都不勾 = 网关自动选。校验中「限流」只代表当前共享池暂时繁忙，渠道本身可用。<span class="mu" style="font-size:11px">面板脚本 ${CLINE_UP_UI_VERSION}</span></span>` +
     `</fieldset></div>`
 }
 
@@ -578,6 +590,8 @@ ${H('管理')}
       <a class="admin-nav__link" href="#cache"><i class="fas fa-memory" aria-hidden="true"></i><span>内存缓存</span></a>
       <a class="admin-nav__link" href="#cache-prefix"><i class="fas fa-database" aria-hidden="true"></i><span>缓存前缀</span></a>
       <a class="admin-nav__link" href="#perf"><i class="fas fa-tachometer-alt" aria-hidden="true"></i><span>性能设置</span></a>
+      <p class="admin-nav__group" aria-hidden="true">提供商凭据</p>
+      <a class="admin-nav__link" href="#qoder-device"><i class="fas fa-fingerprint" aria-hidden="true"></i><span>Qoder 设备身份</span></a>
     </nav>
     <div class="admin-rail__foot">
       <a href="javascript:void(0)" onclick="doLogout()" class="admin-nav__link"><i class="fas fa-sign-out-alt" aria-hidden="true"></i><span>退出登录</span></a>
@@ -587,7 +601,7 @@ ${H('管理')}
   <div class="admin-main">
     <header class="admin-topbar">
       <a class="brand" href="/admin"><span class="brand__mark" aria-hidden="true"><i class="fas fa-cloud"></i></span><span class="brand__name">${SITE_CONFIG.title}</span></a>
-      <nav aria-label="移动端控制台导航"><a href="#overview">概览</a><a href="#providers">提供商</a><a href="#proxy-keys">Key</a><a href="#analytics">统计</a><a href="#usage-logs">日志</a><a href="#logs">系统日志</a><a href="#mcps">MCP</a><a href="#unimodels">联合</a><a href="#thinking">思维引导</a><a href="#cache">缓存</a><a href="#cache-prefix">缓存前缀</a><a href="#perf">性能</a></nav>
+      <nav aria-label="移动端控制台导航"><a href="#overview">概览</a><a href="#providers">提供商</a><a href="#proxy-keys">Key</a><a href="#analytics">统计</a><a href="#usage-logs">日志</a><a href="#logs">系统日志</a><a href="#mcps">MCP</a><a href="#unimodels">联合</a><a href="#thinking">思维引导</a><a href="#cache">缓存</a><a href="#cache-prefix">缓存前缀</a><a href="#perf">性能</a><a href="#qoder-device">Qoder 设备</a></nav>
       <a class="icon-btn" href="javascript:void(0)" onclick="doLogout()" aria-label="退出登录"><i class="fas fa-sign-out-alt" aria-hidden="true"></i></a>
     </header>
 
@@ -1059,6 +1073,38 @@ ${H('管理')}
           <span class="form-helper">调低连接超时可更快失败切换；长思考/agent 场景请保持 idle 超时较大；心跳 0 时不注入，避免干扰私有 SSE 解析器。</span>
         </div>
         <div id="perf-result" class="mt-1" aria-live="polite"></div>
+      </section>
+
+      <!-- ===== Qoder 真机设备身份（原 COSY_* Secret，改为面板配置） ===== -->
+      <section id="qoder-device" class="workspace-section" aria-labelledby="qoder-device-title">
+        <div class="section-heading section-heading--admin">
+          <div><h2 id="qoder-device-title">Qoder 设备身份</h2><p>官方 2026-09-26 起要求请求携带设备标识才下发「每日领取 100 Credits」；用 uid 派生的假身份<b>不报错</b>，但活动列表里会静默少掉这条活动（表现就是「无可用签到活动」）。下面填的是在装了 Qoder 桌面端的机器上跑 <code>runtime-info.exe --account-stdin</code> 提取出的真机常量：机器级、多账号共用一份、抄来即可。存 KV，保存后下次签到立即生效（无需重新部署）。</p></div>
+          <div><span class="mu" id="qoder-device-state" style="font-size:12px"></span></div>
+        </div>
+        <div class="form-group">
+          <label class="fg">
+            <span>粘贴提取脚本输出的 JSON（整段 <code>config.json</code> 或只贴 <code>device</code> 块，点右侧按钮自动填充）</span>
+            <textarea id="qoder-device-json" rows="6" class="fx1" style="white-space:pre-wrap;font-family:monospace;font-size:12px" placeholder='{"device":{"clientType":"10","machineId":"...","machineToken":"...","machineType":"...","machineCode":"...","machineOS":"x86_64_windows","machineHostname":"...","version":"0.4.3"}}' spellcheck="false"></textarea>
+          </label>
+          <div class="fc mt-1 field-row">
+            <button class="btn btn-gh btn-xs" onclick="qoderDeviceFillFromJson()"><i class="fas fa-file-import" aria-hidden="true"></i>从 JSON 填充</button>
+            <span class="form-helper">键名大小写/下划线不敏感，<code>COSY_MACHINE_TOKEN</code>、<code>productVersion</code> 这类写法也认。</span>
+          </div>
+        </div>
+        <div class="form-grid">
+          ${QODER_DEVICE_FIELDS.map((f) => `
+          <label class="fg">
+            <span>${f.header}</span>
+            <input type="text" id="qd-${f.key}" class="fx1" autocomplete="off" spellcheck="false" placeholder="${escapePageHtml(f.placeholder)}">
+            <small class="form-helper" style="display:block">${escapePageHtml(f.hint)}</small>
+          </label>`).join('')}
+        </div>
+        <div class="fc mt-1 field-row">
+          <button class="btn btn-p btn-xs" onclick="saveQoderDevice()"><i class="fas fa-save" aria-hidden="true"></i>保存</button>
+          <button class="btn btn-gh btn-xs" onclick="resetQoderDevice()"><i class="fas fa-undo" aria-hidden="true"></i>清空</button>
+          <span class="form-helper">留空字段的后果：<code>Cosy-ClientType / MachineOS / MachineHostname / Version</code> 回退内置默认值；<code>MachineId / MachineToken / MachineType / MachineCode</code> 回退 uid 派生值——<b>派生值拿不到每日活动</b>。保存后签到日志里 <code>deviceIdentity</code> 会从 <code>derived</code> 变成 <code>native</code>。</span>
+        </div>
+        <div id="qoder-device-result" class="mt-1" aria-live="polite"></div>
       </section>
     </main>
 
@@ -3269,9 +3315,9 @@ function clineUpCostText(count, minGapMs) {
   return '将发起 ' + count + ' 次最小请求，约 ' + sec + ' 秒（期间其它 Cline 请求排队）'
 }
 /**
- * 固定摘要：渠道 + 模式 + 排序 + 排除数。
+ * 固定摘要：勾选的渠道 + 模式 + 排序 + 排除数。
  * 排除项**必须**出现在摘要里：exclude 是换算成 only 白名单下发的独立否决清单，摘要是用户
- * 确认「到底保存了什么」的唯一回显；漏掉它，用户改完排除会以为没保存上。
+ * 确认「到底存了什么」的唯一回显；漏掉它，用户改完排除会以为没保存上。
  * 与后端同口径：exclude 优先于 upstreams（同时出现以排除为准），所以这里也要先减掉。
  */
 function clineUpPinSummary(pin) {
@@ -3281,19 +3327,60 @@ function clineUpPinSummary(pin) {
   if (!ups.length && !exc.length && !pin.sort) return ''
   var parts = []
   if (ups.length) {
-    parts.push(ups[0] + (ups.length > 1 ? ' 等 ' + ups.length + ' 个' : '') + (pin.pinMode === 'preferred' ? '（优先）' : '（严格）'))
+    parts.push(ups.length === 1 ? ups[0] : (ups[0] + ' 等 ' + ups.length + ' 个'))
+    parts.push(pin.pinMode === 'preferred' ? '优先' : '只用这几个')
   } else {
-    parts.push('不固定')
+    parts.push('不指定渠道')
   }
   if (exc.length) parts.push('排除 ' + exc.length + ' 个')
   if (pin.sort) parts.push(pin.sort)
   return parts.join(' · ')
 }
-/** 点击徽章切换「排除」：返回新数组，不改入参（面板据此重渲染）。 */
-function clineUpExcludeToggle(list, ch) {
-  var cur = (list || []).filter(function (x) { return x !== ch })
-  if (cur.length === (list || []).length) cur.push(ch)
-  return cur
+/**
+ * 渠道三态：auto（未指定，网关自选）/ allow（勾选：只用它或优先它）/ deny（永不使用）。
+ *
+ * 为什么是三态循环而不是每个渠道两排按钮：一行一个模型、一行里十几个渠道，两排按钮会让行高翻倍。
+ * 循环点击就地表达，且与源项目口径一致（upstreams 与 exclude 互斥，toggleUp 在两个列表间搬）。
+ * 顺序固定 自动 → 勾选 → 排除 → 自动：第一下点出「勾选」是主要用法（挑几个用），
+ * 想否决再多点一下即可，两种用法都只差一次点击。
+ */
+function clineUpState(pin, ch) {
+  if (((pin && pin.exclude) || []).indexOf(ch) !== -1) return 'deny'
+  if (((pin && pin.upstreams) || []).indexOf(ch) !== -1) return 'allow'
+  return 'auto'
+}
+function clineUpNextState(state) {
+  if (state === 'auto') return 'allow'
+  if (state === 'allow') return 'deny'
+  return 'auto'
+}
+/**
+ * 把一次三态切换写回配置，返回新的 upstreams / exclude 两个数组（不改入参）。
+ * 两个列表**互斥**：切换时先把该渠道从两个列表里都摘掉，再放进目标列表——这样
+ * 「既勾选又排除」的矛盾配置在 UI 层就不可能产生（后端仍保留 exclude 优先的兜底裁决）。
+ */
+function clineUpApplyState(pin, ch, next) {
+  var ups = ((pin && pin.upstreams) || []).filter(function (u) { return u !== ch })
+  var exc = ((pin && pin.exclude) || []).filter(function (u) { return u !== ch })
+  if (next === 'allow') ups.push(ch)
+  else if (next === 'deny') exc.push(ch)
+  return { upstreams: ups, exclude: exc }
+}
+/**
+ * 渠道徽章的状态类与状态文案（面板与测试共读这一处）。
+ * orderNo 是勾选序号（1 起）——多选时用户要能看出网关的优先顺序，否则「优先」等于没有顺序。
+ */
+function clineUpChannelBadge(status, state, orderNo) {
+  var b = clineUpBadge(status)
+  var cls = b[0] + (state === 'deny' ? ' is-excluded' : (state === 'allow' ? ' is-allowed' : ''))
+  var prefix = state === 'deny' ? '✕ ' : (state === 'allow' && orderNo ? orderNo + ' ' : '')
+  return [cls, prefix + b[1]]
+}
+/** 徽章的悬停说明：明确写出当前状态与「再点一下会变成什么」，否则三态循环只能靠试。 */
+function clineUpChannelTitle(state, note) {
+  var label = { auto: '自动（网关自选）', allow: '勾选（只用/优先）', deny: '永不使用' }
+  var next = clineUpNextState(state)
+  return '当前：' + label[state] + '。点击改为「' + label[next] + '」' + (note ? ' · ' + note : '')
 }
 /**
  * 「配了排除但没生效」判定：网关两侧都不认 exclude/ignore 字段（实测被静默忽略），排除只能
@@ -3306,7 +3393,12 @@ function clineUpExcludeUnresolved(pin, probe) {
 }
 /* CLINE_UP_END */
 
+/* CLINE_UP_UI_BEGIN */
+// —— Cline 上游渠道与固定：面板渲染与即时保存（pages-inline-script.test.ts 用 DOM 替身驱动这一段）——
 var _clineUpData = {}
+/** 保存中标记 / 保存期间又有改动：并发点击合并成一次「存完再存」，避免后写覆盖先写。 */
+var _clineUpSaving = {}
+var _clineUpDirty = {}
 
 function clineUpEl(id, name) { return document.getElementById('cu-' + name + '-' + id) }
 function clineUpStatus(id, text) { var el = clineUpEl(id, 'st'); if (el) el.textContent = text || '' }
@@ -3359,28 +3451,19 @@ function clineUpstreamsRender(id) {
     var channels = probe.upstreams || []
     var chk = checks[m] || {}
     var pin = pins[m] || {}
+    var allowed = (pin.upstreams || []).filter(Boolean)
     var excluded = (pin.exclude || []).filter(Boolean)
-    var pinned = (pin.upstreams || [])[0] || ''
-    var list = channels.slice()
-    // 已钉但已从清单消失的渠道也要出现在下拉里，否则一保存就被静默清掉
-    if (pinned && list.indexOf(pinned) === -1) list.unshift(pinned)
-    var options = ['<option value="">不固定（网关自动选）</option>']
-    list.forEach(function (c) {
-      var b = clineUpBadge((chk[c] || {}).status)
-      options.push('<option value="' + escapeHtml(c) + '"' + (c === pinned ? ' selected' : '') + '>' + escapeHtml(c) + '（' + b[1] + '）</option>')
-    })
-    // 徽章即排除开关。已排除但已从清单消失的渠道也排进来，否则用户看不见也改不掉它。
-    var badgeList = channels.concat(excluded.filter(function (c) { return channels.indexOf(c) === -1 }))
+    // 已勾选 / 已排除但已从清单消失的渠道也要排进来，否则用户看不见也改不掉它（下架 / 留档过期）
+    var badgeList = channels.concat(allowed.concat(excluded).filter(function (c) { return channels.indexOf(c) === -1 }))
     badgeRows.push({ model: m, channels: badgeList })
     var badges = badgeList.length
       ? badgeList.map(function (c, j) {
-          var b = clineUpBadge((chk[c] || {}).status)
-          var ex = excluded.indexOf(c) !== -1
-          var note = (chk[c] || {}).note || '尚未校验'
-          var title = (ex ? '已排除：永不路由到该渠道。点击恢复' : '点击排除该渠道（永不使用，其余仍由网关自动选）') + ' · ' + note
-          return '<button type="button" class="bd ' + b[0] + (ex ? ' is-excluded' : '') + '"' +
+          var st = clineUpState(pin, c)
+          var b = clineUpChannelBadge((chk[c] || {}).status, st, allowed.indexOf(c) + 1)
+          var title = clineUpChannelTitle(st, (chk[c] || {}).note || '尚未校验')
+          return '<button type="button" class="bd ' + b[0] + '"' +
             ' data-cu-row="' + i + '" data-cu-ch="' + j + '" title="' + escapeHtml(title) + '"' +
-            ' aria-pressed="' + (ex ? 'true' : 'false') + '">' + escapeHtml(c) + ' · ' + b[1] + '</button>'
+            ' aria-pressed="' + (st === 'auto' ? 'false' : 'true') + '">' + escapeHtml(c) + ' · ' + b[1] + '</button>'
         }).join(' ')
       : '<span class="mu">未探测</span>'
     if (badgeList.length && clineUpExcludeUnresolved(pin, probe)) {
@@ -3388,8 +3471,8 @@ function clineUpstreamsRender(id) {
     }
     var pipe = probe.pipeline && probe.pipeline !== 'unknown' ? probe.pipeline : '—'
     var modeSel = '<select id="cu-md-' + id + '-' + i + '" data-cu-row="' + i + '" aria-label="固定模式">' +
-      '<option value="strict"' + ((pin.pinMode || 'strict') === 'strict' ? ' selected' : '') + '>严格</option>' +
-      '<option value="preferred"' + (pin.pinMode === 'preferred' ? ' selected' : '') + '>优先</option></select>'
+      '<option value="strict"' + ((pin.pinMode || 'strict') === 'strict' ? ' selected' : '') + '>只用勾选的</option>' +
+      '<option value="preferred"' + (pin.pinMode === 'preferred' ? ' selected' : '') + '>优先勾选的</option></select>'
     var sortSel = '<select id="cu-so-' + id + '-' + i + '" data-cu-row="' + i + '" aria-label="渠道排序">' +
       '<option value=""' + (!pin.sort ? ' selected' : '') + '>默认</option>' +
       '<option value="cost"' + (pin.sort === 'cost' ? ' selected' : '') + '>成本</option>' +
@@ -3397,14 +3480,13 @@ function clineUpstreamsRender(id) {
       '<option value="tps"' + (pin.sort === 'tps' ? ' selected' : '') + '>吞吐</option></select>'
     return '<tr><td class="cell-fit">' + escapeHtml(m) + '<div class="mu" style="font-size:11px">管道 ' + escapeHtml(pipe) + '</div></td>' +
       '<td style="white-space:normal">' + badges + '</td>' +
-      '<td class="cell-fit"><select id="cu-ch-' + id + '-' + i + '" data-cu-row="' + i + '" aria-label="固定到哪个渠道">' + options.join('') + '</select></td>' +
       '<td class="cell-fit">' + modeSel + '</td>' +
       '<td class="cell-fit">' + sortSel + '</td>' +
       '<td class="cell-fit"><button class="btn btn-gh btn-xs" data-cu-probe="' + i + '" title="重新探测该模型的渠道清单"><i class="fas fa-satellite-dish"></i></button>' +
       '<button class="btn btn-gh btn-xs" data-cu-check="' + i + '" title="实测该模型全部渠道的可用性"><i class="fas fa-vial"></i></button></td></tr>'
   }).join('')
   box.innerHTML = '<div style="max-height:320px;overflow:auto"><table class="tbl"><thead><tr>' +
-    '<th>模型</th><th>可用渠道（点徽章排除）</th><th>固定到</th><th>模式</th><th>排序</th><th>操作</th>' +
+    '<th>模型</th><th>渠道（点徽章切换：勾选 → 排除 → 自动）</th><th>模式</th><th>排序</th><th>操作</th>' +
     '</tr></thead><tbody>' + body + '</tbody></table></div>'
   // 行内控件用事件委托：模型 ID 含 / 与 . 拼进 onclick 会破坏选择器
   Array.prototype.forEach.call(box.querySelectorAll('[data-cu-probe]'), function (btn) {
@@ -3420,28 +3502,21 @@ function clineUpstreamsRender(id) {
       var ch = row.channels[Number(btn.getAttribute('data-cu-ch'))]
       if (!ch) return
       var p = clineUpPin(id, row.model)
-      p.exclude = clineUpExcludeToggle(p.exclude, ch)
-      // 排除优先于固定：刚被排除的渠道不能还留在「固定到」里，否则配置自相矛盾
-      if ((p.upstreams || [])[0] === ch) p.upstreams = []
+      var applied = clineUpApplyState(p, ch, clineUpNextState(clineUpState(p, ch)))
+      p.upstreams = applied.upstreams
+      p.exclude = applied.exclude
       clineUpstreamsRender(id)
+      // 即时保存：面板不设「保存」这一步，就没有「改了没存上」这种状态可言
+      clineUpstreamsSave(id)
     }
   })
-  // 三个下拉把改动写回本地状态：否则探测/校验触发的重渲染会把没保存的选择悄悄弹回旧值
-  Array.prototype.forEach.call(box.querySelectorAll('select[id^="cu-ch-"]'), function (sel) {
-    sel.onchange = function () {
-      var m = models[Number(sel.getAttribute('data-cu-row'))]
-      if (!m) return
-      var p = clineUpPin(id, m)
-      p.upstreams = sel.value ? [sel.value] : []
-      // 选了它就说明要用它：同步把它从排除列表里摘掉，避免「既排除又固定」的矛盾配置
-      if (sel.value) p.exclude = (p.exclude || []).filter(function (x) { return x !== sel.value })
-      clineUpstreamsRender(id)
-    }
-  })
+  // 两个下拉同样即时保存。改完不重渲染，避免刚点开的下拉失去焦点。
   Array.prototype.forEach.call(box.querySelectorAll('select[id^="cu-md-"]'), function (sel) {
     sel.onchange = function () {
       var m = models[Number(sel.getAttribute('data-cu-row'))]
-      if (m) clineUpPin(id, m).pinMode = sel.value
+      if (!m) return
+      clineUpPin(id, m).pinMode = sel.value
+      clineUpstreamsSave(id)
     }
   })
   Array.prototype.forEach.call(box.querySelectorAll('select[id^="cu-so-"]'), function (sel) {
@@ -3451,6 +3526,7 @@ function clineUpstreamsRender(id) {
       var p = clineUpPin(id, m)
       if (sel.value) p.sort = sel.value
       else delete p.sort
+      clineUpstreamsSave(id)
     }
   })
 }
@@ -3535,40 +3611,91 @@ function clineUpstreamsValidateAll(id) {
   return run()
 }
 
+/**
+ * 保存：把本地 pins 整表提交（clinePinByModel 是**整表替换**语义），成功后**用服务端返回的
+ * 归一结果回渲染**。
+ *
+ * 为什么必须回渲染（2026-10-06 用户反馈「模式/排序/排除保存后不生效」）：原实现保存成功后只更新
+ * 内存、不重渲染，于是「面板上看到的」与「服务端存下来的」可以不一致——用户以为自己存了，
+ * 重进一看全变回去了。回渲染让面板立刻显示**真正存下来的东西**，归一化丢弃（或保留）什么一眼可见。
+ *
+ * 为什么改动即时保存、不设「保存」这一步：批式保存要求用户记得点，而任何一次漏点/请求被中断
+ * 都表现为「保存不生效」，用户无从判断。即时保存把这一类状态整个消掉（源项目也是即时保存）。
+ * 并发点击用 in-flight 标记合并：保存中再有改动只置脏位，完成后自动再存一次，不会互相覆盖。
+ */
 function clineUpstreamsSave(id) {
+  if (_clineUpSaving[id]) { _clineUpDirty[id] = true; return Promise.resolve() }
   var data = _clineUpData[id] || {}
   var models = data.models || []
   var map = {}
-  models.forEach(function (m, i) {
-    var ch = document.getElementById('cu-ch-' + id + '-' + i)
-    var md = document.getElementById('cu-md-' + id + '-' + i)
-    var so = document.getElementById('cu-so-' + id + '-' + i)
-    var v = ch ? ch.value : ''
+  models.forEach(function (m) {
+    var p = (data.pins || {})[m] || {}
+    var ups = (p.upstreams || []).filter(Boolean)
+    var exc = (p.exclude || []).filter(Boolean)
     var cfg = {}
-    if (v) {
-      cfg.upstreams = [v]
-      cfg.pinMode = (md && md.value) || 'strict'
+    if (ups.length) {
+      cfg.upstreams = ups
+      cfg.pinMode = p.pinMode === 'preferred' ? 'preferred' : 'strict'
     }
-    if (so && so.value) cfg.sort = so.value
-    // 排除项来自徽章开关（存在本地状态里，见 clineUpPin）：只排除、不固定也是合法配置
-    var exc = (clineUpPin(id, m).exclude || []).filter(Boolean)
     if (exc.length) cfg.exclude = exc
-    if (cfg.upstreams || cfg.exclude || cfg.sort) map[m] = cfg
+    if (p.sort) cfg.sort = p.sort
+    if (ups.length || exc.length || cfg.sort) map[m] = cfg
   })
+  _clineUpSaving[id] = true
   clineUpStatus(id, '保存中…')
   return fetch('/admin/api/providers/' + encodeURIComponent(id), {
     method: 'PUT',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ clinePinByModel: map }),
   }).then(function (r) { return r.json() }).then(function (d) {
-    if (!d.success) { clineUpStatus(id, '保存失败：' + ((d && d.message) || '未知错误')); return }
-    data.pins = map
-    _clineUpData[id] = data
-    var n = Object.keys(map).length
-    clineUpStatus(id, n ? ('已固定 ' + n + ' 个模型') : '已清空固定设置（全部回到网关自动选）')
-    if (typeof toast === 'function') toast('上游固定设置已保存', 'success')
-  }).catch(function () { clineUpStatus(id, '网络错误，请重试') })
+    if (!d || !d.success) {
+      clineUpStatus(id, '保存失败：' + ((d && d.message) || '未知错误') + '（改动未存，请重试）')
+      return false
+    }
+    var cur = _clineUpData[id] || data
+    cur.pins = (d.data && d.data.clinePinByModel) || {}
+    _clineUpData[id] = cur
+    clineUpstreamsRender(id)
+    var n = Object.keys(cur.pins).length
+    clineUpStatus(id, n ? ('已保存 ' + n + ' 个模型的渠道设置') : '已保存：全部回到网关自动选')
+    return true
+  }).catch(function () {
+    clineUpStatus(id, '网络错误，改动未存（请重试）')
+    return false
+  }).then(function (ok) {
+    _clineUpSaving[id] = false
+    if (_clineUpDirty[id]) { _clineUpDirty[id] = false; return clineUpstreamsSave(id) }
+    return ok
+  })
 }
+
+/**
+ * 批量操作（源项目也有「全选优先 / 清空」）：十几个渠道逐个点太累。
+ * 全选按**可用状态**排序（可用 → 限流 → 未知 → 不可用），这样顺序本身就是一份推荐优先级。
+ */
+function clineUpstreamsBulk(id, mode) {
+  var data = _clineUpData[id] || {}
+  var models = data.models || []
+  var probes = data.probes || {}
+  var checks = data.checks || {}
+  var rank = { ok: 0, limited: 1, unknown: 2, bad: 3, auth: 4 }
+  models.forEach(function (m) {
+    var p = clineUpPin(id, m)
+    if (mode === 'clear') { p.upstreams = []; p.exclude = []; return }
+    var chk = checks[m] || {}
+    var chs = ((probes[m] || {}).upstreams || []).slice()
+    chs.sort(function (a, b) {
+      var ra = rank[(chk[a] || {}).status]
+      var rb = rank[(chk[b] || {}).status]
+      return (ra === undefined ? 2 : ra) - (rb === undefined ? 2 : rb)
+    })
+    p.upstreams = chs
+    p.exclude = []
+  })
+  clineUpstreamsRender(id)
+  clineUpstreamsSave(id)
+}
+/* CLINE_UP_UI_END */
 
 function clineCheckAccounts(id, opts) {
   const silent = !!(opts && opts.silent)
@@ -5007,6 +5134,89 @@ adminNavLinks.forEach(function (link) {
 })
 window.addEventListener('hashchange', function () { maybeLoadPerf(location.hash) })
 setTimeout(loadPerfSettings, 100)
+// ===== Qoder 真机设备身份（原 COSY_* Secret，改为面板配置） =====
+var qoderDeviceFields = []
+function qoderDeviceInputs() {
+  var out = []
+  for (var i = 0; i < qoderDeviceFields.length; i++) {
+    var el = document.getElementById('qd-' + qoderDeviceFields[i].key)
+    if (el) out.push(el)
+  }
+  return out
+}
+// 键名归一：去掉 cosy 前缀与非字母数字，于是 config.json 的 camelCase、
+// COSY_MACHINE_TOKEN 这类环境变量写法、build-manifest.json 的 productVersion 都能对上。
+function qoderDeviceKey(v) {
+  var k = String(v == null ? '' : v).toLowerCase().replace(/[^a-z0-9]/g, '')
+  if (k.indexOf('cosy') === 0) k = k.slice(4)
+  if (k === 'productversion' || k === 'clientversion' || k === 'appversion') k = 'version'
+  return k
+}
+function qoderDeviceFillFromJson() {
+  var ta = document.getElementById('qoder-device-json')
+  var out = document.getElementById('qoder-device-result')
+  if (!ta) return
+  var parsed
+  try { parsed = JSON.parse(ta.value) } catch (e) { toast('JSON 解析失败：' + e.message, 'error'); return }
+  var src = (parsed && parsed.device && typeof parsed.device === 'object') ? parsed.device : parsed
+  if (!src || typeof src !== 'object') { toast('没找到 device 对象', 'error'); return }
+  var map = {}
+  Object.keys(src).forEach(function (k) { map[qoderDeviceKey(k)] = src[k] })
+  var filled = 0
+  qoderDeviceInputs().forEach(function (el) {
+    var v = map[qoderDeviceKey(el.id.slice(3))]
+    if (typeof v !== 'string' || !v.trim()) return
+    el.value = v.trim()
+    filled++
+  })
+  if (out) { out.style.color = ''; out.textContent = filled ? ('已填充 ' + filled + ' 个字段，核对后点「保存」') : '没识别到任何字段，请检查粘贴内容' }
+  if (!filled) toast('没识别到任何字段', 'error')
+}
+async function loadQoderDevice() {
+  var st = document.getElementById('qoder-device-state')
+  try {
+    var r = await fetch('/admin/api/qoder-device')
+    var d = await r.json()
+    if (!d.success) { if (st) st.textContent = '加载失败'; return }
+    qoderDeviceFields = (d.data && d.data.fields) || []
+    var dev = (d.data && d.data.device) || {}
+    qoderDeviceInputs().forEach(function (el) { el.value = dev[el.id.slice(3)] || '' })
+    if (st) st.textContent = (d.data && d.data.isCustom) ? '已配置真机身份（签到日志 deviceIdentity=native）' : '未配置：正在用 uid 派生值，拿不到每日活动'
+  } catch (e) { if (st) st.textContent = '加载失败' }
+}
+async function saveQoderDevice() {
+  var out = document.getElementById('qoder-device-result')
+  if (out) { out.textContent = ''; out.style.color = '' }
+  var device = {}
+  qoderDeviceInputs().forEach(function (el) { device[el.id.slice(3)] = el.value })
+  try {
+    var r = await fetch('/admin/api/qoder-device', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ device: device })
+    })
+    var d = await r.json()
+    if (d.success) { toast('已保存（下次签到生效）', 'success'); loadQoderDevice() }
+    else toast(d.message || '保存失败', 'error')
+  } catch (e) { toast('保存失败', 'error') }
+}
+function resetQoderDevice() {
+  cM('清空 Qoder 设备身份？清空后回退 uid 派生值，拿不到「每日领取 100 Credits」。').then(function (ok) {
+    if (!ok) return
+    qoderDeviceInputs().forEach(function (el) { el.value = '' })
+    var ta = document.getElementById('qoder-device-json')
+    if (ta) ta.value = ''
+    saveQoderDevice()
+  })
+}
+function maybeLoadQoderDevice(hash) { if (hash === '#qoder-device') loadQoderDevice() }
+adminNavLinks.forEach(function (link) {
+  if (link.getAttribute('href') === '#qoder-device') {
+    link.addEventListener('click', function () { setTimeout(loadQoderDevice, 50) })
+  }
+})
+window.addEventListener('hashchange', function () { maybeLoadQoderDevice(location.hash) })
+setTimeout(loadQoderDevice, 100)
 setTimeout(loadCache, 0)
 </script>
 </body></html>`)

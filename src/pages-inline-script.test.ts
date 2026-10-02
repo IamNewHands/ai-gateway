@@ -11,7 +11,7 @@
 import { describe, expect, it } from 'vitest'
 import { Hono } from 'hono'
 import type { AppEnv, Provider } from './types'
-import { renderAdminPage } from './pages'
+import { renderAdminPage, CLINE_UP_UI_VERSION } from './pages'
 import { setProviders } from './storage'
 
 function makeEnv() {
@@ -37,6 +37,21 @@ function traeProvider(): Provider {
     createdAt: 'a',
     updatedAt: 'a',
   }
+}
+
+/** 含 Cline 提供商的播种数据：面板区块（上游渠道与固定）只在 cline 提供商上渲染。 */
+function clineProvider(): Provider {
+  return {
+    id: 'cline',
+    name: 'Cline',
+    baseUrl: 'https://api.cline.bot/api/v1',
+    apiType: 'openai',
+    apiKeys: [{ key: 'rt-cline-test', enabled: true }],
+    models: [{ id: 'cline-free/deepseek-v4.1-flash', enabled: true }],
+    enabled: true,
+    createdAt: 'a',
+    updatedAt: 'a',
+  } as unknown as Provider
 }
 
 async function render(providers: Provider[]): Promise<string> {
@@ -146,7 +161,7 @@ function clineUpApi(html: string): any {
   const js = inlineScripts(html).join('\n')
   const m = js.match(/\/\* CLINE_UP_BEGIN \*\/([\s\S]*?)\/\* CLINE_UP_END \*\//)
   if (!m) throw new Error('未找到 CLINE_UP 标记块：客户端渠道映射块被删除或改名了？')
-  const factory = new Function(m[1] + '\nreturn { clineUpBadge, clineUpCostText, clineUpPinSummary, clineUpExcludeToggle, clineUpExcludeUnresolved }')
+  const factory = new Function(m[1] + '\nreturn { clineUpBadge, clineUpCostText, clineUpPinSummary, clineUpState, clineUpNextState, clineUpApplyState, clineUpChannelBadge, clineUpChannelTitle, clineUpExcludeUnresolved }')
   return factory()
 }
 
@@ -171,30 +186,51 @@ describe('Cline 面板「上游渠道与固定」客户端映射', () => {
     expect(api.clineUpCostText(10)).toContain('8 秒')
   })
 
-  it('固定摘要区分严格/优先并带排序（面板回显用）', async () => {
+  it('固定摘要区分「只用这几个/优先」并带排序（面板回显用）', async () => {
     const api = clineUpApi(await render([traeProvider()]))
     expect(api.clineUpPinSummary(null)).toBe('')
     expect(api.clineUpPinSummary({ upstreams: [] })).toBe('')
-    expect(api.clineUpPinSummary({ upstreams: ['alibaba'] })).toBe('alibaba（严格）')
-    expect(api.clineUpPinSummary({ upstreams: ['alibaba'], pinMode: 'preferred' })).toBe('alibaba（优先）')
-    expect(api.clineUpPinSummary({ upstreams: ['alibaba'], pinMode: 'strict', sort: 'cost' })).toBe('alibaba（严格） · cost')
+    expect(api.clineUpPinSummary({ upstreams: ['alibaba'] })).toBe('alibaba · 只用这几个')
+    expect(api.clineUpPinSummary({ upstreams: ['alibaba'], pinMode: 'preferred' })).toBe('alibaba · 优先')
+    expect(api.clineUpPinSummary({ upstreams: ['alibaba'], pinMode: 'strict', sort: 'cost' })).toBe('alibaba · 只用这几个 · cost')
+    // 多选：只列第一个 + 总数，避免十几个渠道把摘要撑爆
+    expect(api.clineUpPinSummary({ upstreams: ['a', 'b', 'c'], pinMode: 'preferred' })).toBe('a 等 3 个 · 优先')
   })
 
   it('固定摘要必须回显排除项（否则用户改完排除会以为没保存上）', async () => {
     const api = clineUpApi(await render([traeProvider()]))
-    expect(api.clineUpPinSummary({ exclude: ['wafer', 'novita'] })).toBe('不固定 · 排除 2 个')
-    expect(api.clineUpPinSummary({ upstreams: ['alibaba'], exclude: ['wafer'] })).toBe('alibaba（严格） · 排除 1 个')
-    // 与后端同口径：exclude 优先于 upstreams —— 同一个渠道既固定又排除时，固定作废
-    expect(api.clineUpPinSummary({ upstreams: ['wafer'], exclude: ['wafer'] })).toBe('不固定 · 排除 1 个')
+    expect(api.clineUpPinSummary({ exclude: ['wafer', 'novita'] })).toBe('不指定渠道 · 排除 2 个')
+    expect(api.clineUpPinSummary({ upstreams: ['alibaba'], exclude: ['wafer'] })).toBe('alibaba · 只用这几个 · 排除 1 个')
+    // 与后端同口径：exclude 优先于 upstreams —— 同一个渠道既勾选又排除时，勾选作废
+    expect(api.clineUpPinSummary({ upstreams: ['wafer'], exclude: ['wafer'] })).toBe('不指定渠道 · 排除 1 个')
   })
 
-  it('点击徽章 = 切换排除（返回新数组，不改入参）', async () => {
+  it('点徽章三态循环：自动 → 勾选 → 排除 → 自动（两个列表互斥）', async () => {
     const api = clineUpApi(await render([traeProvider()]))
-    const src = ['a']
-    expect(api.clineUpExcludeToggle(src, 'b')).toEqual(['a', 'b'])
-    expect(api.clineUpExcludeToggle(src, 'a')).toEqual([])
-    expect(api.clineUpExcludeToggle(undefined, 'a')).toEqual(['a'])
-    expect(src).toEqual(['a'])
+    expect(api.clineUpState({}, 'a')).toBe('auto')
+    expect(api.clineUpState({ upstreams: ['a'] }, 'a')).toBe('allow')
+    expect(api.clineUpState({ exclude: ['a'] }, 'a')).toBe('deny')
+    expect(api.clineUpNextState('auto')).toBe('allow')
+    expect(api.clineUpNextState('allow')).toBe('deny')
+    expect(api.clineUpNextState('deny')).toBe('auto')
+
+    expect(api.clineUpApplyState({}, 'a', 'allow')).toEqual({ upstreams: ['a'], exclude: [] })
+    // 勾选 → 排除：先从 upstreams 摘掉再进 exclude —— 互斥，不可能同时出现在两边
+    expect(api.clineUpApplyState({ upstreams: ['a', 'b'], exclude: ['c'] }, 'a', 'deny'))
+      .toEqual({ upstreams: ['b'], exclude: ['c', 'a'] })
+    // 排除 → 自动：两个列表里都摘掉
+    expect(api.clineUpApplyState({ upstreams: ['a'], exclude: ['b'] }, 'b', 'auto'))
+      .toEqual({ upstreams: ['a'], exclude: [] })
+  })
+
+  it('徽章状态类与序号：勾选带序号、排除划线、自动中性', async () => {
+    const api = clineUpApi(await render([traeProvider()]))
+    expect(api.clineUpChannelBadge('ok', 'auto', 0)).toEqual(['bd-on', '可用'])
+    expect(api.clineUpChannelBadge('ok', 'allow', 2)).toEqual(['bd-on is-allowed', '2 可用'])
+    expect(api.clineUpChannelBadge('limited', 'deny', 0)).toEqual(['bd-warn is-excluded', '✕ 限流'])
+    // 悬停说明必须写出「再点一下会变成什么」，否则三态循环只能靠试
+    expect(api.clineUpChannelTitle('allow', 'x')).toContain('勾选')
+    expect(api.clineUpChannelTitle('allow', 'x')).toContain('永不使用')
   })
 
   it('「配了排除但清单缺失 → 排除未生效」必须能在面板上标出来（留档 7 天过期就属于这种）', async () => {
@@ -214,10 +250,167 @@ describe('Cline 面板「上游渠道与固定」客户端映射', () => {
     const js = inlineScripts(html).join('\n')
     expect(html).toMatch(/\.tbl select[^{]*\{[^}]*width:\s*auto/)
     expect(html).toMatch(/\.tbl td\.cell-fit[^{]*\{[^}]*width:\s*1%/)
-    // 规则不能是死的：模型行里的控件单元格都得带上 cell-fit（5 列：模型/固定到/模式/排序/操作）
-    expect((js.match(/class="cell-fit"/g) || []).length).toBeGreaterThanOrEqual(5)
-    // 渠道徽章改成可点的按钮后，排除态样式也得在（否则看不出哪个被排除了）
+    // 规则不能是死的：模型行里的控件单元格都得带上 cell-fit（模型/模式/排序/操作）
+    expect((js.match(/class="cell-fit"/g) || []).length).toBeGreaterThanOrEqual(4)
+    // 三种渠道状态必须一眼可分（勾选实心边 / 排除划线），否则「看不出哪个被排除了」会反复出现
     expect(html).toMatch(/button\.bd\.is-excluded[^{]*\{[^}]*text-decoration:\s*line-through/)
+    expect(html).toMatch(/button\.bd\.is-allowed[^{]*\{[^}]*box-shadow/)
+  })
+
+  it('面板带脚本版本戳（没有它就无法判断浏览器是否加载了新脚本）', async () => {
+    const html = await render([clineProvider()])
+    expect(html).toContain('面板脚本 ' + CLINE_UP_UI_VERSION)
+    // 非 cline 提供商不该渲染这个区块（不误伤别的 provider）
+    expect(await render([traeProvider()])).not.toContain('面板脚本 ' + CLINE_UP_UI_VERSION)
+  })
+})
+
+/**
+ * 面板渲染与保存的 DOM 替身 harness。
+ *
+ * 为什么必须写：面板的「点击 → 改状态 → 重渲染 → 即时 PUT → 用服务端结果回渲染」全在客户端，
+ * tsc 与内联脚本语法检查都看不出「保存时读 DOM 而不是读状态」「保存后不回渲染」这类错。
+ * 2026-10-06 用户报的「模式/排序/排除保存后不生效」正属于这一类，而当时 8 个用例全绿——
+ * 因为它们只覆盖了纯映射函数。这里直接断言**渲染出的 HTML** 与 **PUT 的载荷**。
+ */
+function makePanel(html: string) {
+  const js = inlineScripts(html).join('\n')
+  const ui = js.match(/\/\* CLINE_UP_UI_BEGIN \*\/([\s\S]*?)\/\* CLINE_UP_UI_END \*\//)
+  const pure = js.match(/\/\* CLINE_UP_BEGIN \*\/([\s\S]*?)\/\* CLINE_UP_END \*\//)
+  if (!ui || !pure) throw new Error('未找到 CLINE_UP / CLINE_UP_UI 标记块：面板渲染/保存块被删除或改名了？')
+
+  const box = { innerHTML: '', querySelectorAll: (_sel: string) => [] as any[] }
+  const status = { textContent: '' }
+  const document = {
+    getElementById: (id: string) => (id === 'cu-tb-cline' ? box : (id === 'cu-st-cline' ? status : null)),
+  }
+  const net = {
+    /** 默认 null = 回显请求载荷（模拟「存下来的就是发上去的」）；用例可覆盖成归一后的结果。 */
+    reply: null as any,
+    calls: [] as Array<{ url: string; body: any }>,
+  }
+  // 徽章按钮替身：从渲染出的 HTML 里抠出 data-cu-* 属性，渲染时挂上的 onclick 会被保留在
+  // 这些对象上（每次 querySelectorAll 返回同一批引用），测试才能真的「点」它们。
+  let badgeEls: any[] = []
+  box.querySelectorAll = (sel: string) => {
+    if (sel !== '[data-cu-ch]') return []
+    const out: any[] = []
+    const re = /data-cu-row="(\d+)" data-cu-ch="(\d+)"/g
+    let mm: RegExpExecArray | null
+    while ((mm = re.exec(box.innerHTML)) !== null) {
+      const attrs: Record<string, string> = { 'data-cu-row': mm[1], 'data-cu-ch': mm[2] }
+      out.push({ getAttribute: (k: string) => attrs[k] ?? null })
+    }
+    badgeEls = out
+    return out
+  }
+  const fetchStub = (url: string, init: any) => {
+    const body = JSON.parse(String(init?.body || '{}'))
+    net.calls.push({ url, body })
+    const reply = net.reply ?? { success: true, data: { clinePinByModel: body.clinePinByModel } }
+    return Promise.resolve({ json: async () => reply })
+  }
+  const factory = new Function(
+    'document', 'fetch', 'escapeHtml',
+    pure[1] + '\n' + ui[1] + '\nreturn {' +
+      ' setData: function (d) { _clineUpData["cline"] = d },' +
+      ' pins: function () { return _clineUpData["cline"].pins },' +
+      ' render: clineUpstreamsRender, save: clineUpstreamsSave, bulk: clineUpstreamsBulk }'
+  )
+  const api = factory(document, fetchStub, (s: string) => String(s))
+  return { api, box, status, net, badges: () => badgeEls }
+}
+
+describe('Cline 面板：渲染回显与即时保存（DOM 替身驱动客户端代码）', () => {
+  const probe = (upstreams: string[]) => ({ M: { upstreams, pipeline: 'planner' } })
+  /** 排空微任务：保存链有 4 层 then，只 await 一个 Promise.resolve() 清不掉 in-flight 标记。 */
+  const flush = () => new Promise((r) => setTimeout(r, 0))
+
+  it('渲染回显：勾选带序号、排除带划线态、模式/排序按服务端数据选中', async () => {
+    const p = makePanel(await render([traeProvider()]))
+    p.api.setData({
+      models: ['M'],
+      pins: { M: { upstreams: ['alibaba', 'novita'], pinMode: 'preferred', sort: 'cost', exclude: ['wafer'] } },
+      probes: probe(['alibaba', 'novita', 'wafer']),
+      checks: {},
+    })
+    p.api.render('cline')
+    const html = p.box.innerHTML
+    // 用户报的「重进看不出哪个被排除了」：排除态必须回到渲染结果里
+    expect(html).toContain('bd-off is-excluded')
+    expect(html).toContain('✕ 未知')
+    expect(html).toMatch(/is-allowed/)
+    expect(html).toMatch(/value="preferred" selected/)
+    expect(html).toMatch(/value="cost" selected/)
+    // 勾选序号 = 优先顺序（多选时用户要能看出网关先试谁）
+    expect(html).toContain('1 未知')
+    expect(html).toContain('2 未知')
+  })
+
+  it('点徽章 = 三态循环 + 即时保存；PUT 载荷是本地整表（含刚点出来的排除）', async () => {
+    const p = makePanel(await render([traeProvider()]))
+    p.api.setData({ models: ['M'], pins: {}, probes: probe(['alibaba', 'wafer']), checks: {} })
+    p.api.render('cline')
+    expect(p.badges()).toHaveLength(2)
+
+    p.badges()[1].onclick() // wafer：自动 → 勾选
+    await flush()
+    expect(p.api.pins().M.upstreams).toEqual(['wafer'])
+    expect(p.net.calls[0].body).toEqual({ clinePinByModel: { M: { upstreams: ['wafer'], pinMode: 'strict' } } })
+
+    p.badges()[1].onclick() // wafer：勾选 → 排除
+    await flush()
+    expect(p.api.pins().M.exclude).toEqual(['wafer'])
+    // 载荷里必须没有 upstreams：勾选与排除互斥，切到排除时勾选要被摘掉
+    expect(p.net.calls[1].body).toEqual({ clinePinByModel: { M: { exclude: ['wafer'] } } })
+
+    p.badges()[1].onclick() // wafer：排除 → 自动
+    await flush()
+    expect(p.net.calls[2].body).toEqual({ clinePinByModel: {} })
+  })
+
+  it('保存后用**服务端返回的**结果回渲染（面板显示的是存下来的，不是我以为的）', async () => {
+    const p = makePanel(await render([traeProvider()]))
+    p.api.setData({
+      models: ['M'],
+      pins: { M: { upstreams: ['alibaba'], pinMode: 'strict' } },
+      probes: probe(['alibaba']),
+      checks: {},
+    })
+    // 服务端归一后多出 sort、少掉 pinMode —— 面板必须照服务端的来
+    p.net.reply = { success: true, data: { clinePinByModel: { M: { upstreams: ['alibaba'], sort: 'cost' } } } }
+    await p.api.save('cline')
+    expect(p.box.innerHTML).toMatch(/value="cost" selected/)
+    expect(p.box.innerHTML).toMatch(/value="strict" selected/)
+    expect(p.status.textContent).toContain('已保存')
+  })
+
+  it('保存失败：不回渲染、状态行明确说「改动未存」（不能假装成功）', async () => {
+    const p = makePanel(await render([traeProvider()]))
+    p.api.setData({ models: ['M'], pins: { M: { exclude: ['wafer'] } }, probes: probe(['wafer']), checks: {} })
+    p.net.reply = { success: false, message: '提供商不存在' }
+    await p.api.save('cline')
+    expect(p.status.textContent).toContain('保存失败')
+    expect(p.status.textContent).toContain('改动未存')
+  })
+
+  it('全选按可用状态排序（顺序 = 推荐优先级），清空回到自动', async () => {
+    const p = makePanel(await render([traeProvider()]))
+    p.api.setData({
+      models: ['M'],
+      pins: { M: { exclude: ['wafer'] } },
+      probes: probe(['baseten', 'alibaba', 'wafer']),
+      checks: { M: { baseten: { status: 'bad' }, alibaba: { status: 'ok' } } },
+    })
+    p.net.reply = { success: true, data: {} }
+    p.api.bulk('cline', 'all')
+    expect(p.api.pins().M.upstreams).toEqual(['alibaba', 'wafer', 'baseten'])
+    expect(p.api.pins().M.exclude).toEqual([])
+    await flush()
+
+    p.api.bulk('cline', 'clear')
+    expect(p.api.pins().M.upstreams).toEqual([])
+    expect(p.api.pins().M.exclude).toEqual([])
   })
 })
 

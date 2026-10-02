@@ -44,9 +44,14 @@ export interface ApiKeyEntry {
 export interface ClinePinConfig {
   /**
    * 要钉住/偏好的上游渠道，按顺序（如 `['baseten']` 或 `['alibaba','baseten']`）。
-   * - `strict`：只用第一个，其余忽略（网关侧回退被清空，钉住的渠道一挂即硬失败）；
-   * - `preferred`：第一个最优先，其余作为网关侧回退顺序（保留兜底）。
+   * - `strict`：**只用这些**（`only` = 整个列表，网关在它们之间选；网关侧回退被清空，
+   *   这些渠道全挂即硬失败）；
+   * - `preferred`：它们按此顺序最优先，其余作为网关侧回退顺序（保留兜底）。
    * 留空 = 不钉渠道，保持网关自动选（原有行为）。
+   *
+   * 多选语义的来由：源项目用「逐个尝试」的故障转移链实现多选，而本仓按
+   * `ac8bd49 退役全部模型级自动替换` 的决定**不移植该链**，所以多选只能落到
+   * `only`/`order` 多值上（网关自己在这几个里挑）。单元素时与旧行为逐字相同。
    */
   upstreams?: string[]
   /**
@@ -773,24 +778,6 @@ export interface Env {
   M365_DEBUG_SSE?: string
   /** M365 SSE 调试日志单条采样字符数（默认 2000），防止长文档/长回答写爆日志 */
   M365_DEBUG_SSE_SAMPLE?: string
-  /**
-   * Qoder 真机设备身份（可选，8 个 `COSY_*` Secret；与 chevy222/qoder-cf-checkin 同名，
-   * 可直接复用该项目的 Windows 提取脚本输出）。
-   *
-   * 官方 2026-09-26 起要求请求携带设备标识才下发「每日领取 100 Credits」活动；这些值
-   * 只能由装了 Qoder 桌面端的机器跑 `runtime-info.exe --account-stdin` 取真值——
-   * Cloudflare Workers 跑不了原生二进制。**未配置时回退 uid 派生值，但派生值拿不到
-   * 设备定向活动**（hub qoder_accounts.py:128-130 对照实验）。身份是机器级、非账号级，
-   * 多账号共用一份。
-   */
-  COSY_CLIENT_TYPE?: string
-  COSY_MACHINE_ID?: string
-  COSY_MACHINE_TOKEN?: string
-  COSY_MACHINE_TYPE?: string
-  COSY_MACHINE_CODE?: string
-  COSY_MACHINE_OS?: string
-  COSY_MACHINE_HOSTNAME?: string
-  COSY_VERSION?: string
 }
 
 export interface AnalyticsEngineDatasetBinding {

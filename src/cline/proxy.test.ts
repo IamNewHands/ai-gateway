@@ -664,10 +664,13 @@ describe('injectClineUpstreamPrefs：上游渠道钉住双注入', () => {
     expect(body.provider).toEqual({ only: ['baseten'] })
   })
 
-  it('strict 多渠道 → 只取第一个，其余忽略', () => {
+  it('strict 多选 → only = 整个列表（「只用这几个」，网关在它们之间选）', () => {
     const body = injectClineUpstreamPrefs({}, { upstreams: ['alibaba', 'baseten'], pinMode: 'strict' })
-    expect((body.providerOptions as any).gateway).toEqual({ only: ['alibaba'] })
-    expect(body.provider).toEqual({ only: ['alibaba'] })
+    expect((body.providerOptions as any).gateway).toEqual({ only: ['alibaba', 'baseten'] })
+    expect(body.provider).toEqual({ only: ['alibaba', 'baseten'] })
+    // 有意偏差：源项目 strict 多选是「逐个尝试」的故障转移链（不移植，见 ac8bd49 退役模型级替换），
+    // 所以这里落到 only 多值；单元素时与旧行为逐字相同。
+    expect(clinePinDecision(body)).toMatchObject({ applied: true, only: ['alibaba', 'baseten'], order: [] })
   })
 
   it('preferred 多渠道 → 两侧都写 order（保留网关兜底）', () => {

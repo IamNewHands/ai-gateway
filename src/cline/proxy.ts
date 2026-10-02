@@ -825,35 +825,34 @@ export function injectClineUpstreamPrefs(
   const strict = (pin.pinMode || 'strict') === 'strict'
   const sort = pin.sort
   const known = norm(knownUpstreams)
-  // 清单缺失时 allowList 置空：**不假装排除生效**（宁可退回网关自动选，也不能谎报"已排除"）。
-  const allowList = veto.length && known.length ? known.filter((u) => !vetoSet.has(u)) : []
+  // 否决围栏（only 白名单）：exclude 与清单**都**有料时才算得出来，否则置空——**不假装排除生效**
+  // （宁可退回网关自动选，也不能谎报"已排除"）。围栏里并入 `list`：勾选的渠道即使已从清单消失
+  // （渠道下架 / 留档过期）也不能被自己的围栏排除掉，否则 order 与 only 互相矛盾、网关行为未定义。
+  const fence = veto.length && known.length
+    ? [...new Set([...list, ...known.filter((u) => !vetoSet.has(u))])]
+    : []
   const excludeUnresolved = veto.length > 0 && known.length === 0
-  const primary = list[0]
-  const rest = list.slice(1)
-  // 钉住的渠道可能已不在清单里（渠道下架 / 留档过期），此时 only 白名单必须先把它算进去，
-  // 否则 order 与 only 互相矛盾（order 要它、only 不要它），网关行为未定义。
-  if (primary && allowList.length && !allowList.includes(primary)) allowList.unshift(primary)
   const decision: ClinePinDecision = {
     applied: false, order: [], only: [], sort: sort || null, excludeUnresolved,
   }
   // 真正「什么都没配」时不留决策摘要：调用方据此判定该不该写归因日志（空配置不产生日志噪声）。
   if (!veto.length && !list.length && !sort) return body
-  if (!primary && !sort && allowList.length === 0) {
+  if (!list.length && !sort && fence.length === 0) {
     attachPinDecision(body, decision)
     return body
   }
 
   // 规划器管道（Vercel AI Gateway）
   const gw: Record<string, unknown> = {}
-  // strict → only（回退被清空）；preferred → order（保留网关兜底，单渠道也用 order，与源项目一致）
-  if (primary) {
-    if (strict) gw.only = [primary]
+  // strict → only（回退被清空，多选即「只用这几个」）；preferred → order（保留网关兜底）
+  if (list.length) {
+    if (strict) gw.only = list
     else {
-      gw.order = [primary, ...rest]
+      gw.order = list
       // preferred 只给 order 的话，网关兜底仍可能落到被排除的渠道 → 必须同时用 only 圈定范围
-      if (allowList.length) gw.only = allowList
+      if (fence.length) gw.only = fence
     }
-  } else if (allowList.length) gw.only = allowList
+  } else if (fence.length) gw.only = fence
   if (sort) gw.sort = sort
   if (Object.keys(gw).length > 0) {
     const prev = (body.providerOptions as Record<string, unknown> | undefined) || {}
@@ -863,13 +862,13 @@ export function injectClineUpstreamPrefs(
 
   // 直连管道（OpenRouter）
   const or: Record<string, unknown> = {}
-  if (primary) {
-    if (strict) or.only = [primary]
+  if (list.length) {
+    if (strict) or.only = list
     else {
-      or.order = [primary, ...rest]
-      if (allowList.length) or.only = allowList
+      or.order = list
+      if (fence.length) or.only = fence
     }
-  } else if (allowList.length) or.only = allowList
+  } else if (fence.length) or.only = fence
   if (sort) or.sort = CLINE_OR_SORT[sort] || sort
   if (Object.keys(or).length > 0) {
     const prev = (body.provider as Record<string, unknown> | undefined) || {}

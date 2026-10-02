@@ -553,11 +553,13 @@ label, legend { color: var(--color-ink-2); font-size: var(--text-xs); font-weigh
    （min-width 只是下限，宽度仍由内容决定，所以不存在反过来撑爆的问题。） */
 .tbl select, .usage-log-table select { width: auto; min-width: max-content; }
 .tbl td.cell-fit, .usage-log-table td.cell-fit { width: 1%; white-space: nowrap; }
-/* 渠道徽章可点选（点 = 排除/恢复）：排除态划线变淡，与「状态徽章」区分开。
-   用 button 而不是 span 是为了键盘可达（span 不可聚焦）。
+/* 渠道徽章可点选（三态循环：勾选 → 排除 → 自动）。用 button 而不是 span 是为了键盘可达。
+   三种状态必须一眼可分，否则「保存后看不出被排除了」这类问题会反复出现：
+   勾选 = 实心强调边（并带优先序号）｜排除 = 划线变淡｜自动 = 原样。
    只重置 border / 字族：font 简写会把 .bd 的字号与字重一起打掉。 */
 button.bd { border: 0; font-family: inherit; cursor: pointer; }
 button.bd:hover { filter: brightness(.96); }
+button.bd.is-allowed { box-shadow: inset 0 0 0 .125rem currentColor; font-weight: 700; }
 button.bd.is-excluded { opacity: .45; text-decoration: line-through; }
 .usage-log-table code { font-size: var(--text-xs); }
 .usage-log-cards { display: none; }
