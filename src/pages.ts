@@ -85,6 +85,18 @@ const isCnbProviderUI = (p: { id?: string; baseUrl?: string }) =>
   p.id === 'cnb' || (typeof p.baseUrl === 'string' && p.baseUrl.includes('cnb.cool'))
 
 /**
+ * Cline 账号行的第二行：有效性徽章 + 账号名输入框（自动关联 email，关联不到可手工填）。
+ * 只有 Cline 需要——它的 apiKey 一行就是一个 refreshToken 账号，裸 token 无法分辨是谁。
+ * 徽章初始为「未检测」，点「检测全部」或保存后由 clineCheckAccounts 回填。
+ */
+const clineAcctRowHtml = (pid: string, idx: number, label?: string) =>
+  `<span class="cline-acct-row" style="flex-basis:100%;display:flex;gap:8px;align-items:center;flex-wrap:wrap">` +
+  `<span class="bd bd-off" id="kst-${escapePageHtml(pid)}-${idx}" title="点上方「检测全部账号」后显示该 RefreshToken 是否仍可用">未检测</span>` +
+  `<input type="text" class="fx1" style="max-width:320px" id="klbl-${escapePageHtml(pid)}-${idx}" value="${escapePageHtml(label || '')}" placeholder="账号（自动关联邮箱；关联不到可手填）" aria-label="账号名（仅显示用）" onblur="clineSaveLabel('${escapePageJsx(pid)}',${idx})">` +
+  `<span class="mu" style="font-size:12px" id="kmsg-${escapePageHtml(pid)}-${idx}"></span>` +
+  `</span>`
+
+/**
  * 是否 WorkBuddy/CodeBuddy 提供商（browser 登录流，或 id 以 workbuddy 开头，
  * 与 src/proxy.ts isWorkbuddyProvider 对齐）。
  * 仅这类上游消费 oauth.effortPolicy（reasoning_effort 档位声明，见 applyWorkbuddyReasoningEffort），
@@ -662,7 +674,7 @@ ${H('管理')}
                   </fieldset>`:''}
                 </fieldset>
               </div>
-              <fieldset class="form-group ${p.authType==='oauth-device'?'hd':''}" id="keys-fs-${escapePageHtml(p.id)}"><legend id="key-legend-${escapePageHtml(p.id)}">${isTraeProviderUI(p)?'TRAE 账号凭证（每个账号一行 JSON）':(p.id==='cline'?'Cline RefreshTokens（每个账号一行）':'上游 API Keys')}</legend><div id="keys-${escapePageHtml(p.id)}">${p.apiKeys.map((k, ki)=>`<div class="fc mb-3 field-row" data-kidx="${ki}"><input type="password" value="${escapePageHtml(k.key)}" class="fx1" id="k-${escapePageHtml(p.id)}-${ki}" placeholder="API Key" aria-label="API Key"><button class="icon-btn" onclick="toggleKeyText(this)" title="显示/隐藏 Key"><i class="fas fa-eye" aria-hidden="true"></i></button><label class="tg"><input type="checkbox" ${k.enabled?'checked':''} id="ken-${escapePageHtml(p.id)}-${ki}" aria-label="启用 Key"><span class="sl"></span></label><button class="btn btn-gh btn-xs" onclick="testKeyRow('${escapePageJsx(p.id)}',${ki})" title="测试 Key"><i class="fas fa-plug" aria-hidden="true"></i><span>测试</span></button><button class="icon-btn" onclick="rmKeyRow('${escapePageJsx(p.id)}',${ki})" aria-label="移除 Key"><i class="fas fa-times" aria-hidden="true"></i></button></div>`).join('')}</div><div class="fc mt-1 field-row"><input type="password" id="nk-${escapePageHtml(p.id)}" placeholder="${isTraeProviderUI(p)?'新的 TRAE 凭证 JSON（或点「登录账号」自动写入）':(p.id==='cline'?'新的 RefreshToken（一个账号一行）':'新的 API Key')}" class="fx1"><button class="btn btn-s btn-xs" onclick="addKeyRow('${escapePageJsx(p.id)}')"><i class="fas fa-plus" aria-hidden="true"></i>添加</button></div><span id="key-hint-${escapePageHtml(p.id)}" class="form-helper">${isTraeProviderUI(p)?'TRAE SOLO 账号凭证为登录后自动写入的 JSON（也可粘贴 trae 登录脚本落盘的 trae-*.json 内容）。每行一个账号、按剩余积分自动挑选，额度用尽自动冷却轮换；禁用该 Key 即停用账号。':(p.id==='cline'?'Cline 使用 Cline 账号的 refreshToken（长期钥匙）。每个账号一行，额度用完自动切换；留空禁用某个账号。':' ')}</span></fieldset>
+              <fieldset class="form-group ${p.authType==='oauth-device'?'hd':''}" id="keys-fs-${escapePageHtml(p.id)}"><legend id="key-legend-${escapePageHtml(p.id)}">${isTraeProviderUI(p)?'TRAE 账号凭证（每个账号一行 JSON）':(p.id==='cline'?'Cline RefreshTokens（每个账号一行）':'上游 API Keys')}</legend><div id="keys-${escapePageHtml(p.id)}">${p.apiKeys.map((k, ki)=>`<div class="fc mb-3 field-row" data-kidx="${ki}"><input type="password" value="${escapePageHtml(k.key)}" class="fx1" id="k-${escapePageHtml(p.id)}-${ki}" placeholder="API Key" aria-label="API Key"><button class="icon-btn" onclick="toggleKeyText(this)" title="显示/隐藏 Key"><i class="fas fa-eye" aria-hidden="true"></i></button><label class="tg"><input type="checkbox" ${k.enabled?'checked':''} id="ken-${escapePageHtml(p.id)}-${ki}" aria-label="启用 Key"><span class="sl"></span></label><button class="btn btn-gh btn-xs" onclick="testKeyRow('${escapePageJsx(p.id)}',${ki})" title="测试 Key"><i class="fas fa-plug" aria-hidden="true"></i><span>测试</span></button><button class="icon-btn" onclick="rmKeyRow('${escapePageJsx(p.id)}',${ki})" aria-label="移除 Key"><i class="fas fa-times" aria-hidden="true"></i></button>${p.id==='cline'?clineAcctRowHtml(p.id, ki, k.label):''}</div>`).join('')}</div><div class="fc mt-1 field-row"><input type="password" id="nk-${escapePageHtml(p.id)}" placeholder="${isTraeProviderUI(p)?'新的 TRAE 凭证 JSON（或点「登录账号」自动写入）':(p.id==='cline'?'新的 RefreshToken（一个账号一行）':'新的 API Key')}" class="fx1"><button class="btn btn-s btn-xs" onclick="addKeyRow('${escapePageJsx(p.id)}')"><i class="fas fa-plus" aria-hidden="true"></i>添加</button></div>${p.id==='cline'?`<div class="fc mt-1 field-row"><button class="btn btn-s btn-xs" onclick="clineCheckAccounts('${escapePageJsx(p.id)}')" title="逐个用 refreshToken 换一次 accessToken，判断是否仍可用并关联账号邮箱"><i class="fas fa-heart-pulse" aria-hidden="true"></i>检测全部账号</button><span class="mu" id="cline-chk-${escapePageHtml(p.id)}" aria-live="polite" style="font-size:12px"></span></div>`:''}<span id="key-hint-${escapePageHtml(p.id)}" class="form-helper">${isTraeProviderUI(p)?'TRAE SOLO 账号凭证为登录后自动写入的 JSON（也可粘贴 trae 登录脚本落盘的 trae-*.json 内容）。每行一个账号、按剩余积分自动挑选，额度用尽自动冷却轮换；禁用该 Key 即停用账号。':(p.id==='cline'?'Cline 使用 Cline 账号的 refreshToken（长期钥匙）。每个账号一行，额度用完自动切换；留空禁用某个账号。点「检测全部账号」会用每个 token 换一次 accessToken：徽章显示是否仍可用，并自动把上游返回的邮箱填进「账号」框；上游关联不到（或 token 已失效）时可手工填账号名便于分辨，只用于显示。':' ')}</span></fieldset>
               ${p.type === 'kuku' ? `<div class="fg"><label for="kuku-think-${escapePageHtml(p.id)}">Kuku 思考模式</label><input type="number" id="kuku-think-${escapePageHtml(p.id)}" min="0" max="10" value="${p.kukuThinkMode ?? 3}"><span class="form-helper">允许 0 到 10，默认 3。</span></div>
               <div class="fg"><button class="btn btn-p btn-sm" onclick="kukuQrLogin('${escapePageJsx(p.id)}')" type="button"><i class="fas fa-qrcode" aria-hidden="true"></i> 扫码登录自动写 Cookie</button><span class="form-helper">用手机百度 App 扫码，后台自动写入 BDUSS Cookie（已保存的提供商将直接更新 Key）。</span></div>` : ''}
               <fieldset class="form-group" id="models-fs-${escapePageHtml(p.id)}" data-effort="${isWorkbuddyProviderUI(p)?'1':'0'}"><legend>模型</legend><div id="ml-${escapePageHtml(p.id)}">${p.models.map((m,mi)=>{ const pol=((p.oauth&&p.oauth.effortPolicy)||{})[m.id]||[]; return `<div class="fc mb-3 field-row" data-idx="${mi}"><input type="text" value="${escapePageHtml(m.id)}" class="fx1" id="mid-${escapePageHtml(p.id)}-${mi}" placeholder="模型 ID"><label class="tg" title="启用模型"><input type="checkbox" ${m.enabled?'checked':''} id="men-${escapePageHtml(p.id)}-${mi}" aria-label="启用模型"><span class="sl"></span></label><label class="tg" title="启用思维引导注入"><input type="checkbox" ${(p.thinkingInject||[]).includes(m.id)?'checked':''} id="mit-${escapePageHtml(p.id)}-${mi}" aria-label="启用思维引导注入"><span class="sl"></span></label><label class="tg" title="启用缓存前缀注入"><input type="checkbox" ${(p.cachePrefixInject||[]).includes(m.id)?'checked':''} id="mcp-${escapePageHtml(p.id)}-${mi}" aria-label="启用缓存前缀注入"><span class="sl"></span></label>${effDdEditHtml(p.id, mi, pol, !isWorkbuddyProviderUI(p))}<button class="btn btn-gh btn-xs" onclick="testMdl('${escapePageJsx(p.id)}','${escapePageJsx(m.id)}',${mi})" title="测试模型"><i class="fas fa-plug" aria-hidden="true"></i><span>测试</span></button><button class="icon-btn" onclick="rmMdl('${escapePageJsx(p.id)}',${mi})" aria-label="移除模型"><i class="fas fa-times" aria-hidden="true"></i></button></div>`}).join('')}</div><div class="fc mt-1 field-row"><input type="text" id="nmid-${escapePageHtml(p.id)}" placeholder="新的模型 ID" class="fx1"><button class="btn btn-s btn-xs" onclick="addMdl('${escapePageJsx(p.id)}')"><i class="fas fa-plus" aria-hidden="true"></i>添加</button></div><span class="form-helper">每个模型行「启用模型」开关旁的开关依次为「思维引导注入」「缓存前缀注入」，勾选后该模型转发前会被注入对应固定提示词；不勾选则原样转发。「effort」下拉声明该模型的 reasoning_effort 支持档位（多选），仅对 WorkBuddy / CodeBuddy 提供商显示——其余上游不消费该配置。</span></fieldset>
@@ -1119,6 +1131,10 @@ function tog(id) {
   if (d.classList.contains('open') && document.getElementById('wbp-acc-' + id)) oauthPoolStatus(id)
   // DeepSeek App：展开时自动加载 token 池
   if (d.classList.contains('open') && document.getElementById('ds-list-' + id)) deepseekTokenList(id)
+  // Cline：保存/一键授权后标记过「待检测」的账号，展开时自动跑一次（否则只留手动按钮）
+  if (d.classList.contains('open') && document.getElementById('cline-chk-' + id) && (window._clineStale || {})[id]) {
+    clineCheckAccounts(id, { silent: true })
+  }
 }
 
 // P3：M365 账号池渲染 —— 独立页并入提供商详情后按 providerId 定位容器
@@ -3136,6 +3152,7 @@ function clineOAuthPoll(id) {
       if (window._clineOAuthTimer) { clearInterval(window._clineOAuthTimer); window._clineOAuthTimer = null }
       if (pollSt) { pollSt.textContent = '授权成功！正在刷新账号列表…'; setTimeout(closeM, 1200) }
       if (st) showResult(st, true, '授权成功，RefreshToken 已加入账号池')
+      clineMarkStale(id)
       setTimeout(function () { reloadAdmin() }, 1400)
       return true
     }
@@ -3143,6 +3160,75 @@ function clineOAuthPoll(id) {
     if (st) st.textContent = d.message || '等待授权…'
     return false
   }).catch(() => { if (pollSt) pollSt.textContent = '轮询失败，请重试' })
+}
+
+// ===== Cline 账号检测（refreshToken 有效性 + 关联账号） =====
+// 每个 token 换一次 accessToken：徽章=是否仍可用，账号框=上游返回的邮箱（关联不到就手工填）。
+// save() 成功与一键授权成功后会把提供商标记为「待检测」，下次展开自动跑一次，避免每次展开都打上游。
+function clineMarkStale(id) { window._clineStale = window._clineStale || {}; window._clineStale[id] = true }
+
+function clineCheckAccounts(id, opts) {
+  const silent = !!(opts && opts.silent)
+  const st = document.getElementById('cline-chk-' + id)
+  if (st) st.textContent = '检测中…'
+  const rows = Array.prototype.slice.call(document.querySelectorAll('#keys-' + id + ' [data-kidx]'))
+  rows.forEach(function (item) {
+    const b = document.getElementById('kst-' + id + '-' + item.dataset.kidx)
+    if (b && b.textContent !== '待保存') { b.textContent = '检测中…'; b.className = 'bd bd-info' }
+  })
+  return fetch('/admin/api/providers/' + encodeURIComponent(id) + '/cline-accounts/check', { method: 'POST' })
+    .then(function (r) { return r.json() })
+    .then(function (d) {
+      if (!d.success) {
+        if (st) st.textContent = '检测失败：' + ((d && d.message) || '未知错误')
+        if (!silent) toast('检测失败：' + ((d && d.message) || '未知错误'), 'error')
+        return false
+      }
+      const accs = (d.data && d.data.accounts) || []
+      accs.forEach(function (a) {
+        var b = document.getElementById('kst-' + id + '-' + a.index)
+        if (b) {
+          b.textContent = a.valid ? '有效' : '无效'
+          b.className = 'bd ' + (a.valid ? 'bd-on' : 'bd-danger')
+          b.title = (a.masked || '') + ' · ' + (a.message || '')
+        }
+        var m = document.getElementById('kmsg-' + id + '-' + a.index)
+        if (m) {
+          var src = a.labelSource === 'none' ? '未关联到账号，可手工填写账号名'
+            : a.labelSource === 'auto' ? '已自动关联邮箱' : '手工填写的账号名'
+          m.textContent = (a.enabled ? '' : '（已禁用）') + src
+        }
+        // 只在账号框为空时自动回填邮箱；用户手填的名字绝不被覆盖
+        var lbl = document.getElementById('klbl-' + id + '-' + a.index)
+        if (lbl && !lbl.value.trim() && a.label) lbl.value = a.label
+      })
+      if (st) st.textContent = ((d.data && d.data.summary) || '') + ' · ' + new Date().toLocaleTimeString()
+      window._clineStale = window._clineStale || {}
+      window._clineStale[id] = false
+      return true
+    })
+    .catch(function (e) {
+      if (st) st.textContent = '检测失败：' + ((e && e.message) || '网络错误')
+      if (!silent) toast('检测失败', 'error')
+      return false
+    })
+}
+
+// 账号名手工维护：失焦即存（空串=清除），避免用户为改名先点保存
+function clineSaveLabel(id, idx) {
+  var el = document.getElementById('klbl-' + id + '-' + idx)
+  if (!el) return
+  var m = document.getElementById('kmsg-' + id + '-' + idx)
+  fetch('/admin/api/providers/' + encodeURIComponent(id) + '/cline-accounts/label', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ index: parseInt(idx, 10), label: el.value.trim() })
+  }).then(function (r) { return r.json() })
+    .then(function (d) {
+      if (!d.success) { if (m) m.textContent = '账号名保存失败：' + (d.message || '未知错误'); return }
+      if (m) m.textContent = el.value.trim() ? '手工填写的账号名（已保存）' : '未关联到账号，可手工填写账号名'
+    })
+    .catch(function () { if (m) m.textContent = '账号名保存失败：网络错误' })
 }
 
 // OAuth 提供商：用 KV 中的 token 拉取上游模型列表，动态填入编辑表单
@@ -3244,7 +3330,11 @@ function getKeys(id) {
     const idx = parseInt(item.dataset.kidx)
     const k = document.getElementById('k-' + id + '-' + idx).value.trim()
     const en = document.getElementById('ken-' + id + '-' + idx).checked
-    return k ? { key: k, enabled: en } : null
+    if (!k) return null
+    // Cline：账号名（自动关联或手工填），仅显示用，其余提供商没有这个输入框
+    const lblEl = document.getElementById('klbl-' + id + '-' + idx)
+    const lbl = lblEl ? lblEl.value.trim() : ''
+    return lbl ? { key: k, enabled: en, label: lbl } : { key: k, enabled: en }
   }).filter(Boolean)
 }
 
@@ -3255,7 +3345,11 @@ function addKeyRow(id) {
   const d = document.createElement('div')
   d.className = 'fc mb-3 field-row'
   d.dataset.kidx = cnt
-  d.innerHTML = '<input type="password" value="' + escapeHtml(k) + '" class="fx1" id="k-' + escapeHtml(id) + '-' + cnt + '" placeholder="API Key" aria-label="API Key"><button class="icon-btn" onclick="toggleKeyText(this)" title="显示/隐藏 Key" aria-label="显示或隐藏 Key"><i class="fas fa-eye" aria-hidden="true"></i></button><label class="tg"><input type="checkbox" checked id="ken-' + escapeHtml(id) + '-' + cnt + '" aria-label="启用该 Key"><span class="sl"></span></label><button class="btn btn-gh btn-xs" onclick="testKeyRow(\\'' + escapeJsAttr(id) + '\\',' + cnt + ')" title="测试" aria-label="测试该 Key"><i class="fas fa-plug"></i></button><button class="btn btn-gh btn-xs" onclick="rmKeyRow(\\'' + escapeJsAttr(id) + '\\',' + cnt + ')" title="移除" aria-label="移除该 Key"><i class="fas fa-times c-l"></i></button><span class="trt" id="ktr-' + escapeHtml(id) + '-' + cnt + '" style="flex-basis:100%" aria-live="polite"></span>'
+  // Cline 同样要带账号行：新加的 token 还没保存，检测要等保存后
+  const acct = id === 'cline'
+    ? '<span class="cline-acct-row" style="flex-basis:100%;display:flex;gap:8px;align-items:center;flex-wrap:wrap"><span class="bd bd-info" id="kst-' + escapeHtml(id) + '-' + cnt + '">待保存</span><input type="text" class="fx1" style="max-width:320px" id="klbl-' + escapeHtml(id) + '-' + cnt + '" placeholder="账号（保存后自动关联邮箱）" aria-label="账号名（仅显示用）" onblur="clineSaveLabel(\\'' + escapeJsAttr(id) + '\\',' + cnt + ')"><span class="mu" style="font-size:12px" id="kmsg-' + escapeHtml(id) + '-' + cnt + '"></span></span>'
+    : ''
+  d.innerHTML = '<input type="password" value="' + escapeHtml(k) + '" class="fx1" id="k-' + escapeHtml(id) + '-' + cnt + '" placeholder="API Key" aria-label="API Key"><button class="icon-btn" onclick="toggleKeyText(this)" title="显示/隐藏 Key" aria-label="显示或隐藏 Key"><i class="fas fa-eye" aria-hidden="true"></i></button><label class="tg"><input type="checkbox" checked id="ken-' + escapeHtml(id) + '-' + cnt + '" aria-label="启用该 Key"><span class="sl"></span></label><button class="btn btn-gh btn-xs" onclick="testKeyRow(\\'' + escapeJsAttr(id) + '\\',' + cnt + ')" title="测试" aria-label="测试该 Key"><i class="fas fa-plug"></i></button><button class="btn btn-gh btn-xs" onclick="rmKeyRow(\\'' + escapeJsAttr(id) + '\\',' + cnt + ')" title="移除" aria-label="移除该 Key"><i class="fas fa-times c-l"></i></button><span class="trt" id="ktr-' + escapeHtml(id) + '-' + cnt + '" style="flex-basis:100%" aria-live="polite"></span>' + acct
   c.appendChild(d)
   inp.value = ''
   inp.focus()
@@ -3447,7 +3541,12 @@ async function save(id) {
       body: JSON.stringify({ name: nm, baseUrl: url, apiType, authType, oauth: authType === 'oauth-device' ? oauth : undefined, apiKeys: keys, models, enabled, toolBridge: (document.getElementById('atb-' + id)||{}).checked === true, allowUnlistedModels: (document.getElementById('aum-' + id)||{}).checked === true, reasoningEffort: ((document.getElementById('re-' + id)||{}).value || null), deepseekThinkingOff, thinkingInject, cachePrefixInject, cooldown: collectCooldown(id), type: providerType, kukuThinkMode, visionBridge: vb, geminiBaseUrl: ((document.getElementById('gbu-' + id)||{}).value || '').trim() || null, traeEnableRemoteBudget, traeRemoteOnlyModels, traeMaxMessages, traeMaxHistoryChars, traeMaxToolSchemaChars, accountSpread: (document.getElementById('m365-spread-' + id)||{}).checked === true, promptMode, promptText })
     })
     const d = await r.json()
-    if (d.success) { toast('已保存', 'success'); reloadAdmin() }
+    if (d.success) {
+      toast('已保存', 'success')
+      // Cline：账号列表变了（新增/删除/轮换），下次展开自动重跑一次有效性检测
+      if (id === 'cline') clineMarkStale(id)
+      reloadAdmin()
+    }
     else toast(d.message || '保存失败', 'error')
   } catch (e) { toast('保存失败', 'error') }
   finally {

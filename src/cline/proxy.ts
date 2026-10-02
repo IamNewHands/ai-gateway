@@ -1754,15 +1754,77 @@ export async function healthCheckClineAll(env: Env): Promise<ClineHealthSummary>
   return { providers, accounts, ok, failed, errors }
 }
 
-/** 校验单个 refreshToken 是否能换取 accessToken（管理面板"测试"用）。 */
-export async function testClineRefreshToken(refreshToken: string): Promise<{ success: boolean; message: string; statusCode?: number }> {
-  const acc: Account = { refreshToken: refreshToken.trim(), accessToken: null, expiry: 0, cooldownUntil: 0, modelCooldowns: new Map() }
-  try {
-    await getAccountToken(acc)
-    return { success: true, message: 'RefreshToken 有效' }
-  } catch (err) {
-    return { success: false, message: (err as Error).message || 'RefreshToken 无效' }
+/** 单个 refreshToken 的探测结果（管理面板「检测账号」用）。 */
+export interface ClineAccountProbe {
+  /** 能否换到 accessToken。false 时 message 给出原因。 */
+  valid: boolean
+  /** 上游 userInfo.email；上游没给或 token 无效时为空串。 */
+  email: string
+  message: string
+  /** 上游轮换出的新 refreshToken；非空时**必须**由调用方持久化，否则旧值立即失效。 */
+  rotatedTo: string
+  statusCode: number
+}
+
+/**
+ * 用 refreshToken 换一次 accessToken，判定有效性并取回账号 email（管理面板检测用）。
+ *
+ * 独立于 getAccountToken：面板探测的是「未进池的单个 token」，不该改动任何池状态
+ * （不写 accessToken 缓存、不设冷却）。但**上游会轮换 refreshToken**——探测本身
+ * 就可能让调用方手里的旧 token 作废，所以 rotatedTo 必须被调用方落库。
+ */
+export async function probeClineAccount(refreshToken: string): Promise<ClineAccountProbe> {
+  const rt = (refreshToken || '').trim()
+  if (rt.length <= 8) {
+    return { valid: false, email: '', message: 'RefreshToken 为空或过短', rotatedTo: '', statusCode: 0 }
   }
+  let resp: Response
+  try {
+    resp = await fetch(CLINE_API_BASE + '/auth/refresh', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ refreshToken: rt, grantType: 'refresh_token' }),
+      signal: AbortSignal.timeout(15000),
+    })
+  } catch (err) {
+    // 连接层失败 ≠ token 失效：文案要区分，否则用户会白换号
+    return { valid: false, email: '', message: `连接 Cline 失败：${(err as Error).message || '网络错误'}`, rotatedTo: '', statusCode: 0 }
+  }
+  if (!resp.ok) {
+    return { valid: false, email: '', message: `HTTP ${resp.status}：${await readErrSnippet(resp)}`, rotatedTo: '', statusCode: resp.status }
+  }
+  const data = (await resp.json().catch(() => null)) as {
+    data?: { accessToken?: string; refreshToken?: string; userInfo?: { email?: string } }
+  } | null
+  const accessToken = data?.data?.accessToken
+  if (!accessToken) {
+    return { valid: false, email: '', message: '上游未返回 accessToken', rotatedTo: '', statusCode: resp.status }
+  }
+  const email = (data?.data?.userInfo?.email || '').trim()
+  const rotated = (data?.data?.refreshToken || '').trim()
+  return {
+    valid: true,
+    email,
+    message: email ? `有效（${email}）` : '有效（上游未返回账号 email）',
+    rotatedTo: rotated && rotated !== rt ? rotated : '',
+    statusCode: resp.status,
+  }
+}
+
+/** 截断上游错误体，避免把整段 HTML 塞进面板。 */
+async function readErrSnippet(resp: Response): Promise<string> {
+  try {
+    const raw = (await resp.text()) || ''
+    return raw.length > 120 ? `${raw.slice(0, 120)}…` : raw
+  } catch {
+    return ''
+  }
+}
+
+/** 校验单个 refreshToken 是否能换取 accessToken（管理面板"测试"用）。 */
+export async function testClineRefreshToken(refreshToken: string): Promise<{ success: boolean; message: string; statusCode?: number; email?: string; rotatedTo?: string }> {
+  const probe = await probeClineAccount(refreshToken)
+  return { success: probe.valid, message: probe.message, statusCode: probe.statusCode || undefined, email: probe.email, rotatedTo: probe.rotatedTo }
 }
 
 /** 用给定账号池发送一个最小 chat 请求来测试模型可用性。 */

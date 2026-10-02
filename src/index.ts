@@ -39,6 +39,8 @@ import {
   handleOAuthM365ROPC,
   handleClineOAuthConnect,
   handleClineOAuthPoll,
+  handleClineAccountCheck,
+  handleClineAccountLabel,
   handleLogs,
   handleLogsClear,
   handleLogConfig,
@@ -251,6 +253,9 @@ app.post('/admin/api/oauth/:id/m365-ropc', handleOAuthM365ROPC)
 // Cline 一键授权（WorkOS 设备码流程，登录后自动把 refreshToken 存入账号池）
 app.post('/admin/api/cline/oauth/:id/connect', handleClineOAuthConnect)
 app.post('/admin/api/cline/oauth/:id/poll', handleClineOAuthPoll)
+// Cline 账号检测：探测每个 refreshToken 的有效性并关联账号 email / 手工补账号名
+app.post('/admin/api/providers/:id/cline-accounts/check', handleClineAccountCheck)
+app.post('/admin/api/providers/:id/cline-accounts/label', handleClineAccountLabel)
 
 // TRAE SOLO 管理：登录闭环 / 签到 / 模型发现 / 账号状态（面板）
 app.post('/admin/api/trae/:id/login/connect', handleTraeLoginConnect)

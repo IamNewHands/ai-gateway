@@ -22,6 +22,12 @@ export interface CooldownConfig {
 export interface ApiKeyEntry {
   key: string
   enabled: boolean
+  /**
+   * 账号名（仅多账号型提供商有意义：cline / trae / m365 等）。
+   * Cline 侧由 /auth/refresh 返回的 userInfo.email 自动关联；关联不到时可手工填写，
+   * 只用于面板显示，**不参与任何鉴权**。随 refreshToken 轮换一起迁移（见 cline/proxy.ts）。
+   */
+  label?: string
 }
 
 export interface Provider {

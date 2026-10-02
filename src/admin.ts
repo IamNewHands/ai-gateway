@@ -30,7 +30,7 @@ import { MAX_ADMIN_REQUEST_BYTES, readOptionalJSONLimited, readStrictJSONLimited
 import { isTraeProvider, testTraeCredential, testTraeModel } from './trae/proxy'
 import { diagnoseOpenCodeKey, fetchOpenCodeModels, isOpenCodeProvider, resolveOpenCodeUrls, testOpenCodeModel } from './opencode'
 import { isQoderProvider, fetchQoderModels } from './qoder/proxy'
-import { isClineProvider, fetchClineModels, fetchClineRecommendedModels, testClineChat, testClineRefreshToken, startClineOAuth, pollClineOAuth } from './cline/proxy'
+import { isClineProvider, fetchClineModels, fetchClineRecommendedModels, testClineChat, testClineRefreshToken, probeClineAccount, startClineOAuth, pollClineOAuth } from './cline/proxy'
 import { isGeminiProvider, testGeminiModel, GEMINI_MODELS } from './gemini/proxy'
 import { fetchGeminiQuota } from './gemini/quota'
 import { isCnbProvider, testCnbConnection, CNB_MODELS } from './cnb/proxy'
@@ -413,7 +413,7 @@ export async function handleUpsertProvider(c: Context<AppEnv>) {
   const incomingKeys: ApiKeyEntry[] = (body.apiKeys || []).map((k) =>
     typeof k === 'string'
       ? { key: k, enabled: true }
-      : { key: k.key, enabled: k.enabled !== undefined ? k.enabled : true }
+      : { key: k.key, enabled: k.enabled !== undefined ? k.enabled : true, label: normalizeApiKeyLabel(k.label) }
   )
   const incomingModels: Model[] = (body.models || []).map((m) =>
     typeof m === 'string'
@@ -519,7 +519,7 @@ export async function handleUpsertProvider(c: Context<AppEnv>) {
     const existingKeySet = new Set(merged.map((k) => k.key))
     for (const k of incomingKeys) {
       if (existingKeySet.has(k.key)) continue  // 已存在：保留原项，不覆盖、不重复
-      merged.push({ key: k.key, enabled: k.enabled })
+      merged.push({ key: k.key, enabled: k.enabled, label: k.label })
       existingKeySet.add(k.key)
     }
     updates.apiKeys = merged
@@ -807,12 +807,26 @@ export async function handleTestKeyNew(c: Context<AppEnv>) {
   // Cline：校验 refreshToken 是否有效，成功时一并返回实测可用模型列表
   if (providerId && isClineProvider(providerId)) {
     const result = await testClineRefreshToken(apiKey || '')
+    // 探测本身可能触发上游轮换：若该 token 已在池里，立刻写回，否则旧值当场作废
+    if (result.rotatedTo) {
+      try {
+        const provider = await getProvider(c.env, providerId)
+        const keys = provider?.apiKeys || []
+        if (keys.some((k) => k.key === (apiKey || '').trim())) {
+          const apiKeys = keys.map((k) => (k.key === (apiKey || '').trim() ? { ...k, key: result.rotatedTo! } : k))
+          await updateProvider(c.env, providerId, { apiKeys })
+        }
+      } catch (err) {
+        console.error(`[cline-test] 轮换回写失败 ${providerId}：${err instanceof Error ? err.message : String(err)}`)
+      }
+    }
     return c.json<ApiResponse>({
       success: true,
       data: {
         success: result.success,
         statusCode: result.statusCode || 0,
         message: result.message,
+        email: result.email || '',
         data: result.success ? fetchClineModels().models : null,
       },
     })
@@ -1858,6 +1872,145 @@ export async function handleClineOAuthPoll(c: Context<AppEnv>) {
     message: result.message,
     data: result.status === 'success' ? { connected: true } : { connected: false },
   })
+}
+
+// ===== Cline 账号检测（refreshToken 有效性 + 关联账号） =====
+//
+// 每个 apiKey 就是一条 Cline 账号凭据。探测 = 对该 refreshToken 打一次
+// POST /auth/refresh：能换到 accessToken 即有效，响应里的 data.userInfo.email
+// 就是该 token 对应的账号。自动关联不到（上游没给 email / token 已失效）时，
+// 面板留了手工填账号名的入口（label），两者都只是显示用，不参与鉴权。
+
+/** label 归一化：仅去空白、限长 120；空串视为清除（undefined）。 */
+export function normalizeApiKeyLabel(v: unknown): string | undefined {
+  if (typeof v !== 'string') return undefined
+  const s = v.trim().slice(0, 120)
+  return s ? s : undefined
+}
+
+/** 面板用掩码：只露末 4 位，绝不回传完整 refreshToken。 */
+function maskSecret(key: string): string {
+  const k = (key || '').trim()
+  return k.length > 4 ? `****${k.slice(-4)}` : '****'
+}
+
+/** 并发受限的 map，避免几十个账号同时打上游被限流。 */
+async function mapWithLimit<T, R>(items: T[], limit: number, fn: (item: T, index: number) => Promise<R>): Promise<R[]> {
+  const out = new Array<R>(items.length)
+  let cursor = 0
+  const workers = Array.from({ length: Math.min(limit, items.length) }, async () => {
+    while (cursor < items.length) {
+      const i = cursor++
+      out[i] = await fn(items[i], i)
+    }
+  })
+  await Promise.all(workers)
+  return out
+}
+
+export interface ClineAccountRow {
+  /** 对应 provider.apiKeys 的下标；面板按这个回填徽章与账号输入框。 */
+  index: number
+  /** 掩码后的 token，面板用它对号入座（不传完整 token）。 */
+  masked: string
+  enabled: boolean
+  valid: boolean
+  /** 上游返回的账号 email；上游没给时为空串。 */
+  email: string
+  /** 最终显示的账号名：已填的手工 label 优先，否则回落到自动关联到的 email。 */
+  label: string
+  /** 显示名来源：'manual' 手工填 | 'auto' 自动关联 | 'none' 未关联。 */
+  labelSource: 'manual' | 'auto' | 'none'
+  message: string
+}
+
+/**
+ * POST /admin/api/providers/:id/cline-accounts/check
+ * 探测该 Cline 提供商全部 refreshToken 的有效性并关联账号；关联不到的返回给面板手工补名。
+ * 副作用：① 上游轮换出的新 token 立即落库；② label 为空且能拿到 email 的账号自动写入 label。
+ */
+export async function handleClineAccountCheck(c: Context<AppEnv>) {
+  const id = c.req.param('id')
+  if (!id) return c.json<ApiResponse>({ success: false, message: '缺少 id 参数' }, 400)
+  const provider = await getProvider(c.env, id)
+  if (!provider) return c.json<ApiResponse>({ success: false, message: '提供商不存在' }, 404)
+  if (!isClineProvider(provider.id)) {
+    return c.json<ApiResponse>({ success: false, message: '仅支持 Cline 提供商' }, 400)
+  }
+
+  const keys = provider.apiKeys || []
+  const probes = await mapWithLimit(keys, 4, (k) => probeClineAccount(k.key))
+  let apiKeys = keys
+  const dirty = new Set<number>()
+  const rows: ClineAccountRow[] = keys.map((k, i) => {
+    const probe = probes[i]
+    const entry: ApiKeyEntry = { ...k }
+    // 轮换：探测本身就可能让旧 token 失效，必须立刻写回，否则下次就是 invalid_grant
+    if (probe.rotatedTo) {
+      entry.key = probe.rotatedTo
+      dirty.add(i)
+    }
+    // 自动关联：没手工填过才写 email（手工名优先，绝不覆盖用户填的）
+    if (!entry.label && probe.email) {
+      entry.label = probe.email
+      dirty.add(i)
+    }
+    if (dirty.has(i)) apiKeys = apiKeys.map((cur, idx) => (idx === i ? entry : cur))
+    return {
+      index: i,
+      masked: maskSecret(entry.key),
+      enabled: !!k.enabled,
+      valid: probe.valid,
+      email: probe.email,
+      label: entry.label || '',
+      labelSource: !entry.label ? 'none' : (entry.label === probe.email && probe.email ? 'auto' : 'manual'),
+      message: probe.message,
+    }
+  })
+
+  if (dirty.size > 0) {
+    try {
+      await updateProvider(c.env, id, { apiKeys })
+      provider.apiKeys = apiKeys
+    } catch (err) {
+      console.error(`[cline-check] 回写 provider ${id} 失败：${err instanceof Error ? err.message : String(err)}`)
+    }
+  }
+
+  const valid = rows.filter((r) => r.valid).length
+  return c.json<ApiResponse>({
+    success: true,
+    data: {
+      accounts: rows,
+      checkedAt: Date.now(),
+      summary: `有效 ${valid} / 共 ${rows.length}${rows.length - valid ? `，失效或不可达 ${rows.length - valid}` : ''}`,
+    },
+  })
+}
+
+/**
+ * POST /admin/api/providers/:id/cline-accounts/label
+ * body: { index, label } —— 手工维护账号名（关联不到上游 email 时的兜底口子）。传空串即清除。
+ */
+export async function handleClineAccountLabel(c: Context<AppEnv>) {
+  const id = c.req.param('id')
+  if (!id) return c.json<ApiResponse>({ success: false, message: '缺少 id 参数' }, 400)
+  const body = await readStrictJSONLimited<{ index?: unknown; label?: unknown }>(c.req.raw, MAX_ADMIN_REQUEST_BYTES)
+  const index = typeof body.index === 'number' ? body.index : Number(body.index)
+  if (!Number.isInteger(index) || index < 0) {
+    return c.json<ApiResponse>({ success: false, message: 'index 必须是非负整数' }, 400)
+  }
+  const provider = await getProvider(c.env, id)
+  if (!provider) return c.json<ApiResponse>({ success: false, message: '提供商不存在' }, 404)
+  const keys = provider.apiKeys || []
+  if (index >= keys.length) {
+    return c.json<ApiResponse>({ success: false, message: `index 越界（当前共 ${keys.length} 个账号）` }, 400)
+  }
+  const label = normalizeApiKeyLabel(body.label)
+  const apiKeys = keys.map((k, i) => (i === index ? { ...k, label } : k))
+  const updated = await updateProvider(c.env, id, { apiKeys })
+  if (!updated) return c.json<ApiResponse>({ success: false, message: '提供商不存在' }, 404)
+  return c.json<ApiResponse>({ success: true, data: { index, label: label || '' } })
 }
 
 /**
