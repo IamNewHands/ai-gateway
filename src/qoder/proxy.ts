@@ -797,26 +797,22 @@ export async function fetchQoderModels(
   debug.cosyKeyLen = session.cosyKey.length
   debug.uid = session.uid || '(empty)'
 
-  let encodedBody: string
-  try {
-    encodedBody = qoderEncode('{}')
-    console.log(`[qoder-models] encodedBody len=${encodedBody.length}`)
-    debug.encodedBodyLen = encodedBody.length
-  } catch (err) {
-    console.error(`[qoder-models] qoderEncode threw:`, err)
-    return { ok: false, message: `QoderEncoding 失败: ${(err as Error).message || err}`, debug }
-  }
+  // GET 请求**不带 body**，故签名必须覆盖空串（qoder2api client.go:85-89 同）。
+  // 旧实现签 qoderEncode('{}') 却发空 body → 服务端重算不匹配 →
+  // {"code":"101","message":"Signature invalid"}（实测 403）。
+  const signedBody = ''
+  debug.encodedBodyLen = signedBody.length
 
   let headers: Record<string, string>
   const modelsUrl = qoderModelsUrl(sessionRealm)
   try {
     // 先单独调用 buildBearer 获取签名中间值用于调试
-    const bearerInfo = buildBearer(session, encodedBody, modelsUrl)
+    const bearerInfo = buildBearer(session, signedBody, modelsUrl)
     debug.bearerDate = bearerInfo.date
     debug.bearerSigLen = bearerInfo.sigInput.length
     debug.cosyKeyLen = session.cosyKey.length
 
-    headers = cosyHeaders(session, encodedBody, modelsUrl, 'application/json', false)
+    headers = cosyHeaders(session, signedBody, modelsUrl, 'application/json', false)
     // 请求头可能含 Authorization Bearer 签名，只记头名列表
     console.log(`[qoder-models] request header names:`, Object.keys(headers).join(', '))
     debug.cosyHeaderNames = Object.keys(headers)

@@ -142,6 +142,32 @@ const usesGlobalRealmUI = (p: { oauth?: { flowType?: string } }) => {
   return flow === 'browser' || flow === 'qoder'
 }
 
+/**
+ * 「登录域」下拉的文案按流程区分。
+ * 原实现把 WorkBuddy 的域名（codebuddy.cn / workbuddy.ai）写死在共用模板里，
+ * QoderWork 提供商因此显示成 WorkBuddy 的域名——提示与真实端点不符。
+ */
+const realmCopyFor = (p: { oauth?: { flowType?: string } }) => {
+  if (oauthFlowUI(p) === 'qoder') {
+    return {
+      cnLabel: 'qoder.com.cn',
+      globalLabel: 'qoder.com',
+      helper: '国际版账号必须选「国际版」：授权链接走 qoder.com，token 轮询/刷新与签到走 openapi.qoder.sh。',
+      globalDeviceCodePlaceholder: 'https://qoder.com/device/selectAccounts',
+      globalDeviceTokenPlaceholder: 'https://openapi.qoder.sh/api/v1/deviceToken/poll',
+      globalRefreshTokenPlaceholder: 'https://openapi.qoder.sh/api/v1/deviceToken/refresh',
+    }
+  }
+  return {
+    cnLabel: 'codebuddy.cn',
+    globalLabel: 'workbuddy.ai',
+    helper: '国际版账号必须选「国际版」，登录链接与轮询将走 www.workbuddy.ai。',
+    globalDeviceCodePlaceholder: 'https://www.workbuddy.ai/v2/plugin/auth/state?platform=CLI',
+    globalDeviceTokenPlaceholder: 'https://www.workbuddy.ai/v2/plugin/auth/token',
+    globalRefreshTokenPlaceholder: 'https://www.workbuddy.ai/v2/plugin/auth/token/refresh',
+  }
+}
+
 /** Client Secret 唯一消费方是 Gemini OAuth（src/oauth.ts geminiClientCreds），其余流程不读取。 */
 const usesClientSecretUI = (p: { oauth?: { flowType?: string } }) => oauthFlowUI(p) === 'gemini'
 
@@ -571,7 +597,7 @@ ${H('管理')}
                 <div class="collapse-section">
                   <button class="collapse-btn" onclick="toggleAdvOauth('ao-adv-fs', this)" type="button" aria-expanded="false"><i class="fas fa-chevron-right collapse-icon" aria-hidden="true"></i> 高级 OAuth 配置（端点 / 凭据 / Global 域，模板已填好，一般无需修改）</button>
                   <div id="ao-adv-fs" class="hd">
-                    <div class="fg hd" id="ao15-row"><label>登录域（browser / qoder 模式）</label><select id="ao15" class="select-sm" onchange="syncGlobalOauthNew()"><option value="cn">国内版（codebuddy.cn）</option><option value="global">国际版（workbuddy.ai）</option></select><span class="form-helper">国际版账号必须选「国际版」，登录链接与轮询将走 www.workbuddy.ai。</span></div>
+                    <div class="fg hd" id="ao15-row"><label>登录域（browser / qoder 模式）</label><select id="ao15" class="select-sm" onchange="syncGlobalOauthNew()"><option value="cn">国内版（codebuddy.cn / qoder.com.cn）</option><option value="global">国际版（workbuddy.ai / qoder.com）</option></select><span class="form-helper">按上面选的流程取域名：WorkBuddy 走 codebuddy.cn / workbuddy.ai，QoderWork 走 qoder.com.cn / qoder.com。</span></div>
                     <div class="fg"><label>发起端点 (deviceCodeUrl)</label><input type="url" id="ao1" placeholder="https://.../auth/device/code"></div>
                     <div class="fg"><label>轮询端点 (deviceTokenUrl)</label><input type="url" id="ao2" placeholder="https://.../auth/device/token"></div>
                     <div class="fg"><label>Token 刷新端点 (refreshTokenUrl)</label><input type="url" id="ao3" placeholder="https://.../auth/oauth_token/refresh"></div>
@@ -652,7 +678,7 @@ ${H('管理')}
                   <div class="collapse-section">
                     <button class="collapse-btn" onclick="toggleAdvOauth('eao-adv-${escapePageJsx(p.id)}', this)" type="button" aria-expanded="false"><i class="fas fa-chevron-right collapse-icon" aria-hidden="true"></i> 高级 OAuth 配置（端点 / 凭据 / Global 域，一般无需修改）</button>
                     <div id="eao-adv-${escapePageHtml(p.id)}" class="hd">
-                      <div class="fg ${usesGlobalRealmUI(p)?'':'hd'}" id="eao15-row-${escapePageHtml(p.id)}"><label>登录域（browser / qoder 模式）</label><select id="eao15-${escapePageHtml(p.id)}" class="select-sm" onchange="syncGlobalOauthEdit('${escapePageJsx(p.id)}')"><option value="cn" ${(p.oauth&&p.oauth.loginRealm)!=='global'?'selected':''}>国内版（codebuddy.cn）</option><option value="global" ${(p.oauth&&p.oauth.loginRealm)==='global'?'selected':''}>国际版（workbuddy.ai）</option></select><span class="form-helper">国际版账号必须选「国际版」，登录链接与轮询将走 www.workbuddy.ai。</span></div>
+                      <div class="fg ${usesGlobalRealmUI(p)?'':'hd'}" id="eao15-row-${escapePageHtml(p.id)}"><label>登录域（browser / qoder 模式）</label><select id="eao15-${escapePageHtml(p.id)}" class="select-sm" onchange="syncGlobalOauthEdit('${escapePageJsx(p.id)}')"><option value="cn" ${(p.oauth&&p.oauth.loginRealm)!=='global'?'selected':''}>国内版（${realmCopyFor(p).cnLabel}）</option><option value="global" ${(p.oauth&&p.oauth.loginRealm)==='global'?'selected':''}>国际版（${realmCopyFor(p).globalLabel}）</option></select><span class="form-helper">${realmCopyFor(p).helper}</span></div>
                       <div class="fg"><label>发起端点</label><input type="url" id="eao1-${escapePageHtml(p.id)}" value="${escapePageHtml((p.oauth&&p.oauth.deviceCodeUrl)||'')}" placeholder="https://.../auth/device/code"></div>
                       <div class="fg"><label>轮询端点</label><input type="url" id="eao2-${escapePageHtml(p.id)}" value="${escapePageHtml((p.oauth&&p.oauth.deviceTokenUrl)||'')}" placeholder="https://.../auth/device/token"></div>
                       <div class="fg"><label>Token 刷新端点</label><input type="url" id="eao3-${escapePageHtml(p.id)}" value="${escapePageHtml((p.oauth&&p.oauth.refreshTokenUrl)||'')}" placeholder="https://.../auth/oauth_token/refresh"></div>
@@ -667,9 +693,9 @@ ${H('管理')}
                       <div class="fg"><label>Global 域 baseUrl（海外账户，可选）</label><input type="url" id="eao11-${escapePageHtml(p.id)}" value="${escapePageHtml((p.oauth&&p.oauth.globalBaseUrl)||'')}" placeholder="https://www.workbuddy.ai/v2"></div>
                       <div class="fg"><label>Global 域模型 URL（可选）</label><input type="url" id="eao12-${escapePageHtml(p.id)}" value="${escapePageHtml((p.oauth&&p.oauth.globalModelsUrl)||'')}" placeholder="https://www.workbuddy.ai/console/enterprises/personal/models"></div>
                       <div class="fg"><label>Global 域 Origin（可选）</label><input type="url" id="eao13-${escapePageHtml(p.id)}" value="${escapePageHtml((p.oauth&&p.oauth.globalOrigin)||'')}" placeholder="https://www.workbuddy.ai"></div>
-                      <div class="fg"><label>Global 域发起端点（可选）</label><input type="url" id="eao16-${escapePageHtml(p.id)}" value="${escapePageHtml((p.oauth&&p.oauth.globalDeviceCodeUrl)||'')}" placeholder="https://www.workbuddy.ai/v2/plugin/auth/state?platform=CLI"><span class="form-helper">登录域选「国际版」时使用，留空回退国内端点。</span></div>
-                      <div class="fg"><label>Global 域轮询端点（可选）</label><input type="url" id="eao17-${escapePageHtml(p.id)}" value="${escapePageHtml((p.oauth&&p.oauth.globalDeviceTokenUrl)||'')}" placeholder="https://www.workbuddy.ai/v2/plugin/auth/token"></div>
-                      <div class="fg"><label>Global 域刷新端点（可选）</label><input type="url" id="eao18-${escapePageHtml(p.id)}" value="${escapePageHtml((p.oauth&&p.oauth.globalRefreshTokenUrl)||'')}" placeholder="https://www.workbuddy.ai/v2/plugin/auth/token/refresh"></div>
+                      <div class="fg"><label>Global 域发起端点（可选）</label><input type="url" id="eao16-${escapePageHtml(p.id)}" value="${escapePageHtml((p.oauth&&p.oauth.globalDeviceCodeUrl)||'')}" placeholder="${realmCopyFor(p).globalDeviceCodePlaceholder}"><span class="form-helper">登录域选「国际版」时使用，留空回退国内端点。</span></div>
+                      <div class="fg"><label>Global 域轮询端点（可选）</label><input type="url" id="eao17-${escapePageHtml(p.id)}" value="${escapePageHtml((p.oauth&&p.oauth.globalDeviceTokenUrl)||'')}" placeholder="${realmCopyFor(p).globalDeviceTokenPlaceholder}"></div>
+                      <div class="fg"><label>Global 域刷新端点（可选）</label><input type="url" id="eao18-${escapePageHtml(p.id)}" value="${escapePageHtml((p.oauth&&p.oauth.globalRefreshTokenUrl)||'')}" placeholder="${realmCopyFor(p).globalRefreshTokenPlaceholder}"></div>
                       </div>
                       <div class="fg"><label>单账号并发上限（WorkBuddy 池，可选）</label><input type="number" id="eao20-${escapePageHtml(p.id)}" min="0" value="${(p.oauth&&p.oauth.maxInFlight)??''}" placeholder="默认 3"><span class="form-helper">单账号最大在途并发请求数。0/留空 = 不限（仍计数）。调低可防账号被高并发打爆放大 5xx。</span></div>
                       <div class="fg"><label>国际版单号并发上限（可选）</label><input type="number" id="eao21-${escapePageHtml(p.id)}" min="0" value="${(p.oauth&&p.oauth.maxInFlightGlobal)??''}" placeholder="默认回落单号并发"><span class="form-helper">国际版（workbuddy.ai）账号单独的在途并发上限；0/留空 = 不分档（国际版与国内版同用上面「单号并发」）。global 域 WAF 风控更紧，可单独收紧此值。</span></div>

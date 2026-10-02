@@ -7,7 +7,7 @@
 import { describe, it, expect, vi, afterEach } from 'vitest'
 import { cosySessionFor, cosyHeaders } from './cosy'
 import { buildQoderBody, cpaToUpstreamKey, fallbackUnknownModel } from './body'
-import { performQoderCheckin } from './billing'
+import { performQoderCheckin, normalizeQoderRealm, realmHasLegacyCheckin, QODER_OPENAPI, fetchQoderUserResource } from './billing'
 import { classifyQoderError } from './classify'
 import { proxyQoderChatRequest } from './proxy'
 import type { Env, Provider } from '../types'
@@ -280,6 +280,78 @@ describe('P0-4 客户端 tools 覆盖模板内置工具', () => {
     const sent = (fetchMock.mock.calls[0][1] as RequestInit).body as string
     expect(typeof sent).toBe('string')
     expect(sent.length).toBeGreaterThan(0)
+  })
+})
+
+// ===== 国际版 / 国内版签到分域（qoder2api-hub qoder_accounts.py:37-106） =====
+describe('国际版/国内版签到分域', () => {
+  it('openapi 基地址按域区分：cn=openapi.qoder.com.cn，global=openapi.qoder.sh', () => {
+    expect(QODER_OPENAPI.cn).toBe('https://openapi.qoder.com.cn')
+    expect(QODER_OPENAPI.global).toBe('https://openapi.qoder.sh')
+  })
+
+  it('normalizeQoderRealm 只认 global，其余归 cn', () => {
+    expect(normalizeQoderRealm('global')).toBe('global')
+    expect(normalizeQoderRealm('cn')).toBe('cn')
+    expect(normalizeQoderRealm(undefined)).toBe('cn')
+    expect(normalizeQoderRealm('')).toBe('cn')
+  })
+
+  it('legacy daily-check-in 仅国内版存在（国际版实测 404）', () => {
+    expect(realmHasLegacyCheckin('cn')).toBe(true)
+    expect(realmHasLegacyCheckin('global')).toBe(false)
+  })
+
+  it('国际版签到走 openapi.qoder.sh，不再误打国内域', async () => {
+    const fetchMock = vi.fn(async (_input: unknown, _init?: RequestInit) =>
+      new Response(JSON.stringify({ campaigns: [] }), { status: 200 }))
+    vi.stubGlobal('fetch', fetchMock)
+    await performQoderCheckin('dt-g', 'global')
+    const url = String(fetchMock.mock.calls[0][0])
+    expect(url.startsWith('https://openapi.qoder.sh/sash/api/v1/me/campaigns')).toBe(true)
+  })
+
+  it('国内版签到仍走 openapi.qoder.com.cn', async () => {
+    const fetchMock = vi.fn(async (_input: unknown, _init?: RequestInit) =>
+      new Response(JSON.stringify({ campaigns: [] }), { status: 200 }))
+    vi.stubGlobal('fetch', fetchMock)
+    await performQoderCheckin('dt-c', 'cn')
+    expect(String(fetchMock.mock.calls[0][0])).toContain('https://openapi.qoder.com.cn/')
+  })
+
+  it('国际版 claim 的 origin 头跟随所在域（不是硬编码国内域）', async () => {
+    const fetchMock = vi.fn(async (input: unknown, _init?: RequestInit) => {
+      const url = String(input)
+      if (url.endsWith('/me/campaigns')) {
+        return new Response(JSON.stringify({
+          campaigns: [{ campaignId: 'c1', actionType: 'CLAIM_BENEFIT', claimStatus: 'CLAIMABLE' }],
+        }), { status: 200 })
+      }
+      return new Response(JSON.stringify({ status: 'CLAIMED', replayed: false }), { status: 200 })
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    await performQoderCheckin('dt-g', 'global')
+    const claimCall = fetchMock.mock.calls.find((c) => String(c[0]).endsWith('/claim'))
+    expect(claimCall).toBeTruthy()
+    const headers = (claimCall![1] as RequestInit).headers as Record<string, string>
+    expect(headers.origin).toBe('https://openapi.qoder.sh')
+  })
+
+  it('额度查询按域取端点', async () => {
+    const fetchMock = vi.fn(async (_input: unknown, _init?: RequestInit) =>
+      new Response(JSON.stringify({ userQuota: { total: 10, used: 1, remaining: 9 } }), { status: 200 }))
+    vi.stubGlobal('fetch', fetchMock)
+    await fetchQoderUserResource('dt-g', 'global')
+    expect(String(fetchMock.mock.calls[0][0])).toBe('https://openapi.qoder.sh/api/v2/quota/usage')
+  })
+
+  it('签到头带桌面端 cosy-version（缺头会返回空活动列表）', async () => {
+    const fetchMock = vi.fn(async (_input: unknown, _init?: RequestInit) =>
+      new Response(JSON.stringify({ campaigns: [] }), { status: 200 }))
+    vi.stubGlobal('fetch', fetchMock)
+    await performQoderCheckin('dt-c', 'cn')
+    const headers = (fetchMock.mock.calls[0][1] as RequestInit).headers as Record<string, string>
+    expect(headers['cosy-version']).toBe('1.1.64')
   })
 })
 

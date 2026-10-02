@@ -21,7 +21,7 @@ import { getProviders } from './storage'
 import { getOauthAccessToken, detectTokenRealm, refreshQoderTokenPair } from './oauth'
 import { writeLog } from './admin'
 import { isQoderProvider } from './qoder/proxy'
-import { fetchQoderCheckinStatus, performQoderCheckin, fetchQoderUserResource, fetchQoderPaymentType } from './qoder/billing'
+import { fetchQoderCheckinStatus, performQoderCheckin, fetchQoderUserResource, fetchQoderPaymentType, normalizeQoderRealm, realmHasLegacyCheckin, type QoderRealm } from './qoder/billing'
 import {
   readQoderPool,
   seedQoderPoolFromSingle,
@@ -191,9 +191,9 @@ async function fillCredits(env: Env, base: CheckinResult, token: string, realm: 
 // ===== QoderWork 签到（flowType=qoder，dt- token） =====
 
 /** 拉取 Qoder 额度 + 套餐填充到 base（失败只写日志，不影响签到结果）。 */
-async function fillQoderCredits(env: Env, base: CheckinResult, token: string) {
+async function fillQoderCredits(env: Env, base: CheckinResult, token: string, realm: QoderRealm) {
   try {
-    const credits = await fetchQoderUserResource(token)
+    const credits = await fetchQoderUserResource(token, realm)
     if (credits) {
       base.totalRemain = credits.totalRemain
       base.totalUsed = credits.totalUsed
@@ -206,7 +206,7 @@ async function fillQoderCredits(env: Env, base: CheckinResult, token: string) {
     try { await writeLog(env, 'warn', `[checkin] ${base.name} 额度拉取失败: ${(e as Error).message}`, '') } catch { /* ignore */ }
   }
   try {
-    const pt = await fetchQoderPaymentType(token)
+    const pt = await fetchQoderPaymentType(token, realm)
     if (pt) base.paymentType = pt
   } catch { /* ignore */ }
 }
@@ -216,11 +216,13 @@ async function fillQoderCredits(env: Env, base: CheckinResult, token: string) {
  */
 async function checkinQoderPoolAccount(env: Env, provider: Provider, account: QoderPoolAccount): Promise<CheckinResult> {
   const now = Date.now()
+  // 账号域：签到端点与 legacy 能力都按域区分（国际版 legacy 接口不存在）
+  const realm = normalizeQoderRealm(account.realm)
   const base: CheckinResult = {
     providerId: provider.id,
     name: provider.name,
     uid: account.uid || undefined,
-    realm: 'cn',
+    realm,
     success: false,
     reason: 'fail',
     message: '',
@@ -248,12 +250,17 @@ async function checkinQoderPoolAccount(env: Env, provider: Provider, account: Qo
     return base
   }
 
-  // 状态探测
+  // 状态探测（legacy daily-check-in/status）。
+  // 国际版该接口**不存在**（openapi.qoder.sh 返回 404，qoder2api-hub 实测），
+  // 故先按域跳过，避免把「接口不存在」误报成签到失败。活动平台双区域通用，
+  // 跳过状态探测不影响下面的 campaigns 领取。
   let status: Awaited<ReturnType<typeof fetchQoderCheckinStatus>> = null
-  try {
-    status = await fetchQoderCheckinStatus(token)
-  } catch (e) {
-    console.warn(`[checkin] ${provider.name} qoder status fetch failed: ${(e as Error).message}`)
+  if (realmHasLegacyCheckin(realm)) {
+    try {
+      status = await fetchQoderCheckinStatus(token, realm)
+    } catch (e) {
+      console.warn(`[checkin] ${provider.name} qoder status fetch failed: ${(e as Error).message}`)
+    }
   }
   if (status) {
     base.todayCheckedIn = status.todayCheckedIn
@@ -265,14 +272,14 @@ async function checkinQoderPoolAccount(env: Env, provider: Provider, account: Qo
       base.reason = 'already'
       base.message = '今日已签到'
       base.lastCheckinAt = Date.now()
-      await fillQoderCredits(env, base, token)
+      await fillQoderCredits(env, base, token, realm)
       await syncQoderPoolCredits(env, provider.id, account, base)
       return base
     }
   }
 
   // 执行签到（campaigns 流程；legacy daily-check-in/claim 已 DISABLED，不再使用）
-  const res = await performQoderCheckin(token)
+  const res = await performQoderCheckin(token, realm)
   base.success = res.success
   base.message = res.message
   // already = 今日已领取（replayed / 列表 CLAIMED），与「本次新领」区分开：
@@ -285,7 +292,7 @@ async function checkinQoderPoolAccount(env: Env, provider: Provider, account: Qo
   }
 
   // 签到成功后额度已变化，拉最新额度
-  await fillQoderCredits(env, base, token)
+  await fillQoderCredits(env, base, token, realm)
   await syncQoderPoolCredits(env, provider.id, account, base)
   return base
 }
@@ -341,7 +348,8 @@ async function checkinQoderPoolAccounts(env: Env, provider: Provider): Promise<C
       }
     } catch (e) {
       accounts.push({
-        providerId: provider.id, name: provider.name, uid: acc.uid || undefined, realm: 'cn',
+        providerId: provider.id, name: provider.name, uid: acc.uid || undefined,
+        realm: normalizeQoderRealm(acc.realm),
         success: false, reason: 'fail', message: (e as Error).message || String(e),
         todayCheckedIn: false, updatedAt: Date.now(), nickname: acc.nickname || acc.uid,
       })

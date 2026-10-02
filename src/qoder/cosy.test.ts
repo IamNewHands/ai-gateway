@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest'
-import { cosySessionFor, cosyHeaders, buildBearer } from './cosy'
+import { cosySessionFor, cosyHeaders, buildBearer, qoderEncode } from './cosy'
 import { md5Hex } from './md5'
 
 describe('COSY 对齐 keirouter（身份字段/指纹常量/头集）', () => {
@@ -38,10 +38,41 @@ describe('COSY 对齐 keirouter（身份字段/指纹常量/头集）', () => {
     expect(headers['Cosy-Organization-Tags']).toBe('')
   })
 
-  it('Cosy-Machinetoken 与 Cosy-Machineid 同值（对齐 keirouter MachineID 复用）', async () => {
+  it('Cosy-Machinetoken 是独立派生值，不复用 Machineid（client.go:48 / qoder_sign.py:597）', async () => {
     const sess = await cosySessionFor('dt-test1', 'drt', 'u1', 'n')
     const headers = cosyHeaders(sess, '{}', 'https://api3.qoder.sh/algo/api/v2/model/list', 'application/json', false)
-    expect(headers['Cosy-Machinetoken']).toBe(headers['Cosy-Machineid'])
+    // 旧实现生成 machineToken 却发 machineId，等于让派生值白算；
+    // 两套参考实现都发各自的 machineToken。
+    expect(headers['Cosy-Machinetoken']).not.toBe(headers['Cosy-Machineid'])
+    expect(headers['Cosy-Machinetoken']).toBe(sess.machineToken)
+    expect(headers['Cosy-Machineid']).toBe(sess.machineId)
+  })
+
+  it('机器指纹按 uid 稳定派生（同一 uid 重复建会话得到相同机器码）', async () => {
+    const a = await cosySessionFor('dt-same', 'drt', 'uid-stable-1', 'n')
+    const b = await cosySessionFor('dt-same-2', 'drt', 'uid-stable-1', 'n')
+    expect(b.machineId).toBe(a.machineId)
+    expect(b.machineToken).toBe(a.machineToken)
+    expect(b.machineType).toBe(a.machineType)
+    // 不同账号必须彼此独立（阻断跨账号关联）
+    const c = await cosySessionFor('dt-other', 'drt', 'uid-other-2', 'n')
+    expect(c.machineId).not.toBe(a.machineId)
+  })
+
+  it('machineId=md5("machine:"+seed) 32 位、machineType 18 位、machineToken 43 位', async () => {
+    const sess = await cosySessionFor('dt-test1', 'drt', 'u1', 'n')
+    expect(sess.machineId).toMatch(/^[0-9a-f]{32}$/)
+    expect(sess.machineType).toMatch(/^[0-9a-f]{18}$/)
+    expect(sess.machineToken).toMatch(/^[A-Za-z0-9_-]{43}$/)
+  })
+
+  it('GET 签名覆盖空串：签 qoderEncode("{}") 会与服务端重算不匹配（403 Signature invalid）', async () => {
+    const sess = await cosySessionFor('dt-test1', 'drt', 'u1', 'n')
+    const url = 'https://gateway.qoder.com.cn/algo/api/v2/model/list?Encode=1'
+    const empty = buildBearer(sess, '', url)
+    const wrong = buildBearer(sess, qoderEncode('{}'), url)
+    expect(empty.sigInput).toBe(`${empty.payloadB64}\n${sess.cosyKey}\n${empty.date}\n\n/api/v2/model/list`)
+    expect(wrong.sigInput).not.toBe(empty.sigInput)
   })
 
   it('签名 sig 等于 sigInput 的 MD5，sigInput 结构=payloadB64\\ncosyKey\\ndate\\nbody\\nsigPath', async () => {

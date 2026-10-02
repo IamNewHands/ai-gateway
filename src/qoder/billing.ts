@@ -1,21 +1,54 @@
 /**
- * billing.ts — QoderWork 额度 / 签到 / 套餐（移植自 cpa-plugin/qoderwork/billing.go + checkin.go）。
+ * billing.ts — QoderWork 额度 / 签到 / 套餐（移植自 cpa-plugin/qoderwork/billing.go + checkin.go，
+ * 分域端点与活动平台流程对齐 qoder2api-hub qoder_accounts.py:37-106）。
  *
- * 协议：
- *   状态：GET  https://openapi.qoder.com.cn/sash/api/v1/me/daily-check-in/status（只读统计）
- *   活动：GET  https://openapi.qoder.com.cn/sash/api/v1/me/campaigns
- *   领取：POST https://openapi.qoder.com.cn/sash/api/v1/me/campaigns/{campaignId}/claim（空 body）
- *   额度：GET  https://openapi.qoder.com.cn/api/v2/quota/usage
- *   套餐：GET  https://openapi.qoder.com.cn/api/v2/user/plan
+ * 协议（端点按账号域取，见 QODER_OPENAPI）：
+ *   CN     → https://openapi.qoder.com.cn
+ *   global → https://openapi.qoder.sh
+ *   状态：GET  {base}/sash/api/v1/me/daily-check-in/status（只读统计）
+ *   活动：GET  {base}/sash/api/v1/me/campaigns
+ *   领取：POST {base}/sash/api/v1/me/campaigns/{campaignId}/claim（空 body）
+ *   额度：GET  {base}/api/v2/quota/usage
+ *   套餐：GET  {base}/api/v2/user/plan
  *   认证：Authorization: Bearer <token>（dt- / jt- 均可），无 COSY 签名（KNOWLEDGE §2）
  *   响应：普通 JSON，无信封
  *
  * 签到走 campaigns 而非 legacy daily-check-in/claim（移植 qoder2api checkin.go:305-314，commit 99ab022）：
  * legacy 端点已 DISABLED，却对「未领取日」也恒返回 409，把它当「已签到」会永久跳过真实领取
  * （源实测 2026-09-21：不发积分）。真实发放积分的系统是 campaigns。
+ *
+ * 国际版（qoder2api-hub 实测结论，qoder_accounts.py:57-71）：
+ *   - legacy `/sash/api/v1/me/daily-check-in/*` 在 openapi.qoder.sh 上返回 **404**（接口不存在）；
+ *   - 但活动平台 `/sash/api/v1/me/campaigns` **双区域通用**，国际版活动页同样挂
+ *     「每日领取 100 Credits」。
+ *   所以国际版不能「整个跳过签到」，只能「跳过 legacy 状态探测、照常走 campaigns」。
+ *   hub 的做法也是运行时探测能力（`checkin_capability`），不按区域硬编码。
  */
 
-const QODER_API_BASE = 'https://openapi.qoder.com.cn'
+/** 按账号域取 openapi 基地址（qoder2api-hub REALM_CONFIGS）。 */
+export const QODER_OPENAPI: Record<'cn' | 'global', string> = {
+  cn: 'https://openapi.qoder.com.cn',
+  global: 'https://openapi.qoder.sh',
+}
+
+/** 账号域类型（缺省 cn）。 */
+export type QoderRealm = 'cn' | 'global'
+
+/** 桌面端 cosy-version（qoder2api-hub qoder_sign.py:502-505 实测可用于模型列表与推理）。 */
+const DESKTOP_COSY_VERSION = '1.1.64'
+
+/** 规范化账号域：只认 'global'，其余一律 cn。 */
+export function normalizeQoderRealm(realm: unknown): QoderRealm {
+  return realm === 'global' ? 'global' : 'cn'
+}
+
+/**
+ * legacy daily-check-in 接口在**国际版不存在**（openapi.qoder.sh 实测 404）。
+ * 国际版账号跳过状态探测，直接进 campaigns 领取流程。
+ */
+export function realmHasLegacyCheckin(realm: QoderRealm): boolean {
+  return realm === 'cn'
+}
 
 /** 统一认证头（billing 端点用明文 Bearer，不需要 COSY）。 */
 function billingHeaders(token: string): Record<string, string> {
@@ -28,9 +61,12 @@ function billingHeaders(token: string): Record<string, string> {
 }
 
 /**
- * 签到专用头（qoder2api checkin.go:59-67 抓包确认的必需头）。
- * 与 billingHeaders 的差异是实测结论，不是风格选择：签到端点认 `user-agent: Qoder` 与
- * `cosy-clienttype: 10`，且不接受小写以外的 Content-Type 语义（POST claim 无 body）。
+ * 签到专用头。合并两个来源的实测结论：
+ *   - qoder2api checkin.go:59-67：`user-agent: Qoder`、`cosy-clienttype: 10`、`accept-language`
+ *   - qoder2api-hub qoder_accounts.py:655-680（桌面端 0.4.3 同款出站头）：
+ *     缺这些头服务端**不报错但返回空活动列表**，这正是「领不到」的根因；
+ *     `Cosy-ClientType: 10` 是桌面端（CLI 是 5、QoderWork 是 6）。
+ * 故桌面端身份头是**功能必需**，不是可选装饰。
  */
 function checkinHeaders(token: string): Record<string, string> {
   return {
@@ -39,14 +75,16 @@ function checkinHeaders(token: string): Record<string, string> {
     'accept-language': 'zh-CN',
     'user-agent': 'Qoder',
     'cosy-clienttype': '10',
+    'cosy-version': DESKTOP_COSY_VERSION,
   }
 }
 
 /** 签到相关请求：POST 无 body（抓包确认 campaigns/claim 为空 body），并补 origin。 */
-async function checkinRequest(method: 'GET' | 'POST', path: string, token: string): Promise<Response> {
+async function checkinRequest(method: 'GET' | 'POST', path: string, token: string, realm: QoderRealm): Promise<Response> {
+  const base = QODER_OPENAPI[realm]
   const headers = checkinHeaders(token)
-  if (method === 'POST') headers.origin = QODER_API_BASE
-  return fetch(QODER_API_BASE + path, {
+  if (method === 'POST') headers.origin = base
+  return fetch(base + path, {
     method,
     headers,
     signal: AbortSignal.timeout(10000),
@@ -70,19 +108,18 @@ export interface QoderCheckinStatus {
  * 注意：legacy 活动已 DISABLED（streak 恒 0），故这里只用于「今日是否已领」的快速判断；
  * 真实领取必须走 campaigns（performQoderCheckin）。
  * status=CLAIMED 且 lastClaimedAt 落在今天 → 今日已签到。
+ *
+ * 国际版该接口不存在（404）→ 调用方应先用 realmHasLegacyCheckin() 跳过，
+ * 否则会把「接口不存在」误报成签到失败。
  */
-export async function fetchQoderCheckinStatus(token: string): Promise<{
+export async function fetchQoderCheckinStatus(token: string, realm: QoderRealm = 'cn'): Promise<{
   active: boolean
   todayCheckedIn: boolean
   streakDays: number
   totalCredits: number
   dailyCredit: number
 } | null> {
-  const res = await fetch(QODER_API_BASE + '/sash/api/v1/me/daily-check-in/status', {
-    method: 'GET',
-    headers: checkinHeaders(token),
-    signal: AbortSignal.timeout(10000),
-  })
+  const res = await checkinRequest('GET', '/sash/api/v1/me/daily-check-in/status', token, realm)
   if (!res.ok) {
     throw new Error(`checkin status http ${res.status} body=${(await res.text().catch(() => '')).substring(0, 200)}`)
   }
@@ -143,11 +180,14 @@ export interface QoderCheckinOutcome {
  *
  * 不再调用 legacy /daily-check-in/claim：该端点已 DISABLED，对未领取日恒返回 409，
  * 旧实现把 409 当成功 → 假签到、0 积分。
+ *
+ * 活动平台**双区域通用**（qoder2api-hub qoder_accounts.py:929「双区域通用」）：
+ * 国际版账号同样走这里，只是 openapi 基地址换成 openapi.qoder.sh。
  */
-export async function performQoderCheckin(token: string): Promise<QoderCheckinOutcome> {
+export async function performQoderCheckin(token: string, realm: QoderRealm = 'cn'): Promise<QoderCheckinOutcome> {
   let res: Response
   try {
-    res = await checkinRequest('GET', '/sash/api/v1/me/campaigns', token)
+    res = await checkinRequest('GET', '/sash/api/v1/me/campaigns', token, realm)
   } catch (e) {
     return { success: false, message: (e as Error).message || '网络请求失败' }
   }
@@ -180,7 +220,7 @@ export async function performQoderCheckin(token: string): Promise<QoderCheckinOu
 
   let claimRes: Response
   try {
-    claimRes = await checkinRequest('POST', `/sash/api/v1/me/campaigns/${campaignId}/claim`, token)
+    claimRes = await checkinRequest('POST', `/sash/api/v1/me/campaigns/${campaignId}/claim`, token, realm)
   } catch (e) {
     return { success: false, message: (e as Error).message || '网络请求失败' }
   }
@@ -227,13 +267,13 @@ interface QoderQuotaUsage {
  * 拉取额度：聚合 userQuota（基础额度）+ addOnQuota（赠送/签到额度）为两个包。
  * 返回 null 表示数据缺失（非耗尽）。
  */
-export async function fetchQoderUserResource(token: string): Promise<{
+export async function fetchQoderUserResource(token: string, realm: QoderRealm = 'cn'): Promise<{
   totalRemain: number
   totalUsed: number
   totalSize: number
   packCount: number
 } | null> {
-  const res = await fetch(QODER_API_BASE + '/api/v2/quota/usage', {
+  const res = await fetch(QODER_OPENAPI[realm] + '/api/v2/quota/usage', {
     method: 'GET',
     headers: billingHeaders(token),
     signal: AbortSignal.timeout(10000),
@@ -269,9 +309,9 @@ interface QoderPlan {
 }
 
 /** 拉取套餐名：优先 plan_tier_name（如 "Pro Trial"），回退 user_type。失败返回 ''。 */
-export async function fetchQoderPaymentType(token: string): Promise<string> {
+export async function fetchQoderPaymentType(token: string, realm: QoderRealm = 'cn'): Promise<string> {
   try {
-    const res = await fetch(QODER_API_BASE + '/api/v2/user/plan', {
+    const res = await fetch(QODER_OPENAPI[realm] + '/api/v2/user/plan', {
       method: 'GET',
       headers: billingHeaders(token),
       signal: AbortSignal.timeout(10000),

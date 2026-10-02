@@ -78,6 +78,16 @@ function base64UrlNoPad(bytes: Uint8Array): string {
   return base64Std(bytes).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '')
 }
 
+/**
+ * deriveMachineToken：base64url(sha512("machinetoken:" + seed))[:43]。
+ * 与 qoder2api-hub qoder_fingerprint.py 的 derive_machine_token 及 qoder2api
+ * internal/cosy/fingerprint.go:82-85 逐字节同构（同一 seed 产出相同值）。
+ */
+async function deriveMachineToken(seed: string): Promise<string> {
+  const digest = await crypto.subtle.digest('SHA-512', new TextEncoder().encode('machinetoken:' + seed))
+  return base64UrlNoPad(new Uint8Array(digest)).slice(0, 43)
+}
+
 function uuid(): string {
   return crypto.randomUUID()
 }
@@ -234,19 +244,36 @@ export interface CosyIdentity {
   email: string
 }
 
-/** newCosySession：精确移植 Go sign.go newCosySession（身份字段对齐 keirouter userInfo）。 */
+/**
+ * newCosySession：身份字段对齐 keirouter userInfo，机器指纹按 **uid 稳定派生**。
+ *
+ * 为什么指纹必须稳定（qoder2api-hub qoder_fingerprint.py:1-17 + qoder2api
+ * internal/cosy/fingerprint.go:51-85 的共同结论）：
+ *   - 同一账号长期稳定 → 出站请求永远来自同一台虚拟设备，规避机器码漂移风控；
+ *   - 多账号天然隔离 → 不同账号机器码彼此独立，阻断跨账号关联检测。
+ * 旧实现每次调用都随机（且缓存只在 isolate 内存里），isolate 回收即换设备，
+ * 上游看到同一账号在无限多台机器上登录。
+ *
+ * 派生式（与 hub 逐字节同构，同一 seed 产出相同值）：
+ *   machineId    = md5("machine:" + seed)                  → 32 位十六进制
+ *   machineType  = md5("machinetype:" + seed)[:18]
+ *   machineToken = base64url(sha512("machinetoken:" + seed))[:43]
+ * 种子优先 uid；uid 未知时回退 accessToken 前 16 位（保证同凭证跨次一致）。
+ */
 async function newCosySession(id: CosyIdentity): Promise<CosySession> {
-  const machineID = uuid()
-  const seed = (uuid() + uuid()).slice(0, 50)
-  const machineToken = base64UrlNoPad(new TextEncoder().encode(seed))
-  const machineType = uuid().replace(/-/g, '').slice(0, 18)
+  const seed = id.uid || id.securityOauthToken.slice(0, 16)
+  const machineID = md5Hex('machine:' + seed)
+  const machineType = md5Hex('machinetype:' + seed).slice(0, 18)
+  const machineToken = await deriveMachineToken(seed)
   const tempKey = uuid().replace(/-/g, '').slice(0, 16)
 
   const cosyKeyBytes = rsaEncrypt(new TextEncoder().encode(tempKey))
   const cosyKey = base64Std(cosyKeyBytes)
 
-  // 身份 JSON 与 keirouter userInfo 完全一致：{uid, security_oauth_token, name, aid, email}
-  // aid 恒为空串。字段顺序用 jsonObjectOrdered 对齐 Go json.Marshal 的 struct 声明序。
+  // 身份 JSON 与 keirouter userInfo 一致；字段顺序用 jsonObjectOrdered 对齐 Go
+  // json.Marshal 的 struct 声明序。
+  // aid 保持空串（keirouter 口径）：qoder2api-hub 用 uid，两套参考实现在此冲突，
+  // 无实测证据前不跟随——改错会让 info 解密后字段不符（见移植分析 identity 字段集一项）。
   const identityJSON = jsonObjectOrdered([
     ['uid', id.uid],
     ['security_oauth_token', id.securityOauthToken],
@@ -283,7 +310,13 @@ export interface CosyBearer {
   sigInput: string
 }
 
-/** buildBearer：构造 Authorization 头。pathSig 为 URL path 去掉 /algo 前缀。 */
+/** buildBearer：构造 Authorization 头。pathSig 为 URL path 去掉 /algo 前缀。
+ *
+ * 关键约束（qoder2api-hub qoder_sign.py:561-577 + qoder2api client.go:85-89）：
+ * `body` 必须是**实际随请求发出的字节**。签名覆盖 body，服务端会用收到的 body
+ * 重算一遍；两者不一致即 `{"code":"101","message":"Signature invalid"}`。
+ * GET 请求不带 body，故必须签**空串**——签 `qoderEncode('{}')` 必然失败。
+ */
 export function buildBearer(sess: CosySession, body: string, rawUrl: string): CosyBearer {
   const u = new URL(rawUrl)
   let pathSig = u.pathname
@@ -332,8 +365,6 @@ export function cosyHeaders(sess: CosySession, body: string, rawUrl: string, acc
   const u = new URL(rawUrl)
   let sigPath = u.pathname
   if (sigPath.startsWith('/algo')) sigPath = sigPath.slice('/algo'.length)
-  // Cosy-Machinetoken 与 machineId 同值（与 keirouter MachineID 逻辑一致）
-  const machineID = sess.machineId
   const h: Record<string, string> = {
     'Authorization': bearer,
     'Content-Type': 'application/json',
@@ -343,8 +374,11 @@ export function cosyHeaders(sess: CosySession, body: string, rawUrl: string, acc
     'Cosy-User': sess.uid,
     'Cosy-Date': date,
     'Cosy-Version': IDE_VERSION,
-    'Cosy-Machineid': machineID,
-    'Cosy-Machinetoken': machineID,
+    'Cosy-Machineid': sess.machineId,
+    // machineToken 是**独立**的凭证值，不能复用 machineId：
+    // qoder2api client.go:48 与 qoder2api-hub qoder_sign.py:597 都发各自的
+    // machineToken。旧实现生成 machineToken 却发 machineId，等于让派生值白算。
+    'Cosy-Machinetoken': sess.machineToken,
     'Cosy-Machinetype': sess.machineType,
     'Cosy-Machineos': MACHINE_OS,
     'Cosy-Clienttype': CLIENT_TYPE,
