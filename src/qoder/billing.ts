@@ -193,6 +193,12 @@ interface QoderCampaign {
   startAt?: number
   endAt?: number
   benefit?: { kind?: string; amount?: number }
+  /** 不可领取的原因码（qoder2api-hub qoder_accounts.py:999 同名归一化字段）。 */
+  unavailableReason?: string
+  /** 成就门控活动是否已达成（hub qoder_accounts.py:998）。 */
+  achievementCompleted?: boolean
+  /** 成就门控活动的任务 key（hub qoder_accounts.py:996）。 */
+  requiredAchievementKey?: string
 }
 
 /** claim 响应（qoder2api checkin.go:124-138）。 */
@@ -250,10 +256,19 @@ export async function performQoderCheckin(token: string, realm: QoderRealm = 'cn
   const raw = Array.isArray(list.campaigns) ? (list.campaigns as QoderCampaign[]) : []
   let target: QoderCampaign | null = null
   let alreadyClaimed = false
+  /** 非 CLAIMABLE/CLAIMED 的活动：带原因码，用于把「领不到」讲清楚 */
+  const notClaimable: QoderCampaign[] = []
   for (const c of raw) {
-    if (!c || c.actionType !== 'CLAIM_BENEFIT') continue
+    if (!c) continue
+    // 空 actionType 也算奖励类：hub qoder_accounts.py:1127/1150 与 qoder_tasks.py:275
+    // 都把 "" 与 CLAIM_BENEFIT 并列（`action_type in ("", "CLAIM_BENEFIT")`）。
+    // 旧实现只认字面量 CLAIM_BENEFIT，会把「每日领取 Credits」这类未回填
+    // actionType 的活动整条丢掉 → 误报「无可用签到活动」。
+    const action = String(c.actionType || '')
+    if (action !== '' && action !== 'CLAIM_BENEFIT') continue
     if (c.claimStatus === 'CLAIMABLE') target = c
     else if (c.claimStatus === 'CLAIMED') alreadyClaimed = true
+    else notClaimable.push(c)
   }
 
   if (!target) {
@@ -268,6 +283,28 @@ export async function performQoderCheckin(token: string, realm: QoderRealm = 'cn
         message:
           '活动列表被上游按机器身份过滤（showCampaign=false）：服务端未认可本客户端的设备身份，' +
           '故「每日领取 Credits」等设备定向活动未下发。这不是「今天没有活动」。',
+      }
+    }
+    // 有活动但都不可领：把上游原因码如实带出来（hub qoder_accounts.py:1145-1148 同样分类：
+    // REDEMPTION_CODE_OUT_OF_STOCK=名额发完、ACHIEVEMENT_NOT_COMPLETED=需先完成新人任务）。
+    // 全部塌缩成一句「没有 CLAIMABLE 的 CLAIM_BENEFIT」会让人无从判断下一步。
+    if (notClaimable.length > 0) {
+      const detail = notClaimable
+        .map((c) => {
+          const reason = String(c.unavailableReason || '').toUpperCase()
+          const key = c.campaignKey || c.campaignId || '(无 key)'
+          const why =
+            reason === 'REDEMPTION_CODE_OUT_OF_STOCK'
+              ? '名额已发完（次日 10:00 后可再领）'
+              : reason === 'ACHIEVEMENT_NOT_COMPLETED' || c.achievementCompleted === false
+                ? `需先在官方桌面端完成新人任务${c.requiredAchievementKey ? `（成就 ${c.requiredAchievementKey}）` : ''}`
+                : reason || `状态 ${c.claimStatus || '(空)'}`
+          return `${key}: ${why}`
+        })
+        .join('；')
+      return {
+        success: false,
+        message: `签到活动暂不可领取（共 ${raw.length} 个活动，${notClaimable.length} 个奖励类活动均不可领）—— ${detail}`,
       }
     }
     return {

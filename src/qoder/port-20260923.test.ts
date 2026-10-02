@@ -406,6 +406,106 @@ describe('国际版/国内版签到分域', () => {
   })
 })
 
+// ===== 活动 actionType 为空 + 不可领取原因码（线上实测「1 个活动里没有 CLAIMABLE」） =====
+describe('活动领取：空 actionType 视为奖励类，不可领取时如实报原因', () => {
+  it('actionType 为空且 CLAIMABLE → 照常领取（旧实现整条丢弃）', async () => {
+    // hub qoder_accounts.py:1127/1150 与 qoder_tasks.py:275 都是
+    // `action_type in ("", "CLAIM_BENEFIT")`：空串与 CLAIM_BENEFIT 等价。
+    const fetchMock = vi.fn(async (input: unknown) => {
+      const url = String(input)
+      if (url.endsWith('/me/campaigns')) {
+        return new Response(JSON.stringify({
+          showCampaign: true,
+          campaigns: [{ campaignId: 'c-empty', campaignKey: 'daily', claimStatus: 'CLAIMABLE', benefit: { kind: 'CREDITS', amount: 100 } }],
+        }), { status: 200 })
+      }
+      return new Response(JSON.stringify({ status: 'CLAIMED', replayed: false, benefit: { amount: 100 } }), { status: 200 })
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    const r = await performQoderCheckin('dt-c', 'cn', 'u1')
+    expect(r.success).toBe(true)
+    expect(r.rewardCredits).toBe(100)
+    expect(fetchMock.mock.calls.some((c) => String(c[0]).endsWith('/c-empty/claim'))).toBe(true)
+  })
+
+  it('名额发完（REDEMPTION_CODE_OUT_OF_STOCK）→ 报「名额已发完」而非「没有 CLAIMABLE」', async () => {
+    vi.stubGlobal('fetch', vi.fn(async (_input: unknown, _init?: RequestInit) =>
+      new Response(JSON.stringify({
+        showCampaign: true,
+        campaigns: [{
+          campaignId: 'c1', campaignKey: 'act-20260928-620', actionType: 'CLAIM_BENEFIT',
+          claimStatus: 'NOT_ELIGIBLE', unavailableReason: 'REDEMPTION_CODE_OUT_OF_STOCK',
+        }],
+      }), { status: 200 })))
+    const r = await performQoderCheckin('dt-c', 'cn', 'u1')
+    expect(r.success).toBe(false)
+    expect(r.message).toContain('名额已发完')
+    expect(r.message).toContain('act-20260928-620')
+  })
+
+  it('成就未完成（ACHIEVEMENT_NOT_COMPLETED）→ 报出需完成的成就 key', async () => {
+    vi.stubGlobal('fetch', vi.fn(async (_input: unknown, _init?: RequestInit) =>
+      new Response(JSON.stringify({
+        showCampaign: true,
+        campaigns: [{
+          campaignId: 'c2', campaignKey: 'act-locked', actionType: 'CLAIM_BENEFIT',
+          claimStatus: 'NOT_ELIGIBLE', unavailableReason: 'ACHIEVEMENT_NOT_COMPLETED',
+          requiredAchievementKey: 'sites_first_use',
+        }],
+      }), { status: 200 })))
+    const r = await performQoderCheckin('dt-c', 'cn', 'u1')
+    expect(r.success).toBe(false)
+    expect(r.message).toContain('新人任务')
+    expect(r.message).toContain('sites_first_use')
+  })
+
+  it('VIEW_DETAILS 活动仍不算签到奖励（不因放宽 actionType 而被误领）', async () => {
+    const fetchMock = vi.fn(async (_input: unknown, _init?: RequestInit) =>
+      new Response(JSON.stringify({
+        showCampaign: true,
+        campaigns: [{ campaignId: 'v1', actionType: 'VIEW_DETAILS', claimStatus: 'CLAIMABLE' }],
+      }), { status: 200 }))
+    vi.stubGlobal('fetch', fetchMock)
+    const r = await performQoderCheckin('dt-c', 'cn', 'u1')
+    expect(r.success).toBe(false)
+    expect(fetchMock.mock.calls.some((c) => String(c[0]).includes('/claim'))).toBe(false)
+  })
+})
+
+// ===== 测试按钮走真实 COSY 管线（不再 POST /chat/completions 撞 ALB 503） =====
+describe('testQoderModel：测试按钮走 COSY 签名推理端点', () => {
+  it('打到 agent_chat_generation 而非 gateway.qoder.com.cn/chat/completions', async () => {
+    const session = await makeSession()
+    const fetchMock = vi.fn(async (_input: unknown, _init?: RequestInit) =>
+      new Response(sseBody([envelope(INNER_CHUNK)]), { status: 200, headers: { 'Content-Type': 'text/event-stream' } }))
+    vi.stubGlobal('fetch', fetchMock)
+    // 池为空 + 无 OAuth 单 token → 走 opts.session 注入的直发路径
+    const r = await proxyQoderChatRequest(
+      {} as Env,
+      { id: 'qoder' } as Provider,
+      { model: 'qmodel_38max', messages: [{ role: 'user', content: 'hi' }], stream: false },
+      { session: { session }, stream: false }
+    )
+    expect(r.status).toBe(200)
+    const url = String(fetchMock.mock.calls[0][0])
+    expect(url).toContain('/algo/api/v2/service/pro/sse/agent_chat_generation')
+    expect(url).not.toContain('/chat/completions')
+  })
+
+  it('上游返回 ALB 503 HTML 时如实回显（不谎报连接成功）', async () => {
+    const session = await makeSession()
+    const albHtml = '<html><head><title>503 Service Temporarily Unavailable</title></head><body><center><h1>503 Service Temporarily Unavailable</h1></center><hr><center>alb</center></body></html>'
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(albHtml, { status: 503 })))
+    const r = await proxyQoderChatRequest(
+      {} as Env,
+      { id: 'qoder' } as Provider,
+      { model: 'qmodel_38max', messages: [{ role: 'user', content: 'hi' }], stream: false },
+      { session: { session }, stream: false }
+    )
+    expect(r.status).toBe(503)
+  })
+})
+
 // ===== 模型列表场景分类（bridge.go:195-206） =====
 describe('模型列表按场景桶读取（assistant → developer → chat）', () => {
   it('chat 桶为空但 assistant 桶有内容 → 取 assistant（不再误报无模型）', () => {

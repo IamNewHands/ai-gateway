@@ -753,6 +753,52 @@ export async function proxyQoderChatRequest(
 }
 
 /**
+ * 管理后台「测试」按钮（handleTestModel 的 qoder 分支）。
+ *
+ * 为什么不能走通用 OpenAI 路径：Qoder 的 authType 是 oauth-device，通用分支会
+ * POST `${provider.baseUrl}/chat/completions`（即 gateway.qoder.com.cn/chat/completions），
+ * 而该路径根本不是 Qoder 接口——边缘 ALB 直接回自己的 503 HTML 错误页
+ * （`<title>503 Service Temporarily Unavailable</title> … alb`），
+ * 与账号是否可用无关。真实推理必须走 COSY 签名 +
+ * /algo/api/v2/service/pro/sse/agent_chat_generation。
+ *
+ * 这里复用**真实转发管线**（proxyQoderChatRequest）发一次最小非流式请求：
+ * 池挑选/轮转、COSY 签名、信封解析、错误分类全部与线上一致，测出来的结论才可信。
+ * 非流式让错误能带真实 HTTP 状态码（流式在首帧闸门后已发头，无法改状态码）。
+ */
+export async function testQoderModel(
+  env: Env,
+  provider: Provider,
+  modelId: string
+): Promise<{ success: boolean; message: string; statusCode?: number }> {
+  const model = String(modelId || '').trim()
+  if (!model) return { success: false, message: '模型 ID 为空' }
+
+  let resp: Response
+  try {
+    resp = await proxyQoderChatRequest(
+      env,
+      provider,
+      { model, messages: [{ role: 'user', content: 'hi' }], max_tokens: 1, stream: false },
+      { stream: false }
+    )
+  } catch (err) {
+    return { success: false, message: `测试异常: ${((err as Error).message || String(err)).substring(0, 200)}` }
+  }
+
+  if (resp.ok) {
+    return { success: true, message: `连接成功（${model}）`, statusCode: resp.status }
+  }
+  const text = await resp.text().catch(() => '')
+  let msg = text.substring(0, 300)
+  try {
+    const j = JSON.parse(text)
+    msg = j?.error?.message || j?.message || msg
+  } catch { /* 非 JSON：原样回显（如上游 HTML 错误页） */ }
+  return { success: false, message: msg || `HTTP ${resp.status}`, statusCode: resp.status }
+}
+
+/**
  * 拉取 QoderWork 模型列表（GET /algo/api/v2/model/list，COSY 签名，返回普通 JSON）。
  * 响应：{"chat":[{key,display_name,enable,...}], ...}，只取 chat 场景启用的模型。
  */

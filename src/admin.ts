@@ -29,7 +29,7 @@ import { probeMcpServers } from './mcp-gateway'
 import { MAX_ADMIN_REQUEST_BYTES, readOptionalJSONLimited, readStrictJSONLimited } from './request-body'
 import { isTraeProvider, testTraeCredential, testTraeModel } from './trae/proxy'
 import { diagnoseOpenCodeKey, fetchOpenCodeModels, isOpenCodeProvider, resolveOpenCodeUrls, testOpenCodeModel } from './opencode'
-import { isQoderProvider, fetchQoderModels } from './qoder/proxy'
+import { isQoderProvider, fetchQoderModels, testQoderModel } from './qoder/proxy'
 import { isClineProvider, fetchClineRecommendedModels, testClineChat, testClineRefreshToken, probeClineAccount, startClineOAuth, pollClineOAuth } from './cline/proxy'
 import { isGeminiProvider, testGeminiModel, GEMINI_MODELS } from './gemini/proxy'
 import { fetchGeminiQuota } from './gemini/quota'
@@ -588,6 +588,20 @@ export async function handleTestModel(c: Context<AppEnv>) {
     if (!result.success) {
       try {
         await writeLog(c.env, 'error', `[m365-test-model] provider=${id} model=${modelId} → ${result.message}`)
+      } catch { /* ignore */ }
+    }
+    return c.json<ApiResponse>({ success: true, data: result })
+  }
+
+  // QoderWork：COSY 签名的私有协议，**必须**在通用 oauth-device 分支之前拦下。
+  // 通用分支会 POST ${baseUrl}/chat/completions（gateway.qoder.com.cn/chat/completions），
+  // 该路径不是 Qoder 接口，边缘 ALB 直接回 503 HTML 错误页（与账号可用性无关）。
+  // 真实链路是 /algo/api/v2/service/pro/sse/agent_chat_generation + COSY 签名。
+  if (isQoderProvider(provider.id) || provider.oauth?.flowType === 'qoder') {
+    const result = await testQoderModel(c.env, provider, modelId)
+    if (!result.success) {
+      try {
+        await writeLog(c.env, 'error', `[qoder-test-model] provider=${id} model=${modelId} → ${result.message}`)
       } catch { /* ignore */ }
     }
     return c.json<ApiResponse>({ success: true, data: result })
