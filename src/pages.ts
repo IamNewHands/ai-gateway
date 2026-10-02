@@ -119,6 +119,36 @@ const keyRowHtml = (p: { id?: string }, k: { key: string; enabled: boolean; labe
 }
 
 /**
+ * Cline「上游渠道与固定」区块（移植 cline-pass-switcher 的控制台能力）。
+ *
+ * 交互基线（为什么这样排）：
+ *  - 「探测」与「校验」刻意分成两个动作。探测是整模型一次请求——发一个不存在的渠道名让网关
+ *    在路由层回吐清单，零 token、约 0.3s；校验则是**每个渠道一次真实最小请求**，而且免费通道
+ *    并发 >1 会返回空响应，必须串行（间隔 800ms），16 个渠道约占用队列 13s、期间其它 Cline
+ *    请求排队。所以校验一律由用户显式发起，并在确认框里写明将要发起的请求数，绝不"顺手全跑"。
+ *  - 表格与选择器都由脚本按接口数据渲染；「显示已留档」只读 KV，不打上游。
+ *  - 固定设置的保存走通用 PUT /admin/api/providers/:id：clinePinByModel 是**整表替换**语义，
+ *    所以前端每次都提交完整的表（未选的模型即视为取消固定）。
+ */
+const clineUpstreamSectionHtml = (p: { id?: string }) => {
+  const pid = escapePageHtml(p.id)
+  const js = escapePageJsx(p.id)
+  return `<div class="collapse-section">` +
+    `<button class="collapse-btn" onclick="toggleAdvOauth('cu-fs-${js}', this)" type="button" aria-expanded="false">` +
+    `<i class="fas fa-chevron-right collapse-icon" aria-hidden="true"></i> 上游渠道与固定（把模型钉在指定渠道上）</button>` +
+    `<fieldset class="form-group hd" id="cu-fs-${pid}"><legend>上游渠道与固定</legend>` +
+    `<div class="fc mt-1 field-row">` +
+    `<button class="btn btn-s btn-xs" onclick="clineUpstreamsLoad('${js}')" title="读取留档的渠道清单与固定设置；不打上游"><i class="fas fa-list" aria-hidden="true"></i><span>显示已留档</span></button>` +
+    `<button class="btn btn-s btn-xs" onclick="clineUpstreamsProbeAll('${js}')" title="逐个模型发一次假渠道请求，让网关回吐可用渠道清单（零 token、每模型约 0.3 秒）"><i class="fas fa-satellite-dish" aria-hidden="true"></i><span>探测全部渠道</span></button>` +
+    `<button class="btn btn-gh btn-xs" onclick="clineUpstreamsValidateAll('${js}')" title="对每个模型已探测到的渠道逐个发最小真实请求实测可用性；点击后会先告知请求数与预计耗时"><i class="fas fa-vial" aria-hidden="true"></i><span>校验全部渠道</span></button>` +
+    `<button class="btn btn-p btn-xs" onclick="clineUpstreamsSave('${js}')" title="保存下面每个模型选定的渠道与模式"><i class="fas fa-save" aria-hidden="true"></i><span>保存固定设置</span></button>` +
+    `<span class="mu" id="cu-st-${pid}" aria-live="polite" style="font-size:12px"></span></div>` +
+    `<div id="cu-tb-${pid}"></div>` +
+    `<span class="form-helper">钉住发生在 Cline 网关之后的路由层：<b>严格</b>只用你选的渠道（网关不再兜底，该渠道一挂即失败）；<b>优先</b>按你排的顺序优先、仍保留网关兜底。选「不固定」= 保持网关自动选。校验中「限流」只代表当前共享池暂时繁忙，渠道本身可用。</span>` +
+    `</fieldset></div>`
+}
+
+/**
  * 是否 WorkBuddy/CodeBuddy 提供商（browser 登录流，或 id 以 workbuddy 开头，
  * 与 src/proxy.ts isWorkbuddyProvider 对齐）。
  * 仅这类上游消费 oauth.effortPolicy（reasoning_effort 档位声明，见 applyWorkbuddyReasoningEffort），
@@ -801,6 +831,7 @@ ${H('管理')}
                   <i class="fas fa-chevron-right collapse-icon" aria-hidden="true"></i> 系统提示词体系（模式 / 自有提示词，可选）${p.promptMode==='custom'?'<span class="bd bd-on" style="margin-left:6px">custom 已启用</span>':''}
                 </button>
                 <fieldset class="form-group hd" id="psys-fs-${escapePageHtml(p.id)}"><legend>系统提示词体系</legend><div class="fc mt-1 field-row" style="align-items:flex-start"><label style="width:110px;font-size:13px;padding-top:6px">提示词模式</label><select id="pmode-${escapePageHtml(p.id)}" style="flex:1"><option value="passthrough" ${(p.promptMode||'passthrough')==='passthrough'?'selected':''}>passthrough（透传客户端 system，被拦自动降级重试）</option><option value="custom" ${p.promptMode==='custom'?'selected':''}>custom（用下方自有提示词替换）</option><option value="append" ${p.promptMode==='append'?'selected':''}>append（保留客户端 system，另追加一条网关 system）</option></select></div><div class="fc mt-1 field-row" style="align-items:flex-start"><label style="width:110px;font-size:13px;padding-top:6px">自有提示词</label><textarea id="ptext-${escapePageHtml(p.id)}" rows="4" placeholder="custom/append 模式下注入的提示词" style="flex:1">${escapePageHtml(p.promptText||'')}</textarea></div><span class="form-helper">passthrough：透传客户端原始 system；遇内容拦截误报自动换中性提示词重试一次。custom：出站时用上方提示词整体替换 system/developer，从源头消除指纹误报。append：在开头连续 system/developer 块之后追加一条网关 system，客户端项目规范逐字保留、两者并用（降级重试时仍退化为整体替换）。</span></fieldset>
+              ${p.id === 'cline' ? clineUpstreamSectionHtml(p) : ''}
               <div class="detail-actions"><div id="tr-${escapePageHtml(p.id)}" aria-live="polite"></div><div>${((p.id === 'cnb' || (p.baseUrl && p.baseUrl.indexOf('cnb.cool') !== -1)) || ((p.oauth && (p.oauth.flowType === 'm365-pkce' || p.oauth.flowType === 'm365-ropc')))) ? '<button class="btn btn-s" onclick="fetchOauthModels(\'' + escapePageJsx(p.id) + '\')"><i class="fas fa-download" aria-hidden="true"></i>获取模型</button>' : ((isSensenovaProviderUI(p) || p.apiType === 'openai' || p.id === 'cline' || p.id === 'opencode') && !isTraeProviderUI(p) && !(p.authType === 'oauth-device' && p.oauth)) ? '<button class="btn btn-s" onclick="fetchEditModels(\'' + escapePageJsx(p.id) + '\')"><i class="fas fa-download" aria-hidden="true"></i>获取模型</button>' : ''}${p.id === 'cline' ? '<button class="btn btn-s" onclick="clineOAuthConnect(\'' + escapePageJsx(p.id) + '\')"><i class="fas fa-sign-in-alt" aria-hidden="true"></i>一键授权获取 Token</button>' : ''}<button class="btn btn-d" onclick="del('${escapePageJsx(p.id)}')"><i class="fas fa-trash" aria-hidden="true"></i>删除</button><button class="btn btn-p" onclick="save('${escapePageJsx(p.id)}')"><i class="fas fa-save" aria-hidden="true"></i>保存更改</button></div></div>
             </div>
           </article>`).join('') : `<div class="empty-state"><i class="fas fa-server" aria-hidden="true"></i><h3>还没有提供商</h3><p>添加第一个上游提供商，配置 API 地址、Key 和模型。</p><button class="btn btn-p" onclick="showAdd()">添加提供商</button></div>`}
@@ -3214,6 +3245,225 @@ function clineOAuthPoll(id) {
 // 每个 token 换一次 accessToken：徽章=是否仍可用，账号框=上游返回的邮箱（关联不到就手工填）。
 // save() 成功与一键授权成功后会把提供商标记为「待检测」，下次展开自动跑一次，避免每次展开都打上游。
 function clineMarkStale(id) { window._clineStale = window._clineStale || {}; window._clineStale[id] = true }
+
+/* CLINE_UP_BEGIN */
+// —— Cline 上游渠道与固定：纯映射与文案（pages-inline-script.test.ts 抽此块直接断言）——
+function clineUpBadge(status) {
+  var map = {
+    ok: ['bd-on', '可用'],
+    limited: ['bd-warn', '限流'],
+    bad: ['bd-danger', '不可钉'],
+    auth: ['bd-danger', '认证失败'],
+    unknown: ['bd-off', '未知'],
+  }
+  return map[status] || map.unknown
+}
+function clineUpCostText(count, minGapMs) {
+  if (!(count > 0)) return ''
+  var sec = Math.round((count * (minGapMs || 800)) / 1000)
+  return '将发起 ' + count + ' 次最小请求，约 ' + sec + ' 秒（期间其它 Cline 请求排队）'
+}
+function clineUpPinSummary(pin) {
+  if (!pin || !pin.upstreams || !pin.upstreams.length) return ''
+  return pin.upstreams[0] + (pin.pinMode === 'preferred' ? '（优先）' : '（严格）') + (pin.sort ? ' · ' + pin.sort : '')
+}
+/* CLINE_UP_END */
+
+var _clineUpData = {}
+
+function clineUpEl(id, name) { return document.getElementById('cu-' + name + '-' + id) }
+function clineUpStatus(id, text) { var el = clineUpEl(id, 'st'); if (el) el.textContent = text || '' }
+function clineUpPost(id, path, body) {
+  return fetch('/admin/api/providers/' + encodeURIComponent(id) + path, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body || {}),
+  }).then(function (r) { return r.json() })
+}
+
+function clineUpstreamsLoad(id) {
+  clineUpStatus(id, '读取留档中…')
+  return fetch('/admin/api/providers/' + encodeURIComponent(id) + '/cline-upstreams')
+    .then(function (r) { return r.json() })
+    .then(function (d) {
+      if (!d.success) { clineUpStatus(id, '读取失败：' + ((d && d.message) || '未知错误')); return null }
+      _clineUpData[id] = d.data
+      clineUpstreamsRender(id)
+      clineUpStatus(id, d.data.updatedAt ? ('留档时间 ' + new Date(d.data.updatedAt).toLocaleString()) : '还没有留档，点「探测全部渠道」开始')
+      return d.data
+    })
+    .catch(function () { clineUpStatus(id, '网络错误，请重试'); return null })
+}
+
+function clineUpstreamsRender(id) {
+  var box = clineUpEl(id, 'tb')
+  var data = _clineUpData[id]
+  if (!box || !data) return
+  var models = data.models || []
+  if (!models.length) {
+    box.innerHTML = '<div class="mu" style="font-size:12px">该提供商还没有配置模型，先点上方「获取模型」并保存。</div>'
+    return
+  }
+  var probes = data.probes || {}
+  var checks = data.checks || {}
+  var pins = data.pins || {}
+  var body = models.map(function (m, i) {
+    var probe = probes[m] || {}
+    var channels = probe.upstreams || []
+    var chk = checks[m] || {}
+    var pin = pins[m] || {}
+    var pinned = (pin.upstreams || [])[0] || ''
+    var list = channels.slice()
+    // 已钉但已从清单消失的渠道也要出现在下拉里，否则一保存就被静默清掉
+    if (pinned && list.indexOf(pinned) === -1) list.unshift(pinned)
+    var options = ['<option value="">不固定（网关自动选）</option>']
+    list.forEach(function (c) {
+      var b = clineUpBadge((chk[c] || {}).status)
+      options.push('<option value="' + escapeHtml(c) + '"' + (c === pinned ? ' selected' : '') + '>' + escapeHtml(c) + '（' + b[1] + '）</option>')
+    })
+    var badges = channels.length
+      ? channels.map(function (c) {
+          var b = clineUpBadge((chk[c] || {}).status)
+          return '<span class="bd ' + b[0] + '" title="' + escapeHtml((chk[c] || {}).note || '尚未校验') + '">' + escapeHtml(c) + ' · ' + b[1] + '</span>'
+        }).join(' ')
+      : '<span class="mu">未探测</span>'
+    var pipe = probe.pipeline && probe.pipeline !== 'unknown' ? probe.pipeline : '—'
+    var modeSel = '<select id="cu-md-' + id + '-' + i + '" aria-label="固定模式">' +
+      '<option value="strict"' + ((pin.pinMode || 'strict') === 'strict' ? ' selected' : '') + '>严格</option>' +
+      '<option value="preferred"' + (pin.pinMode === 'preferred' ? ' selected' : '') + '>优先</option></select>'
+    var sortSel = '<select id="cu-so-' + id + '-' + i + '" aria-label="渠道排序">' +
+      '<option value=""' + (!pin.sort ? ' selected' : '') + '>默认</option>' +
+      '<option value="cost"' + (pin.sort === 'cost' ? ' selected' : '') + '>成本</option>' +
+      '<option value="ttft"' + (pin.sort === 'ttft' ? ' selected' : '') + '>首字</option>' +
+      '<option value="tps"' + (pin.sort === 'tps' ? ' selected' : '') + '>吞吐</option></select>'
+    return '<tr><td>' + escapeHtml(m) + '<div class="mu" style="font-size:11px">管道 ' + escapeHtml(pipe) + '</div></td>' +
+      '<td style="white-space:normal">' + badges + '</td>' +
+      '<td><select id="cu-ch-' + id + '-' + i + '" aria-label="固定到哪个渠道">' + options.join('') + '</select></td>' +
+      '<td>' + modeSel + '</td>' +
+      '<td>' + sortSel + '</td>' +
+      '<td><button class="btn btn-gh btn-xs" data-cu-probe="' + i + '" title="重新探测该模型的渠道清单"><i class="fas fa-satellite-dish"></i></button>' +
+      '<button class="btn btn-gh btn-xs" data-cu-check="' + i + '" title="实测该模型全部渠道的可用性"><i class="fas fa-vial"></i></button></td></tr>'
+  }).join('')
+  box.innerHTML = '<div style="max-height:320px;overflow:auto"><table class="tbl"><thead><tr>' +
+    '<th>模型</th><th>可用渠道</th><th>固定到</th><th>模式</th><th>排序</th><th>操作</th>' +
+    '</tr></thead><tbody>' + body + '</tbody></table></div>'
+  // 行内按钮用事件委托：模型 ID 含 / 与 . 拼进 onclick 会破坏选择器
+  Array.prototype.forEach.call(box.querySelectorAll('[data-cu-probe]'), function (btn) {
+    btn.onclick = function () { clineUpstreamsProbeOne(id, models[Number(btn.getAttribute('data-cu-probe'))]) }
+  })
+  Array.prototype.forEach.call(box.querySelectorAll('[data-cu-check]'), function (btn) {
+    btn.onclick = function () { clineUpstreamsValidateOne(id, models[Number(btn.getAttribute('data-cu-check'))]) }
+  })
+}
+
+function clineUpstreamsProbeOne(id, model) {
+  if (!model) return Promise.resolve()
+  clineUpStatus(id, '探测中：' + model)
+  return clineUpPost(id, '/cline-upstreams/probe', { model: model }).then(function (d) {
+    if (!d.success) { clineUpStatus(id, '探测失败：' + ((d && d.message) || '未知错误')); return }
+    var cur = _clineUpData[id] || { models: [], pins: {}, probes: {}, checks: {} }
+    cur.probes = cur.probes || {}
+    cur.probes[model] = d.data
+    _clineUpData[id] = cur
+    clineUpstreamsRender(id)
+    var n = (d.data.upstreams || []).length
+    clineUpStatus(id, model + '：' + n + ' 个渠道' + (d.data.ok ? '' : ('（' + (d.data.note || '未拿到清单') + '）')))
+  }).catch(function () { clineUpStatus(id, '网络错误，请重试') })
+}
+
+function clineUpstreamsProbeAll(id) {
+  function run() {
+    var data = _clineUpData[id] || {}
+    var models = data.models || []
+    var i = 0
+    function step() {
+      if (i >= models.length) { clineUpStatus(id, '探测完成：' + models.length + ' 个模型'); return Promise.resolve() }
+      var m = models[i]
+      clineUpStatus(id, '探测中 ' + (i + 1) + '/' + models.length + '：' + m)
+      return clineUpPost(id, '/cline-upstreams/probe', { model: m }).then(function (d) {
+        if (d && d.success) {
+          var cur = _clineUpData[id] || { models: [], pins: {}, probes: {}, checks: {} }
+          cur.probes = cur.probes || {}
+          cur.probes[m] = d.data
+          _clineUpData[id] = cur
+          clineUpstreamsRender(id)
+        }
+      }).catch(function () {}).then(function () { i++; return step() })
+    }
+    return step()
+  }
+  // 先确保拿到模型列表与固定设置（GET 不打上游）
+  if (!_clineUpData[id]) return clineUpstreamsLoad(id).then(run)
+  return run()
+}
+
+function _clineUpValidate(id, model, skipConfirm) {
+  var data = _clineUpData[id] || {}
+  var channels = ((data.probes || {})[model] || {}).upstreams || []
+  if (!channels.length) { clineUpStatus(id, '请先探测渠道清单'); return Promise.resolve() }
+  if (!skipConfirm && typeof confirm === 'function' && !confirm('校验 ' + model + '：' + clineUpCostText(channels.length, data.minGapMs) + '。继续？')) return Promise.resolve()
+  clineUpStatus(id, '校验中：' + model + '（' + channels.length + ' 个渠道）')
+  return clineUpPost(id, '/cline-upstreams/validate', { model: model }).then(function (d) {
+    if (!d.success) { clineUpStatus(id, '校验失败：' + ((d && d.message) || '未知错误')); return }
+    var cur = _clineUpData[id] || { models: [], pins: {}, probes: {}, checks: {} }
+    cur.checks = cur.checks || {}
+    var byCh = {}
+    ;(d.data.checks || []).forEach(function (x) { byCh[x.upstream] = x })
+    cur.checks[model] = byCh
+    _clineUpData[id] = cur
+    clineUpstreamsRender(id)
+    clineUpStatus(id, model + '：' + (d.data.summary || ''))
+  }).catch(function () { clineUpStatus(id, '网络错误，请重试') })
+}
+
+function clineUpstreamsValidateOne(id, model) { return _clineUpValidate(id, model, false) }
+
+function clineUpstreamsValidateAll(id) {
+  function run() {
+    var data = _clineUpData[id] || {}
+    var models = (data.models || []).filter(function (m) { return (((data.probes || {})[m] || {}).upstreams || []).length > 0 })
+    if (!models.length) { clineUpStatus(id, '还没有渠道清单，请先点「探测全部渠道」'); return Promise.resolve() }
+    var total = models.reduce(function (s, m) { return s + ((data.probes[m].upstreams || []).length) }, 0)
+    if (typeof confirm === 'function' && !confirm('校验 ' + models.length + ' 个模型的全部渠道：' + clineUpCostText(total, data.minGapMs) + '。继续？')) return Promise.resolve()
+    var i = 0
+    function step() {
+      if (i >= models.length) { clineUpStatus(id, '校验完成：' + models.length + ' 个模型'); return Promise.resolve() }
+      return _clineUpValidate(id, models[i], true).then(function () { i++; return step() })
+    }
+    return step()
+  }
+  if (!_clineUpData[id]) return clineUpstreamsLoad(id).then(run)
+  return run()
+}
+
+function clineUpstreamsSave(id) {
+  var data = _clineUpData[id] || {}
+  var models = data.models || []
+  var map = {}
+  models.forEach(function (m, i) {
+    var ch = document.getElementById('cu-ch-' + id + '-' + i)
+    var md = document.getElementById('cu-md-' + id + '-' + i)
+    var so = document.getElementById('cu-so-' + id + '-' + i)
+    var v = ch ? ch.value : ''
+    if (!v) return
+    var cfg = { upstreams: [v], pinMode: (md && md.value) || 'strict' }
+    if (so && so.value) cfg.sort = so.value
+    map[m] = cfg
+  })
+  clineUpStatus(id, '保存中…')
+  return fetch('/admin/api/providers/' + encodeURIComponent(id), {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ clinePinByModel: map }),
+  }).then(function (r) { return r.json() }).then(function (d) {
+    if (!d.success) { clineUpStatus(id, '保存失败：' + ((d && d.message) || '未知错误')); return }
+    data.pins = map
+    _clineUpData[id] = data
+    var n = Object.keys(map).length
+    clineUpStatus(id, n ? ('已固定 ' + n + ' 个模型') : '已清空固定设置（全部回到网关自动选）')
+    if (typeof toast === 'function') toast('上游固定设置已保存', 'success')
+  }).catch(function () { clineUpStatus(id, '网络错误，请重试') })
+}
 
 function clineCheckAccounts(id, opts) {
   const silent = !!(opts && opts.silent)

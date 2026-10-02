@@ -41,6 +41,9 @@ import {
   handleClineOAuthPoll,
   handleClineAccountCheck,
   handleClineAccountLabel,
+  handleClineUpstreams,
+  handleClineUpstreamProbe,
+  handleClineUpstreamValidate,
   handleLogs,
   handleLogsClear,
   handleLogConfig,
@@ -256,6 +259,10 @@ app.post('/admin/api/cline/oauth/:id/poll', handleClineOAuthPoll)
 // Cline 账号检测：探测每个 refreshToken 的有效性并关联账号 email / 手工补账号名
 app.post('/admin/api/providers/:id/cline-accounts/check', handleClineAccountCheck)
 app.post('/admin/api/providers/:id/cline-accounts/label', handleClineAccountLabel)
+// Cline 上游渠道探测与固定：读留档（GET，不打上游）/ 探测单模型渠道 / 校验该模型全部渠道
+app.get('/admin/api/providers/:id/cline-upstreams', handleClineUpstreams)
+app.post('/admin/api/providers/:id/cline-upstreams/probe', handleClineUpstreamProbe)
+app.post('/admin/api/providers/:id/cline-upstreams/validate', handleClineUpstreamValidate)
 
 // TRAE SOLO 管理：登录闭环 / 签到 / 模型发现 / 账号状态（面板）
 app.post('/admin/api/trae/:id/login/connect', handleTraeLoginConnect)

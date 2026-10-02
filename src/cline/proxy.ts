@@ -547,7 +547,8 @@ async function clineFetch(
   bodyObj: Record<string, unknown>,
   sessionId: string,
   retried = false,
-  clientSignal?: AbortSignal
+  clientSignal?: AbortSignal,
+  opts?: { skipCooldown?: boolean }
 ): Promise<Response> {
   const model = String((bodyObj as Record<string, unknown>).model || '')
   const token = await getAccessToken(pool, model || undefined)
@@ -583,8 +584,9 @@ async function clineFetch(
   }
   // token 失效：标记当前账号冷却，强制重试（会用别的账号/刷新）
   if (resp.status === 401 && !retried) {
-    if (pool.current) cooldownAccount(pool.current, CLINE_COOLDOWN_401_MS)
-    return clineFetch(pool, path, bodyObj, sessionId, true, clientSignal)
+    // 探测/校验不罚号：诊断动作不该把账号拉进冷却（同「客户端断开不罚号」纪律）
+    if (!opts?.skipCooldown && pool.current) cooldownAccount(pool.current, CLINE_COOLDOWN_401_MS)
+    return clineFetch(pool, path, bodyObj, sessionId, true, clientSignal, opts)
   }
   return resp
 }
@@ -592,7 +594,7 @@ async function clineFetch(
 // ===== 并发限流队列：上游免费通道并发 >1 会返回空响应，强制串行 + 间隔 =====
 
 let queueTail: Promise<unknown> = Promise.resolve()
-const MIN_GAP_MS = 800
+export const MIN_GAP_MS = 800
 
 function enqueue<T>(fn: () => Promise<T>): Promise<T> {
   const run = queueTail.then(() => sleep(MIN_GAP_MS)).then(fn)
@@ -1699,6 +1701,247 @@ export async function proxyClineChatRequest(
     }
     return jsonResponse({ error: { message: (err as Error).message || 'Cline 转发失败', type: 'api_error' } }, 500)
   }
+}
+
+// ===== 上游渠道探测与校验（移植 cline-pass-switcher 的 harvestAvailableProviders / validateUpstreams） =====
+//
+// 为什么用「假渠道」探测：给一个不存在的渠道名，网关会在**路由层**拒绝并回吐完整可用渠道清单，
+// 不产生 token 消耗。2026-10-02 真机实测：单次 297ms、无正文输出、回吐 16 个渠道。
+//
+// 为什么探测与校验必须分开（这是设计约束，不是保守）：
+//   - 探测（枚举清单）在路由层就失败，**一个模型一次请求**，便宜；
+//   - 校验（逐渠道实测可用性）每个渠道都要发一次真实最小请求，而免费通道**并发 >1 会返回
+//     空响应**，所以必须走 enqueue 串行（MIN_GAP_MS = 800）→ 16 个渠道约占队列 13s，
+//     期间其它 Cline 请求全部排队。因此「探测全部模型」只做枚举；校验按模型手动触发，
+//     并在面板上明示将占用的请求数与队列时间。
+export const CLINE_PROBE_UPSTREAM = '__cline_probe__'
+/**
+ * 探测/校验的读体上限：正常错误体很小；若某条管道把假渠道**静默丢弃**而转入真实推理，
+ * 到量/到点立即取消，避免把一整轮 completion 读进来（免费档也不发 max_tokens，拦不住）。
+ */
+const CLINE_PROBE_READ_BYTES = 8192
+const CLINE_PROBE_READ_MS = 20000
+
+export interface ClineUpstreamProbeResult {
+  model: string
+  ok: boolean
+  /** 管道归属：planner（Vercel AI Gateway）| direct（OpenRouter）| unknown */
+  pipeline: 'planner' | 'direct' | 'unknown'
+  upstreams: string[]
+  status: number
+  note: string
+  ms: number
+  probedAt: number
+}
+
+export interface ClineUpstreamCheck {
+  upstream: string
+  status: 'ok' | 'limited' | 'bad' | 'auth' | 'unknown'
+  note: string
+  ms: number
+}
+
+export interface ClineUpstreamCache {
+  probes: Record<string, ClineUpstreamProbeResult>
+  checks: Record<string, Record<string, ClineUpstreamCheck>>
+  updatedAt: number
+}
+
+/** 读响应体到上限/超时即停并取消，返回已读文本（探测只关心路由层错误，不该读完整流）。 */
+async function readTextCapped(
+  resp: Response,
+  limit = CLINE_PROBE_READ_BYTES,
+  ms = CLINE_PROBE_READ_MS
+): Promise<string> {
+  if (!resp.body) return ''
+  const reader = resp.body.getReader()
+  const dec = new TextDecoder()
+  let out = ''
+  const deadline = Date.now() + ms
+  try {
+    for (;;) {
+      if (out.length >= limit || Date.now() > deadline) break
+      const { done, value } = await reader.read()
+      if (done) break
+      out += dec.decode(value, { stream: true })
+    }
+  } catch { /* 读中断按已读部分处理 */ }
+  finally {
+    try { await reader.cancel() } catch { /* 已结束 */ }
+  }
+  return out
+}
+
+/**
+ * 从路由层错误文本里抽渠道清单。两条管道报错形态不同（实测）：
+ *   - 规划器管道（Vercel AI Gateway）：`Available providers are: a, b, c`；
+ *   - 直连管道（OpenRouter）：JSON 里的 `"available_providers": [...]`。
+ * 不逐层取信封（两条管道的嵌套层级不一致），直接正则抓，再用 slug 规则过滤噪声 token。
+ */
+export function parseClineUpstreamList(text: string): string[] {
+  const t = String(text || '')
+  const out: string[] = []
+  const listed = /Available providers are:\s*([^.]+)/i.exec(t)
+  if (listed) {
+    out.push(...listed[1].split(/,\s*/).map((s) => s.trim()).filter((s) => /^[a-z0-9][a-z0-9-]*$/i.test(s)))
+  }
+  const jsonArr = /"available_providers"\s*:\s*\[([^\]]*)\]/i.exec(t)
+  if (jsonArr) {
+    out.push(...(jsonArr[1].match(/"([^"]+)"/g) || []).map((s) => s.replace(/"/g, '')).filter((s) => /^[a-z0-9][a-z0-9-]*$/i.test(s)))
+  }
+  return [...new Set(out.map((s) => s.toLowerCase()))]
+}
+
+/** 渠道错误分类（口径对齐源项目 classifyUpstreamError：限流不算不可用，认证问题与渠道无关）。 */
+export function classifyClineUpstreamError(msg: string): ClineUpstreamCheck['status'] {
+  const t = String(msg || '')
+  if (/empty response content/i.test(t)) return 'ok'
+  if (/\b429\b|rate.?limit|too many requests|temporarily/i.test(t)) return 'limited'
+  if (/unauthorized|re-?authenticate|invalid_grant|\b401\b/i.test(t)) return 'auth'
+  if (/invalid_request|not allowed|no available providers|no allowed providers|not found|unsupported|unknown provider|does not exist/i.test(t)) return 'bad'
+  return 'unknown'
+}
+
+/** 把上游原文压成一行短摘要（探测/校验的 note 字段，面板直接显示）。 */
+function probeNote(text: string): string {
+  const t = String(text || '')
+  const m = /"message"\s*:\s*"((?:[^"\\]|\\.)*)"/.exec(t)
+  const body = (m ? m[1] : t).replace(/\s+/g, ' ').trim()
+  return body.slice(0, 200)
+}
+
+/**
+ * 探测一个模型的上游渠道清单与管道归属。两种形态**同时下发**：管道归属决定哪个后端处理这次
+ * 请求，它只认自己那一侧、另一侧被忽略，所以一次请求即覆盖两条管道。
+ */
+async function probeClineUpstreams(pool: Pool, model: string): Promise<ClineUpstreamProbeResult> {
+  const sessionId = 'sess_probe_' + Date.now()
+  const body: Record<string, unknown> = {
+    model,
+    session_id: sessionId,
+    messages: [{ role: 'user', content: 'hi' }],
+    providerOptions: { gateway: { only: [CLINE_PROBE_UPSTREAM] } },
+    provider: { only: [CLINE_PROBE_UPSTREAM] },
+  }
+  const t0 = Date.now()
+  let resp: Response
+  try {
+    resp = await enqueue(() => clineFetch(pool, '/chat/completions', body, sessionId, false, undefined, { skipCooldown: true }))
+  } catch (err) {
+    return {
+      model, ok: false, pipeline: 'unknown', upstreams: [], status: 0,
+      note: `探测请求失败：${(err as Error).message || String(err)}`, ms: Date.now() - t0, probedAt: Date.now(),
+    }
+  }
+  const text = await readTextCapped(resp)
+  const upstreams = parseClineUpstreamList(text)
+  const pipeline: ClineUpstreamProbeResult['pipeline'] = /available providers are/i.test(text)
+    ? 'planner'
+    : /available_providers/i.test(text)
+      ? 'direct'
+      : 'unknown'
+  return {
+    model, ok: upstreams.length > 0, pipeline, upstreams, status: resp.status,
+    note: probeNote(text), ms: Date.now() - t0, probedAt: Date.now(),
+  }
+}
+
+/** 逐个渠道实测可用性（串行：免费通道并发 >1 会返回空响应）。不罚号、不冷却。 */
+async function validateClineUpstreams(pool: Pool, model: string, upstreams: string[]): Promise<ClineUpstreamCheck[]> {
+  const out: ClineUpstreamCheck[] = []
+  for (const upstream of upstreams) {
+    const sessionId = 'sess_check_' + Date.now()
+    const body: Record<string, unknown> = {
+      model,
+      session_id: sessionId,
+      messages: [{ role: 'user', content: 'hi' }],
+      providerOptions: { gateway: { only: [upstream] } },
+      provider: { only: [upstream] },
+    }
+    const t0 = Date.now()
+    let status = 0
+    let text = ''
+    try {
+      const resp = await enqueue(() => clineFetch(pool, '/chat/completions', body, sessionId, false, undefined, { skipCooldown: true }))
+      status = resp.status
+      text = await readTextCapped(resp)
+    } catch (err) {
+      text = `网络失败：${(err as Error).message || String(err)}`
+    }
+    // 200 且真的吐了内容 = 该渠道可用；否则按错误文本分类（限流/不可钉/认证）
+    const hasOutput = status === 200 && /"(content|reasoning_content|reasoning|tool_calls)"\s*:/.test(text)
+    const st: ClineUpstreamCheck['status'] = hasOutput && !/error/i.test(text) ? 'ok' : classifyClineUpstreamError(text)
+    out.push({ upstream, status: st, note: probeNote(text), ms: Date.now() - t0 })
+  }
+  return out
+}
+
+// ----- 缓存（KV）：探测/校验结果留档，面板打开时直接渲染，不必每次打上游 -----
+
+const CLINE_UPSTREAM_CACHE_PREFIX = 'cline:upstreams:'
+/** 7 天上限：探测结果会漂移，留档只为回答「上次看到什么」，过期即重探。 */
+const CLINE_UPSTREAM_CACHE_TTL_SEC = 7 * 24 * 3600
+
+export async function readClineUpstreamCache(env: Env | undefined, providerId: string): Promise<ClineUpstreamCache> {
+  const empty: ClineUpstreamCache = { probes: {}, checks: {}, updatedAt: 0 }
+  if (!env?.KV) return empty
+  try {
+    const raw = await env.KV.get(CLINE_UPSTREAM_CACHE_PREFIX + providerId)
+    if (!raw) return empty
+    const parsed = JSON.parse(raw) as Partial<ClineUpstreamCache>
+    return {
+      probes: parsed.probes && typeof parsed.probes === 'object' ? parsed.probes : {},
+      checks: parsed.checks && typeof parsed.checks === 'object' ? parsed.checks : {},
+      updatedAt: typeof parsed.updatedAt === 'number' ? parsed.updatedAt : 0,
+    }
+  } catch { return empty }
+}
+
+async function writeClineUpstreamCache(env: Env | undefined, providerId: string, next: ClineUpstreamCache): Promise<void> {
+  if (!env?.KV) return
+  try {
+    await env.KV.put(CLINE_UPSTREAM_CACHE_PREFIX + providerId, JSON.stringify(next), {
+      expirationTtl: CLINE_UPSTREAM_CACHE_TTL_SEC,
+    })
+  } catch { /* 留档失败不影响本次返回 */ }
+}
+
+/** 探测一个模型并落 KV；返回本次结果（面板拿到的是最新值，不依赖 KV 的最终一致）。 */
+export async function probeClineProviderUpstream(
+  env: Env,
+  provider: Provider,
+  model: string
+): Promise<ClineUpstreamProbeResult> {
+  const pool = poolFromProvider(provider, env)
+  const result = await probeClineUpstreams(pool, model)
+  const cache = await readClineUpstreamCache(env, provider.id)
+  const merged: ClineUpstreamCache = { ...cache, probes: { ...cache.probes, [model]: result }, updatedAt: Date.now() }
+  await writeClineUpstreamCache(env, provider.id, merged)
+  return result
+}
+
+/**
+ * 校验一个模型已探测到的全部渠道并落 KV。
+ * 渠道清单取自缓存（不重新探测）：探测与校验的请求形态不同，分开更便于面板分两步展示与分步确认成本。
+ */
+export async function validateClineProviderUpstream(
+  env: Env,
+  provider: Provider,
+  model: string
+): Promise<{ model: string; checks: ClineUpstreamCheck[]; total: number }> {
+  const cache = await readClineUpstreamCache(env, provider.id)
+  const upstreams = cache.probes[model]?.upstreams || []
+  const pool = poolFromProvider(provider, env)
+  const checks = await validateClineUpstreams(pool, model, upstreams)
+  const byChannel: Record<string, ClineUpstreamCheck> = {}
+  for (const c of checks) byChannel[c.upstream] = c
+  const merged: ClineUpstreamCache = {
+    ...cache,
+    checks: { ...cache.checks, [model]: { ...(cache.checks[model] || {}), ...byChannel } },
+    updatedAt: Date.now(),
+  }
+  await writeClineUpstreamCache(env, provider.id, merged)
+  return { model, checks, total: upstreams.length }
 }
 
 /** 返回 Cline 实测可用模型列表（普通 JSON，供管理面板拉取模型）。 */

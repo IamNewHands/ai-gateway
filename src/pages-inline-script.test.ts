@@ -135,6 +135,52 @@ function wbExpiryApi(html: string): any {
   return factory((s: unknown) => String(s))
 }
 
+/**
+ * 抽取客户端「Cline 上游渠道」纯映射块（CLINE_UP_BEGIN/END 标记之间）。
+ *
+ * 为什么单独跑：状态→徽章映射与成本文案是面板使用者的**判断依据**——把「限流」显示成不可用
+ * 会让人白白换渠道，把校验成本算错会让人误以为可以随手全跑（校验是逐渠道真实请求且串行，
+ * 会占用 Cline 队列）。只做语法/存在性检查看不出这类口径漂移。
+ */
+function clineUpApi(html: string): any {
+  const js = inlineScripts(html).join('\n')
+  const m = js.match(/\/\* CLINE_UP_BEGIN \*\/([\s\S]*?)\/\* CLINE_UP_END \*\//)
+  if (!m) throw new Error('未找到 CLINE_UP 标记块：客户端渠道映射块被删除或改名了？')
+  const factory = new Function(m[1] + '\nreturn { clineUpBadge, clineUpCostText, clineUpPinSummary }')
+  return factory()
+}
+
+describe('Cline 面板「上游渠道与固定」客户端映射', () => {
+  it('限流显示为可用但暂忙（黄色），不能显示成不可用——否则会误导用户换渠道', async () => {
+    const api = clineUpApi(await render([traeProvider()]))
+    expect(api.clineUpBadge('ok')).toEqual(['bd-on', '可用'])
+    expect(api.clineUpBadge('limited')).toEqual(['bd-warn', '限流'])
+    expect(api.clineUpBadge('bad')).toEqual(['bd-danger', '不可钉'])
+    expect(api.clineUpBadge('auth')).toEqual(['bd-danger', '认证失败'])
+    // 未知状态不猜可用：默认是中性徽章而不是绿色
+    expect(api.clineUpBadge('nonsense')[0]).toBe('bd-off')
+  })
+
+  it('校验成本按「渠道数 × 队列间隔」换算，并说明会阻塞其它 Cline 请求', async () => {
+    const api = clineUpApi(await render([traeProvider()]))
+    expect(api.clineUpCostText(0, 800)).toBe('')
+    expect(api.clineUpCostText(16, 800)).toContain('16 次')
+    expect(api.clineUpCostText(16, 800)).toContain('13 秒')
+    expect(api.clineUpCostText(16, 800)).toContain('排队')
+    // 间隔缺省回落 800ms（与后端 MIN_GAP_MS 一致）
+    expect(api.clineUpCostText(10)).toContain('8 秒')
+  })
+
+  it('固定摘要区分严格/优先并带排序（面板回显用）', async () => {
+    const api = clineUpApi(await render([traeProvider()]))
+    expect(api.clineUpPinSummary(null)).toBe('')
+    expect(api.clineUpPinSummary({ upstreams: [] })).toBe('')
+    expect(api.clineUpPinSummary({ upstreams: ['alibaba'] })).toBe('alibaba（严格）')
+    expect(api.clineUpPinSummary({ upstreams: ['alibaba'], pinMode: 'preferred' })).toBe('alibaba（优先）')
+    expect(api.clineUpPinSummary({ upstreams: ['alibaba'], pinMode: 'strict', sort: 'cost' })).toBe('alibaba（严格） · cost')
+  })
+})
+
 describe('WorkBuddy 面板「即将到期」标记（客户端口径 = 后端挑号口径）', () => {
   const DAY = 24 * 60 * 60 * 1000
   /** 构造一个包：expireInMs=null → 长期（expireAt 空串），CST 墙钟串由 epoch 反推。 */

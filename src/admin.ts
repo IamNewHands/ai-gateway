@@ -30,7 +30,7 @@ import { MAX_ADMIN_REQUEST_BYTES, readOptionalJSONLimited, readStrictJSONLimited
 import { isTraeProvider, testTraeCredential, testTraeModel } from './trae/proxy'
 import { diagnoseOpenCodeKey, fetchOpenCodeModels, isOpenCodeProvider, resolveOpenCodeUrls, testOpenCodeModel } from './opencode'
 import { isQoderFlow, fetchQoderModels, testQoderModel } from './qoder/proxy'
-import { isClineProvider, fetchClineRecommendedModels, testClineChat, testClineRefreshToken, probeClineAccount, startClineOAuth, pollClineOAuth } from './cline/proxy'
+import { isClineProvider, fetchClineRecommendedModels, testClineChat, testClineRefreshToken, probeClineAccount, startClineOAuth, pollClineOAuth, probeClineProviderUpstream, validateClineProviderUpstream, readClineUpstreamCache, MIN_GAP_MS, DEFAULT_MODEL } from './cline/proxy'
 import { isGeminiProvider, testGeminiModel, GEMINI_MODELS } from './gemini/proxy'
 import { fetchGeminiQuota } from './gemini/quota'
 import { isCnbProvider, testCnbConnection, CNB_MODELS } from './cnb/proxy'
@@ -2032,6 +2032,100 @@ export async function handleClineAccountCheck(c: Context<AppEnv>) {
       checkedAt: Date.now(),
       summary: `有效 ${valid} / 共 ${rows.length}${rows.length - valid ? `，失效或不可达 ${rows.length - valid}` : ''}`,
     },
+  })
+}
+
+// ===== Cline 上游渠道探测 / 校验（对应面板「上游渠道与固定」区块） =====
+
+/** 面板要探测的模型：provider.models 里启用的，并入已配固定的模型；都为空时回落默认模型。 */
+function clinePanelModels(provider: Provider): string[] {
+  const ids = (provider.models || []).filter((m) => m.enabled !== false).map((m) => m.id).filter(Boolean)
+  const pinned = Object.keys(provider.clinePinByModel || {})
+  const all = [...new Set([...ids, ...pinned])]
+  return all.length > 0 ? all : [DEFAULT_MODEL]
+}
+
+/**
+ * GET /admin/api/providers/:id/cline-upstreams
+ * 面板渲染用：**不打上游**，只回当前固定配置与 KV 里的探测/校验留档，
+ * 所以可以安全地随面板打开调用。
+ */
+export async function handleClineUpstreams(c: Context<AppEnv>) {
+  const id = c.req.param('id')
+  if (!id) return c.json<ApiResponse>({ success: false, message: '缺少 id 参数' }, 400)
+  const provider = await getProvider(c.env, id)
+  if (!provider) return c.json<ApiResponse>({ success: false, message: '提供商不存在' }, 404)
+  if (!isClineProvider(provider.id)) {
+    return c.json<ApiResponse>({ success: false, message: '仅支持 Cline 提供商' }, 400)
+  }
+  const cache = await readClineUpstreamCache(c.env, id)
+  return c.json<ApiResponse>({
+    success: true,
+    data: {
+      providerId: id,
+      models: clinePanelModels(provider),
+      pins: provider.clinePinByModel || {},
+      probes: cache.probes,
+      checks: cache.checks,
+      updatedAt: cache.updatedAt,
+      minGapMs: MIN_GAP_MS,
+    },
+  })
+}
+
+/**
+ * POST /admin/api/providers/:id/cline-upstreams/probe  body: { model }
+ * 探测**一个**模型的可用渠道：发一个不存在的渠道名，让网关在路由层拒绝并回吐完整清单（零 token）。
+ * 有意按模型拆分而不是一次探测全部：每个请求都快、面板能逐行刷新，串行队列的占用也最小。
+ */
+export async function handleClineUpstreamProbe(c: Context<AppEnv>) {
+  const id = c.req.param('id')
+  if (!id) return c.json<ApiResponse>({ success: false, message: '缺少 id 参数' }, 400)
+  const body = await readOptionalJSONLimited<{ model?: unknown }>(c.req.raw, MAX_ADMIN_REQUEST_BYTES)
+  const model = typeof body?.model === 'string' ? body.model.trim() : ''
+  const provider = await getProvider(c.env, id)
+  if (!provider) return c.json<ApiResponse>({ success: false, message: '提供商不存在' }, 404)
+  if (!isClineProvider(provider.id)) {
+    return c.json<ApiResponse>({ success: false, message: '仅支持 Cline 提供商' }, 400)
+  }
+  if (!model) return c.json<ApiResponse>({ success: false, message: '缺少 model 参数' }, 400)
+  if (!(provider.apiKeys || []).some((k) => k.enabled)) {
+    return c.json<ApiResponse>({ success: false, message: '该提供商没有启用的 Cline 账号，无法探测渠道' }, 400)
+  }
+  // 探测失败（上游不可达 / 该管道不认假渠道）也回 success:true + ok:false + note，
+  // 让面板把原因直接显示在该行，而不是给一个看不出所以然的通用错误。
+  const result = await probeClineProviderUpstream(c.env, provider, model)
+  return c.json<ApiResponse>({ success: true, data: result })
+}
+
+/**
+ * POST /admin/api/providers/:id/cline-upstreams/validate  body: { model }
+ * 逐渠道实测可用性。**每个渠道一次真实最小请求、且必须串行**（免费通道并发 >1 会返回空响应），
+ * 时长约 渠道数 × MIN_GAP_MS，期间其它 Cline 请求会排队——面板已就该成本明确提示。
+ */
+export async function handleClineUpstreamValidate(c: Context<AppEnv>) {
+  const id = c.req.param('id')
+  if (!id) return c.json<ApiResponse>({ success: false, message: '缺少 id 参数' }, 400)
+  const body = await readOptionalJSONLimited<{ model?: unknown }>(c.req.raw, MAX_ADMIN_REQUEST_BYTES)
+  const model = typeof body?.model === 'string' ? body.model.trim() : ''
+  const provider = await getProvider(c.env, id)
+  if (!provider) return c.json<ApiResponse>({ success: false, message: '提供商不存在' }, 404)
+  if (!isClineProvider(provider.id)) {
+    return c.json<ApiResponse>({ success: false, message: '仅支持 Cline 提供商' }, 400)
+  }
+  if (!model) return c.json<ApiResponse>({ success: false, message: '缺少 model 参数' }, 400)
+  if (!(provider.apiKeys || []).some((k) => k.enabled)) {
+    return c.json<ApiResponse>({ success: false, message: '该提供商没有启用的 Cline 账号，无法校验渠道' }, 400)
+  }
+  const { checks, total } = await validateClineProviderUpstream(c.env, provider, model)
+  if (total === 0) {
+    return c.json<ApiResponse>({ success: false, message: '还没有该模型的渠道清单，请先探测' }, 400)
+  }
+  const ok = checks.filter((x) => x.status === 'ok').length
+  const limited = checks.filter((x) => x.status === 'limited').length
+  return c.json<ApiResponse>({
+    success: true,
+    data: { model, checks, total, summary: `可用 ${ok} / 共 ${total}${limited ? `（限流 ${limited}）` : ''}` },
   })
 }
 
