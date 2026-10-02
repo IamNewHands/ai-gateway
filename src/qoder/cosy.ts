@@ -23,6 +23,10 @@ const LOGIN_VERSION = 'v2'
 const MACHINE_OS = 'x86_64_windows'
 const MACHINE_TYPE = '5'
 const CLIENT_IP = '127.0.0.1'
+// qoder2api internal/bridge/client.go:50-53 抓包确认的传输层头常量。
+const USER_AGENT = 'Go-http-client/2.0'
+const COSY_SCENE = 'assistant'
+const COSY_BUSINESS_TYPE = 'agent'
 
 // ===== QoderEncoding（encoding.go） =====
 
@@ -308,10 +312,22 @@ export function buildBearer(sess: CosySession, body: string, rawUrl: string): Co
 }
 
 /**
- * cosyHeaders：一次推理/模型请求的完整头集合，对齐 keirouter BuildCosyHeaders。
- * sse=true 时加 cache-control。accept 参数在参考实现中未使用，保留签名仅为兼容调用方。
+ * cosyHeaders：一次推理/模型请求的完整头集合，对齐 keirouter BuildCosyHeaders，
+ * 并补齐 qoder2api `internal/bridge/client.go:35-54` 抓包确认的传输层头：
+ *   content-type / accept / user-agent / cosy-scene / cosy-business-type。
+ *
+ * 为什么必须显式给 content-type：请求体是 QoderEncoding 后的**字符串**，Fetch 对
+ * 字符串 body 默认 `text/plain;charset=UTF-8`，与上游期望的 application/json 不符。
+ * accept 同理：SSE 端点需要 `text/event-stream` 才会得到流式响应。
+ *
+ * 刻意不发 `cosy-business-product`：该头取值与请求体 `business.product` 必须一致，
+ * 而目标模板目前是 `cli`、qoder2api 是 `ide`（见移植分析 P1-5，需实测确定）。
+ * 在结论落地前硬编码任一值都会让头与体自相矛盾。
+ *
+ * `_sse` 仅保留调用方语义（流式/非流式），不再影响头集：参考实现恒定发送
+ * `cache-control: no-cache`，这里保持恒定以逐字节对齐。
  */
-export function cosyHeaders(sess: CosySession, body: string, rawUrl: string, accept: string, sse: boolean): Record<string, string> {
+export function cosyHeaders(sess: CosySession, body: string, rawUrl: string, accept: string, _sse: boolean): Record<string, string> {
   const { date, bearer } = buildBearer(sess, body, rawUrl)
   const u = new URL(rawUrl)
   let sigPath = u.pathname
@@ -320,6 +336,9 @@ export function cosyHeaders(sess: CosySession, body: string, rawUrl: string, acc
   const machineID = sess.machineId
   const h: Record<string, string> = {
     'Authorization': bearer,
+    'Content-Type': 'application/json',
+    'Accept': accept,
+    'User-Agent': USER_AGENT,
     'Cosy-Key': sess.cosyKey,
     'Cosy-User': sess.uid,
     'Cosy-Date': date,
@@ -333,13 +352,15 @@ export function cosyHeaders(sess: CosySession, body: string, rawUrl: string, acc
     'Cosy-Bodyhash': md5Hex(body),
     'Cosy-Bodylength': String(body.length),
     'Cosy-Sigpath': sigPath,
+    'Cosy-Scene': COSY_SCENE,
+    'Cosy-Business-Type': COSY_BUSINESS_TYPE,
     'Cosy-Data-Policy': DATA_POLICY,
     'Cosy-Organization-Id': '',
     'Cosy-Organization-Tags': '',
     'Login-Version': LOGIN_VERSION,
     'X-Request-Id': uuid(),
+    'cache-control': 'no-cache',
   }
-  if (sse) h['cache-control'] = 'no-cache'
   return h
 }
 

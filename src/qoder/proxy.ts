@@ -15,7 +15,7 @@
 
 import type { Env, Provider } from '../types'
 import { getOauthAccessToken, readOauthToken, refreshOauthToken, refreshQoderTokenPair } from '../oauth'
-import { buildQoderBody, cpaToUpstreamKey } from './body'
+import { buildQoderBody, cpaToUpstreamKey, fallbackUnknownModel } from './body'
 import { qoderEncode, cosySessionFor, cosyHeaders, buildBearer, type CosySession } from './cosy'
 import { classifyQoderError, qoderOpenAIErrorBody, type QoderClassified } from './classify'
 import {
@@ -109,6 +109,8 @@ async function buildQoderAccountSession(
  *   quota      → 长冷却（planMs，签到恢复积分后自动解冻）
  *   rate_limit → 短冷却（Retry-After 优先，回退 softMs）
  *   auth       → 禁用（需重新登录）
+ *   content_policy → **不记任何状态**：这是客户端输入被审核拒绝，账号本身没问题；
+ *                    记错误会让连续几次敏感输入把好账号冷却掉
  *   其余       → 分类器给出的冷却时长（>0 时），并记一次连续错误
  */
 async function markQoderAccountClassified(
@@ -119,6 +121,9 @@ async function markQoderAccountClassified(
 ): Promise<void> {
   const cd = resolveQoderCooldown(provider)
   switch (c.kind) {
+    case 'content_policy':
+      // 账号无过错：不改冷却、不改错误计数
+      break
     case 'quota':
       await cooldownQoderAccount(env, provider.id, uid, cd.planMs, '额度耗尽（' + c.message.substring(0, 80) + '）')
       break
@@ -299,40 +304,198 @@ function aggregateQoderChunks(text: string, model: string): string {
 }
 
 /**
- * 将上游嵌套 SSE 流转换为客户端可用的 OpenAI SSE 流：
- * `data:{"body":"<json>"}` → 解包 → 清洗 → `data: <cleaned>\n\n`，末尾 `data: [DONE]\n\n`。
+ * 上游信封帧 `{headers, body:"<inner chunk>", statusCodeValue}` 的解析结果。
+ * statusCodeValue 缺失按 200 处理（部分帧不带该字段）。
  */
-function unwrapQoderSSE(upstreamBody: ReadableStream<Uint8Array>, model: string): ReadableStream<Uint8Array> {
-  const decoder = new TextDecoderStream()
-  const reader = upstreamBody.pipeThrough(decoder).getReader()
-  const encoder = new TextEncoder()
-  let lineBuffer = ''
+interface QoderEnvelope {
+  status: number
+  /** 内层 OpenAI chunk 原文；非字符串/空串表示本帧无内容 */
+  body: string
+  /** 信封错误详情（内层 body 优先，回退整帧截断），供错误分类使用 */
+  detail: string
+}
 
-  return new ReadableStream({
+/**
+ * 信封 statusCodeValue 归一化为 int（对齐 qoder2api internal/bridge/delta.go:115-131）：
+ * 上游可能给 number / string；无法解析时按 502（瞬时故障）处理而非当成正常帧。
+ */
+function toEnvelopeStatus(v: unknown): number {
+  if (v === undefined || v === null) return 200
+  if (typeof v === 'number') return Number.isFinite(v) ? Math.trunc(v) : 502
+  if (typeof v === 'string') {
+    const n = Number.parseInt(v, 10)
+    return Number.isFinite(n) ? n : 502
+  }
+  return 502
+}
+
+/** 解析一帧 `data:` 载荷为信封；非 JSON / 非对象返回 null（调用方跳过）。 */
+function parseQoderEnvelope(payload: string): QoderEnvelope | null {
+  let outer: any
+  try {
+    outer = JSON.parse(payload)
+  } catch {
+    return null
+  }
+  if (!outer || typeof outer !== 'object') return null
+  const status = toEnvelopeStatus(outer.statusCodeValue)
+  const body = typeof outer.body === 'string' ? outer.body : ''
+  return { status, body, detail: body || payload.slice(0, 400) }
+}
+
+/**
+ * 解析一行 `data:` 载荷；非信封行返回 null（调用方跳过）。
+ * `[DONE]` 与无 body 的帧由调用方处理（本函数只做信封解析）。
+ */
+function readQoderFrame(line: string): QoderEnvelope | null {
+  const trimmed = line.trim()
+  if (!trimmed.startsWith('data:')) return null
+  const payload = trimmed.slice(5).trim()
+  if (!payload) return null
+  return parseQoderEnvelope(payload)
+}
+
+/** 逐行累加器：把任意分块拼成完整行，未结束的尾行留在缓冲里。 */
+function makeLineSplitter(): (chunk: string) => string[] {
+  let buf = ''
+  return (chunk: string) => {
+    const combined = buf + chunk
+    const lines = combined.split('\n')
+    buf = lines.pop() || ''
+    return lines
+  }
+}
+
+/**
+ * 上游「HTTP 200 建流 + 0 有效帧」的空流错误帧（移植 qoder2api internal/bridge/errors.go:31-34
+ * `ErrEmptyStream`）。wire 已是 200，只能靠帧内错误让客户端知道失败——否则客户端收到空
+ * assistant 消息却按正常 finish 结束（假成功）。
+ *
+ * code 取 `upstream_parse`，与仓库既有空流口径一致（见 workbuddy-sse.ts 的
+ * WORKBUDDY_EMPTY_STREAM_FRAME 注释）。
+ */
+export const QODER_EMPTY_STREAM_FRAME =
+  '{"error":{"message":"empty upstream stream","type":"upstream_error","code":"upstream_parse"}}'
+
+/** 空流的结构化分类：不罚号（cooldownSeconds=0 → 仅记一次错误），允许轮转下一个账号。 */
+const QODER_EMPTY_STREAM_CLASSIFIED: QoderClassified = {
+  status: 502,
+  kind: 'unavailable',
+  failover: true,
+  cooldownSeconds: 0,
+  message: 'empty upstream stream',
+  code: 'upstream_parse',
+  type: 'upstream_error',
+}
+
+/**
+ * 首帧闸门最多预读的上游分块数。有界是为了不让「只发噪声帧的长流」把首字节拖到不可预期；
+ * 达到上限即放弃闸门、直接按流式透传（后续信封错误仍由流内检测兜底）。
+ */
+const QODER_GATE_MAX_READS = 4
+
+type QoderSSEOpenResult =
+  | { ok: true; stream: ReadableStream<Uint8Array> }
+  | { ok: false; classified: QoderClassified }
+
+/**
+ * 打开上游嵌套 SSE 流 → 客户端 OpenAI SSE 流，并在**发出 HTTP 头之前**做有界首帧闸门。
+ *
+ * 为什么要有闸门：源实现（qoder2api `CallQoderWithOpts` 的 emitted 闸门，commit f8037f5）
+ * 能在首帧前发现信封错误并**换账号重开**；而「先建流再读」的写法头已发出，只能把错误塞进
+ * 帧里，池循环拿不到失败信号、无法轮转。闸门把这两种情形拉回到可重试的位置：
+ *
+ *  1. **信封错误**：上游把 provider 故障包在 HTTP200 的信封里（statusCodeValue=418/5xx，
+ *     access log 记 200 而业务错）→ 不建流，交回池循环按分类冷却/换号。
+ *  2. **空流**：建流成功但首帧即正常关流且零有效内容 → 不建流，按 `upstream_parse` 处理。
+ *
+ * 闸门之后的流内仍保留同样的信封检测：上游完全可能首帧正常、第 N 帧才报错。
+ */
+async function openQoderSSE(upstreamBody: ReadableStream<Uint8Array>, _model: string): Promise<QoderSSEOpenResult> {
+  const reader = upstreamBody.pipeThrough(new TextDecoderStream()).getReader()
+  const encoder = new TextEncoder()
+  const splitter = makeLineSplitter()
+  /** 闸门期已清洗好的、待下发的内层 chunk */
+  const pending: string[] = []
+  let envelopeError: QoderClassified | null = null
+  let streamEnded = false
+
+  let gateReads = 0
+  while (pending.length === 0 && !envelopeError && gateReads < QODER_GATE_MAX_READS) {
+    const { done, value } = await reader.read()
+    gateReads++
+    if (done) {
+      streamEnded = true
+      break
+    }
+    for (const line of splitter(value)) {
+      const env = readQoderFrame(line)
+      if (!env) continue
+      if (env.status !== 200) {
+        envelopeError = classifyQoderError({ status: env.status, body: env.detail })
+        break
+      }
+      if (!env.body || env.body === '[DONE]') continue
+      const cleaned = cleanQoderChunk(env.body)
+      if (!cleaned) continue
+      pending.push(cleaned)
+    }
+  }
+
+  if (envelopeError) {
+    // 上游可能仍开着流：主动取消，避免继续读（上游白烧配额）
+    try { await reader.cancel() } catch { /* ignore */ }
+    return { ok: false, classified: envelopeError }
+  }
+  if (streamEnded && pending.length === 0) {
+    return { ok: false, classified: QODER_EMPTY_STREAM_CLASSIFIED }
+  }
+
+  const stream = new ReadableStream<Uint8Array>({
     async start(controller) {
-      while (true) {
-        const { done, value } = await reader.read()
-        if (done) break
-        const combined = lineBuffer + value
-        const lines = combined.split('\n')
-        lineBuffer = lines.pop() || ''
-        for (const line of lines) {
-          const trimmed = line.trim()
-          if (!trimmed.startsWith('data:')) continue
-          const payload = trimmed.slice(5).trim()
-          if (!payload) continue
-          let outer: any
-          try {
-            outer = JSON.parse(payload)
-          } catch {
-            continue
+      // 已下发的有效帧数：为 0 说明闸门与流内都没拿到内容，收尾补错误帧
+      let validFrames = 0
+      let midStreamError: QoderClassified | null = null
+      for (const c of pending) {
+        validFrames++
+        controller.enqueue(encoder.encode(`data: ${c}\n\n`))
+      }
+
+      try {
+        readLoop: while (true) {
+          const { done, value } = await reader.read()
+          if (done) break
+          for (const line of splitter(value)) {
+            const env = readQoderFrame(line)
+            if (!env) continue
+            if (env.status !== 200) {
+              midStreamError = classifyQoderError({ status: env.status, body: env.detail })
+              break readLoop
+            }
+            if (!env.body || env.body === '[DONE]') continue
+            const cleaned = cleanQoderChunk(env.body)
+            if (!cleaned) continue
+            validFrames++
+            controller.enqueue(encoder.encode(`data: ${cleaned}\n\n`))
           }
-          const bodyStr = outer && typeof outer.body === 'string' ? outer.body : ''
-          if (!bodyStr || bodyStr === '[DONE]') continue
-          const cleaned = cleanQoderChunk(bodyStr)
-          if (!cleaned) continue
-          controller.enqueue(encoder.encode(`data: ${cleaned}\n\n`))
         }
+      } catch (e) {
+        // 上游读到一半断开：正文可能已下发一部分，交给客户端按帧内容判断；
+        // 至少不能把「静默断流」伪装成正常收尾。
+        if (validFrames === 0) {
+          controller.enqueue(encoder.encode(`data: ${QODER_EMPTY_STREAM_FRAME}\n\n`))
+          controller.enqueue(encoder.encode('data: [DONE]\n\n'))
+          controller.close()
+          return
+        }
+        midStreamError = classifyQoderError({ status: 0, body: (e as Error).message || 'upstream stream aborted' })
+      }
+
+      if (midStreamError) {
+        try { await reader.cancel() } catch { /* ignore */ }
+        controller.enqueue(encoder.encode(`data: ${qoderOpenAIErrorBody(midStreamError)}\n\n`))
+      } else if (validFrames === 0) {
+        controller.enqueue(encoder.encode(`data: ${QODER_EMPTY_STREAM_FRAME}\n\n`))
       }
       controller.enqueue(encoder.encode('data: [DONE]\n\n'))
       controller.close()
@@ -345,6 +508,8 @@ function unwrapQoderSSE(upstreamBody: ReadableStream<Uint8Array>, model: string)
       }
     },
   })
+
+  return { ok: true, stream }
 }
 
 export interface QoderProxyOptions {
@@ -409,10 +574,12 @@ async function sendQoderChatOnce(
     : {}
 
   if (wantStream) {
-    const readable = unwrapQoderSSE(resp.body, model)
+    // 有界首帧闸门：信封错误/空流在此被拦下，池循环得以冷却并轮转下一个账号
+    const opened = await openQoderSSE(resp.body, model)
+    if (!opened.ok) return { ok: false, classified: opened.classified }
     return {
       ok: true,
-      response: new Response(readable, {
+      response: new Response(opened.stream, {
         status: 200,
         headers: {
           'Content-Type': 'text/event-stream',
@@ -425,31 +592,33 @@ async function sendQoderChatOnce(
   }
 
   // 非流式：收集全部内层 chunk 聚合
-  const decoder = new TextDecoderStream()
-  const reader = resp.body.pipeThrough(decoder).getReader()
+  const reader = resp.body.pipeThrough(new TextDecoderStream()).getReader()
   const chunks: string[] = []
-  let lineBuffer = ''
-  while (true) {
+  const splitter = makeLineSplitter()
+  let envelopeErr: QoderClassified | null = null
+  readLoop: while (true) {
     const { done, value } = await reader.read()
     if (done) break
-    const combined = lineBuffer + value
-    const lines = combined.split('\n')
-    lineBuffer = lines.pop() || ''
-    for (const line of lines) {
-      const trimmed = line.trim()
-      if (!trimmed.startsWith('data:')) continue
-      const payload = trimmed.slice(5).trim()
-      if (!payload) continue
-      let outer: any
-      try {
-        outer = JSON.parse(payload)
-      } catch {
-        continue
+    for (const line of splitter(value)) {
+      const env = readQoderFrame(line)
+      if (!env) continue
+      // 信封状态检查同流式路径：HTTP200 里包着 418/5xx 时必须报错，不能聚合出空回复
+      if (env.status !== 200) {
+        envelopeErr = classifyQoderError({ status: env.status, body: env.detail })
+        break readLoop
       }
-      const bodyStr = outer && typeof outer.body === 'string' ? outer.body : ''
-      if (!bodyStr || bodyStr === '[DONE]') continue
-      chunks.push(`data: ${bodyStr}\n\n`)
+      if (!env.body || env.body === '[DONE]') continue
+      chunks.push(`data: ${env.body}\n\n`)
     }
+  }
+  if (envelopeErr) {
+    try { await reader.cancel() } catch { /* ignore */ }
+    // 非流式尚未发出响应体，可以给出真实 HTTP 状态码
+    return { ok: false, classified: envelopeErr }
+  }
+  if (chunks.length === 0) {
+    // 零有效帧：不再返回「200 + 空 content + finish_reason: stop」的假成功
+    return { ok: false, classified: QODER_EMPTY_STREAM_CLASSIFIED }
   }
   const aggregated = aggregateQoderChunks(chunks.join(''), model)
   return {
@@ -484,9 +653,9 @@ export async function proxyQoderChatRequest(
   opts?: QoderProxyOptions
 ): Promise<Response> {
   const model = (forwardBody.model as string) || 'auto'
-  const modelKey = opts?.modelKey || cpaToUpstreamKey(stripProviderPrefix(model))
+  const modelKey = opts?.modelKey || fallbackUnknownModel(cpaToUpstreamKey(stripProviderPrefix(model)))
   const messages = Array.isArray(forwardBody.messages) ? (forwardBody.messages as any[]) : []
-  const body = buildQoderBody(messages, modelKey)
+  const body = buildQoderBody(messages, modelKey, undefined, forwardBody.tools)
   const encodedBody = qoderEncode(body)
   const wantStream = opts?.stream ?? forwardBody.stream === true
 
@@ -540,6 +709,11 @@ export async function proxyQoderChatRequest(
       if (r.ok) {
         await noteQoderSuccess(env, provider.id, account.uid)
         return r.response
+      }
+      // 内容审核是**请求**属性而非账号属性：换号必然被同样拒绝，继续轮转只会白烧
+      // 其他账号的请求配额并推迟错误。立即停止轮转，把 400 交给客户端改输入。
+      if (r.classified.kind === 'content_policy') {
+        return classifiedErrorResponse(r.classified)
       }
       // 失败：按分类冷却/禁用，然后轮转下一个账号
       await markQoderAccountClassified(env, provider, account.uid, r.classified)

@@ -13,7 +13,7 @@
  */
 
 /** 错误分类种类（对应 cli2api accounts.Kind*）。 */
-export type QoderErrorKind = 'quota' | 'rate_limit' | 'auth' | 'not_ready' | 'unavailable'
+export type QoderErrorKind = 'quota' | 'rate_limit' | 'auth' | 'not_ready' | 'unavailable' | 'content_policy'
 
 export interface QoderClassified {
   /** 对客户端返回的 HTTP 状态码 */
@@ -122,6 +122,23 @@ function notReadyLike(lower: string): boolean {
   )
 }
 
+/**
+ * 内容安全审核标记（移植 qoder2api internal/bridge/errors.go:62-68 contentPolicyMarkers）。
+ * 上游日志实证形态：`InternalError.Algo.DataInspectionFailed: Input text data may contain
+ * inappropriate content.`——这是**确定性拒绝**（用户输入侧问题），重试必然再失败。
+ */
+const CONTENT_POLICY_MARKERS = [
+  'datainspectionfailed',
+  'inappropriate content',
+  'input text data may contain',
+  'contentfilter',
+  'sensitivecontent',
+]
+
+function contentPolicyLike(lower: string): boolean {
+  return CONTENT_POLICY_MARKERS.some((m) => lower.includes(m))
+}
+
 function firstNonEmpty(...values: string[]): string {
   for (const v of values) {
     const t = v.trim()
@@ -152,11 +169,15 @@ export function classifyQoderError(opts: {
 
   let k: QoderErrorKind
   if (kindFromBody) {
-    k = (['quota', 'rate_limit', 'auth', 'not_ready', 'unavailable'] as QoderErrorKind[]).includes(
+    k = (['quota', 'rate_limit', 'auth', 'not_ready', 'unavailable', 'content_policy'] as QoderErrorKind[]).includes(
       kindFromBody as QoderErrorKind
     )
       ? (kindFromBody as QoderErrorKind)
       : 'unavailable'
+  } else if (contentPolicyLike(lower)) {
+    // 内容审核先于瞬时判断：它是确定性拒绝，误判为 unavailable 会让客户端收到 502 + 重试指引，
+    // 而重试必然再被拒（源 errors.go:167-173 显式把该分支放在瞬时判断之前）
+    k = 'content_policy'
   } else if (quotaLike(lower, code, type)) {
     k = 'quota'
   } else if (notReadyLike(lower)) {
@@ -208,6 +229,14 @@ export function classifyQoderError(opts: {
       out.cooldownSeconds = parseRetryAfter(retryAfter, 10 * 1000) / 1000
       out.code = firstNonEmpty(code, 'not_ready')
       break
+    case 'content_policy':
+      // 400 = 用户输入问题，客户端应改输入而非重试；不换账号（换号也会被同样拒绝）
+      out.status = 400
+      out.failover = false
+      out.cooldownSeconds = 0
+      out.code = firstNonEmpty(code, 'content_policy_rejected')
+      out.type = 'content_policy_rejected'
+      break
     default:
       out.status = status >= 400 ? status : 502
       out.failover = true
@@ -219,6 +248,14 @@ export function classifyQoderError(opts: {
   else if (failoverHint === '1') out.failover = true
 
   out.cooldownSeconds = Math.round(out.cooldownSeconds)
+  if (k === 'content_policy') {
+    // 无条件用中文解释覆盖上游原文，但把上游详情附在尾部（源 FriendlyUpstreamError 同形）
+    const detail = out.message.slice(0, 300)
+    out.message =
+      '上游内容安全审核未通过 (DataInspectionFailed)：输入可能含不当内容，属确定性拒绝、重试无效。' +
+      '请检查/缩短输入（系统提示词、超长历史、工具定义或粘贴的代码/文本）后重试。' +
+      (detail ? '上游详情：' + detail : '')
+  }
   if (!out.message) out.message = out.code
   return out
 }

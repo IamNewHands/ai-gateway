@@ -271,13 +271,18 @@ async function checkinQoderPoolAccount(env: Env, provider: Provider, account: Qo
     }
   }
 
-  // 执行签到
+  // 执行签到（campaigns 流程；legacy daily-check-in/claim 已 DISABLED，不再使用）
   const res = await performQoderCheckin(token)
   base.success = res.success
   base.message = res.message
-  base.reason = res.success ? 'ok' : 'fail'
+  // already = 今日已领取（replayed / 列表 CLAIMED），与「本次新领」区分开：
+  // 面板按 reason 聚合「成功/已签」，混在一起会让当日实际领取数虚高。
+  base.reason = res.success ? (res.already ? 'already' : 'ok') : 'fail'
   base.lastCheckinAt = Date.now()
   if (res.success) base.todayCheckedIn = true
+  if (!res.already && typeof res.rewardCredits === 'number' && res.rewardCredits > 0) {
+    base.checkinCredit = res.rewardCredits
+  }
 
   // 签到成功后额度已变化，拉最新额度
   await fillQoderCredits(env, base, token)

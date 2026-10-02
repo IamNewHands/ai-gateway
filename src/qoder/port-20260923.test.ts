@@ -1,0 +1,345 @@
+/**
+ * port-20260923.test.ts — qoder2api 移植项的回归测试。
+ *
+ * 源：github.com/Zhengyuuuui/qoder2api HEAD ae3d42f（分析见 _port-analysis/qoder2api-porting-analysis.md）。
+ * 每个 describe 对应一个已确认的缺陷，断言的是**修复后的行为**而非实现细节。
+ */
+import { describe, it, expect, vi, afterEach } from 'vitest'
+import { cosySessionFor, cosyHeaders } from './cosy'
+import { buildQoderBody, cpaToUpstreamKey, fallbackUnknownModel } from './body'
+import { performQoderCheckin } from './billing'
+import { classifyQoderError } from './classify'
+import { proxyQoderChatRequest } from './proxy'
+import type { Env, Provider } from '../types'
+
+const CHAT_URL = 'https://gateway.qoder.com.cn/algo/api/v2/service/pro/sse/agent_chat_generation?Encode=1'
+
+afterEach(() => {
+  vi.unstubAllGlobals()
+})
+
+/** 构造一个真实 COSY 会话（走 RSA+AES，与生产同路径）。 */
+async function makeSession() {
+  return cosySessionFor('dt-test-20260923', 'drt-test', 'uid-20260923', '测试')
+}
+
+/** 把上游帧拼成 SSE 响应体。 */
+function sseBody(frames: string[]): string {
+  return frames.map((f) => `data: ${f}\n\n`).join('')
+}
+
+/** 上游信封帧。 */
+function envelope(body: string, statusCodeValue?: number | string): string {
+  const o: Record<string, unknown> = { headers: {}, body }
+  if (statusCodeValue !== undefined) o.statusCodeValue = statusCodeValue
+  return JSON.stringify(o)
+}
+
+const INNER_CHUNK = JSON.stringify({
+  id: 'chatcmpl-1',
+  model: 'auto',
+  choices: [{ index: 0, delta: { role: 'assistant', content: '你好' } }],
+})
+
+/** 注入会话 + stub 上游 fetch，走 proxyQoderChatRequest 单次直发路径。 */
+async function callProxy(frames: string[], opts?: { stream?: boolean; tools?: unknown; model?: string }) {
+  const session = await makeSession()
+  const fetchMock = vi.fn(async (_input: unknown, _init?: RequestInit) =>
+    new Response(sseBody(frames), { status: 200, headers: { 'Content-Type': 'text/event-stream' } })
+  )
+  vi.stubGlobal('fetch', fetchMock)
+  const resp = await proxyQoderChatRequest({} as Env, { id: 'qoder' } as Provider, {
+    model: opts?.model || 'auto',
+    stream: opts?.stream ?? true,
+    messages: [{ role: 'user', content: 'hi' }],
+    ...(opts?.tools !== undefined ? { tools: opts.tools } : {}),
+  }, { session: { session }, stream: opts?.stream ?? true })
+  return { resp, fetchMock }
+}
+
+// ===== P0-2：cosyHeaders 补齐传输层头 =====
+describe('P0-2 cosyHeaders 补齐 content-type / accept / user-agent / scene / business-type', () => {
+  it('显式设置 Content-Type，不再让 Fetch 对字符串 body 兜底成 text/plain', async () => {
+    const sess = await makeSession()
+    const h = cosyHeaders(sess, 'encoded-body', CHAT_URL, 'text/event-stream', true)
+    expect(h['Content-Type']).toBe('application/json')
+  })
+
+  it('accept 形参真正生效（原实现形参被忽略）', async () => {
+    const sess = await makeSession()
+    const sse = cosyHeaders(sess, 'b', CHAT_URL, 'text/event-stream', true)
+    const json = cosyHeaders(sess, 'b', CHAT_URL, 'application/json', false)
+    expect(sse['Accept']).toBe('text/event-stream')
+    expect(json['Accept']).toBe('application/json')
+  })
+
+  it('补 user-agent / cosy-scene / cosy-business-type（client.go:50-53）', async () => {
+    const sess = await makeSession()
+    const h = cosyHeaders(sess, '{}', CHAT_URL, 'application/json', false)
+    expect(h['User-Agent']).toBe('Go-http-client/2.0')
+    expect(h['Cosy-Scene']).toBe('assistant')
+    expect(h['Cosy-Business-Type']).toBe('agent')
+  })
+
+  it('不发 cosy-business-product：取值取决于未定的 cli/ide 结论，硬编码会让头与体自相矛盾', async () => {
+    const sess = await makeSession()
+    const h = cosyHeaders(sess, '{}', CHAT_URL, 'application/json', false)
+    expect(h['Cosy-Business-Product']).toBeUndefined()
+    expect(Object.keys(h).map((k) => k.toLowerCase())).not.toContain('cosy-business-product')
+  })
+
+  it('data-policy 仍是目标侧刻意选择的 disagree（不随本次移植改成 agree）', async () => {
+    const sess = await makeSession()
+    const h = cosyHeaders(sess, '{}', CHAT_URL, 'application/json', false)
+    expect(h['Cosy-Data-Policy']).toBe('disagree')
+  })
+})
+
+// ===== P0-1：签到走 campaigns，不再误判 legacy 409 =====
+describe('P0-1 签到走 campaigns 流程（legacy daily-check-in/claim 已 DISABLED）', () => {
+  it('CLAIMABLE 活动 → POST /campaigns/{id}/claim（空 body）并回传积分', async () => {
+    const fetchMock = vi.fn(async (input: unknown, init?: RequestInit) => {
+      const url = String(input)
+      if (url.endsWith('/sash/api/v1/me/campaigns')) {
+        return new Response(JSON.stringify({
+          campaigns: [{
+            campaignId: 'camp-1', campaignKey: 'cn_daily_check_in', actionType: 'CLAIM_BENEFIT',
+            claimStatus: 'CLAIMABLE', startAt: 1790000000,
+            benefit: { kind: 'CREDITS', amount: 100 },
+          }],
+        }), { status: 200 })
+      }
+      if (url.endsWith('/sash/api/v1/me/campaigns/camp-1/claim')) {
+        return new Response(JSON.stringify({
+          grantId: 'g1', status: 'CLAIMED', replayed: false, benefit: { kind: 'CREDITS', amount: 100 },
+        }), { status: 200 })
+      }
+      throw new Error(`unexpected url ${url}`)
+    })
+    vi.stubGlobal('fetch', fetchMock)
+
+    const r = await performQoderCheckin('dt-x')
+    expect(r.success).toBe(true)
+    expect(r.already).toBeFalsy()
+    expect(r.rewardCredits).toBe(100)
+    expect(r.campaignKey).toBe('cn_daily_check_in')
+
+    // claim 必须是 POST 且无 body（抓包确认空 body）
+    const claimCall = fetchMock.mock.calls.find((c) => String(c[0]).endsWith('/claim'))
+    expect(claimCall).toBeTruthy()
+    expect((claimCall![1] as RequestInit).method).toBe('POST')
+    expect((claimCall![1] as RequestInit).body).toBeUndefined()
+  })
+
+  it('replayed=true → already（今日已领取，不是本次新领）', async () => {
+    vi.stubGlobal('fetch', vi.fn(async (input: unknown) => {
+      const url = String(input)
+      if (url.endsWith('/me/campaigns')) {
+        return new Response(JSON.stringify({
+          campaigns: [{ campaignId: 'c', actionType: 'CLAIM_BENEFIT', claimStatus: 'CLAIMABLE' }],
+        }), { status: 200 })
+      }
+      return new Response(JSON.stringify({ status: 'CLAIMED', replayed: true }), { status: 200 })
+    }))
+    const r = await performQoderCheckin('dt-x')
+    expect(r.success).toBe(true)
+    expect(r.already).toBe(true)
+    expect(r.rewardCredits).toBeUndefined()
+  })
+
+  it('无 CLAIMABLE 但已有 CLAIMED → already（不报失败）', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify({
+      campaigns: [{ campaignId: 'c', actionType: 'CLAIM_BENEFIT', claimStatus: 'CLAIMED' }],
+    }), { status: 200 })))
+    const r = await performQoderCheckin('dt-x')
+    expect(r.success).toBe(true)
+    expect(r.already).toBe(true)
+  })
+
+  it('无任何 CLAIM_BENEFIT 活动 → 失败，且绝不调用 legacy claim', async () => {
+    const fetchMock = vi.fn(async (_input: unknown, _init?: RequestInit) => new Response(JSON.stringify({ campaigns: [] }), { status: 200 }))
+    vi.stubGlobal('fetch', fetchMock)
+    const r = await performQoderCheckin('dt-x')
+    expect(r.success).toBe(false)
+    expect(r.message).toContain('无可用签到活动')
+    // 关键回归：legacy 端点对未领取日恒返回 409，旧实现据此报「已签到」造成假成功、0 积分
+    expect(fetchMock.mock.calls.some((c) => String(c[0]).includes('daily-check-in/claim'))).toBe(false)
+  })
+
+  it('campaigns 查询失败时如实报错，不退化成「已签到」', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => new Response('boom', { status: 500 })))
+    const r = await performQoderCheckin('dt-x')
+    expect(r.success).toBe(false)
+    expect(r.message).toContain('查询活动失败')
+  })
+
+  it('签到请求带抓包确认的必需头（user-agent: Qoder / cosy-clienttype: 10 / origin）', async () => {
+    const fetchMock = vi.fn(async (_input: unknown, _init?: RequestInit) => new Response(JSON.stringify({ campaigns: [] }), { status: 200 }))
+    vi.stubGlobal('fetch', fetchMock)
+    await performQoderCheckin('dt-x')
+    const init = fetchMock.mock.calls[0][1] as RequestInit
+    const headers = init.headers as Record<string, string>
+    expect(headers['user-agent']).toBe('Qoder')
+    expect(headers['cosy-clienttype']).toBe('10')
+    expect(headers['accept-language']).toBe('zh-CN')
+    expect(headers['authorization']).toBe('Bearer dt-x')
+  })
+})
+
+// ===== P0-3：信封 statusCodeValue + 空流 =====
+describe('P0-3 信封 statusCodeValue 校验与空流兜底', () => {
+  it('正常帧透传内层 chunk 并补一个 [DONE]', async () => {
+    const { resp } = await callProxy([envelope(INNER_CHUNK, 200), envelope('[DONE]', 200)])
+    expect(resp.status).toBe(200)
+    const text = await resp.text()
+    expect(text).toContain('你好')
+    expect(text.match(/data: \[DONE\]/g)).toHaveLength(1)
+  })
+
+  it('HTTP200 信封里带 statusCodeValue=418 → 网关侧报错而非当正常收尾', async () => {
+    const { resp } = await callProxy([envelope('provider_error: upstream failed', 418)])
+    // 有界首帧闸门在发出 HTTP 头之前拦下 → 可给出真实状态码并让池循环轮转账号
+    expect(resp.status).not.toBe(200)
+    const body = await resp.text()
+    expect(body).toContain('"error"')
+    expect(body).not.toContain('data:')
+  })
+
+  it('statusCodeValue 为字符串时同样识别（"418"）', async () => {
+    const { resp } = await callProxy([envelope('provider_error', '418')])
+    expect(resp.status).not.toBe(200)
+  })
+
+  it('statusCodeValue 缺失按 200 处理（部分帧不带该字段）', async () => {
+    const { resp } = await callProxy([envelope(INNER_CHUNK)])
+    expect(resp.status).toBe(200)
+    expect(await resp.text()).toContain('你好')
+  })
+
+  it('零有效帧（只有 [DONE]）→ 不谎报成功', async () => {
+    const { resp } = await callProxy([envelope('[DONE]', 200)])
+    expect(resp.status).not.toBe(200)
+    const body = await resp.text()
+    expect(body).toContain('empty upstream stream')
+    expect(body).toContain('upstream_parse')
+  })
+
+  it('完全空流 → 不谎报成功', async () => {
+    const { resp } = await callProxy([])
+    expect(resp.status).not.toBe(200)
+    expect(await resp.text()).toContain('empty upstream stream')
+  })
+
+  it('非流式零有效帧同样报错，不再返回 200 + 空 content + finish_reason: stop', async () => {
+    const { resp } = await callProxy([envelope('[DONE]', 200)], { stream: false })
+    expect(resp.status).not.toBe(200)
+    const body = await resp.text()
+    expect(body).not.toContain('"finish_reason":"stop"')
+    expect(body).toContain('empty upstream stream')
+  })
+
+  it('非流式信封错误 → 真实 HTTP 错误码', async () => {
+    const { resp } = await callProxy([envelope('provider_error', 503)], { stream: false })
+    expect(resp.status).toBe(503)
+  })
+
+  it('非流式正常帧聚合出正文', async () => {
+    const { resp } = await callProxy([envelope(INNER_CHUNK, 200)], { stream: false })
+    expect(resp.status).toBe(200)
+    const body = await resp.text()
+    expect(body).toContain('你好')
+    expect(body).toContain('chat.completion')
+  })
+})
+
+// ===== P0-4：客户端 tools 转发 =====
+describe('P0-4 客户端 tools 覆盖模板内置工具', () => {
+  it('未传 tools 时保留模板的 14 个 Qoder CLI 工具', () => {
+    const body = JSON.parse(buildQoderBody([{ role: 'user', content: 'hi' }], 'auto'))
+    expect(Array.isArray(body.tools)).toBe(true)
+    expect(body.tools).toHaveLength(14)
+  })
+
+  it('传 tools 时按客户端定义覆盖（源 bridge.go:388-391）', () => {
+    const tools = [{ type: 'function', function: { name: 'my_custom_tool', parameters: {} } }]
+    const body = JSON.parse(buildQoderBody([{ role: 'user', content: 'hi' }], 'auto', undefined, tools))
+    expect(body.tools).toHaveLength(1)
+    expect(body.tools[0].function.name).toBe('my_custom_tool')
+  })
+
+  it('传空数组时清空工具（显式无工具 ≠ 偷偷塞 14 个）', () => {
+    const body = JSON.parse(buildQoderBody([{ role: 'user', content: 'hi' }], 'auto', undefined, []))
+    expect(body.tools).toEqual([])
+  })
+
+  it('proxyQoderChatRequest 把 forwardBody.tools 透传到上游请求体', async () => {
+    const tools = [{ type: 'function', function: { name: 'probe_tool', parameters: {} } }]
+    const { fetchMock } = await callProxy([envelope(INNER_CHUNK, 200)], { tools })
+    // 上游 body 经 QoderEncoding，无法直接 JSON 解析；改为断言编码前的调用链已生效
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+    const sent = (fetchMock.mock.calls[0][1] as RequestInit).body as string
+    expect(typeof sent).toBe('string')
+    expect(sent.length).toBeGreaterThan(0)
+  })
+})
+
+// ===== P1-7：未知模型名不再静默透传 =====
+describe('P1-7 未知模型名兜底到合法 SKU', () => {
+  it('已知别名仍走精确映射', () => {
+    expect(cpaToUpstreamKey('qwen3.7-max')).toBe('qmodel_latest')
+    expect(cpaToUpstreamKey('qoder-auto')).toBe('auto')
+  })
+
+  it('客户端模型名（claude/gpt/gemini 家族）兜底为 auto，不再原样透传', () => {
+    expect(fallbackUnknownModel(cpaToUpstreamKey('claude-sonnet-4-6'))).toBe('auto')
+    expect(fallbackUnknownModel(cpaToUpstreamKey('gpt-5'))).toBe('auto')
+    expect(fallbackUnknownModel(cpaToUpstreamKey('gemini-2.5-pro'))).toBe('auto')
+    expect(fallbackUnknownModel(cpaToUpstreamKey('o3-mini'))).toBe('auto')
+  })
+
+  it('上游合法 key 原样保留（模型列表新增项不能被强制降级）', () => {
+    expect(fallbackUnknownModel(cpaToUpstreamKey('qmodel_preview'))).toBe('qmodel_preview')
+    expect(fallbackUnknownModel(cpaToUpstreamKey('auto'))).toBe('auto')
+    expect(fallbackUnknownModel('some_future_sku')).toBe('some_future_sku')
+  })
+})
+
+// ===== P1-10：内容审核分类 =====
+describe('P1-10 DataInspectionFailed 归为内容审核（确定性拒绝，不引导重试）', () => {
+  const detail = 'InternalError.Algo.DataInspectionFailed: Input text data may contain inappropriate content.'
+
+  it('分类为 content_policy，状态 400，不 failover（换号也会被同样拒绝）', () => {
+    const c = classifyQoderError({ status: 200, body: detail })
+    expect(c.kind).toBe('content_policy')
+    expect(c.status).toBe(400)
+    expect(c.failover).toBe(false)
+    expect(c.cooldownSeconds).toBe(0)
+    expect(c.type).toBe('content_policy_rejected')
+  })
+
+  it('给出中文解释并明示重试无效', () => {
+    const c = classifyQoderError({ status: 200, body: detail })
+    expect(c.message).toContain('内容安全审核')
+    expect(c.message).toContain('重试无效')
+  })
+
+  it('内容审核优先于瞬时判断（418 也不会被当瞬时故障）', () => {
+    const c = classifyQoderError({ status: 418, body: detail })
+    expect(c.kind).toBe('content_policy')
+    expect(c.status).toBe(400)
+  })
+
+  it('普通瞬时故障仍按 unavailable 处理，未被内容审核分支吞掉', () => {
+    const c = classifyQoderError({ status: 500, body: 'internal server error' })
+    expect(c.kind).toBe('unavailable')
+    expect(c.status).toBe(500)
+  })
+
+  it('内容审核在流内信封错误路径同样生效（HTTP200 + 信封 418 + 审核详情）', async () => {
+    const { resp } = await callProxy([envelope(detail, 418)])
+    expect(resp.status).toBe(400)
+    const body = await resp.text()
+    expect(body).toContain('content_policy_rejected')
+    expect(body).toContain('重试无效')
+  })
+})

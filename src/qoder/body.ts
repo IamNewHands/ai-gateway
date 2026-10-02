@@ -34,6 +34,32 @@ export function cpaToUpstreamKey(model: string): string {
   return MODEL_KEY_MAP[model] || model
 }
 
+/**
+ * 客户端模型家族关键字 → 上游合法 SKU 的兜底映射（移植 qoder2api internal/bridge/bridge.go:575-583
+ * `defaultModelMapping` 的设计原则：默认表只负责让请求落到合法 SKU 不出错，不做分档）。
+ *
+ * 为什么需要：客户端（Claude Code / Cline / Roo 等）传的是自己的模型名（`claude-sonnet-4-6`、
+ * `gpt-5`），上游不认识。原实现原样透传 → 上游静默路由到 auto，**这次调用不计入 quota**
+ * （源 bridge.go:316-317 明确记载这是「请求成功但 dashboard 无用量」的根因）。
+ *
+ * 兜底值取 `auto`：它是两个实现共同承认的合法 SKU，且源在 f4fe47f 已把默认档定为 auto。
+ * 不在这里做 Claude/GPT 分档——目标 SKU 词汇表与源（qmodel_38max/gmodel/qfmodel）不同，
+ * 分档属产品决策，需实测后再定（见移植分析 P1-5）。
+ *
+ * 注意**只匹配家族关键字**，不做全量白名单：模型列表接口返回的新 key 必须能原样透传，
+ * 否则上游新增模型会在网关侧被强制降级成 auto。
+ */
+const CLIENT_FAMILY_KEYWORDS = ['claude', 'sonnet', 'opus', 'haiku', 'gpt', 'gemini', 'o1-', 'o3-', 'o4-']
+
+/** 未知模型名 → 兜底 SKU；命中家族关键字返回 'auto'，否则原样返回。 */
+export function fallbackUnknownModel(model: string): string {
+  const low = model.toLowerCase()
+  for (const kw of CLIENT_FAMILY_KEYWORDS) {
+    if (low.includes(kw)) return 'auto'
+  }
+  return model
+}
+
 export interface ChatMessage {
   role: string
   content: unknown
@@ -67,8 +93,14 @@ function deepClone(obj: unknown): any {
  * @param messages OpenAI 格式消息
  * @param modelKey 上游模型 key（已通过 cpaToUpstreamKey 映射）
  * @param userType aliyun_user_type，默认 personal_professional_trial
+ * @param tools 客户端 tools 定义；传入时**覆盖**模板内置的 14 个 Qoder CLI 工具
  */
-export function buildQoderBody(messages: ChatMessage[], modelKey: string, userType = 'personal_professional_trial'): string {
+export function buildQoderBody(
+  messages: ChatMessage[],
+  modelKey: string,
+  userType = 'personal_professional_trial',
+  tools?: unknown
+): string {
   const base = deepClone(basepromptJson)
   const prompt = extractLatestUserPrompt(messages)
 
@@ -105,6 +137,13 @@ export function buildQoderBody(messages: ChatMessage[], modelKey: string, userTy
     systemMsgs.push({ role: m.role, content: m.content })
   }
   base.messages = systemMsgs
+
+  // 客户端 tools 覆盖模板内置工具（移植 qoder2api internal/bridge/bridge.go:388-391
+  // `body["tools"] = tools`）。不覆盖时上游永远只看到模板里那 14 个 Qoder CLI 工具，
+  // 客户端（Claude Code / Cline 等）声明的工具名对模型不可见 → 工具调用指向错误工具。
+  // 只认数组且非空：空数组会让上游按「无工具」处理，与客户端「未声明工具」语义一致，
+  // 故同样覆盖（显式无工具 ≠ 偷偷塞 14 个工具）。
+  if (Array.isArray(tools)) base.tools = deepClone(tools)
 
   if (base.business && typeof base.business === 'object') {
     base.business.id = crypto.randomUUID()
