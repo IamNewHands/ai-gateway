@@ -839,6 +839,31 @@ function inspectFrame(obj: Record<string, unknown> | null): FrameFacts {
   return facts
 }
 
+/**
+ * 一帧的「形状」摘录：只取键名 / delta 键名 / finish_reason / error.message，不落正文。
+ *
+ * 为什么需要（2026-10-02 实测）：上游 200 但零正文时，`frames=1 content=0 reasoning=0`
+ * 只能说明「回了一帧空壳」，说不出空壳是**错误帧**（`{"error":…}`）、**role-only 帧**
+ * 还是 **usage-only 帧**——而这三者处置完全不同（上游报错 / 模型拒答 / 只结算）。
+ * 摘录形状即可定性，且不含用户内容，可安全落 KV 系统日志。
+ */
+function describeFrameSkeleton(obj: Record<string, unknown> | null, raw: string): string {
+  if (!obj) return `unparsed:${raw.replace(/\s+/g, ' ').slice(0, 80)}`
+  const keys = Object.keys(obj).slice(0, 8).join(',')
+  const err = obj.error
+  const errMsg =
+    typeof err === 'string' ? err
+      : err && typeof err === 'object' ? String((err as Record<string, unknown>).message ?? '')
+        : ''
+  const choice = (((obj.choices as Array<Record<string, unknown>>) || [])[0]) as Record<string, unknown> | undefined
+  const delta = choice && choice.delta && typeof choice.delta === 'object' ? Object.keys(choice.delta as object).slice(0, 8).join(',') : ''
+  const finish = choice && choice.finish_reason ? String(choice.finish_reason) : ''
+  return `keys=${keys}`
+    + (delta ? ` deltaKeys=${delta}` : '')
+    + (finish ? ` finish=${finish}` : '')
+    + (errMsg ? ` upstreamError=${errMsg.replace(/\s+/g, ' ').slice(0, 120)}` : '')
+}
+
 /** 拦截失败时的现场计数（探测期口径）：定性 502 归因用。 */
 interface StreamAttemptStats {
   /** 探测期已解析的 SSE data 帧数（0 = 上游一个可用帧都没有）。 */
@@ -853,6 +878,8 @@ interface StreamAttemptStats {
   sawFinish: boolean
   /** 探测期读上游是否抛过异常（区分「干净 EOF」与「读错误」）。 */
   probeReadError: boolean
+  /** 探测期**首帧**的形状摘录（零正文时用它定性「上游到底回了什么空壳」）。 */
+  frameSkeleton: string
 }
 
 interface StreamAttemptOutcome {
@@ -918,6 +945,8 @@ export async function pumpStreamAttempt(
   let buf = ''
   const probeDeltas: string[] = []   // 探测期收集的 reasoning delta
   const buffered: string[] = []      // 探测期缓冲的原始帧，放行时一次性写回
+  /** 探测期**首帧**的形状摘录（只在零正文被拦截时才用得上，见 describeFrameSkeleton）。 */
+  let frameSkeleton = ''
 
   // ---- 探测期时间上限 + 续流期心跳（2026-10-05，移植 luawei1/cline2api `a055b13`）----
   // 背景：探测期此前**一个字节都不写给客户端**（Response 直到 flushHealthy 才构造），
@@ -1107,6 +1136,7 @@ export async function pumpStreamAttempt(
       buffered: buffered.length,
       sawFinish: state.sawFinish,
       probeReadError: probeErrored,
+      frameSkeleton: frameSkeleton || '(无 data 帧)',
     },
   })
   try {
@@ -1151,6 +1181,7 @@ export async function pumpStreamAttempt(
         }
         let obj: Record<string, unknown> | null = null
         try { obj = unwrapData(JSON.parse(payload)) as Record<string, unknown> } catch { obj = null }
+        if (!frameSkeleton) frameSkeleton = describeFrameSkeleton(obj, payload)
         const facts = inspectFrame(obj)
         noteFacts(facts)
         const isReasoning = facts.reasoningDelta !== null
@@ -1299,7 +1330,7 @@ async function proxyStreamChat(
       `frames=${outcome.stats?.frames ?? '?'} content=${outcome.stats?.content ?? '?'} ` +
       `reasoning=${outcome.stats?.reasoning ?? '?'} buffered=${outcome.stats?.buffered ?? '?'} ` +
       `sawFinish=${outcome.stats?.sawFinish ?? '?'} probeReadError=${outcome.stats?.probeReadError ?? '?'} ` +
-      `cooldownReqMs=${cooldownReqMs}`,
+      `firstFrame=${outcome.stats?.frameSkeleton ?? '?'} cooldownReqMs=${cooldownReqMs}`,
       JSON.stringify({ ...(outcome.stats || {}), cooldownReqMs }),
     )
     await sleep(500 + Math.random() * 500)
@@ -1310,16 +1341,19 @@ async function proxyStreamChat(
     `[cline-attempt] model=${model} 三轮全拦截 → 502 upstream_runaway，明细=[${failedKinds.join(', ')}]`,
     JSON.stringify({ model, attempts: failedKinds }),
   )
+  // X-Cline-Runaway：告诉调用方「这个模型在当前账号池上产不出可用流」是**模型级不可用**，
+  // 与 402/429 同类，可沿免费链换下一个候选（见 proxyClineChatRequest）。
   return jsonResponse(
     { error: { message: 'Cline 推理退化/空响应/上游截断连续 3 次未产出可用流，已冷却换号仍失败', type: 'upstream_runaway' } },
-    502
+    502,
+    { 'X-Cline-Runaway': '1' }
   )
 }
 
-function jsonResponse(obj: unknown, status: number): Response {
+function jsonResponse(obj: unknown, status: number, headers?: Record<string, string>): Response {
   return new Response(JSON.stringify(obj), {
     status,
-    headers: { 'Content-Type': 'application/json; charset=utf-8' },
+    headers: { 'Content-Type': 'application/json; charset=utf-8', ...(headers || {}) },
   })
 }
 
@@ -1594,6 +1628,19 @@ export async function proxyClineChatRequest(
         // 模型早已 402下架，日志里一片空白）。clone 读一份 body 取摘录，last 仍原样返回。
         void resp.clone().text().then((t) => {
           console.warn(`[cline-fallback] model ${model} → ${resp.status}，换下一个候选（已试 ${i + 1}/${chain.length}）：${summarizeClineUpstreamError(t)}`)
+        }).catch(() => {})
+        last = resp
+        continue
+      }
+      // 流式三轮全拦截（`upstream_runaway`）= 该模型在当前账号池上**产不出可用流**，
+      // 属模型级不可用，与 402/429 同类：沿免费链换下一个候选，而不是把三合一 502 直接
+      // 甩给客户端。免费链存在的意义就是扛住单个模型挂掉，而此前只有 402/429/transport
+      // 会走链——2026-10-02 实测 cline-free/deepseek-v4.1-flash 连续三轮返回「1 个空壳帧
+      // + 无 finish_reason」（确定性，非账号问题），三个候选模型里另外两个是好的，
+      // 请求却被直接判死。
+      if (resp.headers.get('X-Cline-Runaway') === '1' && !isLast) {
+        void resp.clone().text().then((t) => {
+          console.warn(`[cline-fallback] model ${model} 三轮未产出可用流（upstream_runaway），换下一个候选（已试 ${i + 1}/${chain.length}）：${summarizeClineUpstreamError(t)}`)
         }).catch(() => {})
         last = resp
         continue

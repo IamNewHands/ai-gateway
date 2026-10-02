@@ -967,6 +967,50 @@ describe('降级链中间失败日志（issue #32 附带发现）', () => {
     expect(summary!.message).toContain('probe-eof-no-frames')
     expect(summary!.details).toContain('probe-eof-no-frames')
   }, 20000)
+
+  // 2026-10-02 线上：cline-free/deepseek-v4.1-flash 连续三轮都只回「1 个空壳帧 + 无 finish_reason」
+  // （确定性，不是账号问题），免费链里另外两个候选模型是好的，请求却被三合一 502 判死。
+  // 免费链存在的意义就是扛住单个模型挂掉，所以 runaway 必须和 402/429/transport 一样走链。
+  it('流式三轮全拦截 → 沿免费链换下一个候选模型，不再直接 502', async () => {
+    __resetClineCatalogCacheForTests()
+    const CANDIDATE_1 = 'cline-free/deepseek-v4.1-flash'
+    const CANDIDATE_2 = 'cline-free/gemini-3.8-flash'
+    const calls: string[] = []
+    const fn = vi.fn(async (input: unknown, init?: RequestInit) => {
+      const url = String(input)
+      if (url.includes('recommended-models')) {
+        return jsonResp({ recommended: [], free: [{ id: CANDIDATE_1 }, { id: CANDIDATE_2 }], clinePass: [] })
+      }
+      if (url.endsWith('/v1/models')) return jsonResp({ data: [] })
+      if (url.includes('/auth/refresh')) return jsonResp({ data: { accessToken: 'tok-1', expiresAt: Date.now() + 3_600_000 } })
+      if (url.includes('/chat/completions')) {
+        const body = JSON.parse(String(init?.body || '{}')) as { model: string }
+        calls.push(body.model)
+        // 首选模型复刻线上形状：空壳帧 + [DONE]，全程无 finish_reason
+        if (body.model === CANDIDATE_1) {
+          return new Response(dataFrame({}) + doneFrame(), { status: 200, headers: { 'Content-Type': 'text/event-stream' } })
+        }
+        return sseOkResp()
+      }
+      throw new Error('unexpected url: ' + url)
+    })
+    vi.stubGlobal('fetch', fn)
+    const logs = await captureLogs(async () => {
+      const resp = await proxyClineChatRequest(
+        undefined,
+        clineProvider([REFRESH_TOKEN]),
+        { model: CANDIDATE_1, messages: [{ role: 'user', content: 'hi' }] },
+        { stream: true },
+      )
+      expect(resp.status).toBe(200)
+      const text = await readAll(resp)
+      expect(text).toContain('"content":"hi"')
+    })
+    // 首选模型仍试满 3 轮才换（保持「空响应冷却换号重试」既有语义），随后由候选 2 服务
+    expect(calls.filter((m) => m === CANDIDATE_1)).toHaveLength(3)
+    expect(calls).toContain(CANDIDATE_2)
+    expect(logs.some((l) => l.includes('换下一个候选') && l.includes(CANDIDATE_1))).toBe(true)
+  }, 30000)
 })
 
 describe('summarizeClineUpstreamError 摘录解析', () => {
@@ -1101,6 +1145,27 @@ describe('上游流未发 finish_reason 的截断兜底（2026-09-25）', () => 
     expect(outcome.kind).toBe('empty')
     expect(outcome.detail).toBe('probe-eof-no-frames')
     expect(outcome.stats).toMatchObject({ frames: 0, buffered: 0, sawFinish: false, probeReadError: false })
+  })
+
+  // 2026-10-02 线上实测形状：上游 200 → **1 个零正文帧** → 干净 EOF（无 finish_reason），
+  // frames=1 / content=0 / reasoning=0 说不出那帧是什么。frameSkeleton 负责定性：
+  // 错误帧（上游报错）/ role-only 帧（模型拒答）/ usage-only 帧（只结算）处置完全不同。
+  it('零正文空壳帧 → frameSkeleton 摘出形状，错误帧连上游原文一起摘出（不落正文）', async () => {
+    // 空 delta 帧 + [DONE]：与线上 frames=1 / buffered=2 / sawFinish=false 完全同形
+    const outcome = await pumpStreamAttempt(sseResp(dataFrame({}) + doneFrame()))
+    expect(outcome.kind).toBe('empty')
+    expect(outcome.detail).toBe('probe-eof-no-finish')
+    expect(outcome.stats).toMatchObject({ frames: 1, content: 0, reasoning: 0, buffered: 2, sawFinish: false })
+    expect(outcome.stats?.frameSkeleton).toBe('keys=id,choices')
+
+    // 上游把错误塞进 200 的 SSE 里：形状必须能看出来，否则只能当「空响应」白重试
+    const errOutcome = await pumpStreamAttempt(
+      sseResp('data: {"error":{"message":"free quota exhausted"}}\n\n' + doneFrame()),
+    )
+    expect(errOutcome.kind).toBe('empty')
+    expect(errOutcome.detail).toBe('probe-eof-no-finish')
+    expect(errOutcome.stats?.frameSkeleton).toContain('keys=error')
+    expect(errOutcome.stats?.frameSkeleton).toContain('upstreamError=free quota exhausted')
   })
 
   it('截断 → proxyStreamChat 冷却换号重试，第 2 次完整流才交给客户端', async () => {

@@ -270,6 +270,28 @@ fire-and-forget，换「响应返回时日志已落盘」的确定性）。
 否则又回到「只有三合一文案」的不可归因状态。对客户端响应体一个字没改（仍是原 502 文案），
 避免客户端按 message 做匹配的逻辑被打破。
 
+### Cline `upstream_runaway` 走免费链 + 空壳帧形状摘录（2026-10-02）
+
+面板 KV 日志实测定性（15:38）：`detail=probe-eof-no-finish frames=1 content=0 reasoning=0
+buffered=2 sawFinish=false probeReadError=false`，**三轮完全一致**。含义：上游 200 → 只回
+**1 个零正文帧** → 干净 EOF（无 finish_reason）。确定性复现 ⇒ 重试同一模型纯属白烧。
+
+两处修复：
+
+1. **`upstream_runaway` 沿免费链换模型**（`proxyStreamChat` 的 502 加 `X-Cline-Runaway: 1`，
+   `proxyClineChatRequest` 见到该头且 `!isLast` 时 `continue`）。免费链存在的意义就是扛住
+   单个模型挂掉，而此前只有 402/429/transport 会走链——首选模型确定性产不出流时，
+   链上另外两个候选模型是好的，请求却被三合一 502 判死。首选模型仍试满 3 轮才换，
+   保持「空响应冷却换号重试」既有语义（多账号场景靠它换号）。
+2. **`frameSkeleton` 形状摘录**（`describeFrameSkeleton`，进 `stats` 与日志 `firstFrame=`）：
+   `frames=1 content=0` 只能说明「回了一帧空壳」，说不出是**错误帧**（`{"error":…}`）、
+   **role-only 帧**（模型拒答）还是 **usage-only 帧**（只结算），而三者处置完全不同。
+   摘录只取键名 / delta 键名 / finish_reason / error.message，不落正文，可安全进 KV。
+
+**注意**：`probe-eof-no-finish` 目前同时覆盖「真截断」与「上游主动收尾但零正文」——流式探测期
+不认 `[DONE]` 为收尾标志（非流式聚合路径已有 `sawDone` 口径）。要分开二者需再加
+`sawDone` 标志位；本次未做，因为两者的处置（换号重试 → 换模型）相同。
+
 ### 已知缺口
 
 - **上下文超限不是账号故障**（2026-10-01，`isTraeRequestSideError` 扩充）：上游把上下文超限
