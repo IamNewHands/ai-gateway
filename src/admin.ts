@@ -30,7 +30,7 @@ import { MAX_ADMIN_REQUEST_BYTES, readOptionalJSONLimited, readStrictJSONLimited
 import { isTraeProvider, testTraeCredential, testTraeModel } from './trae/proxy'
 import { diagnoseOpenCodeKey, fetchOpenCodeModels, isOpenCodeProvider, resolveOpenCodeUrls, testOpenCodeModel } from './opencode'
 import { isQoderProvider, fetchQoderModels } from './qoder/proxy'
-import { isClineProvider, fetchClineModels, fetchClineRecommendedModels, testClineChat, testClineRefreshToken, probeClineAccount, startClineOAuth, pollClineOAuth } from './cline/proxy'
+import { isClineProvider, fetchClineRecommendedModels, testClineChat, testClineRefreshToken, probeClineAccount, startClineOAuth, pollClineOAuth } from './cline/proxy'
 import { isGeminiProvider, testGeminiModel, GEMINI_MODELS } from './gemini/proxy'
 import { fetchGeminiQuota } from './gemini/quota'
 import { isCnbProvider, testCnbConnection, CNB_MODELS } from './cnb/proxy'
@@ -827,7 +827,9 @@ export async function handleTestKeyNew(c: Context<AppEnv>) {
         statusCode: result.statusCode || 0,
         message: result.message,
         email: result.email || '',
-        data: result.success ? fetchClineModels().models : null,
+        // 这里是「测这条 refreshToken 是否有效」，**不回模型列表**：
+        // 面板的 testKeyRow 会用返回的 data 渲染模型网格，把模型列表塞进来会让
+        // 「测试」按钮顺手改模型列表（2026-10-02 反馈）。要模型列表请用「获取模型」。
       },
     })
   }

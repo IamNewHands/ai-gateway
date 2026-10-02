@@ -62,7 +62,8 @@ async function testKeyConnection(url, apiType, key, providerId, intent) {
     })
     var d = await r.json()
     if (d.success && d.data) {
-      return { success: d.data.success, status: d.data.statusCode, data: d.data.data, message: d.data.message }
+      // email 仅 Cline 的 refreshToken 探测会带（用于回填账号名），其余为 undefined
+      return { success: d.data.success, status: d.data.statusCode, data: d.data.data, message: d.data.message, email: d.data.email }
     }
     return { success: false, status: 0, data: null }
   } catch (e) {

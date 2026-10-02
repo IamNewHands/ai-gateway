@@ -1827,6 +1827,14 @@ export async function testClineRefreshToken(refreshToken: string): Promise<{ suc
   return { success: probe.valid, message: probe.message, statusCode: probe.statusCode || undefined, email: probe.email, rotatedTo: probe.rotatedTo }
 }
 
+/** 上游「模型不存在」类错误（400/404）判定，正则对齐 cline2api `modelGoneRe`（JS 无内联 flag，用 i 标志）。 */
+const CLINE_MODEL_GONE_RE = /model[\s_-]*(not[\s_-]*found|does\s+not\s+exist|no\s+such|unknown|invalid)|(invalid|unknown|no\s+such)[\s_-]*model/i
+
+export function isClineModelGone(status: number, body: string): boolean {
+  if (status !== 400 && status !== 404) return false
+  return CLINE_MODEL_GONE_RE.test(body || '')
+}
+
 /** 用给定账号池发送一个最小 chat 请求来测试模型可用性。 */
 export async function testClineChat(
   refreshTokens: string[],
@@ -1867,6 +1875,27 @@ export async function testClineChat(
     }
     if (resp.status === 403 && /cline-pass/i.test(t)) {
       return { success: false, statusCode: resp.status, message: '该模型需要付费订阅 cline-pass 才能使用' }
+    }
+    // 上游「模型不存在」（400/404）——**不是账号问题**，别让用户去换号：
+    // Cline 的目录端点（recommended-models / /v1/models）与推理端点会不一致，
+    // 目录里还列着的模型推理侧可能已经下架/改名（cline2api 对同一现象的处理见
+    // 其 models_sync.go 的 modelGoneRe + Delisted 标记）。这里顺手查一次实时目录，
+    // 把「目录也查不到（确实下架）」与「目录还列着（上游两套数据打架）」分开说。
+    if (isClineModelGone(resp.status, t)) {
+      let inCatalog = false
+      try {
+        const { models } = await getClineCatalog()
+        inCatalog = models.some((m) => m.id === (modelId || DEFAULT_MODEL))
+      } catch { /* 目录不可用时按「已下架」表述 */ }
+      const id = modelId || DEFAULT_MODEL
+      const raw = t ? `（上游原文：${t.replace(/\s+/g, ' ').slice(0, 120)}）` : ''
+      return {
+        success: false,
+        statusCode: resp.status,
+        message: inCatalog
+          ? `上游不认识该模型：${id}。它还在官方目录里（上游目录与推理端点不一致，属上游侧下架/改名），请改用其它免费模型，或重新「获取模型」后从列表里移除它${raw}`
+          : `上游已下架该模型：${id}（官方目录里已没有它）。请点「获取模型」重新同步并移除它${raw}`,
+      }
     }
     return { success: false, statusCode: resp.status, message: `HTTP ${resp.status}: ${t}` }
   } catch (err) {

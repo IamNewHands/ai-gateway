@@ -205,6 +205,14 @@ label, legend { color: var(--color-ink-2); font-size: var(--text-xs); font-weigh
 .field-row { min-width: 0; flex-wrap: nowrap; }
 .field-row input { min-width: 0; }
 
+/* Cline 账号行：一行里放 token + 开关 + 测试 + 有效性徽章 + 账号名。
+   .field-row 默认 nowrap，这里必须允许换行：窗口窄时账号部分整体折到第二行，
+   而不是把 token 输入框压成一条缝（flex 项在 nowrap 下会被压缩而不是换行）。 */
+.cline-key-row { flex-wrap: wrap; }
+.cline-key-row .cline-tok { flex: 1 1 240px; max-width: 420px; }
+.cline-key-row .cline-lbl { flex: 0 1 220px; min-width: 140px; }
+.cline-key-row .trt { flex-basis: 100%; }
+
 /* switch */
 .tg { position: relative; display: inline-block; width: 2.5rem; height: var(--control-h); flex: 0 0 2.5rem; margin: 0; }
 .tg input { position: absolute; opacity: 0; width: .0625rem; height: .0625rem; }

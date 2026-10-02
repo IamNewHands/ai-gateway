@@ -1,8 +1,8 @@
 import { describe, expect, it, beforeEach, afterEach, vi } from 'vitest'
 import { Hono } from 'hono'
 import type { AppEnv, Provider } from '../types'
-import { probeClineAccount } from './proxy'
-import { handleClineAccountCheck, handleClineAccountLabel, normalizeApiKeyLabel } from '../admin'
+import { probeClineAccount, testClineChat, isClineModelGone, __resetClineCatalogCacheForTests } from './proxy'
+import { handleClineAccountCheck, handleClineAccountLabel, normalizeApiKeyLabel, handleTestKeyNew } from '../admin'
 import { getProvider, setProviders } from '../storage'
 import { renderAdminPage } from '../pages'
 
@@ -201,6 +201,77 @@ describe('POST /admin/api/providers/:id/cline-accounts/label（手工维护口�
   })
 })
 
+describe('单行「测试 Key」：只判 refreshToken 有效性，不拉模型列表', () => {
+  it('返回 email，且不回任何模型列表（此前会顺手改写模型网格）', async () => {
+    const env = makeEnv()
+    await setProviders(env as never, [clineProvider([{ key: RT_A, enabled: true }])])
+    globalThis.fetch = (async () => jsonResp({ data: { accessToken: 'at-1', refreshToken: RT_A, userInfo: { email: 'a@example.com' } } })) as typeof fetch
+
+    const app = new Hono<AppEnv>()
+    app.post('/admin/api/test-key', handleTestKeyNew)
+    const res = await app.request('/admin/api/test-key', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ url: 'https://api.cline.bot/api/v1', apiKey: RT_A, providerId: 'cline', intent: 'diagnose' }),
+    }, env as never)
+    const j: any = await res.json()
+    expect(j.data.success).toBe(true)
+    expect(j.data.email).toBe('a@example.com')
+    expect(j.data.data).toBeUndefined()
+    expect(JSON.stringify(j)).not.toContain('"id"')
+  })
+})
+
+describe('模型测试：上游报「模型不存在」时点明是上游下架，不是账号问题', () => {
+  beforeEach(() => { __resetClineCatalogCacheForTests() })
+  afterEach(() => { __resetClineCatalogCacheForTests() })
+
+  function installFetch(catalogFree: string[]): void {
+    globalThis.fetch = (async (url: string) => {
+      const u = String(url)
+      if (u.includes('/auth/refresh')) {
+        return jsonResp({ data: { accessToken: 'at-1', refreshToken: RT_A } })
+      }
+      if (u.includes('recommended-models')) {
+        return jsonResp({ free: catalogFree.map((id) => ({ id })), recommended: [], clinePass: [] })
+      }
+      if (u.includes('/models')) return jsonResp({ data: [] })
+      if (u.includes('/chat/completions')) {
+        return new Response('{"error":"model not found","success":false}', { status: 404 })
+      }
+      throw new Error('unexpected url ' + u)
+    }) as typeof fetch
+  }
+
+  it('目录里已没有该模型 → 直说「上游已下架」并指引重新获取模型', async () => {
+    installFetch(['cline-free/other-model'])
+    const r = await testClineChat([RT_A], 'cline-free/gemini-3.8-flash')
+    expect(r.success).toBe(false)
+    expect(r.message).toContain('上游已下架')
+    expect(r.message).toContain('cline-free/gemini-3.8-flash')
+    expect(r.message).toMatch(/获取模型/)
+    // 上游原文必须留在消息里，便于继续排查
+    expect(r.message).toContain('model not found')
+  })
+
+  it('目录里还列着 → 说明是上游目录与推理端点不一致（别去换号）', async () => {
+    installFetch(['cline-free/gemini-3.8-flash'])
+    const r = await testClineChat([RT_A], 'cline-free/gemini-3.8-flash')
+    expect(r.success).toBe(false)
+    expect(r.message).toContain('目录与推理端点不一致')
+    expect(r.message).not.toContain('账号')
+  })
+
+  it('isClineModelGone：只认 400/404 + 模型不存在类文案（对齐 cline2api modelGoneRe）', () => {
+    expect(isClineModelGone(404, '{"error":"model not found","success":false}')).toBe(true)
+    expect(isClineModelGone(400, '{"msg":"invalid model"}')).toBe(true)
+    expect(isClineModelGone(404, 'Model does not exist')).toBe(true)
+    // 403/402/429/500 与普通 404 文案都不算模型下架
+    expect(isClineModelGone(403, 'model not found')).toBe(false)
+    expect(isClineModelGone(500, 'model not found')).toBe(false)
+    expect(isClineModelGone(404, '{"error":"route not found"}')).toBe(false)
+  })
+})
+
 describe('Cline 面板：账号行 + 检测按钮', () => {
   async function renderHtml(env: AppEnv) {
     const app = new Hono<AppEnv>()
@@ -223,7 +294,7 @@ describe('Cline 面板：账号行 + 检测按钮', () => {
     expect(panel).toContain('onblur="clineSaveLabel(\'cline\',0)"')
   })
 
-  it('Cline：账号行是独立一行，不挤占 RefreshToken 输入框（.field-row 是 flex-wrap: nowrap）', async () => {
+  it('Cline：token 与账号信息同处一行，窄窗口才折行（不再挤成两行）', async () => {
     const env = makeEnv()
     await setProviders(env as never, [clineProvider([{ key: RT_A, enabled: true }])])
     const html = await renderHtml(env)
@@ -231,10 +302,18 @@ describe('Cline 面板：账号行 + 检测按钮', () => {
     const panel = html.slice(start, html.indexOf('</article>', start))
     // 每行只能有一个 [data-kidx]，否则 getKeys 会把同一个 token 收集两次
     expect((panel.match(/data-kidx="0"/g) || []).length).toBe(1)
-    // 账号行在 token 行的 field-row 闭合之后（不是它的 flex 兄弟节点）
-    expect(panel).toMatch(/id="k-cline-0"[\s\S]*?<\/div>[\s\S]*?id="kst-cline-0"/)
-    expect(panel).toContain('class="cline-key-row" data-kidx="0"><div class="fc field-row">')
-    expect(panel).not.toMatch(/<div class="fc mb-3 field-row" data-kidx="0"[^>]*id="kst-cline-0"/)
+    // 一个 .cline-key-row 里同时含 token 输入框、徽章与账号输入框
+    const rowStart = panel.indexOf('class="fc mb-3 field-row cline-key-row"')
+    expect(rowStart).toBeGreaterThan(-1)
+    const row = panel.slice(rowStart, panel.indexOf('</div>', panel.indexOf('id="ktr-cline-0"')))
+    expect(row).toContain('class="cline-tok"')
+    expect(row).toContain('id="kst-cline-0"')
+    expect(row).toContain('class="cline-lbl"')
+    // 行内结果区（跑「测试」时就地显示，不再写到面板顶部）
+    expect(row).toContain('id="ktr-cline-0"')
+    // 不要再回到两行结构（上一版的 cline-acct-row 独立块）
+    expect(panel).not.toContain('cline-acct-row')
+    expect(panel).not.toContain('class="cline-key-row" data-kidx="0"><div')
   })
 
   it('非 Cline 提供商：不注入账号行', async () => {

@@ -85,29 +85,28 @@ const isCnbProviderUI = (p: { id?: string; baseUrl?: string }) =>
   p.id === 'cnb' || (typeof p.baseUrl === 'string' && p.baseUrl.includes('cnb.cool'))
 
 /**
- * Cline 账号行的第二行：有效性徽章 + 账号名输入框（自动关联 email，关联不到可手工填）。
- * 只有 Cline 需要——它的 apiKey 一行就是一个 refreshToken 账号，裸 token 无法分辨是谁。
- * 徽章初始为「未检测」，点「检测全部」或保存后由 clineCheckAccounts 回填。
+ * Cline 账号行：token 与「有效性徽章 + 账号名」同处一行（窗口窄时账号部分自动折行）。
  *
- * 必须是**独立的一行块级容器**，不能塞进 .field-row：那条 CSS 是 `flex-wrap: nowrap`，
- * 挤进同一行会把 RefreshToken 输入框压成一条缝（内容完全看不见）。
+ * 为什么不做成两个 .field-row 上下叠：token 输入框会被拉满整行，一行只放一个
+ * 字段太浪费横向空间（见 2026-10-02 反馈）。为什么不能简单塞进默认 .field-row：
+ * 那条 CSS 是 `flex-wrap: nowrap`，nowrap 下 flex 项被压缩而不是换行，账号部分
+ * 会把 token 输入框挤成一条缝——所以这里用 .cline-key-row 覆盖成 wrap，
+ * 并给 token/账号两个输入框各自的 flex 基准（见 pages.css.ts）。
  */
-const clineAcctRowHtml = (pid: string, idx: number, label?: string) =>
-  `<div class="fc mb-3 cline-acct-row" style="gap:8px;flex-wrap:wrap">` +
-  `<span class="bd bd-off" id="kst-${escapePageHtml(pid)}-${idx}" title="点上方「检测全部账号」后显示该 RefreshToken 是否仍可用">未检测</span>` +
-  `<input type="text" class="fx1" style="max-width:320px;min-width:180px" id="klbl-${escapePageHtml(pid)}-${idx}" value="${escapePageHtml(label || '')}" placeholder="账号（自动关联邮箱；关联不到可手填）" aria-label="账号名（仅显示用）" onblur="clineSaveLabel('${escapePageJsx(pid)}',${idx})">` +
-  `<span class="mu" style="font-size:12px" id="kmsg-${escapePageHtml(pid)}-${idx}"></span>` +
-  `</div>`
+const clineAcctFieldsHtml = (pid: string, idx: number, label?: string) =>
+  `<span class="bd bd-off" id="kst-${escapePageHtml(pid)}-${idx}" title="点「测试」或「检测全部账号」后显示该 RefreshToken 是否仍可用">未检测</span>` +
+  `<input type="text" class="cline-lbl" id="klbl-${escapePageHtml(pid)}-${idx}" value="${escapePageHtml(label || '')}" placeholder="账号（自动关联邮箱；关联不到可手填）" aria-label="账号名（仅显示用）" onblur="clineSaveLabel('${escapePageJsx(pid)}',${idx})">` +
+  `<span class="mu" style="font-size:12px" id="kmsg-${escapePageHtml(pid)}-${idx}"></span>`
 
 /**
- * apiKey 单行（Cline 走两行结构，见 clineAcctRowHtml 的说明）。
- * data-kidx 只挂在外层容器上：getKeys() 按 [data-kidx] 逐行收集，
+ * apiKey 单行。data-kidx 只挂在外层容器上：getKeys() 按 [data-kidx] 逐行收集，
  * 一行里出现两个带 data-kidx 的元素会让同一个 token 被收集两次。
  */
 const keyRowHtml = (p: { id?: string }, k: { key: string; enabled: boolean; label?: string }, ki: number) => {
   const pid = escapePageHtml(p.id)
+  const isCline = p.id === 'cline'
   const controls =
-    `<input type="password" value="${escapePageHtml(k.key)}" class="fx1" id="k-${pid}-${ki}" placeholder="API Key" aria-label="API Key">` +
+    `<input type="password" value="${escapePageHtml(k.key)}" class="${isCline ? 'cline-tok' : 'fx1'}" id="k-${pid}-${ki}" placeholder="API Key" aria-label="API Key">` +
     `<button class="icon-btn" onclick="toggleKeyText(this)" title="显示/隐藏 Key"><i class="fas fa-eye" aria-hidden="true"></i></button>` +
     `<label class="tg"><input type="checkbox" ${k.enabled ? 'checked' : ''} id="ken-${pid}-${ki}" aria-label="启用 Key"><span class="sl"></span></label>` +
     `<button class="btn btn-gh btn-xs" onclick="testKeyRow('${escapePageJsx(p.id)}',${ki})" title="测试 Key"><i class="fas fa-plug" aria-hidden="true"></i><span>测试</span></button>` +
@@ -115,7 +114,8 @@ const keyRowHtml = (p: { id?: string }, k: { key: string; enabled: boolean; labe
   if (p.id !== 'cline') {
     return `<div class="fc mb-3 field-row" data-kidx="${ki}">${controls}</div>`
   }
-  return `<div class="cline-key-row" data-kidx="${ki}"><div class="fc field-row">${controls}</div>${clineAcctRowHtml(p.id!, ki, k.label)}</div>`
+  return `<div class="fc mb-3 field-row cline-key-row" data-kidx="${ki}">${controls}${clineAcctFieldsHtml(p.id!, ki, k.label)}` +
+    `<span class="trt" id="ktr-${pid}-${ki}" aria-live="polite"></span></div>`
 }
 
 /**
@@ -3364,22 +3364,19 @@ function addKeyRow(id) {
   const inp = document.getElementById('nk-' + id), k = inp.value.trim()
   if (!k) { toast('请输入 API Key', 'error'); return }
   const c = document.getElementById('keys-' + id), cnt = c.querySelectorAll('[data-kidx]').length
-  const controls = '<input type="password" value="' + escapeHtml(k) + '" class="fx1" id="k-' + escapeHtml(id) + '-' + cnt + '" placeholder="API Key" aria-label="API Key"><button class="icon-btn" onclick="toggleKeyText(this)" title="显示/隐藏 Key" aria-label="显示或隐藏 Key"><i class="fas fa-eye" aria-hidden="true"></i></button><label class="tg"><input type="checkbox" checked id="ken-' + escapeHtml(id) + '-' + cnt + '" aria-label="启用该 Key"><span class="sl"></span></label><button class="btn btn-gh btn-xs" onclick="testKeyRow(\\'' + escapeJsAttr(id) + '\\',' + cnt + ')" title="测试" aria-label="测试该 Key"><i class="fas fa-plug"></i></button><button class="btn btn-gh btn-xs" onclick="rmKeyRow(\\'' + escapeJsAttr(id) + '\\',' + cnt + ')" title="移除" aria-label="移除该 Key"><i class="fas fa-times c-l"></i></button>'
+  const isCline = id === 'cline'
   const d = document.createElement('div')
-  // Cline 两行（token 一行 + 账号一行），其余提供商单行；data-kidx 只挂外层，避免 getKeys 重复收集
-  if (id === 'cline') {
-    d.className = 'cline-key-row'
-    d.dataset.kidx = cnt
-    d.innerHTML = '<div class="fc field-row">' + controls + '</div>' +
-      '<div class="fc mb-3 cline-acct-row" style="gap:8px;flex-wrap:wrap">' +
-      '<span class="bd bd-info" id="kst-' + escapeHtml(id) + '-' + cnt + '">待保存</span>' +
-      '<input type="text" class="fx1" style="max-width:320px;min-width:180px" id="klbl-' + escapeHtml(id) + '-' + cnt + '" placeholder="账号（保存后自动关联邮箱）" aria-label="账号名（仅显示用）" onblur="clineSaveLabel(\\'' + escapeJsAttr(id) + '\\',' + cnt + ')">' +
-      '<span class="mu" style="font-size:12px" id="kmsg-' + escapeHtml(id) + '-' + cnt + '"></span></div>'
-  } else {
-    d.className = 'fc mb-3 field-row'
-    d.dataset.kidx = cnt
-    d.innerHTML = controls + '<span class="trt" id="ktr-' + escapeHtml(id) + '-' + cnt + '" style="flex-basis:100%" aria-live="polite"></span>'
+  // Cline：token 与账号信息同处一行（.cline-key-row 允许换行，窄窗口才折到第二行）
+  d.className = isCline ? 'fc mb-3 field-row cline-key-row' : 'fc mb-3 field-row'
+  d.dataset.kidx = cnt
+  let html = '<input type="password" value="' + escapeHtml(k) + '" class="' + (isCline ? 'cline-tok' : 'fx1') + '" id="k-' + escapeHtml(id) + '-' + cnt + '" placeholder="API Key" aria-label="API Key"><button class="icon-btn" onclick="toggleKeyText(this)" title="显示/隐藏 Key" aria-label="显示或隐藏 Key"><i class="fas fa-eye" aria-hidden="true"></i></button><label class="tg"><input type="checkbox" checked id="ken-' + escapeHtml(id) + '-' + cnt + '" aria-label="启用该 Key"><span class="sl"></span></label><button class="btn btn-gh btn-xs" onclick="testKeyRow(\\'' + escapeJsAttr(id) + '\\',' + cnt + ')" title="测试" aria-label="测试该 Key"><i class="fas fa-plug"></i></button><button class="btn btn-gh btn-xs" onclick="rmKeyRow(\\'' + escapeJsAttr(id) + '\\',' + cnt + ')" title="移除" aria-label="移除该 Key"><i class="fas fa-times c-l"></i></button>'
+  if (isCline) {
+    html += '<span class="bd bd-info" id="kst-' + escapeHtml(id) + '-' + cnt + '">待保存</span>' +
+      '<input type="text" class="cline-lbl" id="klbl-' + escapeHtml(id) + '-' + cnt + '" placeholder="账号（保存后自动关联邮箱）" aria-label="账号名（仅显示用）" onblur="clineSaveLabel(\\'' + escapeJsAttr(id) + '\\',' + cnt + ')">' +
+      '<span class="mu" style="font-size:12px" id="kmsg-' + escapeHtml(id) + '-' + cnt + '"></span>'
   }
+  html += '<span class="trt" id="ktr-' + escapeHtml(id) + '-' + cnt + '" aria-live="polite"></span>'
+  d.innerHTML = html
   c.appendChild(d)
   inp.value = ''
   inp.focus()
@@ -3409,9 +3406,33 @@ async function testKeyRow(id, idx) {
   showSpinner(tr)
   // 「测试密钥」按钮：opencode 走单 key 推理诊断（intent=diagnose），其余提供商忽略该参数
   const result = await testKeyConnection(url, apiType, k, id, 'diagnose')
-  showResult(tr, result.success, result.success ? '' : (result.message && result.message.indexOf('HTTP') !== -1 ? result.message : 'HTTP ' + result.status + (result.message ? ': ' + result.message : '')))
+  showResult(tr, result.success, result.success ? (result.email ? 'RefreshToken 有效（' + result.email + '）' : 'RefreshToken 有效') : (result.message && result.message.indexOf('HTTP') !== -1 ? result.message : 'HTTP ' + result.status + (result.message ? ': ' + result.message : '')))
+  if (id === 'cline') {
+    // Cline 这行测的是 refreshToken 是否有效 + 属于哪个账号，**不拉模型列表**
+    // （拉模型是「获取模型」按钮的事，此前会顺手改写模型网格）。
+    clineApplyProbe(id, idx, result)
+    return
+  }
   if (result.success) {
     showEditModelsList(id, extractModels(result.data))
+  }
+}
+
+// 把单行探测结果写回该行的徽章与账号框（有效/无效 + 自动关联邮箱）
+function clineApplyProbe(id, idx, result) {
+  const b = document.getElementById('kst-' + id + '-' + idx)
+  if (b) {
+    b.textContent = result.success ? '有效' : '无效'
+    b.className = 'bd ' + (result.success ? 'bd-on' : 'bd-danger')
+    b.title = result.message || ''
+  }
+  const m = document.getElementById('kmsg-' + id + '-' + idx)
+  const lbl = document.getElementById('klbl-' + id + '-' + idx)
+  if (result.success && result.email && lbl && !lbl.value.trim()) lbl.value = result.email
+  if (m) {
+    if (!result.success) m.textContent = '该 RefreshToken 不可用（账号信息取自上游，失败时取不到）'
+    else if (result.email) m.textContent = '已自动关联邮箱'
+    else m.textContent = '上游未返回邮箱，可手工填写账号名'
   }
 }
 
