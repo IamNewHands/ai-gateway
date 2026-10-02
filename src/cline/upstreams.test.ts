@@ -10,7 +10,7 @@ import {
   CLINE_PROBE_UPSTREAM,
   MIN_GAP_MS,
 } from './proxy'
-import { handleClineUpstreams, handleClineUpstreamProbe, handleClineUpstreamValidate } from '../admin'
+import { handleClineUpstreams, handleClineUpstreamProbe, handleClineUpstreamValidate, normalizeClinePinByModel } from '../admin'
 import { setProviders } from '../storage'
 
 /** 内存 KV（暴露 map 以便断言留档写入）。 */
@@ -304,5 +304,32 @@ describe('面板端点：GET 留档 / probe / validate', () => {
     expect(d.data.total).toBe(4)
     expect(d.data.checks).toHaveLength(4)
     expect(d.data.summary).toContain('可用 4 / 共 4')
+  })
+})
+
+// 保存归一是 exclude 的**唯一持久化入口**：漏掉 exclude 的归一/空配置判定，面板上排好的
+// 排除项会被静默丢弃，而界面看起来「保存成功」。
+describe('normalizeClinePinByModel：exclude 归一与空配置判定', () => {
+  it('只排除、不钉渠道的配置必须落库（这是 exclude 的主要用法）', () => {
+    expect(normalizeClinePinByModel({ M: { exclude: ['wafer'] } })).toEqual({ M: { exclude: ['wafer'] } })
+  })
+
+  it('exclude 去重/trim/丢空值；与 upstreams 同时存在时两者都留（裁决在注入侧）', () => {
+    expect(normalizeClinePinByModel({ M: { upstreams: ['a'], exclude: [' wafer ', 'wafer', ''] } }))
+      .toEqual({ M: { upstreams: ['a'], exclude: ['wafer'] } })
+    expect(normalizeClinePinByModel({ M: { exclude: [7, null, {}] } })).toBeUndefined()
+  })
+
+  it('三项全空 / 非法输入 → undefined（不落空配置）', () => {
+    expect(normalizeClinePinByModel({ M: {} })).toBeUndefined()
+    expect(normalizeClinePinByModel({ M: { exclude: [] } })).toBeUndefined()
+    expect(normalizeClinePinByModel({ M: 'nope' })).toBeUndefined()
+    expect(normalizeClinePinByModel(null)).toBeUndefined()
+    expect(normalizeClinePinByModel([])).toBeUndefined()
+  })
+
+  it('exclude + sort 的组合保留（排序与排除互不冲突）', () => {
+    expect(normalizeClinePinByModel({ M: { exclude: ['wafer'], sort: 'cost' }, N: { sort: 'bogus' } }))
+      .toEqual({ M: { exclude: ['wafer'], sort: 'cost' } })
   })
 })

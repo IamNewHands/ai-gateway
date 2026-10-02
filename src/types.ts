@@ -49,6 +49,18 @@ export interface ClinePinConfig {
    * 留空 = 不钉渠道，保持网关自动选（原有行为）。
    */
   upstreams?: string[]
+  /**
+   * 永不使用的渠道（**否决权**，优先级高于 `upstreams`：两处同时出现时以本字段为准）。
+   *
+   * 为什么需要它（而不是只用 `only` 白名单）：豁免语义。16 个渠道里常年「限流/不可钉」的那几个
+   * 不需要逐个批准剩下的，只要点名否决坏的；白名单在渠道清单变化后必须重新勾选，否决列表不用。
+   *
+   * 与 `upstreams` 一样，网关**两侧都不支持** exclude/ignore 字段（源项目实测被静默忽略，
+   * 见 `_port-analysis/src/cps/server.js:465`），所以本字段由 `injectClineUpstreamPrefs`
+   * 结合渠道清单换算成显式 `only` 白名单下发——清单缺失时排除**不会**假装生效（见归因日志
+   * 的 `exclude-unresolved` 标记）。
+   */
+  exclude?: string[]
   /** `strict`（缺省）= 只钉第一个；`preferred` = 钉住但保留回退顺序。 */
   pinMode?: 'strict' | 'preferred'
   /** 渠道排序偏好。Vercel 原生支持这三个值；OpenRouter 侧映射为 price/latency/throughput。 */

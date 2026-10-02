@@ -129,6 +129,11 @@ const keyRowHtml = (p: { id?: string }, k: { key: string; enabled: boolean; labe
  *  - 表格与选择器都由脚本按接口数据渲染；「显示已留档」只读 KV，不打上游。
  *  - 固定设置的保存走通用 PUT /admin/api/providers/:id：clinePinByModel 是**整表替换**语义，
  *    所以前端每次都提交完整的表（未选的模型即视为取消固定）。
+ *  - 渠道徽章即「排除」开关：排除是否决权（永不使用该渠道），而不只是白名单的另一面。网关两侧
+ *    都不认 exclude/ignore 字段（源项目实测被静默忽略），排除由后端结合渠道清单换算成 only
+ *    白名单下发——所以清单缺失时排除会失效，面板必须显式标出（见 clineUpExcludeUnresolved）。
+ *  - 三个下拉与徽章的改动都写进本地 `pins`，再按它重渲染：否则探测/校验触发的重渲染会把用户
+ *    尚未保存的选择弹回旧值，看起来像「点了没反应」。
  */
 const clineUpstreamSectionHtml = (p: { id?: string }) => {
   const pid = escapePageHtml(p.id)
@@ -144,7 +149,7 @@ const clineUpstreamSectionHtml = (p: { id?: string }) => {
     `<button class="btn btn-p btn-xs" onclick="clineUpstreamsSave('${js}')" title="保存下面每个模型选定的渠道与模式"><i class="fas fa-save" aria-hidden="true"></i><span>保存固定设置</span></button>` +
     `<span class="mu" id="cu-st-${pid}" aria-live="polite" style="font-size:12px"></span></div>` +
     `<div id="cu-tb-${pid}"></div>` +
-    `<span class="form-helper">钉住发生在 Cline 网关之后的路由层：<b>严格</b>只用你选的渠道（网关不再兜底，该渠道一挂即失败）；<b>优先</b>按你排的顺序优先、仍保留网关兜底。选「不固定」= 保持网关自动选。校验中「限流」只代表当前共享池暂时繁忙，渠道本身可用。</span>` +
+    `<span class="form-helper">钉住发生在 Cline 网关之后的路由层：<b>严格</b>只用你选的渠道（网关不再兜底，该渠道一挂即失败）；<b>优先</b>按你排的顺序优先、仍保留网关兜底。<b>点渠道徽章 = 排除</b>（划线即已排除）：排除是<b>否决权</b>，优先级高于「固定到」，「不固定 + 排除几个坏渠道」是最省心的用法。选「不固定」且不排除 = 保持网关自动选。校验中「限流」只代表当前共享池暂时繁忙，渠道本身可用。</span>` +
     `</fieldset></div>`
 }
 
@@ -3263,9 +3268,41 @@ function clineUpCostText(count, minGapMs) {
   var sec = Math.round((count * (minGapMs || 800)) / 1000)
   return '将发起 ' + count + ' 次最小请求，约 ' + sec + ' 秒（期间其它 Cline 请求排队）'
 }
+/**
+ * 固定摘要：渠道 + 模式 + 排序 + 排除数。
+ * 排除项**必须**出现在摘要里：exclude 是换算成 only 白名单下发的独立否决清单，摘要是用户
+ * 确认「到底保存了什么」的唯一回显；漏掉它，用户改完排除会以为没保存上。
+ * 与后端同口径：exclude 优先于 upstreams（同时出现以排除为准），所以这里也要先减掉。
+ */
 function clineUpPinSummary(pin) {
-  if (!pin || !pin.upstreams || !pin.upstreams.length) return ''
-  return pin.upstreams[0] + (pin.pinMode === 'preferred' ? '（优先）' : '（严格）') + (pin.sort ? ' · ' + pin.sort : '')
+  if (!pin) return ''
+  var exc = (pin.exclude || []).filter(Boolean)
+  var ups = (pin.upstreams || []).filter(function (u) { return Boolean(u) && exc.indexOf(u) === -1 })
+  if (!ups.length && !exc.length && !pin.sort) return ''
+  var parts = []
+  if (ups.length) {
+    parts.push(ups[0] + (ups.length > 1 ? ' 等 ' + ups.length + ' 个' : '') + (pin.pinMode === 'preferred' ? '（优先）' : '（严格）'))
+  } else {
+    parts.push('不固定')
+  }
+  if (exc.length) parts.push('排除 ' + exc.length + ' 个')
+  if (pin.sort) parts.push(pin.sort)
+  return parts.join(' · ')
+}
+/** 点击徽章切换「排除」：返回新数组，不改入参（面板据此重渲染）。 */
+function clineUpExcludeToggle(list, ch) {
+  var cur = (list || []).filter(function (x) { return x !== ch })
+  if (cur.length === (list || []).length) cur.push(ch)
+  return cur
+}
+/**
+ * 「配了排除但没生效」判定：网关两侧都不认 exclude/ignore 字段（实测被静默忽略），排除只能
+ * 结合渠道清单换算成 only 白名单——没有清单就换算不出来，后端会退回网关自动选。
+ * 留档有 7 天有效期，过期后排除会悄悄失效，所以面板必须显式标出来，否则用户一直以为排除还在。
+ */
+function clineUpExcludeUnresolved(pin, probe) {
+  var exc = (pin && pin.exclude) || []
+  return exc.length > 0 && !((((probe || {}).upstreams) || []).length)
 }
 /* CLINE_UP_END */
 
@@ -3273,6 +3310,14 @@ var _clineUpData = {}
 
 function clineUpEl(id, name) { return document.getElementById('cu-' + name + '-' + id) }
 function clineUpStatus(id, text) { var el = clineUpEl(id, 'st'); if (el) el.textContent = text || '' }
+/** 该模型的本地固定配置（渲染与保存的唯一状态源；表格控件都写这里，重渲染不丢改动）。 */
+function clineUpPin(id, model) {
+  var d = _clineUpData[id]
+  if (!d) { d = { models: [], pins: {}, probes: {}, checks: {} }; _clineUpData[id] = d }
+  d.pins = d.pins || {}
+  if (!d.pins[model]) d.pins[model] = {}
+  return d.pins[model]
+}
 function clineUpPost(id, path, body) {
   return fetch('/admin/api/providers/' + encodeURIComponent(id) + path, {
     method: 'POST',
@@ -3307,11 +3352,14 @@ function clineUpstreamsRender(id) {
   var probes = data.probes || {}
   var checks = data.checks || {}
   var pins = data.pins || {}
+  /** 每行的渠道顺序，供事件委托按 (行, 列) 反查渠道名——渠道名拼进选择器不安全。 */
+  var badgeRows = []
   var body = models.map(function (m, i) {
     var probe = probes[m] || {}
     var channels = probe.upstreams || []
     var chk = checks[m] || {}
     var pin = pins[m] || {}
+    var excluded = (pin.exclude || []).filter(Boolean)
     var pinned = (pin.upstreams || [])[0] || ''
     var list = channels.slice()
     // 已钉但已从清单消失的渠道也要出现在下拉里，否则一保存就被静默清掉
@@ -3321,38 +3369,89 @@ function clineUpstreamsRender(id) {
       var b = clineUpBadge((chk[c] || {}).status)
       options.push('<option value="' + escapeHtml(c) + '"' + (c === pinned ? ' selected' : '') + '>' + escapeHtml(c) + '（' + b[1] + '）</option>')
     })
-    var badges = channels.length
-      ? channels.map(function (c) {
+    // 徽章即排除开关。已排除但已从清单消失的渠道也排进来，否则用户看不见也改不掉它。
+    var badgeList = channels.concat(excluded.filter(function (c) { return channels.indexOf(c) === -1 }))
+    badgeRows.push({ model: m, channels: badgeList })
+    var badges = badgeList.length
+      ? badgeList.map(function (c, j) {
           var b = clineUpBadge((chk[c] || {}).status)
-          return '<span class="bd ' + b[0] + '" title="' + escapeHtml((chk[c] || {}).note || '尚未校验') + '">' + escapeHtml(c) + ' · ' + b[1] + '</span>'
+          var ex = excluded.indexOf(c) !== -1
+          var note = (chk[c] || {}).note || '尚未校验'
+          var title = (ex ? '已排除：永不路由到该渠道。点击恢复' : '点击排除该渠道（永不使用，其余仍由网关自动选）') + ' · ' + note
+          return '<button type="button" class="bd ' + b[0] + (ex ? ' is-excluded' : '') + '"' +
+            ' data-cu-row="' + i + '" data-cu-ch="' + j + '" title="' + escapeHtml(title) + '"' +
+            ' aria-pressed="' + (ex ? 'true' : 'false') + '">' + escapeHtml(c) + ' · ' + b[1] + '</button>'
         }).join(' ')
       : '<span class="mu">未探测</span>'
+    if (badgeList.length && clineUpExcludeUnresolved(pin, probe)) {
+      badges += '<div class="mu" style="font-size:11px;color:var(--color-danger)">已配排除但渠道清单缺失 → <b>排除暂未生效</b>，请重新探测</div>'
+    }
     var pipe = probe.pipeline && probe.pipeline !== 'unknown' ? probe.pipeline : '—'
-    var modeSel = '<select id="cu-md-' + id + '-' + i + '" aria-label="固定模式">' +
+    var modeSel = '<select id="cu-md-' + id + '-' + i + '" data-cu-row="' + i + '" aria-label="固定模式">' +
       '<option value="strict"' + ((pin.pinMode || 'strict') === 'strict' ? ' selected' : '') + '>严格</option>' +
       '<option value="preferred"' + (pin.pinMode === 'preferred' ? ' selected' : '') + '>优先</option></select>'
-    var sortSel = '<select id="cu-so-' + id + '-' + i + '" aria-label="渠道排序">' +
+    var sortSel = '<select id="cu-so-' + id + '-' + i + '" data-cu-row="' + i + '" aria-label="渠道排序">' +
       '<option value=""' + (!pin.sort ? ' selected' : '') + '>默认</option>' +
       '<option value="cost"' + (pin.sort === 'cost' ? ' selected' : '') + '>成本</option>' +
       '<option value="ttft"' + (pin.sort === 'ttft' ? ' selected' : '') + '>首字</option>' +
       '<option value="tps"' + (pin.sort === 'tps' ? ' selected' : '') + '>吞吐</option></select>'
-    return '<tr><td>' + escapeHtml(m) + '<div class="mu" style="font-size:11px">管道 ' + escapeHtml(pipe) + '</div></td>' +
+    return '<tr><td class="cell-fit">' + escapeHtml(m) + '<div class="mu" style="font-size:11px">管道 ' + escapeHtml(pipe) + '</div></td>' +
       '<td style="white-space:normal">' + badges + '</td>' +
-      '<td><select id="cu-ch-' + id + '-' + i + '" aria-label="固定到哪个渠道">' + options.join('') + '</select></td>' +
-      '<td>' + modeSel + '</td>' +
-      '<td>' + sortSel + '</td>' +
-      '<td><button class="btn btn-gh btn-xs" data-cu-probe="' + i + '" title="重新探测该模型的渠道清单"><i class="fas fa-satellite-dish"></i></button>' +
+      '<td class="cell-fit"><select id="cu-ch-' + id + '-' + i + '" data-cu-row="' + i + '" aria-label="固定到哪个渠道">' + options.join('') + '</select></td>' +
+      '<td class="cell-fit">' + modeSel + '</td>' +
+      '<td class="cell-fit">' + sortSel + '</td>' +
+      '<td class="cell-fit"><button class="btn btn-gh btn-xs" data-cu-probe="' + i + '" title="重新探测该模型的渠道清单"><i class="fas fa-satellite-dish"></i></button>' +
       '<button class="btn btn-gh btn-xs" data-cu-check="' + i + '" title="实测该模型全部渠道的可用性"><i class="fas fa-vial"></i></button></td></tr>'
   }).join('')
   box.innerHTML = '<div style="max-height:320px;overflow:auto"><table class="tbl"><thead><tr>' +
-    '<th>模型</th><th>可用渠道</th><th>固定到</th><th>模式</th><th>排序</th><th>操作</th>' +
+    '<th>模型</th><th>可用渠道（点徽章排除）</th><th>固定到</th><th>模式</th><th>排序</th><th>操作</th>' +
     '</tr></thead><tbody>' + body + '</tbody></table></div>'
-  // 行内按钮用事件委托：模型 ID 含 / 与 . 拼进 onclick 会破坏选择器
+  // 行内控件用事件委托：模型 ID 含 / 与 . 拼进 onclick 会破坏选择器
   Array.prototype.forEach.call(box.querySelectorAll('[data-cu-probe]'), function (btn) {
     btn.onclick = function () { clineUpstreamsProbeOne(id, models[Number(btn.getAttribute('data-cu-probe'))]) }
   })
   Array.prototype.forEach.call(box.querySelectorAll('[data-cu-check]'), function (btn) {
     btn.onclick = function () { clineUpstreamsValidateOne(id, models[Number(btn.getAttribute('data-cu-check'))]) }
+  })
+  Array.prototype.forEach.call(box.querySelectorAll('[data-cu-ch]'), function (btn) {
+    btn.onclick = function () {
+      var row = badgeRows[Number(btn.getAttribute('data-cu-row'))]
+      if (!row) return
+      var ch = row.channels[Number(btn.getAttribute('data-cu-ch'))]
+      if (!ch) return
+      var p = clineUpPin(id, row.model)
+      p.exclude = clineUpExcludeToggle(p.exclude, ch)
+      // 排除优先于固定：刚被排除的渠道不能还留在「固定到」里，否则配置自相矛盾
+      if ((p.upstreams || [])[0] === ch) p.upstreams = []
+      clineUpstreamsRender(id)
+    }
+  })
+  // 三个下拉把改动写回本地状态：否则探测/校验触发的重渲染会把没保存的选择悄悄弹回旧值
+  Array.prototype.forEach.call(box.querySelectorAll('select[id^="cu-ch-"]'), function (sel) {
+    sel.onchange = function () {
+      var m = models[Number(sel.getAttribute('data-cu-row'))]
+      if (!m) return
+      var p = clineUpPin(id, m)
+      p.upstreams = sel.value ? [sel.value] : []
+      // 选了它就说明要用它：同步把它从排除列表里摘掉，避免「既排除又固定」的矛盾配置
+      if (sel.value) p.exclude = (p.exclude || []).filter(function (x) { return x !== sel.value })
+      clineUpstreamsRender(id)
+    }
+  })
+  Array.prototype.forEach.call(box.querySelectorAll('select[id^="cu-md-"]'), function (sel) {
+    sel.onchange = function () {
+      var m = models[Number(sel.getAttribute('data-cu-row'))]
+      if (m) clineUpPin(id, m).pinMode = sel.value
+    }
+  })
+  Array.prototype.forEach.call(box.querySelectorAll('select[id^="cu-so-"]'), function (sel) {
+    sel.onchange = function () {
+      var m = models[Number(sel.getAttribute('data-cu-row'))]
+      if (!m) return
+      var p = clineUpPin(id, m)
+      if (sel.value) p.sort = sel.value
+      else delete p.sort
+    }
   })
 }
 
@@ -3445,10 +3544,16 @@ function clineUpstreamsSave(id) {
     var md = document.getElementById('cu-md-' + id + '-' + i)
     var so = document.getElementById('cu-so-' + id + '-' + i)
     var v = ch ? ch.value : ''
-    if (!v) return
-    var cfg = { upstreams: [v], pinMode: (md && md.value) || 'strict' }
+    var cfg = {}
+    if (v) {
+      cfg.upstreams = [v]
+      cfg.pinMode = (md && md.value) || 'strict'
+    }
     if (so && so.value) cfg.sort = so.value
-    map[m] = cfg
+    // 排除项来自徽章开关（存在本地状态里，见 clineUpPin）：只排除、不固定也是合法配置
+    var exc = (clineUpPin(id, m).exclude || []).filter(Boolean)
+    if (exc.length) cfg.exclude = exc
+    if (cfg.upstreams || cfg.exclude || cfg.sort) map[m] = cfg
   })
   clineUpStatus(id, '保存中…')
   return fetch('/admin/api/providers/' + encodeURIComponent(id), {

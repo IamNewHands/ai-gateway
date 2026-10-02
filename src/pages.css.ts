@@ -545,6 +545,20 @@ label, legend { color: var(--color-ink-2); font-size: var(--text-xs); font-weigh
 .usage-log-table th, .usage-log-table td, .tbl th, .tbl td { min-width: 0; height: 2.75rem; padding: var(--space-2xs) var(--space-sm); border-block-end: .0625rem solid var(--color-rule); text-align: left; white-space: nowrap; }
 .usage-log-table th, .tbl th { background: var(--color-paper-2); color: var(--color-muted); font-weight: 600; }
 .usage-log-table td.numeric, .tbl td.numeric { text-align: right; font-family: var(--font-mono); }
+/* 表格里的下拉（2026-10-06 用户反馈「固定到/模式/排序的字显示不全」）：
+   全局 select{width:100%} 撞上 .tbl td{min-width:0}，在 auto 表格布局里被压到比选中项还窄，
+   选中项直接被裁。两条修复：td.cell-fit 让单元格按内容定宽（width:1% 在 auto 布局 = 收缩到
+   内容），宽度富余量交给会换行的渠道徽章列吸收；select 用 width:auto + min-width:max-content
+   直接声明「不得窄于最宽选项」——不靠 magic number，选项文案变了也不会忽然又被裁。
+   （min-width 只是下限，宽度仍由内容决定，所以不存在反过来撑爆的问题。） */
+.tbl select, .usage-log-table select { width: auto; min-width: max-content; }
+.tbl td.cell-fit, .usage-log-table td.cell-fit { width: 1%; white-space: nowrap; }
+/* 渠道徽章可点选（点 = 排除/恢复）：排除态划线变淡，与「状态徽章」区分开。
+   用 button 而不是 span 是为了键盘可达（span 不可聚焦）。
+   只重置 border / 字族：font 简写会把 .bd 的字号与字重一起打掉。 */
+button.bd { border: 0; font-family: inherit; cursor: pointer; }
+button.bd:hover { filter: brightness(.96); }
+button.bd.is-excluded { opacity: .45; text-decoration: line-through; }
 .usage-log-table code { font-size: var(--text-xs); }
 .usage-log-cards { display: none; }
 .analytics-log-filters, .syslog-filters { display: grid; grid-template-columns: minmax(0, 1fr); gap: var(--space-2xs); margin-block: var(--space-sm); padding: var(--space-sm); border: .0625rem solid var(--color-rule); border-radius: var(--radius-control); background: var(--color-paper-2); }

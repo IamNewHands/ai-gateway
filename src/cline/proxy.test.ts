@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
-import { parseCooldownMs, fetchClineModels, isRunawayReasoningCutoff, isDegenerateReasoningDeltas, isWhitespaceOnlyReasoningDelta, normalizeReasoningDeltaForUI, pumpStreamAttempt, sanitizeClineMessages, isFreeClineModel, buildUpstreamBody, injectClineUpstreamPrefs, clineMaxOutputLimit, clineMaxTokensClamp, proxyClineChatRequest, __resetClineCatalogCacheForTests, CLINE_MAX_TOKENS, CLINE_FREE_WHITELIST, CLINE_CHAT_CONNECT_TIMEOUT_MS, CLINE_MAX_TRANSPORT_ATTEMPTS, CLINE_PROBE_MAX_MS, CLINE_KEEPALIVE_MS, DEFAULT_MODEL } from './proxy'
+import { parseCooldownMs, fetchClineModels, isRunawayReasoningCutoff, isDegenerateReasoningDeltas, isWhitespaceOnlyReasoningDelta, normalizeReasoningDeltaForUI, pumpStreamAttempt, sanitizeClineMessages, isFreeClineModel, buildUpstreamBody, injectClineUpstreamPrefs, clinePinDecision, clinePinDecisionText, shouldLogClinePin, __resetClinePinLogForTests, clineMaxOutputLimit, clineMaxTokensClamp, proxyClineChatRequest, __resetClineCatalogCacheForTests, CLINE_MAX_TOKENS, CLINE_FREE_WHITELIST, CLINE_CHAT_CONNECT_TIMEOUT_MS, CLINE_MAX_TRANSPORT_ATTEMPTS, CLINE_PROBE_MAX_MS, CLINE_KEEPALIVE_MS, DEFAULT_MODEL } from './proxy'
 import type { Provider } from '../types'
 
 /** 读取一个 Response 的完整文本（用于流式结果断言）。 */
@@ -711,6 +711,112 @@ describe('injectClineUpstreamPrefs：上游渠道钉住双注入', () => {
   })
 })
 
+// ---------------------------------------------------------------------------
+// exclude（排除渠道）：网关两侧都不认 exclude/ignore 字段（源项目实测被静默忽略，
+// 见 _port-analysis/src/cps/server.js:465），所以排除必须结合渠道清单换算成显式 only 白名单。
+// 主要用法是「不固定 + 排除几个常年限流的坏渠道」——单纯白名单在渠道清单变化后要重新勾一遍。
+// ---------------------------------------------------------------------------
+describe('injectClineUpstreamPrefs：exclude 换算 only 白名单', () => {
+  const KNOWN = ['alibaba', 'baseten', 'novita', 'wafer']
+
+  it('只配排除、不钉渠道 → 两侧 only = 已知清单 − 排除', () => {
+    const body = injectClineUpstreamPrefs({}, { exclude: ['wafer'] }, KNOWN)
+    const expectOnly = ['alibaba', 'baseten', 'novita']
+    expect((body.providerOptions as any).gateway).toEqual({ only: expectOnly })
+    expect(body.provider).toEqual({ only: expectOnly })
+    expect(clinePinDecision(body)).toMatchObject({ applied: true, only: expectOnly, order: [], excludeUnresolved: false })
+  })
+
+  it('排除优先于固定：同时出现在 upstreams 与 exclude 的渠道从候选里剔除', () => {
+    const body = injectClineUpstreamPrefs(
+      {},
+      { upstreams: ['wafer', 'alibaba'], pinMode: 'preferred', exclude: ['wafer'] },
+      KNOWN
+    )
+    expect((body.provider as any).order).toEqual(['alibaba'])
+  })
+
+  it('preferred + 排除 → order 给优先序，同时 only 圈住范围（否则兜底仍会落到被排除渠道）', () => {
+    const body = injectClineUpstreamPrefs({}, { upstreams: ['alibaba'], pinMode: 'preferred', exclude: ['wafer'] }, KNOWN)
+    const gw = (body.providerOptions as any).gateway
+    expect(gw.order).toEqual(['alibaba'])
+    expect(gw.only).toEqual(['alibaba', 'baseten', 'novita'])
+  })
+
+  it('strict + 排除 → 只写 only=[主渠道]，不再叠加白名单（strict 本身已排除其它一切）', () => {
+    const body = injectClineUpstreamPrefs({}, { upstreams: ['alibaba'], pinMode: 'strict', exclude: ['wafer'] }, KNOWN)
+    expect((body.providerOptions as any).gateway).toEqual({ only: ['alibaba'] })
+    expect(body.provider).toEqual({ only: ['alibaba'] })
+  })
+
+  it('渠道清单缺失 → 不下发任何偏好，但必须留下 exclude-unresolved 标记（不许假装排除生效）', () => {
+    const body = injectClineUpstreamPrefs({ model: 'm' }, { exclude: ['wafer'] }, [])
+    expect(body).not.toHaveProperty('provider')
+    expect(body).not.toHaveProperty('providerOptions')
+    expect(clinePinDecision(body)).toMatchObject({ applied: false, excludeUnresolved: true })
+  })
+
+  it('钉住的渠道已不在清单里 → only 必须含它，不能下发 order/only 自相矛盾的偏好', () => {
+    const body = injectClineUpstreamPrefs(
+      {},
+      { upstreams: ['gone'], pinMode: 'preferred', exclude: ['wafer'] },
+      KNOWN
+    )
+    expect((body.provider as any).only).toEqual(['gone', 'alibaba', 'baseten', 'novita'])
+  })
+
+  it('排除掉全部已知渠道 → 白名单为空按未配置处理（退回网关自动选，不下发空 only）', () => {
+    const body = injectClineUpstreamPrefs({ model: 'm' }, { exclude: KNOWN }, KNOWN)
+    expect(body).not.toHaveProperty('providerOptions')
+    expect(body).not.toHaveProperty('provider')
+    // 清单是有的，所以这不是「清单缺失」——只是排到最后没人可选了，不该报成解析失败
+    expect(clinePinDecision(body)?.excludeUnresolved).toBe(false)
+  })
+
+  it('什么都没配 → 不挂决策摘要（调用方据此不写日志，空配置不产生噪声）', () => {
+    expect(clinePinDecision(injectClineUpstreamPrefs({ model: 'm' }, {}))).toBeNull()
+  })
+
+  it('exclude 与 upstreams 一样做 trim/去重/丢空值', () => {
+    const body = injectClineUpstreamPrefs({}, { exclude: [' wafer ', 'wafer', ''] }, KNOWN)
+    expect((body.provider as any).only).toEqual(['alibaba', 'baseten', 'novita'])
+  })
+
+  it('决策摘要不参与序列化（不能把它当字段发给上游）', () => {
+    const body = injectClineUpstreamPrefs({}, { exclude: ['wafer'] }, KNOWN)
+    expect(JSON.parse(JSON.stringify(body))).not.toHaveProperty('__clinePinDecision')
+    expect(clinePinDecision(body)).not.toBeNull()
+  })
+
+  it('归因文案写的是**实际下发内容**，而不是配置回显', () => {
+    const body = injectClineUpstreamPrefs({}, { upstreams: ['alibaba'], pinMode: 'preferred', exclude: ['wafer'] }, KNOWN)
+    const text = clinePinDecisionText(clinePinDecision(body)!)
+    expect(text).toContain('applied=1')
+    expect(text).toContain('order=[alibaba]')
+    expect(text).toContain('only=[alibaba,baseten,novita]')
+    expect(text).not.toContain('exclude-unresolved')
+
+    const unresolved = clinePinDecision(injectClineUpstreamPrefs({}, { exclude: ['wafer'] }, []))!
+    expect(clinePinDecisionText(unresolved)).toContain('exclude-unresolved')
+    expect(clinePinDecisionText(unresolved)).toContain('applied=0')
+  })
+})
+
+describe('渠道钉住归因日志的去重窗口', () => {
+  beforeEach(() => __resetClinePinLogForTests())
+
+  it('同一决定 5 分钟内只落一次；窗口到点或决定变化立刻再落', () => {
+    const T0 = 1_000_000
+    expect(shouldLogClinePin('cline|m|only=[a]', T0)).toBe(true)
+    expect(shouldLogClinePin('cline|m|only=[a]', T0 + 60_000)).toBe(false)
+    expect(shouldLogClinePin('cline|m|only=[a]', T0 + 5 * 60_000)).toBe(true)
+    // 决定了变（改配置 / 换了清单）→ 立刻留痕，不受上一个窗口压制
+    expect(shouldLogClinePin('cline|m|only=[b]', T0 + 60_000)).toBe(true)
+    // 不同模型/提供商各自计时
+    expect(shouldLogClinePin('cline|m2|only=[a]', T0 + 60_000)).toBe(true)
+  })
+})
+
 describe('渠道钉住接线（buildUpstreamBody 第 5 参）', () => {
   const freeSet = new Set([DEFAULT_MODEL])
 
@@ -758,6 +864,96 @@ describe('渠道钉住接线（buildUpstreamBody 第 5 参）', () => {
     )
     expect(body.provider).toEqual({ only: ['baseten'] })
   })
+
+  it('第 6 参（渠道清单）喂给 exclude 换算，不传则排除不生效', () => {
+    const withKnown = buildUpstreamBody(
+      { model: PAID_MODEL }, true, 's1', freeSet,
+      { exclude: ['baseten'] }, ['alibaba', 'baseten']
+    )
+    expect((withKnown.providerOptions as any).gateway.only).toEqual(['alibaba'])
+
+    const noKnown = buildUpstreamBody({ model: PAID_MODEL }, true, 's1', freeSet, { exclude: ['baseten'] })
+    expect(noKnown).not.toHaveProperty('providerOptions')
+    expect(clinePinDecision(noKnown)?.excludeUnresolved).toBe(true)
+  })
+})
+
+// exclude 的整条链路：请求路径按需从 KV 渠道清单换算 only，并在**请求真正发出去之前**把
+// 「被钉到哪」落进 KV 系统日志（面板可搜 [cline-pin]）。没有这条测试，热路径的接线（读清单、
+// 传第 6 参、写日志）任何一环掉了都不会有人发现——而面板上看起来一切正常。
+describe('exclude 端到端：读留档清单 → 换算 only → 落归因日志', () => {
+  const MODEL = 'z-ai/glm-5.3-flash'
+  const CHANNELS = ['alibaba', 'baseten', 'novita']
+
+  function seededEnv(providerId: string) {
+    const puts: Array<{ key: string; value: string }> = []
+    const cache = JSON.stringify({
+      probes: { [MODEL]: { model: MODEL, ok: true, pipeline: 'planner', upstreams: CHANNELS, status: 400, note: '', ms: 1, probedAt: 1 } },
+      checks: {}, updatedAt: 1,
+    })
+    const env = {
+      KV: {
+        get: async (key: string) => (key === 'cline:upstreams:' + providerId ? cache : null),
+        put: async (key: string, value: string) => { puts.push({ key, value }) },
+      },
+    }
+    return { env, puts }
+  }
+
+  it('上游收到的 only 已扣掉被排除渠道，且 KV 日志里留下 info 级 [cline-pin]', async () => {
+    __resetClinePinLogForTests()
+    const provider = clineProvider([REFRESH_TOKEN])
+    provider.clinePinByModel = { [MODEL]: { exclude: ['baseten'] } }
+    const { env, puts } = seededEnv(provider.id)
+    const { bodies } = installFetch(() => sseOkResp())
+
+    const resp = await proxyClineChatRequest(
+      env,
+      provider,
+      { model: MODEL, messages: [{ role: 'user', content: 'hi' }] },
+      { stream: true }
+    )
+    expect(resp.status).toBe(200)
+    await resp.text()
+
+    // 上游请求体：排除已换算成白名单（网关不认 exclude 字段，不换算等于没排除）
+    expect((bodies[0].provider as { only: string[] }).only).toEqual(['alibaba', 'novita'])
+    expect((bodies[0].providerOptions as { gateway: { only: string[] } }).gateway.only).toEqual(['alibaba', 'novita'])
+    expect(JSON.stringify(bodies[0])).not.toContain('exclude')
+
+    const logs = puts.filter((p) => p.key.startsWith('log:')).map((p) => JSON.parse(p.value) as { type: string; message: string })
+    const pin = logs.filter((l) => l.message.includes('[cline-pin]'))
+    expect(pin).toHaveLength(1)
+    // 正常路径不许伪装成告警：warn 计数留给真正的故障
+    expect(pin[0].type).toBe('info')
+    expect(pin[0].message).toContain('only=[alibaba,novita]')
+  }, 20000)
+
+  it('没配 exclude → 不读渠道清单（热路径零额外 KV 读），但归因日志照旧', async () => {
+    __resetClinePinLogForTests()
+    const provider = clineProvider([REFRESH_TOKEN])
+    provider.clinePinByModel = { [MODEL]: { upstreams: ['alibaba'] } }
+    const reads: string[] = []
+    const puts: Array<{ key: string; value: string }> = []
+    const env = {
+      KV: {
+        get: async (key: string) => { reads.push(key); return null },
+        put: async (key: string, value: string) => { puts.push({ key, value }) },
+      },
+    }
+    installFetch(() => sseOkResp())
+    const resp = await proxyClineChatRequest(
+      env, provider, { model: MODEL, messages: [{ role: 'user', content: 'hi' }] }, { stream: true }
+    )
+    await resp.text()
+    // 没有 exclude 就不该为换算去读留档：那是每条请求都要付的成本
+    expect(reads.some((k) => k.startsWith('cline:upstreams:'))).toBe(false)
+    // 但钉住的归因仍然要能查到（只固定、未排除的配置同样需要「到底下发没下发」的证据）
+    const pin = puts.map((p) => p.value).filter((v) => v.includes('[cline-pin]'))
+    expect(pin).toHaveLength(1)
+    expect(pin[0]).toContain('only=[alibaba]')
+    expect(pin[0]).toContain('"type":"info"')
+  }, 20000)
 })
 
 // 输出预算的模型级硬上限（2026-10-05，移植 luawei1/cline2api `3f72255`）：

@@ -146,7 +146,7 @@ function clineUpApi(html: string): any {
   const js = inlineScripts(html).join('\n')
   const m = js.match(/\/\* CLINE_UP_BEGIN \*\/([\s\S]*?)\/\* CLINE_UP_END \*\//)
   if (!m) throw new Error('未找到 CLINE_UP 标记块：客户端渠道映射块被删除或改名了？')
-  const factory = new Function(m[1] + '\nreturn { clineUpBadge, clineUpCostText, clineUpPinSummary }')
+  const factory = new Function(m[1] + '\nreturn { clineUpBadge, clineUpCostText, clineUpPinSummary, clineUpExcludeToggle, clineUpExcludeUnresolved }')
   return factory()
 }
 
@@ -178,6 +178,46 @@ describe('Cline 面板「上游渠道与固定」客户端映射', () => {
     expect(api.clineUpPinSummary({ upstreams: ['alibaba'] })).toBe('alibaba（严格）')
     expect(api.clineUpPinSummary({ upstreams: ['alibaba'], pinMode: 'preferred' })).toBe('alibaba（优先）')
     expect(api.clineUpPinSummary({ upstreams: ['alibaba'], pinMode: 'strict', sort: 'cost' })).toBe('alibaba（严格） · cost')
+  })
+
+  it('固定摘要必须回显排除项（否则用户改完排除会以为没保存上）', async () => {
+    const api = clineUpApi(await render([traeProvider()]))
+    expect(api.clineUpPinSummary({ exclude: ['wafer', 'novita'] })).toBe('不固定 · 排除 2 个')
+    expect(api.clineUpPinSummary({ upstreams: ['alibaba'], exclude: ['wafer'] })).toBe('alibaba（严格） · 排除 1 个')
+    // 与后端同口径：exclude 优先于 upstreams —— 同一个渠道既固定又排除时，固定作废
+    expect(api.clineUpPinSummary({ upstreams: ['wafer'], exclude: ['wafer'] })).toBe('不固定 · 排除 1 个')
+  })
+
+  it('点击徽章 = 切换排除（返回新数组，不改入参）', async () => {
+    const api = clineUpApi(await render([traeProvider()]))
+    const src = ['a']
+    expect(api.clineUpExcludeToggle(src, 'b')).toEqual(['a', 'b'])
+    expect(api.clineUpExcludeToggle(src, 'a')).toEqual([])
+    expect(api.clineUpExcludeToggle(undefined, 'a')).toEqual(['a'])
+    expect(src).toEqual(['a'])
+  })
+
+  it('「配了排除但清单缺失 → 排除未生效」必须能在面板上标出来（留档 7 天过期就属于这种）', async () => {
+    const api = clineUpApi(await render([traeProvider()]))
+    expect(api.clineUpExcludeUnresolved({ exclude: ['wafer'] }, { upstreams: ['alibaba'] })).toBe(false)
+    expect(api.clineUpExcludeUnresolved({ exclude: ['wafer'] }, { upstreams: [] })).toBe(true)
+    expect(api.clineUpExcludeUnresolved({ exclude: ['wafer'] }, undefined)).toBe(true)
+    // 没配排除就不该报警
+    expect(api.clineUpExcludeUnresolved({ upstreams: ['alibaba'] }, { upstreams: [] })).toBe(false)
+    expect(api.clineUpExcludeUnresolved(null, {})).toBe(false)
+  })
+
+  // 2026-10-06 用户反馈：「固定到 / 模式 / 排序 三个字段选字框里字显示不全」。
+  // 根因是全局 select{width:100%} 撞上 .tbl td{min-width:0}，在 auto 表格布局里被压到比选中项还窄。
+  it('面板表格里的下拉按内容自适应，且控件列按内容定宽（否则选中项又被裁）', async () => {
+    const html = await render([traeProvider()])
+    const js = inlineScripts(html).join('\n')
+    expect(html).toMatch(/\.tbl select[^{]*\{[^}]*width:\s*auto/)
+    expect(html).toMatch(/\.tbl td\.cell-fit[^{]*\{[^}]*width:\s*1%/)
+    // 规则不能是死的：模型行里的控件单元格都得带上 cell-fit（5 列：模型/固定到/模式/排序/操作）
+    expect((js.match(/class="cell-fit"/g) || []).length).toBeGreaterThanOrEqual(5)
+    // 渠道徽章改成可点的按钮后，排除态样式也得在（否则看不出哪个被排除了）
+    expect(html).toMatch(/button\.bd\.is-excluded[^{]*\{[^}]*text-decoration:\s*line-through/)
   })
 })
 

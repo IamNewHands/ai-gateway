@@ -234,23 +234,28 @@ function normalizeReasoningEffortByModel(value: unknown): Record<string, string>
 
 /**
  * 归一 Cline 上游钉住表（移植 cline-pass-switcher）：丢弃非法 pinMode/sort 与空 key，
- * `upstreams` 只留非空字符串并去重；既无渠道又无排序的空配置不落库。
+ * `upstreams` / `exclude` 只留非空字符串并去重；三项都空的配置不落库。
  * 无有效项返回 undefined（= 完全注入，回落网关自动选渠道）。
  */
-function normalizeClinePinByModel(value: unknown): Record<string, ClinePinConfig> | undefined {
+export function normalizeClinePinByModel(value: unknown): Record<string, ClinePinConfig> | undefined {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined
+  const clean = (raw: unknown) =>
+    Array.isArray(raw)
+      ? [...new Set(raw.filter((u) => typeof u === 'string' && u.trim() !== '').map((u) => String(u).trim()))]
+      : []
   const out: Record<string, ClinePinConfig> = {}
   for (const [model, raw] of Object.entries(value as Record<string, unknown>)) {
     if (!model || !raw || typeof raw !== 'object' || Array.isArray(raw)) continue
     const cfg = raw as Record<string, unknown>
-    const upstreams = Array.isArray(cfg.upstreams)
-      ? [...new Set(cfg.upstreams.filter((u) => typeof u === 'string' && u.trim() !== '').map((u) => String(u).trim()))]
-      : []
+    const upstreams = clean(cfg.upstreams)
+    const exclude = clean(cfg.exclude)
     const pinMode = cfg.pinMode === 'preferred' ? 'preferred' : cfg.pinMode === 'strict' ? 'strict' : undefined
     const sort = cfg.sort === 'cost' || cfg.sort === 'ttft' || cfg.sort === 'tps' ? cfg.sort : undefined
-    if (upstreams.length === 0 && !sort) continue
+    if (upstreams.length === 0 && exclude.length === 0 && !sort) continue
     const entry: ClinePinConfig = {}
     if (upstreams.length > 0) entry.upstreams = upstreams
+    // exclude 单独存在也合法：只否决坏渠道、其余交给网关自动选，是这个字段的主要用法
+    if (exclude.length > 0) entry.exclude = exclude
     if (pinMode) entry.pinMode = pinMode
     if (sort) entry.sort = sort
     out[model] = entry

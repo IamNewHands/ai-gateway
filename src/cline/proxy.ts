@@ -757,32 +757,103 @@ export function sanitizeClineMessages(messages: unknown): unknown {
 const CLINE_OR_SORT: Record<string, string> = { cost: 'price', ttft: 'latency', tps: 'throughput' }
 
 /**
+ * 一次注入的**实际下发内容**（不是配置回显：`exclude` 已换算成白名单、`exclude` 与 `upstreams`
+ * 冲突已裁决）。挂在出站 body 的不可枚举属性上供归因日志与测试读取，不发给上游。
+ * 为什么需要它：`[cline-pin]` 日志必须回答「这条请求被钉到哪」，而配置里写的东西与
+ * 实际下发的东西在 exclude 场景下并不相同（清单缺失时排除根本没生效）。
+ */
+export interface ClinePinDecision {
+  /** 是否真的改写了路由偏好；false = 本请求仍按网关自动选渠道 */
+  applied: boolean
+  /** 实际下发到 order 的优先序列（空数组 = 未下发 order） */
+  order: string[]
+  /** 实际下发到 only 的白名单（空数组 = 未下发 only） */
+  only: string[]
+  /** 实际下发的排序偏好（Vercel 枚举；OpenRouter 侧另有映射） */
+  sort: string | null
+  /** exclude 已配置但渠道清单缺失 → **排除未生效**，必须能在日志里一眼看出 */
+  excludeUnresolved: boolean
+}
+
+const CLINE_PIN_DECISION_KEY = '__clinePinDecision'
+
+/** 读取注入器贴在出站 body 上的决策摘要（未配置 pin 时为 null）。 */
+export function clinePinDecision(body: Record<string, unknown>): ClinePinDecision | null {
+  const v = (body as Record<string, unknown>)[CLINE_PIN_DECISION_KEY]
+  return v && typeof v === 'object' ? (v as ClinePinDecision) : null
+}
+
+/** 决策摘要的单行文案（归因日志用；面板侧文案在 pages.ts，两处口径由测试各自钉住）。 */
+export function clinePinDecisionText(d: ClinePinDecision): string {
+  const parts = [`applied=${d.applied ? 1 : 0}`]
+  if (d.only.length) parts.push(`only=[${d.only.join(',')}]`)
+  if (d.order.length) parts.push(`order=[${d.order.join(',')}]`)
+  if (d.sort) parts.push(`sort=${d.sort}`)
+  if (d.excludeUnresolved) parts.push('exclude-unresolved（渠道清单缺失，排除未生效）')
+  return parts.join(' ')
+}
+
+function attachPinDecision(body: Record<string, unknown>, decision: ClinePinDecision): void {
+  Object.defineProperty(body, CLINE_PIN_DECISION_KEY, { value: decision, enumerable: false })
+}
+
+/**
  * 把渠道钉住偏好注入出站请求体。**原地改 `body` 并返回同一个对象**：
  * `buildUpstreamBody` 把 max_tokens 封顶事实挂在**不可枚举**属性 `__maxTokensClamp` 上，
  * 换成 spread 复制会把它丢掉，响应侧的 `X-Cline-Max-Tokens-Clamped` 归因头随之失效。
  *
  * @param pin 该模型的钉住配置；未配置 / 空配置时**零改动**（保持网关自动选渠道）
+ * @param knownUpstreams 该模型已知的渠道清单（探测留档）。**只有配了 `exclude` 时才需要**：
+ *   网关两侧都不认 exclude/ignore 字段（源项目实测被静默忽略），排除只能换算成显式 `only`
+ *   白名单，而白名单必须从已知清单里减出来。
  */
 export function injectClineUpstreamPrefs(
   body: Record<string, unknown>,
-  pin?: ClinePinConfig | null
+  pin?: ClinePinConfig | null,
+  knownUpstreams: string[] = []
 ): Record<string, unknown> {
-  const raw = pin && Array.isArray(pin.upstreams) ? pin.upstreams : []
-  const list = [...new Set(raw.filter((u) => typeof u === 'string' && u.trim() !== '').map((u) => u.trim()))]
-  const strict = (pin?.pinMode || 'strict') === 'strict'
-  const sort = pin?.sort
-  if (list.length === 0 && !sort) return body
-
+  if (!pin || typeof pin !== 'object') return body
+  const norm = (raw: unknown) =>
+    Array.isArray(raw)
+      ? [...new Set(raw.filter((u) => typeof u === 'string' && u.trim() !== '').map((u) => u.trim()))]
+      : []
+  const veto = norm(pin.exclude)
+  const vetoSet = new Set(veto)
+  // exclude 否决一切：与 upstreams 同时出现时，被排除的渠道直接从候选序列里去掉（源项目口径
+  // buildAttempts: wanted = listed.filter(u => !excl.has(u))），而不是留下一份自相矛盾的配置。
+  const list = norm(pin.upstreams).filter((u) => !vetoSet.has(u))
+  const strict = (pin.pinMode || 'strict') === 'strict'
+  const sort = pin.sort
+  const known = norm(knownUpstreams)
+  // 清单缺失时 allowList 置空：**不假装排除生效**（宁可退回网关自动选，也不能谎报"已排除"）。
+  const allowList = veto.length && known.length ? known.filter((u) => !vetoSet.has(u)) : []
+  const excludeUnresolved = veto.length > 0 && known.length === 0
   const primary = list[0]
   const rest = list.slice(1)
+  // 钉住的渠道可能已不在清单里（渠道下架 / 留档过期），此时 only 白名单必须先把它算进去，
+  // 否则 order 与 only 互相矛盾（order 要它、only 不要它），网关行为未定义。
+  if (primary && allowList.length && !allowList.includes(primary)) allowList.unshift(primary)
+  const decision: ClinePinDecision = {
+    applied: false, order: [], only: [], sort: sort || null, excludeUnresolved,
+  }
+  // 真正「什么都没配」时不留决策摘要：调用方据此判定该不该写归因日志（空配置不产生日志噪声）。
+  if (!veto.length && !list.length && !sort) return body
+  if (!primary && !sort && allowList.length === 0) {
+    attachPinDecision(body, decision)
+    return body
+  }
 
   // 规划器管道（Vercel AI Gateway）
   const gw: Record<string, unknown> = {}
   // strict → only（回退被清空）；preferred → order（保留网关兜底，单渠道也用 order，与源项目一致）
   if (primary) {
     if (strict) gw.only = [primary]
-    else gw.order = [primary, ...rest]
-  }
+    else {
+      gw.order = [primary, ...rest]
+      // preferred 只给 order 的话，网关兜底仍可能落到被排除的渠道 → 必须同时用 only 圈定范围
+      if (allowList.length) gw.only = allowList
+    }
+  } else if (allowList.length) gw.only = allowList
   if (sort) gw.sort = sort
   if (Object.keys(gw).length > 0) {
     const prev = (body.providerOptions as Record<string, unknown> | undefined) || {}
@@ -794,13 +865,21 @@ export function injectClineUpstreamPrefs(
   const or: Record<string, unknown> = {}
   if (primary) {
     if (strict) or.only = [primary]
-    else or.order = [primary, ...rest]
-  }
+    else {
+      or.order = [primary, ...rest]
+      if (allowList.length) or.only = allowList
+    }
+  } else if (allowList.length) or.only = allowList
   if (sort) or.sort = CLINE_OR_SORT[sort] || sort
   if (Object.keys(or).length > 0) {
     const prev = (body.provider as Record<string, unknown> | undefined) || {}
     body.provider = { ...prev, ...or }
   }
+
+  decision.applied = Object.keys(gw).length > 0 || Object.keys(or).length > 0
+  decision.only = Array.isArray(gw.only) ? (gw.only as string[]).slice() : []
+  decision.order = Array.isArray(gw.order) ? (gw.order as string[]).slice() : []
+  attachPinDecision(body, decision)
   return body
 }
 
@@ -809,7 +888,8 @@ export function buildUpstreamBody(
   isStream: boolean,
   sessionId: string,
   freeSet?: Set<string>,
-  pin?: ClinePinConfig | null
+  pin?: ClinePinConfig | null,
+  knownUpstreams?: string[]
 ): Record<string, unknown> {
   const model = (forwardBody.model as string) || DEFAULT_MODEL
   const body: Record<string, unknown> = {
@@ -856,7 +936,7 @@ export function buildUpstreamBody(
   // 渠道钉住放最后：必须在 `__maxTokensClamp` defineProperty 之后，且只能原地改（见函数注释）。
   // 客户端自带的 provider / providerOptions 不参与透传（不在 passthrough 清单里），
   // 出站路由偏好**只由网关配置决定**，避免客户端绕过钉住。
-  injectClineUpstreamPrefs(body, pin)
+  injectClineUpstreamPrefs(body, pin, knownUpstreams)
   return body
 }
 
@@ -1352,6 +1432,53 @@ async function logClineAttempt(env: Env | undefined, message: string, details?: 
 }
 
 /**
+ * 渠道钉住归因日志：把「这条请求被钉到哪」同时写 console 与 KV 系统日志（面板里搜 `[cline-pin]`）。
+ *
+ * 为什么必须落 KV：钉住是否生效**只能从日志看出来**——出站请求体是网关拼的，客户端看不到；
+ * console 只在 CF 仪表盘可见，用户面板里查不到（与 `[cline-attempt]` 同一动机，见上）。
+ *
+ * 为什么用 info 而不是 warn（2026-10-06）：钉住是**配置驱动的正常行为**，不是告警。走 warn 出口
+ * 会让「系统日志」的 warn 计数被正常流量灌满，真正的告警被淹没。
+ *
+ * 为什么按 (提供商, 模型, 决定内容) 做 5 分钟去重：配置不变时同模型的决定恒定不变，逐请求落盘
+ * 只会刷满日志（面板按 KV 键名分页，噪声会挤掉真正的错误行）。决定一变（改配置/清单变化）立刻
+ * 留痕。与 `logClineAttempt` 不同——那条是异常路径，逐次必落。
+ */
+const CLINE_PIN_LOG_WINDOW_MS = 5 * 60 * 1000
+const clinePinLoggedAt = new Map<string, number>()
+
+/** 去重判定（导出以便单测直接钉住"5 分钟内不重复落盘、决定变化立刻落盘"）。 */
+export function shouldLogClinePin(key: string, now = Date.now()): boolean {
+  const last = clinePinLoggedAt.get(key)
+  if (last !== undefined && now - last < CLINE_PIN_LOG_WINDOW_MS) return false
+  // isolate 长活时键数受 (提供商 × 模型 × 决定) 组合数限制，但仍加一道上界防无界增长
+  if (clinePinLoggedAt.size > 200) clinePinLoggedAt.clear()
+  clinePinLoggedAt.set(key, now)
+  return true
+}
+
+/** 仅供测试：清空去重窗口，避免用例间互相影响。 */
+export function __resetClinePinLogForTests(): void {
+  clinePinLoggedAt.clear()
+}
+
+async function logClinePinDecision(
+  env: Env | undefined,
+  providerId: string,
+  model: string,
+  decision: ClinePinDecision
+): Promise<void> {
+  const text = clinePinDecisionText(decision)
+  if (!shouldLogClinePin(`${providerId}|${model}|${text}`)) return
+  const line = `[cline-pin] ${providerId} model=${model} ${text}`
+  console.log(line)
+  if (!env?.KV) return
+  try {
+    await writeLog(env, 'info', line)
+  } catch { /* 日志失败不影响响应 */ }
+}
+
+/**
  * 流式转发（带推理空转防护）：最多 3 次尝试，退化/空响应冷却切号重试；
  * 全部失败时返回 502 错误 JSON（客户端按错误处理，可自行重试）。
  */
@@ -1664,15 +1791,17 @@ export async function proxyClineChatRequest(
   // 上游恒定强制流式（item4）：免费通道非流式返回 500 "empty response content"，
   // 统一以流式取数，客户端要非流式时再聚合成 chat.completion。
   // 渠道钉住按**点名模型**取配置：本仓不做模型级替换，所以这里的 model 就是发给上游的 model。
-  const pin = provider.clinePinByModel?.[model] || null
-  const body = buildUpstreamBody({ ...forwardBody, model }, true, sessionId, freeSet, pin)
+  const pinCfg = provider.clinePinByModel?.[model] || null
+  // `exclude` 只能换算成 only 白名单（网关两侧都不认 exclude/ignore 字段），换算要用该模型的
+  // 渠道清单；没配 exclude 时**不读 KV**，热路径零额外开销。清单读不到时排除不会生效，
+  // 但会由归因日志的 exclude-unresolved 标记出来（见 logClinePinDecision）。
+  const knownUpstreams = pinCfg?.exclude?.length
+    ? (await readClineUpstreamCache(_env as Env | undefined, provider.id)).probes[model]?.upstreams || []
+    : []
+  const body = buildUpstreamBody({ ...forwardBody, model }, true, sessionId, freeSet, pinCfg, knownUpstreams)
   // 归因：钉住是配置驱动的路由改写，出问题时必须能一眼看出「这条请求被谁钉到哪」。
-  if (pin && ((pin.upstreams?.length ?? 0) > 0 || pin.sort)) {
-    console.log(
-      `[cline-pin] model=${model} mode=${pin.pinMode || 'strict'} ` +
-        `upstreams=[${(pin.upstreams || []).join(',')}] sort=${pin.sort || '-'}`
-    )
-  }
+  const pinDecision = clinePinDecision(body)
+  if (pinDecision) await logClinePinDecision(_env as Env | undefined, provider.id, model, pinDecision)
   try {
     const resp = wantStream
       ? await proxyStreamChat(pool, body, sessionId, opts?.signal, _env as Env | undefined)
