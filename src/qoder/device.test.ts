@@ -9,17 +9,20 @@
  * 这里逐条钉住，并覆盖「粘贴 config.json → 保存 → 出站头」的完整链路。
  */
 import { describe, it, expect, vi, afterEach } from 'vitest'
+import type { Context } from 'hono'
 import {
   QODER_DEVICE_FIELDS,
   normalizeQoderDevice,
   hasQoderDevice,
+  hasAnyNonEmptyStringValue,
   getQoderDevice,
   getQoderDeviceConfig,
   setQoderDevice,
 } from './device'
 import { KV_KEYS } from '../config'
 import { QODER_DESKTOP_DEFAULTS, performQoderCheckin, type QoderDeviceIdentity } from './billing'
-import type { Env } from '../types'
+import { handleSetQoderDevice } from '../admin'
+import type { AppEnv, Env } from '../types'
 
 /** 假 KV：`get(k, 'json')` 与真 KV 同行为——内容不是合法 JSON 时**抛异常**（不是返回 null）。 */
 function makeEnv(seed: Record<string, string> = {}) {
@@ -135,6 +138,75 @@ describe('getQoderDevice：全空回退 uid 派生路径；脏数据不炸', () 
     expect(hasQoderDevice({})).toBe(false)
     expect(hasQoderDevice({ machineToken: '' })).toBe(false)
     expect(hasQoderDevice({ machineToken: 'tok' })).toBe(true)
+  })
+
+  it('hasAnyNonEmptyStringValue：只有「非空字符串值」才算（用于识别键名不匹配）', () => {
+    expect(hasAnyNonEmptyStringValue({ a: 'x' })).toBe(true)
+    expect(hasAnyNonEmptyStringValue({ a: '   ' })).toBe(false)
+    expect(hasAnyNonEmptyStringValue({ a: '' })).toBe(false)
+    expect(hasAnyNonEmptyStringValue({ a: 1, b: true, c: null })).toBe(false)
+    expect(hasAnyNonEmptyStringValue({})).toBe(false)
+    expect(hasAnyNonEmptyStringValue(null)).toBe(false)
+    expect(hasAnyNonEmptyStringValue('str')).toBe(false)
+    expect(hasAnyNonEmptyStringValue(['x'])).toBe(false)
+  })
+})
+
+/**
+ * 保存接口的键名守卫（2026-10-02 真实事故的防线）。
+ *
+ * 事故：面板客户端把键名归一成了全小写（clienttype），后端只认 camelCase 已知键 →
+ * 整包被丢弃 → setQoderDevice 判定「全空」而**删掉 KV**，把已配好的真机身份一起清掉，
+ * 而且不报任何错（用户只看到「保存后一片空白」）。现在这种请求必须在 400 上被挡住。
+ */
+describe('PUT /admin/api/qoder-device 的键名守卫', () => {
+  /** 假 Context：只需 req.raw（有界读体用）与 env/json（返回体用）。 */
+  function fakeCtx(body: unknown, env: Env) {
+    const raw = new Request('https://gw.test/admin/api/qoder-device', {
+      method: 'PUT',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(body),
+    })
+    const captured: { body: any; status: number } = { body: null, status: 200 }
+    const c = {
+      req: { raw },
+      env,
+      json: (b: any, s?: number) => { captured.body = b; captured.status = s ?? 200; return b },
+    } as unknown as Context<AppEnv>
+    return { c, captured }
+  }
+
+  it('键名不被识别（有非空值但一个已知字段都没有）→ 400，且不碰 KV', async () => {
+    const { env, store } = makeEnv()
+    await setQoderDevice(env, { machineToken: 'keep-me' })
+    const before = store.get(KV_KEYS.QODER_DEVICE)
+    const { c, captured } = fakeCtx({ device: { clienttype: '10', machinetoken: 'tok' } }, env)
+    await handleSetQoderDevice(c)
+    expect(captured.status).toBe(400)
+    expect(captured.body.success).toBe(false)
+    // 关键：已配置的身份原样保留（旧实现会在这里把 KV 删掉）
+    expect(store.get(KV_KEYS.QODER_DEVICE)).toBe(before)
+    expect(await getQoderDevice(env)).toEqual({ machineToken: 'keep-me' })
+  })
+
+  it('正常保存（camelCase 已知键）→ 200 并写入 KV', async () => {
+    const { env } = makeEnv()
+    const { c, captured } = fakeCtx({ device: { machineToken: 'tok', machineId: 'mid' } }, env)
+    await handleSetQoderDevice(c)
+    expect(captured.status).toBe(200)
+    expect(await getQoderDevice(env)).toEqual({ machineToken: 'tok', machineId: 'mid' })
+  })
+
+  it('全空值 = 用户点「清空」→ 200 且删掉 KV（守卫不能把清空功能挡掉）', async () => {
+    const { env, store } = makeEnv()
+    await setQoderDevice(env, { machineToken: 'tok' })
+    const allEmpty: Record<string, string> = {}
+    for (const f of QODER_DEVICE_FIELDS) allEmpty[f.key] = ''
+    const { c, captured } = fakeCtx({ device: allEmpty }, env)
+    await handleSetQoderDevice(c)
+    expect(captured.status).toBe(200)
+    expect(store.has(KV_KEYS.QODER_DEVICE)).toBe(false)
+    expect(await getQoderDevice(env)).toBeUndefined()
   })
 })
 

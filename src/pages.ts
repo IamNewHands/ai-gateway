@@ -125,7 +125,7 @@ const keyRowHtml = (p: { id?: string }, k: { key: string; enabled: boolean; labe
  * 「行为没变」到底是没部署、没刷新，还是代码就是错的，只能靠来回猜（2026-10-06 已经为这个
  * 浪费过一轮）。用户只要比对刷新前后这一行是否变化，就能自证加载的是不是新脚本。
  */
-export const CLINE_UP_UI_VERSION = '2026-10-06-verify'
+export const CLINE_UP_UI_VERSION = '2026-10-06-traffic'
 
 /**
  * Cline「上游渠道与固定」区块（移植 cline-pass-switcher 的控制台能力）。
@@ -162,7 +162,7 @@ const clineUpstreamSectionHtml = (p: { id?: string }) => {
     `<button class="btn btn-gh btn-xs" onclick="clineUpstreamsBulk('${js}','clear')" title="清空全部勾选与排除（回到网关自动选）"><i class="fas fa-eraser" aria-hidden="true"></i><span>清空</span></button>` +
     `<span class="mu" id="cu-st-${pid}" aria-live="polite" style="font-size:12px"></span></div>` +
     `<div id="cu-tb-${pid}"></div>` +
-    `<span class="form-helper">钉住发生在 Cline 网关之后的路由层。<b>改动即时保存，不需要点保存按钮</b>（状态行会显示「已保存」）。<b>点渠道徽章切换三态</b>：勾选 → 排除 → 自动。勾选的渠道带序号（序号 = 优先顺序）：<b>只用这几个</b>模式下网关只在这几个里选、不再兜底（全挂即失败）；<b>优先</b>模式下它们最优先、其余仍可兜底。排除 = 永不使用（划线），是<b>否决权</b>，优先级高于勾选。一个都不勾 = 网关自动选。<b>「验证钉住」是唯一能证明"上游真的照做了"的动作</b>：它发 1 次最小真实请求，读回上游实际走的渠道——日志里的 <code>[cline-pin]</code> 只能证明网关把偏好发出去了，证明不了上游认了它（规划器管道会静默丢弃）。校验中「限流」只代表当前共享池暂时繁忙，渠道本身可用。<span class="mu" style="font-size:11px">面板脚本 ${CLINE_UP_UI_VERSION}</span></span>` +
+    `<span class="form-helper">钉住发生在 Cline 网关之后的路由层。<b>改动即时保存，不需要点保存按钮</b>（状态行会显示「已保存」）。<b>点渠道徽章切换三态</b>：勾选 → 排除 → 自动。勾选的渠道带序号（序号 = 优先顺序）：<b>只用这几个</b>模式下网关只在这几个里选、不再兜底（全挂即失败）；<b>优先</b>模式下它们最优先、其余仍可兜底。排除 = 永不使用（划线），是<b>否决权</b>，优先级高于勾选。一个都不勾 = 网关自动选。<b>「验证钉住」是唯一能证明"上游真的照做了"的动作</b>：它发 1 次最小真实请求，读回上游实际走的渠道——日志里的 <code>[cline-pin]</code> 只能证明网关把偏好发出去了，证明不了上游认了它（规划器管道会静默丢弃）。校验中「限流」只代表当前共享池暂时繁忙，渠道本身可用。每个模型徽章下方还有一行<b>真实流量画像</b>：网关把每条真实请求里上游回吐的实际渠道自动留档（<b>不需要点任何按钮</b>），手动「验证钉住」只是抽样一次，这行才是全量——它同时能发现「配置生效了、但该渠道自己挂了所以实际走了兜底渠道」。<span class="mu" style="font-size:11px">面板脚本 ${CLINE_UP_UI_VERSION}</span></span>` +
     `</fieldset></div>`
 }
 
@@ -757,35 +757,132 @@ ${H('管理')}
                     <div class="fc mt-1 field-row" style="gap:8px"><input type="number" id="cd-plan-${escapePageHtml(p.id)}" value="${p.cooldown&&p.cooldown.planMs?Math.round(p.cooldown.planMs/60000):''}" style="width:88px" placeholder="plan冷却" title="余额/权益耗尽（402）的硬冷却时长（分钟）。到期到次日 04:00，签到恢复后自动解冻。"><input type="number" id="cd-soft-${escapePageHtml(p.id)}" value="${p.cooldown&&p.cooldown.softMs?Math.round(p.cooldown.softMs/1000):''}" style="width:88px" placeholder="429冷却" title="429 限流 / WAF 403 / 404 / 5xx（无 Retry-After 头时）的默认软冷却时长（秒）。"><input type="number" id="cd-err-${escapePageHtml(p.id)}" value="${p.cooldown&&p.cooldown.errThreshold?p.cooldown.errThreshold:''}" style="width:76px" placeholder="错误阈值" title="连续 5xx 错误次数阈值：达到后把该账号冷却 errMs 分钟。偶发 502 若携带 Retry-After 头会优先按其时长软冷却、不再触发本计数。"><input type="number" id="cd-errms-${escapePageHtml(p.id)}" value="${p.cooldown&&p.cooldown.errMs?Math.round(p.cooldown.errMs/60000):''}" style="width:88px" placeholder="错误冷却" title="达到错误阈值后的账号级冷却时长（分钟）。"><span class="mu" style="font-size:12px">冷却参数（保存后生效）</span></div>
                   </fieldset>`:''}
                   ${(p.oauth&&p.oauth.flowType==='qoder')||p.id==='qoder'?`
-                  <fieldset class="form-group" id="qdp-fs-${escapePageHtml(p.id)}"><legend>Qoder 多账号池</legend><span class="form-helper">设备授权流每次成功登录都会把该账号加入账号池（按 user_id 去重，多登一个 = 多个账号）。转发挑号：<b>7 天内到期的积分优先消耗</b>（到期越早越优先），窗口内没有待救积分时才按剩余积分最多者挑选；账号行上的「⏳ N 个包 7 天内到期」徽章与额度包明细里琥珀色的到期时间就是该规则的依据（到期时间按北京时间 CST 判定，数据来自最近一次签到/刷新额度）。「额度包明细」分「套餐额度」（到期 = 套餐到期，即基础额度作废时刻）与「签到/赠送额度」（到期 = 最近一次领取的那笔 30 天有效期）两项，<b>已用完的包自动隐藏</b>，其余按到期升序排列（快过期的在最上面）。额度耗尽/429/鉴权失败按策略冷却或禁用并自动轮换下一个账号；每日签到后积分恢复自动解冻（<b>签到成功也一并清除「需重新登录」的禁用标记</b>——签到通过鉴权就是 token 有效的直接证据）。冷却参数留空 = 默认（额度耗尽 12h / 429 60s / 连续 5 次错误冷却 10m）。</span>
+                  <fieldset class="form-group" id="qdp-fs-${escapePageHtml(p.id)}"><legend>Qoder 多账号池</legend><span class="form-helper">设备授权流每次成功登录都会把该账号加入账号池（按 user_id 去重，多登一个 = 多个账号）。转发挑号：<b>7 天内到期的积分优先消耗</b>（到期越早越优先），窗口内没有待救积分时才按剩余积分最多者挑选；账号行上的「⏳ N 个包 7 天内到期」徽章与额度包明细里琥珀色的到期时间就是该规则的依据（到期时间按北京时间 CST 判定，数据来自最近一次签到）。「额度包明细」分「套餐额度」（到期 = 套餐到期，即基础额度作废时刻）与「签到/赠送额度」（到期 = 最近一次领取的那笔 30 天有效期）两项，<b>已用完的包自动隐藏</b>，其余按到期升序排列（快过期的在最上面）。额度耗尽/429/鉴权失败按策略冷却或禁用并自动轮换下一个账号；每日签到后积分恢复自动解冻（<b>签到成功也一并清除「需重新登录」的禁用标记</b>——签到通过鉴权就是 token 有效的直接证据）。冷却参数留空 = 默认（额度耗尽 12h / 429 60s / 连续 5 次错误冷却 10m）。</span>
                     <div class="fc mt-1 field-row"><button class="btn btn-s" onclick="qoderPoolStatus('${escapePageJsx(p.id)}')"><i class="fas fa-sync" aria-hidden="true"></i>刷新账号池</button><button class="btn btn-s" onclick="oauthConnect('${escapePageJsx(p.id)}')"><i class="fas fa-sign-in-alt" aria-hidden="true"></i>登录新账号</button><button class="btn btn-gh btn-xs" onclick="oauthPoolExportModal('${escapePageJsx(p.id)}')"><i class="fas fa-file-export" aria-hidden="true"></i>导出凭证/Token</button><button class="btn btn-p" onclick="triggerCheckin('${escapePageJsx(p.id)}')"><i class="fas fa-calendar-check" aria-hidden="true"></i>立即签到</button><span id="qdp-st-${escapePageHtml(p.id)}" class="oauth-status"></span></div>
                     <div id="qdp-acc-${escapePageHtml(p.id)}" class="mt-1"></div>
                     <div class="fc mt-1 field-row" style="gap:8px"><input type="number" id="cd-plan-${escapePageHtml(p.id)}" value="${p.cooldown&&p.cooldown.planMs?Math.round(p.cooldown.planMs/60000):''}" style="width:88px" placeholder="额度耗尽冷却" title="额度/权益耗尽（402）的硬冷却时长（分钟）。到期到次日 04:00，签到恢复后自动解冻。"><input type="number" id="cd-soft-${escapePageHtml(p.id)}" value="${p.cooldown&&p.cooldown.softMs?Math.round(p.cooldown.softMs/1000):''}" style="width:88px" placeholder="429冷却" title="429 限流的默认软冷却时长（秒）。"><input type="number" id="cd-err-${escapePageHtml(p.id)}" value="${p.cooldown&&p.cooldown.errThreshold?p.cooldown.errThreshold:''}" style="width:76px" placeholder="错误阈值" title="连续错误次数阈值：达到后把该账号冷却「错误冷却」时长。"><input type="number" id="cd-errms-${escapePageHtml(p.id)}" value="${p.cooldown&&p.cooldown.errMs?Math.round(p.cooldown.errMs/60000):''}" style="width:88px" placeholder="错误冷却" title="达到错误阈值后的账号级冷却时长（分钟）。"><span class="mu" style="font-size:12px">冷却参数（保存后生效）</span></div>
                     <div class="qoder-device-block" data-qoder-device="${escapePageHtml(p.id)}" style="margin-top:10px;border-top:1px solid var(--border,#e5e7eb);padding-top:8px">
-                      <div class="fc field-row" style="align-items:center;justify-content:space-between;gap:8px"><b style="font-size:13px">真机设备身份</b><span class="mu qoder-device-state" style="font-size:12px"></span></div>
-                      <span class="form-helper">官方 2026-09-26 起要求请求携带设备标识才下发「每日领取 100 Credits」；用 uid 派生的假身份<b>不报错</b>，但活动列表里会静默少掉这条活动（表现就是「无可用签到活动」）。在装了 Qoder 桌面端的机器上跑 <code>runtime-info.exe --account-stdin</code> 提取一次，把 JSON 贴进来即可（机器级常量、抄来即可，<b>所有 Qoder 提供商共用这一份</b>；存 KV，保存后下次签到生效，无需重新部署）。</span>
-                      <label class="fg" style="margin-top:6px">
-                        <span>粘贴提取脚本输出的 JSON（整段 <code>config.json</code> 或只贴 <code>device</code> 块）</span>
-                        <textarea class="fx1 qoder-device-json" rows="4" style="white-space:pre-wrap;font-family:monospace;font-size:12px" placeholder='{"device":{"clientType":"10","machineId":"...","machineToken":"...","machineType":"...","machineCode":"...","machineOS":"x86_64_windows","machineHostname":"...","version":"0.4.3"}}' spellcheck="false"></textarea>
-                      </label>
-                      <div class="fc mt-1 field-row">
-                        <button class="btn btn-gh btn-xs" onclick="qoderDeviceFillFromJson(this)"><i class="fas fa-file-import" aria-hidden="true"></i>从 JSON 填充</button>
-                        <span class="form-helper">键名大小写/下划线不敏感，<code>COSY_MACHINE_TOKEN</code>、<code>productVersion</code> 这类写法也认。</span>
+                      <div class="collapse-section">
+                        <div class="fc field-row" style="align-items:center;justify-content:space-between;gap:8px">
+                          <button class="collapse-btn" onclick="toggleCollapse('qdwrap-${escapePageJsx(p.id)}', this)" type="button" aria-expanded="false" aria-controls="qdwrap-${escapePageHtml(p.id)}"><i class="fas fa-chevron-right collapse-icon" aria-hidden="true"></i> 真机设备身份（全局配置，所有 Qoder 提供商共用一份）</button>
+                          <span class="mu qoder-device-state" style="font-size:12px;white-space:nowrap"></span>
+                        </div>
+                        <div id="qdwrap-${escapePageHtml(p.id)}" class="hd">
+                          <span class="form-helper">官方 2026-09-26 起要求请求携带设备标识才下发「每日领取 100 Credits」；uid 派生的假身份<b>不报错</b>，但活动列表里会静默少掉这条活动（表现就是「无可用签到活动」）。这份身份是<b>机器级常量</b>：抄一次长期回放，<b>不会按时间过期</b>，只有「重装 Qoder 桌面端 / 换机器 / 上游改校验规则」才会失效——失效的表现同样是活动列表变空（签到日志里 <code>showCampaign:false</code>，或活动里不再出现「每日领取 100 Credits」），<b>重新提取一次覆盖保存即可</b>，不需要改代码。存 KV，保存后下次签到生效。</span>
+                          <div class="collapse-section" style="margin-top:6px">
+                            <button class="collapse-btn" onclick="toggleCollapse('qdext-${escapePageJsx(p.id)}', this)" type="button" aria-expanded="false" aria-controls="qdext-${escapePageHtml(p.id)}"><i class="fas fa-chevron-right collapse-icon" aria-hidden="true"></i> 怎么提取（首次配置 / 失效后重取；点这里复制脚本）</button>
+                            <div id="qdext-${escapePageHtml(p.id)}" class="hd">
+                              <span class="form-helper">在<b>装了 Qoder 桌面端的那台 Windows 机器</b>上：① 点下面「复制脚本」；② 存成 <code>qoder-device.ps1</code>（记事本直接保存即可，脚本全 ASCII，任何编码都能跑）；③ 运行 <code>powershell -ExecutionPolicy Bypass -File qoder-device.ps1</code>（或右键「使用 PowerShell 运行」）；④ 把输出的 JSON 整段贴到下面的框里。脚本只<b>读</b>本机 Qoder 的安装目录与数据目录（<code>runtime-info.exe</code> / <code>auth.machine-id</code> / <code>build-manifest.json</code>），<b>不联网、不写任何文件</b>，输出就是网关要发的 8 个 <code>Cosy-*</code> 头。</span>
+                              <div class="fc mt-1 field-row"><button class="btn btn-gh btn-xs" onclick="copyQoderExtractScript(this)"><i class="fas fa-copy" aria-hidden="true"></i>复制脚本</button><span class="form-helper">PowerShell 5.1+（Win10/11 自带），不需要 Python。</span></div>
+                              <pre class="qoder-extract-script" style="max-height:300px;overflow:auto;white-space:pre;font-size:11px;line-height:1.45;background:var(--bg-soft,#f8fafc);border:1px solid var(--border,#e5e7eb);border-radius:6px;padding:8px;margin:6px 0 0"># Qoder real-device identity extractor (Windows PowerShell 5.1+, no 3rd-party deps, read-only)
+# Usage:  powershell -ExecutionPolicy Bypass -File qoder-device.ps1
+# Output: the JSON block at the end -> copy it whole into the gateway admin panel.
+# NOTE: ASCII only on purpose. Windows PowerShell 5.1 reads BOM-less UTF-8 as the legacy ANSI
+#       codepage, so non-ASCII text here would corrupt into syntax errors depending on how the
+#       file was saved. Keep every line ASCII and it runs no matter the encoding.
+$ErrorActionPreference = 'Continue'
+
+# 1) locate runtime-info.exe (shipped inside the Qoder install dir under resources\\umid\\)
+$roots = @(
+  (Join-Path $env:LOCALAPPDATA 'Programs\\Qoder'),
+  (Join-Path $env:LOCALAPPDATA 'Programs\\Qoder CN'),
+  (Join-Path ([Environment]::GetEnvironmentVariable('ProgramFiles')) 'Qoder'),
+  (Join-Path ([Environment]::GetEnvironmentVariable('ProgramFiles')) 'Qoder CN'),
+  (Join-Path ([Environment]::GetEnvironmentVariable('ProgramFiles(x86)')) 'Qoder'),
+  (Join-Path ([Environment]::GetEnvironmentVariable('ProgramFiles(x86)')) 'Qoder CN')
+)
+$uninst = @(
+  'HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\*',
+  'HKLM:\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\*',
+  'HKLM:\\Software\\WOW6432Node\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\*'
+)
+$roots += (Get-ItemProperty $uninst -ErrorAction SilentlyContinue |
+  Where-Object { $_.DisplayName -like '*Qoder*' -and $_.InstallLocation } |
+  Select-Object -ExpandProperty InstallLocation)
+$exe = $null
+foreach ($r in $roots) {
+  if (-not $r) { continue }
+  $p = Join-Path $r 'resources\\umid\\runtime-info.exe'
+  if (Test-Path $p) { $exe = (Resolve-Path $p).Path; break }
+}
+if (-not $exe) {
+  Write-Host '[X] runtime-info.exe not found. Is the Qoder desktop app installed on this machine?'
+  Write-Host '    You can also add its install dir to $roots at the top of this script.'
+  exit 1
+}
+Write-Host ('[OK] runtime-info.exe: ' + $exe)
+
+# 2) run it (no account on stdin; the last stdout line is the device JSON)
+$ri = @{}
+$raw = &amp; $exe --account-stdin 2>$null
+$line = ($raw | Where-Object { $_.Trim() } | Select-Object -Last 1)
+if ($line) {
+  try { $ri = $line | ConvertFrom-Json } catch { Write-Host ('[X] runtime-info output is not JSON: ' + $line); exit 1 }
+}
+
+# 3) machineId: auth.machine-id inside the client data dir (intl com.qoder.app.* / cn com.qodercn.app.*)
+$machineId = ''
+$dirs = Get-ChildItem (Join-Path $env:APPDATA 'com.qoder*.app.*') -Directory -ErrorAction SilentlyContinue |
+  Sort-Object LastWriteTime -Descending
+foreach ($d in $dirs) {
+  $f = Join-Path $d.FullName 'auth.machine-id'
+  if (Test-Path $f) { $machineId = (Get-Content $f -Raw).Trim(); if ($machineId) { break } }
+}
+
+# 4) version: productVersion from build-manifest.json in the install dir (client version)
+$version = ''
+$mf = Join-Path (Split-Path (Split-Path $exe -Parent) -Parent) 'build-manifest.json'
+if (Test-Path $mf) { $version = (Get-Content $mf -Raw | ConvertFrom-Json).productVersion }
+
+# 5) arch + hostname (avoid $host: it is a read-only built-in variable)
+$arch = 'x86_64'
+if ($env:PROCESSOR_ARCHITECTURE -eq 'ARM64') { $arch = 'aarch64' }
+$pcName = $env:COMPUTERNAME
+
+$device = [ordered]@{
+  clientType      = '10'
+  machineOS       = ($arch + '_windows')
+  machineHostname = $pcName
+  machineId       = $machineId
+  machineToken    = "$($ri.machineToken)"
+  machineCode     = "$($ri.machineCode)"
+  machineType     = "$($ri.machineType)"
+  version         = $version
+}
+
+Write-Host ''
+Write-Host '--- copy the JSON below into the admin panel (real-device identity) ---'
+[pscustomobject]@{ device = $device } | ConvertTo-Json -Depth 4
+Write-Host ''
+Write-Host ('[check] lengths -> machineId ' + $device.machineId.Length + ' / machineToken ' + $device.machineToken.Length + ' / machineCode ' + $device.machineCode.Length + ' / machineType ' + $device.machineType.Length)
+if (-not $device.machineToken) { Write-Host '[!] machineToken is empty: runtime-info.exe returned no identity. Do NOT save yet - an identity without it gets no daily campaign.' }
+if (-not $device.machineId) { Write-Host '[!] machineId is empty: auth.machine-id not found. Has the desktop app been signed in on this machine?' }</pre>
+                            </div>
+                          </div>
+                          <label class="fg" style="margin-top:8px">
+                            <span>粘贴提取脚本输出的 JSON（整段 <code>config.json</code> 或只贴 <code>device</code> 块）</span>
+                            <textarea class="fx1 qoder-device-json" rows="4" style="white-space:pre-wrap;font-family:monospace;font-size:12px" placeholder='{"device":{"clientType":"10","machineId":"...","machineToken":"...","machineType":"...","machineCode":"...","machineOS":"x86_64_windows","machineHostname":"...","version":"0.4.3"}}' spellcheck="false"></textarea>
+                          </label>
+                          <div class="fc mt-1 field-row">
+                            <button class="btn btn-gh btn-xs" onclick="qoderDeviceFillFromJson(this)"><i class="fas fa-file-import" aria-hidden="true"></i>从 JSON 填充</button>
+                            <span class="form-helper">键名大小写/下划线不敏感，<code>COSY_MACHINE_TOKEN</code>、<code>productVersion</code> 这类写法也认。</span>
+                          </div>
+                          <div class="form-grid">
+                            ${QODER_DEVICE_FIELDS.map((f) => `
+                            <label class="fg">
+                              <span>${escapePageHtml(f.header)}</span>
+                              <input type="text" class="fx1 qoder-device-input" data-key="${escapePageHtml(f.key)}" autocomplete="off" spellcheck="false" placeholder="${escapePageHtml(f.placeholder)}">
+                              <small class="form-helper" style="display:block">${escapePageHtml(f.hint)}</small>
+                            </label>`).join('')}
+                          </div>
+                          <div class="fc mt-1 field-row">
+                            <button class="btn btn-p btn-xs" onclick="saveQoderDevice(this)"><i class="fas fa-save" aria-hidden="true"></i>保存</button>
+                            <button class="btn btn-gh btn-xs" onclick="resetQoderDevice(this)"><i class="fas fa-undo" aria-hidden="true"></i>清空</button>
+                            <span class="form-helper">留空字段的后果：<code>Cosy-ClientType / MachineOS / MachineHostname / Version</code> 回退内置默认值；<code>MachineId / MachineToken / MachineType / MachineCode</code> 回退 uid 派生值——<b>派生值拿不到每日活动</b>。保存后签到日志里 <code>deviceIdentity</code> 会从 <code>derived</code> 变成 <code>native</code>。</span>
+                          </div>
+                          <div class="mu mt-1 qoder-device-result" aria-live="polite"></div>
+                        </div>
                       </div>
-                      <div class="form-grid">
-                        ${QODER_DEVICE_FIELDS.map((f) => `
-                        <label class="fg">
-                          <span>${escapePageHtml(f.header)}</span>
-                          <input type="text" class="fx1 qoder-device-input" data-key="${escapePageHtml(f.key)}" autocomplete="off" spellcheck="false" placeholder="${escapePageHtml(f.placeholder)}">
-                          <small class="form-helper" style="display:block">${escapePageHtml(f.hint)}</small>
-                        </label>`).join('')}
-                      </div>
-                      <div class="fc mt-1 field-row">
-                        <button class="btn btn-p btn-xs" onclick="saveQoderDevice(this)"><i class="fas fa-save" aria-hidden="true"></i>保存</button>
-                        <button class="btn btn-gh btn-xs" onclick="resetQoderDevice(this)"><i class="fas fa-undo" aria-hidden="true"></i>清空</button>
-                        <span class="form-helper">留空字段的后果：<code>Cosy-ClientType / MachineOS / MachineHostname / Version</code> 回退内置默认值；<code>MachineId / MachineToken / MachineType / MachineCode</code> 回退 uid 派生值——<b>派生值拿不到每日活动</b>。保存后签到日志里 <code>deviceIdentity</code> 会从 <code>derived</code> 变成 <code>native</code>。</span>
-                      </div>
-                      <div class="mu mt-1 qoder-device-result" aria-live="polite"></div>
                     </div>
                   </fieldset>`:''}
                   ${(p.oauth&&(p.oauth.flowType==='m365-pkce'||p.oauth.flowType==='m365-ropc'))?`
@@ -3435,6 +3532,61 @@ function clineUpVerifyText(res) {
   var when = res.verifiedAt ? new Date(res.verifiedAt).toLocaleTimeString() : ''
   return (res.note || '') + (when ? '（' + when + '）' : '')
 }
+/**
+ * 把 {名字: 次数} 压成「alibaba×10 · baseten×2」，按次数降序，超出 cap 用「等 N 个」收尾。
+ * 按次数降序而不是字典序：用户要一眼看出**主走哪个渠道**，字典序会把偶然走一次的排在最前。
+ */
+function clineUpCountText(counts, cap) {
+  var keys = Object.keys(counts || {}).filter(function (k) { return counts[k] > 0 })
+  if (!keys.length) return ''
+  keys.sort(function (a, b) { return counts[b] - counts[a] || (a < b ? -1 : 1) })
+  var head = keys.slice(0, cap).map(function (k) { return k + '×' + counts[k] })
+  if (keys.length > cap) head.push('等 ' + keys.length + ' 个')
+  return head.join(' · ')
+}
+/** 判定计数：标签复用 clineUpVerdict——同一个结论不能有两套叫法（手动验证与流量画像必须同词）。 */
+function clineUpVerdictCounts(counts) {
+  var order = ['ok', 'fallback', 'mismatch', 'unknown', 'unpinned']
+  var out = []
+  order.forEach(function (v) {
+    var n = (counts || {})[v]
+    if (n > 0) out.push(clineUpVerdict(v)[1] + '×' + n)
+  })
+  return out.join(' · ')
+}
+/**
+ * 真实流量的路由画像（一行）。
+ *
+ * 读的是与手动「验证钉住」同一个字段（provider_metadata.gateway.routing.finalProvider），
+ * 区别是这是**全量**的：手动验证抽样一次，这里每条真实请求都留档。三件事必须一眼可辨：
+ *   1. 有没有读到路由信息——routed=0 时**绝不能说成生效**（读不到 = 无法判定）；
+ *   2. 实际走了哪些渠道、各多少次（配置生效但该渠道本身挂了，会在这里露出兜底渠道）；
+ *   3. 违反白名单的次数由 clineUpTrafficAnomalyText 另起一行标红，不混进这行统计。
+ */
+function clineUpTrafficText(rec) {
+  if (!rec || !(rec.requests > 0)) return ''
+  var parts = ['真实流量 ' + rec.requests + ' 次']
+  parts.push(rec.routed ? ('读到路由 ' + rec.routed + ' 次') : '没读到路由信息（无法判定）')
+  var provs = clineUpCountText(rec.providers, 3)
+  if (provs) parts.push('实走 ' + provs)
+  var vs = clineUpVerdictCounts(rec.verdicts)
+  if (vs) parts.push('判定 ' + vs)
+  if (rec.last) {
+    parts.push('最近 ' + new Date(rec.last.at).toLocaleTimeString() +
+      (rec.last.finalProvider ? ' → ' + rec.last.finalProvider : ''))
+  }
+  return parts.join(' ｜ ')
+}
+/**
+ * 异常行（红）：实际渠道违反硬约束的次数 + 最近一条原文。
+ * 为什么单独一行而不是并进统计：计数只说「未生效×2」，用户还需要**最近一次的具体证据**
+ * （实际走了谁、不在哪个白名单里）才能判断是配置写错了还是上游不服从。
+ */
+function clineUpTrafficAnomalyText(rec) {
+  var list = (rec && rec.anomalies) || []
+  if (!list.length) return ''
+  return '实测未生效 ' + list.length + ' 次，最近一次：' + (list[0].note || '')
+}
 /* CLINE_UP_END */
 
 /* CLINE_UP_UI_BEGIN */
@@ -3510,6 +3662,7 @@ function clineUpstreamsRender(id) {
   var checks = data.checks || {}
   var pins = data.pins || {}
   var verifies = data.verifies || {}
+  var traffic = data.traffic || {}
   /** 每行的渠道顺序，供事件委托按 (行, 列) 反查渠道名——渠道名拼进选择器不安全。 */
   var badgeRows = []
   var body = models.map(function (m, i) {
@@ -3541,6 +3694,16 @@ function clineUpstreamsRender(id) {
       var vb = clineUpVerdict(vfy.verdict)
       badges += '<div style="font-size:11px;margin-top:4px"><span class="bd ' + vb[0] + '">' + escapeHtml(vb[1]) + '</span>' +
         ' <span class="mu">' + escapeHtml(clineUpVerifyText(vfy)) + '</span></div>'
+    }
+    // 真实流量的路由画像：**不需要点任何按钮**，每条真实请求都已留档（手动验证只是抽样一次）
+    var tr = traffic[m]
+    var trText = clineUpTrafficText(tr)
+    if (trText) {
+      badges += '<div class="mu" style="font-size:11px;margin-top:4px">' + escapeHtml(trText) + '</div>'
+    }
+    var trBad = clineUpTrafficAnomalyText(tr)
+    if (trBad) {
+      badges += '<div style="font-size:11px;margin-top:2px;color:var(--color-danger)">⚠ ' + escapeHtml(trBad) + '</div>'
     }
     var pipe = probe.pipeline && probe.pipeline !== 'unknown' ? probe.pipeline : '—'
     var modeSel = '<select id="cu-md-' + id + '-' + i + '" data-cu-row="' + i + '" aria-label="固定模式">' +
@@ -5306,11 +5469,28 @@ function qoderDeviceInputs(block) {
 }
 // 键名归一：去掉 cosy 前缀与非字母数字，于是 config.json 的 camelCase、
 // COSY_MACHINE_TOKEN 这类环境变量写法、build-manifest.json 的 productVersion 都能对上。
+// **只用于匹配「粘贴进来的 JSON」**，绝不能用在出站载荷上（见 qoderDevicePayload）。
 function qoderDeviceKey(v) {
   var k = String(v == null ? '' : v).toLowerCase().replace(/[^a-z0-9]/g, '')
   if (k.indexOf('cosy') === 0) k = k.slice(4)
   if (k === 'productversion' || k === 'clientversion' || k === 'appversion') k = 'version'
   return k
+}
+// 出站载荷：键名必须与后端 normalizeQoderDevice 的已知键**逐字相同**（camelCase），
+// 所以这里直接用 data-key 原值，不归一。
+// 踩过的坑（2026-10-02）：这里若写成 qoderDeviceKey(el.getAttribute('data-key'))，
+// 键名会变成 'clienttype' 这类全小写 → 后端只认已知键、整包被丢弃 → 归一结果为空 →
+// setQoderDevice 判定「用户清空了」而**删掉 KV**（连之前配好的真机身份一起清），
+// 面板上只表现为「填好点保存，刷新后一片空白」，没有任何报错。后端现在也会 400 拦住它。
+function qoderDevicePayload(block) {
+  var device = {}
+  qoderDeviceInputs(block).forEach(function (el) { device[el.getAttribute('data-key')] = el.value })
+  return device
+}
+// 回填：同样按 data-key 原值取——用归一后的键名取不到（同一个坑的另一半，表现为保存成功也不回填）。
+function qoderDeviceApply(block, dev) {
+  var d = dev || {}
+  qoderDeviceInputs(block).forEach(function (el) { el.value = d[el.getAttribute('data-key')] || '' })
 }
 function qoderDeviceFillFromJson(btn) {
   var block = qoderDeviceBlock(btn)
@@ -5342,8 +5522,7 @@ async function loadQoderDeviceBlock(block) {
     var r = await fetch('/admin/api/qoder-device')
     var d = await r.json()
     if (!d.success) { if (st) st.textContent = '加载失败'; return }
-    var dev = (d.data && d.data.device) || {}
-    qoderDeviceInputs(block).forEach(function (el) { el.value = dev[qoderDeviceKey(el.getAttribute('data-key'))] || '' })
+    qoderDeviceApply(block, d.data && d.data.device)
     if (st) st.textContent = (d.data && d.data.isCustom) ? '已配置真机身份（签到日志 deviceIdentity=native）' : '未配置：正在用 uid 派生值，拿不到每日活动'
   } catch (e) { if (st) st.textContent = '加载失败' }
 }
@@ -5356,8 +5535,7 @@ async function saveQoderDevice(btn) {
   if (!block) return
   var out = block.querySelector('.qoder-device-result')
   if (out) { out.textContent = ''; out.style.color = '' }
-  var device = {}
-  qoderDeviceInputs(block).forEach(function (el) { device[qoderDeviceKey(el.getAttribute('data-key'))] = el.value })
+  var device = qoderDevicePayload(block)
   try {
     var r = await fetch('/admin/api/qoder-device', {
       method: 'PUT',
@@ -5366,8 +5544,20 @@ async function saveQoderDevice(btn) {
     })
     var d = await r.json()
     if (d.success) { toast('已保存（下次签到生效）', 'success'); loadQoderDeviceBlock(block) }
-    else toast(d.message || '保存失败', 'error')
+    else {
+      // 400 = 键名不被识别（后端拒绝保存以免清空已配置的身份）：必须显示出来，
+      // 否则用户看到的就是「点了保存、什么也没发生、刷新后还是空的」。
+      if (out) { out.style.color = 'var(--color-danger,#ef4444)'; out.textContent = d.message || '保存失败' }
+      toast(d.message || '保存失败', 'error')
+    }
   } catch (e) { toast('保存失败', 'error') }
+}
+// 复制内置的提取脚本：内容来自卡片里的 <pre>（textContent 已还原 &amp; 实体，复制出来可直接运行）
+function copyQoderExtractScript(btn) {
+  var block = qoderDeviceBlock(btn)
+  var pre = block ? block.querySelector('.qoder-extract-script') : null
+  if (!pre) { toast('没找到脚本内容', 'error'); return }
+  copyText(pre.textContent, btn)
 }
 function resetQoderDevice(btn) {
   var block = qoderDeviceBlock(btn)

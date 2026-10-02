@@ -73,6 +73,22 @@ export function hasQoderDevice(device: QoderDeviceIdentity | undefined): boolean
   return !!device && Object.values(device).some(Boolean)
 }
 
+/**
+ * 请求体里是否存在任何「trim 后非空的字符串」值。
+ *
+ * 用途：把「用户真的清空了所有字段」（值全空 → 应该删 KV）与「客户端用了后端不认识的键名」
+ * （值非空，但 normalizeQoderDevice 一个都不认 → 归一结果为空）区分开。后者若按「全空」处理，
+ * 会**静默删掉已配置的身份**，而面板上只表现为「保存后一片空白」。
+ *
+ * 2026-10-02 真实踩过：面板客户端把键名归一成了全小写（`clienttype`），后端只认 camelCase
+ * 已知键 → 整包被丢弃 → `hasQoderDevice` 为假 → 走 delete 分支，把之前配好的真机身份一起清掉，
+ * 而且**不报任何错**。现在 handleSetQoderDevice 用本函数把这种请求挡在 400 上。
+ */
+export function hasAnyNonEmptyStringValue(raw: unknown): boolean {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return false
+  return Object.values(raw as Record<string, unknown>).some((v) => typeof v === 'string' && v.trim() !== '')
+}
+
 /** 读取面板配置：未配置时返回空对象（KV 损坏/非法 JSON 同样回退空对象，不 500）。 */
 export async function getQoderDeviceConfig(env: Env): Promise<QoderDeviceIdentity> {
   try {

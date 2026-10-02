@@ -18,7 +18,7 @@ import { Hono } from 'hono'
 import type { AppEnv, Provider } from '../types'
 import { renderAdminPage } from '../pages'
 import { setProviders } from '../storage'
-import { QODER_DEVICE_FIELDS } from './device'
+import { QODER_DEVICE_FIELDS, normalizeQoderDevice } from './device'
 
 function makeEnv() {
   const map = new Map<string, string>()
@@ -116,8 +116,9 @@ describe('「Qoder 设备身份」配置块（挂在 Qoder 提供商卡片里）
     // 有内置值的字段把默认值显示成 placeholder
     expect(html).toMatch(/data-key="clientType"[^>]*placeholder="10"/)
     expect(html).toContain('deviceIdentity')
-    // 全局语义必须写明：多张 Qoder 卡片共用同一份
-    expect(html).toContain('所有 Qoder 提供商共用这一份')
+    // 全局语义必须写明：多张 Qoder 卡片共用同一份（写在折叠标题里，收起时也看得见）
+    expect(html).toContain('所有 Qoder 提供商共用一份')
+    expect(html).toContain('机器级常量')
   })
 
   it('客户端函数与接口路径都在脚本里（少了就是「按钮点了没反应」）', async () => {
@@ -167,12 +168,16 @@ function makeQoderDevApi(html: string) {
   const toasts: string[] = []
   const factory = new Function(
     'toast',
-    m[1] + '\nreturn { fill: qoderDeviceFillFromJson, key: qoderDeviceKey }'
+    m[1] + '\nreturn {' +
+      ' fill: qoderDeviceFillFromJson,' +
+      ' key: qoderDeviceKey,' +
+      ' payload: qoderDevicePayload,' +
+      ' apply: qoderDeviceApply }'
   )
   const api = factory((msg: string) => { toasts.push(String(msg)) })
   return {
     ...api,
-    ta, out, toasts, btn,
+    ta, out, toasts, btn, block,
     val: (key: string) => inputs.find((i) => i.key === key)?.value ?? null,
     all: (): string[] => inputs.map((i) => i.value),
   }
@@ -256,5 +261,171 @@ describe('「从 JSON 填充」：键名归一与填充行为', () => {
     const api = makeQoderDevApi(await render([qoderProvider()]))
     expect(() => api.fill({ closest: () => null })).not.toThrow()
     expect(() => api.fill(null)).not.toThrow()
+  })
+})
+
+/**
+ * 「保存 → 回填」的端到端契约（2026-10-02 真实事故的回归测试）。
+ *
+ * 事故：客户端把键名归一成全小写（clienttype）后发出，后端 normalizeQoderDevice 只认
+ * QODER_DEVICE_FIELDS 的 camelCase key → 整包被丢弃 → 归一结果为空 → setQoderDevice 判定
+ * 「用户清空了」而**删掉 KV**。用户看到的只有「填好点保存，刷新后一片空白」，
+ * 而存在性/语法断言全都通过——所以这里必须跑真实的载荷 → 归一 → 回填链路。
+ */
+describe('保存与回填：出站键名必须与后端已知键逐字相同', () => {
+  const FILLED: Record<string, string> = {
+    clientType: '10',
+    machineId: '0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0',
+    machineToken: 'dev-machine-token-placeholder',
+    machineType: 'aabbccddeeff001122',
+    machineCode: '00112233445566aabb',
+    machineOS: 'x86_64_windows',
+    machineHostname: 'HUAWEI-MACBOOK',
+    version: '0.4.3',
+  }
+
+  it('载荷键名 = data-key 原值（camelCase），后端归一后 8 个字段一个不丢', async () => {
+    const api = makeQoderDevApi(await render([qoderProvider()]))
+    api.ta.value = JSON.stringify({ device: FILLED })
+    api.fill(api.btn)
+
+    const payload = api.payload(api.block) as Record<string, string>
+    expect(Object.keys(payload).sort()).toEqual([...QODER_DEVICE_FIELDS.map((f) => f.key)].sort())
+    // 归一后必须还是 8 个 —— 若键名被归一成 clienttype，这里会变成 0（KV 随后被删）
+    const norm = normalizeQoderDevice(payload)
+    expect(Object.keys(norm).length).toBe(QODER_DEVICE_FIELDS.length)
+    expect(norm).toEqual(FILLED)
+  })
+
+  it('保存成功后回填：清空输入框 → 用后端返回值重填 → 8 个值原样回来', async () => {
+    const api = makeQoderDevApi(await render([qoderProvider()]))
+    api.ta.value = JSON.stringify({ device: FILLED })
+    api.fill(api.btn)
+    const norm = normalizeQoderDevice(api.payload(api.block))
+    // 模拟刷新后重新加载：先清空，再用「KV 里存的归一结果」回填
+    api.apply(api.block, {})
+    expect(api.all().every((v: string) => v === '')).toBe(true)
+    api.apply(api.block, norm)
+    expect(api.all()).toEqual(QODER_DEVICE_FIELDS.map((f) => FILLED[f.key]))
+  })
+
+  it('后端返回脏数据/缺字段时按空串回填，不把 undefined 写进输入框', async () => {
+    const api = makeQoderDevApi(await render([qoderProvider()]))
+    api.apply(api.block, { machineToken: 'tok' })
+    expect(api.val('machineToken')).toBe('tok')
+    expect(api.all().filter((v: string) => v === 'undefined').length).toBe(0)
+    expect(api.all().filter((v: string) => v === '')).toHaveLength(QODER_DEVICE_FIELDS.length - 1)
+  })
+})
+
+/**
+ * 内置提取脚本：用户会忘记怎么提取，所以脚本必须跟着界面走。
+ *
+ * 断言的是**解码后**（浏览器 textContent 语义）的脚本文本，因为这段脚本嵌在 pages.ts 的
+ * 模板字面量里，`\u`/`\S` 这类反斜杠会被 JS 转义规则吃掉或报错——只有把解码结果拿出来比对，
+ * 才能确认注册表路径与 exe 路径没被吃掉（`'HKCU:\Software\...'` 写成单反斜杠时，
+ * JS 会静默把 `\S` 变成 `S`，脚本照跑但路径全错）。
+ */
+function extractScript(html: string): string {
+  const m = html.match(/<pre class="qoder-extract-script"[^>]*>([\s\S]*?)<\/pre>/)
+  if (!m) throw new Error('未找到内置提取脚本 <pre>：被删或 class 改名了？')
+  return m[1]
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'")
+    .replace(/&amp;/g, '&')
+}
+
+describe('内置提取脚本（防止后续忘记怎么提取）', () => {
+  it('脚本在页面里，且关键路径的反斜杠没被模板转义吃掉', async () => {
+    const script = extractScript(await render([qoderProvider()]))
+    expect(script).toContain("'Programs\\Qoder'")
+    expect(script).toContain("'Programs\\Qoder CN'")
+    expect(script).toContain("'resources\\umid\\runtime-info.exe'")
+    expect(script).toContain("'HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\*'")
+    expect(script).toContain("'HKLM:\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\*'")
+    expect(script).toContain("'HKLM:\\Software\\WOW6432Node\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\*'")
+    // 调用运算符必须还原成 &（源里写的是 &amp;，textContent 会解回 &）
+    expect(script).toContain('& $exe --account-stdin')
+    expect(script).not.toContain('&amp;')
+  })
+
+  /**
+   * 反斜杠总数的兜底断言。
+   *
+   * 为什么需要它：这段脚本嵌在 pages.ts 的**模板字面量**里，`\u` 会直接编译报错，但
+   * `\Q` / `\S` / `\P` 这类会**静默丢掉反斜杠**——`'Programs\Qoder'` 变成 `'ProgramsQoder'`，
+   * 脚本照常运行、语法检查全过、只是路径找不到（2026-10-02 真实踩到：本地跑真机脚本成功，
+   * 而从页面里取出的那份报 "runtime-info.exe not found"）。上面逐条断言能定位到具体是哪一行，
+   * 这条总数断言则保证**新加的任何一行**带反斜杠的路径都不会悄悄漏掉转义。
+   *
+   * 改脚本时若这里失败：先把新路径里的每个 `\` 都写成 `\\`，再更新下面的数字。
+   */
+  it('反斜杠总数固定：任何一行新路径漏写 \\\\ 都会在这里失败', async () => {
+    const script = extractScript(await render([qoderProvider()]))
+    const count = (script.match(/\\/g) || []).length
+    expect(count, '反斜杠数量对不上：多半是新加的 Windows 路径漏写了一个 \\，被模板字面量吃掉了').toBe(25)
+  })
+
+  it('脚本输出与面板期望的 JSON 结构一致：device 块 + 8 个已知键', async () => {
+    const script = extractScript(await render([qoderProvider()]))
+    expect(script).toContain('$device = [ordered]@{')
+    expect(script).toContain('[pscustomobject]@{ device = $device } | ConvertTo-Json')
+    for (const f of QODER_DEVICE_FIELDS) {
+      expect(script, `脚本没覆盖字段 ${f.key}`).toContain(f.key)
+    }
+    // 三个数据来源都要在：runtime-info.exe / auth.machine-id / build-manifest.json
+    expect(script).toContain('runtime-info.exe')
+    expect(script).toContain('auth.machine-id')
+    expect(script).toContain('build-manifest.json')
+  })
+
+  it('脚本保持纯 ASCII（PS 5.1 读无 BOM 的 UTF-8 中文会乱码成语法错误）', async () => {
+    const script = extractScript(await render([qoderProvider()]))
+    // eslint-disable-next-line no-control-regex
+    expect(script).not.toMatch(/[^\x00-\x7F]/)
+  })
+
+  it('「复制脚本」按钮接上了读 <pre> 的函数（脚本内容不经过 JS 字符串，避免二次转义）', async () => {
+    const html = await render([qoderProvider()])
+    const js = inlineScripts(html).join('\n')
+    expect(html).toContain('copyQoderExtractScript(this)')
+    expect(js).toContain('function copyQoderExtractScript')
+    expect(js).toContain("querySelector('.qoder-extract-script')")
+    // 复制的是 textContent（已还原实体），不是 innerHTML
+    expect(js).toContain('copyText(pre.textContent, btn)')
+  })
+})
+
+/**
+ * 折叠与状态可见性：配置块默认收起（用户要求），但「配没配」必须一眼可见——
+ * 徽章若放进折叠体里，收起后就再也看不出当前生效的是真机身份还是派生值。
+ */
+describe('设备身份折叠与状态徽章', () => {
+  it('两层折叠（外层配置块 + 内层提取说明），各自有独立的折叠目标 id', async () => {
+    const html = await render([qoderProvider()])
+    expect(html).toContain("toggleCollapse('qdwrap-qoder'")
+    expect(html).toContain('id="qdwrap-qoder" class="hd"')
+    expect(html).toContain("toggleCollapse('qdext-qoder'")
+    expect(html).toContain('id="qdext-qoder" class="hd"')
+    // 默认收起：aria-expanded=false + 内容容器带 hd
+    expect(html).toMatch(/aria-expanded="false"[^>]*><i class="fas fa-chevron-right collapse-icon"[^>]*><\/i> 真机设备身份/)
+  })
+
+  it('状态徽章在折叠体之外（收起时仍能看到「已配置/未配置」）', async () => {
+    const html = await render([qoderProvider()])
+    const badgeAt = html.indexOf('class="mu qoder-device-state"')
+    const bodyAt = html.indexOf('id="qdwrap-qoder" class="hd"')
+    expect(badgeAt).toBeGreaterThan(-1)
+    expect(bodyAt).toBeGreaterThan(-1)
+    expect(badgeAt).toBeLessThan(bodyAt)
+  })
+
+  it('失效判断与恢复路径写在说明里（用户会问「这值会过期吗」）', async () => {
+    const html = await render([qoderProvider()])
+    expect(html).toContain('不会按时间过期')
+    expect(html).toContain('重新提取一次覆盖保存即可')
+    expect(html).toContain('showCampaign:false')
   })
 })

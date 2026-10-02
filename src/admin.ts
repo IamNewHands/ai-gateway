@@ -30,7 +30,8 @@ import { MAX_ADMIN_REQUEST_BYTES, readOptionalJSONLimited, readStrictJSONLimited
 import { isTraeProvider, testTraeCredential, testTraeModel } from './trae/proxy'
 import { diagnoseOpenCodeKey, fetchOpenCodeModels, isOpenCodeProvider, resolveOpenCodeUrls, testOpenCodeModel } from './opencode'
 import { isQoderFlow, fetchQoderModels, testQoderModel } from './qoder/proxy'
-import { isClineProvider, fetchClineRecommendedModels, testClineChat, testClineRefreshToken, probeClineAccount, startClineOAuth, pollClineOAuth, probeClineProviderUpstream, validateClineProviderUpstream, verifyClineProviderUpstream, readClineUpstreamCache, MIN_GAP_MS, DEFAULT_MODEL } from './cline/proxy'
+import { isClineProvider, fetchClineRecommendedModels, testClineChat, testClineRefreshToken, probeClineAccount, startClineOAuth, pollClineOAuth, probeClineProviderUpstream, validateClineProviderUpstream, verifyClineProviderUpstream, readClineUpstreamCache, readClineTraffic, MIN_GAP_MS, DEFAULT_MODEL } from './cline/proxy'
+import type { ClineTrafficRecord } from './cline/proxy'
 import { isGeminiProvider, testGeminiModel, GEMINI_MODELS } from './gemini/proxy'
 import { fetchGeminiQuota } from './gemini/quota'
 import { isCnbProvider, testCnbConnection, CNB_MODELS } from './cnb/proxy'
@@ -2064,15 +2065,22 @@ export async function handleClineUpstreams(c: Context<AppEnv>) {
     return c.json<ApiResponse>({ success: false, message: '仅支持 Cline 提供商' }, 400)
   }
   const cache = await readClineUpstreamCache(c.env, id)
+  const models = clinePanelModels(provider)
+  // 真实流量的路由留档：按模型 1 次 KV.get（不是 list 全量扫——流量键是聚合后的单键/模型）。
+  // 并发读而不是串行：面板模型数不多（启用模型 + 已固定模型），但串行会线性叠加 KV 往返延迟。
+  const records = await Promise.all(models.map((m) => readClineTraffic(c.env, id, m)))
+  const traffic: Record<string, ClineTrafficRecord> = {}
+  models.forEach((m, i) => { const r = records[i]; if (r) traffic[m] = r })
   return c.json<ApiResponse>({
     success: true,
     data: {
       providerId: id,
-      models: clinePanelModels(provider),
+      models,
       pins: provider.clinePinByModel || {},
       probes: cache.probes,
       checks: cache.checks,
       verifies: cache.verifies || {},
+      traffic,
       updatedAt: cache.updatedAt,
       minGapMs: MIN_GAP_MS,
     },
@@ -3270,10 +3278,24 @@ export async function handleGetQoderDevice(c: Context<AppEnv>) {
   return c.json<ApiResponse>({ success: true, data: { device, isCustom: hasQoderDevice(device), fields: QODER_DEVICE_FIELDS } })
 }
 
-/** 保存 Qoder 设备身份（覆盖式；全空 → 清空 KV，回退 uid 派生值）。 */
+/**
+ * 保存 Qoder 设备身份（覆盖式；全空 → 清空 KV，回退 uid 派生值）。
+ *
+ * 键名不匹配的保护（2026-10-02 真实事故）：请求体里有非空值、但归一后一个已知字段都不剩，
+ * 说明客户端用的键名与 QODER_DEVICE_FIELDS 的 key 不一致。这种情况**必须 400**——
+ * 直接交给 setQoderDevice 会被当成「用户清空」而删掉 KV，把已配置的真机身份静默清掉，
+ * 面板上只表现为「保存后一片空白」，没有任何报错可查。
+ */
 export async function handleSetQoderDevice(c: Context<AppEnv>) {
-  const { setQoderDevice } = await import('./qoder/device')
+  const { setQoderDevice, normalizeQoderDevice, hasQoderDevice, hasAnyNonEmptyStringValue } = await import('./qoder/device')
   const body = await readStrictJSONLimited<{ device?: Record<string, unknown> }>(c.req.raw, MAX_ADMIN_REQUEST_BYTES)
-  await setQoderDevice(c.env, body?.device ?? {})
+  const raw = body?.device ?? {}
+  if (!hasQoderDevice(normalizeQoderDevice(raw)) && hasAnyNonEmptyStringValue(raw)) {
+    return c.json<ApiResponse>(
+      { success: false, message: '设备身份字段名不被识别（有非空值但没有任何已知字段）——已拒绝保存，以免清空已配置的身份' },
+      400
+    )
+  }
+  await setQoderDevice(c.env, raw)
   return c.json<ApiResponse>({ success: true, message: '已保存' })
 }
