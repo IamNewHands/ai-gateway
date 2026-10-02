@@ -139,6 +139,33 @@ function contentPolicyLike(lower: string): boolean {
   return CONTENT_POLICY_MARKERS.some((m) => lower.includes(m))
 }
 
+/**
+ * 上游排队已满（qoder2api-hub v1.1.9 PR#7 实测形态，线上复现）：
+ *   信封 statusCodeValue=403 + body
+ *   `{"code":"10605","message":"{\"isQueued\":true,\"queueCount\":0,\"queueType\":\"p3\",
+ *     \"retryAfterSeconds\":30,\"serviceAvailable\":false,\"waitTime\":30}"}`
+ *
+ * 语义是**上游容量/优先级**：免费号进 p3 队列被拒，不是凭证故障。
+ * 必须与 auth 分开——落到 auth 会被 pool 当成「token 失效」**永久禁用账号**
+ * （pool.ts disableQoderAccount），一次排队就把好账号打死，且签到不会解冻。
+ */
+function queueFullLike(lower: string): boolean {
+  return lower.includes('10605') || lower.includes('isqueued')
+}
+
+/**
+ * 从错误体解析上游给出的排队重试秒数。
+ * 信封层没有 Retry-After 头，重试时长只在 body 的 retryAfterSeconds 里
+ * （hub qoder_proxy.py:2630-2636 同口径）；上限对齐 MAX_RETRY_AFTER_MS。
+ */
+function parseQueueRetrySeconds(body: string): number | null {
+  const m = /retryafterseconds\D{0,6}(\d+)/i.exec(body)
+  if (!m) return null
+  const sec = Number(m[1])
+  if (!Number.isFinite(sec) || sec <= 0) return null
+  return Math.min(sec, MAX_RETRY_AFTER_MS / 1000)
+}
+
 function firstNonEmpty(...values: string[]): string {
   for (const v of values) {
     const t = v.trim()
@@ -166,6 +193,7 @@ export function classifyQoderError(opts: {
   const { msg, code, type, kind } = extractError(body)
   const kindFromBody = kindHint || kind
   const lower = (msg + ' ' + code + ' ' + type).toLowerCase()
+  const queueFull = queueFullLike(lower)
 
   let k: QoderErrorKind
   if (kindFromBody) {
@@ -178,6 +206,10 @@ export function classifyQoderError(opts: {
     // 内容审核先于瞬时判断：它是确定性拒绝，误判为 unavailable 会让客户端收到 502 + 重试指引，
     // 而重试必然再被拒（源 errors.go:167-173 显式把该分支放在瞬时判断之前）
     k = 'content_policy'
+  } else if (queueFull) {
+    // 排队已满（10605）必须排在 authLike/`status === 403` 之前：
+    // 它的信封状态也是 403，落到 auth 会让 pool 永久禁用账号（本分支即为此而设）
+    k = 'rate_limit'
   } else if (quotaLike(lower, code, type)) {
     k = 'quota'
   } else if (notReadyLike(lower)) {
@@ -215,7 +247,14 @@ export function classifyQoderError(opts: {
     case 'rate_limit':
       out.status = 429
       out.failover = true
-      out.cooldownSeconds = parseRetryAfter(retryAfter, 60 * 1000) / 1000
+      if (queueFull) {
+        // 冷却时长优先取 body 里的 retryAfterSeconds（信封层没有 Retry-After 头）
+        out.cooldownSeconds = parseQueueRetrySeconds(body) ?? parseRetryAfter(retryAfter, 60 * 1000) / 1000
+        out.code = firstNonEmpty(code, '10605')
+        out.type = 'upstream_queue_full'
+      } else {
+        out.cooldownSeconds = parseRetryAfter(retryAfter, 60 * 1000) / 1000
+      }
       break
     case 'auth':
       out.status = status === 401 ? 401 : 403
@@ -254,6 +293,16 @@ export function classifyQoderError(opts: {
     out.message =
       '上游内容安全审核未通过 (DataInspectionFailed)：输入可能含不当内容，属确定性拒绝、重试无效。' +
       '请检查/缩短输入（系统提示词、超长历史、工具定义或粘贴的代码/文本）后重试。' +
+      (detail ? '上游详情：' + detail : '')
+  }
+  if (queueFull) {
+    // 原样回显上游嵌套 JSON 时面板读不出「该做什么」，且会被误当账号坏了。
+    // 明示三件事：是上游排队（非账号/鉴权故障）、已冷却多久、稍后重试即可。
+    const detail = out.message.slice(0, 200)
+    out.message =
+      '上游排队已满（10605 / isQueued）：本次请求被上游放入低优先级队列并拒绝，' +
+      '属上游容量与优先级问题，不是账号或鉴权故障。' +
+      `已按上游要求冷却 ${out.cooldownSeconds}s 并轮换账号，稍后重试即可。` +
       (detail ? '上游详情：' + detail : '')
   }
   if (!out.message) out.message = out.code

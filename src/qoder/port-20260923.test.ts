@@ -493,7 +493,7 @@ describe('isQoderFlow：Qoder 判定只有一处 owner', () => {
 
 describe('testQoderModel：结果自带链路标识（区分旧构建与真失败）', () => {
   it('失败信息带 [COSY 链路] 前缀，且绝不请求 /chat/completions', async () => {
-    const fetchMock = vi.fn(async () => new Response('{}', { status: 200 }))
+    const fetchMock = vi.fn(async (_input: unknown) => new Response('{}', { status: 200 }))
     vi.stubGlobal('fetch', fetchMock)
     // 空 env + 无 oauth：拿不到会话 → 如实报未连接，而不是去打通用端点
     const r = await testQoderModel({} as Env, { id: 'qoder' } as Provider, 'qmodel_38max')
@@ -686,5 +686,63 @@ describe('P1-10 DataInspectionFailed 归为内容审核（确定性拒绝，不�
     const body = await resp.text()
     expect(body).toContain('content_policy_rejected')
     expect(body).toContain('重试无效')
+  })
+})
+
+// ===== 上游排队已满（10605 / isQueued）：信封层 403 不是鉴权故障 =====
+// 源：qoder2api-hub v1.1.9 PR#7（信封层 403 + 10605 排队 → 账号冷却 + 轮换，而非按鉴权打死账号）。
+describe('上游排队已满（10605 / isQueued）归为限流，绝不按鉴权禁用账号', () => {
+  /** 线上实测原文（管理后台「测试」按钮的失败体，modelKey=qfmodel）。 */
+  const QUEUE_DETAIL = JSON.stringify({
+    code: '10605',
+    message: JSON.stringify({
+      isQueued: true,
+      modelKey: 'qfmodel',
+      queueCount: 0,
+      queueType: 'p3',
+      retryAfterSeconds: 30,
+      serviceAvailable: false,
+      waitTime: 30,
+    }),
+  })
+
+  it('403 + 10605 → rate_limit（不是 auth），冷却取上游 retryAfterSeconds', () => {
+    const c = classifyQoderError({ status: 403, body: QUEUE_DETAIL })
+    // 判成 auth 会走 pool.ts disableQoderAccount → 账号被永久禁用，一次排队就打死好账号
+    expect(c.kind).toBe('rate_limit')
+    expect(c.kind).not.toBe('auth')
+    expect(c.failover).toBe(true)
+    expect(c.cooldownSeconds).toBe(30)
+    expect(c.code).toBe('10605')
+    expect(c.type).toBe('upstream_queue_full')
+  })
+
+  it('消息是中文说明而非裸 JSON（面板要能读出「不是账号坏了」）', () => {
+    const c = classifyQoderError({ status: 403, body: QUEUE_DETAIL })
+    expect(c.message.startsWith('上游排队已满')).toBe(true)
+    expect(c.message).toContain('不是账号或鉴权故障')
+    expect(c.message).toContain('30s')
+  })
+
+  it('retryAfterSeconds 缺失时回退默认冷却，且不高于 10 分钟上限', () => {
+    const noRetry = JSON.stringify({ code: '10605', message: '{"isQueued":true}' })
+    expect(classifyQoderError({ status: 403, body: noRetry }).cooldownSeconds).toBe(60)
+    const huge = JSON.stringify({ code: '10605', message: '{"isQueued":true,"retryAfterSeconds":99999}' })
+    expect(classifyQoderError({ status: 403, body: huge }).cooldownSeconds).toBe(600)
+  })
+
+  it('真鉴权故障（401 + 会话死亡标记）仍是 auth，未被排队判定吞掉', () => {
+    const c = classifyQoderError({ status: 401, body: 'TOKEN_EXPIRE: offline user session not found' })
+    expect(c.kind).toBe('auth')
+  })
+
+  it('信封 403 + 10605 走完整链路 → 429 + Retry-After，提示排队而非鉴权', async () => {
+    const { resp } = await callProxy([envelope(QUEUE_DETAIL, 403)], { stream: false })
+    expect(resp.status).toBe(429)
+    expect(resp.headers.get('Retry-After')).toBe('30')
+    const body = await resp.text()
+    expect(body).toContain('排队已满')
+    expect(body).toContain('upstream_queue_full')
+    expect(body).not.toContain('unauthorized')
   })
 })
