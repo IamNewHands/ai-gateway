@@ -205,15 +205,26 @@ export async function noteQoderSuccess(env: Env, providerId: string, uid: string
   }
 }
 
-/** 签到后解冻：仅当 remain > 0 且账号处于冷却（非禁用）时恢复。 */
+/**
+ * 签到后解冻：remain > 0 时把冷却**与 `disabled` 一起**清掉。
+ *
+ * 为什么成功签到要连 `disabled` 一起清：`disabled` 的语义是「token 已失效，需重新登录」，
+ * 而签到成功本身就是「这个 token 现在能通过上游鉴权」的直接反证——留着它自相矛盾。
+ * 旧实现只清冷却、保留 `disabled`，于是历史误判（如 c7b79c8 之前 10605 排队被当成鉴权故障）
+ * 会把好账号**永久钉死**：签到照常成功、积分照常恢复，但转发永远跳过它，
+ * 面板显示成「积分=400 已禁用（鉴权失败：…）」，而那段 reason 原文只有旧代码写得出来
+ * （新文案是「鉴权失败（会话已失效，需重新登录）：…」，见 proxy.ts markQoderAccountClassified）。
+ *
+ * remain <= 0 时保持原样：没有积分就解冻只会让它立刻被挑中再撞额度耗尽，反而多一次无效上游请求。
+ */
 export async function reenableQoderIfCredits(env: Env, providerId: string, uid: string, remain: number): Promise<void> {
   const pool = await readQoderPool(env, providerId)
   const acc = pool.find((a) => a.uid === uid)
   if (!acc) return
   const st = acc.state || { credits: 0, disabled: false, until: 0, errCount: 0 }
   acc.state = { ...st, credits: remain }
-  if (remain > 0 && !st.disabled) {
-    acc.state = { ...acc.state, until: 0, reason: '', errCount: 0 }
+  if (remain > 0) {
+    acc.state = { ...acc.state, until: 0, disabled: false, reason: '', errCount: 0 }
   }
   await writeQoderPool(env, providerId, pool)
 }
