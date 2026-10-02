@@ -354,6 +354,22 @@ describe('内置提取脚本（防止后续忘记怎么提取）', () => {
     expect(script).toContain("'' | & $exe --account-stdin")
   })
 
+  it('结果落盘 + 交互式运行结束时暂停（窗口不会一闪而过看不到结果）', async () => {
+    const script = extractScript(await render([qoderProvider()]))
+    // 双击 / 右键「使用 PowerShell 运行」时窗口会在脚本结束时立刻关闭，
+    // 所以除了打印，还必须把 JSON 写到脚本旁边（用户 2026-10-02 实测「很快退出、没看到结果」）
+    expect(script).toContain("Join-Path (Split-Path -Parent $PSCommandPath) 'qoder-device.json'")
+    expect(script).toContain('[saved] also written to: ')
+    // 无 BOM 写入：BOM 会被一起粘进面板，JSON.parse 直接失败
+    expect(script).toContain('New-Object System.Text.UTF8Encoding($false)')
+    // 有人在看就停住；stdin 被重定向（管道/自动化）时不停，避免卡住脚本化调用
+    expect(script).toContain('[Console]::IsInputRedirected')
+    const guard = script.indexOf('IsInputRedirected')
+    const pause = script.indexOf("Read-Host 'Press Enter to close'")
+    expect(guard).toBeGreaterThan(-1)
+    expect(pause).toBeGreaterThan(guard)
+  })
+
   /**
    * 反斜杠总数的兜底断言。
    *

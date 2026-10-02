@@ -856,11 +856,38 @@ $device = [ordered]@{
 
 Write-Host ''
 Write-Host '--- copy the JSON below into the admin panel (real-device identity) ---'
-[pscustomobject]@{ device = $device } | ConvertTo-Json -Depth 4
+$json = [pscustomobject]@{ device = $device } | ConvertTo-Json -Depth 4
+Write-Host ''
+Write-Host '--- copy the JSON below into the admin panel (real-device identity) ---'
+$json
 Write-Host ''
 Write-Host ('[check] lengths -> machineId ' + $device.machineId.Length + ' / machineToken ' + $device.machineToken.Length + ' / machineCode ' + $device.machineCode.Length + ' / machineType ' + $device.machineType.Length)
 if (-not $device.machineToken) { Write-Host '[!] machineToken is empty: runtime-info.exe returned no identity. Do NOT save yet - an identity without it gets no daily campaign.' }
-if (-not $device.machineId) { Write-Host '[!] machineId is empty: auth.machine-id not found. Has the desktop app been signed in on this machine?' }</pre>
+if (-not $device.machineId) { Write-Host '[!] machineId is empty: auth.machine-id not found. Has the desktop app been signed in on this machine?' }
+
+# Also write the JSON next to this script. A double-clicked / "Run with PowerShell" .ps1 closes
+# its window the instant the script ends, so the printed JSON is easy to miss completely
+# (reported 2026-10-02: "it exits immediately and I never saw the result"). A file cannot be lost.
+# UTF-8 WITHOUT BOM on purpose: a BOM would ride along when the file content is pasted into the
+# panel and break its JSON.parse.
+$outFile = Join-Path (Split-Path -Parent $PSCommandPath) 'qoder-device.json'
+try {
+  [System.IO.File]::WriteAllText($outFile, $json, (New-Object System.Text.UTF8Encoding($false)))
+  Write-Host ''
+  Write-Host ('[saved] also written to: ' + $outFile)
+} catch {
+  Write-Host ''
+  Write-Host ('[!] could not write ' + $outFile + ' - just copy the JSON printed above instead')
+}
+
+# Keep the window open while a human is watching. Skipped when stdin is redirected, so piping
+# and automation never block on Read-Host.
+$waitForHuman = $false
+try { $waitForHuman = -not [Console]::IsInputRedirected } catch { $waitForHuman = $false }
+if ($waitForHuman) {
+  Write-Host ''
+  Read-Host 'Press Enter to close'
+}</pre>
                             </div>
                           </div>
                           <label class="fg" style="margin-top:8px">
