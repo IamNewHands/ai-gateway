@@ -357,6 +357,125 @@ function makePanel(html: string) {
   return { api, box, status, net, badges: () => badgeEls, verifies: () => verifyEls }
 }
 
+describe('Cline 账号行：冷却/额度状态徽章与「展开即读取」（DOM 替身驱动客户端代码）', () => {
+  /**
+   * 只跑 CLINE_UP_UI 块，注入 document/fetch/window 替身。
+   *
+   * 为什么必须有这一组：2026-10-02 用户报「部署了但看不到运行状态徽章」，根因有两个，且都
+   * 在客户端接线里——① 刷新后卡片本来就是展开的（从 localStorage 恢复），而恢复展开态的加载
+   * 列表里**没有 Cline**，于是什么都没读；② 账号池只装启用账号，留档下标与面板下标错位。
+   * 语法检查（本文件前半段）与 tsc 对这两类错完全无感。
+   */
+  function makeAcctPanel(html: string, opts: { stale?: boolean; accounts?: unknown[] } = {}) {
+    const js = inlineScripts(html).join('\n')
+    const ui = js.match(/\/\* CLINE_UP_UI_BEGIN \*\/([\s\S]*?)\/\* CLINE_UP_UI_END \*\//)
+    const pure = js.match(/\/\* CLINE_UP_BEGIN \*\/([\s\S]*?)\/\* CLINE_UP_END \*\//)
+    if (!ui || !pure) throw new Error('未找到 CLINE_UP / CLINE_UP_UI 标记块：面板渲染块被删除或改名了？')
+
+    const els: Record<string, any> = {}
+    /** 预建元素替身：徽章（krun-）与状态行（cline-chk-）是本组用例唯一会碰的两个。 */
+    const ensure = (id: string) => (els[id] = els[id] || { id, textContent: '', className: '', title: '', style: { display: '' } })
+    ensure('cline-chk-cline')
+    ensure('krun-cline-0')
+    ensure('krun-cline-1')
+    const document = { getElementById: (id: string) => els[id] ?? null, querySelectorAll: () => [] }
+    const calls: Array<{ url: string; method?: string }> = []
+    const fetchStub = (url: string, init?: any) => {
+      calls.push({ url: String(url), method: init && init.method })
+      if (String(url).includes('cline-account-states')) {
+        return Promise.resolve({ json: async () => ({ success: true, data: { accounts: opts.accounts || [] } }) })
+      }
+      return Promise.resolve({ json: async () => ({ success: true, data: { accounts: [], summary: '有效 1 / 共 1' } }) })
+    }
+    const windowStub = { _clineStale: opts.stale ? { cline: true } : {} }
+    const factory = new Function(
+      'document', 'fetch', 'window', 'escapeHtml',
+      pure[1] + '\n' + ui[1] + '\nreturn { paint: clinePaintRunBadge, load: clineLoadStates, onOpen: clineOnCardOpen }'
+    )
+    const api = factory(document, fetchStub, windowStub, (s: string) => String(s))
+    return { api, els, calls, flush: () => new Promise((r) => setTimeout(r, 0)) }
+  }
+
+  it('展开卡片：读取只读留档（GET，不打上游）并写出读取结果，未记录到冷却时明说', async () => {
+    const p = makeAcctPanel(await render([clineProvider()]), { accounts: [] })
+    expect(p.api.onOpen('cline')).toBe(true)
+    await p.flush()
+    expect(p.calls).toHaveLength(1)
+    expect(p.calls[0].url).toContain('/cline-account-states')
+    // 只读：绝不能是 POST 到会探测上游的 check 端点
+    expect(p.calls[0].method).toBeUndefined()
+    // 「读取成功但没有冷却记录」必须与「没读」区分开——否则用户分不清功能是否生效
+    expect(p.els['cline-chk-cline'].textContent).toContain('冷却留档已读取')
+    expect(p.els['cline-chk-cline'].textContent).toContain('未记录到冷却')
+  })
+
+  it('有冷却记录：徽章写文案/颜色/tooltip，状态行点数', async () => {
+    const p = makeAcctPanel(await render([clineProvider()]), {
+      accounts: [
+        { index: 0, enabled: true, cooling: true, stateKind: 'quota_empty', stateLabel: '额度耗尽 · 冷却 52s', stateTitle: '原因：额度耗尽' },
+        { index: 1, enabled: true, cooling: false, stateKind: null, stateLabel: '', stateTitle: '' },
+      ],
+    })
+    await p.api.load('cline')
+    // 红 = 现在真的不可用；文案直接来自服务端（面板不自己算时间）
+    expect(p.els['krun-cline-0'].textContent).toBe('额度耗尽 · 冷却 52s')
+    expect(p.els['krun-cline-0'].className).toBe('bd bd-danger')
+    expect(p.els['krun-cline-0'].style.display).toBe('')
+    expect(p.els['krun-cline-0'].title).toContain('额度耗尽')
+    // 没冷却的那行不显示徽章（不猜、不画假的绿）
+    expect(p.els['krun-cline-1'].style.display).toBe('none')
+    expect(p.els['cline-chk-cline'].textContent).toContain('冷却中 1')
+  })
+
+  it('已禁用优先于冷却：文案先说禁用，颜色走中性', async () => {
+    const p = makeAcctPanel(await render([clineProvider()]), {
+      accounts: [{ index: 0, enabled: false, cooling: true, stateKind: 'auth', stateLabel: '凭据失效 · 冷却 8m', stateTitle: '原因：凭据失效' }],
+    })
+    await p.api.load('cline')
+    expect(p.els['krun-cline-0'].textContent).toBe('已禁用 · 凭据失效 · 冷却 8m')
+    expect(p.els['krun-cline-0'].className).toBe('bd bd-off')
+    expect(p.els['krun-cline-0'].title).toContain('该密钥已禁用')
+  })
+
+  it('保存/授权后标记过「待检测」：走真实检测（POST），不走只读留档', async () => {
+    const p = makeAcctPanel(await render([clineProvider()]), { stale: true })
+    p.api.onOpen('cline')
+    await p.flush()
+    expect(p.calls[0].url).toContain('/cline-accounts/check')
+    expect(p.calls[0].method).toBe('POST')
+  })
+
+  it('非 Cline 卡片（没有状态行元素）→ 什么都不做，也不发请求', async () => {
+    const p = makeAcctPanel(await render([clineProvider()]))
+    expect(p.api.onOpen('deepseek')).toBe(false)
+    await p.flush()
+    expect(p.calls).toHaveLength(0)
+  })
+
+  it('徽章元素缺失时不抛错（老 HTML 缓存 / 行被删）', async () => {
+    const p = makeAcctPanel(await render([clineProvider()]), {
+      accounts: [{ index: 9, enabled: true, cooling: true, stateKind: 'auth', stateLabel: 'x', stateTitle: 'y' }],
+    })
+    await expect(p.api.load('cline')).resolves.toBe(true)
+  })
+
+  /**
+   * 恢复展开态也要加载 Cline —— 这条用**源码断言**而不是 DOM 驱动。
+   *
+   * 为什么接受源码断言：restoreAdminState 依赖 localStorage / requestAnimationFrame / 全页元素，
+   * 造一个完整的替身环境成本远高于收益；而这里的失败模式恰恰是「加载器列表里漏了一项」
+   * （2026-10-02 实际就漏了 Cline），一行断言正好钉住它。
+   */
+  it('刷新后恢复展开态：恢复路径里包含 Cline 的加载入口', async () => {
+    const html = await render([clineProvider()])
+    const js = inlineScripts(html).join('\n')
+    const restore = js.slice(js.indexOf('function restoreAdminState'))
+    const body = restore.slice(0, restore.indexOf('\n}'))
+    // 必须带**恢复出来的 pid**：写死成别的 id（或漏传）等于没加载当前卡片
+    expect(body).toContain('clineOnCardOpen(pid)')
+  })
+})
+
 describe('Cline 面板：渲染回显与即时保存（DOM 替身驱动客户端代码）', () => {
   const probe = (upstreams: string[]) => ({ M: { upstreams, pipeline: 'planner' } })
   /** 排空微任务：保存链有 4 层 then，只 await 一个 Promise.resolve() 清不掉 in-flight 标记。 */

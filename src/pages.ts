@@ -141,7 +141,7 @@ const keyRowHtml = (p: { id?: string }, k: { key: string; enabled: boolean; labe
  * 「行为没变」到底是没部署、没刷新，还是代码就是错的，只能靠来回猜（2026-10-06 已经为这个
  * 浪费过一轮）。用户只要比对刷新前后这一行是否变化，就能自证加载的是不是新脚本。
  */
-export const CLINE_UP_UI_VERSION = '2026-10-06-acct-state'
+export const CLINE_UP_UI_VERSION = '2026-10-06-acct-state-2'
 
 /**
  * Cline「上游渠道与固定」区块（移植 cline-pass-switcher 的控制台能力）。
@@ -1400,10 +1400,7 @@ function tog(id) {
   if (d.classList.contains('open') && document.getElementById('ds-list-' + id)) deepseekTokenList(id)
   // Cline：展开时**先读一次只读留档**（不打上游），让"额度耗尽被冷却"一眼可见；
   // 保存/一键授权后标记过「待检测」的账号再多跑一次真实检测（那时需要拿新 token 关联账号）。
-  if (d.classList.contains('open') && document.getElementById('cline-chk-' + id)) {
-    if ((window._clineStale || {})[id]) clineCheckAccounts(id, { silent: true })
-    else clineLoadStates(id)
-  }
+  if (d.classList.contains('open')) clineOnCardOpen(id)
 }
 
 // P3：M365 账号池渲染 —— 独立页并入提供商详情后按 providerId 定位容器
@@ -1611,6 +1608,9 @@ function restoreAdminState() {
         if (document.getElementById('trae-acc-' + pid)) traeStatus(pid)
         if (document.getElementById('qdp-acc-' + pid)) qoderPoolStatus(pid)
         if (document.getElementById('wbp-acc-' + pid)) oauthPoolStatus(pid)
+        // Cline：恢复展开态同样要读冷却/额度留档——否则「刷新后面板本来就是开的」这条最常见路径
+        // 什么都不加载，用户看不到任何状态（2026-10-02 实测报障）。与手动 tog 共用同一入口。
+        clineOnCardOpen(pid)
       })
       if (s.add) { const af = document.getElementById('af'); if (af) af.classList.remove('hd') }
       if (typeof s.y === 'number') uiScroll = s.y
@@ -4076,8 +4076,6 @@ function clineUpstreamsBulk(id, mode) {
   clineUpstreamsRender(id)
   clineUpstreamsSave(id)
 }
-/* CLINE_UP_UI_END */
-
 /**
  * 画一行账号的运行状态徽章。两个数据源共用（检测端点与只读留档端点），画法只有一处实现。
  *
@@ -4110,17 +4108,47 @@ function clinePaintRunBadge(id, a) {
  *
  * 为什么不复用那个会逐个换 token 的按钮：它给每个 refreshToken 换一次 accessToken（有副作用的探测），
  * 而「看一眼这个号是不是额度耗尽被冷却了」不该付这个代价，也不该等用户先想到去点它。
+ *
+ * 读完后在按钮旁写一行结果（含时刻）。**这行不是装饰**：没有它时，「读取成功但没有冷却记录」与
+ * 「压根没读取/读取失败」在界面上长得一模一样——2026-10-02 用户报「没看到徽章」时正是分不清这两者。
  */
 function clineLoadStates(id) {
   return fetch('/admin/api/providers/' + encodeURIComponent(id) + '/cline-account-states')
     .then(function (r) { return r.json() })
     .then(function (d) {
-      if (!d || !d.success) return false
+      var st = document.getElementById('cline-chk-' + id)
+      if (!d || !d.success) {
+        if (st) st.textContent = '冷却留档读取失败：' + ((d && d.message) || '未知错误')
+        return false
+      }
       var accs = (d.data && d.data.accounts) || []
       accs.forEach(function (a) { clinePaintRunBadge(id, a) })
+      var cooling = accs.filter(function (a) { return a.cooling }).length
+      if (st) {
+        st.textContent = '冷却留档已读取（' + new Date().toLocaleTimeString() + '）' +
+          (cooling ? ' · 冷却中 ' + cooling : ' · 未记录到冷却')
+      }
       return true
     })
-    .catch(function () { return false })
+    .catch(function () {
+      var st = document.getElementById('cline-chk-' + id)
+      if (st) st.textContent = '冷却留档读取失败：网络错误'
+      return false
+    })
+}
+
+/**
+ * 卡片展开（手动点击或刷新后恢复展开态）后该做的加载动作——**两条路径共用这一个入口**。
+ *
+ * 为什么必须共用：恢复展开态原本只加载 M365/TRAE/Qoder/WorkBuddy 的池子，Cline 不在其列，
+ * 于是「刷新页面 → 卡片本来就是开的」这条最常见的路径下什么都没加载，用户看不到徽章
+ * （2026-10-02 实测报障）。把决策收进一个函数，两条路径就不可能再各自漏掉一半。
+ */
+function clineOnCardOpen(id) {
+  if (!document.getElementById('cline-chk-' + id)) return false
+  if ((window._clineStale || {})[id]) { clineCheckAccounts(id, { silent: true }); return true }
+  clineLoadStates(id)
+  return true
 }
 
 function clineCheckAccounts(id, opts) {
@@ -4189,6 +4217,7 @@ function clineSaveLabel(id, idx) {
     })
     .catch(function () { if (m) m.textContent = '账号名保存失败：网络错误' })
 }
+/* CLINE_UP_UI_END */
 
 // OAuth 提供商：用 KV 中的 token 拉取上游模型列表，动态填入编辑表单
 async function fetchOauthModels(id) {

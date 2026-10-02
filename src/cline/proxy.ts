@@ -375,6 +375,14 @@ interface Pool {
   providerId: string
   /** 冷却留档需要 KV 绑定；未注入（如测试路径 `__cline_test__`）时只做内存冷却。 */
   env?: Env
+  /**
+   * 池下标 → provider.apiKeys 下标。
+   *
+   * 池只装**启用**的账号（poolFromProvider 过滤 enabled），而面板按 apiKeys 的下标对号——
+   * 只要有一行被禁用，两个坐标系就整体错位：留档会写到**别的账号**那一行上（比不显示更糟，
+   * 用户会去查一个无辜的号）。所以留档一律换算成 apiKeys 下标。未注入时按恒等处理。
+   */
+  keyIndexes?: number[]
 }
 
 const pools = new Map<string, Pool>()
@@ -400,6 +408,19 @@ function getPool(providerId: string, refreshTokens: string[]): Pool {
   return pool!
 }
 
+/**
+ * 池下标 → provider.apiKeys 下标。
+ *
+ * 过滤条件必须与 `getPool` 的判据**逐字一致**（enabled + trim 后长度 > 8），否则映射会静默错位。
+ * 池是按启用账号顺序建的，这里只是把同样的顺序映射回原始下标。
+ */
+function keyIndexesOf(provider: Provider): number[] {
+  return (provider.apiKeys || [])
+    .map((k, i) => ({ k, i }))
+    .filter(({ k }) => k.enabled && (k.key || '').trim().length > 8)
+    .map(({ i }) => i)
+}
+
 /** 由 provider 的启用 apiKeys（即各账号 refreshToken）构造账号池。 */
 function poolFromProvider(provider: Provider, env?: Env): Pool {
   const tokens = (provider.apiKeys || []).filter((k) => k.enabled).map((k) => k.key)
@@ -408,6 +429,8 @@ function poolFromProvider(provider: Provider, env?: Env): Pool {
   if (env) pool.onRotate = (oldRt, newRt) => { void persistClineRotation(env, provider, oldRt, newRt) }
   // env 每次都刷新：同一 isolate 先后用不同 env（测试常见）时不能沿用上一次的绑定
   pool.env = env
+  // 下标映射同样每次都刷新：面板改了启用开关/增删行之后，留档必须跟着新下标走
+  pool.keyIndexes = keyIndexesOf(provider)
   return pool
 }
 
@@ -478,7 +501,8 @@ async function recordCooldownState(
   const index = pool.accounts.indexOf(acc)
   if (index < 0) return
   await recordClineAccountState(pool.env, pool.providerId, {
-    index,
+    // 换算成 apiKeys 下标：面板按它对号（池下标在有禁用行时会错位，见 Pool.keyIndexes 注释）
+    index: pool.keyIndexes?.[index] ?? index,
     masked: maskClineToken(acc.refreshToken),
     kind,
     until,
@@ -499,7 +523,7 @@ async function clearCooldownState(pool: Pool | undefined, acc: Account | null): 
   if (!pool || !acc) return
   const index = pool.accounts.indexOf(acc)
   if (index < 0) return
-  await clearClineAccountState(pool.env, pool.providerId, index)
+  await clearClineAccountState(pool.env, pool.providerId, pool.keyIndexes?.[index] ?? index)
 }
 
 /**
@@ -2895,6 +2919,7 @@ export async function healthCheckClineAll(env: Env): Promise<ClineHealthSummary>
       const pool = getPool(p.id, enabled.map((k) => k.key))
       pool.onRotate = (oldRt, newRt) => { void persistClineRotation(env, p, oldRt, newRt) }
       pool.env = env
+      pool.keyIndexes = keyIndexesOf(p)
       for (const acc of pool.accounts) {
         accounts++
         acc.cooldownUntil = 0 // 探活忽略既有冷却，尝试复活
@@ -2903,7 +2928,7 @@ export async function healthCheckClineAll(env: Env): Promise<ClineHealthSummary>
           ok++
           // 复活成功即清掉冷却留档：否则面板会一直显示一个已经被证明不成立的结论
           const idx = pool.accounts.indexOf(acc)
-          if (idx >= 0) await clearClineAccountState(env, p.id, idx)
+          if (idx >= 0) await clearClineAccountState(env, p.id, pool.keyIndexes?.[idx] ?? idx)
         } catch {
           failed++ // getAccountToken 失败时已标记冷却
         }

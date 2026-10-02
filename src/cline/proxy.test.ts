@@ -2074,6 +2074,29 @@ describe('账号冷却状态落 KV：面板据此显示「额度耗尽 / 限流�
     expect(states(provider.id)).toHaveLength(0)
   }, 20000)
 
+  it('留档下标按 provider.apiKeys 计（池只装启用账号，有禁用行时池下标会错位）', async () => {
+    __resetClineAccountStateForTests()
+    const { env, states } = stateEnv()
+    const provider = clineProvider([REFRESH_TOKEN])
+    // 第 0 行被禁用：池里只剩第 1 行，池下标 0 ↔ apiKeys 下标 1。
+    // 若留档写池下标，面板会把这条冷却显示到**被禁用的那一行**上（用户会去查一个无辜的号）。
+    provider.apiKeys = [
+      { key: 'rt-disabled-aaaaaaaaaaaa', enabled: false },
+      { key: REFRESH_TOKEN, enabled: true },
+    ]
+    installFetch(() => jsonResp({ error: { code: 'insufficient_credits', message: 'Insufficient balance' } }, 402))
+
+    await proxyClineChatRequest(
+      env as never, provider,
+      { model: PAID_MODEL, messages: [{ role: 'user', content: 'hi' }] },
+      { stream: false },
+    )
+    const rows = states(provider.id)
+    expect(rows).toHaveLength(1)
+    expect(rows[0].index).toBe(1)
+    expect(rows[0].masked).toBe('****mnop')
+  }, 20000)
+
   it('没有 KV 绑定（本地/测试）时只做内存冷却，不抛错', async () => {
     __resetClineAccountStateForTests()
     const provider = clineProvider([REFRESH_TOKEN])

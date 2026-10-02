@@ -423,6 +423,31 @@ describe('Cline 面板：账号冷却 / 额度耗尽 / 已禁用 的状态显示
     expect(saved!.apiKeys![0].key).toBe(RT_ROTATED)
   })
 
+  it('有禁用行时下标不错位：留档只落在它真正对应的那一行（池下标 ≠ apiKeys 下标）', async () => {
+    const { env, map } = makeEnvWithMap()
+    const RT_C = 'rt-cccccccccccccccccccc'
+    // 第 1 行禁用：池里只有第 0、2 行，池下标 1 ↔ apiKeys 下标 2
+    await setProviders(env as never, [clineProvider([
+      { key: RT_A, enabled: true },
+      { key: RT_B, enabled: false },
+      { key: RT_C, enabled: true },
+    ])])
+    installNoRotate()
+    seedState(map, {
+      index: 2, masked: '****cccc', kind: 'quota_empty',
+      until: Date.now() + 600_000, at: Date.now(), model: null, reason: 'Daily free limit reached',
+    })
+
+    const res = await mountCheck(env).request('/admin/api/providers/cline/cline-accounts/check', { method: 'POST' }, env as never)
+    const accs = ((await res.json()) as { data: { accounts: Array<Record<string, unknown>> } }).data.accounts
+    expect(accs[2].cooling).toBe(true)
+    // 被禁用的中间那行不能被误标成冷却（它的掩码对不上，判据必须拦住）
+    expect(accs[1].cooling).toBe(false)
+    expect(accs[0].cooling).toBe(false)
+    // 面板汇总只算 1 个冷却
+    expect(((await (await mountCheck(env).request('/admin/api/providers/cline/cline-accounts/check', { method: 'POST' }, env as never)).json()) as { data: { summary: string } }).data.summary).toContain('冷却中 1')
+  })
+
   it('留档已到期 → 不显示冷却（冷却一到期就必须自己消失，不靠定时清理）', async () => {
     const { env, map } = makeEnvWithMap()
     await setProviders(env as never, [clineProvider([{ key: RT_A, enabled: true }])])
