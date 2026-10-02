@@ -1,5 +1,6 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
-import { parseCooldownMs, fetchClineModels, isRunawayReasoningCutoff, isDegenerateReasoningDeltas, isWhitespaceOnlyReasoningDelta, normalizeReasoningDeltaForUI, pumpStreamAttempt, sanitizeClineMessages, isFreeClineModel, buildUpstreamBody, injectClineUpstreamPrefs, clinePinDecision, clinePinDecisionText, shouldLogClinePin, __resetClinePinLogForTests, clineMaxOutputLimit, clineMaxTokensClamp, proxyClineChatRequest, __resetClineCatalogCacheForTests, CLINE_MAX_TOKENS, CLINE_FREE_WHITELIST, CLINE_CHAT_CONNECT_TIMEOUT_MS, CLINE_MAX_TRANSPORT_ATTEMPTS, CLINE_PROBE_MAX_MS, CLINE_KEEPALIVE_MS, DEFAULT_MODEL } from './proxy'
+import { parseCooldownMs, fetchClineModels, isRunawayReasoningCutoff, isDegenerateReasoningDeltas, isWhitespaceOnlyReasoningDelta, normalizeReasoningDeltaForUI, pumpStreamAttempt, sanitizeClineMessages, isFreeClineModel, buildUpstreamBody, injectClineUpstreamPrefs, clinePinDecision, clinePinDecisionText, shouldLogClinePin, __resetClinePinLogForTests, __resetClineTrafficForTests, clineMaxOutputLimit, clineMaxTokensClamp, proxyClineChatRequest, __resetClineCatalogCacheForTests, CLINE_MAX_TOKENS, CLINE_FREE_WHITELIST, CLINE_CHAT_CONNECT_TIMEOUT_MS, CLINE_MAX_TRANSPORT_ATTEMPTS, CLINE_PROBE_MAX_MS, CLINE_KEEPALIVE_MS, DEFAULT_MODEL } from './proxy'
+import type { ClineTrafficRecord } from './proxy'
 import type { Provider } from '../types'
 
 /** 读取一个 Response 的完整文本（用于流式结果断言）。 */
@@ -959,6 +960,147 @@ describe('exclude 端到端：读留档清单 → 换算 only → 落归因日�
   }, 20000)
 })
 
+// 真实流量留档的**端到端**接线：请求真的走完 → KV 里真的有"上游实际走了哪个渠道"。
+//
+// 为什么必须端到端（不能只测 recordClineTraffic）：留档的价值全在接线——帧解析拿到的 obj、
+// 出站实际下发的偏好（sent）、收尾时机（含被拦截的尝试）三者只要有一环没接上，面板上就是空的，
+// 而单元测试全绿。用户此前已经吃过一次"面板看起来一切正常"的亏（2026-10-06 保存不生效）。
+describe('真实流量留档端到端：真实请求 → KV 里留下上游实际渠道', () => {
+  const MODEL = 'z-ai/glm-5.3-flash'
+
+  function makeTrafficEnv() {
+    const map = new Map<string, string>()
+    const env = {
+      KV: {
+        get: async (k: string) => map.get(k) ?? null,
+        put: async (k: string, v: string) => { map.set(k, v) },
+        delete: async (k: string) => { map.delete(k) },
+        list: async () => ({ keys: [] }),
+      },
+    }
+    const rec = (providerId: string): ClineTrafficRecord | null => {
+      const raw = map.get('cline:traffic:' + providerId + ':' + MODEL)
+      return raw ? JSON.parse(raw) as ClineTrafficRecord : null
+    }
+    const logs = () => [...map.entries()].filter(([k]) => k.startsWith('log:'))
+      .map(([, v]) => JSON.parse(v) as { type: string; message: string })
+    return { env, map, rec, logs }
+  }
+
+  /** 带上游路由元数据的最小可用流；metaFirst 决定元数据帧在前还是在正文之后。 */
+  function sseRoutedResp(finalProvider: string, metaFirst = true): Response {
+    const meta = `data: {"provider_metadata":{"gateway":{"routing":{"finalProvider":"${finalProvider}","fallbacksAvailable":[]}}}}\n\n`
+    const head = 'data: {"id":"c1","choices":[{"index":0,"delta":{"content":"hi"},"finish_reason":null}]}\n\n'
+    const tail = 'data: {"id":"c1","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}\n\n'
+    const body = (metaFirst ? meta + head : head + meta) + tail + 'data: [DONE]\n\n'
+    return new Response(body, { status: 200, headers: { 'Content-Type': 'text/event-stream' } })
+  }
+
+  it('流式：钉住 alibaba 且实际走 alibaba → 留档记下实走渠道与"生效"', async () => {
+    __resetClineTrafficForTests()
+    const { env, rec } = makeTrafficEnv()
+    const provider = clineProvider([REFRESH_TOKEN])
+    provider.clinePinByModel = { [MODEL]: { upstreams: ['alibaba'], pinMode: 'strict' } }
+    installFetch(() => sseRoutedResp('alibaba'))
+
+    const resp = await proxyClineChatRequest(env, provider, { model: MODEL, messages: [{ role: 'user', content: 'hi' }] }, { stream: true })
+    expect(resp.status).toBe(200)
+    await resp.text()
+
+    const r = rec(provider.id)!
+    expect(r).toBeTruthy()
+    expect(r.requests).toBe(1)
+    expect(r.routed).toBe(1)
+    expect(r.providers).toEqual({ alibaba: 1 })
+    expect(r.verdicts).toEqual({ ok: 1 })
+    expect(r.last!.finalProvider).toBe('alibaba')
+    // 自证口径：判定用的是**实际下发**的偏好，不是面板上的配置
+    expect(r.sent.only).toEqual(['alibaba'])
+    expect(r.anomalies).toEqual([])
+  }, 20000)
+
+  it('元数据帧在正文之后出现也读得到（真机两条管道位置不同）', async () => {
+    __resetClineTrafficForTests()
+    const { env, rec } = makeTrafficEnv()
+    const provider = clineProvider([REFRESH_TOKEN])
+    provider.clinePinByModel = { [MODEL]: { upstreams: ['novita'] } }
+    installFetch(() => sseRoutedResp('novita', false))
+
+    await (await proxyClineChatRequest(env, provider, { model: MODEL, messages: [{ role: 'user', content: 'hi' }] }, { stream: true })).text()
+    expect(rec(provider.id)!.last!.finalProvider).toBe('novita')
+  }, 20000)
+
+  it('实际走了白名单外的渠道 → 留档记 mismatch + 异常，并落 warn 级 [cline-route] 日志', async () => {
+    __resetClineTrafficForTests()
+    __resetClinePinLogForTests()
+    const { env, rec, logs } = makeTrafficEnv()
+    const provider = clineProvider([REFRESH_TOKEN])
+    provider.clinePinByModel = { [MODEL]: { upstreams: ['alibaba'], pinMode: 'strict' } }
+    installFetch(() => sseRoutedResp('baseten'))
+
+    await (await proxyClineChatRequest(env, provider, { model: MODEL, messages: [{ role: 'user', content: 'hi' }] }, { stream: true })).text()
+
+    const r = rec(provider.id)!
+    expect(r.verdicts).toEqual({ mismatch: 1 })
+    expect(r.anomalies).toHaveLength(1)
+    expect(r.anomalies[0].finalProvider).toBe('baseten')
+    // 聚合键可能丢更新/被限流合并，异常必须另有 append-only 的日志兜底
+    const route = logs().filter((l) => l.message.includes('[cline-route]'))
+    expect(route).toHaveLength(1)
+    expect(route[0].type).toBe('warn')
+    expect(route[0].message).toContain('钉住没生效')
+  }, 20000)
+
+  it('流里没有路由元数据 → routed=0 且判定 unknown（**绝不记成生效**）', async () => {
+    __resetClineTrafficForTests()
+    const { env, rec } = makeTrafficEnv()
+    const provider = clineProvider([REFRESH_TOKEN])
+    provider.clinePinByModel = { [MODEL]: { upstreams: ['alibaba'] } }
+    installFetch(() => sseOkResp())
+
+    await (await proxyClineChatRequest(env, provider, { model: MODEL, messages: [{ role: 'user', content: 'hi' }] }, { stream: true })).text()
+
+    const r = rec(provider.id)!
+    expect(r.requests).toBe(1)
+    expect(r.routed).toBe(0)
+    expect(r.verdicts).toEqual({ unknown: 1 })
+    expect(r.providers).toEqual({})
+  }, 20000)
+
+  it('非流式（stream:false）同样留档：同一条上游流的聚合体里也有路由证据', async () => {
+    __resetClineTrafficForTests()
+    const { env, rec } = makeTrafficEnv()
+    const provider = clineProvider([REFRESH_TOKEN])
+    provider.clinePinByModel = { [MODEL]: { upstreams: ['novita'] } }
+    installFetch(() => sseRoutedResp('novita'))
+
+    const resp = await proxyClineChatRequest(env, provider, { model: MODEL, messages: [{ role: 'user', content: 'hi' }] }, { stream: false })
+    expect(resp.status).toBe(200)
+    await resp.json()
+    expect(rec(provider.id)!.providers).toEqual({ novita: 1 })
+  }, 20000)
+
+  it('被拦截的尝试也留档：失败请求不能排除在流量画像之外', async () => {
+    __resetClineTrafficForTests()
+    const { env, rec } = makeTrafficEnv()
+    const provider = clineProvider([REFRESH_TOKEN])
+    provider.clinePinByModel = { [MODEL]: { upstreams: ['alibaba'] } }
+    // 空白洪泛 reasoning → 探测期判定退化、拦截重试；但上游**已经**宣告了实际渠道
+    const flood = 'data: {"provider_metadata":{"gateway":{"routing":{"finalProvider":"baseten"}}}}\n\n' +
+      Array.from({ length: 40 }, () => 'data: {"choices":[{"delta":{"reasoning_content":"   \\n   "}}]}\n\n').join('')
+    installFetch(() => new Response(flood, { status: 200, headers: { 'Content-Type': 'text/event-stream' } }))
+
+    const resp = await proxyClineChatRequest(env, provider, { model: MODEL, messages: [{ role: 'user', content: 'hi' }] }, { stream: true })
+    expect(resp.status).toBe(502)
+    await resp.json()
+
+    const r = rec(provider.id)!
+    expect(r.providers).toEqual({ baseten: 1 })
+    // 被拦截的尝试 ok=false：面板要能区分"路由证据有效"与"这次请求成功"
+    expect(r.last!.ok).toBe(false)
+  }, 30000)
+})
+
 // 输出预算的模型级硬上限（2026-10-05，移植 luawei1/cline2api `3f72255`）：
 // Cline 官方接口不带 maxTokens 元数据，客户端默认的 128000 会原样透传，超过模型硬上限时
 // 上游 400，而 400 属于「原样透传、不换模型」分支（proxyClineChatRequest 的「只服务点名模型」注释）——
@@ -1189,7 +1331,10 @@ describe('Cline 流式拦截归因日志（[cline-attempt]）', () => {
       expect(resp.status).toBe(502)
       await resp.json()
     })
-    const entries = puts.map((p) => JSON.parse(p.value) as { type: string; message: string; details?: string })
+    // 只看日志键空间：这条路径现在还会落流量留档（cline:traffic:*），它没有 type 字段，
+    // 混进来会把「日志出口的级别纪律」这条断言变成一句无关的解析失败
+    const entries = puts.filter((p) => p.key.startsWith('log:'))
+      .map((p) => JSON.parse(p.value) as { type: string; message: string; details?: string })
     expect(entries.every((e) => e.type === 'warn')).toBe(true)
     const attempts = entries.filter((e) => e.message.includes('[cline-attempt]') && e.message.includes('attempt='))
     expect(attempts).toHaveLength(3)

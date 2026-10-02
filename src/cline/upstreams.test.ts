@@ -5,7 +5,14 @@ import {
   parseClineUpstreamList,
   classifyClineUpstreamError,
   parseClineRoutingMeta,
+  clineRoutingFromFrame,
   judgeClinePinVerify,
+  mergeClineTraffic,
+  recordClineTraffic,
+  readClineTraffic,
+  __resetClineTrafficForTests,
+  __resetClinePinLogForTests,
+  CLINE_TRAFFIC_MIN_GAP_MS,
   probeClineProviderUpstream,
   validateClineProviderUpstream,
   verifyClineProviderUpstream,
@@ -13,6 +20,7 @@ import {
   CLINE_PROBE_UPSTREAM,
   MIN_GAP_MS,
 } from './proxy'
+import type { ClineTrafficSample } from './proxy'
 import { handleClineUpstreams, handleClineUpstreamProbe, handleClineUpstreamValidate, handleClineUpstreamVerify, normalizeClinePinByModel } from '../admin'
 import { setProviders } from '../storage'
 
@@ -517,5 +525,239 @@ describe('normalizeClinePinByModel：exclude 归一与空配置判定', () => {
   it('exclude + sort 的组合保留（排序与排除互不冲突）', () => {
     expect(normalizeClinePinByModel({ M: { exclude: ['wafer'], sort: 'cost' }, N: { sort: 'bogus' } }))
       .toEqual({ M: { exclude: ['wafer'], sort: 'cost' } })
+  })
+})
+
+// ===== 真实流量的路由结果留档（2026-10-06）=====
+//
+// 手动「验证钉住」是**抽样一次**；真实流量里每条响应帧都带 finalProvider，那才是全量证据。
+// 这一组钉住三件事：① 逐帧摘取不重复解析 JSON；② 并发/丢更新下**旧写不许把"最近一次观测"回退**；
+// ③ 异常必须另落 append-only 的系统日志——聚合键是快视图（可能丢更新、会被限流合并），日志才是真值。
+describe('clineRoutingFromFrame：从已解析的帧对象摘路由元数据（热路径零重复解析）', () => {
+  it('实测形态：provider_metadata.gateway.routing.finalProvider', () => {
+    const obj = { id: 'c1', provider_metadata: { gateway: { routing: { finalProvider: 'alibaba', fallbacksAvailable: [] } } } }
+    expect(clineRoutingFromFrame(obj)).toEqual({ finalProvider: 'alibaba', fallbacksAvailable: [] })
+  })
+
+  it('信封多一层（data 包装）也读得到：不写死层级，换管道不会静默读不到', () => {
+    const obj = { data: { provider_metadata: { gateway: { routing: { resolvedProvider: 'baseten' } } } } }
+    expect(clineRoutingFromFrame(obj).finalProvider).toBe('baseten')
+  })
+
+  it('没有路由段 → 两个 null（不猜；由判定层给 unknown）', () => {
+    expect(clineRoutingFromFrame({ choices: [{ delta: { content: 'hi' } }] }))
+      .toEqual({ finalProvider: null, fallbacksAvailable: null })
+    expect(clineRoutingFromFrame(null)).toEqual({ finalProvider: null, fallbacksAvailable: null })
+  })
+
+  it('与文本版同口径：同一帧两条路径得出同样结论（否则手动验证与流量画像会互相矛盾）', () => {
+    const text = 'data: {"provider_metadata":{"gateway":{"routing":{"finalProvider":"novita","fallbacksAvailable":["wafer"]}}}}\n\n'
+    const frame = JSON.parse(text.slice(5).trim())
+    expect(clineRoutingFromFrame(frame)).toEqual(parseClineRoutingMeta(text))
+  })
+})
+
+/** 一次观测的构造器（merge 是纯函数，用例直接喂结构而不是走 KV）。 */
+const SAMPLE = (at: number, finalProvider: string, verdict: ClineTrafficSample['verdict'] = 'ok'): ClineTrafficSample =>
+  ({ at, finalProvider, fallbacksAvailable: [], verdict, note: 'note-' + at, ok: true })
+
+/** in-isolate 聚合桶的替身（结构必须与 ClineTrafficBucket 一致，否则 merge 的签名会挡住）。 */
+function delta(over: Record<string, unknown> = {}) {
+  return {
+    providerId: 'cline', model: 'M', from: 1000, requests: 1, routed: 1,
+    providers: { alibaba: 1 }, verdicts: { ok: 1 }, last: SAMPLE(1000, 'alibaba'),
+    anomalies: [] as ClineTrafficSample[], sent: { only: ['alibaba'], order: [], sort: null },
+    ...over,
+  }
+}
+
+describe('mergeClineTraffic：并发写下的合并语义', () => {
+  it('首次（无旧值）→ 直接成为留档', () => {
+    const r = mergeClineTraffic(null, delta())
+    expect(r.requests).toBe(1)
+    expect(r.routed).toBe(1)
+    expect(r.providers).toEqual({ alibaba: 1 })
+    // to 缺省时用 from：updatedAt 不能是 0（面板用它判"留档时间"）
+    expect(r.updatedAt).toBe(1000)
+  })
+
+  it('计数与渠道次数相加（近似统计：读到的旧值偏旧总数就偏小，这是已知取舍）', () => {
+    const prev = mergeClineTraffic(null, delta())
+    const r = mergeClineTraffic(prev, delta({
+      providers: { novita: 2 }, verdicts: { mismatch: 2 }, requests: 2, routed: 2, last: SAMPLE(2000, 'novita', 'mismatch'),
+    }))
+    expect(r.requests).toBe(3)
+    expect(r.providers).toEqual({ alibaba: 1, novita: 2 })
+    expect(r.verdicts).toEqual({ ok: 1, mismatch: 2 })
+    expect(r.from).toBe(1000)
+    expect(r.last!.at).toBe(2000)
+  })
+
+  it('**旧写不许回退 last**：并发下带着旧快照的写入不能把"最近一次观测"改早', () => {
+    const prev = mergeClineTraffic(null, delta({
+      last: SAMPLE(5000, 'novita'), from: 5000, sent: { only: ['novita'], order: [], sort: null },
+    }))
+    const stale = delta({ last: SAMPLE(3000, 'alibaba'), sent: { only: ['alibaba'], order: [], sort: null } })
+    const r = mergeClineTraffic(prev, stale)
+    expect(r.last!.at).toBe(5000)
+    expect(r.last!.finalProvider).toBe('novita')
+    // sent 跟着 last 走：不能用旧请求的下发口径去解释新结论，否则面板会自相矛盾
+    expect(r.sent.only).toEqual(['novita'])
+    // 但计数照加：丢的是"新"不是"量"
+    expect(r.requests).toBe(2)
+  })
+
+  it('anomalies：同一 (at, 渠道) 去重、新→旧排序、封顶 5 条', () => {
+    const many = (n: number, base = 1000) =>
+      Array.from({ length: n }, (_, i) => SAMPLE(base + i, 'baseten', 'mismatch'))
+    let r = mergeClineTraffic(null, delta({ anomalies: many(3) }))
+    r = mergeClineTraffic(r, delta({ anomalies: [SAMPLE(1002, 'baseten', 'mismatch')] }))
+    expect(r.anomalies.filter((a) => a.at === 1002)).toHaveLength(1)
+    expect(r.anomalies.map((a) => a.at)).toEqual([1002, 1001, 1000])
+    r = mergeClineTraffic(r, delta({ anomalies: many(10, 2000) }))
+    expect(r.anomalies).toHaveLength(5)
+    expect(r.anomalies[0].at).toBe(2009)
+  })
+
+  it('readClineTraffic 对损坏/缺字段的留档做兜底（不抛、不把 undefined 喂给面板）', async () => {
+    const { env, map } = makeEnv()
+    map.set('cline:traffic:cline:M', 'not-json')
+    expect(await readClineTraffic(env, 'cline', 'M')).toBeNull()
+    map.set('cline:traffic:cline:M', JSON.stringify({ model: 'M', requests: 3 }))
+    const r = await readClineTraffic(env, 'cline', 'M')
+    expect(r).toMatchObject({ requests: 3, routed: 0, providers: {}, anomalies: [], last: null })
+    expect(await readClineTraffic(env, 'cline', 'N')).toBeNull()
+  })
+})
+
+const trafficKeys = (map: Map<string, string>) => [...map.keys()].filter((k) => k.startsWith('cline:traffic:'))
+const logEntries = (map: Map<string, string>) =>
+  [...map.entries()].filter(([k]) => k.startsWith('log:')).map(([, v]) => JSON.parse(v) as { type: string; message: string })
+
+describe('recordClineTraffic：限流合并 + 落盘 + 异常落日志', () => {
+  // 白名单含 alibaba + novita：这两条是"正常流量"，异常用例显式喂 baseten
+  const CTX = (env: Env, model = 'M') =>
+    ({ env, providerId: 'cline', model, sent: { only: ['alibaba', 'novita'], order: [], sort: null } })
+
+  it('首条立即落盘；窗口内的连发合并进桶（不写 KV），窗口过后一次写清', async () => {
+    __resetClineTrafficForTests()
+    const { env, map } = makeEnv()
+    const t0 = 1_700_000_000_000
+    const now = vi.spyOn(Date, 'now').mockReturnValue(t0)
+    try {
+      await recordClineTraffic(CTX(env), { finalProvider: 'alibaba', fallbacksAvailable: [] }, true)
+      expect(trafficKeys(map)).toHaveLength(1)
+
+      // 5 秒窗口内的连发不落盘：KV 写配额是所有功能共享的，写爆了连提供商配置都存不进去
+      now.mockReturnValue(t0 + 1000)
+      await recordClineTraffic(CTX(env), { finalProvider: 'novita', fallbacksAvailable: [] }, true)
+      expect(trafficKeys(map)).toHaveLength(1)
+
+      now.mockReturnValue(t0 + CLINE_TRAFFIC_MIN_GAP_MS + 1)
+      await recordClineTraffic(CTX(env), { finalProvider: 'novita', fallbacksAvailable: [] }, true)
+      // 同一个模型只占一个键（面板读取 = 1 次 KV.get/模型，不是 list 全量扫）
+      expect(trafficKeys(map)).toHaveLength(1)
+
+      const rec = await readClineTraffic(env, 'cline', 'M')
+      expect(rec!.requests).toBe(3)
+      expect(rec!.routed).toBe(3)
+      expect(rec!.providers).toEqual({ alibaba: 1, novita: 2 })
+      expect(rec!.verdicts).toEqual({ ok: 3 })
+      expect(rec!.last!.finalProvider).toBe('novita')
+    } finally { now.mockRestore() }
+  })
+
+  it('读不到路由元数据 → routed=0 且判定 unknown（**不许记成生效**）', async () => {
+    __resetClineTrafficForTests()
+    const { env } = makeEnv()
+    await recordClineTraffic(CTX(env), null, true)
+    const rec = await readClineTraffic(env, 'cline', 'M')
+    expect(rec!.requests).toBe(1)
+    expect(rec!.routed).toBe(0)
+    expect(rec!.providers).toEqual({})
+    expect(rec!.verdicts).toEqual({ unknown: 1 })
+    expect(rec!.last!.verdict).toBe('unknown')
+  })
+
+  it('没配钉住 → unpinned（真实流量照记，只是"无事可验"）', async () => {
+    __resetClineTrafficForTests()
+    const { env } = makeEnv()
+    const ctx = { ...CTX(env), sent: { only: [], order: [], sort: null } }
+    await recordClineTraffic(ctx, { finalProvider: 'alibaba', fallbacksAvailable: [] }, true)
+    const rec = await readClineTraffic(env, 'cline', 'M')
+    expect(rec!.verdicts).toEqual({ unpinned: 1 })
+    expect(rec!.providers).toEqual({ alibaba: 1 })
+  })
+
+  it('每个模型一条留档：不同模型的观测不互相污染', async () => {
+    __resetClineTrafficForTests()
+    const { env, map } = makeEnv()
+    await recordClineTraffic(CTX(env, 'M'), { finalProvider: 'alibaba', fallbacksAvailable: [] }, true)
+    __resetClineTrafficForTests() // 只清聚合桶，不清已落盘的 KV
+    await recordClineTraffic(CTX(env, 'N'), { finalProvider: 'novita', fallbacksAvailable: [] }, true)
+    expect(trafficKeys(map).sort()).toEqual(['cline:traffic:cline:M', 'cline:traffic:cline:N'])
+    expect((await readClineTraffic(env, 'cline', 'M'))!.providers).toEqual({ alibaba: 1 })
+    expect((await readClineTraffic(env, 'cline', 'N'))!.providers).toEqual({ novita: 1 })
+  })
+
+  it('异常（实际渠道违反白名单）→ 落 **warn** 级 [cline-route] 系统日志，5 分钟内不重复', async () => {
+    __resetClineTrafficForTests()
+    __resetClinePinLogForTests()
+    const { env, map } = makeEnv()
+    const t0 = 1_700_000_000_000
+    const now = vi.spyOn(Date, 'now').mockReturnValue(t0)
+    try {
+      await recordClineTraffic(CTX(env), { finalProvider: 'baseten', fallbacksAvailable: [] }, true)
+      now.mockReturnValue(t0 + CLINE_TRAFFIC_MIN_GAP_MS + 1)
+      await recordClineTraffic(CTX(env), { finalProvider: 'baseten', fallbacksAvailable: [] }, true)
+
+      const route = logEntries(map).filter((l) => l.message.includes('[cline-route]'))
+      // 结论完全相同，重复落盘没有信息量——持续失效时每 5 秒一条会把面板刷满
+      expect(route).toHaveLength(1)
+      // 异常是告警：走 warn（info 出口留给正常路径的 [cline-pin]）
+      expect(route[0].type).toBe('warn')
+      expect(route[0].message).toContain('钉住没生效')
+      expect(route[0].message).toContain('baseten')
+
+      // 聚合键里两条异常都在：日志与快视图各司其职，不能因为去重就把计数也吞掉
+      const rec = await readClineTraffic(env, 'cline', 'M')
+      expect(rec!.verdicts).toEqual({ mismatch: 2 })
+      expect(rec!.anomalies).toHaveLength(2)
+    } finally { now.mockRestore() }
+  })
+
+  it('正常流量不写系统日志（否则日志出口会被正常请求灌满）', async () => {
+    __resetClineTrafficForTests()
+    __resetClinePinLogForTests()
+    const { env, map } = makeEnv()
+    await recordClineTraffic(CTX(env), { finalProvider: 'alibaba', fallbacksAvailable: [] }, true)
+    expect(logEntries(map).filter((l) => l.message.includes('[cline-route]'))).toHaveLength(0)
+  })
+})
+
+describe('面板端点：GET cline-upstreams 带回真实流量留档', () => {
+  it('已留档的模型直接回传（打开面板就看到流量画像，不必再打上游）', async () => {
+    const { env, map } = makeEnv()
+    await setProviders(env, [clineProvider({ clinePinByModel: { M: { upstreams: ['alibaba'] } } })])
+    map.set('cline:traffic:cline:M', JSON.stringify({
+      model: 'M', requests: 7, routed: 7, providers: { alibaba: 5, baseten: 2 },
+      verdicts: { ok: 5, mismatch: 2 },
+      last: SAMPLE(9, 'baseten', 'mismatch'),
+      anomalies: [SAMPLE(9, 'baseten', 'mismatch')],
+      sent: { only: ['alibaba'], order: [], sort: null }, from: 1, updatedAt: 9,
+    }))
+    const app = new Hono()
+    app.get('/admin/api/providers/:id/cline-upstreams', handleClineUpstreams)
+
+    const res = await app.request('/admin/api/providers/cline/cline-upstreams', {}, env as never)
+    expect(res.status).toBe(200)
+    const d = await res.json() as {
+      data: { traffic: Record<string, { requests: number; providers: Record<string, number>; anomalies: unknown[] }> }
+    }
+    expect(d.data.traffic.M.requests).toBe(7)
+    expect(d.data.traffic.M.providers).toEqual({ alibaba: 5, baseten: 2 })
+    expect(d.data.traffic.M.anomalies).toHaveLength(1)
+    // 没有留档的模型不出现在 traffic 里（面板据此决定要不要渲染那一行）
+    expect(d.data.traffic['cline-free/deepseek-v4.1-flash']).toBeUndefined()
   })
 })

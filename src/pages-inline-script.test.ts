@@ -350,6 +350,7 @@ function makePanel(html: string) {
       ' setData: function (d) { _clineUpData["cline"] = d },' +
       ' pins: function () { return _clineUpData["cline"].pins },' +
       ' render: clineUpstreamsRender, save: clineUpstreamsSave, bulk: clineUpstreamsBulk,' +
+      ' trafficText: clineUpTrafficText, trafficBad: clineUpTrafficAnomalyText,' +
       ' queue: queueProviderWrite }'
   )
   const api = factory(document, fetchStub, (s: string) => String(s))
@@ -540,6 +541,81 @@ describe('Cline 面板：渲染回显与即时保存（DOM 替身驱动客户端
     await blocker
     await flush()
     expect(p.net.calls.some((c) => c.url.includes('/verify'))).toBe(true)
+  })
+
+  // 真实流量的路由画像：手动「验证钉住」只是抽样一次，这一行才是全量证据（每条真实请求都留档）。
+  // 面板上最容易出的错不是算错数，而是把「读不到路由信息」渲染成「生效」——那正是这套东西要消灭的。
+  describe('真实流量画像', () => {
+    const rec = (over: Record<string, unknown> = {}) => ({
+      model: 'M', requests: 12, routed: 12,
+      providers: { alibaba: 10, baseten: 2 },
+      verdicts: { ok: 10, mismatch: 2 },
+      last: {
+        at: 1759700000000, finalProvider: 'baseten', fallbacksAvailable: [],
+        verdict: 'mismatch', note: '实际走 baseten，不在白名单 [alibaba] 内——钉住没生效', ok: true,
+      },
+      anomalies: [{
+        at: 1759700000000, finalProvider: 'baseten', fallbacksAvailable: [],
+        verdict: 'mismatch', note: '实际走 baseten，不在白名单 [alibaba] 内——钉住没生效', ok: true,
+      }],
+      sent: { only: ['alibaba'], order: [], sort: null }, from: 1, updatedAt: 9,
+      ...over,
+    })
+
+    it('一行说清：多少流量、读没读到路由、实走哪些渠道各几次、判定计数、最近一次', async () => {
+      const p = makePanel(await render([traeProvider()]))
+      const t = p.api.trafficText(rec())
+      expect(t).toContain('真实流量 12 次')
+      expect(t).toContain('读到路由 12 次')
+      // 按次数降序：用户要一眼看出主走哪个渠道
+      expect(t).toContain('实走 alibaba×10 · baseten×2')
+      expect(t).toContain('判定 生效×10 · 未生效×2')
+      expect(t).toContain('→ baseten')
+    })
+
+    it('渠道多时只列前 3，其余折成「等 N 个」（一行不能撑爆表格）', async () => {
+      const p = makePanel(await render([traeProvider()]))
+      const t = p.api.trafficText(rec({ providers: { a: 1, b: 5, c: 3, d: 2, e: 9 } }))
+      expect(t).toContain('实走 e×9 · b×5 · c×3 · 等 5 个')
+    })
+
+    it('读不到路由信息 → 明说「无法判定」，且**不出现任何"生效"字样**（不许把没验证伪装成验证过）', async () => {
+      const p = makePanel(await render([traeProvider()]))
+      const t = p.api.trafficText(rec({
+        routed: 0, providers: {}, verdicts: { unknown: 12 },
+        last: { at: 1, finalProvider: null, fallbacksAvailable: null, verdict: 'unknown', note: '未读到路由元数据', ok: true },
+      }))
+      expect(t).toContain('没读到路由信息（无法判定）')
+      expect(t).not.toContain('生效')
+    })
+
+    it('异常单独一行带最近一次原文（计数说不出"是配置错了还是上游不服从"）', async () => {
+      const p = makePanel(await render([traeProvider()]))
+      expect(p.api.trafficBad(rec())).toContain('实测未生效 1 次')
+      expect(p.api.trafficBad(rec())).toContain('不在白名单 [alibaba] 内')
+      expect(p.api.trafficBad(rec({ anomalies: [] }))).toBe('')
+      // 没有留档时两个函数都必须返回空串（面板据此决定不渲染那一行）
+      expect(p.api.trafficText(null)).toBe('')
+      expect(p.api.trafficText(rec({ requests: 0 }))).toBe('')
+    })
+
+    it('渲染进模型行；没有留档就不渲染那一行（不显示 undefined/空行）', async () => {
+      const p = makePanel(await render([traeProvider()]))
+      p.api.setData({
+        models: ['M'], pins: { M: { upstreams: ['alibaba'] } },
+        probes: { M: { upstreams: ['alibaba'], pipeline: 'planner' } }, checks: {}, traffic: { M: rec() },
+      })
+      p.api.render('cline')
+      expect(p.box.innerHTML).toContain('真实流量 12 次')
+      expect(p.box.innerHTML).toContain('⚠ 实测未生效 1 次')
+
+      p.api.setData({
+        models: ['M'], pins: {}, probes: { M: { upstreams: ['alibaba'], pipeline: 'planner' } }, checks: {},
+      })
+      p.api.render('cline')
+      expect(p.box.innerHTML).not.toContain('真实流量')
+      expect(p.box.innerHTML).not.toContain('undefined')
+    })
   })
 })
 

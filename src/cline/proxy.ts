@@ -1055,7 +1055,9 @@ interface StreamAttemptOutcome {
 /** @internal 流式尝试的探测 + 后台续流（导出供测试验证流式语义）。 */
 export async function pumpStreamAttempt(
   resp: Response,
-  onRunaway?: () => void
+  onRunaway?: () => void,
+  /** 真实流量留档上下文：给了才会把"上游实际走了哪个渠道"落库（面板的流量视图）。 */
+  traffic?: ClineTrafficContext
 ): Promise<StreamAttemptOutcome> {  const reader = resp.body!.getReader()
   const decoder = new TextDecoder()
   const encoder = new TextEncoder()
@@ -1077,17 +1079,36 @@ export async function pumpStreamAttempt(
     hasToolCalls: false,
   }
   /**
+   * 本请求观测到的路由元数据（`provider_metadata.gateway.routing`）。**每请求一份**，
+   * 因为它描述的是"这次上游把请求交给了谁"，与帧无关；只保留最后一次出现（后帧更权威，
+   * 与 parseClineRoutingMeta 的覆盖语义一致）。
+   */
+  let routing: ClineRoutingMeta | null = null
+  /**
    * 记录一帧的终态统计（探测期与续流期共用，保证 sawFinish 在两条路径上都被置位）。
    *
    * sawFinish 是「上游是否正常收尾」的唯一判据：探测期缓冲的帧由 flushHealthy 直接
    * 写回、不经过 routeToStream，所以只在一处统计会漏掉探测期见到的 finish_reason。
+   *
+   * 路由元数据也在这里摘（而不是在 routeToStream）：探测期的帧**不经过** routeToStream，
+   * 只在那一处摘会漏掉"上游在探测期就已宣告实际渠道"的情况——而那正是最常见的情况。
+   * obj 是已经 parse 过的对象，这里是纯遍历，不重复解析 JSON。
    */
-  const noteFacts = (facts: FrameFacts) => {
+  const noteFacts = (facts: FrameFacts, obj?: Record<string, unknown> | null) => {
     state.frames++
     state.contentChars += facts.contentChars
     if (facts.reasoningDelta !== null) state.reasoningChars += (facts.reasoningDelta as string).length
     if (facts.finishReason) state.sawFinish = true
     if (facts.hasToolCalls) state.hasToolCalls = true
+    if (traffic && obj) {
+      const r = clineRoutingFromFrame(obj)
+      if (r.finalProvider || r.fallbacksAvailable) routing = r
+    }
+  }
+  /** 本次尝试收尾时的流量留档（所有出口共用；ok=是否产出了可用流）。 */
+  const finishTraffic = async (ok: boolean): Promise<void> => {
+    if (!traffic) return
+    await recordClineTraffic(traffic, routing, ok)
   }
   let buf = ''
   const probeDeltas: string[] = []   // 探测期收集的 reasoning delta
@@ -1144,7 +1165,7 @@ export async function pumpStreamAttempt(
     let obj: Record<string, unknown> | null = null
     try { obj = unwrapData(JSON.parse(payload)) as Record<string, unknown> } catch { obj = null }
     const facts = inspectFrame(obj)
-    noteFacts(facts)
+    noteFacts(facts, obj)
     const isReasoning = facts.reasoningDelta !== null
     if (isReasoning) {
       state.ring.push(facts.reasoningDelta as string)
@@ -1189,59 +1210,67 @@ export async function pumpStreamAttempt(
     state.ring = probeDeltas.slice(-RING_SIZE)
     void (async () => {
       armHeartbeat(w)
-      // 先写探测期缓冲的帧
-      for (const f of initial) {
-        lastEmitAt = Date.now()
-        await w.write(encoder.encode(f))
-      }
-      let cbuf = continuationBuf
-      // 排空探测期已读入但尚未处理的整行
-      let ci: number
-      while ((ci = cbuf.indexOf('\n')) >= 0) {
-        const line = cbuf.slice(0, ci)
-        cbuf = cbuf.slice(ci + 1)
-        await routeToStream(line, w)
-      }
       let abnormal = false
-      // 探测期超时放行时那次仍在飞的 read 排在本轮队首，必须先消费它
-      let carried: Promise<ReadableStreamReadResult<Uint8Array>> | null = firstRead ?? null
       try {
-        while (true) {
-          const r = carried ?? reader.read()
-          carried = null
-          const { done, value } = await r
-          if (done) break
-          cbuf += decoder.decode(value, { stream: true })
-          let idx: number
-          while ((idx = cbuf.indexOf('\n')) >= 0) {
-            const line = cbuf.slice(0, idx)
-            cbuf = cbuf.slice(idx + 1)
-            await routeToStream(line, w)
+        // 先写探测期缓冲的帧
+        for (const f of initial) {
+          lastEmitAt = Date.now()
+          await w.write(encoder.encode(f))
+        }
+        let cbuf = continuationBuf
+        // 排空探测期已读入但尚未处理的整行
+        let ci: number
+        while ((ci = cbuf.indexOf('\n')) >= 0) {
+          const line = cbuf.slice(0, ci)
+          cbuf = cbuf.slice(ci + 1)
+          await routeToStream(line, w)
+        }
+        // 探测期超时放行时那次仍在飞的 read 排在本轮队首，必须先消费它
+        let carried: Promise<ReadableStreamReadResult<Uint8Array>> | null = firstRead ?? null
+        try {
+          while (true) {
+            const r = carried ?? reader.read()
+            carried = null
+            const { done, value } = await r
+            if (done) break
+            cbuf += decoder.decode(value, { stream: true })
+            let idx: number
+            while ((idx = cbuf.indexOf('\n')) >= 0) {
+              const line = cbuf.slice(0, idx)
+              cbuf = cbuf.slice(idx + 1)
+              await routeToStream(line, w)
+            }
           }
+        } catch {
+          // 上游流异常（网络重置/断连等）：不再静默截断。给客户端发一帧错误后再收尾，
+          // 让 DSH 等客户端按可重试错误快速处理，而不是对着一个没有 finish_reason 的
+          // 半截流干等超时。帧格式与上方 upstream_runaway 错误帧一致。
+          abnormal = true
+          const errMsg = { error: { message: 'Cline 上游流中途断开，连接异常终止', type: 'upstream_interrupted' } }
+          await w.write(encoder.encode('data: ' + JSON.stringify(errMsg) + '\n\n')).catch(() => {})
         }
-      } catch {
-        // 上游流异常（网络重置/断连等）：不再静默截断。给客户端发一帧错误后再收尾，
-        // 让 DSH 等客户端按可重试错误快速处理，而不是对着一个没有 finish_reason 的
-        // 半截流干等超时。帧格式与上方 upstream_runaway 错误帧一致。
-        abnormal = true
-        const errMsg = { error: { message: 'Cline 上游流中途断开，连接异常终止', type: 'upstream_interrupted' } }
-        await w.write(encoder.encode('data: ' + JSON.stringify(errMsg) + '\n\n')).catch(() => {})
-      }
-      // 上游「干净结束」但全程没发 finish_reason：此前直接 w.close()，客户端只看到半截流，
-      // DSH 归类成 TRANSPORT 的 Stream ended without finish_reason 并白重试 5 次（实测
-      // 2026-09-25 一轮 6 次全挂、约 77 秒）。补一帧具名错误，把静默截断变成可归因的失败。
-      // 注意：探测期缓冲帧由上面 initial 循环直接写回、不过 routeToStream，故 sawFinish
-      // 必须由 noteFacts 在探测期也置位（见 state 上方注释）。
-      if (!abnormal && !state.sawFinish) {
-        const detail =
-          `frames=${state.frames}, content=${state.contentChars}, reasoning=${state.reasoningChars}, toolCalls=${state.hasToolCalls}`
-        const errMsg = {
-          error: { message: `Cline 上游流未发送 finish_reason 即结束（疑似截断）：${detail}`, type: 'upstream_no_finish' },
+        // 上游「干净结束」但全程没发 finish_reason：此前直接 w.close()，客户端只看到半截流，
+        // DSH 归类成 TRANSPORT 的 Stream ended without finish_reason 并白重试 5 次（实测
+        // 2026-09-25 一轮 6 次全挂、约 77 秒）。补一帧具名错误，把静默截断变成可归因的失败。
+        // 注意：探测期缓冲帧由上面 initial 循环直接写回、不过 routeToStream，故 sawFinish
+        // 必须由 noteFacts 在探测期也置位（见 state 上方注释）。
+        if (!abnormal && !state.sawFinish) {
+          const detail =
+            `frames=${state.frames}, content=${state.contentChars}, reasoning=${state.reasoningChars}, toolCalls=${state.hasToolCalls}`
+          const errMsg = {
+            error: { message: `Cline 上游流未发送 finish_reason 即结束（疑似截断）：${detail}`, type: 'upstream_no_finish' },
+          }
+          await w.write(encoder.encode('data: ' + JSON.stringify(errMsg) + '\n\n')).catch(() => {})
         }
-        await w.write(encoder.encode('data: ' + JSON.stringify(errMsg) + '\n\n')).catch(() => {})
+      } finally {
+        // 收尾必须放在 finally：客户端中途断开时上面的 w.write 会抛，若不留档就正好丢掉
+        // 「被断开的那次请求实际走了哪个渠道」——而那恰恰是最需要看的样本。
+        stopHeartbeat()
+        // 留档在 close 之前 await：观测必须在响应真正结束前落盘，否则 isolate 可能先被回收，
+        // 留下「发过请求却没有任何记录」的洞（同 logClineAttempt 的确定性取舍）。
+        await finishTraffic(!abnormal && state.sawFinish)
+        await w.close().catch(() => {})
       }
-      stopHeartbeat()
-      await w.close().catch(() => {})
     })().catch(() => {
       // 客户端在续流途中断开：TransformStream 写入会 reject，属正常收尾，不外抛
     })
@@ -1272,20 +1301,26 @@ export async function pumpStreamAttempt(
    * 拦截出口统一构造器：除 kind 外附带 detail（命中分支）+ 现场计数。
    * 此前只有聚合 502（「退化/空响应/截断」三合一文案），线上无法分辨到底中了哪一种；
    * detail 是唯一能定性的字段，新增拦截分支时**必须**给出新的 detail 值。
+   *
+   * 为什么是 async：拦截路径也要留流量观测（被拦截的那一轮**照样**从上游拿到了真实路由结果，
+   * 丢掉它等于把"最需要看的失败请求"排除在流量画像之外）。
    */
-  const failed = (kind: 'degenerate' | 'empty', detail: string): StreamAttemptOutcome => ({
-    kind,
-    detail,
-    stats: {
-      frames: state.frames,
-      content: state.contentChars,
-      reasoning: state.reasoningChars,
-      buffered: buffered.length,
-      sawFinish: state.sawFinish,
-      probeReadError: probeErrored,
-      frameSkeleton: frameSkeleton || '(无 data 帧)',
-    },
-  })
+  const failed = async (kind: 'degenerate' | 'empty', detail: string): Promise<StreamAttemptOutcome> => {
+    await finishTraffic(false)
+    return {
+      kind,
+      detail,
+      stats: {
+        frames: state.frames,
+        content: state.contentChars,
+        reasoning: state.reasoningChars,
+        buffered: buffered.length,
+        sawFinish: state.sawFinish,
+        probeReadError: probeErrored,
+        frameSkeleton: frameSkeleton || '(无 data 帧)',
+      },
+    }
+  }
   try {
     while (true) {
       const readOnce = pendingRead ?? (pendingRead = reader.read())
@@ -1330,7 +1365,7 @@ export async function pumpStreamAttempt(
         try { obj = unwrapData(JSON.parse(payload)) as Record<string, unknown> } catch { obj = null }
         if (!frameSkeleton) frameSkeleton = describeFrameSkeleton(obj, payload)
         const facts = inspectFrame(obj)
-        noteFacts(facts)
+        noteFacts(facts, obj)
         const isReasoning = facts.reasoningDelta !== null
         if (isReasoning) probeDeltas.push(facts.reasoningDelta as string)
         // 纯空白 "\n" 排版噪声：照常计入 probeDeltas（退化判定依赖空白占比），
@@ -1486,7 +1521,9 @@ async function proxyStreamChat(
   body: Record<string, unknown>,
   sessionId: string,
   clientSignal?: AbortSignal,
-  env?: Env
+  env?: Env,
+  /** 真实流量留档上下文：透传给每次流式尝试（含被拦截重试的那几轮）。 */
+  traffic?: ClineTrafficContext
 ): Promise<Response> {
   const model = String((body as Record<string, unknown>).model || '')
   /** 三次尝试的定性结果（kind:detail），用于聚合 502 时一行说清「空在哪一种」。 */
@@ -1505,7 +1542,8 @@ async function proxyStreamChat(
     }
     const outcome = await pumpStreamAttempt(
       resp,
-      () => applyModelCooldown(pool, model, CLINE_COOLDOWN_RUNAWAY_MS, clientSignal)
+      () => applyModelCooldown(pool, model, CLINE_COOLDOWN_RUNAWAY_MS, clientSignal),
+      traffic
     )
     if (outcome.kind === 'healthy') return outcome.response!
     // 客户端已断开：不再冷却、不再重试，直接放弃本轮（上游白烧的代价已止住）
@@ -1592,6 +1630,8 @@ interface AggregatedChat {
   sawDone: boolean
   /** 上游在 200 之后于流内下发的具名错误帧（代理常把 502/504 这样塞进 SSE）。 */
   streamError: string
+  /** 本段流里读到的路由元数据（上游实际走了哪个渠道）；读不到为 null。 */
+  routing: ClineRoutingMeta | null
 }
 
 /** 读取整段上游 SSE，累积 content / reasoning / tool_calls / usage，返回聚合后的 chat 状态。 */
@@ -1599,7 +1639,7 @@ async function aggregateStream(upstream: Response): Promise<AggregatedChat> {
   const reader = upstream.body!.getReader()
   const decoder = new TextDecoder()
   const toolIndex = new Map<number, number>()
-  const acc: AggregatedChat = { id: '', model: '', created: 0, content: '', reasoning: '', toolCalls: [], usage: null, finishReason: '', sawDone: false, streamError: '' }
+  const acc: AggregatedChat = { id: '', model: '', created: 0, content: '', reasoning: '', toolCalls: [], usage: null, finishReason: '', sawDone: false, streamError: '', routing: null }
   let buf = ''
   while (true) {
     const { done, value } = await reader.read()
@@ -1631,6 +1671,10 @@ async function aggregateStream(upstream: Response): Promise<AggregatedChat> {
         if (o.model) acc.model = String(o.model)
         if (o.created) acc.created = Number(o.created)
         if (o.usage) acc.usage = o.usage as Record<string, unknown>
+        // 路由元数据与 content 无关，可能出现在任意一帧（实测常与 usage 同帧）；读到即覆盖
+        // （后帧更权威，与 parseClineRoutingMeta 的语义一致）。非流式路径同样要留流量观测。
+        const r = clineRoutingFromFrame(o)
+        if (r.finalProvider || r.fallbacksAvailable) acc.routing = r
         const choice = (((o.choices as Array<Record<string, unknown>>) || [])[0]) as Record<string, unknown> | undefined
         if (!choice) continue
         if (choice.finish_reason) acc.finishReason = String(choice.finish_reason)
@@ -1682,63 +1726,80 @@ function chatCompletionFromAgg(a: AggregatedChat): Record<string, unknown> {
  * - 正常收尾但正文为空（含推理空转被 length 截断）→ 冷却切号重试（最多 3 次），
  *   最后仍空则把 reasoning 兜底拼进 content，避免"静默不回复"（item5）。
  */
-async function proxyNonStreamChat(pool: Pool, body: Record<string, unknown>, sessionId: string, clientSignal?: AbortSignal): Promise<Response> {
+async function proxyNonStreamChat(
+  pool: Pool,
+  body: Record<string, unknown>,
+  sessionId: string,
+  clientSignal?: AbortSignal,
+  traffic?: ClineTrafficContext
+): Promise<Response> {
   // 恒流式前置：无论调用方 body 是否带 stream，一律强制 stream:true，
   // 否则免费通道非流式返回 500 "empty response content"（item4 修复测试/直连等手工 body 场景）。
   body['stream'] = true
   let last: AggregatedChat | null = null
-  for (let attempt = 0; attempt < 3; attempt++) {
-    if (clientSignal?.aborted) throw clientAbortedError()
-    const resp = await clineFetchWithRetry(pool, '/chat/completions', body, sessionId, true, 4, clientSignal)
-    if (!resp.ok) {
-      // 402 余额耗尽是我们自己合成的响应（已带明确 message 与 type），原样透传不二次包装
-      if (resp.headers.get('X-Cline-Plan-Exhausted')) return resp
-      const errText = await resp.text().catch(() => '')
-      return jsonResponse(
-        { error: { message: `Cline 上游 HTTP ${resp.status}: ${errText.slice(0, 300)}`, type: 'upstream_error' } },
-        resp.status || 502
-      )
-    }
-    const agg = await aggregateStream(resp)
-    last = agg
-    // 上游流内错误帧：200 里塞的具名失败（排队超时 / 空闲 504）。此前整帧被忽略，
-    // 结果是回 200 + 空 content，客户端看到「成功但什么都没说」。
-    if (agg.streamError) {
-      return jsonResponse(
-        { error: { message: `Cline 上游流内报错：${agg.streamError.slice(0, 300)}`, type: 'upstream_stream_error' } },
-        502,
-      )
-    }
-    // 流被中途截断（全程既没见 [DONE] 也没有 finish_reason）：**即使已有部分正文也不谎报成功**，
-    // 与流式路径同口径（探测期丢弃半截帧、交给上层重试，见 pumpStreamAttempt 的截断分支）。
-    // 不冷却账号：截断多来自网关/中间层掐连接，不是账号本身的问题，冷却只会连坐好号。
-    if (!agg.sawDone && !agg.finishReason) {
-      return jsonResponse(
-        {
-          error: {
-            message: `Cline 上游流未发送 finish_reason/[DONE] 即结束（疑似截断）：chars=${agg.content.length}, reasoning=${agg.reasoning.length}, toolCalls=${agg.toolCalls.length}`,
-            type: 'upstream_truncated',
+  // 真实流量留档：非流式是**同一段上游流**聚合出来的，路由证据一样有效，不能只在流式路径记。
+  // 用 try/finally 收口：本函数有多条 return（成功 / 流内错误 / 截断 / 空响应兜底），
+  // 逐条补留档必然漏一条——而漏掉的那条恰好会是"失败请求"。
+  try {
+    for (let attempt = 0; attempt < 3; attempt++) {
+      if (clientSignal?.aborted) throw clientAbortedError()
+      const resp = await clineFetchWithRetry(pool, '/chat/completions', body, sessionId, true, 4, clientSignal)
+      if (!resp.ok) {
+        // 402 余额耗尽是我们自己合成的响应（已带明确 message 与 type），原样透传不二次包装
+        if (resp.headers.get('X-Cline-Plan-Exhausted')) return resp
+        const errText = await resp.text().catch(() => '')
+        return jsonResponse(
+          { error: { message: `Cline 上游 HTTP ${resp.status}: ${errText.slice(0, 300)}`, type: 'upstream_error' } },
+          resp.status || 502
+        )
+      }
+      const agg = await aggregateStream(resp)
+      last = agg
+      // 上游流内错误帧：200 里塞的具名失败（排队超时 / 空闲 504）。此前整帧被忽略，
+      // 结果是回 200 + 空 content，客户端看到「成功但什么都没说」。
+      if (agg.streamError) {
+        return jsonResponse(
+          { error: { message: `Cline 上游流内报错：${agg.streamError.slice(0, 300)}`, type: 'upstream_stream_error' } },
+          502,
+        )
+      }
+      // 流被中途截断（全程既没见 [DONE] 也没有 finish_reason）：**即使已有部分正文也不谎报成功**，
+      // 与流式路径同口径（探测期丢弃半截帧、交给上层重试，见 pumpStreamAttempt 的截断分支）。
+      // 不冷却账号：截断多来自网关/中间层掐连接，不是账号本身的问题，冷却只会连坐好号。
+      if (!agg.sawDone && !agg.finishReason) {
+        return jsonResponse(
+          {
+            error: {
+              message: `Cline 上游流未发送 finish_reason/[DONE] 即结束（疑似截断）：chars=${agg.content.length}, reasoning=${agg.reasoning.length}, toolCalls=${agg.toolCalls.length}`,
+              type: 'upstream_truncated',
+            },
           },
-        },
-        502,
-      )
-    }
-    if (agg.content) return jsonResponse(chatCompletionFromAgg(agg), 200)
-    // 推理空转被截断（length + 无正文/无工具调用）：预算烧在 reasoning 上未产出 → 冷却切号重试
-    if (isRunawayReasoningCutoff(agg.content, agg.toolCalls, agg.finishReason)) {
-      if (pool.current) cooldownAccount(pool.current, CLINE_COOLDOWN_RUNAWAY_MS)
+          502,
+        )
+      }
+      if (agg.content) return jsonResponse(chatCompletionFromAgg(agg), 200)
+      // 推理空转被截断（length + 无正文/无工具调用）：预算烧在 reasoning 上未产出 → 冷却切号重试
+      if (isRunawayReasoningCutoff(agg.content, agg.toolCalls, agg.finishReason)) {
+        if (pool.current) cooldownAccount(pool.current, CLINE_COOLDOWN_RUNAWAY_MS)
+        await sleep(500 + Math.random() * 500)
+        continue
+      }
+      // 有正常结束原因但无文本：不空转重试（如 stop/tool_calls 但 content 空，属合法但不该重试）
+      if (agg.finishReason) break
+      // 客户端已断开：放弃本轮且不冷却账号（移植 4265b29）
+      if (clientSignal?.aborted) throw clientAbortedError()
+      if (pool.current) cooldownAccount(pool.current, CLINE_COOLDOWN_EMPTY_MS)
       await sleep(500 + Math.random() * 500)
-      continue
     }
-    // 有正常结束原因但无文本：不空转重试（如 stop/tool_calls 但 content 空，属合法但不该重试）
-    if (agg.finishReason) break
-    // 客户端已断开：放弃本轮且不冷却账号（移植 4265b29）
-    if (clientSignal?.aborted) throw clientAbortedError()
-    if (pool.current) cooldownAccount(pool.current, CLINE_COOLDOWN_EMPTY_MS)
-    await sleep(500 + Math.random() * 500)
+    if (last && last.content === '' && last.reasoning) last.content = last.reasoning
+    return jsonResponse(chatCompletionFromAgg(last as AggregatedChat), 200)
+  } finally {
+    // 只在真的读到过上游 200 响应体时留档：402 余额耗尽 / HTTP 错误是**路由之前**就被拒的，
+    // 把它们算成"读不到路由信息"会污染流量画像（看起来像网关不吐路由元数据）。
+    if (traffic && last) {
+      await recordClineTraffic(traffic, last.routing, !!(last.sawDone || last.finishReason))
+    }
   }
-  if (last && last.content === '' && last.reasoning) last.content = last.reasoning
-  return jsonResponse(chatCompletionFromAgg(last as AggregatedChat), 200)
 }
 
 // ===== 对外接口 =====
@@ -1801,10 +1862,22 @@ export async function proxyClineChatRequest(
   // 归因：钉住是配置驱动的路由改写，出问题时必须能一眼看出「这条请求被谁钉到哪」。
   const pinDecision = clinePinDecision(body)
   if (pinDecision) await logClinePinDecision(_env as Env | undefined, provider.id, model, pinDecision)
+  // 真实流量留档：把「上游实际走了哪个渠道」写进 KV，面板不必再发请求就能看到全量流量画像。
+  // sent 取**实际下发**的偏好（不是配置）：exclude 换算失败时两者不同，拿配置判会得出假结论。
+  const traffic: ClineTrafficContext = {
+    env: _env as Env | undefined,
+    providerId: provider.id,
+    model,
+    sent: {
+      only: pinDecision?.only || [],
+      order: pinDecision?.order || [],
+      sort: pinDecision?.sort ?? null,
+    },
+  }
   try {
     const resp = wantStream
-      ? await proxyStreamChat(pool, body, sessionId, opts?.signal, _env as Env | undefined)
-      : await proxyNonStreamChat(pool, body, sessionId, opts?.signal)
+      ? await proxyStreamChat(pool, body, sessionId, opts?.signal, _env as Env | undefined, traffic)
+      : await proxyNonStreamChat(pool, body, sessionId, opts?.signal, traffic)
     const clamp = clineMaxTokensClamp(body)
     if (clamp) console.log(`[cline-max-tokens] ${model} 输出预算被封顶 ${clamp.from}->${clamp.to}（模型硬上限）`)
     return withMaxTokensClampHeader(resp, clamp)
@@ -2119,39 +2192,62 @@ export async function validateClineProviderUpstream(
  * 逐帧解析而不是正则抓全文——routing 是嵌套对象，正则容易跨对象误匹配。
  * `resolvedProvider` 是同一段的另一个字段名，作为兜底（不同管道用词不同）。
  */
-export function parseClineRoutingMeta(text: string): {
+export interface ClineRoutingMeta {
   finalProvider: string | null
   fallbacksAvailable: string[] | null
-} {
-  const out = { finalProvider: null as string | null, fallbacksAvailable: null as string[] | null }
-  const seen = (node: unknown): void => {
-    if (!node || typeof node !== 'object') return
-    for (const [k, v] of Object.entries(node as Record<string, unknown>)) {
-      if (k === 'gateway' && v && typeof v === 'object') {
-        const routing = (v as Record<string, unknown>).routing
-        if (routing && typeof routing === 'object') {
-          const rt = routing as Record<string, unknown>
-          const fp = rt.finalProvider ?? rt.resolvedProvider
-          if (typeof fp === 'string' && fp) out.finalProvider = fp
-          if (Array.isArray(rt.fallbacksAvailable)) {
-            out.fallbacksAvailable = rt.fallbacksAvailable.filter((x): x is string => typeof x === 'string')
-          }
+}
+
+/**
+ * 路由元数据的递归摘取（就地累加进 out）。
+ *
+ * 为什么是递归而不是按固定层级取：两条管道的信封嵌套层级不一致（planner 的
+ * `provider_metadata` 有时在 data 包装里），写死层级会在换管道时静默读不到——而"读不到"
+ * 与"没生效"在面板上是两种结论，静默降级会把它俩混成一个。
+ */
+function walkClineRouting(node: unknown, out: ClineRoutingMeta): void {
+  if (!node || typeof node !== 'object') return
+  for (const [k, v] of Object.entries(node as Record<string, unknown>)) {
+    if (k === 'gateway' && v && typeof v === 'object') {
+      const routing = (v as Record<string, unknown>).routing
+      if (routing && typeof routing === 'object') {
+        const rt = routing as Record<string, unknown>
+        const fp = rt.finalProvider ?? rt.resolvedProvider
+        if (typeof fp === 'string' && fp) out.finalProvider = fp
+        if (Array.isArray(rt.fallbacksAvailable)) {
+          out.fallbacksAvailable = rt.fallbacksAvailable.filter((x): x is string => typeof x === 'string')
         }
       }
-      if (v && typeof v === 'object') seen(v)
     }
+    if (v && typeof v === 'object') walkClineRouting(v, out)
   }
+}
+
+/**
+ * 从一个**已解析**的帧对象里抽路由元数据。
+ *
+ * 为什么单独导出这个（而不只留 parseClineRoutingMeta 的文本版）：热路径的每一帧在
+ * routeToStream/探测期都已经 JSON.parse 过一次了，真实流量留档若再走一遍文本版就是
+ * 把同一段 JSON 解析两次。这里直接吃已解析的对象，零重复解析。
+ */
+export function clineRoutingFromFrame(node: unknown): ClineRoutingMeta {
+  const out: ClineRoutingMeta = { finalProvider: null, fallbacksAvailable: null }
+  walkClineRouting(node, out)
+  return out
+}
+
+export function parseClineRoutingMeta(text: string): ClineRoutingMeta {
+  const out: ClineRoutingMeta = { finalProvider: null, fallbacksAvailable: null }
   const raw = String(text || '')
   for (const line of raw.split('\n')) {
     const t = line.trim()
     if (!t.startsWith('data:')) continue
     const payload = t.slice(5).trim()
     if (!payload || payload === '[DONE]') continue
-    try { seen(JSON.parse(payload)) } catch { /* 非 JSON 帧忽略 */ }
+    try { walkClineRouting(JSON.parse(payload), out) } catch { /* 非 JSON 帧忽略 */ }
   }
   // 非流式/无 data: 前缀的实现也兜一下（整段就是一个 JSON 对象）
   if (out.finalProvider === null && out.fallbacksAvailable === null) {
-    try { seen(JSON.parse(raw)) } catch { /* 不是 JSON，保持未知 */ }
+    try { walkClineRouting(JSON.parse(raw), out) } catch { /* 不是 JSON，保持未知 */ }
   }
   return out
 }
@@ -2190,6 +2286,252 @@ export function judgeClinePinVerify(
     return { verdict: 'ok', note: `实际走 ${finalProvider}，在你勾选的序列 [${sent.order.join(',')}] 内（${fb}）` }
   }
   return { verdict: 'fallback', note: `实际走 ${finalProvider}，不在优先序列 [${sent.order.join(',')}] 内（优先模式允许兜底，非失败）` }
+}
+
+// ===== 真实流量的路由结果留档（2026-10-06）=====
+//
+// 为什么需要：「验证钉住」是**抽样**——它回答"此刻生效吗"，且只在有人点按钮时才发生。真实流量里
+// 每一条响应帧都带着 `provider_metadata.gateway.routing.finalProvider`，那才是**全量证据**。落库后
+// 面板不必再发请求就能回答两件手动验证答不了的事：
+//   1. 这个模型最近实际走了哪些渠道、有没有违反白名单（自动发现"配置还在、上游已经不服从"的漂移）；
+//   2. 出站偏好改对了但**该渠道本身已经挂了**（配置生效、实走却是兜底渠道）。
+//
+// 为什么另开一个键空间而不写系统日志：系统日志是**逐请求**一条（见 logClinePinDecision 里同一取舍），
+// 逐请求落盘会刷满面板分页、把真正的错误行挤掉。流量观测天然可聚合——一条记录/模型足够，
+// 读取成本是 1 次 KV.get/模型（不是 list 全量扫）。
+//
+// 有意取舍（丢更新）：单键是 read-modify-write，跨 isolate 并发写会丢计数（本仓已记录过同类坑）。
+// 所以这里只当**近似统计**用：计数可能偏小；`last` 与 `anomalies` 由 at 时间戳保护（新者胜），
+// 而**异常另有 append-only 的系统日志兜底**（精确、可检索）。真值来源是日志，这个键是快视图。
+const CLINE_TRAFFIC_PREFIX = 'cline:traffic:'
+/** 7 天：与渠道留档同量级——流量画像会漂移，过期数据只会误导。 */
+const CLINE_TRAFFIC_TTL_SEC = 7 * 24 * 3600
+/**
+ * 两次落盘之间的最小间隔（毫秒）：把并发突发合并成一条。
+ *
+ * 为什么必须限流：KV 写配额是所有功能共享的（日志、渠道留档、**提供商配置**）。逐请求落盘在
+ * 持续流量下能把配额写爆，而配额耗尽的后果是**连提供商配置都存不进去**——用一个观测功能的
+ * 写量去换配置功能不可用，是本末倒置。5 秒的代价：突发后立刻停流量时，桶里最后几次观测会随
+ * isolate 一起消失（见上面"有意取舍"）。
+ */
+export const CLINE_TRAFFIC_MIN_GAP_MS = 5000
+/** 异常样本上限：面板只展示最近几条，留档不必无限增长。 */
+const CLINE_TRAFFIC_ANOMALY_CAP = 5
+
+/** 一次真实流量的路由观测（面板展示的最小单元）。 */
+export interface ClineTrafficSample {
+  at: number
+  finalProvider: string | null
+  fallbacksAvailable: string[] | null
+  verdict: ClinePinVerdict
+  note: string
+  /** 该次请求是否产出了可用流（false = 被退化/截断拦截；**路由证据仍然有效**，照样计入） */
+  ok: boolean
+}
+
+/** 一个模型的路由留档（KV 值；面板直接渲染）。 */
+export interface ClineTrafficRecord {
+  model: string
+  /** 观测到的请求数（含读不到路由元数据的——它们同样是"流量"） */
+  requests: number
+  /** 其中读到路由元数据的请求数（requests - routed = 读不到的次数） */
+  routed: number
+  /** 各渠道实际被选中的次数 */
+  providers: Record<string, number>
+  /** 判定结果计数（口径与 judgeClinePinVerify 一致） */
+  verdicts: Partial<Record<ClinePinVerdict, number>>
+  /** 最近一次观测 */
+  last: ClineTrafficSample | null
+  /** 违反硬约束的样本（新→旧，最多 CLINE_TRAFFIC_ANOMALY_CAP 条） */
+  anomalies: ClineTrafficSample[]
+  /** 最近一次出站**实际下发**的偏好（解释判定口径：可能与面板上的配置不同） */
+  sent: { only: string[]; order: string[]; sort: string | null }
+  /** 首末观测时间 */
+  from: number
+  updatedAt: number
+}
+
+/** 热路径携带的留档上下文（谁在钉、钉的是什么）。 */
+export interface ClineTrafficContext {
+  env?: Env
+  providerId: string
+  model: string
+  sent: { only: string[]; order: string[]; sort: string | null }
+}
+
+/** in-isolate 聚合桶：同 (提供商, 模型) 的并发请求共用一个桶，落盘时合并成一条记录。 */
+interface ClineTrafficBucket {
+  providerId: string
+  model: string
+  from: number
+  requests: number
+  routed: number
+  providers: Record<string, number>
+  verdicts: Record<string, number>
+  last: ClineTrafficSample | null
+  anomalies: ClineTrafficSample[]
+  sent: { only: string[]; order: string[]; sort: string | null }
+}
+
+const clineTrafficBuckets = new Map<string, ClineTrafficBucket>()
+/** 上次落盘时刻（isolate 级，**跨模型共享**）：限流的意义是限制总写量，不是每个模型各写一条。 */
+let clineTrafficFlushedAt = 0
+
+/** 仅供测试：清空聚合桶与限流窗口，避免用例间互相影响。 */
+export function __resetClineTrafficForTests(): void {
+  clineTrafficBuckets.clear()
+  clineTrafficFlushedAt = 0
+}
+
+const sumCounts = (a: Record<string, number>, b: Record<string, number>): Record<string, number> => {
+  const out: Record<string, number> = { ...a }
+  for (const [k, v] of Object.entries(b)) out[k] = (out[k] || 0) + v
+  return out
+}
+
+/**
+ * 合并「旧留档 + 本次增量」。**纯函数**（便于把丢更新下的保护语义钉在测试里）。
+ *
+ * 计数是相加的（读到的旧值若偏旧，加出来的总数就偏小——这是已知的近似，见上方取舍），
+ * 但 last 与 anomalies 按 `at` 取新：**并发的旧写不允许把"最近一次观测"回退成更早的时刻**，
+ * 否则面板会显示一个比实际更旧的结论，看起来像"流量停了"。
+ */
+export function mergeClineTraffic(
+  prev: ClineTrafficRecord | null,
+  delta: Omit<ClineTrafficBucket, 'last'> & { last: ClineTrafficSample; to?: number }
+): ClineTrafficRecord {
+  const mergedAnomalies = [...(delta.anomalies || []), ...((prev && prev.anomalies) || [])]
+    .filter((s, i, arr) => arr.findIndex((x) => x.at === s.at && x.finalProvider === s.finalProvider) === i)
+    .sort((a, b) => b.at - a.at)
+    .slice(0, CLINE_TRAFFIC_ANOMALY_CAP)
+  const prevLast = prev?.last || null
+  const last = !prevLast || delta.last.at >= prevLast.at ? delta.last : prevLast
+  return {
+    model: delta.model,
+    requests: (prev?.requests || 0) + delta.requests,
+    routed: (prev?.routed || 0) + delta.routed,
+    providers: sumCounts(prev?.providers || {}, delta.providers),
+    verdicts: sumCounts((prev?.verdicts || {}) as Record<string, number>, delta.verdicts),
+    last,
+    anomalies: mergedAnomalies,
+    // sent 跟着 last 走：判定口径必须与"最近一次观测"是同一次请求的，否则面板会用旧口径解释新结论
+    sent: last === delta.last ? delta.sent : ((prev as ClineTrafficRecord).sent || delta.sent),
+    from: Math.min(prev?.from || delta.from, delta.from),
+    updatedAt: Math.max(prev?.updatedAt || 0, delta.to ?? delta.from),
+  }
+}
+
+/** 读一个模型的路由留档（无则 null）。 */
+export async function readClineTraffic(
+  env: Env | undefined,
+  providerId: string,
+  model: string
+): Promise<ClineTrafficRecord | null> {
+  if (!env?.KV) return null
+  try {
+    const raw = await env.KV.get(CLINE_TRAFFIC_PREFIX + providerId + ':' + model)
+    if (!raw) return null
+    const p = JSON.parse(raw) as Partial<ClineTrafficRecord>
+    if (!p || typeof p !== 'object') return null
+    return {
+      model: typeof p.model === 'string' ? p.model : model,
+      requests: Number(p.requests) || 0,
+      routed: Number(p.routed) || 0,
+      providers: p.providers && typeof p.providers === 'object' ? p.providers : {},
+      verdicts: p.verdicts && typeof p.verdicts === 'object' ? p.verdicts : {},
+      last: p.last && typeof p.last === 'object' ? p.last : null,
+      anomalies: Array.isArray(p.anomalies) ? p.anomalies.slice(0, CLINE_TRAFFIC_ANOMALY_CAP) : [],
+      sent: p.sent && typeof p.sent === 'object' ? p.sent : { only: [], order: [], sort: null },
+      from: Number(p.from) || 0,
+      updatedAt: Number(p.updatedAt) || 0,
+    }
+  } catch { return null }
+}
+
+/**
+ * 异常（实际渠道违反硬约束）同时进系统日志。
+ *
+ * 为什么异常要额外落日志：聚合键可能丢更新、也可能被 5 秒限流合并掉，而"钉住没生效"是**必须
+ * 留痕**的事实。日志是 append-only 的（每条约一个独立键），所以它是精确的真值来源；面板上的
+ * 聚合只是快视图。按 (提供商, 模型, 实际渠道, 结论) 做 5 分钟去重——钉住持续失效时每 5 秒
+ * 一条会把面板刷满，而结论完全相同，重复落盘没有信息量。
+ */
+async function logClineTrafficAnomaly(
+  env: Env,
+  providerId: string,
+  model: string,
+  sample: ClineTrafficSample
+): Promise<void> {
+  if (!shouldLogClinePin(`anomaly|${providerId}|${model}|${sample.finalProvider}|${sample.verdict}`)) return
+  const line = `[cline-route] ${providerId} model=${model} ${sample.note}`
+  console.log(line)
+  try {
+    await writeLog(env, 'warn', line, JSON.stringify(sample))
+  } catch { /* 日志失败不影响响应 */ }
+}
+
+/** 把桶写进 KV 并清空；桶里的异常顺带落系统日志。 */
+async function flushClineTraffic(env: Env, bucketKey: string): Promise<void> {
+  const b = clineTrafficBuckets.get(bucketKey)
+  if (!b) return
+  // 先摘桶再 await：写期间新到的观测要落进**新桶**，否则会在下面 delete 时被一起丢掉
+  clineTrafficBuckets.delete(bucketKey)
+  clineTrafficFlushedAt = Date.now()
+  // last 理论上必非空（recordClineTraffic 落盘前一定先赋值），这里只是把不变量显式化
+  if (!b.last) return
+  try {
+    const prev = await readClineTraffic(env, b.providerId, b.model)
+    const merged = mergeClineTraffic(prev, { ...b, last: b.last, to: Date.now() })
+    await env.KV.put(CLINE_TRAFFIC_PREFIX + b.providerId + ':' + b.model, JSON.stringify(merged), {
+      expirationTtl: CLINE_TRAFFIC_TTL_SEC,
+    })
+  } catch { /* 留档失败不影响本次请求 */ }
+  for (const a of b.anomalies) await logClineTrafficAnomaly(env, b.providerId, b.model, a)
+}
+
+/**
+ * 记录一次真实流量的路由观测，并在限流窗口外落盘。
+ *
+ * 判定在**记录时**按该次请求自己下发的偏好算（而不是落盘时按聚合口径重算）：配置改过之后，
+ * 同一个桶里可能混着两种口径的请求，用最新配置去重判旧请求会得出错误的"生效/未生效"。
+ */
+export async function recordClineTraffic(
+  traffic: ClineTrafficContext,
+  routing: ClineRoutingMeta | null,
+  ok: boolean
+): Promise<void> {
+  const { env, providerId, model, sent } = traffic
+  if (!env?.KV) return
+  const bucketKey = providerId + '|' + model
+  let b = clineTrafficBuckets.get(bucketKey)
+  if (!b) {
+    b = {
+      providerId, model, from: Date.now(), requests: 0, routed: 0,
+      providers: {}, verdicts: {}, last: null, anomalies: [], sent,
+    }
+    clineTrafficBuckets.set(bucketKey, b)
+  }
+  const judged = judgeClinePinVerify(sent, routing?.finalProvider ?? null, routing?.fallbacksAvailable ?? null)
+  const sample: ClineTrafficSample = {
+    at: Date.now(),
+    finalProvider: routing?.finalProvider ?? null,
+    fallbacksAvailable: routing?.fallbacksAvailable ?? null,
+    verdict: judged.verdict,
+    note: judged.note,
+    ok,
+  }
+  b.requests++
+  b.sent = sent
+  if (sample.finalProvider) {
+    b.routed++
+    b.providers[sample.finalProvider] = (b.providers[sample.finalProvider] || 0) + 1
+  }
+  b.verdicts[judged.verdict] = (b.verdicts[judged.verdict] || 0) + 1
+  b.last = sample
+  // 桶内异常也设上限：持续失效时 5 秒限流窗口内可能攒下几十条，留档只需最近几条
+  if (judged.verdict === 'mismatch' && b.anomalies.length < CLINE_TRAFFIC_ANOMALY_CAP) b.anomalies.push(sample)
+  if (Date.now() - clineTrafficFlushedAt < CLINE_TRAFFIC_MIN_GAP_MS) return
+  await flushClineTraffic(env, bucketKey)
 }
 
 /**
