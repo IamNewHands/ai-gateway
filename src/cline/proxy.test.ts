@@ -915,7 +915,7 @@ describe('降级链中间失败日志（issue #32 附带发现）', () => {
       const data = (await resp.json()) as { error: { type: string } }
       expect(data.error.type).toBe('upstream_runaway')
     })
-    const attempts = logs.filter((l) => l.includes('[cline-attempt]'))
+    const attempts = logs.filter((l) => l.includes('[cline-attempt]') && l.includes('attempt='))
     expect(attempts).toHaveLength(3)
     expect(attempts.map((l) => /attempt=(\d)\/3/.exec(l)?.[1])).toEqual(['1', '2', '3'])
     for (const l of attempts) {
@@ -925,6 +925,47 @@ describe('降级链中间失败日志（issue #32 附带发现）', () => {
       expect(l).toContain('sawFinish=false')
     }
     expect(attempts[0]).toContain(`model=${DEFAULT_MODEL}`)
+    // 聚合结论行：一条日志说清三轮分别空在哪一种，不用翻三条
+    const summary = logs.filter((l) => l.includes('[cline-attempt]') && l.includes('三轮全拦截'))
+    expect(summary).toHaveLength(1)
+    expect(summary[0]).toContain('probe-eof-no-frames')
+  }, 20000)
+
+  // 2026-10-02 追加：归因只进 console 时用户只能在 CF 仪表盘查，管理面板「系统日志」看不到。
+  // 改为同时落 KV，用户自己发起一次请求就能在面板搜 [cline-attempt] 定性。
+  it('拦截归因落 KV 系统日志（面板可搜），console 与 KV 双出口', async () => {
+    const puts: Array<{ key: string; value: string }> = []
+    const env = {
+      KV: {
+        get: async () => null, // log_enabled / log_retention_days 缺省 → 开启 + 默认保留天数
+        put: async (key: string, value: string) => { puts.push({ key, value }) },
+      },
+    }
+    await captureLogs(async () => {
+      installFetch(() => new Response('', { status: 200, headers: { 'Content-Type': 'text/event-stream' } }))
+      const resp = await proxyClineChatRequest(
+        env,
+        clineProvider([REFRESH_TOKEN]),
+        { model: DEFAULT_MODEL, messages: [{ role: 'user', content: 'hi' }] },
+        { stream: true },
+      )
+      expect(resp.status).toBe(502)
+      await resp.json()
+    })
+    const entries = puts.map((p) => JSON.parse(p.value) as { type: string; message: string; details?: string })
+    expect(entries.every((e) => e.type === 'warn')).toBe(true)
+    const attempts = entries.filter((e) => e.message.includes('[cline-attempt]') && e.message.includes('attempt='))
+    expect(attempts).toHaveLength(3)
+    expect(attempts.map((e) => /attempt=(\d)\/3/.exec(e.message)?.[1])).toEqual(['1', '2', '3'])
+    for (const e of attempts) {
+      expect(e.message).toContain('detail=probe-eof-no-frames')
+      expect(e.message).toContain('frames=0')
+      expect(e.details).toContain('"frames":0')
+    }
+    const summary = entries.find((e) => e.message.includes('三轮全拦截'))
+    expect(summary).toBeTruthy()
+    expect(summary!.message).toContain('probe-eof-no-frames')
+    expect(summary!.details).toContain('probe-eof-no-frames')
   }, 20000)
 })
 

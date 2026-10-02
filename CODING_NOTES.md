@@ -255,8 +255,16 @@ DSH 的 retry policy 是 `initialDelayMs=500` + `jitterRatio=0.1`（`dsh-llm/lib
   `probe-finish-length-no-content` / `probe-eof-ws-ratio` / `probe-eof-no-frames` /
   `probe-eof-no-finish`），并附带现场计数 `stats`（`frames` / `content` / `reasoning` /
   `buffered` / `sawFinish` / `probeReadError`）
-- `proxyStreamChat` 每次拦截打一行 console（CF 仪表盘可查，与 `[cline-fallback]` /
+- `proxyStreamChat` 每次拦截打一行日志（console + **KV 系统日志双出口**，与 `[cline-fallback]` /
   `[cline-max-tokens]` 同一口径）：`[cline-attempt] model=… attempt=n/3 kind=… detail=… frames=… content=… reasoning=… buffered=… sawFinish=… probeReadError=… cooldownReqMs=…`
+- 三轮全失败时另补一行聚合结论：`[cline-attempt] model=… 三轮全拦截 → 502 upstream_runaway，明细=[kind:detail, …]`
+  ——一条日志即可说清三轮分别空在哪一种
+
+**为什么必须落 KV（2026-10-02 追加）**：`detail` 是唯一定性字段，但它原先只走 `console.log`，
+只在 Cloudflare 仪表盘可见；管理面板「系统日志」查不到，用户自己发起一次请求也拿不到归因，
+线上排查只能靠猜。落 KV 后：面板「系统日志」搜 `[cline-attempt]` 即可定性。
+实现见 `logClineAttempt()`（`env.KV` 缺失时静默跳过，写日志失败不影响响应；有意 await 而非
+fire-and-forget，换「响应返回时日志已落盘」的确定性）。
 
 **有意的取舍**：`detail` 是唯一能定性的字段，**新增拦截分支必须给出新的 detail 值**，
 否则又回到「只有三合一文案」的不可归因状态。对客户端响应体一个字没改（仍是原 502 文案），

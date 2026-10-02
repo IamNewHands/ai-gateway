@@ -26,6 +26,10 @@ import { streamFetchWithTimeout } from '../opencode'
 // 通用 tool 配对工具（纯函数、与提供商无关）：Cline 出站历史同样需要清孤儿 tool 结果。
 // 复用而非复制，避免两份实现漂移（owner 仍在 workbuddy-upstream.ts）。
 import { cleanupOrphanToolCalls } from '../workbuddy-upstream'
+// 拦截归因同时落 KV 系统日志（管理面板「系统日志」可直接搜 `[cline-attempt]`），
+// 不再只进 CF 仪表盘。admin 亦 import 本模块，但 writeLog 只在运行期调用，无循环初始化问题
+// （与 src/trae/proxy.ts 同一既有口径）。
+import { writeLog } from '../admin'
 
 export const CLINE_PROVIDER_ID = 'cline'
 export const CLINE_API_BASE = 'https://api.cline.bot/api/v1'
@@ -1231,6 +1235,24 @@ function applyModelCooldown(pool: Pool, model: string, ms: number, clientSignal?
 }
 
 /**
+ * 把一条拦截归因写到两个日志出口：console（CF 仪表盘）+ KV 系统日志（管理面板「系统日志」）。
+ *
+ * 为什么必须落 KV（2026-10-02）：三轮全失败的聚合 502 文案把「推理退化 / 零帧空流 / 截断无
+ * finish / 探测期读错误」四类混在一起，只有 detail 能定性；而 console 只在 CF 仪表盘可见，
+ * 用户在面板里查不到，线上排查只能靠猜。落 KV 后发起一次请求即可在面板搜 `[cline-attempt]`。
+ *
+ * 有意取舍：await 而不 fire-and-forget——失败路径本来就要等冷却+重试，多一次 KV put 无感，
+ * 换来「响应返回时日志已落盘」的确定性（也便于单测断言）。任何写日志失败都不得影响响应。
+ */
+async function logClineAttempt(env: Env | undefined, message: string, details?: string): Promise<void> {
+  console.log(message)
+  if (!env?.KV) return
+  try {
+    await writeLog(env, 'warn', message, details)
+  } catch { /* 日志失败不影响响应 */ }
+}
+
+/**
  * 流式转发（带推理空转防护）：最多 3 次尝试，退化/空响应冷却切号重试；
  * 全部失败时返回 502 错误 JSON（客户端按错误处理，可自行重试）。
  */
@@ -1238,9 +1260,12 @@ async function proxyStreamChat(
   pool: Pool,
   body: Record<string, unknown>,
   sessionId: string,
-  clientSignal?: AbortSignal
+  clientSignal?: AbortSignal,
+  env?: Env
 ): Promise<Response> {
   const model = String((body as Record<string, unknown>).model || '')
+  /** 三次尝试的定性结果（kind:detail），用于聚合 502 时一行说清「空在哪一种」。 */
+  const failedKinds: string[] = []
   for (let attempt = 0; attempt < 3; attempt++) {
     if (clientSignal?.aborted) throw clientAbortedError()
     const resp = await clineFetchWithRetry(pool, '/chat/completions', body, sessionId, true, 4, clientSignal)
@@ -1265,16 +1290,26 @@ async function proxyStreamChat(
     // 逐尝试归因日志：三轮全失败时客户端只拿到三合一的 502 文案，分辨不了中了哪一种
     // （退化 / 零帧 / 截断无 finish / 探测期读错误）。detail 是 pumpStreamAttempt 拦截出口
     // 唯一给出的定性字段；stats 计数（尤其 frames=0 与 sawFinish）用于区分「上游空响应」
-    // 与「上游截断」。与 [cline-fallback]/[cline-max-tokens] 同一 console 口径，进 CF 仪表盘日志。
-    console.log(
-      `[cline-attempt] model=${model} attempt=${attempt + 1}/3 kind=${outcome.kind} ` +
-      `detail=${outcome.detail || 'unknown'} frames=${outcome.stats?.frames ?? '?'} ` +
-      `content=${outcome.stats?.content ?? '?'} reasoning=${outcome.stats?.reasoning ?? '?'} ` +
-      `buffered=${outcome.stats?.buffered ?? '?'} sawFinish=${outcome.stats?.sawFinish ?? '?'} ` +
-      `probeReadError=${outcome.stats?.probeReadError ?? '?'} cooldownReqMs=${cooldownReqMs}`
+    // 与「上游截断」。console 进 CF 仪表盘，同时落 KV 系统日志供面板检索。
+    const detail = outcome.detail || 'unknown'
+    failedKinds.push(`${outcome.kind}:${detail}`)
+    await logClineAttempt(
+      env,
+      `[cline-attempt] model=${model} attempt=${attempt + 1}/3 kind=${outcome.kind} detail=${detail} ` +
+      `frames=${outcome.stats?.frames ?? '?'} content=${outcome.stats?.content ?? '?'} ` +
+      `reasoning=${outcome.stats?.reasoning ?? '?'} buffered=${outcome.stats?.buffered ?? '?'} ` +
+      `sawFinish=${outcome.stats?.sawFinish ?? '?'} probeReadError=${outcome.stats?.probeReadError ?? '?'} ` +
+      `cooldownReqMs=${cooldownReqMs}`,
+      JSON.stringify({ ...(outcome.stats || {}), cooldownReqMs }),
     )
     await sleep(500 + Math.random() * 500)
   }
+  // 聚合结论单独一行：一条日志即可回答「三轮分别空在哪一种」，不用翻三条。
+  await logClineAttempt(
+    env,
+    `[cline-attempt] model=${model} 三轮全拦截 → 502 upstream_runaway，明细=[${failedKinds.join(', ')}]`,
+    JSON.stringify({ model, attempts: failedKinds }),
+  )
   return jsonResponse(
     { error: { message: 'Cline 推理退化/空响应/上游截断连续 3 次未产出可用流，已冷却换号仍失败', type: 'upstream_runaway' } },
     502
@@ -1548,7 +1583,7 @@ export async function proxyClineChatRequest(
     const body = buildUpstreamBody({ ...forwardBody, model }, true, sessionId, freeSet)
     try {
       const resp = wantStream
-        ? await proxyStreamChat(pool, body, sessionId, opts?.signal)
+        ? await proxyStreamChat(pool, body, sessionId, opts?.signal, _env as Env | undefined)
         : await proxyNonStreamChat(pool, body, sessionId, opts?.signal)
       // 402/429 = 「该模型在当前账号池上不可用」→ 沿免费链换模型（移植 169fd9d）。
       // 其余错误（400/403/5xx）原样透传：不把参数错误伪装成「换个模型就好了」。
