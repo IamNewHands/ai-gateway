@@ -252,6 +252,51 @@ export async function noteQoderSuccess(env: Env, providerId: string, uid: string
 }
 
 /**
+ * 回写额度 + 额度包明细的内部实现。
+ *
+ * `unfreeze` 决定是否顺带清冷却/禁用，两个调用方语义不同，必须分开：
+ *   - 签到成功（true）：签到通过上游鉴权 = token 有效的直接证据，冷却与「需重新登录」都不再成立；
+ *   - 面板「刷新账号池」的额度探测（false）：**只读一次额度不该解冻账号**——把 429 冷却中的
+ *     账号放出来等于绕过限流保护，禁用标记同理（留给签到或人工处理）。
+ */
+async function writeQoderQuota(
+  env: Env,
+  providerId: string,
+  uid: string,
+  credits: number,
+  packages: PackageInfo[] | undefined,
+  unfreeze: boolean
+): Promise<void> {
+  const pool = await readQoderPool(env, providerId)
+  const acc = pool.find((a) => a.uid === uid)
+  if (!acc) return
+  const st = acc.state || { credits: 0, disabled: false, until: 0, errCount: 0 }
+  acc.state = { ...st, credits }
+  // 额度包明细与 credits 同一次 KV 写落盘（它是「到期优先」挑号的数据源，分开写会读到半旧状态）
+  if (Array.isArray(packages)) {
+    acc.state = { ...acc.state, packages, packagesAt: Date.now() }
+  }
+  if (unfreeze && credits > 0) {
+    acc.state = { ...acc.state, until: 0, disabled: false, reason: '', errCount: 0 }
+  }
+  await writeQoderPool(env, providerId, pool)
+}
+
+/**
+ * 只回写额度与额度包明细，**不动冷却/禁用**（面板「刷新账号池」的额度探测用）。
+ * 见 writeQoderQuota 的 unfreeze 说明。
+ */
+export async function setQoderPoolQuota(
+  env: Env,
+  providerId: string,
+  uid: string,
+  credits: number,
+  packages?: PackageInfo[]
+): Promise<void> {
+  await writeQoderQuota(env, providerId, uid, credits, packages, false)
+}
+
+/**
  * 签到后解冻：remain > 0 时把冷却**与 `disabled` 一起**清掉。
  *
  * 为什么成功签到要连 `disabled` 一起清：`disabled` 的语义是「token 已失效，需重新登录」，
@@ -270,19 +315,7 @@ export async function reenableQoderIfCredits(
   remain: number,
   packages?: PackageInfo[]
 ): Promise<void> {
-  const pool = await readQoderPool(env, providerId)
-  const acc = pool.find((a) => a.uid === uid)
-  if (!acc) return
-  const st = acc.state || { credits: 0, disabled: false, until: 0, errCount: 0 }
-  acc.state = { ...st, credits: remain }
-  // 额度包明细与 credits 同一次 KV 写落盘（它是「到期优先」挑号的数据源，分开写会读到半旧状态）
-  if (Array.isArray(packages)) {
-    acc.state = { ...acc.state, packages, packagesAt: Date.now() }
-  }
-  if (remain > 0) {
-    acc.state = { ...acc.state, until: 0, disabled: false, reason: '', errCount: 0 }
-  }
-  await writeQoderPool(env, providerId, pool)
+  await writeQoderQuota(env, providerId, uid, remain, packages, true)
 }
 
 /** 签到时回写昵称（池账号登录时可能未带 nickname，签到后补齐供面板展示）。 */

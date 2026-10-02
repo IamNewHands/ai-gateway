@@ -1554,6 +1554,18 @@ export async function handleOAuthStatus(c: Context<AppEnv>) {
   // QoderWork 多账号池：返回池账号状态（脱敏）供面板展示
   if (isQoderFlow(provider)) {
     try { await seedQoderPoolFromSingle(c.env, id) } catch { /* ignore */ }
+    // ?credits=1：面板「刷新账号池」顺便探一次额度（Qoder 的额度只有签到会拉，
+    // 不探的话「额度包明细 / 到期天数」最多滞后一天，挑号依据也就可能是昨天的）。
+    // 显式参数而不是默认行为：这是 N 次真实上游请求，其他调用方（脚本/探活）不该被动付这个代价。
+    if (c.req.query('credits') === '1') {
+      const { probeQoderPoolQuota } = await import('./qoder/probe')
+      try {
+        data.quotaProbe = await probeQoderPoolQuota(c.env, provider)
+      } catch (e) {
+        // 探测失败不能让整个状态查询失败——面板至少还要能显示池状态
+        data.quotaProbe = { error: (e as Error).message || '额度探测失败' }
+      }
+    }
     const qpool = await listQoderPoolStatus(c.env, id)
     data.pool = qpool
     data.connected = qpool.length > 0

@@ -757,8 +757,8 @@ ${H('管理')}
                     <div class="fc mt-1 field-row" style="gap:8px"><input type="number" id="cd-plan-${escapePageHtml(p.id)}" value="${p.cooldown&&p.cooldown.planMs?Math.round(p.cooldown.planMs/60000):''}" style="width:88px" placeholder="plan冷却" title="余额/权益耗尽（402）的硬冷却时长（分钟）。到期到次日 04:00，签到恢复后自动解冻。"><input type="number" id="cd-soft-${escapePageHtml(p.id)}" value="${p.cooldown&&p.cooldown.softMs?Math.round(p.cooldown.softMs/1000):''}" style="width:88px" placeholder="429冷却" title="429 限流 / WAF 403 / 404 / 5xx（无 Retry-After 头时）的默认软冷却时长（秒）。"><input type="number" id="cd-err-${escapePageHtml(p.id)}" value="${p.cooldown&&p.cooldown.errThreshold?p.cooldown.errThreshold:''}" style="width:76px" placeholder="错误阈值" title="连续 5xx 错误次数阈值：达到后把该账号冷却 errMs 分钟。偶发 502 若携带 Retry-After 头会优先按其时长软冷却、不再触发本计数。"><input type="number" id="cd-errms-${escapePageHtml(p.id)}" value="${p.cooldown&&p.cooldown.errMs?Math.round(p.cooldown.errMs/60000):''}" style="width:88px" placeholder="错误冷却" title="达到错误阈值后的账号级冷却时长（分钟）。"><span class="mu" style="font-size:12px">冷却参数（保存后生效）</span></div>
                   </fieldset>`:''}
                   ${(p.oauth&&p.oauth.flowType==='qoder')||p.id==='qoder'?`
-                  <fieldset class="form-group" id="qdp-fs-${escapePageHtml(p.id)}"><legend>Qoder 多账号池</legend><span class="form-helper">设备授权流每次成功登录都会把该账号加入账号池（按 user_id 去重，多登一个 = 多个账号）。转发挑号：<b>7 天内到期的积分优先消耗</b>（到期越早越优先），窗口内没有待救积分时才按剩余积分最多者挑选；账号行上的「⏳ N 个包 7 天内到期」徽章与额度包明细里琥珀色的到期时间就是该规则的依据（到期时间按北京时间 CST 判定，数据来自最近一次签到）。「额度包明细」分「套餐额度」（到期 = 套餐到期，即基础额度作废时刻）与「签到/赠送额度」（到期 = 最近一次领取的那笔 30 天有效期）两项，<b>已用完的包自动隐藏</b>，其余按到期升序排列（快过期的在最上面）。额度耗尽/429/鉴权失败按策略冷却或禁用并自动轮换下一个账号；每日签到后积分恢复自动解冻（<b>签到成功也一并清除「需重新登录」的禁用标记</b>——签到通过鉴权就是 token 有效的直接证据）。冷却参数留空 = 默认（额度耗尽 12h / 429 60s / 连续 5 次错误冷却 10m）。</span>
-                    <div class="fc mt-1 field-row"><button class="btn btn-s" onclick="qoderPoolStatus('${escapePageJsx(p.id)}')"><i class="fas fa-sync" aria-hidden="true"></i>刷新账号池</button><button class="btn btn-s" onclick="oauthConnect('${escapePageJsx(p.id)}')"><i class="fas fa-sign-in-alt" aria-hidden="true"></i>登录新账号</button><button class="btn btn-gh btn-xs" onclick="oauthPoolExportModal('${escapePageJsx(p.id)}')"><i class="fas fa-file-export" aria-hidden="true"></i>导出凭证/Token</button><button class="btn btn-p" onclick="triggerCheckin('${escapePageJsx(p.id)}')"><i class="fas fa-calendar-check" aria-hidden="true"></i>立即签到</button><span id="qdp-st-${escapePageHtml(p.id)}" class="oauth-status"></span></div>
+                  <fieldset class="form-group" id="qdp-fs-${escapePageHtml(p.id)}"><legend>Qoder 多账号池</legend><span class="form-helper">设备授权流每次成功登录都会把该账号加入账号池（按 user_id 去重，多登一个 = 多个账号）。转发挑号：<b>7 天内到期的积分优先消耗</b>（到期越早越优先），窗口内没有待救积分时才按剩余积分最多者挑选；账号行上的「⏳ N 个包 7 天内到期」徽章与额度包明细里琥珀色的到期时间就是该规则的依据（到期时间按北京时间 CST 判定，数据来自最近一次签到，或点「刷新账号池」时即时探测）。「额度包明细」分「套餐额度」（到期 = 套餐到期，即基础额度作废时刻）与「签到/赠送额度」（到期 = 最近一次领取的那笔 30 天有效期）两项，<b>已用完的包自动隐藏</b>，其余按到期升序排列（快过期的在最上面）。额度耗尽/429/鉴权失败按策略冷却或禁用并自动轮换下一个账号；每日签到后积分恢复自动解冻（<b>签到成功也一并清除「需重新登录」的禁用标记</b>——签到通过鉴权就是 token 有效的直接证据）。冷却参数留空 = 默认（额度耗尽 12h / 429 60s / 连续 5 次错误冷却 10m）。</span>
+                    <div class="fc mt-1 field-row"><button class="btn btn-s" onclick="qoderPoolStatus('${escapePageJsx(p.id)}')" title="重新读取池状态，并顺便向每个账号探一次额度（会更新「额度包明细」与到期天数）"><i class="fas fa-sync" aria-hidden="true"></i>刷新账号池</button><button class="btn btn-s" onclick="oauthConnect('${escapePageJsx(p.id)}')"><i class="fas fa-sign-in-alt" aria-hidden="true"></i>登录新账号</button><button class="btn btn-gh btn-xs" onclick="oauthPoolExportModal('${escapePageJsx(p.id)}')"><i class="fas fa-file-export" aria-hidden="true"></i>导出凭证/Token</button><button class="btn btn-p" onclick="triggerCheckin('${escapePageJsx(p.id)}')"><i class="fas fa-calendar-check" aria-hidden="true"></i>立即签到</button><span id="qdp-st-${escapePageHtml(p.id)}" class="oauth-status"></span></div>
                     <div id="qdp-acc-${escapePageHtml(p.id)}" class="mt-1"></div>
                     <div class="fc mt-1 field-row" style="gap:8px"><input type="number" id="cd-plan-${escapePageHtml(p.id)}" value="${p.cooldown&&p.cooldown.planMs?Math.round(p.cooldown.planMs/60000):''}" style="width:88px" placeholder="额度耗尽冷却" title="额度/权益耗尽（402）的硬冷却时长（分钟）。到期到次日 04:00，签到恢复后自动解冻。"><input type="number" id="cd-soft-${escapePageHtml(p.id)}" value="${p.cooldown&&p.cooldown.softMs?Math.round(p.cooldown.softMs/1000):''}" style="width:88px" placeholder="429冷却" title="429 限流的默认软冷却时长（秒）。"><input type="number" id="cd-err-${escapePageHtml(p.id)}" value="${p.cooldown&&p.cooldown.errThreshold?p.cooldown.errThreshold:''}" style="width:76px" placeholder="错误阈值" title="连续错误次数阈值：达到后把该账号冷却「错误冷却」时长。"><input type="number" id="cd-errms-${escapePageHtml(p.id)}" value="${p.cooldown&&p.cooldown.errMs?Math.round(p.cooldown.errMs/60000):''}" style="width:88px" placeholder="错误冷却" title="达到错误阈值后的账号级冷却时长（分钟）。"><span class="mu" style="font-size:12px">冷却参数（保存后生效）</span></div>
                     <div class="qoder-device-block" data-qoder-device="${escapePageHtml(p.id)}" style="margin-top:10px;border-top:1px solid var(--border,#e5e7eb);padding-top:8px">
@@ -2696,17 +2696,36 @@ function oauthPoolExportModal(id) {
 }
 
 // ===== Qoder 多账号池：状态 / 移除 =====
+/**
+ * 额度探测结果摘要。失败必须带出原因——只显示「已刷新」会让用户以为每个号都探到了，
+ * 而实际上某个号的 token 已经不能用（那正是他点刷新想确认的事）。
+ */
+function qoderProbeSummary(count, probe) {
+  var base = '共 ' + count + ' 个账号'
+  if (!probe) return base
+  if (probe.error) return base + ' · 额度探测失败：' + probe.error
+  if (!probe.length) return base + ' · 额度探测：池内无账号'
+  var ok = 0, fails = []
+  probe.forEach(function (r) {
+    if (r && r.ok) ok++
+    else fails.push(((r && r.uid) ? String(r.uid).slice(0, 8) : '?') + '：' + ((r && r.error) || '未知错误'))
+  })
+  return base + ' · 额度已刷新 ' + ok + '/' + probe.length + (fails.length ? '，失败 ' + fails.join('；') : '')
+}
 function qoderPoolStatus(id) {
   const st = document.getElementById('qdp-st-' + id)
-  if (st) st.innerHTML = '<span class="mu"><i class="fas fa-spinner fa-spin"></i> 加载账号池…</span>'
+  if (st) st.innerHTML = '<span class="mu"><i class="fas fa-spinner fa-spin"></i> 刷新账号池并探测额度…</span>'
   return Promise.all([
-    fetch('/admin/api/oauth/' + encodeURIComponent(id) + '/status').then(r => r.json()),
+    // credits=1：顺便让后端向每个账号探一次额度。Qoder 的额度只有签到会拉（cron 每天两次），
+    // 不探的话「额度包明细 / 到期天数」会一直停在最近一次签到时的数据，「7 天内到期优先」
+    // 的挑号依据也可能是昨天的。
+    fetch('/admin/api/oauth/' + encodeURIComponent(id) + '/status?credits=1').then(r => r.json()),
     fetch('/admin/api/checkin/status').then(r => r.json()).catch(() => null),
   ]).then(res => {
     const d = res[0], cd = res[1]
     if (!d.success) { if (st) showResult(st, false, d.message || '查询失败'); return }
     const pool = (d.data && d.data.pool) || []
-    if (st) showResult(st, true, '共 ' + pool.length + ' 个账号')
+    if (st) showResult(st, true, qoderProbeSummary(pool.length, d.data && d.data.quotaProbe))
     // 签到状态按 uid 匹配逐账号明细
     let ciAccounts = []
     if (cd && cd.success && cd.data && Array.isArray(cd.data.workbuddy)) {
