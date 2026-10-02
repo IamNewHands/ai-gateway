@@ -747,9 +747,15 @@ export function buildUpstreamBody(
   const body: Record<string, unknown> = {
     model,
     session_id: sessionId,
-    reasoning_effort: String(forwardBody.reasoning_effort || forwardBody.reasoningEffort || CLINE_DEFAULT_REASONING_EFFORT),
     messages: sanitizeClineMessages(forwardBody.messages) as unknown[],
   }
+  // reasoning_effort：**Cline 上游不接受 "none" 枚举**（移植 luawei1/cline2api
+  // `proxy.go:870-874` 及其 issue #9）。客户端显式关思考时删字段，而不是回落默认档——
+  // 默认档是 medium，回落等于把「关」悄悄变「开」。
+  // Anthropic / Responses 入口本来就先过 sanitizeUpstreamBody（删 reasoning_effort），
+  // 只有 Chat Completions 直连路径会带着 "none" 走到这里。
+  const effort = String(forwardBody.reasoning_effort || forwardBody.reasoningEffort || CLINE_DEFAULT_REASONING_EFFORT)
+  if (effort !== 'none') body.reasoning_effort = effort
   // max_tokens 分档（见 CLINE_MAX_TOKENS 文档）：免费档剥离，非免费档保留并兜下限。
   // 免费判定用 free 列表成员（不是前缀）——stealth/space-bunny-alpha 无 cline-free/ 前缀。
   let clamped = false

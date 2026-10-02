@@ -612,6 +612,38 @@ describe('buildUpstreamBody max_tokens 通道分档', () => {
   })
 })
 
+// reasoning_effort=none 必须删字段而不是原样下发（Cline 上游无此枚举）：
+// 移植 luawei1/cline2api `proxy.go:870-874` + issue #9。只有 Chat Completions 直连
+// 路径会带着 "none" 到达这里——Anthropic / Responses 入口先被 sanitizeUpstreamBody 删掉。
+describe('buildUpstreamBody reasoning_effort=none 不下发（移植 cline2api proxy.go:870）', () => {
+  const freeSet = new Set([DEFAULT_MODEL])
+
+  it('none 被删字段，且不回落到默认档（回落会把「关」变「开」）', () => {
+    const body = buildUpstreamBody({ model: PAID_MODEL, reasoning_effort: 'none' }, true, 's1', freeSet)
+    expect('reasoning_effort' in body).toBe(false)
+  })
+
+  it('驼峰 reasoningEffort=none 同样被删', () => {
+    const body = buildUpstreamBody({ model: PAID_MODEL, reasoningEffort: 'none' }, true, 's1', freeSet)
+    expect('reasoning_effort' in body).toBe(false)
+  })
+
+  it('合法档位原样下发（low/medium/high）', () => {
+    for (const effort of ['low', 'medium', 'high']) {
+      expect(buildUpstreamBody({ model: PAID_MODEL, reasoning_effort: effort }, true, 's1', freeSet).reasoning_effort).toBe(effort)
+    }
+  })
+
+  it('未指定时仍是默认护栏档（medium）', () => {
+    expect(buildUpstreamBody({ model: PAID_MODEL }, true, 's1', freeSet).reasoning_effort).toBe('medium')
+  })
+
+  it('none 时出站 JSON 里不含该键（不会被不可枚举标记之外的东西带出去）', () => {
+    const body = buildUpstreamBody({ model: PAID_MODEL, reasoning_effort: 'none' }, true, 's1', freeSet)
+    expect(JSON.stringify(body)).not.toContain('reasoning_effort')
+  })
+})
+
 // 输出预算的模型级硬上限（2026-10-05，移植 luawei1/cline2api `3f72255`）：
 // Cline 官方接口不带 maxTokens 元数据，客户端默认的 128000 会原样透传，超过模型硬上限时
 // 上游 400，而 400 属于「原样透传、不降级」分支（clineModelFallbackChain 注释）——
