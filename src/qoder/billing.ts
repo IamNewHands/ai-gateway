@@ -1,4 +1,6 @@
 import { cosySessionFor, type CosySession } from './cosy'
+import { formatCstWallClock, parseCstWallClock } from '../credit-expiry'
+import type { PackageInfo } from '../types'
 
 /**
  * billing.ts — QoderWork 额度 / 签到 / 套餐（移植自 cpa-plugin/qoderwork/billing.go + checkin.go，
@@ -264,6 +266,12 @@ export interface QoderCheckinOutcome {
   /** 命中的活动 key，便于排查是哪个活动发的积分 */
   campaignKey?: string
   /**
+   * 本次新领积分的到期时刻（epoch ms，来自 claim 响应的 expiresAt，30 天相对有效期）。
+   * 落进池状态的「签到/赠送额度」包，面板据此显示到期天数、挑号据此优先消耗快过期的积分。
+   * 仅在**本次新领**时有值：replayed（今日已领）没有新 grant，用池里已存的到期时间。
+   */
+  rewardExpiresAt?: number
+  /**
    * 诊断详情（供签到日志落盘；**绝不含 token 原文**）。
    *
    * 为什么必须带出来：线上出现「提示签到成功但积分没增加」，而面板只显示一句
@@ -450,6 +458,8 @@ export async function performQoderCheckin(
       message: amount ? `领取成功 +${amount} ${target.campaignKey || ''}`.trim() : '签到成功',
       rewardCredits: amount,
       campaignKey: target.campaignKey,
+      // claim 响应的 expiresAt 是 ISO 串（如 "2026-11-01T10:52:18.531379Z"，= 领取时刻 + 30 天）
+      rewardExpiresAt: parseCstWallClock(cr.expiresAt) ?? undefined,
       debug: dbg,
     }
   }
@@ -469,15 +479,75 @@ interface QoderQuotaUsage {
   addOnQuota?: { total?: number; used?: number; remaining?: number }
 }
 
+/** 一个额度分项（基础 / 加购）。 */
+export interface QoderQuotaSplit {
+  size: number
+  used: number
+  remain: number
+}
+
+/** 面板与池状态里的两个额度包名——唯一定义处（checkin 写路径与测试都引用它）。 */
+export const QODER_PACK_BASE = '套餐额度'
+export const QODER_PACK_ADDON = '签到/赠送额度'
+
+/**
+ * 组装权益包列表（`PackageInfo` 形态，`expireAt` 统一为 CST 墙钟串）。
+ *
+ * 为什么要把 Qoder 的额度也装成 PackageInfo：这样面板的到期渲染/排序/「⏳ N 个包 7 天内到期」
+ * 徽章、以及 credit-expiry 的到期优先判定，全部与 workbuddy 共用同一套实现（零新渲染逻辑）。
+ *
+ * 两个包的到期来源不同，必须分开对待：
+ *   - 套餐额度（userQuota）：到期 = quota/usage 的顶层 `expiresAt`（套餐到期即基础额度作废）；
+ *   - 签到/赠送额度（addOnQuota）：quota/usage **不返回**它的到期时间，只能取「最近一次领取
+ *     的那笔 grant」的 expiresAt（claim 响应的 30 天相对有效期）。已领过的账号用池里已存的
+ *     到期时间兜底（`prev`），避免每日「已签到」路径把到期时间擦掉。
+ */
+export function buildQoderPacks(
+  quota: { baseQuota: QoderQuotaSplit; addonQuota: QoderQuotaSplit; planExpiresAt: number },
+  rewardExpiresAtMs: number | undefined,
+  prev?: readonly PackageInfo[] | null
+): PackageInfo[] {
+  const prevAddon = Array.isArray(prev) ? prev.find((p) => p && p.name === QODER_PACK_ADDON) : undefined
+  const addonExpireAt =
+    typeof rewardExpiresAtMs === 'number' && Number.isFinite(rewardExpiresAtMs) && rewardExpiresAtMs > 0
+      ? rewardExpiresAtMs
+      : (parseCstWallClock(prevAddon?.expireAt) ?? 0)
+  return [
+    {
+      name: QODER_PACK_BASE,
+      expireAt: formatCstWallClock(quota.planExpiresAt),
+      size: quota.baseQuota.size,
+      used: quota.baseQuota.used,
+      unit: 'credits',
+    },
+    {
+      name: QODER_PACK_ADDON,
+      expireAt: formatCstWallClock(addonExpireAt),
+      size: quota.addonQuota.size,
+      used: quota.addonQuota.used,
+      unit: 'credits',
+    },
+  ]
+}
+
 /**
  * 拉取额度：聚合 userQuota（基础额度）+ addOnQuota（赠送/签到额度）为两个包。
  * 返回 null 表示数据缺失（非耗尽）。
+ *
+ * 除聚合值外还返回**分项**与套餐到期时间：签到积分落在 addOnQuota 里，而它的到期时间
+ * 决定「哪些积分会先作废」，只有拿到分项才能把两个包分别标上到期时间（buildQoderPacks）。
  */
 export async function fetchQoderUserResource(token: string, realm: QoderRealm = 'cn'): Promise<{
   totalRemain: number
   totalUsed: number
   totalSize: number
   packCount: number
+  /** 套餐（基础额度）到期 epoch ms；0 = 上游未给或不可解析 */
+  planExpiresAt: number
+  /** 基础额度（userQuota） */
+  baseQuota: QoderQuotaSplit
+  /** 加购/赠送额度（addOnQuota）——签到发的 100 Credits 落在这里 */
+  addonQuota: QoderQuotaSplit
   /** 上游原始响应体（截断）。面板出现「可用 0 · 已用 0」时，需要它来区分
    *  「账号确实没额度」与「字段名/结构变了导致解析成 0」。 */
   raw?: string
@@ -497,13 +567,16 @@ export async function fetchQoderUserResource(token: string, realm: QoderRealm = 
   const uq = q.userQuota || {}
   const aq = q.addOnQuota || {}
   const num = (v: unknown) => (typeof v === 'number' && Number.isFinite(v) ? v : Number(v) || 0)
-  const base = { remain: num(uq.remaining), used: num(uq.used), size: num(uq.total) }
-  const addon = { remain: num(aq.remaining), used: num(aq.used), size: num(aq.total) }
+  const baseQuota: QoderQuotaSplit = { remain: num(uq.remaining), used: num(uq.used), size: num(uq.total) }
+  const addonQuota: QoderQuotaSplit = { remain: num(aq.remaining), used: num(aq.used), size: num(aq.total) }
   return {
-    totalRemain: base.remain + addon.remain,
-    totalUsed: base.used + addon.used,
-    totalSize: base.size + addon.size,
+    totalRemain: baseQuota.remain + addonQuota.remain,
+    totalUsed: baseQuota.used + addonQuota.used,
+    totalSize: baseQuota.size + addonQuota.size,
     packCount: 2,
+    planExpiresAt: num(q.expiresAt),
+    baseQuota,
+    addonQuota,
     raw: bodyText.substring(0, 500),
   }
 }

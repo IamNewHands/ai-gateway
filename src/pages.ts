@@ -758,7 +758,7 @@ ${H('管理')}
                     <div class="fc mt-1 field-row" style="gap:8px"><input type="number" id="cd-plan-${escapePageHtml(p.id)}" value="${p.cooldown&&p.cooldown.planMs?Math.round(p.cooldown.planMs/60000):''}" style="width:88px" placeholder="plan冷却" title="余额/权益耗尽（402）的硬冷却时长（分钟）。到期到次日 04:00，签到恢复后自动解冻。"><input type="number" id="cd-soft-${escapePageHtml(p.id)}" value="${p.cooldown&&p.cooldown.softMs?Math.round(p.cooldown.softMs/1000):''}" style="width:88px" placeholder="429冷却" title="429 限流 / WAF 403 / 404 / 5xx（无 Retry-After 头时）的默认软冷却时长（秒）。"><input type="number" id="cd-err-${escapePageHtml(p.id)}" value="${p.cooldown&&p.cooldown.errThreshold?p.cooldown.errThreshold:''}" style="width:76px" placeholder="错误阈值" title="连续 5xx 错误次数阈值：达到后把该账号冷却 errMs 分钟。偶发 502 若携带 Retry-After 头会优先按其时长软冷却、不再触发本计数。"><input type="number" id="cd-errms-${escapePageHtml(p.id)}" value="${p.cooldown&&p.cooldown.errMs?Math.round(p.cooldown.errMs/60000):''}" style="width:88px" placeholder="错误冷却" title="达到错误阈值后的账号级冷却时长（分钟）。"><span class="mu" style="font-size:12px">冷却参数（保存后生效）</span></div>
                   </fieldset>`:''}
                   ${(p.oauth&&p.oauth.flowType==='qoder')||p.id==='qoder'?`
-                  <fieldset class="form-group" id="qdp-fs-${escapePageHtml(p.id)}"><legend>Qoder 多账号池</legend><span class="form-helper">设备授权流每次成功登录都会把该账号加入账号池（按 user_id 去重，多登一个 = 多个账号）。转发按剩余积分自动挑选账号，额度耗尽/429/鉴权失败按策略冷却或禁用并自动轮换下一个账号；每日签到后积分恢复自动解冻。冷却参数留空 = 默认（额度耗尽 12h / 429 60s / 连续 5 次错误冷却 10m）。</span>
+                  <fieldset class="form-group" id="qdp-fs-${escapePageHtml(p.id)}"><legend>Qoder 多账号池</legend><span class="form-helper">设备授权流每次成功登录都会把该账号加入账号池（按 user_id 去重，多登一个 = 多个账号）。转发挑号：<b>7 天内到期的积分优先消耗</b>（到期越早越优先），窗口内没有待救积分时才按剩余积分最多者挑选；账号行上的「⏳ N 个包 7 天内到期」徽章与额度包明细里琥珀色的到期时间就是该规则的依据（到期时间按北京时间 CST 判定，数据来自最近一次签到/刷新额度）。「额度包明细」分「套餐额度」（到期 = 套餐到期，即基础额度作废时刻）与「签到/赠送额度」（到期 = 最近一次领取的那笔 30 天有效期）两项，<b>已用完的包自动隐藏</b>，其余按到期升序排列（快过期的在最上面）。额度耗尽/429/鉴权失败按策略冷却或禁用并自动轮换下一个账号；每日签到后积分恢复自动解冻（<b>签到成功也一并清除「需重新登录」的禁用标记</b>——签到通过鉴权就是 token 有效的直接证据）。冷却参数留空 = 默认（额度耗尽 12h / 429 60s / 连续 5 次错误冷却 10m）。</span>
                     <div class="fc mt-1 field-row"><button class="btn btn-s" onclick="qoderPoolStatus('${escapePageJsx(p.id)}')"><i class="fas fa-sync" aria-hidden="true"></i>刷新账号池</button><button class="btn btn-s" onclick="oauthConnect('${escapePageJsx(p.id)}')"><i class="fas fa-sign-in-alt" aria-hidden="true"></i>登录新账号</button><button class="btn btn-gh btn-xs" onclick="oauthPoolExportModal('${escapePageJsx(p.id)}')"><i class="fas fa-file-export" aria-hidden="true"></i>导出凭证/Token</button><button class="btn btn-p" onclick="triggerCheckin('${escapePageJsx(p.id)}')"><i class="fas fa-calendar-check" aria-hidden="true"></i>立即签到</button><span id="qdp-st-${escapePageHtml(p.id)}" class="oauth-status"></span></div>
                     <div id="qdp-acc-${escapePageHtml(p.id)}" class="mt-1"></div>
                     <div class="fc mt-1 field-row" style="gap:8px"><input type="number" id="cd-plan-${escapePageHtml(p.id)}" value="${p.cooldown&&p.cooldown.planMs?Math.round(p.cooldown.planMs/60000):''}" style="width:88px" placeholder="额度耗尽冷却" title="额度/权益耗尽（402）的硬冷却时长（分钟）。到期到次日 04:00，签到恢复后自动解冻。"><input type="number" id="cd-soft-${escapePageHtml(p.id)}" value="${p.cooldown&&p.cooldown.softMs?Math.round(p.cooldown.softMs/1000):''}" style="width:88px" placeholder="429冷却" title="429 限流的默认软冷却时长（秒）。"><input type="number" id="cd-err-${escapePageHtml(p.id)}" value="${p.cooldown&&p.cooldown.errThreshold?p.cooldown.errThreshold:''}" style="width:76px" placeholder="错误阈值" title="连续错误次数阈值：达到后把该账号冷却「错误冷却」时长。"><input type="number" id="cd-errms-${escapePageHtml(p.id)}" value="${p.cooldown&&p.cooldown.errMs?Math.round(p.cooldown.errMs/60000):''}" style="width:88px" placeholder="错误冷却" title="达到错误阈值后的账号级冷却时长（分钟）。"><span class="mu" style="font-size:12px">冷却参数（保存后生效）</span></div>
@@ -2250,8 +2250,9 @@ function oauthPoolStatus(id) {
   }).catch(() => { if (st) showResult(st, false, '查询失败') })
 }
 /* WB_EXPIRY_BEGIN */
-// ===== WorkBuddy 权益包「7 天内到期」判定与渲染（纯函数；单测按标记块抽取） =====
-// 口径必须与后端挑号一致（src/credit-expiry.ts + oauth-pool.soonestOauthExpiryAt）：
+// ===== 权益包「7 天内到期」判定与渲染（纯函数；单测按标记块抽取） =====
+// WorkBuddy / TRAE / Qoder 三个池共用这一套（Qoder 的额度包由后端 buildQoderPacks 落成同一形态）。
+// 口径必须与后端挑号一致（src/credit-expiry.ts + oauth-pool.soonestOauthExpiryAt / qoder/pool.soonestQoderExpiryAt）：
 //   1) 上游 ExpiredTime 是 **CST 墙钟串**，浏览器本地时区可能是别的，必须显式按 +08:00 解释；
 //   2) 只有「剩余 = 总额 - 已用 > 0」的包才算待救积分（已用尽的空包不参与优先）；
 //   3) 窗口 7 天（含边界）；窗口内最早到期的账号在池内被优先挑中。
@@ -2656,6 +2657,11 @@ function renderQoderPoolAccounts(id, accs, ciByUid, ciAccounts) {
       creditLine = '<div class="mu" style="margin-top:2px">可用 ' + ci.totalRemain + ' · 已用 ' + used + '</div>'
     }
     let line = (a.nickname ? escapeHtml(a.nickname) : 'uid=' + escapeHtml(a.uid)) + ' · 积分=' + (a.credits || 0)
+    // 额度包明细：数据源优先池状态（它就是挑号用的那一份，且比签到结果活得久）；
+    // 旧 KV 数据 / 尚未签到探测时回退签到结果里的同源快照。
+    const pkgs = Array.isArray(a.packages) ? a.packages : (ci && Array.isArray(ci.packages) ? ci.packages : null)
+    const expiring7d = wbPackExpiring7d(pkgs)
+    line += wbExpiringBadge(pkgs)
     // 冷却状态徽章（常显，与 WorkBuddy 池同款）：禁用（红）> 冷却中（琥珀）> 无冷却（绿）；详情 muted 文字跟随
     const coolBadge = isOff ? '<span class="bd bd-danger">已禁用</span>'
       : (a.cooling ? '<span class="bd bd-warn">冷却中</span>' : '<span class="bd bd-on">无冷却</span>')
@@ -2667,8 +2673,32 @@ function renderQoderPoolAccounts(id, accs, ciByUid, ciAccounts) {
     if (a.tokenMask) {
       line += ' · <code class="mu" style="font-size:11px" title="已存储于网关 KV">Token: ' + escapeHtml(a.tokenMask) + '</code>'
     }
-    return '<div class="fc mb-2 field-row" style="align-items:flex-start"><div class="fx1" style="font-size:12px;min-width:0"><div>' + line + ' ' + ciBadge + '</div>' + creditLine + '</div><div class="fc" style="gap:4px"><button class="btn btn-gh btn-xs" onclick="oauthPoolCopyToken(\\'' + escapeJsAttr(id) + '\\',\\'' + escapeJsAttr(a.uid) + '\\')" title="复制 Access Token"><i class="fas fa-copy" aria-hidden="true"></i>复制Token</button><button class="btn btn-gh btn-xs" onclick="oauthPoolRemove(\\'' + escapeJsAttr(id) + '\\',\\'' + escapeJsAttr(a.uid) + '\\')"><i class="fas fa-trash" aria-hidden="true"></i>移除</button></div></div>'
+    // 额度包折叠表（与 WorkBuddy 池同款结构；Qoder 上游没有「周期结束」概念，故少一列）：
+    // 隐藏已用完的包，其余按到期升序（快过期的在最上面），到期时间单元格带「剩 N 天」。
+    const pkgDisp = wbPackageDisplayList(pkgs)
+    const hiddenPkg = pkgDisp.hidden > 0 ? ' · <span class="mu">已用完 ' + pkgDisp.hidden + ' 个已隐藏</span>' : ''
+    let pkgHtml = ''
+    if (pkgDisp.rows.length > 0) {
+      const aid = 'qdpkg-' + escapeHtml(id) + '-' + i
+      const rows = pkgDisp.rows.map(function(p) {
+        let qty = '—'
+        if (p.size !== undefined && p.size !== null && p.size > 0) {
+          const used2 = (p.used !== undefined && p.used !== null) ? p.used : 0
+          qty = used2 + ' / ' + p.size + (p.unit ? ' ' + p.unit : '')
+        }
+        return '<tr><td>' + escapeHtml(p.name) + '</td><td>' + wbPackExpireHtml(p.expireAt) + '</td><td class="numeric">' + qty + '</td></tr>'
+      }).join('')
+      const pkgHead = '额度包明细（' + pkgDisp.rows.length + '）' + (expiring7d.length > 0 ? ' · <span style="color:var(--color-warn,#d97706)">' + expiring7d.length + ' 个 7 天内到期</span>' : '') + hiddenPkg
+      pkgHtml = '<div class="collapse-section" style="margin-top:4px"><button class="collapse-btn" data-pkg="' + aid + '" type="button" aria-expanded="false"><i class="fas fa-chevron-right collapse-icon" aria-hidden="true"></i> ' + pkgHead + '</button><div id="' + aid + '" class="hd usage-log-table-wrap"><table class="usage-log-table"><thead><tr><th>名称</th><th>到期时间</th><th>已用/总额度</th></tr></thead><tbody>' + rows + '</tbody></table></div></div>'
+    } else if (pkgDisp.total > 0) {
+      pkgHtml = '<div class="mu" style="margin-top:2px">额度包明细：' + pkgDisp.total + ' 个包已全部用完</div>'
+    }
+    return '<div class="fc mb-2 field-row" style="align-items:flex-start"><div class="fx1" style="font-size:12px;min-width:0"><div>' + line + ' ' + ciBadge + '</div>' + creditLine + pkgHtml + '</div><div class="fc" style="gap:4px"><button class="btn btn-gh btn-xs" onclick="oauthPoolCopyToken(\\'' + escapeJsAttr(id) + '\\',\\'' + escapeJsAttr(a.uid) + '\\')" title="复制 Access Token"><i class="fas fa-copy" aria-hidden="true"></i>复制Token</button><button class="btn btn-gh btn-xs" onclick="oauthPoolRemove(\\'' + escapeJsAttr(id) + '\\',\\'' + escapeJsAttr(a.uid) + '\\')"><i class="fas fa-trash" aria-hidden="true"></i>移除</button></div></div>'
   }).join('')
+  // 绑定额度包折叠按钮（与 WorkBuddy 池相同的 toggleCollapse 交互）
+  box.querySelectorAll('[data-pkg]').forEach(function(btn) {
+    btn.addEventListener('click', function() { toggleCollapse(btn.getAttribute('data-pkg'), btn) })
+  })
 }
 /** 收集冷却参数（trae / workbuddy 池共用 cd-* 输入）；无输入框返回 undefined，全空返回 null（恢复默认）。 */
 function numOrUndef(v) {

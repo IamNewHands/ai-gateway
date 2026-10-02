@@ -587,6 +587,35 @@ describe('WorkBuddy 面板「即将到期」标记（客户端口径 = 后端挑
     expect(js).toContain('个已隐藏')
     expect(js).toContain('个包已全部用完')
   })
+
+  /**
+   * Qoder 池的账号行也接上同一套到期渲染（2026-10-02）。
+   * 只断言「页面里有这些函数」是不够的：函数全局存在、而 Qoder 卡片仍在用旧的纯文本渲染，
+   * 面板照样能跑、语法照样合法，但「到期天数」和「⏳ 7 天内到期」在 Qoder 上永远不出现。
+   * 所以这里把 renderQoderPoolAccounts 的函数体抠出来，逐项确认它真的用了这些口径。
+   */
+  it('Qoder 池账号行真的用了同一套到期渲染（函数体级断言，防「函数在但没接上」）', async () => {
+    const html = await render([{
+      ...traeProvider(), id: 'qoder', name: 'QoderWork', authType: 'oauth-device', oauth: { flowType: 'qoder' },
+    } as Provider])
+    const js = inlineScripts(html).join('\n')
+    const m = js.match(/function renderQoderPoolAccounts\(id, accs, ciByUid, ciAccounts\) \{([\s\S]*?)\n\}/)
+    expect(m, '未找到 renderQoderPoolAccounts：Qoder 账号池渲染被删除或改名了？').not.toBeNull()
+    const body = m![1]
+    // 数据源：池状态 a.packages 优先，回退签到结果 ci.packages（与 WorkBuddy 同口径）
+    expect(body).toContain('Array.isArray(a.packages) ? a.packages')
+    expect(body).toContain('wbExpiringBadge(pkgs)')
+    expect(body).toContain('wbPackageDisplayList(pkgs)')
+    expect(body).toContain('wbPackExpireHtml(p.expireAt)')
+    // 折叠表 id 前缀 + 折叠绑定（没有绑定就点不开明细）
+    expect(body).toContain("'qdpkg-'")
+    expect(body).toContain("querySelectorAll('[data-pkg]')")
+    // 静态说明文案已声明新规则
+    expect(html).toContain('7 天内到期的积分优先消耗')
+    expect(html).toContain('额度包明细')
+    // 任务1 的修复也要在文案里说明（签到成功清禁用，避免用户以为要重新登录）
+    expect(html).toContain('签到成功也一并清除')
+  })
 })
 
 /**

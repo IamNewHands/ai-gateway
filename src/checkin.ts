@@ -15,13 +15,13 @@
  * 多账号：遍历所有 oauth-device provider，各自签到。
  */
 import { Context } from 'hono'
-import type { Env, Provider, CheckinResult, ApiResponse } from './types'
+import type { Env, Provider, CheckinResult, ApiResponse, PackageInfo } from './types'
 import { KV_KEYS, CHECKIN_RESULT_TTL_SEC, OAUTH_TOKEN_REFRESH_MARGIN_MS } from './config'
 import { getProviders } from './storage'
 import { getOauthAccessToken, detectTokenRealm, refreshQoderTokenPair } from './oauth'
 import { writeLog } from './admin'
 import { isQoderFlow } from './qoder/proxy'
-import { fetchQoderCheckinStatus, performQoderCheckin, fetchQoderUserResource, fetchQoderPaymentType, normalizeQoderRealm, realmHasLegacyCheckin, type QoderRealm } from './qoder/billing'
+import { fetchQoderCheckinStatus, performQoderCheckin, fetchQoderUserResource, fetchQoderPaymentType, buildQoderPacks, normalizeQoderRealm, realmHasLegacyCheckin, type QoderRealm } from './qoder/billing'
 import { getQoderDevice } from './qoder/device'
 import {
   readQoderPool,
@@ -192,8 +192,19 @@ async function fillCredits(env: Env, base: CheckinResult, token: string, realm: 
 // ===== QoderWork 签到（flowType=qoder，dt- token） =====
 
 /** 拉取 Qoder 额度 + 套餐填充到 base（失败只写日志，不影响签到结果）。
- *  返回额度接口的原始响应体（截断），供签到日志区分「真没额度」与「解析成 0」。 */
-async function fillQoderCredits(env: Env, base: CheckinResult, token: string, realm: QoderRealm): Promise<string | undefined> {
+ *  返回额度接口的原始响应体（截断），供签到日志区分「真没额度」与「解析成 0」。
+ *
+ *  同时把额度拆成两个带到期时间的包（buildQoderPacks）落进 base.packages：
+ *  面板据此显示「到期时间 + 剩 N 天」，挑号据此优先消耗快过期的积分。
+ *  `rewardExpiresAt` = 本次新领积分的到期时刻（claim 响应），已签到路径没有新 grant，
+ *  由 `prevPackages`（池里已存的包）兜底，避免每日「已签到」把到期时间擦掉。 */
+async function fillQoderCredits(
+  env: Env,
+  base: CheckinResult,
+  token: string,
+  realm: QoderRealm,
+  opts?: { rewardExpiresAt?: number; prevPackages?: readonly PackageInfo[] }
+): Promise<string | undefined> {
   let quotaRaw: string | undefined
   try {
     const credits = await fetchQoderUserResource(token, realm)
@@ -202,6 +213,7 @@ async function fillQoderCredits(env: Env, base: CheckinResult, token: string, re
       base.totalUsed = credits.totalUsed
       base.totalSize = credits.totalSize
       base.packCount = credits.packCount
+      base.packages = buildQoderPacks(credits, opts?.rewardExpiresAt, opts?.prevPackages)
       quotaRaw = credits.raw
     } else {
       try { await writeLog(env, 'warn', `[checkin] ${base.name} 额度无数据（quota/usage 响应为空）`, '') } catch { /* ignore */ }
@@ -277,7 +289,7 @@ async function checkinQoderPoolAccount(env: Env, provider: Provider, account: Qo
       base.reason = 'already'
       base.message = '今日已签到'
       base.lastCheckinAt = Date.now()
-      await fillQoderCredits(env, base, token, realm)
+      await fillQoderCredits(env, base, token, realm, { prevPackages: account.state?.packages })
       await syncQoderPoolCredits(env, provider.id, account, base)
       return base
     }
@@ -300,8 +312,11 @@ async function checkinQoderPoolAccount(env: Env, provider: Provider, account: Qo
     base.checkinCredit = res.rewardCredits
   }
 
-  // 签到成功后额度已变化，拉最新额度
-  const quotaRaw = await fillQoderCredits(env, base, token, realm)
+  // 签到成功后额度已变化，拉最新额度（本次新领的到期时刻来自 claim 响应）
+  const quotaRaw = await fillQoderCredits(env, base, token, realm, {
+    rewardExpiresAt: res.rewardExpiresAt,
+    prevPackages: account.state?.packages,
+  })
   await syncQoderPoolCredits(env, provider.id, account, base)
 
   // ===== 签到日志（落系统日志，供「提示成功但积分没增加」定位） =====
@@ -337,11 +352,17 @@ async function checkinQoderPoolAccount(env: Env, provider: Provider, account: Qo
   return base
 }
 
-/** 签到后把额度/昵称回写 Qoder 池：积分>0 的冷却账号自动解冻（对齐 WorkBuddy 池）。 */
+/**
+ * 签到后把额度/额度包/昵称回写 Qoder 池：积分>0 的冷却账号自动解冻（对齐 WorkBuddy 池）。
+ *
+ * `totalRemain === 0`（额度真用尽）也要回写：那不是失败，`state.credits` 与额度包明细
+ * （面板到期展示 + 「到期优先」挑号的数据源）都必须更新；解冻只在 remain > 0 时发生，
+ * 由 reenableQoderIfCredits 内部把关。
+ */
 async function syncQoderPoolCredits(env: Env, providerId: string, account: QoderPoolAccount, base: CheckinResult): Promise<void> {
   try {
-    if (typeof base.totalRemain === 'number' && base.totalRemain > 0) {
-      await reenableQoderIfCredits(env, providerId, account.uid, base.totalRemain)
+    if (typeof base.totalRemain === 'number') {
+      await reenableQoderIfCredits(env, providerId, account.uid, base.totalRemain, base.packages)
     }
     if (base.nickname && base.nickname !== account.nickname) {
       await setQoderPoolAccountNickname(env, providerId, account.uid, base.nickname)

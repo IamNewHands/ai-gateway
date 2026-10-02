@@ -7,10 +7,13 @@
  *      且到期越早越优先；
  *   2) 否则回落到原有「积分高低」规则（池侧行为完全不变）。
  *
- * 本模块只做**纯计算**（不碰 KV / 网络 / 上游），两个池各自提供自己的到期数据源：
+ * 本模块只做**纯计算**（不碰 KV / 网络 / 上游），三个池各自提供自己的到期数据源：
  *   - trae：state.packs（expireAt 为 Unix 秒，rem 为剩余额度）
  *   - workbuddy：state.packages（expireAt 为 CST 墙钟字符串，remain = size − used）
+ *   - qoder：state.packages（同 workbuddy 形态；上游给的是 ms 时间戳/ISO 串，
+ *     由 billing.buildQoderPacks 用 formatCstWallClock 统一落成同一形态）
  */
+import type { PackageInfo } from './types'
 
 /** 优先窗口：7 天。窗口内的到期积分优先消耗，窗口外按原规则。 */
 export const CREDIT_EXPIRY_WINDOW_MS = 7 * 24 * 60 * 60 * 1000
@@ -54,6 +57,53 @@ export interface CreditExpiryEntry {
   expireAt: number | null
   /** 剩余可用额度；<= 0 视为无剩余（不参与优先） */
   remain: number
+}
+
+/**
+ * epoch ms → 上游同款 `"YYYY-MM-DD HH:mm:ss"`（**CST 墙钟**，无时区后缀）。
+ * `parseCstWallClock` 的逆运算（同一 +08:00 口径），供只拿到 ms 时间戳的池
+ * （Qoder：quota/usage 的套餐 expiresAt 是 ms、claim 响应的 expiresAt 是 ISO 串）
+ * 落成 `PackageInfo.expireAt`，从而与 workbuddy 共用同一套面板渲染与到期优先判定。
+ *
+ * 非有限 / <= 0 → 空串（语义 = 长期有效或未知，面板显示「长期」，不参与到期优先）。
+ */
+export function formatCstWallClock(ms: number | null | undefined): string {
+  if (typeof ms !== 'number' || !Number.isFinite(ms) || ms <= 0) return ''
+  const d = new Date(ms + 8 * 60 * 60 * 1000)
+  const p = (n: number) => String(n).padStart(2, '0')
+  return (
+    `${d.getUTCFullYear()}-${p(d.getUTCMonth() + 1)}-${p(d.getUTCDate())} ` +
+    `${p(d.getUTCHours())}:${p(d.getUTCMinutes())}:${p(d.getUTCSeconds())}`
+  )
+}
+
+/**
+ * 单个权益包 → 到期条目：expireAt 为上游 CST 墙钟字符串（按 +08:00 解释），
+ * remain = max(0, size − used)。size/used 都缺省（探测不到容量）→ remain 0，不参与优先
+ * ——宁可回落积分规则，也不把"包还在但额度未知"当成待救积分去抢占挑号。
+ */
+export function packageExpiryEntry(p: PackageInfo): CreditExpiryEntry {
+  const size = typeof p?.size === 'number' && Number.isFinite(p.size) ? p.size : 0
+  const used = typeof p?.used === 'number' && Number.isFinite(p.used) ? p.used : 0
+  return { expireAt: parseCstWallClock(p?.expireAt), remain: size - used }
+}
+
+/**
+ * 一组权益包里「窗口期内到期且仍有剩余」的最早到期时刻（epoch ms）；没有 → null。
+ * 数据来自池状态里的 `packages`（签到/刷新时落盘），未探测过 → null，回落积分高低规则。
+ */
+export function soonestPackageExpiryAt(
+  packages: readonly PackageInfo[] | null | undefined,
+  now: number,
+  windowMs: number = CREDIT_EXPIRY_WINDOW_MS
+): number | null {
+  if (!packages || packages.length === 0) return null
+  const entries: CreditExpiryEntry[] = []
+  for (const p of packages) {
+    if (!p) continue
+    entries.push(packageExpiryEntry(p))
+  }
+  return soonestExpiringAt(entries, now, windowMs)
 }
 
 /**

@@ -28,7 +28,7 @@
  * 冷却参数默认对齐 workbuddy-wild cooldown.*（12h / 60s / 5 次 / 10m），可被 provider.cooldown 覆盖。
  */
 import type { Env, OAuthDeviceConfig, OAuthTokenState, PackageInfo, Provider } from './types'
-import { CREDIT_EXPIRY_WINDOW_MS, parseCstWallClock, soonestExpiringAt, type CreditExpiryEntry } from './credit-expiry'
+import { CREDIT_EXPIRY_WINDOW_MS, soonestPackageExpiryAt } from './credit-expiry'
 import { OAUTH_POOL_KV_PREFIX, decodeJwtUid, readOauthToken, refreshBrowserTokenState } from './oauth'
 import { nextDay4AMMs } from './workbuddy-upstream'
 
@@ -233,33 +233,16 @@ function accountWeight(providerId: string, acc: OAuthPoolAccount, maxCredits: nu
 }
 
 /**
- * 单个权益包 → 到期条目：expireAt 为上游 CST 墙钟字符串（按 +08:00 解释），
- * remain = max(0, size − used)。size/used 都缺省（探测不到容量）→ remain 0，不参与优先
- * ——宁可回落积分规则，也不把"包还在但额度未知"当成待救积分去抢占挑号。
- */
-export function packageExpiryEntry(p: PackageInfo): CreditExpiryEntry {
-  const size = typeof p?.size === 'number' && Number.isFinite(p.size) ? p.size : 0
-  const used = typeof p?.used === 'number' && Number.isFinite(p.used) ? p.used : 0
-  return { expireAt: parseCstWallClock(p?.expireAt), remain: size - used }
-}
-
-/**
  * 账号「7 天内到期且仍有剩余」的最早到期时刻（epoch ms）；没有 → null。
  * 数据来自 state.packages（签到写路径落盘），未探测过 → null，回落三因子加权挑号。
+ * 判定本体在 credit-expiry.ts（workbuddy / trae / qoder 三个池共用同一份口径）。
  */
 export function soonestOauthExpiryAt(
   state: OAuthPoolState | undefined,
   now: number,
   windowMs: number = CREDIT_EXPIRY_WINDOW_MS
 ): number | null {
-  const pkgs = state?.packages
-  if (!pkgs || pkgs.length === 0) return null
-  const entries: CreditExpiryEntry[] = []
-  for (const p of pkgs) {
-    if (!p) continue
-    entries.push(packageExpiryEntry(p))
-  }
-  return soonestExpiringAt(entries, now, windowMs)
+  return soonestPackageExpiryAt(state?.packages, now, windowMs)
 }
 
 export async function readOauthPool(env: Env, providerId: string): Promise<OAuthPool> {

@@ -17,11 +17,12 @@
  * 池 KV key：qoder:pool:<providerId>（KV_KEYS.QODER_POOL_PREFIX）。
  * 兼容迁移：池为空时若存在单 token（oauth:token:<id>），自动种子成池账号。
  */
-import type { Env, OAuthDeviceConfig, OAuthTokenState, Provider } from '../types'
+import type { Env, OAuthDeviceConfig, OAuthTokenState, PackageInfo, Provider } from '../types'
 import { KV_KEYS, OAUTH_TOKEN_REFRESH_MARGIN_MS } from '../config'
 import { readOauthToken } from '../oauth'
+import { CREDIT_EXPIRY_WINDOW_MS, soonestPackageExpiryAt } from '../credit-expiry'
 
-/** 池内账号状态（冷却/禁用/积分）。 */
+/** 池内账号状态（冷却/禁用/积分/额度包）。 */
 export interface QoderPoolState {
   credits: number
   disabled: boolean
@@ -29,6 +30,13 @@ export interface QoderPoolState {
   /** 冷却至 epoch ms；0 = 无冷却 */
   until: number
   errCount: number
+  /**
+   * 额度包明细（到期 + 已用/总额度），签到/刷新额度时落盘。
+   * 「7 天内到期优先消耗」挑号与面板「⏳ N 个包 7 天内到期」徽章的唯一数据源。
+   */
+  packages?: PackageInfo[]
+  /** packages 的探测时刻（面板据此说明数据新鲜度） */
+  packagesAt?: number
 }
 
 /** 池内账号（凭证 + 状态），存于 KV qoder:pool:<providerId> */
@@ -128,7 +136,28 @@ export async function seedQoderPoolFromSingle(env: Env, providerId: string): Pro
   return true
 }
 
-/** 挑号：health + 未 tried 中剩余积分最多者优先；若指定 preferUid（账号固定）且该账号健康则固定返回它。 */
+/**
+ * 账号「7 天内到期且仍有剩余」的最早到期时刻（epoch ms）；没有 → null。
+ * 数据来自 state.packages（签到/刷新额度时才探测，请求热路径不写），未探测过 → null。
+ * 判定本体在 credit-expiry.ts（workbuddy / trae / qoder 三池共用同一份口径）。
+ */
+export function soonestQoderExpiryAt(
+  state: QoderPoolState | undefined,
+  now: number,
+  windowMs: number = CREDIT_EXPIRY_WINDOW_MS
+): number | null {
+  return soonestPackageExpiryAt(state?.packages, now, windowMs)
+}
+
+/**
+ * 挑号（两段式，与 trae / workbuddy 池同口径）：
+ *  - 指定 preferUid（客户端 X-Qoder-Account 固定账号）且健康 → 直接用它；
+ *  - 第二段：**7 天内到期且有剩余**的账号里，到期最早者优先（同到期比积分高低）。
+ *    为什么必须这样：积分带到期时间，高分号若一直占坑，低分号整包额度会直接作废；
+ *  - 第三段（兜底）：窗口内没有待救积分 → 原策略「剩余积分最多者优先」。
+ *
+ * 注：积分最低但马上要过期的号会赢过积分最高的长期号——这正是本段的目的。
+ */
 export async function pickQoderAccount(
   env: Env,
   providerId: string,
@@ -142,7 +171,24 @@ export async function pickQoderAccount(
     const pinned = pool.find((a) => a.uid === preferUid)
     if (pinned && !tried.has(pinned.uid) && isQoderAccountHealthy(pinned, now)) return pinned
   }
+  // 第二段：7 天内到期的积分优先（到期越早越优先，同到期比积分高低）
   let best: QoderPoolAccount | null = null
+  let bestExpiry: number | null = null
+  let bestExpiryCredits = -Infinity
+  for (const a of pool) {
+    if (tried.has(a.uid)) continue
+    if (!isQoderAccountHealthy(a, now)) continue
+    const exp = soonestQoderExpiryAt(a.state, now)
+    if (exp === null) continue
+    const credits = a.state?.credits ?? 0
+    if (bestExpiry === null || exp < bestExpiry || (exp === bestExpiry && credits > bestExpiryCredits)) {
+      best = a
+      bestExpiry = exp
+      bestExpiryCredits = credits
+    }
+  }
+  if (best) return best
+  // 第三段：窗口内没有待救积分 → 剩余积分最多者优先（原自动策略）
   let bestCredits = -Infinity
   for (const a of pool) {
     if (tried.has(a.uid)) continue
@@ -217,12 +263,22 @@ export async function noteQoderSuccess(env: Env, providerId: string, uid: string
  *
  * remain <= 0 时保持原样：没有积分就解冻只会让它立刻被挑中再撞额度耗尽，反而多一次无效上游请求。
  */
-export async function reenableQoderIfCredits(env: Env, providerId: string, uid: string, remain: number): Promise<void> {
+export async function reenableQoderIfCredits(
+  env: Env,
+  providerId: string,
+  uid: string,
+  remain: number,
+  packages?: PackageInfo[]
+): Promise<void> {
   const pool = await readQoderPool(env, providerId)
   const acc = pool.find((a) => a.uid === uid)
   if (!acc) return
   const st = acc.state || { credits: 0, disabled: false, until: 0, errCount: 0 }
   acc.state = { ...st, credits: remain }
+  // 额度包明细与 credits 同一次 KV 写落盘（它是「到期优先」挑号的数据源，分开写会读到半旧状态）
+  if (Array.isArray(packages)) {
+    acc.state = { ...acc.state, packages, packagesAt: Date.now() }
+  }
   if (remain > 0) {
     acc.state = { ...acc.state, until: 0, disabled: false, reason: '', errCount: 0 }
   }
@@ -255,6 +311,9 @@ export async function listQoderPoolStatus(env: Env, providerId: string): Promise
     uid: a.uid,
     nickname: a.nickname || '',
     credits: a.state?.credits ?? 0,
+    // 额度包明细 + 探测时刻：「7 天内到期优先」挑号的可见依据（面板据此解释"为何选这个号"）
+    packages: a.state?.packages,
+    packagesAt: a.state?.packagesAt,
     enabled: a.enabled !== false,
     disabled: a.state?.disabled === true,
     cooling: a.state?.until ? a.state.until > now : false,

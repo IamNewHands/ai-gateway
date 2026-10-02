@@ -20,10 +20,13 @@ import {
   noteQoderError,
   pickQoderAccount,
   reenableQoderIfCredits,
+  soonestQoderExpiryAt,
   writeQoderPool,
   type QoderPoolAccount,
 } from './pool'
-import type { Env } from '../types'
+import { CREDIT_EXPIRY_WINDOW_MS, formatCstWallClock } from '../credit-expiry'
+import { QODER_PACK_ADDON, QODER_PACK_BASE } from './billing'
+import type { Env, PackageInfo } from '../types'
 
 /** 假 KV：只实现池读写用到的 get/put/delete。 */
 function makeEnv() {
@@ -116,5 +119,141 @@ describe('reenableQoderIfCredits：成功签到必须同时清掉 disabled（历
     await writeQoderPool(env, pid, [account()])
     await expect(reenableQoderIfCredits(env, pid, 'nobody', 100)).resolves.toBeUndefined()
     expect((await listQoderPoolStatus(env, pid)).length).toBe(1)
+  })
+})
+
+// ===== 到期优先（2026-10-02，与 workbuddy / trae 池同口径） =====
+const DAY = 24 * 60 * 60 * 1000
+
+/** 构造一个额度包：expireInMs=null → 长期（expireAt 空串）。 */
+function pkg(expireInMs: number | null, over: Partial<PackageInfo> = {}): PackageInfo {
+  return {
+    name: over.name ?? QODER_PACK_BASE,
+    expireAt: expireInMs === null ? '' : formatCstWallClock(Date.now() + expireInMs),
+    size: over.size ?? 100,
+    used: over.used ?? 0,
+    unit: 'credits',
+  }
+}
+
+/** 带额度包明细的账号。 */
+function accountWithPacks(uid: string, credits: number, packs: PackageInfo[]): QoderPoolAccount {
+  return account({ uid, state: { credits, disabled: false, until: 0, errCount: 0, packages: packs } })
+}
+
+describe('soonestQoderExpiryAt：窗口内最早到期且仍有剩余', () => {
+  const st = (packages: PackageInfo[]) => ({ credits: 100, disabled: false, until: 0, errCount: 0, packages })
+
+  it('取窗口内最早到期的那一个（多个包时不是第一个）', () => {
+    const now = Date.now()
+    const got = soonestQoderExpiryAt(st([pkg(3 * DAY, { name: 'late' }), pkg(1 * DAY, { name: 'soon' })]), now)
+    expect(got).not.toBeNull()
+    // 与「1 天后到期」的包同一时刻（秒级取整误差内）
+    expect(Math.abs(got! - (now + 1 * DAY))).toBeLessThan(1000)
+  })
+
+  it('窗口边界含等号：正好 7 天内算窗口内，8 天外不算', () => {
+    const now = Date.now()
+    expect(soonestQoderExpiryAt(st([pkg(CREDIT_EXPIRY_WINDOW_MS - 60_000)]), now)).not.toBeNull()
+    expect(soonestQoderExpiryAt(st([pkg(8 * DAY)]), now)).toBeNull()
+  })
+
+  it('长期（空串）/ 已用尽 / 已过期 / 无数据 → null（回落积分高低）', () => {
+    const now = Date.now()
+    expect(soonestQoderExpiryAt(st([pkg(null)]), now)).toBeNull()
+    expect(soonestQoderExpiryAt(st([pkg(1 * DAY, { size: 100, used: 100 })]), now)).toBeNull()
+    expect(soonestQoderExpiryAt(st([pkg(-1 * DAY)]), now)).toBeNull()
+    expect(soonestQoderExpiryAt(st([]), now)).toBeNull()
+    expect(soonestQoderExpiryAt(undefined, now)).toBeNull()
+  })
+})
+
+describe('pickQoderAccount 两段式：7 天内到期的积分优先，窗口内没有才比积分', () => {
+  it('积分只有 10 但 2 天后到期 → 优先于积分 5000 且 20 天后到期的账号', async () => {
+    const { env } = makeEnv()
+    const pid = 'qoder-pick-1'
+    await writeQoderPool(env, pid, [
+      accountWithPacks('rich', 5000, [pkg(20 * DAY)]),
+      accountWithPacks('soon', 10, [pkg(2 * DAY, { name: QODER_PACK_ADDON })]),
+    ])
+    expect((await pickQoderAccount(env, pid, new Set()))?.uid).toBe('soon')
+  })
+
+  it('都在窗口外 → 回落「剩余积分最多者」（原自动策略完全不变）', async () => {
+    const { env } = makeEnv()
+    const pid = 'qoder-pick-2'
+    await writeQoderPool(env, pid, [
+      accountWithPacks('rich', 5000, [pkg(20 * DAY)]),
+      accountWithPacks('soon', 10, [pkg(30 * DAY)]),
+    ])
+    expect((await pickQoderAccount(env, pid, new Set()))?.uid).toBe('rich')
+  })
+
+  it('未探测过额度包（老 KV 数据）→ 回落积分高低，不因缺数据而挑不出号', async () => {
+    const { env } = makeEnv()
+    const pid = 'qoder-pick-3'
+    await writeQoderPool(env, pid, [
+      account({ uid: 'rich', state: { credits: 5000, disabled: false, until: 0, errCount: 0 } }),
+      account({ uid: 'poor', state: { credits: 10, disabled: false, until: 0, errCount: 0 } }),
+    ])
+    expect((await pickQoderAccount(env, pid, new Set()))?.uid).toBe('rich')
+  })
+
+  it('同到期比积分高低；tried 里的账号不参与（轮换时不会反复回到同一个号）', async () => {
+    const { env } = makeEnv()
+    const pid = 'qoder-pick-4'
+    await writeQoderPool(env, pid, [
+      accountWithPacks('low', 10, [pkg(2 * DAY)]),
+      accountWithPacks('high', 900, [pkg(2 * DAY)]),
+    ])
+    expect((await pickQoderAccount(env, pid, new Set()))?.uid).toBe('high')
+    expect((await pickQoderAccount(env, pid, new Set(['high'])))?.uid).toBe('low')
+  })
+
+  it('冷却中 / 已禁用的账号即使积分马上过期也不被挑中（健康过滤在最前）', async () => {
+    const { env } = makeEnv()
+    const pid = 'qoder-pick-5'
+    await writeQoderPool(env, pid, [
+      accountWithPacks('rich', 5000, [pkg(20 * DAY)]),
+      accountWithPacks('soon', 10, [pkg(1 * DAY)]),
+    ])
+    await cooldownQoderAccount(env, pid, 'soon', 60_000, '限流（429）')
+    expect((await pickQoderAccount(env, pid, new Set()))?.uid).toBe('rich')
+  })
+
+  it('面板手工指定的 preferUid 压过到期优先（账号固定是用户的明确意图）', async () => {
+    const { env } = makeEnv()
+    const pid = 'qoder-pick-6'
+    await writeQoderPool(env, pid, [
+      accountWithPacks('rich', 5000, [pkg(20 * DAY)]),
+      accountWithPacks('soon', 10, [pkg(1 * DAY)]),
+    ])
+    expect((await pickQoderAccount(env, pid, new Set(), 'rich'))?.uid).toBe('rich')
+  })
+
+  it('签到回写：额度包与探测时刻落进池状态，且立刻参与到期优先判定', async () => {
+    const { env } = makeEnv()
+    const pid = 'qoder-pick-e2e'
+    await writeQoderPool(env, pid, [account({ uid: 'a' })])
+    const packs = [pkg(2 * DAY, { name: QODER_PACK_ADDON, size: 100, used: 0 }), pkg(20 * DAY)]
+    await reenableQoderIfCredits(env, pid, 'a', 100, packs)
+
+    const st = (await listQoderPoolStatus(env, pid))[0]
+    expect(st.packages).toEqual(packs)
+    expect(st.packagesAt).toBeTypeOf('number')
+    expect(soonestQoderExpiryAt(
+      { credits: 100, disabled: false, until: 0, errCount: 0, packages: st.packages as PackageInfo[] },
+      Date.now()
+    )).not.toBeNull()
+  })
+
+  it('不传 packages（额度拉取失败）→ 保留池里已存的明细，不擦成空', async () => {
+    const { env } = makeEnv()
+    const pid = 'qoder-pick-7'
+    await writeQoderPool(env, pid, [accountWithPacks('a', 100, [pkg(2 * DAY)])])
+    await reenableQoderIfCredits(env, pid, 'a', 50)
+    const st = (await listQoderPoolStatus(env, pid))[0]
+    expect(st.credits).toBe(50)
+    expect((st.packages as PackageInfo[]).length).toBe(1)
   })
 })

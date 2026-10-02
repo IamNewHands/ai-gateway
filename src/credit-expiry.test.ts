@@ -7,10 +7,14 @@
 import { describe, it, expect } from 'vitest'
 import {
   CREDIT_EXPIRY_WINDOW_MS,
+  formatCstWallClock,
+  packageExpiryEntry,
   parseCstWallClock,
   soonestExpiringAt,
+  soonestPackageExpiryAt,
   type CreditExpiryEntry,
 } from './credit-expiry'
+import type { PackageInfo } from './types'
 
 const DAY = 24 * 60 * 60 * 1000
 
@@ -81,5 +85,53 @@ describe('soonestExpiringAt：窗口内最早到期且有剩余的积分', () =>
   it('窗口可覆盖（供测试与未来按 provider 配置）', () => {
     expect(soonestExpiringAt([entry(now + 3 * DAY, 1)], now, 2 * DAY)).toBeNull()
     expect(soonestExpiringAt([entry(now + 3 * DAY, 1)], now, 4 * DAY)).toBe(now + 3 * DAY)
+  })
+})
+
+describe('formatCstWallClock：parseCstWallClock 的逆运算（供只拿到 ms 的上游落成同一形态）', () => {
+  it('按 +08:00 输出，且往返解析回原时刻（整秒）', () => {
+    const ms = Date.UTC(2026, 8, 30, 15, 59, 59) // CST 2026-09-30 23:59:59
+    expect(formatCstWallClock(ms)).toBe('2026-09-30 23:59:59')
+    expect(parseCstWallClock(formatCstWallClock(ms))).toBe(ms)
+  })
+
+  it('跨日/跨月的 +8 进位正确（UTC 16:00 → 次日 CST 00:00）', () => {
+    expect(formatCstWallClock(Date.UTC(2026, 8, 30, 16, 0, 0))).toBe('2026-10-01 00:00:00')
+  })
+
+  it('非有限 / <= 0 → 空串（长期或未知，不参与到期优先）', () => {
+    expect(formatCstWallClock(0)).toBe('')
+    expect(formatCstWallClock(-1)).toBe('')
+    expect(formatCstWallClock(Number.NaN)).toBe('')
+    expect(formatCstWallClock(Number.POSITIVE_INFINITY)).toBe('')
+    expect(formatCstWallClock(undefined)).toBe('')
+    expect(formatCstWallClock(null)).toBe('')
+  })
+})
+
+describe('soonestPackageExpiryAt：PackageInfo 形态（workbuddy / qoder 共用）', () => {
+  const now = Date.UTC(2026, 8, 1, 0, 0, 0)
+  const pack = (expireAt: string, size: number, used: number, name = '包'): PackageInfo => ({ name, expireAt, size, used })
+
+  it('remain = size − used；窗口内最早到期的胜出', () => {
+    const soon = formatCstWallClock(now + 2 * DAY)!
+    const late = formatCstWallClock(now + 5 * DAY)!
+    expect(soonestPackageExpiryAt([pack(late, 100, 0), pack(soon, 100, 0)], now)).toBe(now + 2 * DAY)
+  })
+
+  it('已用尽 / 长期 / 已过期 / 空输入 → null', () => {
+    expect(soonestPackageExpiryAt([pack(formatCstWallClock(now + DAY)!, 100, 100)], now)).toBeNull()
+    expect(soonestPackageExpiryAt([pack('', 100, 0)], now)).toBeNull()
+    expect(soonestPackageExpiryAt([pack(formatCstWallClock(now - DAY)!, 100, 0)], now)).toBeNull()
+    expect(soonestPackageExpiryAt([], now)).toBeNull()
+    expect(soonestPackageExpiryAt(undefined, now)).toBeNull()
+  })
+
+  it('packageExpiryEntry：size/used 缺省或非法 → remain 0（不把"容量未知"当成待救积分）', () => {
+    expect(packageExpiryEntry({ name: 'x', expireAt: formatCstWallClock(now + DAY)! })).toEqual({
+      expireAt: now + DAY,
+      remain: 0,
+    })
+    expect(packageExpiryEntry({ name: 'x', expireAt: '', size: 10, used: 3 })).toEqual({ expireAt: null, remain: 7 })
   })
 })
