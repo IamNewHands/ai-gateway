@@ -6,7 +6,7 @@
  */
 import { describe, it, expect, vi, afterEach } from 'vitest'
 import { cosySessionFor, cosyHeaders } from './cosy'
-import { buildQoderBody, cpaToUpstreamKey, fallbackUnknownModel } from './body'
+import { buildQoderBody, cpaToUpstreamKey, fallbackUnknownModel, pickQoderModels } from './body'
 import { performQoderCheckin, normalizeQoderRealm, realmHasLegacyCheckin, QODER_OPENAPI, fetchQoderUserResource } from './billing'
 import { classifyQoderError } from './classify'
 import { proxyQoderChatRequest } from './proxy'
@@ -352,6 +352,107 @@ describe('国际版/国内版签到分域', () => {
     await performQoderCheckin('dt-c', 'cn')
     const headers = (fetchMock.mock.calls[0][1] as RequestInit).headers as Record<string, string>
     expect(headers['cosy-version']).toBe('1.1.64')
+  })
+
+  it('签到头带完整桌面端机器身份（hub: 缺这些头服务端不报错但返回空活动列表）', async () => {
+    const fetchMock = vi.fn(async (_input: unknown, _init?: RequestInit) =>
+      new Response(JSON.stringify({ campaigns: [] }), { status: 200 }))
+    vi.stubGlobal('fetch', fetchMock)
+    await performQoderCheckin('dt-c', 'cn', 'uid-machine-1')
+    const headers = (fetchMock.mock.calls[0][1] as RequestInit).headers as Record<string, string>
+    // 桌面端身份头是功能必需，不是装饰
+    expect(headers['cosy-clienttype']).toBe('10')
+    expect(headers['cosy-machineid']).toMatch(/^[0-9a-f]{32}$/)
+    expect(headers['cosy-machinetoken']).toMatch(/^[A-Za-z0-9_-]{43}$/)
+    expect(headers['cosy-machinetype']).toMatch(/^[0-9a-f]{18}$/)
+    expect(headers['cosy-machineos']).toBe('x86_64_win32')
+    expect(headers['cosy-machinehostname']).toBe('DESKTOP-QODER')
+    expect(headers['user-agent']).toBe('Qoder')
+    // machineid 与 machinetoken 必须是不同值（各自独立派生）
+    expect(headers['cosy-machinetoken']).not.toBe(headers['cosy-machineid'])
+  })
+
+  it('同一 uid 的签到与推理呈现同一台设备（指纹种子一致）', async () => {
+    const fetchMock = vi.fn(async (_input: unknown, _init?: RequestInit) =>
+      new Response(JSON.stringify({ campaigns: [] }), { status: 200 }))
+    vi.stubGlobal('fetch', fetchMock)
+    await performQoderCheckin('dt-c', 'cn', 'uid-same-device')
+    const headers = (fetchMock.mock.calls[0][1] as RequestInit).headers as Record<string, string>
+    const inferSess = await cosySessionFor('dt-c', '', 'uid-same-device', '')
+    expect(headers['cosy-machineid']).toBe(inferSess.machineId)
+    expect(headers['cosy-machinetoken']).toBe(inferSess.machineToken)
+  })
+
+  it('showCampaign=false 时报「身份被过滤」而非「今天没有活动」', async () => {
+    // hub qoder_accounts.py:929-1005：服务端判定非官方身份时返回 200 + 空列表 +
+    // showCampaign=false，把两者混为一谈会让人以为签到正常。
+    vi.stubGlobal('fetch', vi.fn(async (_input: unknown, _init?: RequestInit) =>
+      new Response(JSON.stringify({ campaigns: [], showCampaign: false }), { status: 200 })))
+    const r = await performQoderCheckin('dt-c', 'cn', 'u1')
+    expect(r.success).toBe(false)
+    expect(r.message).toContain('机器身份')
+    expect(r.message).not.toContain('无可用签到活动')
+  })
+
+  it('活动存在但无可领取项时，消息带上活动条数便于定位', async () => {
+    vi.stubGlobal('fetch', vi.fn(async (_input: unknown, _init?: RequestInit) =>
+      new Response(JSON.stringify({
+        campaigns: [{ campaignId: 'c', actionType: 'VIEW_DETAILS', claimStatus: 'CLAIMED' }],
+        showCampaign: true,
+      }), { status: 200 })))
+    const r = await performQoderCheckin('dt-c', 'cn', 'u1')
+    expect(r.success).toBe(false)
+    expect(r.message).toContain('1 个活动')
+  })
+})
+
+// ===== 模型列表场景分类（bridge.go:195-206） =====
+describe('模型列表按场景桶读取（assistant → developer → chat）', () => {
+  it('chat 桶为空但 assistant 桶有内容 → 取 assistant（不再误报无模型）', () => {
+    const r = pickQoderModels({
+      chat: [],
+      assistant: [{ key: 'qmodel_38max', enable: true }, { key: 'qfmodel', enable: true }],
+    })
+    expect(r.error).toBe('')
+    expect(r.category).toBe('assistant')
+    expect(r.models.map((m) => m.id)).toEqual(['qmodel_38max', 'qfmodel'])
+  })
+
+  it('assistant 桶为空时回退 developer，再回退 chat', () => {
+    const r = pickQoderModels({ assistant: [], developer: [], chat: [{ key: 'auto', enable: true }] })
+    expect(r.error).toBe('')
+    expect(r.category).toBe('chat')
+    expect(r.models.map((m) => m.id)).toEqual(['auto'])
+  })
+
+  it('只保留 enable=true 的条目', () => {
+    const r = pickQoderModels({
+      chat: [{ key: 'on', enable: true }, { key: 'off', enable: false }, { key: 'noflag' }],
+    })
+    expect(r.models.map((m) => m.id)).toEqual(['on'])
+  })
+
+  it('桶存在但全部 enable=false → 如实说明，不谎报 success', () => {
+    const r = pickQoderModels({ chat: [{ key: 'auto', enable: false }] })
+    expect(r.models).toHaveLength(0)
+    expect(r.error).toContain('均未启用')
+    expect(r.error).toContain('chat')
+  })
+
+  it('完全没有模型场景 → 报出实际 keys 便于排查', () => {
+    const r = pickQoderModels({ somethingElse: [] })
+    expect(r.error).toContain('somethingElse')
+  })
+
+  it('counts 报出各桶条数（区分「没有模型」与「模型都被禁用」）', () => {
+    const r = pickQoderModels({ assistant: [{ key: 'a', enable: true }], chat: [{ key: 'b' }] })
+    expect(r.counts).toEqual({ assistant: 1, developer: 0, chat: 1 })
+    expect(r.category).toBe('assistant')
+  })
+
+  it('非对象输入不抛异常', () => {
+    expect(pickQoderModels(null).error).toContain('缺少模型场景')
+    expect(pickQoderModels('nope').error).toContain('缺少模型场景')
   })
 })
 

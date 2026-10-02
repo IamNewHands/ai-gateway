@@ -1,3 +1,5 @@
+import { cosySessionFor, type CosySession } from './cosy'
+
 /**
  * billing.ts — QoderWork 额度 / 签到 / 套餐（移植自 cpa-plugin/qoderwork/billing.go + checkin.go，
  * 分域端点与活动平台流程对齐 qoder2api-hub qoder_accounts.py:37-106）。
@@ -36,6 +38,12 @@ export type QoderRealm = 'cn' | 'global'
 
 /** 桌面端 cosy-version（qoder2api-hub qoder_sign.py:502-505 实测可用于模型列表与推理）。 */
 const DESKTOP_COSY_VERSION = '1.1.64'
+/** 桌面端 Cosy-ClientType（hub qoder_accounts.py:650：桌面端 10、CLI 5、QoderWork 6）。 */
+const DESKTOP_CLIENT_TYPE = '10'
+/** 桌面端 machine-os（hub qoder_accounts.py:652 实测值；与推理路径的 x86_64_windows 不同）。 */
+const DESKTOP_MACHINE_OS = 'x86_64_win32'
+/** 桌面端 machine-hostname（hub qoder_accounts.py:653）。 */
+const DESKTOP_MACHINE_HOSTNAME = 'DESKTOP-QODER'
 
 /** 规范化账号域：只认 'global'，其余一律 cn。 */
 export function normalizeQoderRealm(realm: unknown): QoderRealm {
@@ -61,28 +69,53 @@ function billingHeaders(token: string): Record<string, string> {
 }
 
 /**
- * 签到专用头。合并两个来源的实测结论：
- *   - qoder2api checkin.go:59-67：`user-agent: Qoder`、`cosy-clienttype: 10`、`accept-language`
- *   - qoder2api-hub qoder_accounts.py:655-680（桌面端 0.4.3 同款出站头）：
- *     缺这些头服务端**不报错但返回空活动列表**，这正是「领不到」的根因；
- *     `Cosy-ClientType: 10` 是桌面端（CLI 是 5、QoderWork 是 6）。
- * 故桌面端身份头是**功能必需**，不是可选装饰。
+ * 签到专用头 = 官方桌面端 0.4.3 同款出站头（qoder2api-hub qoder_accounts.py:655-686）。
+ *
+ * 这是**功能必需**，不是可选装饰。hub 实测记录的两层坑：
+ *   1. 缺这些头 → 服务端**不报错**但返回**空活动列表**（表现为「无可用签到活动」）；
+ *   2. 机器身份用派生假值 → 列表里**静默少掉设备定向活动**（「每日领取 100 Credits」）。
+ *
+ * 官方桌面端调用 /sash/api/v1/me/campaigns 时携带：
+ *   Authorization / User-Agent: Qoder / Cosy-ClientType: 10 /
+ *   Cosy-Version / Cosy-MachineOS / MachineHostname / MachineId / MachineToken /
+ *   MachineType / MachineCode
+ *
+ * 机器身份复用推理路径的 uid 派生值（与 qoder_sign.py 同一派生式），
+ * 保证同一账号在两条路径上呈现同一台设备。
+ * 注：hub 优先用官方 runtime-info.exe 取**真**身份，Workers 跑不了原生二进制，
+ * 故只能用派生值——若签到始终领不到，这是下一个怀疑点。
  */
-function checkinHeaders(token: string): Record<string, string> {
+function checkinHeaders(token: string, sess: CosySession): Record<string, string> {
   return {
     authorization: `Bearer ${token}`,
-    accept: 'application/json',
+    accept: 'application/json, text/plain, */*',
     'accept-language': 'zh-CN',
     'user-agent': 'Qoder',
-    'cosy-clienttype': '10',
+    'cosy-clienttype': DESKTOP_CLIENT_TYPE,
     'cosy-version': DESKTOP_COSY_VERSION,
+    'cosy-machineid': sess.machineId,
+    'cosy-machinetoken': sess.machineToken,
+    'cosy-machinetype': sess.machineType,
+    'cosy-machineos': DESKTOP_MACHINE_OS,
+    'cosy-machinehostname': DESKTOP_MACHINE_HOSTNAME,
   }
 }
 
-/** 签到相关请求：POST 无 body（抓包确认 campaigns/claim 为空 body），并补 origin。 */
-async function checkinRequest(method: 'GET' | 'POST', path: string, token: string, realm: QoderRealm): Promise<Response> {
+/**
+ * 签到相关请求：POST 无 body（抓包确认 campaigns/claim 为空 body），并补 origin。
+ *
+ * 需要 COSY 会话（机器身份头）：billing 端点自身不校验签名，但活动平台按
+ * 机器身份过滤活动，故仍要带。会话按 uid+token 缓存，无额外网络开销。
+ */
+async function checkinRequest(
+  method: 'GET' | 'POST',
+  path: string,
+  token: string,
+  realm: QoderRealm,
+  sess: CosySession
+): Promise<Response> {
   const base = QODER_OPENAPI[realm]
-  const headers = checkinHeaders(token)
+  const headers = checkinHeaders(token, sess)
   if (method === 'POST') headers.origin = base
   return fetch(base + path, {
     method,
@@ -112,14 +145,25 @@ export interface QoderCheckinStatus {
  * 国际版该接口不存在（404）→ 调用方应先用 realmHasLegacyCheckin() 跳过，
  * 否则会把「接口不存在」误报成签到失败。
  */
-export async function fetchQoderCheckinStatus(token: string, realm: QoderRealm = 'cn'): Promise<{
+/**
+ * 取签到用的 COSY 会话：优先用调用方注入的会话，否则按 uid 建（缓存复用）。
+ * uid 决定机器指纹种子——必须与推理路径用同一个 uid，否则签到与推理
+ * 会呈现成两台不同设备，反而更容易被判定为非官方客户端。
+ */
+async function checkinSession(token: string, uid: string, sess?: CosySession): Promise<CosySession> {
+  if (sess) return sess
+  return cosySessionFor(token, '', uid, '')
+}
+
+export async function fetchQoderCheckinStatus(token: string, realm: QoderRealm = 'cn', uid = '', sess?: CosySession): Promise<{
   active: boolean
   todayCheckedIn: boolean
   streakDays: number
   totalCredits: number
   dailyCredit: number
 } | null> {
-  const res = await checkinRequest('GET', '/sash/api/v1/me/daily-check-in/status', token, realm)
+  const s = await checkinSession(token, uid, sess)
+  const res = await checkinRequest('GET', '/sash/api/v1/me/daily-check-in/status', token, realm, s)
   if (!res.ok) {
     throw new Error(`checkin status http ${res.status} body=${(await res.text().catch(() => '')).substring(0, 200)}`)
   }
@@ -184,10 +228,11 @@ export interface QoderCheckinOutcome {
  * 活动平台**双区域通用**（qoder2api-hub qoder_accounts.py:929「双区域通用」）：
  * 国际版账号同样走这里，只是 openapi 基地址换成 openapi.qoder.sh。
  */
-export async function performQoderCheckin(token: string, realm: QoderRealm = 'cn'): Promise<QoderCheckinOutcome> {
+export async function performQoderCheckin(token: string, realm: QoderRealm = 'cn', uid = '', sess?: CosySession): Promise<QoderCheckinOutcome> {
+  const s = await checkinSession(token, uid, sess)
   let res: Response
   try {
-    res = await checkinRequest('GET', '/sash/api/v1/me/campaigns', token, realm)
+    res = await checkinRequest('GET', '/sash/api/v1/me/campaigns', token, realm, s)
   } catch (e) {
     return { success: false, message: (e as Error).message || '网络请求失败' }
   }
@@ -213,14 +258,29 @@ export async function performQoderCheckin(token: string, realm: QoderRealm = 'cn
 
   if (!target) {
     if (alreadyClaimed) return { success: true, already: true, message: '今日已领取' }
-    return { success: false, message: '无可用签到活动（无 CLAIMABLE 的 CLAIM_BENEFIT 活动）' }
+    // 区分两种「没活动」：真的没有活动 vs 服务端把本客户端判定为非官方身份而过滤掉全部活动。
+    // hub qoder_accounts.py:929-1005 用 showCampaign 标记这一点，并靠刷新机器身份重试；
+    // 不区分就会把「身份被过滤」误报成「今天没活动」，让人以为签到正常。
+    const showCampaign = list.showCampaign
+    if (showCampaign === false) {
+      return {
+        success: false,
+        message:
+          '活动列表被上游按机器身份过滤（showCampaign=false）：服务端未认可本客户端的设备身份，' +
+          '故「每日领取 Credits」等设备定向活动未下发。这不是「今天没有活动」。',
+      }
+    }
+    return {
+      success: false,
+      message: `无可用签到活动（${raw.length} 个活动里没有 CLAIMABLE 的 CLAIM_BENEFIT）`,
+    }
   }
   const campaignId = target.campaignId
   if (!campaignId) return { success: false, message: '签到活动缺少 campaignId' }
 
   let claimRes: Response
   try {
-    claimRes = await checkinRequest('POST', `/sash/api/v1/me/campaigns/${campaignId}/claim`, token, realm)
+    claimRes = await checkinRequest('POST', `/sash/api/v1/me/campaigns/${campaignId}/claim`, token, realm, s)
   } catch (e) {
     return { success: false, message: (e as Error).message || '网络请求失败' }
   }

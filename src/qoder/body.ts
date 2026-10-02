@@ -65,6 +65,65 @@ export interface ChatMessage {
   content: unknown
 }
 
+/** 模型列表的场景桶优先级（qoder2api internal/bridge/bridge.go:195-206 parseQoderModels）。 */
+export const QODER_MODEL_CATEGORIES = ['assistant', 'developer', 'chat'] as const
+
+export interface QoderModelPick {
+  /** 启用的模型 key；失败时为空数组 */
+  models: Array<{ id: string }>
+  /** 命中的场景桶名（失败时为空串） */
+  category: string
+  /** 各桶条目数，供诊断（区分「没有模型」与「模型都被禁用」） */
+  counts: Record<string, number>
+  /** 失败原因；成功为 '' */
+  error: string
+}
+
+/**
+ * 从 model/list 响应中挑出启用的模型。
+ *
+ * 上游把模型按场景分桶，**不是所有桶都有内容**：只读 `chat` 会在某些区域/账号下
+ * 拿到空列表或明显偏少的模型。按 assistant → developer → chat 取第一个非空桶。
+ *
+ * 失败时区分两种情形（都不谎报成功）：
+ *   - 完全没有已知场景桶 → 报出实际 keys；
+ *   - 桶存在但全部 enable=false → 报出桶名与条目数。
+ */
+export function pickQoderModels(json: unknown): QoderModelPick {
+  const obj = json && typeof json === 'object' ? (json as Record<string, unknown>) : {}
+  const counts: Record<string, number> = {}
+  let picked: any[] | null = null
+  let category = ''
+  for (const cat of QODER_MODEL_CATEGORIES) {
+    const arr = Array.isArray(obj[cat]) ? (obj[cat] as any[]) : null
+    counts[cat] = arr ? arr.length : 0
+    if (arr && arr.length > 0 && !picked) {
+      picked = arr
+      category = cat
+    }
+  }
+  if (!picked) {
+    return {
+      models: [],
+      category: '',
+      counts,
+      error: `响应缺少模型场景，keys=${Object.keys(obj).join(',') || '(empty)'}`,
+    }
+  }
+  const models = picked
+    .filter((m: any) => m && m.enable === true && m.key)
+    .map((m: any) => ({ id: String(m.key) }))
+  if (models.length === 0) {
+    return {
+      models: [],
+      category,
+      counts,
+      error: `场景 ${category} 的 ${picked.length} 个模型均未启用（enable=false）`,
+    }
+  }
+  return { models, category, counts, error: '' }
+}
+
 /** 取最后一条 user 消息的文本内容。content 为数组时提取第一段 text。 */
 export function extractLatestUserPrompt(messages: ChatMessage[]): string {
   for (let i = messages.length - 1; i >= 0; i--) {

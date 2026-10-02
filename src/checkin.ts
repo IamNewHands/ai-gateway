@@ -257,7 +257,7 @@ async function checkinQoderPoolAccount(env: Env, provider: Provider, account: Qo
   let status: Awaited<ReturnType<typeof fetchQoderCheckinStatus>> = null
   if (realmHasLegacyCheckin(realm)) {
     try {
-      status = await fetchQoderCheckinStatus(token, realm)
+      status = await fetchQoderCheckinStatus(token, realm, account.uid)
     } catch (e) {
       console.warn(`[checkin] ${provider.name} qoder status fetch failed: ${(e as Error).message}`)
     }
@@ -279,7 +279,7 @@ async function checkinQoderPoolAccount(env: Env, provider: Provider, account: Qo
   }
 
   // 执行签到（campaigns 流程；legacy daily-check-in/claim 已 DISABLED，不再使用）
-  const res = await performQoderCheckin(token, realm)
+  const res = await performQoderCheckin(token, realm, account.uid)
   base.success = res.success
   base.message = res.message
   // already = 今日已领取（replayed / 列表 CLAIMED），与「本次新领」区分开：

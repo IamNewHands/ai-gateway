@@ -15,7 +15,7 @@
 
 import type { Env, Provider } from '../types'
 import { getOauthAccessToken, readOauthToken, refreshOauthToken, refreshQoderTokenPair } from '../oauth'
-import { buildQoderBody, cpaToUpstreamKey, fallbackUnknownModel } from './body'
+import { buildQoderBody, cpaToUpstreamKey, fallbackUnknownModel, pickQoderModels } from './body'
 import { qoderEncode, cosySessionFor, cosyHeaders, buildBearer, type CosySession } from './cosy'
 import { classifyQoderError, qoderOpenAIErrorBody, type QoderClassified } from './classify'
 import {
@@ -796,6 +796,8 @@ export async function fetchQoderModels(
   debug.infoLen = session.info.length
   debug.cosyKeyLen = session.cosyKey.length
   debug.uid = session.uid || '(empty)'
+  debug.realm = sessionRealm
+  debug.modelsUrl = qoderModelsUrl(sessionRealm)
 
   // GET 请求**不带 body**，故签名必须覆盖空串（qoder2api client.go:85-89 同）。
   // 旧实现签 qoderEncode('{}') 却发空 body → 服务端重算不匹配 →
@@ -846,15 +848,15 @@ export async function fetchQoderModels(
   } catch {
     return { ok: false, message: `响应不是合法 JSON: ${rawText.substring(0, 200)}`, debug }
   }
-  const chat = json && Array.isArray(json.chat) ? json.chat : null
-  if (!chat) {
-    return { ok: false, message: `响应缺少 chat 场景，keys=${Object.keys(json || {}).join(',') || '(empty)'}`, debug }
+  // 场景分类读取（bridge.go:195-206 parseQoderModels）。只读 chat 会在某些
+  // 区域/账号下拿到空列表或明显偏少的模型；pickQoderModels 按
+  // assistant → developer → chat 取第一个非空桶。
+  const pick = pickQoderModels(json)
+  debug.categoryCounts = pick.counts
+  debug.pickedCategory = pick.category
+  if (pick.error) {
+    return { ok: false, message: pick.error, debug }
   }
-  const models = chat
-    .filter((m: any) => m && m.enable === true && m.key)
-    .map((m: any) => ({ id: m.key }))
-  if (models.length === 0) {
-    return { ok: false, message: '没有启用的 chat 模型', debug }
-  }
-  return { ok: true, message: 'success', models, debug }
+  console.log(`[qoder-models] category=${pick.category} enabled=${pick.models.length}`)
+  return { ok: true, message: 'success', models: pick.models, debug }
 }
