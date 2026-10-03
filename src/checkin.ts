@@ -141,12 +141,12 @@ async function fetchCheckinStatus(
   return null
 }
 
-/** 执行签到。返回 { success, message }。 */
-async function performCheckin(
+/** 执行签到。返回 { success, message, reward?, already? }。 */
+export async function performCheckin(
   token: string,
   realm: 'cn' | 'global',
   env?: Env
-): Promise<{ success: boolean; message: string; reward?: any }> {
+): Promise<{ success: boolean; message: string; reward?: any; already?: boolean }> {
   try {
     // 路径按 realm 切（global 无 /v2 前缀优先，404 时 fallback），对齐 workbuddy2api checkinMeterPaths。
     // 当前 global 账号在上层已提前 return（不签到），此处保持按 realm 正确以便未来放开即生效。
@@ -158,7 +158,7 @@ async function performCheckin(
     // 结构化业务错误（BillingError）认业务码 10001/14001（带边界）+ 全量文案；
     // 传输层/解析层裸错误只认中文文案，避免 "address already in use" 这类文本被误判为已签到。
     if (isAlreadyCheckin(e)) {
-      return { success: true, message: '今日已签到' }
+      return { success: true, message: '今日已签到', already: true }
     }
     return { success: false, message: (e as Error).message }
   }
@@ -421,7 +421,7 @@ async function checkinQoderPoolAccounts(env: Env, provider: Provider): Promise<C
   base.accounts = accounts
   base.todayCheckedIn = accounts.some((a) => a.todayCheckedIn)
   base.success = success > 0 || already > 0
-  base.reason = base.success ? 'ok' : (fail > 0 ? 'fail' : 'skipped_no_token')
+  base.reason = success > 0 ? 'ok' : (already > 0 ? 'already' : (fail > 0 ? 'fail' : 'skipped_no_token'))
   base.message = `共 ${accounts.length} 个账号：成功 ${success} / 已签 ${already} / 失败 ${fail} / 跳过 ${skipped}`
   // 汇总：额度取剩余最多的账号（挑号依据）
   let bestAcc: CheckinResult | null = null
@@ -626,7 +626,7 @@ async function checkinOauthPoolAccount(
     const res = await performCheckin(token, 'cn', env)
     base.success = res.success
     base.message = res.message
-    base.reason = res.success ? 'ok' : 'fail'
+    base.reason = res.success ? (res.already ? 'already' : 'ok') : 'fail'
     base.lastCheckinAt = now
     if (res.success) base.todayCheckedIn = true
   }
@@ -759,7 +759,7 @@ async function checkinOauthPoolAccounts(
   base.accounts = accounts
   base.todayCheckedIn = accounts.some((a) => a.todayCheckedIn)
   base.success = success > 0 || already > 0
-  base.reason = base.success ? 'ok' : (fail > 0 ? 'fail' : 'skipped_no_token')
+  base.reason = success > 0 ? 'ok' : (already > 0 ? 'already' : (fail > 0 ? 'fail' : 'skipped_no_token'))
   base.message = `共 ${accounts.length} 个账号：成功 ${success} / 已签 ${already} / 失败 ${fail} / 跳过 ${skipped}`
   // 汇总额度：取任一成功账号
   const okOne = accounts.find((a) => a.reason === 'ok' || a.reason === 'already')
@@ -893,10 +893,10 @@ export async function checkinOneAccount(
     const res = await performCheckin(token, 'cn', env)
     base.success = res.success
     base.message = res.message
-    base.reason = res.success ? 'ok' : 'fail'
+    base.reason = res.success ? (res.already ? 'already' : 'ok') : 'fail'
     base.lastCheckinAt = now
     if (res.success) base.todayCheckedIn = true
-    if (res.success && res.reward && typeof (res.reward as any).credit === 'number') {
+    if (res.success && !res.already && res.reward && typeof (res.reward as any).credit === 'number') {
       base.checkinCredit = (res.reward as any).credit
     }
   }

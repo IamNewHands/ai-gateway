@@ -500,7 +500,48 @@ export async function fetchCheckinStatus(account: TraeAccount): Promise<TraeChec
 /** 9074 限流/指纹失败后的重试等待（对齐 workbuddy-wild 生产默认 8s）。 */
 const CHECKIN_RETRY_DELAY_MS = 8000
 
-export async function performCheckinClaim(account: TraeAccount): Promise<void> {
+/** 业务码 9095 = TRAE 官方「当前设备今日已签到」 */
+export const TRAE_CHECKIN_IDEMPOTENT_CODES = [9095]
+
+/**
+ * 专属中文关键词（对齐 workbuddy-billing.ts BARE_MARKERS 纪律）。
+ * 刻意排除泛词「今日」（会误伤「今日限流」「今日系统维护」）以及英文「already」
+ * （会误伤网络层 EADDRINUSE 或 5xx WAF 报错）。
+ */
+export const TRAE_CHECKIN_IDEMPOTENT_MARKERS = [
+  '今天已签到',
+  '今日已签到',
+  '已签到',
+  '已经签到',
+  '重复签到',
+  '已完成签到',
+]
+
+/**
+ * 判定 TRAE 签到抛出的错误是否可能表示「已签到/幂等重复」。
+ * 仅用于决定是否触发 status 后置复核，绝不单独作为直接成功的依据。
+ */
+export function isAlreadyTraeCheckin(err: unknown): boolean {
+  if (err === null || err === undefined) return false
+  const anyErr = err as any
+  // 传输层/网络层失败直接排除
+  if (anyErr?.kind === 'transport') return false
+  // HTTP 非 200 响应直接排除（即使 body 包含 already 等词）
+  if (typeof anyErr?.status === 'number' && anyErr.status >= 400) return false
+
+  const msg = err instanceof Error ? err.message : String(err)
+  // 业务码 9095
+  for (const code of TRAE_CHECKIN_IDEMPOTENT_CODES) {
+    if (msg.includes(String(code))) return true
+  }
+  // 中文专属签到文案匹配
+  for (const m of TRAE_CHECKIN_IDEMPOTENT_MARKERS) {
+    if (msg.includes(m)) return true
+  }
+  return false
+}
+
+export async function performCheckinClaim(account: TraeAccount): Promise<{ already: boolean }> {
   for (let attempt = 0; attempt < 2; attempt++) {
     const data = await doJson(TRAE_CONSTANTS.UgHost + TRAE_CONSTANTS.EpCheckinClaim, ugHeaders(account), {})
     const code = checkinCode(data)
@@ -511,12 +552,12 @@ export async function performCheckinClaim(account: TraeAccount): Promise<void> {
       continue
     }
     // 9095 = 当前设备今日已签到（幂等，视为成功，交由后置 status 校验最终状态）
-    if (code === 9095) return
+    if (code === 9095) return { already: true }
     if (code !== 0 || rejected) {
       const msg = checkinMessage(data?.message, data?.msg)
       throw new Error(checkinBizError(code, msg) + (rejected && code === 0 ? ' (success=false)' : ''))
     }
-    return
+    return { already: false }
   }
   throw new Error('checkin claim failed: code=9074 持续限流/指纹失败')
 }

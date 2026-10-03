@@ -22,6 +22,7 @@ import {
   fetchUserEntUsage,
   fetchUserEntUsageDetails,
   getUserInfo,
+  isAlreadyTraeCheckin,
   needsTraeRefresh,
   performCheckinClaim,
   probeTraeCredits,
@@ -274,7 +275,7 @@ async function readCheckinResults(env: Env, providerId: string): Promise<TraeChe
 }
 
 /** 单个账号签到 + 积分刷新 + 解冻（对齐 scheduler.RunCheckinNow）。 */
-async function checkinTraeAccount(env: Env, provider: Provider, account: TraeAccount): Promise<TraeCheckinResult> {
+export async function checkinTraeAccount(env: Env, provider: Provider, account: TraeAccount): Promise<TraeCheckinResult> {
   const base: TraeCheckinResult = {
     uid: account.uid,
     nickname: account.nickname,
@@ -291,24 +292,32 @@ async function checkinTraeAccount(env: Env, provider: Provider, account: TraeAcc
       base.message = '今日已签到'
     } else if (st.enable) {
       try {
-        await performCheckinClaim(account)
+        const claimRes = await performCheckinClaim(account)
         // 后置校验：claim 业务码不为 0 也可能幂等成功（如 9095 今日已签），以 status 实测为准
         const st2 = await fetchCheckinStatus(account)
         if (st2.checkedIn) {
           base.success = true
           base.checkedIn = true
-          base.message = '签到成功'
+          base.message = claimRes?.already ? '今日已签到' : '签到成功'
         } else {
           base.message = '签到校验失败: claim 后 checked_in 仍为 false（请稍后重试）'
         }
       } catch (e) {
         const msg = (e as Error).message || String(e)
-        // 业务软失败（已签到类）→ 视为成功已签
-        const low = msg.toLowerCase()
-        if (low.includes('already') || msg.includes('已签') || msg.includes('今日')) {
-          base.success = true
-          base.checkedIn = true
-          base.message = '今日已签到'
+        // 软失败候选：只有错误文本明确包含签到幂等业务特征时，才尝试后置 status 复核（绝不单凭裸错误报成功）
+        if (isAlreadyTraeCheckin(e)) {
+          try {
+            const st2 = await fetchCheckinStatus(account)
+            if (st2.checkedIn) {
+              base.success = true
+              base.checkedIn = true
+              base.message = '今日已签到'
+            } else {
+              base.message = '签到失败: ' + msg.substring(0, 200)
+            }
+          } catch {
+            base.message = '签到失败: ' + msg.substring(0, 200)
+          }
         } else {
           base.message = '签到失败: ' + msg.substring(0, 200)
         }

@@ -79,6 +79,23 @@
 
 ---
 
+## 签到防御加固：TRAE 裸文本假绿消除与 WorkBuddy 记账对齐（2026-10-03）
+
+1. **TRAE 签到假绿防御（`src/trae/upstream.ts` & `src/trae/admin.ts`）**：
+   - 根因：原实现用 `low.includes('already') || msg.includes('已签') || msg.includes('今日')` 直接匹配裸错误文本，且 catch 分支不做后置 status 复核。若上游报 500（body 偶带 already）或网络层抛出 `address already in use`、或包含泛词「今日限流」，会直接误判为今日已签到给假绿勾。
+   - 修复：
+     - 新增 `isAlreadyTraeCheckin`：严格排除网络传输层错误（`kind === 'transport'`）与 HTTP 4xx/5xx 非 200 响应，排除英文短词 `already` 与泛词「今日」，仅认 9095 业务码与专属中文签到文案；
+     - 软失败候选分支**必须调用 `fetchCheckinStatus` 进行二次状态复核**，只有后置确认为 `checked_in=true` 才认今日已签到，校验未通过一律如实报失败；
+     - `performCheckinClaim` 遇到 9095 显式传出 `{ already: true }`，后置成功后标为「今日已签到」，不再混报「签到成功」。
+2. **WorkBuddy / Qoder 池已签 reason 归类对齐（`src/checkin.ts`）**：
+   - 根因：`performCheckin` 遇到幂等错误时返回 `{ success: true, message: '今日已签到' }` 但缺少 `already: true` 标记，导致池与单账号路径直接赋值 `base.reason = res.success ? 'ok' : 'fail'`，把已签到记成 `'ok'`（本次成功）。此外，池汇总在全已签时把 summary reason 算成 `'ok'`，导致全量签到摘要与面板徽章将已签到虚高计入「成功」。
+   - 修复：
+     - `performCheckin` 幂等分支补齐 `already: true`；
+     - `checkinOauthPoolAccount` 与 `checkinOneAccount` 统一按 `res.success ? (res.already ? 'already' : 'ok') : 'fail'` 分流；
+     - 池汇总 `base.reason` 修正为 `success > 0 ? 'ok' : (already > 0 ? 'already' : (fail > 0 ? 'fail' : 'skipped_no_token'))`，只有真正有新成功账号时才报 `'ok'`。
+
+---
+
 ## TRAE（SOLO 协议）适配指南
 
 TRAE 上游（`trae-api-cn.mchost.guru`）**不是 OpenAI 兼容端点**，是 SOLO 私有 SSE 协议
