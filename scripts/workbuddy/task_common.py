@@ -44,6 +44,17 @@ def _parse_jwt(token: str) -> dict:
     return {}
 
 
+def auth_is_global(auth: dict) -> bool:
+    """按 access_token 的 JWT iss 判定账号领域（对齐 src/oauth.ts detectTokenRealm）。
+
+    iss 含 workbuddy.ai → global；含 codebuddy.cn → cn；无法解析按 cn 处理。
+    domain 字段是 realm 的结果而非来源（global 恒为 workbuddy.ai），不可用作判据。
+    global 账号不参与 CN 侧活动（开学季 / 转盘）。
+    """
+    iss = str(_parse_jwt(auth.get("token", "")).get("iss") or "").lower()
+    return "workbuddy.ai" in iss
+
+
 def _parse_auth_dict(d: dict, p: str) -> dict:
     if not isinstance(d, dict):
         raise SystemExit(f"Invalid auth entry in {p}: expected dict, got {type(d).__name__}")
