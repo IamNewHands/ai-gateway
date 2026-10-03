@@ -65,6 +65,23 @@ export function realmHasLegacyCheckin(realm: QoderRealm): boolean {
   return realm === 'cn'
 }
 
+/**
+ * Qoder 每日活动的刷新点：**CST（UTC+8）每日 10:00** 放量新一轮
+ * （hub `_diag_campaign.py:34-35`「每日 10:00（UTC+8）刷新，错过不补」，
+ * `qoder_tasks.py:670` / `qoder_accounts.py:294` 同口径）。
+ *
+ * 为什么签到判定必须知道这个点：列表里的 `claimStatus=CLAIMED` 只表示
+ * **当前轮**已领，而轮次要到 10:00 才滚动。10:00 之前看到的 CLAIMED 属于
+ * **上一轮**，把它当「今天已领」就会假报 already、当天积分一直不落账
+ * （2026-10-03 实例：09:01 自动签到报「今日已领取」、额度 395 未动；
+ * 10:23 手工再领才 +100 → 495，反向证明 09:01 那次没拿到当轮额度）。
+ *
+ * 纯函数、显式收 now（不读 Date.now），便于单测固定时刻、不随 CI 挂钟漂移。
+ */
+export function qoderDailyRoundOpen(nowMs: number): boolean {
+  return new Date(nowMs + 8 * 60 * 60 * 1000).getUTCHours() >= 10
+}
+
 /** 统一认证头（billing 端点用明文 Bearer，不需要 COSY）。 */
 function billingHeaders(token: string): Record<string, string> {
   return {
@@ -365,9 +382,9 @@ export async function performQoderCheckin(
       achievement: c?.requiredAchievementKey ? String(c.requiredAchievementKey) : undefined,
     })),
   }
-  let target: QoderCampaign | null = null
-  let alreadyClaimed = false
-  /** 非 CLAIMABLE/CLAIMED 的活动：带原因码，用于把「领不到」讲清楚 */
+  /** 奖励类（Credits）活动：只有这些参与每日签到判定 */
+  const daily: QoderCampaign[] = []
+  /** 非 CLAIMABLE/CLAIMED 的奖励类活动：带原因码，用于把「领不到」讲清楚 */
   const notClaimable: QoderCampaign[] = []
   for (const c of raw) {
     if (!c) continue
@@ -377,13 +394,30 @@ export async function performQoderCheckin(
     // actionType 的活动整条丢掉 → 误报「无可用签到活动」。
     const action = String(c.actionType || '')
     if (action !== '' && action !== 'CLAIM_BENEFIT') continue
-    if (c.claimStatus === 'CLAIMABLE') target = c
-    else if (c.claimStatus === 'CLAIMED') alreadyClaimed = true
-    else notClaimable.push(c)
+
+    // 只认 Credits 积分奖励（对齐 hub campaign_checkin 的 only_kinds=("", "CREDITS")，
+    // qoder_accounts.py:1123-1126）：兑换券/周边类活动（REDEMPTION_CODE 等）与每日签到
+    // 无关，混进来会让「已领过一张券」被当成「今天积分已领」→ 假 already、当天 0 积分。
+    const kind = String(c.benefit?.kind || '').toUpperCase()
+    if (kind !== '' && kind !== 'CREDITS') continue
+
+    daily.push(c)
+    if (c.claimStatus !== 'CLAIMABLE' && c.claimStatus !== 'CLAIMED') notClaimable.push(c)
   }
+  // 目标：优先真正可领的每日活动。
+  // ⚠️ 不能因为列表里存在任意 CLAIMED 就断言「今天已领」：同一个活动（如
+  // act-20260930-894，key 里的日期是**活动起始日**、不是当天）的 claimStatus 会
+  // 按轮次滚动，而每轮要等 **CST 10:00** 才刷新放量（见 qoderDailyRoundOpen）。
+  // 刷新前列表里残留的 CLAIMED 属于**上一轮**，据此短路就会「自动签到报 already、
+  // 积分一整天不动」（2026-10-03 实例：09:01 报 already、额度 395 未动；
+  // 10:23 手工才 +100 → 495）。
+  const target = daily.find((c) => c.claimStatus === 'CLAIMABLE') || null
+  const alreadyClaimedList = daily.filter((c) => c.claimStatus === 'CLAIMED')
+  // 轮次是否已滚动到「今天这一轮」：未滚动时，列表里的 CLAIMED 是上一轮残留，
+  // 不能当作「今日已领」的证据。
+  const roundOpen = qoderDailyRoundOpen(Date.now())
 
   if (!target) {
-    if (alreadyClaimed) return { success: true, already: true, message: '今日已领取', debug: dbg }
     // 区分两种「没活动」：真的没有活动 vs 服务端把本客户端判定为非官方身份而过滤掉全部活动。
     // hub qoder_accounts.py:929-1005 用 showCampaign 标记这一点，并靠刷新机器身份重试；
     // 不区分就会把「身份被过滤」误报成「今天没活动」，让人以为签到正常。
@@ -397,32 +431,75 @@ export async function performQoderCheckin(
         debug: dbg,
       }
     }
+
+    const formatNotClaimable = (items: QoderCampaign[]) => items
+      .map((c) => {
+        const reason = String(c.unavailableReason || '').toUpperCase()
+        const key = c.campaignKey || c.campaignId || '(无 key)'
+        const why =
+          reason === 'REDEMPTION_CODE_OUT_OF_STOCK'
+            ? '名额已发完（每日 10:00 刷新，次日或 10:00 后可再领）'
+            : reason === 'ACHIEVEMENT_NOT_COMPLETED' || c.achievementCompleted === false
+              ? `需先在官方桌面端完成新人任务${c.requiredAchievementKey ? `（成就 ${c.requiredAchievementKey}）` : ''}`
+              : reason || `状态 ${c.claimStatus || '(空)'}`
+        return `${key}: ${why}`
+      })
+      .join('；')
+
+    if (alreadyClaimedList.length > 0) {
+      // 避免历史其它已领活动掩盖今日签到名额发完：
+      // 若已领列表里全无 Credits 额度包，且存在名额已发完活动，则按名额发完报错
+      const outOfStockItems = notClaimable.filter((c) => String(c.unavailableReason || '').toUpperCase() === 'REDEMPTION_CODE_OUT_OF_STOCK')
+      const hasClaimedCredits = alreadyClaimedList.some((c) => (c.benefit?.amount || 0) > 0)
+      if (!hasClaimedCredits && outOfStockItems.length > 0) {
+        return {
+          success: false,
+          message: `签到活动名额已发完（${formatNotClaimable(outOfStockItems)}）`,
+          debug: dbg,
+        }
+      }
+
+      const keys = alreadyClaimedList.map((c) => c.campaignKey || c.campaignId).filter(Boolean).join('、')
+
+      // 轮次未滚动（今天 10:00 之前）：这里的 CLAIMED 是**上一轮**残留，不是今天的。
+      // 若照旧报 already，就会重演「自动签到假成功、积分一整天不落账」——宁可如实
+      // 报「本轮未刷新、10:00 后重试」，也不要给一个会误导人的绿勾。
+      if (!roundOpen) {
+        return {
+          success: false,
+          message:
+            `每日签到活动尚未刷新（Qoder 每轮 CST 10:00 放量）：列表里的已领取记录` +
+            `${keys ? `（${keys}）` : ''}属于上一轮，不能证明今天已领。请在 10:00 后重试。`,
+          debug: dbg,
+        }
+      }
+
+      let msg = keys ? `今日已领取（${keys}）` : '今日已领取'
+      if (notClaimable.length > 0) {
+        msg += `；另有活动暂不可领：${formatNotClaimable(notClaimable)}`
+      }
+      return {
+        success: true,
+        already: true,
+        message: msg,
+        campaignKey: alreadyClaimedList[0]?.campaignKey,
+        debug: dbg,
+      }
+    }
+
     // 有活动但都不可领：把上游原因码如实带出来（hub qoder_accounts.py:1145-1148 同样分类：
     // REDEMPTION_CODE_OUT_OF_STOCK=名额发完、ACHIEVEMENT_NOT_COMPLETED=需先完成新人任务）。
     // 全部塌缩成一句「没有 CLAIMABLE 的 CLAIM_BENEFIT」会让人无从判断下一步。
     if (notClaimable.length > 0) {
-      const detail = notClaimable
-        .map((c) => {
-          const reason = String(c.unavailableReason || '').toUpperCase()
-          const key = c.campaignKey || c.campaignId || '(无 key)'
-          const why =
-            reason === 'REDEMPTION_CODE_OUT_OF_STOCK'
-              ? '名额已发完（次日 10:00 后可再领）'
-              : reason === 'ACHIEVEMENT_NOT_COMPLETED' || c.achievementCompleted === false
-                ? `需先在官方桌面端完成新人任务${c.requiredAchievementKey ? `（成就 ${c.requiredAchievementKey}）` : ''}`
-                : reason || `状态 ${c.claimStatus || '(空)'}`
-          return `${key}: ${why}`
-        })
-        .join('；')
       return {
         success: false,
-        message: `签到活动暂不可领取（共 ${raw.length} 个活动，${notClaimable.length} 个奖励类活动均不可领）—— ${detail}`,
+        message: `签到活动暂不可领取（共 ${raw.length} 个活动，${notClaimable.length} 个奖励类活动均不可领）—— ${formatNotClaimable(notClaimable)}`,
         debug: dbg,
       }
     }
     return {
       success: false,
-      message: `无可用签到活动（${raw.length} 个活动里没有 CLAIMABLE 的 CLAIM_BENEFIT）`,
+      message: `无可用签到活动（${raw.length} 个活动里没有可领取的 Credits 奖励活动）`,
       debug: dbg,
     }
   }
@@ -450,7 +527,13 @@ export async function performQoderCheckin(
 
   if (cr.status === 'CLAIMED') {
     if (cr.replayed) {
-      return { success: true, already: true, message: '今日已领取', campaignKey: target.campaignKey, debug: dbg }
+      return {
+        success: true,
+        already: true,
+        message: target.campaignKey ? `今日已领取（${target.campaignKey}）` : '今日已领取',
+        campaignKey: target.campaignKey,
+        debug: dbg,
+      }
     }
     const amount = typeof cr.benefit?.amount === 'number' ? cr.benefit.amount : undefined
     return {

@@ -535,14 +535,14 @@ app.onError((err, c) => {
 // ===== Cron：定时任务（按 event.cron 分发） =====
 // crons（见 wrangler.toml）：
 //   "0 */2 * * *"   —— 每 2 小时刷新 OAuth token
-//   "0 1,13 * * *"  —— 每日 09:00/21:00（北京时间）WorkBuddy 签到
+//   "5 2,14 * * *"  —— 每日 10:05/22:05（北京时间）WorkBuddy/Qoder 签到（避开 Qoder 每日 10:00 刷新放量节点）
 //   "0 * * * *"     —— 每小时 M365 对话自动清理
 //   "0 20 * * *"    —— 每日 04:00（北京时间）M365 账号健康检查（临期刷新 + 复活误判不可用账号）
 // ⚠️ Cloudflare ES Module Workers 只认 default export 上的 handler：
 //    scheduled 若写成 named export（export async function scheduled），运行时找不到
 //    default.scheduled，cron 触发后会被静默丢弃 → 定时签到/token 刷新均不执行。
 async function scheduled(event: ScheduledEvent, env: Env, ctx: ExecutionContext) {
-  if (event.cron === '0 1,13 * * *') {
+  if (event.cron === '5 2,14 * * *' || event.cron === '0 1,13 * * *') {
     // 签到（WorkBuddy/QoderWork + TRAE SOLO）
     const summary = await runAllCheckins(env)
     console.log(`[checkin] cron done: total=${summary.total} ok=${summary.success} already=${summary.already} fail=${summary.fail} skipped=${summary.skipped}`)

@@ -381,7 +381,7 @@ export async function handleTraeCheckin(c: Context<AppEnv>) {
   return c.json<ApiResponse<TraeCheckinResult[]>>({ success: true, data: results })
 }
 
-/** 全量签到（cron「0 1,13 * * *」与 /api/manage/trae/checkin 用）。 */
+/** 全量签到（cron「5 2,14 * * *」与 /api/manage/trae/checkin 用）。 */
 export async function runTraeCheckins(env: Env, silent = false): Promise<{ total: number; ok: number; already: number; fail: number }> {
   const providers = (await getProviders(env)).filter((p) => isTraeProvider(p))
   const summary = { total: 0, ok: 0, already: 0, fail: 0 }

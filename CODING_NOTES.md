@@ -50,6 +50,35 @@
 
 ---
 
+## Qoder 签到：CST 10:00 轮次边界（2026-10-03 假签到事故）
+
+**现象**：09:01 自动签到日志报 `already / 今日已领取`，但当日积分一整天不动（额度 395）；
+10:23 手工再签一次才 +100 → 495。
+
+**根因**：Qoder 的每日活动（`act-20260930-894`，key 里的日期是**活动起始日**、不是当天）
+`claimStatus` 按轮次滚动，每轮要等 **CST 10:00** 才刷新放量
+（hub `_diag_campaign.py:34-35`「每日 10:00（UTC+8）刷新，错过不补」）。
+09:01 看到的 `CLAIMED` 是**上一轮**残留，旧实现据此短路成 `already`，
+于是当天真实额度从未入账；10:23 能领到 +100 反向证明 09:01 那次没拿到当轮额度。
+
+**修复（两处，缺一不可）**：
+
+1. **代码**（`src/qoder/billing.ts`）：
+   - 判定只认 Credits 奖励活动（对齐 hub `only_kinds=("", "CREDITS")`），
+     兑换券类（`REDEMPTION_CODE`）已领不再被当成「今日积分已领」；
+   - 新增 `qoderDailyRoundOpen(nowMs)`：CST 10:00 前，列表里的 `CLAIMED` **不算**
+     「今日已领」，如实报「尚未刷新，请在 10:00 后重试」，**不再给假绿勾**。
+2. **排程**（`wrangler.toml`）：签到 cron 由 `0 1,13 * * *`（09:00/21:00 CST）
+   改为 `5 2,14 * * *`（10:05/22:05 CST），避开 10:00 刷新点。
+
+**不要顺手改回去**：
+- 不要恢复「列表有任意 CLAIMED 就报 already」——那正是本次事故的成因；
+- `qoderDailyRoundOpen` 必须显式收 `nowMs`（纯函数），否则单测会随 CI 挂钟漂移；
+- 相关用例（`src/qoder/port-20260923.test.ts`）用 `vi.setSystemTime` 固定到
+  10:30 CST / 09:01 CST 两侧，改测试时不要去掉时间固定。
+
+---
+
 ## TRAE（SOLO 协议）适配指南
 
 TRAE 上游（`trae-api-cn.mchost.guru`）**不是 OpenAI 兼容端点**，是 SOLO 私有 SSE 协议
@@ -437,7 +466,7 @@ TRAE 思考模型在推理阶段可能 15~20s 不发数据，客户端（AI SDK 
 - trae 的 SOLO 与 Work 通道**各看自己那一类包**（`isWork`）：混用会把另一个通道的额度提前烧掉。
 - workbuddy 到期数据落在池状态 `state.packages`（随手签到写路径落盘；`[]`＝探测成功但无包，
   会清旧明细）；trae 落在 `state.packs`。两者都**不在请求热路径写**，最多滞后到上一次探测
-  （workbuddy cron `0 1,13 * * *` UTC 一天两次）。
+  （workbuddy cron `5 2,14 * * *` UTC 一天两次）。
 
 **不要"顺手改回去"**：窗口 7 天（后端 `CREDIT_EXPIRY_WINDOW_MS` 与面板 `WB_EXPIRY_WINDOW_MS`
 必须同值，面板 trae 侧也统一成 7 天——原先是 3 天，与挑号窗口不一致会误导）；上游 `ExpiredTime`

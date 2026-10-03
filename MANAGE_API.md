@@ -189,7 +189,7 @@ curl -X DELETE -H "Authorization: Bearer <TOKEN>" https://gateway.example.com/ap
 
 ### 6.4 POST `/api/manage/checkin` — WorkBuddy 每日签到（手动触发）
 
-触发所有 WorkBuddy/CodeBuddy OAuth 账号签到（领取免费积分）。仅 CN 账号签到，国际版自动跳过。定时任务每天 09:00/21:00（北京时间）自动执行，此接口供脚本手动触发。
+触发所有 WorkBuddy/CodeBuddy OAuth 账号签到（领取免费积分）。仅 CN 账号签到，国际版自动跳过。定时任务每天 10:05/22:05（北京时间）自动执行（原 09:00/21:00：Qoder 每日活动按 CST 10:00 刷新放量，早于该点跑会拿到上一轮的已领取状态、假报「今日已领取」），此接口供脚本手动触发。
 
 **全量签到**：
 ```bash

@@ -7,7 +7,7 @@
 import { describe, it, expect, vi, afterEach } from 'vitest'
 import { cosySessionFor, cosyHeaders } from './cosy'
 import { buildQoderBody, cpaToUpstreamKey, fallbackUnknownModel, pickQoderModels } from './body'
-import { performQoderCheckin, normalizeQoderRealm, realmHasLegacyCheckin, QODER_OPENAPI, fetchQoderUserResource, type QoderDeviceIdentity } from './billing'
+import { performQoderCheckin, normalizeQoderRealm, realmHasLegacyCheckin, qoderDailyRoundOpen, QODER_OPENAPI, fetchQoderUserResource, type QoderDeviceIdentity } from './billing'
 import { QODER_DEVICE_FIELDS } from './device'
 import { classifyQoderError, type QoderClassified } from './classify'
 import { proxyQoderChatRequest, isQoderFlow, testQoderModel, markQoderAccountClassified, isQoderSessionDead } from './proxy'
@@ -15,7 +15,17 @@ import type { Env, Provider } from '../types'
 
 const CHAT_URL = 'https://gateway.qoder.com.cn/algo/api/v2/service/pro/sse/agent_chat_generation?Encode=1'
 
+/**
+ * 固定到「Qoder 当日轮次已刷新」的时刻：2026-10-03 10:30 CST。
+ * 轮次边界见 qoderDailyRoundOpen（每轮 CST 10:00 放量），相关用例必须显式固定
+ * 系统时间，否则断言会随 CI 挂钟在 10:00 前后翻转。
+ */
+const AFTER_ROUND_OPEN = new Date('2026-10-03T02:30:00Z')
+/** 线上事故时刻：2026-10-03 09:01 CST —— 轮次尚未刷新，列表里的 CLAIMED 属上一轮。 */
+const BEFORE_ROUND_OPEN = new Date('2026-10-03T01:01:00Z')
+
 afterEach(() => {
+  vi.useRealTimers()
   vi.unstubAllGlobals()
 })
 
@@ -149,12 +159,43 @@ describe('P0-1 签到走 campaigns 流程（legacy daily-check-in/claim 已 DISA
   })
 
   it('无 CLAIMABLE 但已有 CLAIMED → already（不报失败）', async () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(AFTER_ROUND_OPEN)
     vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify({
       campaigns: [{ campaignId: 'c', actionType: 'CLAIM_BENEFIT', claimStatus: 'CLAIMED' }],
     }), { status: 200 })))
     const r = await performQoderCheckin('dt-x')
     expect(r.success).toBe(true)
     expect(r.already).toBe(true)
+  })
+
+  it('轮次未刷新（CST 10:00 前）的 CLAIMED 是上一轮残留 → 不报 already（2026-10-03 假签到事故）', async () => {
+    // 线上原状：09:01 自动签到看到上一轮的 CLAIMED → 报「今日已领取」，
+    // 额度 395 一整天不动；10:23 手工再领才 +100。修好后必须如实报「尚未刷新」。
+    vi.useFakeTimers()
+    vi.setSystemTime(BEFORE_ROUND_OPEN)
+    const fetchMock = vi.fn(async (_input: unknown) => new Response(JSON.stringify({
+      campaigns: [{
+        campaignId: 'c-daily', campaignKey: 'act-20260930-894', actionType: 'CLAIM_BENEFIT',
+        claimStatus: 'CLAIMED', benefit: { kind: 'CREDITS', amount: 100 },
+      }],
+    }), { status: 200 }))
+    vi.stubGlobal('fetch', fetchMock)
+    const r = await performQoderCheckin('dt-c', 'cn', 'u1')
+    expect(r.success).toBe(false)
+    expect(r.already).toBeFalsy()
+    expect(r.message).toContain('尚未刷新')
+    expect(r.message).toContain('act-20260930-894')
+    // 关键：绝不因为「列表说已领」就跳过领取动作（旧实现正是这样漏掉当天积分）
+    expect(fetchMock.mock.calls.some((c) => String(c[0]).includes('/claim'))).toBe(false)
+  })
+
+  it('qoderDailyRoundOpen：CST 10:00 为界，前后各差一分钟都判对', () => {
+    expect(qoderDailyRoundOpen(Date.parse('2026-10-03T01:59:00Z'))).toBe(false) // 09:59 CST 未放量
+    expect(qoderDailyRoundOpen(Date.parse('2026-10-03T02:00:00Z'))).toBe(true)  // 10:00 CST 已放量
+    expect(qoderDailyRoundOpen(Date.parse('2026-10-03T02:01:00Z'))).toBe(true)  // 10:01 CST
+    expect(qoderDailyRoundOpen(Date.parse('2026-10-03T15:00:00Z'))).toBe(true)  // 当日 23:00 CST 仍在当轮内
+    expect(qoderDailyRoundOpen(Date.parse('2026-10-03T16:00:00Z'))).toBe(false) // 次日 00:00 CST 新一轮未放量
   })
 
   it('无任何 CLAIM_BENEFIT 活动 → 失败，且绝不调用 legacy claim', async () => {
@@ -554,6 +595,60 @@ describe('活动领取：空 actionType 视为奖励类，不可领取时如实�
     const r = await performQoderCheckin('dt-c', 'cn', 'u1')
     expect(r.success).toBe(false)
     expect(fetchMock.mock.calls.some((c) => String(c[0]).includes('/claim'))).toBe(false)
+  })
+
+  it('非 CREDITS 奖励活动（如兑换码 REDEMPTION_CODE 已领）不误判为每日签到已领', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () =>
+      new Response(JSON.stringify({
+        showCampaign: true,
+        campaigns: [{
+          campaignId: 'c-coupon', campaignKey: 'act-20260928-620', actionType: 'CLAIM_BENEFIT',
+          claimStatus: 'CLAIMED', benefit: { kind: 'REDEMPTION_CODE', amount: 1 },
+        }],
+      }), { status: 200 })))
+    const r = await performQoderCheckin('dt-c', 'cn', 'u1')
+    expect(r.success).toBe(false)
+    expect(r.already).toBeFalsy()
+  })
+
+  it('无积分已领活动不掩盖今日签到名额发完（REDEMPTION_CODE_OUT_OF_STOCK）', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () =>
+      new Response(JSON.stringify({
+        showCampaign: true,
+        campaigns: [
+          {
+            campaignId: 'c-old', campaignKey: 'act-old-task', actionType: 'CLAIM_BENEFIT',
+            claimStatus: 'CLAIMED', benefit: { kind: '', amount: 0 },
+          },
+          {
+            campaignId: 'c-daily', campaignKey: 'act-20260930-894', actionType: 'CLAIM_BENEFIT',
+            claimStatus: 'NOT_ELIGIBLE', unavailableReason: 'REDEMPTION_CODE_OUT_OF_STOCK',
+            benefit: { kind: 'CREDITS', amount: 100 },
+          },
+        ],
+      }), { status: 200 })))
+    const r = await performQoderCheckin('dt-c', 'cn', 'u1')
+    expect(r.success).toBe(false)
+    expect(r.message).toContain('名额已发完')
+    expect(r.message).toContain('act-20260930-894')
+  })
+
+  it('已领取的签到活动在 message 和 campaignKey 中如实带出', async () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(AFTER_ROUND_OPEN)
+    vi.stubGlobal('fetch', vi.fn(async () =>
+      new Response(JSON.stringify({
+        showCampaign: true,
+        campaigns: [{
+          campaignId: 'c-daily', campaignKey: 'act-20260930-894', actionType: 'CLAIM_BENEFIT',
+          claimStatus: 'CLAIMED', benefit: { kind: 'CREDITS', amount: 100 },
+        }],
+      }), { status: 200 })))
+    const r = await performQoderCheckin('dt-c', 'cn', 'u1')
+    expect(r.success).toBe(true)
+    expect(r.already).toBe(true)
+    expect(r.campaignKey).toBe('act-20260930-894')
+    expect(r.message).toContain('act-20260930-894')
   })
 })
 
