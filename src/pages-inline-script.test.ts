@@ -366,7 +366,7 @@ describe('Cline 账号行：冷却/额度状态徽章与「展开即读取」（
    * 列表里**没有 Cline**，于是什么都没读；② 账号池只装启用账号，留档下标与面板下标错位。
    * 语法检查（本文件前半段）与 tsc 对这两类错完全无感。
    */
-  function makeAcctPanel(html: string, opts: { stale?: boolean; accounts?: unknown[] } = {}) {
+  function makeAcctPanel(html: string, opts: { stale?: boolean; accounts?: unknown[]; checkAccounts?: unknown[] } = {}) {
     const js = inlineScripts(html).join('\n')
     const ui = js.match(/\/\* CLINE_UP_UI_BEGIN \*\/([\s\S]*?)\/\* CLINE_UP_UI_END \*\//)
     const pure = js.match(/\/\* CLINE_UP_BEGIN \*\/([\s\S]*?)\/\* CLINE_UP_END \*\//)
@@ -385,15 +385,21 @@ describe('Cline 账号行：冷却/额度状态徽章与「展开即读取」（
       if (String(url).includes('cline-account-states')) {
         return Promise.resolve({ json: async () => ({ success: true, data: { accounts: opts.accounts || [] } }) })
       }
-      return Promise.resolve({ json: async () => ({ success: true, data: { accounts: [], summary: '有效 1 / 共 1' } }) })
+      // 检测端点（POST）：用 checkAccounts 驱动，验证「点检测后也会排到点重取」
+      return Promise.resolve({ json: async () => ({ success: true, data: { accounts: opts.checkAccounts || [], summary: '有效 1 / 共 1' } }) })
     }
     const windowStub = { _clineStale: opts.stale ? { cline: true } : {} }
+    // setTimeout / clearTimeout 替身：冷却「到点自动重取」是定时器行为，真等 52 秒没法测。
+    // 注入假定时器后能直接断言「排了几次、睡多久、到点做什么」，且不给测试进程留下长命 handle。
+    const timers: Array<{ fn: () => void; ms: number; cancelled?: boolean }> = []
+    const fakeSetTimeout = (fn: () => void, ms: number) => { timers.push({ fn, ms }); return timers.length }
+    const fakeClearTimeout = (id: number) => { const t = timers[id - 1]; if (t) t.cancelled = true }
     const factory = new Function(
-      'document', 'fetch', 'window', 'escapeHtml',
-      pure[1] + '\n' + ui[1] + '\nreturn { paint: clinePaintRunBadge, load: clineLoadStates, onOpen: clineOnCardOpen }'
+      'document', 'fetch', 'window', 'escapeHtml', 'setTimeout', 'clearTimeout',
+      pure[1] + '\n' + ui[1] + '\nreturn { paint: clinePaintRunBadge, load: clineLoadStates, check: clineCheckAccounts, onOpen: clineOnCardOpen }'
     )
-    const api = factory(document, fetchStub, windowStub, (s: string) => String(s))
-    return { api, els, calls, flush: () => new Promise((r) => setTimeout(r, 0)) }
+    const api = factory(document, fetchStub, windowStub, (s: string) => String(s), fakeSetTimeout, fakeClearTimeout)
+    return { api, els, calls, timers, flush: () => new Promise((r) => setTimeout(r, 0)) }
   }
 
   it('展开卡片：读取只读留档（GET，不打上游）并写出读取结果，未记录到冷却时明说', async () => {
@@ -425,6 +431,44 @@ describe('Cline 账号行：冷却/额度状态徽章与「展开即读取」（
     // 没冷却的那行不显示徽章（不猜、不画假的绿）
     expect(p.els['krun-cline-1'].style.display).toBe('none')
     expect(p.els['cline-chk-cline'].textContent).toContain('冷却中 1')
+  })
+
+  it('冷却中：按服务端 remainingMs 排一次「到点重取」（客户端只睡觉，不自己算时间）', async () => {
+    const p = makeAcctPanel(await render([clineProvider()]), {
+      accounts: [{ index: 0, enabled: true, cooling: true, stateKind: 'quota_empty', stateLabel: '额度耗尽 · 冷却 52s', stateTitle: 'x', remainingMs: 52_000 }],
+    })
+    await p.api.load('cline')
+    // 只排一次（同一 provider 反复读取不会堆积定时器）
+    expect(p.timers).toHaveLength(1)
+    // 上限定为 30 分钟一轮：402 的 12h 冷却不该留一个睡 12h 的定时器
+    expect(p.timers[0].ms).toBeLessThanOrEqual(30 * 60 * 1000 + 1000)
+    expect(p.timers[0].ms).toBeGreaterThanOrEqual(52_000)
+    // 到点后真正重取一次——仍走只读留档（GET），绝不升级成会换 token 的检测
+    p.timers[0].fn()
+    await p.flush()
+    const statesCalls = p.calls.filter((c) => c.url.includes('cline-account-states'))
+    expect(statesCalls).toHaveLength(2)
+    expect(statesCalls.every((c) => c.method === undefined)).toBe(true)
+  })
+
+  it('没有冷却记录 → 不排任何定时器（不空转、不猜）', async () => {
+    const p = makeAcctPanel(await render([clineProvider()]), { accounts: [] })
+    await p.api.load('cline')
+    expect(p.timers).toHaveLength(0)
+  })
+
+  it('「检测全部账号」返回冷却 → 同样排到点重取（两条显示路径同一口径）', async () => {
+    const p = makeAcctPanel(await render([clineProvider()]), {
+      checkAccounts: [{ index: 0, valid: true, masked: '****aaaa', cooling: true, stateKind: 'quota_empty', stateLabel: '额度耗尽 · 冷却 3m', stateTitle: 'x', remainingMs: 180_000 }],
+    })
+    await p.api.check()
+    expect(p.timers).toHaveLength(1)
+    expect(p.timers[0].ms).toBeGreaterThanOrEqual(180_000)
+    // 到点后重取走的是**只读**留档（不是再做一次有副作用的检测）
+    p.timers[0].fn()
+    await p.flush()
+    expect(p.calls.filter((c) => c.url.includes('cline-account-states'))).toHaveLength(1)
+    expect(p.calls.filter((c) => c.url.includes('cline-accounts/check'))).toHaveLength(1)
   })
 
   it('已禁用优先于冷却：文案先说禁用，颜色走中性', async () => {

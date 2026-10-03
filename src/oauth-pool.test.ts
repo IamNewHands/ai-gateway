@@ -15,6 +15,7 @@ import {
   cooldownOauthAccountSoftForModel,
   listModelCooldowns,
   hasModelCooldown,
+  listOauthPoolStatus,
   __resetOauthPoolRuntimeForTests,
   __resetOauthModelCostsForTests,
   reenableOauthIfCredits,
@@ -262,6 +263,46 @@ describe('全冷却兜底（allowCoolingFallback，对齐 workbuddy2api pickEarl
     ])
     const acc = await pickOauthAccount(kv2.env, pid, new Set(), undefined, { allowCoolingFallback: true, rng: RNG_ZERO })
     expect(acc!.uid).toBe('healthy')
+  })
+})
+
+describe('池状态透出的剩余冷却时长（面板「冷却至 …（剩 8m）」与「到点重取」的唯一数据源）', () => {
+  it('冷却中 → remainingMs / remainingText；已到期 → 归零且不写剩余文案', async () => {
+    const pid = PROVIDER + '-st1'
+    const now = Date.now()
+    const kv = makeRealKV(pid, [
+      makeAccount('cold', {
+        state: { credits: 1, disabled: false, until: now + 8 * 60000, errCount: 0, reason: '429 rate limit' },
+      }),
+      makeAccount('hot', {
+        state: { credits: 1, disabled: false, until: now - 1, errCount: 0, reason: '429 rate limit' },
+      }),
+    ])
+    const rows = await listOauthPoolStatus(kv.env, pid)
+    const cold = rows.find((r) => r.uid === 'cold')!
+    const hot = rows.find((r) => r.uid === 'hot')!
+
+    expect(cold.cooling).toBe(true)
+    // 时长文案由服务端算（客户端只画）：8 分钟 → '8m'
+    expect(cold.remainingText).toBe('8m')
+    expect(cold.remainingMs).toBeGreaterThan(7 * 60000)
+
+    // 已到期：不冷却、剩余归零、无剩余文案（面板据此写「无冷却（上次：…）」，绝不显示负数）
+    expect(hot.cooling).toBe(false)
+    expect(hot.remainingMs).toBe(0)
+    expect(hot.remainingText).toBe('')
+  })
+
+  it('模型级 6004 冷却不写账号级剩余（账号整体仍可用，面板只多一个模型徽章）', async () => {
+    const pid = PROVIDER + '-st2'
+    const kv = makeRealKV(pid, [makeAccount('u1')])
+    await cooldownOauthAccountSoftForModel(kv.env, pid, 'u1', 'model-A', Date.now() + 60000, '6004')
+
+    const row = (await listOauthPoolStatus(kv.env, pid))[0]
+    expect(row.cooling).toBe(false)
+    expect(row.remainingMs).toBe(0)
+    // 模型级条目照旧透出（面板「模型限流(model-A)」徽章的来源）
+    expect((row.modelCooldowns as Array<{ model: string }>)[0].model).toBe('model-A')
   })
 })
 

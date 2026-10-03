@@ -31,6 +31,7 @@ import type { Env, OAuthDeviceConfig, OAuthTokenState, PackageInfo, Provider } f
 import { CREDIT_EXPIRY_WINDOW_MS, soonestPackageExpiryAt } from './credit-expiry'
 import { OAUTH_POOL_KV_PREFIX, decodeJwtUid, readOauthToken, refreshBrowserTokenState } from './oauth'
 import { nextDay4AMMs } from './workbuddy-upstream'
+import { formatRemaining } from './remaining'
 
 /** 池内账号状态（冷却/禁用/积分） */
 export interface OAuthPoolState {
@@ -1101,6 +1102,10 @@ export async function listOauthPoolStatus(env: Env, providerId: string): Promise
     packagesAt: a.state?.packagesAt,
     cooling: !!(a.state?.until && a.state.until > now),
     until: a.state?.until ?? 0,
+    // 剩余时长（服务端算，客户端只画）：面板据此写「冷却至 …（剩 8m）」，
+    // 并据此决定「到点重取一次」的时刻——不让客户端自己算时间，避免两端口径分叉。
+    remainingMs: a.state?.until && a.state.until > now ? a.state.until - now : 0,
+    remainingText: a.state?.until && a.state.until > now ? formatRemaining(a.state.until - now) : '',
     reason: a.state?.reason || '',
     disabled: a.state?.disabled === true,
     errCount: a.state?.errCount || 0,

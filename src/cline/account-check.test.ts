@@ -382,6 +382,10 @@ describe('Cline 面板：账号冷却 / 额度耗尽 / 已禁用 的状态显示
     expect(String(row.stateTitle)).toContain('Try again in 23h 59m')
     expect(body.data.summary).toContain('冷却中 1')
     expect(body.data.summary).toContain('额度耗尽 1')
+    // 检测端点与只读留档端点同口径：也下发 until / remainingMs，否则「点检测看到冷却 52s」
+    // 之后就再也不会自动更新（面板两条路径都要能排到点重取）
+    expect(Number(row.until)).toBeGreaterThan(Date.now() + 30_000)
+    expect(Number(row.remainingMs)).toBeGreaterThan(30_000)
   })
 
   it('留档掩码与当前 token 不符（这行换过号）→ 不认这条记录，宁可不显示也不硬套', async () => {
@@ -506,6 +510,29 @@ describe('Cline 面板：账号冷却 / 额度耗尽 / 已禁用 的状态显示
     expect(String(row.stateLabel)).toContain('余额/权益不足')
     expect(String(row.stateTitle)).toContain('cline-pass/glm-5.3')
     expect(row.enabled).toBe(true)
+    // 冷却截止与剩余时长必须下发：面板据此排「到点自动重取」（客户端不许自己算时间，
+    // 但必须知道睡多久）。剩余量级 = 12h，不允许被写成 0。
+    const until = Number(row.until)
+    expect(until).toBeGreaterThan(Date.now() + 11 * 3600_000)
+    expect(Number(row.remainingMs)).toBeGreaterThan(11 * 3600_000)
+  })
+
+  it('GET cline-account-states：已到期/掩码不符 → until 与 remainingMs 都为 0（不排空定时器）', async () => {
+    const { env, map } = makeEnvWithMap()
+    await setProviders(env as never, [clineProvider([{ key: RT_A, enabled: true }])])
+    seedState(map, {
+      index: 0, masked: '****aaaa', kind: 'quota_empty',
+      until: Date.now() - 1, at: Date.now() - 60_000, model: null, reason: 'x',
+    })
+    globalThis.fetch = (async (url: string) => { throw new Error('不应发起上游请求：' + url) }) as typeof fetch
+
+    const app = new Hono<AppEnv>()
+    app.get('/admin/api/providers/:id/cline-account-states', handleClineAccountStates)
+    const res = await app.request('/admin/api/providers/cline/cline-account-states', {}, env as never)
+    const row = ((await res.json()) as { data: { accounts: Array<Record<string, unknown>> } }).data.accounts[0]
+    expect(row.cooling).toBe(false)
+    expect(row.until).toBe(0)
+    expect(row.remainingMs).toBe(0)
   })
 
   it('GET cline-account-states：非 Cline 提供商拒绝；掩码不符的留档被丢弃', async () => {

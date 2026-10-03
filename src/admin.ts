@@ -2034,6 +2034,11 @@ export async function handleClineAccountStates(c: Context<AppEnv>) {
       stateKind: view?.active ? state!.kind : null,
       stateLabel: view?.label || '',
       stateTitle: view?.detail || '',
+      // 冷却截止与剩余时长：面板据此写「到点重取一次」的时刻。
+      // 为什么必须下发 remainingMs（而不是让客户端解析 stateLabel 或自己算）：
+      // 文案是服务端的唯一真源（「冷却 52s」在下一毫秒就过期了），客户端只负责画与定时。
+      until: view?.active ? state!.until : 0,
+      remainingMs: view?.active ? view.remainingMs : 0,
     }
   })
   return c.json<ApiResponse>({ success: true, data: { accounts, checkedAt: now } })
@@ -2101,6 +2106,10 @@ export async function handleClineAccountCheck(c: Context<AppEnv>) {
       stateKind: view?.active ? matched!.kind : null,
       stateLabel: view?.label || '',
       stateTitle: view?.detail || '',
+      // 与只读留档端点同口径：面板两条路径（展开卡片 / 点检测）都要能排「到点重取」，
+      // 否则「点检测看到冷却 52s」之后就再也不会自己更新了。
+      until: view?.active ? matched!.until : 0,
+      remainingMs: view?.active ? view.remainingMs : 0,
     }
   })
 

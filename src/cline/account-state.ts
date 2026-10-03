@@ -19,6 +19,7 @@
  *   滞后只会让状态**更早**显示为已到期，绝不把已冷却的账号显示成正常。
  */
 import type { Env } from '../types'
+import { formatRemaining } from '../remaining'
 
 /** 冷却原因分类。字符串是落 KV 的稳定契约，不要随文案改。 */
 export type ClineAccountStateKind =
@@ -244,16 +245,12 @@ const KIND_LABEL: Record<ClineAccountStateKind, string> = {
   runaway: '推理空转',
 }
 
-/** 剩余时长的紧凑写法：`11h59m` / `8m` / `30s`。 */
-export function formatRemaining(ms: number): string {
-  if (ms <= 0) return '0s'
-  const sec = Math.floor(ms / 1000)
-  if (sec < 60) return `${sec}s`
-  const min = Math.floor(sec / 60)
-  if (min < 60) return `${min}m`
-  const hour = Math.floor(min / 60)
-  return `${hour}h${min % 60}m`
-}
+/** 剩余时长的紧凑写法：`11h59m` / `8m` / `30s`。
+ *
+ * 实现已移到 `src/remaining.ts`（WorkBuddy/Qoder 池共用同一份文案），此处只做转出，
+ * 保持既有调用方与测试的 import 路径不变。
+ */
+export { formatRemaining }
 
 export interface ClineAccountStateView {
   /** 该状态此刻是否仍生效（冷却未到期）。false 时面板不该显示任何徽章。 */

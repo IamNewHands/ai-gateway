@@ -2386,6 +2386,14 @@ function oauthPoolStatus(id) {
       a.__idx = ai
     })
     renderOauthPoolAccounts(id, pool, ciByUid, ciByNick, ciAccounts, preferUid)
+    // 冷却到点自动重取一次：剩余时长来自服务端（remainingMs/remainingText），客户端只按它睡觉。
+    // 为什么可以放心轮询：WorkBuddy 池的 /status 是**纯 KV 读**（不打上游）——只有 Qoder 的
+    // 「刷新账号池」会顺带逐号探额度（?credits=1），那条路径绝不挂自动重取。
+    var soonestWb = 0
+    pool.forEach(function (a) {
+      if (a && a.cooling && a.remainingMs > 0 && (soonestWb === 0 || a.remainingMs < soonestWb)) soonestWb = a.remainingMs
+    })
+    coolRefreshSchedule('wbpool:' + id, soonestWb, function () { oauthPoolStatus(id) })
   }).catch(() => { if (st) showResult(st, false, '查询失败') })
 }
 /* WB_EXPIRY_BEGIN */
@@ -2624,7 +2632,7 @@ function renderOauthPoolAccounts(id, accs, ciByUid, ciByNick, ciAccounts, prefer
       : (a.cooling ? '<span class="bd bd-warn">冷却中</span>' : '<span class="bd bd-on">无冷却</span>')
     let coolDetail = ''
     if (isOff) coolDetail = a.reason ? '（' + escapeHtml(a.reason) + '）' : ''
-    else if (a.cooling && a.until) coolDetail = ' 冷却至 ' + new Date(a.until).toLocaleString() + (a.reason ? '（' + escapeHtml(a.reason) + '）' : '')
+    else if (a.cooling && a.until) coolDetail = ' 冷却至 ' + new Date(a.until).toLocaleString() + (a.remainingText ? '（剩 ' + escapeHtml(a.remainingText) + '）' : '') + (a.reason ? '（' + escapeHtml(a.reason) + '）' : '')
     else if (a.reason) coolDetail = '（上次：' + escapeHtml(a.reason) + '）'
     let modelRateBadge = ''
     // 6004 模型级限流徽章（多模型表）：逐条展示仍在限额中的模型与恢复时刻
@@ -4104,6 +4112,32 @@ function clinePaintRunBadge(id, a) {
 }
 
 /**
+ * 冷却「到点自动重取一次」的调度器（同一 key 只保留一个定时器）。
+ *
+ * 为什么需要：冷却剩余时长是**服务端在响应那一刻**算出来的（见 clineLoadStates /
+ * oauthPoolStatus）。页面不重取，那个数就永远停在当时——用户会看到「冷却 52s」挂一小时
+ * 一动不动，或冷却早已结束、面板还写着「冷却中」。
+ *
+ * 为什么不在客户端倒计时：剩余时长与文案的唯一真源在服务端。客户端一旦自己算，两端口径
+ * 迟早分叉（这正是「面板谎报账号健康」的成因）。所以客户端只做一件事：按服务端给的
+ * remainingMs **睡到点，再读一次**。
+ *
+ * 为什么 clamp 到 30 分钟一轮：402 的冷却可以长达 12h，睡 12h 的定时器没有意义（页面早就
+ * 重载或关掉了）。醒来若仍在冷却，会再排一轮，效果等价、不留长命定时器。
+ *
+ * 同一 key 先清旧定时器：卡片反复展开/点刷新会重复调用，不清理就会堆积多个重取。
+ */
+function coolRefreshSchedule(key, ms, fn) {
+  if (!(ms > 0) || typeof setTimeout !== 'function') return
+  var timers = window._coolTimers || (window._coolTimers = {})
+  if (timers[key] && typeof clearTimeout === 'function') clearTimeout(timers[key])
+  timers[key] = setTimeout(function () {
+    delete timers[key]
+    fn()
+  }, Math.min(ms, 30 * 60 * 1000) + 1000)
+}
+
+/**
  * 只读冷却/额度留档（不打上游）：展开 Cline 卡片时调用。
  *
  * 为什么不复用那个会逐个换 token 的按钮：它给每个 refreshToken 换一次 accessToken（有副作用的探测），
@@ -4128,6 +4162,13 @@ function clineLoadStates(id) {
         st.textContent = '冷却留档已读取（' + new Date().toLocaleTimeString() + '）' +
           (cooling ? ' · 冷却中 ' + cooling : ' · 未记录到冷却')
       }
+      // 冷却到点自动重取一次：剩余时长是服务端按响应时刻算的，不重取就会一直挂在界面上。
+      // 取最早到期的那个（多个号冷却时，先醒来看第一个到期的）。
+      var soonest = 0
+      accs.forEach(function (a) {
+        if (a.cooling && a.remainingMs > 0 && (soonest === 0 || a.remainingMs < soonest)) soonest = a.remainingMs
+      })
+      coolRefreshSchedule('cline:' + id, soonest, function () { clineLoadStates(id) })
       return true
     })
     .catch(function () {
@@ -4190,6 +4231,13 @@ function clineCheckAccounts(id, opts) {
         if (lbl && !lbl.value.trim() && a.label) lbl.value = a.label
       })
       if (st) st.textContent = ((d.data && d.data.summary) || '') + ' · ' + new Date().toLocaleTimeString()
+      // 检测结果里若含冷却，同样排一次「到点重取」——否则点完检测看到的「冷却 52s」
+      // 又会一直挂着不动（与展开卡片路径同一口径，只是数据来源换成了检测端点）。
+      var soonestChk = 0
+      accs.forEach(function (a) {
+        if (a.cooling && a.remainingMs > 0 && (soonestChk === 0 || a.remainingMs < soonestChk)) soonestChk = a.remainingMs
+      })
+      coolRefreshSchedule('cline:' + id, soonestChk, function () { clineLoadStates(id) })
       window._clineStale = window._clineStale || {}
       window._clineStale[id] = false
       return true
