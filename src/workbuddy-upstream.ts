@@ -1694,7 +1694,9 @@ export function parseJwtClaims(token: string): { uid: string; enterpriseId: stri
     if (parts.length >= 2) {
       let b64 = parts[1].replace(/-/g, '+').replace(/_/g, '/')
       while (b64.length % 4) b64 += '='
-      claims = JSON.parse(atob(b64))
+      // atob 返回的是「每字符 = 一字节」的 Latin-1 字符串，直接 JSON.parse 会把 UTF-8
+      // 多字节昵称解成乱码（如 妹 → å¦¹）。必须按字节还原再以 UTF-8 解码。
+      claims = JSON.parse(new TextDecoder().decode(Uint8Array.from(atob(b64), (ch) => ch.charCodeAt(0))))
     }
   } catch { claims = null }
   const out = { uid: '', enterpriseId: '', nickname: '', domain: '' }
