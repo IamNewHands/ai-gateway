@@ -774,6 +774,69 @@ describe('WorkBuddy 池化代理端到端（粘性 + 会话头族 + 协议头）
     expect((st.until || 0) - Date.now()).toBeLessThanOrEqual(60 * 60 * 1000)
   })
 
+  // ===== 429 报文里的冷却时长必须真的生效（2026-10-03）=====
+  //
+  // 为什么必须端到端测：oauth-pool 的单元测试**全部直接传绝对 epoch**，所以
+  // 「调用点按什么单位把报文给的时刻传下去」这条接缝零覆盖。曾经的缺陷形态是
+  // 把「时长」传进「绝对时刻」参数 → 落到 now + 1ms，冷却当场失效：面板永远显示
+  // 「无冷却（上次：429 model rate limit (6004)）」，模型级豁免形同虚设
+  // （同模型下一请求继续硬撞上游）。本组用例锁死这条接缝。
+
+  it('429 + code 6004 → 该模型冷却到报文给的重置时刻（模型级生效、账号级不动）', async () => {
+    const { env, store, app } = makeEnv([makeProvider()])
+    await seedPool(env, ['u1'])
+
+    // 上游文案口径是 UTC+8 墙钟；换算成同一时刻的 CST 串，便于往返比对到秒。
+    const resetAt = Math.floor((Date.now() + 30 * 60 * 1000) / 1000) * 1000
+    const cst = new Date(resetAt + 8 * 3600 * 1000).toISOString().slice(0, 19).replace('T', ' ')
+
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(
+      `{"code":6004,"msg":"将在 ${cst} UTC+8 重置"}`,
+      { status: 429, headers: { 'Content-Type': 'application/json' } }
+    )))
+
+    await app.post({
+      model: `${PID}/deepseek-v4-flash`,
+      messages: [{ role: 'user', content: 'hi' }],
+      stream: false,
+    })
+
+    const pool = JSON.parse(store.get(OAUTH_POOL_KV_PREFIX + PID)!) as Array<{
+      uid: string
+      state: { reason?: string; until?: number; softRateModels?: Record<string, { until: number; resetAt: number }> }
+    }>
+    const st = pool.find((a) => a.uid === 'u1')!.state
+    const mc = st.softRateModels?.['deepseek-v4-flash']
+    expect(mc).toBeTruthy()
+    // 报文给的重置时刻就是冷却截止：既不是 now+1ms（单位传错），也不是默认 60s
+    expect(Math.abs(mc!.until - resetAt)).toBeLessThanOrEqual(1000)
+    expect(mc!.until - Date.now()).toBeGreaterThan(20 * 60 * 1000)
+    // 模型级：账号级 until 不动，其他模型仍可用（账号不被整体禁入）
+    expect(st.until || 0).toBeLessThanOrEqual(Date.now())
+    expect(st.reason).toBe('429 model rate limit (6004)')
+  })
+
+  it('429 软限流 → 优先采信上游 Retry-After（不再固定 60s）', async () => {
+    const { env, store, app } = makeEnv([makeProvider()])
+    await seedPool(env, ['u1'])
+
+    vi.stubGlobal('fetch', vi.fn(async () => new Response('{"error":{"message":"rate limited"}}', {
+      status: 429,
+      headers: { 'Content-Type': 'application/json', 'Retry-After': '600' },
+    })))
+
+    await app.post({
+      model: `${PID}/deepseek-v4-flash`,
+      messages: [{ role: 'user', content: 'hi' }],
+      stream: false,
+    })
+
+    const pool = JSON.parse(store.get(OAUTH_POOL_KV_PREFIX + PID)!) as Array<{ uid: string; state: { reason?: string; until?: number } }>
+    const st = pool.find((a) => a.uid === 'u1')!.state
+    expect(st.reason).toBe('429 rate limit (retry-after)')
+    expect((st.until || 0) - Date.now()).toBeGreaterThan(9 * 60 * 1000)
+  })
+
   // ===== R6-1：429 + code 14018 积分耗尽（移植 80acb32，源 issue #175）=====
 
   it('R6-1：429 + code 14018 → 硬积分冷却（余额不足，远超 60s），换健康号成功', async () => {

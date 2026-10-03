@@ -82,6 +82,7 @@ import {
   rotateBackoffAfterMs,
   isWafBlocked,
   parseRetryAfterMs,
+  RETRY_AFTER_SANITY_MS,
 } from './workbuddy-upstream'
 import {
   buildChatMeta,
@@ -2477,16 +2478,35 @@ async function proxyOAuthRequestPooledCore(
           await cooldownOauthAccountUntilTomorrow4AM(c.env, provider.id, account.uid, '余额不足')
           break
         case 'model_rate': {
-          // 429 6004 模型级限流（切模型立即可用，对齐 workbuddy2api issue #31）
+          // 429 6004 模型级限流（切模型立即可用，对齐 workbuddy2api issue #31）。
+          //
+          // **单位契约**：cooldownOauthAccountSoftForModel 第 5 参是**绝对 epoch 截止时刻**
+          // （见 oauth-pool 的 untilMs 语义，单元测试全部按绝对时刻传参）。2026-10-03 前这里
+          // 传的是「时长」（resetAt - now）→ 落进 `untilMs > now ? untilMs : now + 1` 的兜底，
+          // 冷却恒为 now+1ms：模型级豁免形同虚设，同模型下一请求继续硬撞上游，面板也永远只会
+          // 显示「无冷却（上次：… 6004）」。报文给的 UTC+8 墙钟按 2h 上限封顶（同 Retry-After
+          // 头族的异常值口径），不可信/缺失时才回落本地软冷却时长。
           const resetAt = parseSoftRateReset(text)
-          const cdMs = resetAt ? Math.max(0, resetAt - Date.now()) : cd.softMs
-          await cooldownOauthAccountSoftForModel(c.env, provider.id, account.uid, reqModel || '', cdMs, '429 model rate limit (6004)')
+          const now = Date.now()
+          const untilMs = resetAt !== null
+            ? Math.min(resetAt, now + RETRY_AFTER_SANITY_MS)
+            : now + cd.softMs
+          await cooldownOauthAccountSoftForModel(c.env, provider.id, account.uid, reqModel || '', untilMs, '429 model rate limit (6004)')
           break
         }
-        case 'soft_rate':
-          // 429 限流 → 短冷却
-          await cooldownOauthAccount(c.env, provider.id, account.uid, cd.softMs, '429 rate limit')
+        case 'soft_rate': {
+          // 429 限流 → 短冷却。优先采信上游明示的 Retry-After 头族（与 WAF / 5xx / 404 分支
+          // 同一口径：上游说多久就多久），缺失/非法才回落本地默认 softMs（旧语义不变）。
+          const raMs = parseRetryAfterMs(response.headers)
+          await cooldownOauthAccount(
+            c.env,
+            provider.id,
+            account.uid,
+            raMs !== null ? raMs : cd.softMs,
+            raMs !== null ? '429 rate limit (retry-after)' : '429 rate limit'
+          )
           break
+        }
         case 'model_blocked': {
           // 11102「该后端无此模型」→ 模型级避让（对齐 workbuddy2api BlockModelBackoff）：
           // 只写 modelCooldowns[model] 独立冷却，指数退避（6h 起 ×2^min(hits-1,6) 封顶 24h），
