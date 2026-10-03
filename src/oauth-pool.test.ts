@@ -306,6 +306,51 @@ describe('池状态透出的剩余冷却时长（面板「冷却至 …（剩 8m
   })
 })
 
+describe('池状态昵称以 JWT 为权威来源（历史 Latin-1 乱码无需重新登录/重新添加账号）', () => {
+  /** UTF-8 安全的 base64url：btoa 直接吃中文会抛 InvalidCharacterError。 */
+  function b64urlUtf8(o: unknown): string {
+    const bytes = new TextEncoder().encode(JSON.stringify(o))
+    let bin = ''
+    for (const b of bytes) bin += String.fromCharCode(b)
+    return btoa(bin).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '')
+  }
+  function tokenWithNickname(nickname: string): OAuthTokenState {
+    return {
+      access_token: `h.${b64urlUtf8({ uid: 'u-nick', nickname })}.s`,
+      refresh_token: 'r',
+      expires_at: 0,
+    } as unknown as OAuthTokenState
+  }
+
+  it('存储值是乱码 å¦¹、JWT 是 妹 → 面板透出 妹', async () => {
+    const pid = PROVIDER + '-nick1'
+    const kv = makeRealKV(pid, [makeAccount('u-nick', { nickname: 'å¦¹', token: tokenWithNickname('妹') })])
+    expect((await listOauthPoolStatus(kv.env, pid))[0].nickname).toBe('妹')
+  })
+
+  it('多字中文昵称同样以 JWT 为准（å¿«å¿«ä¹ä¹ → 快快乐乐）', async () => {
+    const pid = PROVIDER + '-nick2'
+    const kv = makeRealKV(pid, [
+      makeAccount('u-nick', { nickname: 'å¿«å¿«ä¹ä¹', token: tokenWithNickname('快快乐乐') }),
+    ])
+    expect((await listOauthPoolStatus(kv.env, pid))[0].nickname).toBe('快快乐乐')
+  })
+
+  it('JWT 无昵称字段 → 回落池内存储值（不清空已有昵称）', async () => {
+    const pid = PROVIDER + '-nick3'
+    const kv = makeRealKV(pid, [makeAccount('u-nick', { nickname: '存值', token: makeToken('u-nick') })])
+    expect((await listOauthPoolStatus(kv.env, pid))[0].nickname).toBe('存值')
+  })
+
+  it('token 缺失或非 JWT → 回落存储值且不抛错', async () => {
+    const pid = PROVIDER + '-nick4'
+    const kv = makeRealKV(pid, [
+      makeAccount('u-nick', { nickname: '存值', token: { access_token: 'not-a-jwt' } as unknown as OAuthTokenState }),
+    ])
+    expect((await listOauthPoolStatus(kv.env, pid))[0].nickname).toBe('存值')
+  })
+})
+
 describe('6004 模型级限流隔离（对齐 workbuddy2api issue #31 / modelCooldowns 多模型表）', () => {
   it('多模型独立：A 触发后 B 再触发，A 的记录不被覆盖', async () => {
     const pid = PROVIDER + '-mc1'

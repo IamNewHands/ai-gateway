@@ -542,7 +542,12 @@ async function checkinOauthPoolAccount(
   const claims = decodeWorkbuddyClaims(token)
   const uid = account.uid || claims.uid
   const enterpriseId = claims.enterpriseId
-  if (!base.nickname && claims.nickname) {
+  // JWT 是昵称的**唯一权威来源**，必须无条件覆盖池内存储值：
+  // 池里的旧值可能是历史版本按 Latin-1 写坏的乱码（å¦¹ / å¿«å¿«ä¹ä¹）。
+  // 若沿用「仅在为空时补」的写法，base.nickname 会一直等于乱码旧值，
+  // 下面 syncPoolCredits 的回写判定（base.nickname !== account.nickname）恒为 false，
+  // 乱码将永久留在 KV 里——这正是「部署了修复但面板仍乱码」的原因。
+  if (claims.nickname) {
     base.nickname = claims.nickname
   }
 

@@ -30,7 +30,7 @@
 import type { Env, OAuthDeviceConfig, OAuthTokenState, PackageInfo, Provider } from './types'
 import { CREDIT_EXPIRY_WINDOW_MS, soonestPackageExpiryAt } from './credit-expiry'
 import { OAUTH_POOL_KV_PREFIX, decodeJwtUid, readOauthToken, refreshBrowserTokenState } from './oauth'
-import { nextDay4AMMs } from './workbuddy-upstream'
+import { nextDay4AMMs, parseJwtClaims } from './workbuddy-upstream'
 import { formatRemaining } from './remaining'
 
 /** 池内账号状态（冷却/禁用/积分） */
@@ -1094,7 +1094,10 @@ export async function listOauthPoolStatus(env: Env, providerId: string): Promise
   const now = Date.now()
   return pool.map((a) => ({
     uid: a.uid,
-    nickname: a.nickname || '',
+    // 昵称以 token 内 JWT 为**权威来源**：登录时不解昵称、或历史版本把 UTF-8 昵称
+    // 按 Latin-1 写坏（å¦¹ / å¿«å¿«ä¹ä¹）时，面板仍显示正确值——不必重新登录或重新添加账号。
+    // token 缺失/非 JWT 才回落池内存储值（签到时已回写的兜底路径）。
+    nickname: parseJwtClaims(a.token?.access_token || '').nickname || a.nickname || '',
     enabled: a.enabled !== false,
     credits: a.state?.credits ?? 0,
     // 权益包明细 + 探测时刻：「7 天内到期优先」挑号的可见依据（面板/排查据此解释"为何选这个号"）
