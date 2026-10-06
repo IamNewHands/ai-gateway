@@ -11,7 +11,7 @@
  */
 import { KV_KEYS, OAUTH_TOKEN_REFRESH_MARGIN_MS } from '../config'
 import type { Env, OAuthDeviceConfig, OAuthTokenState, DeviceFlowState } from '../types'
-import { markAccountTokenRefreshed } from './account-health'
+import { markAccountTokenRefreshed, markAccountAuthFailed, isAuthFailure } from './account-health'
 
 /** M365 Copilot 商业版 OAuth 端点（与官方桌面客户端一致） */
 export const M365_OAUTH = {
@@ -496,23 +496,30 @@ export async function m365ROPC(env: Env, providerId: string, cfg: OAuthDeviceCon
 
 // ===== token 刷新 =====
 
-const refreshInflight = new Map<string, Promise<boolean>>()
+export interface M365RefreshDetail {
+  success: boolean
+  error?: string
+  errorCode?: string
+  status?: number
+  expiresAt?: number
+}
+
+const refreshInflight = new Map<string, Promise<M365RefreshDetail>>()
 
 function normalizedAccountEmail(email?: string): string {
   return email ? String(email).toLowerCase().trim() : ''
 }
 
 /**
- * 刷新指定 M365 账号。oid 是首选稳定标识；历史账号缺少 oid 时用规范化 email 定位。
- * 两者都缺失时仅允许单账号池回退，避免多账号池静默刷新错误账号。
+ * 刷新指定 M365 账号（返回完整详情，含错误原因与新过期时间）。
  */
-export function refreshM365Token(
+export function refreshM365TokenDetail(
   env: Env,
   providerId: string,
   cfg: OAuthDeviceConfig,
   oid?: string,
   email?: string,
-): Promise<boolean> {
+): Promise<M365RefreshDetail> {
   const normalizedEmail = normalizedAccountEmail(email)
   const accountKey = oid ? `oid:${oid}` : normalizedEmail ? `email:${normalizedEmail}` : 'unidentified'
   const key = `${providerId}:${accountKey}`
@@ -525,13 +532,28 @@ export function refreshM365Token(
   return task
 }
 
-async function doRefreshM365Token(
+/**
+ * 刷新指定 M365 账号。oid 是首选稳定标识；历史账号缺少 oid 时用规范化 email 定位。
+ * 两者都缺失时仅允许单账号池回退，避免多账号池静默刷新错误账号。
+ */
+export async function refreshM365Token(
   env: Env,
   providerId: string,
   cfg: OAuthDeviceConfig,
   oid?: string,
   email?: string,
 ): Promise<boolean> {
+  const r = await refreshM365TokenDetail(env, providerId, cfg, oid, email)
+  return r.success
+}
+
+async function doRefreshM365Token(
+  env: Env,
+  providerId: string,
+  cfg: OAuthDeviceConfig,
+  oid?: string,
+  email?: string,
+): Promise<M365RefreshDetail> {
   const list = await readAccounts(env, providerId)
   const normalizedEmail = normalizedAccountEmail(email)
   const state = oid
@@ -541,7 +563,9 @@ async function doRefreshM365Token(
       : list.length === 1
         ? list[0]
         : undefined
-  if (!state?.refresh_token) return false
+  if (!state?.refresh_token) {
+    return { success: false, error: '缺少 refresh_token' }
+  }
   try {
     const conf = m365ClientConfig(cfg)
     const params = new URLSearchParams({
@@ -562,9 +586,34 @@ async function doRefreshM365Token(
       body: params.toString(),
       signal: AbortSignal.timeout(20000),
     })
-    if (!res.ok) return false
+    if (!res.ok) {
+      const errText = await res.text().catch(() => '')
+      let errorMsg = `HTTP ${res.status}`
+      let errorCode = ''
+      try {
+        const j = JSON.parse(errText) as { error?: string; error_description?: string }
+        if (j.error) errorCode = j.error
+        if (j.error_description) {
+          errorMsg = `${j.error || ''}: ${j.error_description}`.trim()
+        } else if (j.error) {
+          errorMsg = String(j.error)
+        }
+      } catch {
+        if (errText) errorMsg = `${errorMsg}: ${errText.slice(0, 200)}`
+      }
+      console.error(`[m365-refresh] provider=${providerId} account=${oid || normalizedEmail || 'unknown'} refresh failed: ${errorMsg}`)
+      // 若为确凿的凭据失效（400 invalid_grant、401、unauthorized 等）：标记该账号 authFailed
+      const isAuthDeath = res.status === 400 || res.status === 401 || isAuthFailure(errorMsg)
+      const healthKey = state.oid || (state.email ? `email:${normalizedAccountEmail(state.email)}` : '')
+      if (isAuthDeath && healthKey) {
+        await markAccountAuthFailed(env, healthKey, errorMsg)
+      }
+      return { success: false, error: errorMsg, errorCode, status: res.status }
+    }
     const data = (await res.json()) as { access_token: string; refresh_token?: string; expires_in?: number; id_token?: string }
-    if (!data.access_token) return false
+    if (!data.access_token) {
+      return { success: false, error: '上游返回缺少 access_token' }
+    }
     const fresh = buildTokenState(data)
     // 刷新响应通常不带完整账号信息，保留原账号身份后按 oid/email 写回池。
     await writeToken(env, providerId, {
@@ -577,9 +626,15 @@ async function doRefreshM365Token(
       email: state.email || fresh.email,
       nickname: state.nickname || fresh.nickname,
     }, state)
-    return true
-  } catch {
-    return false
+    const healthKey = state.oid || (state.email ? `email:${normalizedAccountEmail(state.email)}` : '')
+    if (healthKey) {
+      await markAccountTokenRefreshed(env, healthKey)
+    }
+    return { success: true, expiresAt: fresh.expires_at }
+  } catch (err) {
+    const msg = (err as Error)?.message || String(err)
+    console.error(`[m365-refresh] provider=${providerId} account=${oid || normalizedEmail || 'unknown'} exception: ${msg}`)
+    return { success: false, error: msg }
   }
 }
 
@@ -609,6 +664,7 @@ export async function refreshM365AccountIfNeeded(
   providerId: string,
   oid?: string,
   email?: string,
+  cfg?: OAuthDeviceConfig,
 ): Promise<M365Account | null> {
   const list = await readAccounts(env, providerId)
   const normalizedEmail = normalizedAccountEmail(email)
@@ -622,7 +678,7 @@ export async function refreshM365AccountIfNeeded(
   if (!state || !state.access_token) return null
 
   if (state.refresh_token && state.expires_at - Date.now() < OAUTH_TOKEN_REFRESH_MARGIN_MS) {
-    const ok = await refreshM365Token(env, providerId, {} as OAuthDeviceConfig, state.oid, state.email)
+    const ok = await refreshM365Token(env, providerId, cfg || ({} as OAuthDeviceConfig), state.oid, state.email)
     if (ok) {
       const refreshedList = await readAccounts(env, providerId)
       const refreshed = state.oid

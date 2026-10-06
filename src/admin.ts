@@ -53,7 +53,7 @@ import { startKukuQrLogin, pollKukuQrLogin } from './kuku/qr'
 import { listSessions as listM365Sessions, deleteSession as deleteM365Session } from './m365/session'
 import { listConversations as listM365Conversations, whitelistConversation, unwhitelistConversation, getCleanupMode, setCleanupMode, getCleanupConfig, setCleanupConfig, deleteConversationRecord } from './m365/conversation-manager'
 import { autoCleanupProvider } from './m365/auto-cleanup'
-import { getM365AccountInfos, listM365Accounts, removeM365Account, m365PoolDiagnostic } from './m365/oauth'
+import { getM365AccountInfos, listM365Accounts, removeM365Account, m365PoolDiagnostic, refreshM365TokenDetail } from './m365/oauth'
 import { clearAccountHealth, isAccountAvailable, accountCooldownSeconds, readHealth } from './m365/account-health'
 import { fluxSnapshot } from './m365/account-flux'
 import type {
@@ -3234,14 +3234,16 @@ export async function handleM365Accounts(c: Context<AppEnv>) {
     const accounts = []
     for (const info of infos) {
       const oid = info.oid || ''
-      const health = oid ? await readHealth(c.env, oid) : null
+      const healthKey = oid || (info.email ? `email:${String(info.email).toLowerCase().trim()}` : '')
+      const health = healthKey ? await readHealth(c.env, healthKey) : null
       const cooldownUntil = health?.cooldownUntil && health.cooldownUntil > now ? health.cooldownUntil : 0
       const imageLimitedUntil = health?.imageLimitedUntil && health.imageLimitedUntil > now ? health.imageLimitedUntil : 0
       const trippedUntil = health?.trippedUntil && health.trippedUntil > now ? health.trippedUntil : 0
       const authFailed = !!health?.authFailed
+      const authError = health?.authError || null
       const inflight = oid ? (snap.inflight[oid] || 0) : 0
-      const available = info.connected ? (oid ? await isAccountAvailable(c.env, oid) : false) : false
-      const cooldownSeconds = info.connected ? (oid ? await accountCooldownSeconds(c.env, oid) : 0) : 0
+      const available = info.connected ? (healthKey ? await isAccountAvailable(c.env, healthKey) : false) : false
+      const cooldownSeconds = info.connected ? (healthKey ? await accountCooldownSeconds(c.env, healthKey) : 0) : 0
       // 账号状态语义：使用中(inflight>0) > 未连接 > 授权失效 > 已隔离(图片额度耗尽/鉴权) > 冷却中 > 休眠(长期未用) > 空闲
       const idleMs = info.lastUsedAt ? now - info.lastUsedAt : -1
       let state: 'in_use' | 'idle' | 'dormant' | 'cooldown' | 'auth_failed' | 'isolated' | 'disconnected'
@@ -3262,6 +3264,8 @@ export async function handleM365Accounts(c: Context<AppEnv>) {
         hasRefreshToken: !!info.hasRefreshToken,
         inflight,
         state,
+        authFailed,
+        authError,
         available,
         cooldownSeconds,
         cooldownUntil: cooldownUntil || null,
@@ -3276,10 +3280,65 @@ export async function handleM365Accounts(c: Context<AppEnv>) {
       idle: accounts.filter((a) => a.state === 'idle').length,
       dormant: accounts.filter((a) => a.state === 'dormant').length,
       cooling: accounts.filter((a) => a.state === 'cooldown').length,
+      authFailed: accounts.filter((a) => a.state === 'auth_failed').length,
       unhealthy: accounts.filter((a) => !a.healthy).length,
       concurrencyLimit: snap.limit,
     }
     return c.json({ success: true, data: { provider: providerId, accounts, summary } })
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err)
+    return c.json({ error: { message: msg, type: 'internal_error' } }, 500)
+  }
+}
+
+/** 手动检测/刷新 M365 账号（可指定 ?oid= 单个账号，缺省刷新池内全部账号） */
+export async function handleM365RefreshAccounts(c: Context<AppEnv>) {
+  const providerId = c.req.param('id')
+  if (!providerId) {
+    return c.json({ error: { message: '缺少 provider_id 参数', type: 'invalid_request_error' } }, 400)
+  }
+  const provider = await getProvider(c.env, providerId).catch(() => null)
+  if (!provider) {
+    return c.json({ error: { message: '提供商不存在', type: 'not_found' } }, 404)
+  }
+  if (!isM365Provider(provider)) {
+    return c.json({ error: { message: '该提供商不是 M365 类型', type: 'invalid_request_error' } }, 400)
+  }
+  try {
+    const targetOid = c.req.query('oid') || ''
+    const accounts = await listM365Accounts(c.env, providerId)
+    const targets = targetOid ? accounts.filter((a) => a.oid === targetOid) : accounts
+    if (targets.length === 0) {
+      return c.json({ error: { message: targetOid ? '未找到该账号' : '账号池为空', type: 'not_found' } }, 404)
+    }
+    const oauthCfg = provider.oauth || ({} as OAuthDeviceConfig)
+    let refreshed = 0
+    let failed = 0
+    const results = []
+    for (const acc of targets) {
+      const res = await refreshM365TokenDetail(c.env, providerId, oauthCfg, acc.oid, acc.email)
+      if (res.success) {
+        refreshed++
+      } else {
+        failed++
+      }
+      results.push({
+        oid: acc.oid,
+        email: acc.email,
+        success: res.success,
+        error: res.error || null,
+        tokenExpiresAt: res.expiresAt || null,
+      })
+    }
+    return c.json({
+      success: true,
+      data: {
+        total: targets.length,
+        refreshed,
+        failed,
+        results,
+      },
+    })
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err)
     return c.json({ error: { message: msg, type: 'internal_error' } }, 500)

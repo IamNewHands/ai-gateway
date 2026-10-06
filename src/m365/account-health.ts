@@ -37,6 +37,10 @@ export interface AccountHealthState {
   cooldownUntil: number
   /** 是否鉴权失败（token 无效） */
   authFailed: boolean
+  /** 鉴权失败具体原因（上游报错摘要） */
+  authError?: string
+  /** 鉴权失败发生时间（Unix ms） */
+  authFailedAt?: number
   /** 图片额度耗尽到期时间（Unix ms），0 表示正常 */
   imageLimitedUntil: number
   /** 连续限流次数（供指数退避） */
@@ -73,6 +77,8 @@ export async function readHealth(env: Env, accountId: string): Promise<AccountHe
     return {
       cooldownUntil: s.cooldownUntil || 0,
       authFailed: !!s.authFailed,
+      authError: s.authError || undefined,
+      authFailedAt: s.authFailedAt || 0,
       imageLimitedUntil: s.imageLimitedUntil || 0,
       rlFailures: s.rlFailures || 0,
       breakerStart: s.breakerStart || 0,
@@ -283,6 +289,8 @@ export async function markAccountFailure(
 
   if (isAuthFailure(err)) {
     state.authFailed = true
+    state.authError = msg.substring(0, 300)
+    state.authFailedAt = now
     state.rlFailures = 0
     state.cooldownUntil = now + AUTH_FAIL_COOLDOWN_MS
   } else if (isRateLimited(err)) {
@@ -317,6 +325,18 @@ export async function markAccountFailure(
   console.log(`[account-health] ${accountId} marked failure: authFailed=${state.authFailed} cooldown=${Math.ceil((state.cooldownUntil - now) / 1000)}s`)
 }
 
+/** 显式标记账号凭据失效（Refresh Token 被上游拒绝等场景，持久化错误原因） */
+export async function markAccountAuthFailed(env: Env, accountId: string, reason?: string): Promise<void> {
+  const state = await readHealth(env, accountId)
+  const now = Date.now()
+  state.authFailed = true
+  state.authError = (reason || '凭据已失效，需重新授权').substring(0, 300)
+  state.authFailedAt = now
+  state.cooldownUntil = now + AUTH_FAIL_COOLDOWN_MS
+  await writeHealth(env, accountId, state)
+  console.log(`[account-health] ${accountId} marked auth-failed: reason=${state.authError}`)
+}
+
 /** 标记图片额度耗尽（24h 冷却，同原版 MarkImageLimited） */
 export async function markAccountImageLimited(env: Env, accountId: string, hours = 24): Promise<void> {
   const state = await readHealth(env, accountId)
@@ -336,6 +356,8 @@ export async function markAccountSuccess(env: Env, accountId: string): Promise<v
   await writeHealth(env, accountId, {
     cooldownUntil: 0,
     authFailed: false,
+    authError: undefined,
+    authFailedAt: 0,
     rlFailures: 0,
     // 熔断窗口延续（updateBreaker 已更新 state）
     breakerStart: state.breakerStart,
@@ -360,10 +382,12 @@ export async function markAccountSuccess(env: Env, accountId: string): Promise<v
  */
 export async function markAccountTokenRefreshed(env: Env, accountId: string): Promise<void> {
   const state = await readHealth(env, accountId)
-  // 仅清除鉴权失败标记；cooldownUntil / rlFailures / trippedUntil / imageLimitedUntil 均保留
+  // 仅清除鉴权失败标记与错误；cooldownUntil / rlFailures / trippedUntil / imageLimitedUntil 均保留
   await writeHealth(env, accountId, {
     cooldownUntil: state.cooldownUntil,
     authFailed: false,
+    authError: undefined,
+    authFailedAt: 0,
     rlFailures: state.rlFailures,
     breakerStart: state.breakerStart,
     breakerFailures: state.breakerFailures,

@@ -1417,14 +1417,18 @@ function m365Render(providerId) {
       var sum = (res.j.data && res.j.data.summary) || {}
       if (accs.length === 0) { root.innerHTML = '<div class="empty-state"><i class="fas fa-users"></i><h3>暂无账号</h3><p>点上方「连接新账号」，用授权码或账密登录，第一个账号即进入此池。</p></div>'; return; }
       // 顶部聚合状态条（对齐 M365-Gateway 账号池概览）
-      var summaryHtml = '<div class="fc mb-2" style="flex-wrap:wrap;gap:8px;font-size:12px">' +
+      var summaryHtml = '<div class="fc mb-2" style="flex-wrap:wrap;gap:8px;font-size:12px;justify-content:space-between;align-items:center">' +
+        '<div class="fc" style="gap:8px;align-items:center;flex-wrap:wrap">' +
         '<span class="mu">共 <b>' + (sum.total || accs.length) + '</b> 个</span>' +
         '<span class="bd bd-on">使用中 ' + (sum.inUse || 0) + '</span>' +
         '<span class="bd bd-off">空闲 ' + (sum.idle || 0) + '</span>' +
         '<span class="bd bd-off">休眠 ' + (sum.dormant || 0) + '</span>' +
         (sum.cooling ? '<span class="bd bd-warn">冷却 ' + sum.cooling + '</span>' : '') +
+        (sum.authFailed ? '<span class="bd bd-danger">失效 ' + sum.authFailed + '</span>' : '') +
         (sum.unhealthy ? '<span class="bd bd-danger">异常 ' + sum.unhealthy + '</span>' : '') +
         '<span class="mu">每账号并发上限 ' + (sum.concurrencyLimit != null ? sum.concurrencyLimit : 1) + '</span>' +
+        '</div>' +
+        '<div><button class="btn btn-s btn-xs" onclick="m365RefreshAccounts(\\'' + m365Esc(providerId) + '\\',this)" title="向微软请求刷新全部账号令牌并探活"><i class="fas fa-sync-alt"></i>检测/刷新全部账号</button></div>' +
         '</div>'
       root.innerHTML = summaryHtml + '<table class="tbl"><thead><tr><th>账号</th><th>OID</th><th>状态</th><th>令牌有效期</th><th>最近使用</th><th>操作</th></tr></thead><tbody>' +
         accs.map(function (a) {
@@ -1444,14 +1448,20 @@ function m365Render(providerId) {
           if (a.cooldownUntil) detail = ' 冷却至 ' + new Date(a.cooldownUntil).toLocaleString()
           else if (a.trippedUntil) detail = ' 熔断至 ' + new Date(a.trippedUntil).toLocaleString()
           else if (a.imageLimitedUntil) detail = ' 图片额度恢复 ' + new Date(a.imageLimitedUntil).toLocaleString()
-          var stCell = badge + (detail ? '<span class="mu">' + m365Esc(detail) + '</span>' : '')
+          var authErrDetail = (st === 'auth_failed' && a.authError) ? '<span class="c-d" style="display:block;font-size:11px;margin-top:2px;max-width:260px;word-break:break-all" title="' + m365Esc(a.authError) + '">' + m365Esc(a.authError.length > 60 ? a.authError.slice(0, 60) + '…' : a.authError) + '</span>' : ''
+          var stCell = badge + (detail ? '<span class="mu">' + m365Esc(detail) + '</span>' : '') + authErrDetail
           // 令牌有效期 + 自动续期说明
           var exp = '—'
           if (a.tokenExpiresAt) {
             exp = new Date(a.tokenExpiresAt).toLocaleString()
             if (a.tokenExpiresAt <= Date.now()) {
-              // 有有效 refresh_token：只是 access_token 临期，唤醒/下次请求会自动续期，非硬过期
-              exp += (a.hasRefreshToken ? ' <span class="bd bd-warn">已过期·可自动续期</span>' : ' <span class="bd bd-danger">已过期</span>')
+              if (st === 'auth_failed') {
+                exp += ' <span class="bd bd-danger">已失效·需重新授权</span>'
+              } else if (a.hasRefreshToken) {
+                exp += ' <span class="bd bd-warn">已过期·可自动续期</span>'
+              } else {
+                exp += ' <span class="bd bd-danger">已过期</span>'
+              }
             }
             else exp += ' <span class="mu">· 自动续期</span>'
           }
@@ -1459,11 +1469,42 @@ function m365Render(providerId) {
           return '<tr><td>' + m365Esc(a.email || a.oid || '?') + '</td><td><code>' + m365Esc(a.oid || '') + '</code></td><td>' + stCell + '</td><td>' + exp + '</td><td>' + last + '</td>' +
             '<td>' +
             (a.state === 'cooldown' ? '<button class="btn btn-gh btn-xs" onclick="m365ClearCooldown(\\'' + m365Esc(providerId) + '\\',\\'' + m365Esc(a.oid || '') + '\\',this)" title="清除该账号冷却"><i class="fas fa-fire-extinguisher"></i>清除冷却</button> ' : '') +
+            '<button class="btn btn-gh btn-xs" onclick="m365RefreshAccounts(\\'' + m365Esc(providerId) + '\\',this,\\'' + m365Esc(a.oid || '') + '\\')" title="向微软刷新此账号令牌"><i class="fas fa-sync-alt"></i>刷新</button> ' +
             '<button class="btn btn-d btn-xs" onclick="m365Remove(\\'' + m365Esc(providerId) + '\\',\\'' + m365Esc(a.oid || '') + '\\',this)"><i class="fas fa-trash"></i>移除</button></td></tr>';
         }).join('') + '</tbody></table>' +
-        '<p class="mu" style="margin-top:8px">状态说明：使用中=当前有请求在途；空闲=健康可立即接单；休眠=超过 24h 未使用（唤醒时自动续期）；冷却=被上游限流/熔断，到期自动恢复。令牌「已过期·可自动续期」表示仅 access_token 临期但 refresh_token 仍在，下次使用/刷新会自动续期；只有 refresh_token 失效才显示红色「已过期」。</p>';
+        '<p class="mu" style="margin-top:8px">状态说明：使用中=当前有请求在途；空闲=健康可立即接单；休眠=超过 24h 未使用（唤醒时自动续期）；冷却=被上游限流/熔断，到期自动恢复；授权已失效=上游拒绝刷新凭据，需重新授权。令牌「已过期·可自动续期」表示仅 access_token 临期但 refresh_token 仍在，后台 Cron 会定期主动保活；若刷新失败则会标红提示「已失效·需重新授权」。</p>';
     })
     .catch(function (e) { root.innerHTML = '<p class="c-d">请求异常：' + m365Esc(String(e && e.message || e)) + '</p>'; });
+}
+function m365RefreshAccounts(providerId, btn, oid) {
+  if (btn) btn.disabled = true;
+  var origHtml = btn ? btn.innerHTML : '';
+  if (btn) btn.innerHTML = '<i class="fas fa-spinner fa-spin"></i>检测中…';
+  var url = '/admin/api/m365/accounts/' + encodeURIComponent(providerId) + '/refresh' + (oid ? '?oid=' + encodeURIComponent(oid) : '');
+  fetch(url, { method: 'POST' })
+    .then(function (r) { return r.json().then(function (j) { return { ok: r.ok, j: j }; }); })
+    .then(function (res) {
+      if (btn) { btn.disabled = false; btn.innerHTML = origHtml; }
+      if (res.ok && res.j && res.j.data) {
+        var d = res.j.data;
+        var msg = '检测/刷新完成：' + (d.refreshed || 0) + ' 个正常，' + (d.failed || 0) + ' 个失效';
+        if (d.failed > 0 && d.results) {
+          var failItems = d.results.filter(function (x) { return !x.success; });
+          if (failItems.length > 0 && failItems[0].error) {
+            msg += '\\n\\n失败原因示例：' + failItems[0].error;
+          }
+        }
+        window.alert(msg);
+        m365Render(providerId);
+      } else {
+        window.alert((res.j && res.j.error && res.j.error.message) || (res.j && res.j.message) || '刷新请求失败');
+        m365Render(providerId);
+      }
+    })
+    .catch(function (e) {
+      if (btn) { btn.disabled = false; btn.innerHTML = origHtml; }
+      window.alert('请求异常: ' + String(e && e.message || e));
+    });
 }
 function m365ClearCooldown(providerId, oid, btn) {
   if (btn) btn.disabled = true;

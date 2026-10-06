@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { refreshM365AccountIfNeeded, refreshM365Token, type PooledAccount } from './oauth'
+import { refreshM365AccountIfNeeded, refreshM365Token, refreshM365TokenDetail, type PooledAccount } from './oauth'
+import { readHealth } from './account-health'
 import type { Env, OAuthDeviceConfig } from '../types'
 
 class MemoryKV {
@@ -172,4 +173,59 @@ describe('M365 token refresh account identity', () => {
     await expect(refreshM365Token(envWithKv(kv), 'm365-retry', oauthConfig, undefined, 'retry@example.com')).resolves.toBe(true)
     expect(fetchMock).toHaveBeenCalledTimes(2)
   })
+
+  it('marks account as authFailed with error message when upstream returns AADSTS700082 expired refresh token', async () => {
+    const kv = new MemoryKV()
+    const testOid = 'oid-expired-1'
+    kv.seed('m365-exp', [account({ oid: testOid, email: 'expired@example.com', refresh_token: 'dead-rt' })])
+    const errorBody = JSON.stringify({
+      error: 'invalid_grant',
+      error_description: 'AADSTS700082: The refresh token has expired due to inactivity. The token was issued on 2026-10-01 and was inactive for 90.00:00:00.',
+    })
+    const fetchMock = vi.fn().mockResolvedValueOnce(new Response(errorBody, {
+      status: 400,
+      headers: { 'Content-Type': 'application/json' },
+    }))
+    vi.stubGlobal('fetch', fetchMock)
+
+    const detail = await refreshM365TokenDetail(envWithKv(kv), 'm365-exp', oauthConfig, testOid)
+    expect(detail.success).toBe(false)
+    expect(detail.errorCode).toBe('invalid_grant')
+    expect(detail.error).toContain('AADSTS700082')
+
+    // 检查 KV 中的账号健康记录
+    const health = await readHealth(envWithKv(kv), testOid)
+    expect(health.authFailed).toBe(true)
+    expect(health.authError).toContain('AADSTS700082')
+    expect(health.authFailedAt).toBeGreaterThan(0)
+  })
+
+  it('clears authFailed status in health when token refresh succeeds', async () => {
+    const kv = new MemoryKV()
+    const testOid = 'oid-success-1'
+    kv.seed('m365-ok', [account({ oid: testOid, email: 'ok@example.com', refresh_token: 'valid-rt' })])
+    // 预置已失效的健康状态
+    const deadHealth = {
+      cooldownUntil: Date.now() + 86400000,
+      authFailed: true,
+      authError: 'invalid_grant: previous token expired',
+      authFailedAt: Date.now() - 3600000,
+      imageLimitedUntil: 0,
+      updatedAt: Date.now() - 3600000,
+    }
+    await kv.put(`m365:health:${testOid}`, JSON.stringify(deadHealth))
+
+    const fetchMock = vi.fn().mockResolvedValueOnce(tokenResponse('fresh-access', 'fresh-refresh'))
+    vi.stubGlobal('fetch', fetchMock)
+
+    const detail = await refreshM365TokenDetail(envWithKv(kv), 'm365-ok', oauthConfig, testOid)
+    expect(detail.success).toBe(true)
+    expect(detail.expiresAt).toBeGreaterThan(Date.now())
+
+    const health = await readHealth(envWithKv(kv), testOid)
+    expect(health.authFailed).toBe(false)
+    expect(health.authError).toBeUndefined()
+    expect(health.authFailedAt).toBe(0)
+  })
 })
+

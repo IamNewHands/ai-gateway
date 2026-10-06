@@ -1231,6 +1231,7 @@ export class M365Session {
    * 返回按尝试顺序排列的 ChatHubAccount 候选数组（单活模式 <= 2，分摊模式为全部健康账号）。
    */
   private async selectAccounts(providerId: string, resolved: ResolveResult, explicitAccountId?: string): Promise<{ accounts: ChatHubAccount[]; emptyBusy: boolean; emptyCooling: boolean; emptyTransport: boolean }> {
+    const provider = await getProvider(this.env, providerId).catch(() => null)
     const accounts = await listM365Accounts(this.env, providerId)
     if (accounts.length === 0) return { accounts: [], emptyBusy: false, emptyCooling: false, emptyTransport: false }
     const snapshot: { limit: number; inflight: Record<string, number> } =
@@ -1245,7 +1246,7 @@ export class M365Session {
       if (!a.accessToken || !a.oid) continue
       // 惰性刷新：access_token 临近过期/已过期时自动刷新（刷新成功会恢复健康标记），
       // 避免用过期 token 触发 ws dial 401 后被误判为账号禁用（authFailed 24h 冷却）
-      const fresh = await refreshM365AccountIfNeeded(this.env, providerId, a.oid)
+      const fresh = await refreshM365AccountIfNeeded(this.env, providerId, a.oid, a.email, provider?.oauth)
       if (!fresh || Date.now() >= fresh.expiresAt) continue
       if (!(await isAccountAvailable(this.env, fresh.oid))) {
         sawCooldownBlocked = true
@@ -1272,7 +1273,6 @@ export class M365Session {
     // 会话级多账号分摊（Account Spread）：
     // 优先读 provider 配置（后台勾选框 accountSpread），环境变量 M365_ACCOUNT_SPREAD 作为兼容回退。
     // 开启后新会话按持久化游标在全部健康账号间均匀轮转，且仍受每账号并发/最小间隔约束。
-    const provider = await getProvider(this.env, providerId)
     const spread = provider?.accountSpread === true
       || (provider?.accountSpread === undefined && String(this.env.M365_ACCOUNT_SPREAD ?? '').toLowerCase() === 'true')
     if (spread && resolved.isNew && healthy.length > 0) {

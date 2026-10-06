@@ -73,6 +73,7 @@ import {
   handleM365TokenHealth,
   handleM365ClearCooldown,
   handleM365Accounts,
+  handleM365RefreshAccounts,
   handleM365Diag,
   handleGetThinkingPrompt,
   handleSetThinkingPrompt,
@@ -386,6 +387,8 @@ app.delete('/admin/api/m365/cooldown/:id', handleM365ClearCooldown)
 app.all('/admin/api/m365/cooldown/:id', handleM365ClearCooldown)
 // M365 账号池管理（GET 列出账号；DELETE ?oid= 移除账号）
 app.all('/admin/api/m365/accounts/:id', handleM365Accounts)
+// M365 账号手动检测/刷新（POST ?oid= 刷新单个或全部账号）
+app.post('/admin/api/m365/accounts/:id/refresh', handleM365RefreshAccounts)
 // M365 账号池底层存储诊断（只读，排查"面板空"）
 app.get('/admin/api/m365/diag', handleM365Diag)
 
@@ -552,8 +555,12 @@ async function scheduled(event: ScheduledEvent, env: Env, ctx: ExecutionContext)
   }
   if (event.cron === '0 * * * *') {
     // M365 对话自动清理
-    const result = await autoCleanupAll(env)
-    console.log(`[auto-cleanup] cron done: total=${result.total} providers=${result.providers} errors=${result.errors}`)
+    try {
+      const result = await autoCleanupAll(env)
+      console.log(`[auto-cleanup] cron done: total=${result.total} providers=${result.providers} errors=${result.errors}`)
+    } catch (err) {
+      console.error(`[auto-cleanup] cron error: ${(err as Error).message}`)
+    }
     // DeepSeek App 会话维护：每小时醒一次，但**是否真的动手**由 sessions.ts 内部的
     // KV 标记 + 抖动决定（人类节奏清理：base 1h ±50%，且每次只有 0.5 概率动一个账号）；
     // purge 同一入口处理「窗口到期」与「启动补跑」（错过 24h 内补一次，失败不风暴重试）。
@@ -566,22 +573,32 @@ async function scheduled(event: ScheduledEvent, env: Env, ctx: ExecutionContext)
       // 维护失败绝不能影响同一 cron 上的其他任务
       console.error(`[deepseek-maintenance] cron failed: ${err instanceof Error ? err.message : String(err)}`)
     }
-    return
+    // 注意：不再在此直接 return。
+    // 0 * * * * 与 0 */2 * * * 在整点重叠，每小时整点顺带执行 token 刷新与保活，
+    // 确保各 OAuth/M365 账号池的主动保活与临期刷新任务绝不被截断跳过。
   }
   if (event.cron === '0 20 * * *') {
     // M365 账号每日健康检查（04:00 北京时间）：临期/过期 token 自动刷新 + 复活被误判不可用的账号
-    const result = await healthCheckM365All(env)
-    console.log(`[m365-health] cron done: providers=${result.providers} accounts=${result.accounts} ok=${result.ok} recovered=${result.recovered} failed=${result.failed} errors=${result.errors}`)
+    try {
+      const result = await healthCheckM365All(env)
+      console.log(`[m365-health] cron done: providers=${result.providers} accounts=${result.accounts} ok=${result.ok} recovered=${result.recovered} failed=${result.failed} errors=${result.errors}`)
+    } catch (err) {
+      console.error(`[m365-health] cron error: ${(err as Error).message}`)
+    }
     return
   }
-  // token 刷新（默认 / "0 */2 * * *"）——OAuth 提供商 + TRAE SOLO 预刷新 + Cline 账号探活
-  const providers = (await getProviders(env)) as Provider[]
-  const oauthProviders = providers.filter((p) => p.authType === 'oauth-device' && p.oauth)
-  const result = await refreshAllOauthTokens(env, oauthProviders)
-  console.log(`[oauth] cron refresh done: ${result.ok} ok, ${result.fail} fail`)
-  const traeRefresh = await refreshTraeTokens(env)
-  console.log(`[trae] cron refresh done: ${traeRefresh.ok} ok, ${traeRefresh.fail} fail`)
-  // Cline 账号健康检查（item10）：并发独立执行，失败不影响 OAuth/TRAE 刷新；每 2 小时随本 cron 一起跑
+  // token 刷新（默认 / "0 */2 * * *" / "0 * * * *" 整点顺带）——OAuth 提供商 + TRAE SOLO 预刷新 + Cline 账号探活
+  try {
+    const providers = (await getProviders(env)) as Provider[]
+    const oauthProviders = providers.filter((p) => p.authType === 'oauth-device' && p.oauth)
+    const result = await refreshAllOauthTokens(env, oauthProviders)
+    console.log(`[oauth] cron refresh done: ${result.ok} ok, ${result.fail} fail`)
+    const traeRefresh = await refreshTraeTokens(env)
+    console.log(`[trae] cron refresh done: ${traeRefresh.ok} ok, ${traeRefresh.fail} fail`)
+  } catch (err) {
+    console.error(`[oauth-cron] error: ${(err as Error).message}`)
+  }
+  // Cline 账号健康检查（item10）：并发独立执行，失败不影响 OAuth/TRAE 刷新；随本 cron 一起跑
   try {
     const clineHealth = await healthCheckClineAll(env)
     console.log(`[cline-health] cron done: providers=${clineHealth.providers} accounts=${clineHealth.accounts} ok=${clineHealth.ok} failed=${clineHealth.failed} errors=${clineHealth.errors}`)
