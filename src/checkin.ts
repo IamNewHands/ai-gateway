@@ -21,7 +21,7 @@ import { getProviders } from './storage'
 import { getOauthAccessToken, detectTokenRealm, refreshQoderTokenPair } from './oauth'
 import { writeLog } from './admin'
 import { isQoderFlow } from './qoder/proxy'
-import { fetchQoderCheckinStatus, performQoderCheckin, fetchQoderUserResource, fetchQoderPaymentType, buildQoderPacks, normalizeQoderRealm, realmHasLegacyCheckin, type QoderRealm } from './qoder/billing'
+import { fetchQoderCheckinStatus, performQoderCheckin, fetchQoderUserResource, fetchQoderPaymentType, fetchQoderUserInfo, buildQoderPacks, normalizeQoderRealm, realmHasLegacyCheckin, type QoderRealm } from './qoder/billing'
 import { getQoderDevice } from './qoder/device'
 import {
   readQoderPool,
@@ -29,6 +29,7 @@ import {
   refreshQoderPoolAccountIfNeeded,
   reenableQoderIfCredits,
   setQoderPoolAccountNickname,
+  isRealQoderNickname,
   type QoderPoolAccount,
 } from './qoder/pool'
 import { isTraeProvider } from './trae/proxy'
@@ -253,7 +254,9 @@ async function checkinQoderPoolAccount(env: Env, provider: Provider, account: Qo
     message: '',
     todayCheckedIn: false,
     updatedAt: now,
-    nickname: account.nickname || account.uid,
+    // 不拿 uid 冒充昵称：旧写法 `account.nickname || account.uid` 会把 UUID 写进池里的
+    // nickname 字段（见 qoder/pool.ts isRealQoderNickname），面板从此只会显示一长串 id。
+    nickname: isRealQoderNickname(account.nickname, account.uid) ? account.nickname : undefined,
   }
 
   let token = account.token?.access_token || ''
@@ -273,6 +276,14 @@ async function checkinQoderPoolAccount(env: Env, provider: Provider, account: Qo
     base.reason = 'skipped_no_token'
     base.message = 'token 刷新失败，无可用 access token'
     return base
+  }
+
+  // 昵称回填（best-effort，必须放在下面「今日已签」早退之前，否则已签账号永远补不上名字）。
+  // Qoder 的授权/刷新响应都不带昵称，`/api/v1/userinfo` 是唯一来源（见 fetchQoderUserInfo）；
+  // 已有真昵称就不再请求，避免每天每账号白跑一次上游。拿到名字后由 syncQoderPoolCredits 落池。
+  if (!isRealQoderNickname(account.nickname, account.uid)) {
+    const ui = await fetchQoderUserInfo(token, realm)
+    if (ui?.name) base.nickname = ui.name
   }
 
   // 状态探测（legacy daily-check-in/status）。
@@ -420,7 +431,8 @@ async function checkinQoderPoolAccounts(env: Env, provider: Provider): Promise<C
         providerId: provider.id, name: provider.name, uid: acc.uid || undefined,
         realm: normalizeQoderRealm(acc.realm),
         success: false, reason: 'fail', message: (e as Error).message || String(e),
-        todayCheckedIn: false, updatedAt: Date.now(), nickname: acc.nickname || acc.uid,
+        todayCheckedIn: false, updatedAt: Date.now(),
+        nickname: isRealQoderNickname(acc.nickname, acc.uid) ? acc.nickname : undefined,
       })
       fail++
     }

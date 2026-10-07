@@ -185,6 +185,60 @@ describe('probeQoderPoolQuota：只写额度，绝不解冻账号', () => {
     expect(out).toEqual([{ uid: 'u1', ok: false, error: '无 access token' }])
     expect(fetchMock).not.toHaveBeenCalled()
   })
+
+  /**
+   * 昵称回填（2026-10-07）：用户要求 Qoder 账号行像 WorkBuddy 那样显示昵称。
+   * 「刷新账号池」本来就是「每账号打一次上游」的动作，顺手补名字，用户不必等到下次签到。
+   * 反向边界：已有真昵称不再白发请求；补名字**不能**顺手解冻账号（本探测的核心不变式）。
+   */
+  it('无昵称的账号：刷新时顺手从 userinfo 补名字，且不会因此解冻冷却/禁用状态', async () => {
+    const { env } = makeEnv()
+    await writeQoderPool(env, 'qoder', [account({ uid: 'u1', nickname: undefined })])
+    await cooldownQoderAccount(env, 'qoder', 'u1', 60_000, '限流（429）')
+    vi.stubGlobal('fetch', vi.fn(async (input: unknown) => {
+      const url = String(input)
+      if (url.includes('/api/v1/userinfo')) {
+        return new Response(JSON.stringify({ id: 'u1', name: 'Shiro' }), { status: 200 })
+      }
+      return new Response(JSON.stringify(QUOTA_JSON), { status: 200 })
+    }))
+
+    await probeQoderPoolQuota(env, qoderProvider())
+
+    const st = (await listQoderPoolStatus(env, 'qoder'))[0]
+    expect(st.nickname).toBe('Shiro')
+    expect(st.cooling).toBe(true)   // 补名字不动冷却——「只写额度」的例外只有 nickname 这一个展示字段
+    expect(st.credits).toBe(400)
+  })
+
+  it('已有真昵称 → 不再请求 userinfo（刷新一次不该多发一次无用上游调用）', async () => {
+    const { env } = makeEnv()
+    await writeQoderPool(env, 'qoder', [account({ uid: 'u1', nickname: 'Shiro' })])
+    const urls: string[] = []
+    vi.stubGlobal('fetch', vi.fn(async (input: unknown) => {
+      urls.push(String(input))
+      return new Response(JSON.stringify(QUOTA_JSON), { status: 200 })
+    }))
+
+    await probeQoderPoolQuota(env, qoderProvider())
+    expect(urls.some((u) => u.includes('/api/v1/userinfo'))).toBe(false)
+  })
+
+  it('历史脏数据（nickname === uid）→ 刷新时被真名覆盖（这正是用户看到的那一行）', async () => {
+    const { env } = makeEnv()
+    const UID = '01a0fb50-84b9-7848-a8d1-240c89950b79'
+    await writeQoderPool(env, 'qoder', [account({ uid: UID, nickname: UID })])
+    vi.stubGlobal('fetch', vi.fn(async (input: unknown) => {
+      const url = String(input)
+      if (url.includes('/api/v1/userinfo')) {
+        return new Response(JSON.stringify({ id: UID, name: 'Shiro' }), { status: 200 })
+      }
+      return new Response(JSON.stringify(QUOTA_JSON), { status: 200 })
+    }))
+
+    await probeQoderPoolQuota(env, qoderProvider())
+    expect((await listQoderPoolStatus(env, 'qoder'))[0].nickname).toBe('Shiro')
+  })
 })
 
 describe('GET /admin/api/oauth/:id/status?credits=1：探测是显式开关', () => {  it('带 credits=1 → 探测并把结果放进响应', async () => {

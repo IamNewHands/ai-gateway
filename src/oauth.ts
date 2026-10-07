@@ -2,6 +2,7 @@ import { KV_KEYS, OAUTH_TOKEN_REFRESH_MARGIN_MS } from './config'
 import type { Env, OAuthDeviceConfig, OAuthTokenState, DeviceFlowState } from './types'
 import { startM365PKCE, submitM365PKCECallback, m365ROPC, refreshM365Token, getM365AccountInfos, maskEmail } from './m365/oauth'
 import { readHealth } from './m365/account-health'
+import { fetchQoderUserInfo } from './qoder/billing'
 
 // ===== KV 读写 =====
 
@@ -654,12 +655,19 @@ export async function pollOauthQoderFlow(env: Env, providerId: string, cfg: OAut
       return { status: 'error', message: 'Qoder poll returned 200 but no token（授权服务异常，请重新发起登录）' }
     }
 
+    // 昵称回填（best-effort）：设备授权的 200 响应只有 token/refresh_token/user_id，**没有名字**，
+    // 不补这一步新账号入库时 nickname 就是空的，面板只能显示 36 位 uid。
+    // /api/v1/userinfo 是唯一来源，失败返回 null（不阻断登录）——见 qoder/billing.ts fetchQoderUserInfo。
+    const userInfo = await fetchQoderUserInfo(token, realm)
+
     await writeOauthToken(env, providerId, {
       access_token: token,
       refresh_token: data.refresh_token,
       expires_at: qoderExpiryUnix(data),
       updated_at: Date.now(),
       user_id: data.user_id || undefined,
+      // 上游没给名字时留 undefined（**不要**退回 uid：那会让面板把 UUID 当昵称显示）
+      nickname: userInfo?.name || undefined,
       realm,
     })
     // Qoder 多账号池：每次成功登录把一个账号 upsert 进池（按 user_id 去重），
@@ -670,6 +678,7 @@ export async function pollOauthQoderFlow(env: Env, providerId: string, cfg: OAut
       expires_at: qoderExpiryUnix(data),
       updated_at: Date.now(),
       user_id: data.user_id || undefined,
+      nickname: userInfo?.name || undefined,
       realm,
     })
     await env.KV.delete(deviceKey(providerId))
@@ -753,6 +762,9 @@ async function qoderPoolUpsert(env: Env, providerId: string, token: OAuthTokenSt
       existing.enabled = true
       existing.updatedAt = Date.now()
       existing.realm = realm
+      // 重新登录 / 补拉 userinfo 拿到真昵称时同步覆盖：老账号的 nickname 可能是空的，
+      // 或被旧签到写成 uid（见 qoder/pool.ts isRealQoderNickname）。
+      if (token.nickname && token.nickname !== uid) existing.nickname = token.nickname
     } else {
       pool.push({
         uid,

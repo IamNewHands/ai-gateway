@@ -2896,7 +2896,9 @@ function renderQoderPoolAccounts(id, accs, ciByUid, ciAccounts, preferUid) {
       const used = (ci.totalUsed !== undefined && ci.totalUsed !== null) ? ci.totalUsed : '—'
       creditLine = '<div class="mu" style="margin-top:2px">可用 ' + ci.totalRemain + ' · 已用 ' + used + '</div>'
     }
-    let line = (a.nickname ? escapeHtml(a.nickname) : 'uid=' + escapeHtml(a.uid)) + ' · 积分=' + (a.credits || 0)
+    // 与 WorkBuddy 池同款：uid 在前（它才是 X-Qoder-Account / 首选账号要填的值），昵称跟在括号里。
+    // 昵称来自 /api/v1/userinfo（见 checkin.ts 的昵称回填）；拿不到时只显示 uid，绝不拿 uid 冒充昵称。
+    let line = 'uid=' + escapeHtml(a.uid) + (a.nickname ? '（' + escapeHtml(a.nickname) + '）' : '') + ' · 积分=' + (a.credits || 0)
     // 额度包明细：数据源优先池状态（它就是挑号用的那一份，且比签到结果活得久）；
     // 旧 KV 数据 / 尚未签到探测时回退签到结果里的同源快照。
     const pkgs = Array.isArray(a.packages) ? a.packages : (ci && Array.isArray(ci.packages) ? ci.packages : null)

@@ -16,11 +16,13 @@ import { describe, it, expect } from 'vitest'
 import {
   cooldownQoderAccount,
   disableQoderAccount,
+  isRealQoderNickname,
   listQoderPoolStatus,
   noteQoderError,
   pickQoderAccount,
   reenableQoderIfCredits,
   resolveQoderPreferUid,
+  setQoderPoolAccountNickname,
   soonestQoderExpiryAt,
   writeQoderPool,
   type QoderPoolAccount,
@@ -288,5 +290,73 @@ describe('resolveQoderPreferUid：请求头优先，面板指定兜底', () => {
   it('返回值已 trim：带空格的面板设置不会因为精确匹配失败而静默失效', () => {
     expect(resolveQoderPreferUid('', providerWith(' u1 '))).toBe('u1')
     expect(resolveQoderPreferUid(' u2 ', providerWith(undefined))).toBe('u2')
+  })
+})
+
+/**
+ * 昵称字段的脏数据治理（2026-10-07 用户报「qoder 只显示 01a0fb50-… 一长串 id，
+ * 能不能像 workbuddy 那样显示昵称」的根因）。
+ *
+ * 根因不是「上游没给名字」这一条：旧签到路径 `base.nickname = account.nickname || account.uid`
+ * 会把 uid 当昵称回写进池，于是 `nickname === uid`，面板的
+ * `a.nickname ? 昵称 : 'uid=' + uid` 永远走「有昵称」那一支，显示成一长串 UUID。
+ * 这里钉住两件事：不再写入 uid 冒充的昵称；已存的脏值在对外状态里按「无昵称」透出。
+ */
+describe('isRealQoderNickname / setQoderPoolAccountNickname：uid 不得冒充昵称', () => {
+  const UID = '01a0fb50-84b9-7848-a8d1-240c89950b79'
+
+  it('isRealQoderNickname：空、纯空白、等于 uid 都判为「没有昵称」', () => {
+    expect(isRealQoderNickname('Shiro', UID)).toBe(true)
+    expect(isRealQoderNickname(undefined, UID)).toBe(false)
+    expect(isRealQoderNickname(null, UID)).toBe(false)
+    expect(isRealQoderNickname('', UID)).toBe(false)
+    expect(isRealQoderNickname('   ', UID)).toBe(false)
+    expect(isRealQoderNickname(UID, UID)).toBe(false)
+    // 带空白但内容是真名 → 仍算有昵称（由调用方 trim）
+    expect(isRealQoderNickname('  Shiro  ', UID)).toBe(true)
+  })
+
+  it('回写真昵称：落进池并被对外状态读到', async () => {
+    const { env } = makeEnv()
+    const pid = 'qoder-nick-1'
+    await writeQoderPool(env, pid, [account({ uid: UID, nickname: undefined })])
+    await setQoderPoolAccountNickname(env, pid, UID, 'Shiro')
+    expect((await listQoderPoolStatus(env, pid))[0].nickname).toBe('Shiro')
+  })
+
+  it('uid 当昵称传入 → 拒绝写入（否则面板永远显示 UUID）', async () => {
+    const { env, store } = makeEnv()
+    const pid = 'qoder-nick-2'
+    await writeQoderPool(env, pid, [account({ uid: UID, nickname: undefined })])
+    await setQoderPoolAccountNickname(env, pid, UID, UID)
+    // 两层都要挡住：写盘时不落脏值，读出来也按「无昵称」透出
+    const raw = JSON.parse(store.get('qoder:pool:' + pid)!) as Array<{ nickname?: string }>
+    expect(raw[0].nickname).toBeUndefined()
+    expect((await listQoderPoolStatus(env, pid))[0].nickname).toBe('')
+  })
+
+  it('空串 / 纯空白 → 拒绝写入（不能把已有真昵称擦成空）', async () => {
+    const { env } = makeEnv()
+    const pid = 'qoder-nick-3'
+    await writeQoderPool(env, pid, [account({ uid: UID, nickname: 'Shiro' })])
+    await setQoderPoolAccountNickname(env, pid, UID, '   ')
+    expect((await listQoderPoolStatus(env, pid))[0].nickname).toBe('Shiro')
+  })
+
+  it('历史脏数据（nickname === uid）在对外状态里按「无昵称」透出，让面板走 uid= 分支', async () => {
+    const { env } = makeEnv()
+    const pid = 'qoder-nick-4'
+    await writeQoderPool(env, pid, [account({ uid: UID, nickname: UID })])
+    const st = (await listQoderPoolStatus(env, pid))[0]
+    expect(st.nickname).toBe('')
+    expect(st.uid).toBe(UID)
+  })
+
+  it('传入真昵称时顺带 trim（上游/表单可能带空白，带空白的名字会让首选账号下拉框看起来有空行）', async () => {
+    const { env } = makeEnv()
+    const pid = 'qoder-nick-5'
+    await writeQoderPool(env, pid, [account({ uid: UID, nickname: undefined })])
+    await setQoderPoolAccountNickname(env, pid, UID, '  Shiro  ')
+    expect((await listQoderPoolStatus(env, pid))[0].nickname).toBe('Shiro')
   })
 })

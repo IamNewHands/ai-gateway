@@ -15,8 +15,8 @@
 import type { Env, Provider } from '../types'
 import { OAUTH_TOKEN_REFRESH_MARGIN_MS } from '../config'
 import { refreshQoderTokenPair } from '../oauth'
-import { buildQoderPacks, fetchQoderUserResource, normalizeQoderRealm } from './billing'
-import { readQoderPool, refreshQoderPoolAccountIfNeeded, setQoderPoolQuota } from './pool'
+import { buildQoderPacks, fetchQoderUserInfo, fetchQoderUserResource, normalizeQoderRealm } from './billing'
+import { isRealQoderNickname, readQoderPool, refreshQoderPoolAccountIfNeeded, setQoderPoolAccountNickname, setQoderPoolQuota } from './pool'
 
 /** 单个账号的探测结果（供面板逐条显示，脱敏：不含 token）。 */
 export interface QoderQuotaProbeOutcome {
@@ -46,6 +46,14 @@ export async function probeQoderPoolQuota(env: Env, provider: Provider): Promise
           const refreshed = await refreshQoderPoolAccountIfNeeded(env, provider.id, uid, provider.oauth!, refreshQoderTokenPair)
           if (refreshed) token = refreshed.token.access_token
         } catch { /* 刷新失败继续用旧 token，让上游如实报错 */ }
+      }
+      // 昵称回填（2026-10-07）：面板「刷新账号池」已经是「每账号打一次上游」的动作，
+      // 顺手补一次名字，用户就不必等到下一次签到才看到昵称。
+      // 注意：这里**只写 nickname 这一个纯展示字段**，文件头「不动冷却/禁用状态」的不变式照旧
+      // （setQoderPoolAccountNickname 只改 nickname，不碰 state）。
+      if (!isRealQoderNickname(acc.nickname, uid)) {
+        const ui = await fetchQoderUserInfo(token, normalizeQoderRealm(acc.realm))
+        if (ui?.name) await setQoderPoolAccountNickname(env, provider.id, uid, ui.name)
       }
       const quota = await fetchQoderUserResource(token, normalizeQoderRealm(acc.realm))
       if (!quota) {

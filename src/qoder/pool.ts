@@ -126,7 +126,7 @@ export async function seedQoderPoolFromSingle(env: Env, providerId: string): Pro
   const uid = single.user_id || single.access_token.slice(0, 16)
   await writeQoderPool(env, providerId, [{
     uid,
-    nickname: single.nickname,
+    nickname: isRealQoderNickname(single.nickname, uid) ? String(single.nickname).trim() : undefined,
     token: single,
     enabled: true,
     state: { credits: 0, disabled: false, until: 0, errCount: 0 },
@@ -335,12 +335,32 @@ export async function reenableQoderIfCredits(
   await writeQoderQuota(env, providerId, uid, remain, packages, true)
 }
 
-/** 签到时回写昵称（池账号登录时可能未带 nickname，签到后补齐供面板展示）。 */
+/**
+ * 昵称是否可用作展示名（而不是 uid 的复读）。
+ *
+ * 背景：旧签到路径把 `account.nickname || account.uid` 当昵称回写进池，于是 uid 被当成昵称
+ * 永久存了下来；面板的渲染分支 `a.nickname ? 昵称 : 'uid=' + uid` 因此永远走「有昵称」那支，
+ * 显示成一长串 36 位 UUID（2026-10-07 用户报的正是这个）。
+ * 统一的判定放在这里，避免挑号/面板/转发各写一份 `nickname !== uid` 而漂移。
+ */
+export function isRealQoderNickname(nickname: unknown, uid: string): boolean {
+  const v = typeof nickname === 'string' ? nickname.trim() : ''
+  return v !== '' && v !== uid
+}
+
+/**
+ * 签到时回写昵称（池账号登录时可能未带 nickname，签到后补齐供面板展示）。
+ *
+ * 空值与「等值于 uid」都拒绝写入：写进去只会让面板永远显示 UUID，比留空更差
+ * （留空时面板至少会走 `uid=` 前缀分支，语义明确）。
+ */
 export async function setQoderPoolAccountNickname(env: Env, providerId: string, uid: string, nickname: string): Promise<void> {
+  const name = typeof nickname === 'string' ? nickname.trim() : ''
+  if (!isRealQoderNickname(name, uid)) return
   const pool = await readQoderPool(env, providerId)
   const acc = pool.find((a) => a.uid === uid)
-  if (!acc || acc.nickname === nickname) return
-  acc.nickname = nickname
+  if (!acc || acc.nickname === name) return
+  acc.nickname = name
   await writeQoderPool(env, providerId, pool)
 }
 
@@ -359,7 +379,8 @@ export async function listQoderPoolStatus(env: Env, providerId: string): Promise
   const now = Date.now()
   return pool.map((a) => ({
     uid: a.uid,
-    nickname: a.nickname || '',
+    // 历史脏数据（nickname === uid）按「无昵称」透出，让面板显示 `uid=xxx` 而不是把 UUID 当名字
+    nickname: isRealQoderNickname(a.nickname, a.uid) ? String(a.nickname).trim() : '',
     credits: a.state?.credits ?? 0,
     // 额度包明细 + 探测时刻：「7 天内到期优先」挑号的可见依据（面板据此解释"为何选这个号"）
     packages: a.state?.packages,

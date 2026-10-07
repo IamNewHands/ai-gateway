@@ -83,11 +83,18 @@ describe('Qoder OAuth 域路由（poll/refresh）', () => {
   })
 
   it('poll 按 device.loginRealm=global 走 global 轮询端点 openapi.qoder.sh', async () => {
-    const { env } = makeKV()
-    const fetchMock = vi.fn(async (_input: unknown) => new Response(
-      JSON.stringify({ token: 'dt-1', refresh_token: 'drt-1', user_id: 'u1' }),
-      { status: 200, headers: { 'Content-Type': 'application/json' } }
-    ))
+    const { env, store } = makeKV()
+    // 按 URL 分派：poll 与紧随其后的 userinfo（昵称回填，见 oauth.ts pollOauthQoderFlow）
+    const fetchMock = vi.fn(async (input: unknown) => {
+      const url = String(input)
+      if (url.includes('/api/v1/userinfo')) {
+        return new Response(JSON.stringify({ id: 'u1', name: 'Shiro' }), { status: 200 })
+      }
+      return new Response(
+        JSON.stringify({ token: 'dt-1', refresh_token: 'drt-1', user_id: 'u1' }),
+        { status: 200, headers: { 'Content-Type': 'application/json' } }
+      )
+    })
     vi.stubGlobal('fetch', fetchMock)
     const c = cfg({
       loginRealm: 'global',
@@ -99,7 +106,14 @@ describe('Qoder OAuth 域路由（poll/refresh）', () => {
     const called = String(fetchMock.mock.calls[0][0])
     expect(called.startsWith('https://openapi.qoder.sh/api/v1/deviceToken/poll?')).toBe(true)
     // 成功登录写入的 token/池账号带 realm=global，供后续推理路由
-    expect((fetchMock.mock.calls).length).toBe(1)
+    // 登录总共两次上游调用：轮询 + 昵称回填；昵称回填也必须跟着账号域走 global
+    // （写死 cn 会让国际版账号的名字永远拉不到，而且**不报错**，只是面板一直显示 uid）
+    expect(fetchMock.mock.calls.map((c2) => String(c2[0]))).toEqual([
+      expect.stringContaining('https://openapi.qoder.sh/api/v1/deviceToken/poll?'),
+      'https://openapi.qoder.sh/api/v1/userinfo',
+    ])
+    const pool = JSON.parse(store.get('qoder:pool:qoder')!) as Array<{ uid: string; nickname?: string; realm?: string }>
+    expect(pool[0]).toMatchObject({ uid: 'u1', nickname: 'Shiro', realm: 'global' })
   })
 
   it('refresh 按 prev.realm=global 走 global 刷新端点 openapi.qoder.sh', async () => {

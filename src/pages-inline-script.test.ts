@@ -942,6 +942,13 @@ describe('WorkBuddy 面板「即将到期」标记（客户端口径 = 后端挑
     expect(html).toContain('额度包明细')
     // 任务1 的修复也要在文案里说明（签到成功清禁用，避免用户以为要重新登录）
     expect(html).toContain('签到成功也一并清除')
+    // 账号行标识（2026-10-07 用户要求「像 workbuddy 那样显示昵称」）：
+    // uid 必须常显——它才是「首选账号 / X-Qoder-Account」要填的值；昵称跟在括号里做快速识人。
+    // 旧写法 `a.nickname ? 昵称 : 'uid=' + uid` 一旦 nickname 被写成 uid（历史脏数据），
+    // 面板就只剩一长串 UUID 且看不出那是 uid，这里把新口径钉住。
+    expect(body).toContain("'uid=' + escapeHtml(a.uid)")
+    expect(body).toContain("(a.nickname ? '（' + escapeHtml(a.nickname) + '）' : '')")
+    expect(body).not.toContain("a.nickname ? escapeHtml(a.nickname) : 'uid='")
   })
 })
 

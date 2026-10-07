@@ -664,6 +664,56 @@ export async function fetchQoderUserResource(token: string, realm: QoderRealm = 
   }
 }
 
+/** GET /api/v1/userinfo 响应里用到的字段（其余字段与本网关无关，忽略）。 */
+export interface QoderUserInfo {
+  /** 上游权威 uid（userinfo.id）；上游没给则空串 */
+  uid: string
+  /** 账号昵称（userinfo.name）。**这是 Qoder 唯一可得的展示名来源**，可能为空 */
+  name: string
+  /** 用户类型（如 personal_professional_trial） */
+  userType: string
+  organizationId: string
+  organizationName: string
+}
+
+/**
+ * 拉取账号身份：昵称 / 用户类型 / 组织。
+ *
+ * 为什么必须有它（2026-10-07 用户报「qoder 只显示一长串 id，能不能像 workbuddy 那样显示昵称」）：
+ * Qoder 的**设备授权响应与 token 刷新响应都不带任何名字**（只有 token/refresh_token/user_id，
+ * 见 oauth.ts pollOauthQoderFlow 的响应类型与 qoder 的 `dt-` token 不是 JWT、无法解 claims），
+ * 所以池里 nickname 一直是空的，面板只能退化成 36 位 UUID——这正是用户看到的那一行。
+ * `/api/v1/userinfo` 是唯一来源，两份参考实现都用它取名：
+ *   - qoder2api-hub qoder_accounts.py:1729-1743（`ui.get("name")` → nickname，`ui.get("id")` → uid）；
+ *   - qoder2api account/oauth.go:221-233（同端点、同 `Bearer` 明文鉴权）。
+ * 端点路径由 hub README:150 与 region.go:26/37 交叉确认（双域均存在）。
+ *
+ * 失败一律返回 null（**不抛**）：这是纯展示增强，绝不能让它把签到/登录流程带崩。
+ */
+export async function fetchQoderUserInfo(token: string, realm: QoderRealm = 'cn'): Promise<QoderUserInfo | null> {
+  if (!token) return null
+  try {
+    const res = await fetch(QODER_OPENAPI[realm] + '/api/v1/userinfo', {
+      method: 'GET',
+      headers: billingHeaders(token),
+      signal: AbortSignal.timeout(10000),
+    })
+    if (!res.ok) return null
+    const ui = (await res.json().catch(() => null)) as Record<string, unknown> | null
+    if (!ui || typeof ui !== 'object') return null
+    const str = (v: unknown) => (typeof v === 'string' ? v.trim() : '')
+    return {
+      uid: str(ui.id),
+      name: str(ui.name),
+      userType: str(ui.user_type),
+      organizationId: str(ui.organization_id),
+      organizationName: str(ui.organization_name),
+    }
+  } catch {
+    return null
+  }
+}
+
 /** GET /api/v2/user/plan 响应。 */
 interface QoderPlan {
   user_type?: string
