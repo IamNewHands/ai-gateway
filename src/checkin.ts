@@ -1131,9 +1131,10 @@ export async function handleAdminOverview(c: Context<{ Bindings: Env }>) {
     }
   }
 
-  // TRAE SOLO：账号级签到结果与面板「今日签到」列同源；额度取账号池 work_credits
-  // （Work 专属通道是挑号依据，见 trae/pool.ts pick），额度池上限来自 Work 权益包。
-  let traeWorkRemain = 0, traeWorkSize = 0, traeAccounts = 0
+  // TRAE SOLO：账号级签到结果与面板「今日签到」列同源；额度取账号池双通道合计
+  // （SOLO 通用 + Work 专属）。只看 Work 会在没有 Work 权益包的账号上恒显 0——
+  // 账号池里 credits/workCredits 由积分探测写入，两者互不替代。
+  let traeRemain = 0, traeSize = 0, traeAccounts = 0, traeSoloRemain = 0, traeWorkRemain = 0
   for (const p of providers.filter((x) => isTraeProvider(x))) {
     const results = await readTraeCheckinResults(c.env, p.id)
     const doneUids = new Set(results.filter((r) => r.checkedIn).map((r) => r.uid))
@@ -1142,8 +1143,12 @@ export async function handleAdminOverview(c: Context<{ Bindings: Env }>) {
       traeAccounts++
       totalAccounts++
       if (doneUids.has(a.uid)) checkedIn++
-      if (typeof a.workCredits === 'number') traeWorkRemain += a.workCredits
-      for (const pack of a.packs || []) if (pack.isWork) traeWorkSize += pack.limit
+      const solo = typeof a.credits === 'number' ? a.credits : 0
+      const work = typeof a.workCredits === 'number' ? a.workCredits : 0
+      traeSoloRemain += solo
+      traeWorkRemain += work
+      traeRemain += solo + work
+      for (const pack of a.packs || []) traeSize += pack.limit
     }
   }
 
@@ -1158,7 +1163,10 @@ export async function handleAdminOverview(c: Context<{ Bindings: Env }>) {
     success: true,
     data: {
       checkin: { checkedIn, totalAccounts, remain, size },
-      trae: { workRemain: traeWorkRemain, workSize: traeWorkSize, accounts: traeAccounts },
+      trae: {
+        remain: traeRemain, size: traeSize, accounts: traeAccounts,
+        soloRemain: traeSoloRemain, workRemain: traeWorkRemain,
+      },
       usage,
     },
   })

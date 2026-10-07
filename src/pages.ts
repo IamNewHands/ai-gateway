@@ -4990,6 +4990,10 @@ window.addEventListener('hashchange', function () {
     }
     return '<div class="kpi"><span>' + value + '</span><p>' + label + '</p><small>' + sub + '</small>' + bar + '</div>'
   }
+  function kpiNum(v) {
+    var n = typeof v === 'number' && isFinite(v) ? v : 0
+    return String(Math.round(n) === n ? n : Number(n.toFixed(2)))
+  }
   try {
     var r = await fetch('/admin/api/overview')
     var d = await r.json()
@@ -5005,12 +5009,12 @@ window.addEventListener('hashchange', function () {
       html += kpiCard('—', 'WorkBuddy 可用额度', '暂无签到数据', null)
       html += kpiCard('—', '今日签到', '暂无签到数据', null)
     }
-    // TRAE Work 可用额度：账号池 work_credits 合计（挑号依据）；额度池取 Work 权益包上限
+    // TRAE 可用额度：SOLO(通用) + Work(专属) 双通道合计，副标题给出通道拆分便于定位
     var tr = d.data.trae || {}
     if (tr.accounts > 0) {
-      html += kpiCard(String(tr.workRemain ?? '—'), 'TRAE Work 可用额度', tr.workSize > 0 ? '额度池 ' + tr.workSize : tr.accounts + ' 个账号', tr.workSize > 0 ? tr.workRemain / tr.workSize * 100 : null)
+      html += kpiCard(kpiNum(tr.remain), 'TRAE 可用额度', 'SOLO ' + kpiNum(tr.soloRemain) + ' · Work ' + kpiNum(tr.workRemain), tr.size > 0 ? tr.remain / tr.size * 100 : null)
     } else {
-      html += kpiCard('—', 'TRAE Work 可用额度', '暂无 TRAE 账号', null)
+      html += kpiCard('—', 'TRAE 可用额度', '暂无 TRAE 账号', null)
     }
     // 24h 调用：analytics 不可用时降级
     var u = d.data.usage

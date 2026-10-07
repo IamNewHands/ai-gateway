@@ -69,7 +69,7 @@ async function overview(env: Env) {
   const res = (await handleAdminOverview(c)) as unknown as { data: any }
   return res.data as {
     checkin: { checkedIn: number; totalAccounts: number; remain: number; size: number }
-    trae: { workRemain: number; workSize: number; accounts: number }
+    trae: { remain: number; size: number; accounts: number; soloRemain: number; workRemain: number }
     usage: { requests: number; successRate: number } | null
   }
 }
@@ -131,7 +131,7 @@ describe('handleAdminOverview：今日签到分母口径', () => {
 })
 
 describe('handleAdminOverview：TRAE SOLO 聚合', () => {
-  it('TRAE 签到结果并入今日签到，Work 积分与 Work 权益包上限分别聚合', async () => {
+  it('TRAE 签到结果并入今日签到，SOLO + Work 双通道额度与权益包上限分别聚合', async () => {
     const env = makeEnv({
       'trae:pool:trae_agg': JSON.stringify({
         u_a: {
@@ -154,15 +154,34 @@ describe('handleAdminOverview：TRAE SOLO 聚合', () => {
     expect(d.checkin.checkedIn).toBe(1)
     expect(d.checkin.totalAccounts).toBe(2)
     expect(d.trae.accounts).toBe(2)
+    expect(d.trae.soloRemain).toBe(107)
     expect(d.trae.workRemain).toBe(80)
-    // 只累加 isWork 权益包的 limit（SOLO 包的 999 不计）
-    expect(d.trae.workSize).toBe(200)
+    expect(d.trae.remain).toBe(187)
+    // 额度池上限累加全部权益包（SOLO 999 + Work 200）
+    expect(d.trae.size).toBe(1199)
+  })
+
+  it('只有 SOLO 包的账号不能显示 0（Work 通道为空时仍要给出可用额度）', async () => {
+    const env = makeEnv({
+      'trae:pool:trae_solo': JSON.stringify({
+        u_a: {
+          credits: 3487.3464, workCredits: 0, disabled: false, until: 0, errCount: 0,
+          packs: [{ name: '每日签到包(500)', limit: 500, used: 100, rem: 400, isWork: false }],
+        },
+      }),
+    })
+    getProvidersMock.mockResolvedValue([traeProvider('trae_solo', ['u_a'])])
+
+    const d = await overview(env)
+    expect(d.trae.workRemain).toBe(0)
+    expect(d.trae.soloRemain).toBe(3487.3464)
+    expect(d.trae.remain).toBe(3487.3464)
   })
 
   it('无 TRAE 账号时额度为 0 且不进分母', async () => {
     getProvidersMock.mockResolvedValue([workbuddyProvider('wb3')])
     const d = await overview(makeEnv())
-    expect(d.trae).toEqual({ workRemain: 0, workSize: 0, accounts: 0 })
+    expect(d.trae).toEqual({ remain: 0, size: 0, accounts: 0, soloRemain: 0, workRemain: 0 })
     expect(d.checkin.totalAccounts).toBe(0)
   })
 })
