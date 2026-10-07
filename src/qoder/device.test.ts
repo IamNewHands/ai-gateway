@@ -241,7 +241,7 @@ describe('端到端：粘贴提取脚本的 config.json → 保存 → 出站头
     expect(headers['cosy-version']).toBe('0.4.3')
   })
 
-  it('只配 machineToken：其余回退内置默认 + uid 派生值，绝不发空头', async () => {
+  it('只配 machineToken：机器头整套发出，缺的字段回退内置默认 + uid 派生值', async () => {
     const { env } = makeEnv()
     await setQoderDevice(env, { machineToken: 'dev-machine-token-placeholder' })
     const headers = await checkinHeadersFor(await getQoderDevice(env))
@@ -254,5 +254,18 @@ describe('端到端：粘贴提取脚本的 config.json → 保存 → 出站头
     expect(headers['cosy-machineid']).toBeTruthy()
     expect(headers['cosy-machinetype']).toBeTruthy()
     expect(headers['cosy-machinecode']).toBeTruthy()
+  })
+
+  it('没配 machineToken（含只配了别的字段）→ 一个机器头都不发（hub issue #10）', async () => {
+    // 判据只有 machineToken 一个：hub 逐头隔离实测「六头全发（派生值）→ CLAIMABLE 活动
+    // 被整条过滤」，故仅凭 machineId/machineOS 等字段不构成真机身份，必须走 omitted。
+    const { env } = makeEnv()
+    await setQoderDevice(env, { machineId: 'only-id', machineOS: 'x86_64_windows' })
+    const headers = await checkinHeadersFor(await getQoderDevice(env))
+    expect(Object.keys(headers).filter((k) => k.startsWith('cosy-machine'))).toEqual([])
+    // 展示活动必需的三个头仍在
+    expect(headers['cosy-clienttype']).toBe(QODER_DESKTOP_DEFAULTS.clientType)
+    expect(headers['cosy-version']).toBe(QODER_DESKTOP_DEFAULTS.version)
+    expect(headers['user-agent']).toBe('Qoder')
   })
 })

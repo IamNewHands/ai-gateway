@@ -21,9 +21,9 @@ import { getProviders } from './storage'
 import { getOauthAccessToken, detectTokenRealm, refreshQoderTokenPair } from './oauth'
 import { writeLog } from './admin'
 import { isQoderFlow } from './qoder/proxy'
-import { fetchQoderCheckinStatus, performQoderCheckin, fetchQoderUserResource, fetchQoderPaymentType, fetchQoderUserInfo, buildQoderPacks, legacyQoderAddonExpireAt, normalizeQoderRealm, realmHasLegacyCheckin, type QoderRealm } from './qoder/billing'
+import { fetchQoderCheckinStatus, performQoderCheckin, fetchQoderUserResource, fetchQoderPaymentType, fetchQoderUserInfo, buildQoderPacks, legacyQoderAddonExpireAt, normalizeQoderRealm, realmHasLegacyCheckin, qoderMachineHeadersState, type QoderRealm } from './qoder/billing'
 import { reconcileQoderAddonGrants, type QoderAddonGrant } from './qoder/grants'
-import { getQoderDevice } from './qoder/device'
+import { getQoderDevice, hasQoderDevice } from './qoder/device'
 import {
   readQoderPool,
   seedQoderPoolFromSingle,
@@ -392,8 +392,12 @@ async function checkinQoderPoolAccount(env: Env, provider: Provider, account: Qo
         credits: { before: creditsBefore, after: creditsAfter, delta: creditsDelta },
         debug: res.debug,
         quotaRaw,
-        // native = 已在管理后台配置真机身份；derived = 回退 uid 派生值（拿不到设备定向活动）
-        deviceIdentity: device ? 'native' : 'derived',
+        // machineHeaders = 实际发出的机器头形态：native = 有真机 machineToken、发全套六头；
+        // omitted = 无真机身份、一个 cosy-machine* 都不发（hub issue #10：全套派生值会被
+        // 服务端判定为非官方客户端并过滤掉 CLAIMABLE 活动）。deviceConfigured 单独记，
+        // 用来区分「面板没配」与「配了但没填 machineToken」（后者同样走 omitted）。
+        machineHeaders: qoderMachineHeadersState(device),
+        deviceConfigured: hasQoderDevice(device),
       }).substring(0, 4000)
     )
   } catch { /* 日志失败不影响签到结果 */ }

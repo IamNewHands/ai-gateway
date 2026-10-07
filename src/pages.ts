@@ -926,7 +926,7 @@ if ($waitForHuman) {
                           <div class="fc mt-1 field-row">
                             <button class="btn btn-p btn-xs" onclick="saveQoderDevice(this)"><i class="fas fa-save" aria-hidden="true"></i>保存</button>
                             <button class="btn btn-gh btn-xs" onclick="resetQoderDevice(this)"><i class="fas fa-undo" aria-hidden="true"></i>清空</button>
-                            <span class="form-helper">留空字段的后果：<code>Cosy-ClientType / MachineOS / MachineHostname / Version</code> 回退内置默认值；<code>MachineId / MachineToken / MachineType / MachineCode</code> 回退 uid 派生值——<b>派生值拿不到每日活动</b>。保存后签到日志里 <code>deviceIdentity</code> 会从 <code>derived</code> 变成 <code>native</code>。</span>
+                            <span class="form-helper">关键字段是 <code>MachineToken</code>：填了它，六个 <code>Cosy-Machine*</code> 头才整套发出（缺的字段回退内置默认/uid 派生值）；<b>没填就一个机器头都不发</b>——实测「整套派生值」会被服务端判定为非官方客户端，把「每日领取 Credits」整条过滤掉，缺头反而可见。保存后签到日志里 <code>machineHeaders</code> 会从 <code>omitted</code> 变成 <code>native</code>。</span>
                           </div>
                           <div class="mu mt-1 qoder-device-result" aria-live="polite"></div>
                         </div>
@@ -5836,7 +5836,7 @@ async function loadQoderDeviceBlock(block) {
     var d = await r.json()
     if (!d.success) { if (st) st.textContent = '加载失败'; return }
     qoderDeviceApply(block, d.data && d.data.device)
-    if (st) st.textContent = (d.data && d.data.isCustom) ? '已配置真机身份（签到日志 deviceIdentity=native）' : '未配置：正在用 uid 派生值，拿不到每日活动'
+    if (st) st.textContent = (d.data && d.data.isCustom) ? '已配置真机身份（签到日志 machineHeaders=native）' : '未配置 MachineToken：不发机器头，拿不到每日活动'
   } catch (e) { if (st) st.textContent = '加载失败' }
 }
 // 页面加载即拉取：配置块在提供商卡片里，卡片可能处于折叠状态——元素仍在 DOM 中，直接填即可。
@@ -5875,7 +5875,7 @@ function copyQoderExtractScript(btn) {
 function resetQoderDevice(btn) {
   var block = qoderDeviceBlock(btn)
   if (!block) return
-  cM('清空 Qoder 设备身份？清空后回退 uid 派生值，拿不到「每日领取 100 Credits」。').then(function (ok) {
+  cM('清空 Qoder 设备身份？清空后将不再发送任何机器头，拿不到「每日领取 100 Credits」。').then(function (ok) {
     if (!ok) return
     qoderDeviceInputs(block).forEach(function (el) { el.value = '' })
     var ta = block.querySelector('.qoder-device-json')

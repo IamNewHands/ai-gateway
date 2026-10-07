@@ -125,21 +125,54 @@ export interface QoderDeviceIdentity {
 }
 
 /**
+ * 机器身份头的发送状态：`native` = 有真机 machineToken、按官方客户端同款发全套六头；
+ * `omitted` = 无真机身份、**一个 cosy-machine* 都不发**。
+ *
+ * 这不是「降级」，而是 hub issue #10 实测出的**唯一正确形态**（见 checkinHeaders）。
+ */
+export type QoderMachineHeadersState = 'native' | 'omitted'
+
+/**
+ * 是否发六个 `cosy-machine*` 头。
+ *
+ * 判据**只有** `device.machineToken` 一个：hub 的逐头隔离实验里，服务端认的是
+ * 「真机 token」这一项能力，而不是六个字段凑齐。仅凭 machineId/machineType 等
+ * 其它字段无法构成真机身份，反而会落进「全套派生六头」这个被过滤的形态。
+ */
+export function qoderMachineHeadersState(device?: QoderDeviceIdentity): QoderMachineHeadersState {
+  return device?.machineToken ? 'native' : 'omitted'
+}
+
+/**
  * 签到专用头 = 官方桌面端 0.4.3 同款出站头（qoder2api-hub qoder_accounts.py:655-686）。
  *
- * 这是**功能必需**，不是可选装饰。hub 实测记录的两层坑：
- *   1. 缺这些头 → 服务端**不报错**但返回**空活动列表**（表现为「无可用签到活动」）；
- *   2. 机器身份用派生假值 → 列表里**静默少掉设备定向活动**（「每日领取 100 Credits」）。
+ * 这是**功能必需**，不是可选装饰。hub 实测记录的三层坑：
+ *   1. 缺 UA / `cosy-clienttype` / `cosy-version` → 服务端**不报错**但返回
+ *      **空活动列表**（表现为「无可用签到活动」）——这三个头**无条件发**；
+ *   2. 机器身份用派生假值 → 列表里**静默少掉设备定向活动**（「每日领取 100 Credits」）；
+ *   3. **六个 cosy-machine\* 全发但全是派生值 → 整条 CLAIMABLE 活动被过滤**
+ *      （hub issue #10，Linux/Docker 实测；见下）。
  *
- * 官方桌面端调用 /sash/api/v1/me/campaigns 时携带：
- *   Authorization / User-Agent: Qoder / Cosy-ClientType: 10 /
- *   Cosy-Version / Cosy-MachineOS / MachineHostname / MachineId / MachineToken /
- *   MachineType / MachineCode
+ * ## 为什么无真机身份时一个机器头都不发（hub issue #10 / v1.2.1 330cf23）
  *
- * 机器身份优先级：真机身份（`device`，管理后台「Qoder 设备身份」配置，见 qoder/device.ts）
- * > uid 派生值（`sess`）；两者都没有的字段再回退 QODER_DESKTOP_DEFAULTS。
+ * hub 的逐头隔离实验结论：
+ *   - 六头**任一个单独**出现 → 活动可见；
+ *   - 六头**全发**（派生值） → CLAIMABLE 的「每日领取 100 Credits」被**整条过滤**，
+ *     列表只剩 VIEW_DETAILS 类；
+ *   - 去掉 `machinetoken` 或 `machineid` → 可见。
+ * 即服务端把「全套派生六头」判定为非官方客户端。hub 的修法是：原生桥给出真身份
+ * （machineToken 非空）才发全套六头，否则**一个都不发**，只留 UA / clienttype / version。
+ *
+ * 旧实现（本文件此前）在无 `device` 时发 uid 派生的六个值——**正是被过滤的那个形态**，
+ * 于是「没配设备身份」的部署会稳定拿不到每日活动，且服务端不报错。现在按 hub 同口径门控。
+ *
  * 注：hub 优先用官方 runtime-info.exe 取**真**身份，Workers 跑不了原生二进制，
- * 故只能用调用方注入的 `device` 或派生值——派生值拿不到每日活动，这是已知上限。
+ * 故真机身份只能由用户在装了桌面端的机器上一次性提取后填进管理后台（qoder/device.ts）。
+ * 未配置时不再伪造机器头——伪造比缺失更糟（缺失只是拿不到设备定向活动，伪造会让
+ * 整条活动列表被过滤）。
+ *
+ * 有真机身份时，缺的字段仍回退 uid 派生值/内置默认（与 hub 原生分支逐字同构：
+ * `ident.get(x) or derive_x(...)`）——真机 token 已证明客户端身份，其余字段只是凑形状。
  *
  * User-Agent 保持 `Qoder`（**不跟随**那四个项目的 `Qoder/claim`）：`Qoder/claim` 是脚本
  * 自己起的名字（"claim" 即脚本名），不是抓包值；`Qoder` 有两个独立来源（本文件早前的
@@ -147,22 +180,27 @@ export interface QoderDeviceIdentity {
  * 发 `Qoder/claim` 却拿到空列表，说明 UA 不是活动是否下发的判别项——改它属于无据变更。
  */
 function checkinHeaders(token: string, sess: CosySession, device?: QoderDeviceIdentity): Record<string, string> {
-  return {
+  const h: Record<string, string> = {
     authorization: `Bearer ${token}`,
     accept: 'application/json, text/plain, */*',
     'accept-language': 'zh-CN',
     'user-agent': 'Qoder',
     'cosy-clienttype': device?.clientType || QODER_DESKTOP_DEFAULTS.clientType,
     'cosy-version': device?.version || QODER_DESKTOP_DEFAULTS.version,
-    'cosy-machineid': device?.machineId || sess.machineId,
-    'cosy-machinetoken': device?.machineToken || sess.machineToken,
-    'cosy-machinetype': device?.machineType || sess.machineType,
+  }
+  // 六个 cosy-machine* 只在真机身份可用时发送（hub issue #10）：全套派生值会被
+  // 服务端判定为非官方客户端并过滤掉 CLAIMABLE 活动，缺头反而可见。
+  if (qoderMachineHeadersState(device) === 'native') {
+    h['cosy-machineid'] = device?.machineId || sess.machineId
+    h['cosy-machinetoken'] = device?.machineToken || sess.machineToken
+    h['cosy-machinetype'] = device?.machineType || sess.machineType
     // 真机 machineCode 与 machineType 同为 18 位十六进制（wallechfox 提交的真机 config.json）；
     // hub 与那四个项目都发这个头，缺它会让本客户端比真机少一个身份字段。
-    'cosy-machinecode': device?.machineCode || sess.machineCode,
-    'cosy-machineos': device?.machineOS || QODER_DESKTOP_DEFAULTS.machineOS,
-    'cosy-machinehostname': device?.machineHostname || QODER_DESKTOP_DEFAULTS.machineHostname,
+    h['cosy-machinecode'] = device?.machineCode || sess.machineCode
+    h['cosy-machineos'] = device?.machineOS || QODER_DESKTOP_DEFAULTS.machineOS
+    h['cosy-machinehostname'] = device?.machineHostname || QODER_DESKTOP_DEFAULTS.machineHostname
   }
+  return h
 }
 
 /**

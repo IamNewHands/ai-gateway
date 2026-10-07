@@ -396,33 +396,52 @@ describe('国际版/国内版签到分域', () => {
     expect(headers['cosy-version']).toBe('1.1.64')
   })
 
-  it('签到头带完整桌面端机器身份（hub: 缺这些头服务端不报错但返回空活动列表）', async () => {
+  it('无真机身份时一个 cosy-machine* 都不发（hub issue #10：全套派生值会被过滤掉每日活动）', async () => {
     const fetchMock = vi.fn(async (_input: unknown, _init?: RequestInit) =>
       new Response(JSON.stringify({ campaigns: [] }), { status: 200 }))
     vi.stubGlobal('fetch', fetchMock)
     await performQoderCheckin('dt-c', 'cn', 'uid-machine-1')
     const headers = (fetchMock.mock.calls[0][1] as RequestInit).headers as Record<string, string>
-    // 桌面端身份头是功能必需，不是装饰
+    // 展示活动所必需的三个头**无条件发**（hub 实测：缺它们服务端不报错但返回空列表）
     expect(headers['cosy-clienttype']).toBe('10')
+    expect(headers['cosy-version']).toBeTruthy()
+    expect(headers['user-agent']).toBe('Qoder')
+    // 六个机器头一个都不发：hub 逐头隔离实测「六头全发（派生值）→ CLAIMABLE 活动被整条过滤」，
+    // 而「缺头」只是拿不到设备定向活动——伪造比缺失更糟。
+    expect(Object.keys(headers).filter((k) => k.startsWith('cosy-machine'))).toEqual([])
+  })
+
+  it('配了真机 machineToken 时六个机器头整套发出，且与推理会话不同源', async () => {
+    const fetchMock = vi.fn(async (_input: unknown, _init?: RequestInit) =>
+      new Response(JSON.stringify({ campaigns: [] }), { status: 200 }))
+    vi.stubGlobal('fetch', fetchMock)
+    // 只给 machineToken（真机身份的判据），其余字段应回退 uid 派生值/内置默认
+    await performQoderCheckin('dt-c', 'cn', 'uid-machine-2', undefined, { machineToken: 'real-token-abc' })
+    const headers = (fetchMock.mock.calls[0][1] as RequestInit).headers as Record<string, string>
+    expect(headers['cosy-machinetoken']).toBe('real-token-abc')
     expect(headers['cosy-machineid']).toMatch(/^[0-9a-f]{32}$/)
-    expect(headers['cosy-machinetoken']).toMatch(/^[A-Za-z0-9_-]{43}$/)
     expect(headers['cosy-machinetype']).toMatch(/^[0-9a-f]{18}$/)
+    expect(headers['cosy-machinecode']).toMatch(/^[0-9a-f]{18}$/)
     expect(headers['cosy-machineos']).toBe('x86_64_win32')
     expect(headers['cosy-machinehostname']).toBe('DESKTOP-QODER')
-    expect(headers['user-agent']).toBe('Qoder')
     // machineid 与 machinetoken 必须是不同值（各自独立派生）
     expect(headers['cosy-machinetoken']).not.toBe(headers['cosy-machineid'])
+    // 只配了 token、没配 machineId → machineId 用 uid 派生值，故与推理会话同源
+    const inferSess = await cosySessionFor('dt-c', '', 'uid-machine-2', '')
+    expect(headers['cosy-machineid']).toBe(inferSess.machineId)
   })
 
   it('同一 uid 的签到与推理呈现同一台设备（指纹种子一致）', async () => {
     const fetchMock = vi.fn(async (_input: unknown, _init?: RequestInit) =>
       new Response(JSON.stringify({ campaigns: [] }), { status: 200 }))
     vi.stubGlobal('fetch', fetchMock)
-    await performQoderCheckin('dt-c', 'cn', 'uid-same-device')
+    // 用真机 token 走 native 分支（否则按 hub issue #10 根本不发机器头）
+    await performQoderCheckin('dt-c', 'cn', 'uid-same-device', undefined, { machineToken: 'tok-same' })
     const headers = (fetchMock.mock.calls[0][1] as RequestInit).headers as Record<string, string>
     const inferSess = await cosySessionFor('dt-c', '', 'uid-same-device', '')
+    // 未配 machineId/machineToken 时回退 uid 派生值 → 与推理路径同源（同一台设备）
     expect(headers['cosy-machineid']).toBe(inferSess.machineId)
-    expect(headers['cosy-machinetoken']).toBe(inferSess.machineToken)
+    expect(headers['cosy-machineid']).toBeTruthy()
   })
 
   it('showCampaign=false 时报「身份被过滤」而非「今天没有活动」', async () => {
@@ -457,11 +476,11 @@ describe('国际版/国内版签到分域', () => {
 // 身份的**存储与配置**在管理后台（KV `qoder:device`，见 device.ts / device.test.ts），
 // 这里只负责「给了身份就一定要发出去、且与面板字段一一对应」。
 describe('真机设备身份优先于 uid 派生值', () => {
-  it('签到头补上 cosy-machinecode（真机与 hub 都发这个头，旧实现漏发）', async () => {
+  it('cosy-machinecode 与真机/hub 口径一致（18 位十六进制，真机身份时随全套发出）', async () => {
     const fetchMock = vi.fn(async (_input: unknown, _init?: RequestInit) =>
       new Response(JSON.stringify({ campaigns: [] }), { status: 200 }))
     vi.stubGlobal('fetch', fetchMock)
-    await performQoderCheckin('dt-c', 'cn', 'uid-mc')
+    await performQoderCheckin('dt-c', 'cn', 'uid-mc', undefined, { machineToken: 'tok-mc' })
     const headers = (fetchMock.mock.calls[0][1] as RequestInit).headers as Record<string, string>
     expect(headers['cosy-machinecode']).toMatch(/^[0-9a-f]{18}$/)
   })

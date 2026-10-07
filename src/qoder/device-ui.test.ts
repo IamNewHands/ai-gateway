@@ -115,7 +115,7 @@ describe('「Qoder 设备身份」配置块（挂在 Qoder 提供商卡片里）
     expect((html.match(/无内置值/g) || []).length).toBe(4)
     // 有内置值的字段把默认值显示成 placeholder
     expect(html).toMatch(/data-key="clientType"[^>]*placeholder="10"/)
-    expect(html).toContain('deviceIdentity')
+    expect(html).toContain('machineHeaders')
     // 全局语义必须写明：多张 Qoder 卡片共用同一份（写在折叠标题里，收起时也看得见）
     expect(html).toContain('所有 Qoder 提供商共用一份')
     expect(html).toContain('机器级常量')
