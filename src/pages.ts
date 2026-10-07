@@ -4978,7 +4978,7 @@ window.addEventListener('hashchange', function () {
   if (location.hash === '#m365-accounts') location.replace('#providers')
 })
 
-// P2：概览驾驶舱聚合 KPI —— 拉取 /admin/api/overview 渲染额度/签到/调用量/成功率卡片
+// P2：概览驾驶舱聚合 KPI —— 拉取 /admin/api/overview 渲染各产品族额度 + 签到进度卡片
 ;(async function loadOverviewKpi() {
   var root = document.getElementById('overview-kpi')
   if (!root) return
@@ -4994,6 +4994,14 @@ window.addEventListener('hashchange', function () {
     var n = typeof v === 'number' && isFinite(v) ? v : 0
     return String(Math.round(n) === n ? n : Number(n.toFixed(2)))
   }
+  // 额度卡：remain/size 进度条；该产品族无账号时降级占位
+  function quotaCard(q, label, emptyText) {
+    var o = q || {}
+    if (o.accounts > 0) {
+      return kpiCard(kpiNum(o.remain), label, '额度池 ' + kpiNum(o.size), o.size > 0 ? o.remain / o.size * 100 : null)
+    }
+    return kpiCard('—', label, emptyText, null)
+  }
   try {
     var r = await fetch('/admin/api/overview')
     var d = await r.json()
@@ -5001,14 +5009,9 @@ window.addEventListener('hashchange', function () {
     var ck = d.data.checkin || {}
     var ckTotal = ck.totalAccounts || 0
     var html = ''
-    // 可用额度：remain/size 进度条；无签到数据时降级占位
-    if (ckTotal > 0) {
-      html += kpiCard(String(ck.remain ?? '—'), 'WorkBuddy 可用额度', '额度池 ' + (ck.size ?? '—'), ck.size > 0 ? ck.remain / ck.size * 100 : null)
-      html += kpiCard(ck.checkedIn + '/' + ckTotal, '今日签到', ck.checkedIn >= ckTotal ? '全部完成' : ((ckTotal - ck.checkedIn) + ' 个待签'), ckTotal ? ck.checkedIn / ckTotal * 100 : null)
-    } else {
-      html += kpiCard('—', 'WorkBuddy 可用额度', '暂无签到数据', null)
-      html += kpiCard('—', '今日签到', '暂无签到数据', null)
-    }
+    // 额度按产品族分开：合并成一个数会让 WorkBuddy 卡片把 QoderWork 的额度也算进去
+    html += quotaCard(d.data.workbuddy, 'WorkBuddy 可用额度', '暂无 WorkBuddy 账号')
+    html += quotaCard(d.data.qoder, 'QoderWork 可用额度', '暂无 QoderWork 账号')
     // TRAE 可用额度：SOLO(通用) + Work(专属) 双通道合计，副标题给出通道拆分便于定位
     var tr = d.data.trae || {}
     if (tr.accounts > 0) {
@@ -5016,12 +5019,11 @@ window.addEventListener('hashchange', function () {
     } else {
       html += kpiCard('—', 'TRAE 可用额度', '暂无 TRAE 账号', null)
     }
-    // 24h 调用：analytics 不可用时降级
-    var u = d.data.usage
-    if (u) {
-      html += kpiCard(String(u.requests), '24h 调用量', 'Analytics Engine', null)
+    // 今日签到：跨产品族总口径
+    if (ckTotal > 0) {
+      html += kpiCard(ck.checkedIn + '/' + ckTotal, '今日签到', ck.checkedIn >= ckTotal ? '全部完成' : ((ckTotal - ck.checkedIn) + ' 个待签'), ckTotal ? ck.checkedIn / ckTotal * 100 : null)
     } else {
-      html += kpiCard('—', '24h 调用量', '统计未启用', null)
+      html += kpiCard('—', '今日签到', '暂无签到数据', null)
     }
     root.innerHTML = html
   } catch (e) { /* 聚合接口失败保持空白，不打扰配置统计展示 */ }

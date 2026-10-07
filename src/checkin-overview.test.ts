@@ -17,9 +17,6 @@ vi.mock('./storage', () => ({
   getProvider: vi.fn(),
   updateProvider: vi.fn(),
 }))
-vi.mock('./analytics/query', () => ({
-  queryUsageOverview: async () => ({ requests: 42, successRate: 90 }),
-}))
 
 import { handleAdminOverview } from './checkin'
 
@@ -32,6 +29,19 @@ function workbuddyProvider(id: string): Provider {
     authType: 'oauth-device',
     baseUrl: 'https://api.workbuddy.cn',
     oauth: { flowType: 'oauth-device' },
+    apiKeys: [],
+    models: [],
+    enabled: true,
+  } as unknown as Provider
+}
+
+function qoderProvider(id: string): Provider {
+  return {
+    id,
+    name: id,
+    authType: 'oauth-device',
+    baseUrl: 'https://gateway.qoder.com.cn',
+    oauth: { flowType: 'qoder' },
     apiKeys: [],
     models: [],
     enabled: true,
@@ -68,9 +78,10 @@ async function overview(env: Env) {
   const c = { env, json: (body: unknown) => body } as unknown as Context<{ Bindings: Env }>
   const res = (await handleAdminOverview(c)) as unknown as { data: any }
   return res.data as {
-    checkin: { checkedIn: number; totalAccounts: number; remain: number; size: number }
+    checkin: { checkedIn: number; totalAccounts: number }
+    workbuddy: { remain: number; size: number; accounts: number }
+    qoder: { remain: number; size: number; accounts: number }
     trae: { remain: number; size: number; accounts: number; soloRemain: number; workRemain: number }
-    usage: { requests: number; successRate: number } | null
   }
 }
 
@@ -110,8 +121,27 @@ describe('handleAdminOverview：今日签到分母口径', () => {
     expect(d.checkin.checkedIn).toBe(2)
     expect(d.checkin.totalAccounts).toBe(2)
     // 额度仍要累加国际版账号（它照样消耗额度池），仅签到分母排除
-    expect(d.checkin.remain).toBe(140)
-    expect(d.checkin.size).toBe(310)
+    expect(d.workbuddy.remain).toBe(140)
+    expect(d.workbuddy.size).toBe(310)
+    // 账号数用全量口径（含 skip），否则只有国际版账号的产品族会被额度卡误判成「无账号」
+    expect(d.workbuddy.accounts).toBe(4)
+  })
+
+  it('只有国际版账号的产品族仍要显示出额度卡（不能被当成「暂无账号」）', async () => {
+    const env = makeEnv({
+      'checkin:result:wb_global_only': JSON.stringify({
+        providerId: 'wb_global_only', name: 'wb', realm: 'global', success: true, reason: 'skipped_global',
+        message: '国际版账号无签到功能', todayCheckedIn: false, updatedAt: Date.now(),
+        accounts: [acc('u_g1', 'skipped_global', false, 300, 900)],
+      }),
+    })
+    getProvidersMock.mockResolvedValue([workbuddyProvider('wb_global_only')])
+
+    const d = await overview(env)
+    expect(d.workbuddy).toEqual({ remain: 300, size: 900, accounts: 1 })
+    // 签到分母为空（该族没有可签到账号），不显示 0/0 这种误导进度
+    expect(d.checkin.totalAccounts).toBe(0)
+    expect(d.checkin.checkedIn).toBe(0)
   })
 
   it('未签到账号仍计入分母（真实待签不能被吞掉）', async () => {
@@ -183,5 +213,41 @@ describe('handleAdminOverview：TRAE SOLO 聚合', () => {
     const d = await overview(makeEnv())
     expect(d.trae).toEqual({ remain: 0, size: 0, accounts: 0, soloRemain: 0, workRemain: 0 })
     expect(d.checkin.totalAccounts).toBe(0)
+  })
+})
+
+describe('handleAdminOverview：额度按产品族分开', () => {
+  it('QoderWork 账号的额度不进 WorkBuddy 卡（标签与数字必须对得上）', async () => {
+    const env = makeEnv({
+      'checkin:result:wb_fam': JSON.stringify({
+        providerId: 'wb_fam', name: 'wb_fam', realm: 'cn', success: true, reason: 'ok',
+        message: '', todayCheckedIn: true, updatedAt: Date.now(),
+        accounts: [acc('wb_cn', 'ok', true, 5000, 9000), acc('wb_global', 'skipped_global', false, 3151, 9747)],
+      }),
+      'checkin:result:qoder_fam': JSON.stringify({
+        providerId: 'qoder_fam', name: 'qoder_fam', realm: 'cn', success: true, reason: 'ok',
+        message: '', todayCheckedIn: true, updatedAt: Date.now(),
+        accounts: [
+          { ...acc('q_cn', 'ok', true, 895, 1200), realm: 'cn' },
+          { ...acc('q_global', 'skipped_global', false, 40, 100), realm: 'global' },
+        ],
+      }),
+    })
+    getProvidersMock.mockResolvedValue([workbuddyProvider('wb_fam'), qoderProvider('qoder_fam')])
+
+    const d = await overview(env)
+    // WorkBuddy 卡只含 WorkBuddy 族（国内 5000 + 国际 3151），账号数含国际版
+    expect(d.workbuddy).toEqual({ remain: 8151, size: 18747, accounts: 2 })
+    // QoderWork 卡单独一份（含其国际版账号额度）
+    expect(d.qoder).toEqual({ remain: 935, size: 1300, accounts: 2 })
+    // 今日签到是跨族总口径：wb 1 + qoder 1（两族的 skipped_global 都不计分母）
+    expect(d.checkin.checkedIn).toBe(2)
+    expect(d.checkin.totalAccounts).toBe(2)
+  })
+
+  it('没有某个产品族的账号时该族额度为 0 且 accounts=0', async () => {
+    getProvidersMock.mockResolvedValue([workbuddyProvider('wb_only')])
+    const d = await overview(makeEnv())
+    expect(d.qoder).toEqual({ remain: 0, size: 0, accounts: 0 })
   })
 })

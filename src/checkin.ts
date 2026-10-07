@@ -66,7 +66,6 @@ import {
   type RegionCountry,
   ACTIVITY_ACCOUNT_DELAY_MS,
 } from './workbuddy-billing'
-import { queryUsageOverview } from './analytics/query'
 import { MAX_ADMIN_REQUEST_BYTES, readOptionalJSONLimited } from './request-body'
 
 /**
@@ -1104,45 +1103,74 @@ export async function handleCheckinStatus(c: Context<{ Bindings: Env }>) {
   return c.json<ApiResponse>({ success: true, data: { workbuddy, trae } })
 }
 
+/** 一个签到产品族（WorkBuddy / QoderWork）的额度与签到进度快照。 */
+interface CheckinFamilyQuota {
+  /** 账号总数（含国际版 / 无 token 等 skip 账号）：额度卡据此判断该族有没有数据 */
+  accounts: number
+  /** 计入签到分母的账号数（skip 账号不计） */
+  checkinAccounts: number
+  /** 其中今日已签到数 */
+  checkedIn: number
+  /** 可用额度合计（逐账号 totalRemain 累加，含国际版账号） */
+  remain: number
+  /** 额度池合计（逐账号 totalSize 累加） */
+  size: number
+}
+
+/**
+ * 聚合一个签到产品族的签到 KV。
+ *
+ * 逐 provider 读 `checkin:result:<id>`（TTL 2 天）：池提供商逐账号累加，单账号直接取。
+ * skip 账号（国际版 / 无 token）不计入签到分子分母——它们结构上签不成，计入会让
+ * 「今日签到」永不达标；但额度仍要累加（国际版账号照样消耗额度池），账号数也照算
+ * （否则只有国际版账号的产品族会被额度卡误判成「无账号」）。
+ */
+async function aggregateCheckinFamily(env: Env, familyProviders: readonly Provider[]): Promise<CheckinFamilyQuota> {
+  const out: CheckinFamilyQuota = { accounts: 0, checkinAccounts: 0, checkedIn: 0, remain: 0, size: 0 }
+  for (const p of familyProviders) {
+    const r = await readCheckinResult(env, p.id)
+    if (!r) continue
+    const accounts = r.accounts && r.accounts.length > 0 ? r.accounts : [r]
+    for (const a of accounts) {
+      out.accounts++
+      if (!isCheckinSkipped(a)) {
+        out.checkinAccounts++
+        if (a.todayCheckedIn) out.checkedIn++
+      }
+      if (typeof a.totalRemain === 'number') out.remain += a.totalRemain
+      if (typeof a.totalSize === 'number') out.size += a.totalSize
+    }
+  }
+  return out
+}
+
 /**
  * GET /admin/api/overview：概览驾驶舱聚合数据（P2）。
- * 聚合三类来源：WorkBuddy/QoderWork 签到 KV（额度/签到进度）+ TRAE SOLO 账号池与签到 KV
- * + Analytics Engine 24h 调用概况。任一来源失败不阻塞其它来源（analytics 不可用时 usage 为 null）。
+ * 聚合来源：WorkBuddy 族 / QoderWork 族签到 KV（各自独立额度与签到进度）
+ * + TRAE SOLO 账号池与签到 KV。任一来源失败不阻塞其它来源。
+ *
+ * 额度按产品族分开返回：原先合并成一个数会让「WorkBuddy 可用额度」卡片把
+ * QoderWork 账号的额度也算进去（标签与数字不符，且用户无法对账）。
  */
 export async function handleAdminOverview(c: Context<{ Bindings: Env }>) {
   const providers = (await getProviders(c.env)) as Provider[]
 
-  // WorkBuddy/QoderWork 签到结果聚合：池账号逐个累加，单账号直接取。
-  // skip 账号（国际版 / 无 token）不计入签到分子分母——它们结构上签不成，
-  // 计入会让「今日签到」永不达标；但额度仍要累加（国际版账号照样消耗额度池）。
-  const oauthProviders = providers.filter(participatesInCheckin)
-  let checkedIn = 0, totalAccounts = 0, remain = 0, size = 0
-  for (const p of oauthProviders) {
-    const r = await readCheckinResult(c.env, p.id)
-    if (!r) continue
-    const accounts = r.accounts && r.accounts.length > 0 ? r.accounts : [r]
-    for (const a of accounts) {
-      if (!isCheckinSkipped(a)) {
-        totalAccounts++
-        if (a.todayCheckedIn) checkedIn++
-      }
-      if (typeof a.totalRemain === 'number') remain += a.totalRemain
-      if (typeof a.totalSize === 'number') size += a.totalSize
-    }
-  }
+  const checkinProviders = providers.filter(participatesInCheckin)
+  const workbuddy = await aggregateCheckinFamily(c.env, checkinProviders.filter((p) => !isQoderFlow(p)))
+  const qoder = await aggregateCheckinFamily(c.env, checkinProviders.filter((p) => isQoderFlow(p)))
 
   // TRAE SOLO：账号级签到结果与面板「今日签到」列同源；额度取账号池双通道合计
   // （SOLO 通用 + Work 专属）。只看 Work 会在没有 Work 权益包的账号上恒显 0——
   // 账号池里 credits/workCredits 由积分探测写入，两者互不替代。
   let traeRemain = 0, traeSize = 0, traeAccounts = 0, traeSoloRemain = 0, traeWorkRemain = 0
+  let traeCheckedIn = 0
   for (const p of providers.filter((x) => isTraeProvider(x))) {
     const results = await readTraeCheckinResults(c.env, p.id)
     const doneUids = new Set(results.filter((r) => r.checkedIn).map((r) => r.uid))
     const accounts = await listTraeStatus(c.env, p)
     for (const a of accounts) {
       traeAccounts++
-      totalAccounts++
-      if (doneUids.has(a.uid)) checkedIn++
+      if (doneUids.has(a.uid)) traeCheckedIn++
       const solo = typeof a.credits === 'number' ? a.credits : 0
       const work = typeof a.workCredits === 'number' ? a.workCredits : 0
       traeSoloRemain += solo
@@ -1152,22 +1180,20 @@ export async function handleAdminOverview(c: Context<{ Bindings: Env }>) {
     }
   }
 
-  // 24h 调用概况（Analytics Engine 可能未启用/失败，降级为 null）
-  let usage: { requests: number; successRate: number } | null = null
-  try {
-    const ov = await queryUsageOverview(c as unknown as Parameters<typeof queryUsageOverview>[0], '24h')
-    usage = { requests: ov.requests, successRate: ov.successRate }
-  } catch { /* analytics 不可用 */ }
-
   return c.json<ApiResponse>({
     success: true,
     data: {
-      checkin: { checkedIn, totalAccounts, remain, size },
+      // 今日签到进度是跨产品族的总口径（三族相加），额度则各归各族
+      checkin: {
+        checkedIn: workbuddy.checkedIn + qoder.checkedIn + traeCheckedIn,
+        totalAccounts: workbuddy.checkinAccounts + qoder.checkinAccounts + traeAccounts,
+      },
+      workbuddy: { remain: workbuddy.remain, size: workbuddy.size, accounts: workbuddy.accounts },
+      qoder: { remain: qoder.remain, size: qoder.size, accounts: qoder.accounts },
       trae: {
         remain: traeRemain, size: traeSize, accounts: traeAccounts,
         soloRemain: traeSoloRemain, workRemain: traeWorkRemain,
       },
-      usage,
     },
   })
 }
