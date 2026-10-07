@@ -312,9 +312,21 @@ label, legend { color: var(--color-ink-2); font-size: var(--text-xs); font-weigh
 .admin-metrics > div { min-width: 0; padding: var(--space-sm); border-inline-end: .0625rem solid var(--color-rule); border-block-end: .0625rem solid var(--color-rule); }
 .admin-metrics > div:nth-child(even) { border-inline-end: 0; }
 .admin-metrics > div:nth-child(n+3) { border-block-end: 0; }
+/* 第 3 格（转发 Key）在窄屏独占一行，避免 3 格塞 2 列时留半格空位 */
+.admin-metrics > div:nth-child(3) { grid-column: 1 / -1; border-inline-end: 0; }
 .admin-metrics > div > span:not(.status-dot) { color: var(--color-ink); font-family: var(--font-display); font-size: var(--text-xl); font-weight: 600; line-height: 1; }
 .admin-metrics p { margin-block-start: var(--space-xs); color: var(--color-ink); font-weight: 600; }
 .admin-metrics small { color: var(--color-muted); font-size: var(--text-xs); }
+/* 概览：7 天内到期积分明细（每渠道一行；替代原「已配置 / 存储 Cloudflare KV」展示格） */
+.admin-expiring { margin-block-start: var(--space-sm); padding: var(--space-sm); border: .0625rem solid var(--color-rule); border-radius: var(--radius-panel); background: var(--color-paper); }
+.admin-expiring[hidden] { display: none; }
+.admin-expiring__head { display: flex; flex-wrap: wrap; align-items: baseline; justify-content: space-between; gap: var(--space-3xs) var(--space-sm); }
+.admin-expiring__head p { color: var(--color-ink); font-weight: 600; font-size: var(--text-xs); }
+.admin-expiring__head small { color: var(--color-muted); font-size: var(--text-xs); }
+.admin-expiring__row { min-width: 0; margin-block-start: var(--space-3xs); display: grid; grid-template-columns: minmax(0, 1fr) auto auto; align-items: baseline; gap: var(--space-xs); font-size: var(--text-xs); }
+.admin-expiring__row > span { min-width: 0; color: var(--color-ink-2); overflow-wrap: anywhere; }
+.admin-expiring__row > b { color: var(--color-ink); font-family: var(--font-display); font-size: var(--text-sm); font-weight: 600; }
+.admin-expiring__row > i { min-width: 4.25rem; color: var(--color-warn-ink); font-style: normal; text-align: end; }
 .workspace-section { margin-block-start: var(--space-xl); }
 /* P2：概览驾驶舱聚合 KPI 卡片（额度/签到/调用量/成功率 + 进度条） */
 .overview-kpi { margin-block-start: var(--space-sm); display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: var(--space-xs); }
@@ -458,10 +470,11 @@ label, legend { color: var(--color-ink-2); font-size: var(--text-xs); font-weigh
   .admin-content { padding-inline: var(--space-lg); }
   .admin-heading, .section-heading--admin { grid-template-columns: minmax(0, 1fr) auto; }
   .admin-heading__actions { justify-content: flex-end; }
-  .admin-metrics { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+  .admin-metrics { grid-template-columns: repeat(3, minmax(0, 1fr)); }
   .overview-kpi { grid-template-columns: repeat(4, minmax(0, 1fr)); }
   .admin-metrics > div { border-block-end: 0; }
   .admin-metrics > div:nth-child(even) { border-inline-end: .0625rem solid var(--color-rule); }
+  .admin-metrics > div:nth-child(3) { grid-column: auto; }
   .admin-metrics > div:last-child { border-inline-end: 0; }
   .panel-actions, .detail-actions { flex-direction: row; align-items: center; justify-content: space-between; }
   .ki { flex-direction: row; align-items: center; justify-content: space-between; }

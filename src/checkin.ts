@@ -33,8 +33,15 @@ import {
 } from './qoder/pool'
 import { isTraeProvider } from './trae/proxy'
 import { runTraeCheckins, readTraeCheckinResults } from './trae/admin'
-import { listTraeStatus } from './trae/pool'
+import { listTraeStatus, packExpireAtMs } from './trae/pool'
 import type { TraeCheckinResult } from './trae/types'
+import {
+  packageExpiryEntry,
+  summarizeExpiringAt,
+  CREDIT_EXPIRY_WINDOW_MS,
+  type CreditExpiryEntry,
+  type ExpiringCreditSummary,
+} from './credit-expiry'
 import {
   isOAuthPoolProvider,
   readOauthPool,
@@ -1115,6 +1122,13 @@ interface CheckinFamilyQuota {
   remain: number
   /** 额度池合计（逐账号 totalSize 累加） */
   size: number
+  /**
+   * 7 天窗口内到期且仍有剩余的积分，**按域拆开**：国内版与国际版是两套账号、
+   * 两个独立积分池，合并成一个数看不出该去哪个账号救火（与签到族拆分同理）。
+   */
+  expiringCn: ExpiringCreditSummary
+  /** 国际版（realm=global）账号窗口内到期的积分 */
+  expiringGlobal: ExpiringCreditSummary
 }
 
 /**
@@ -1124,9 +1138,19 @@ interface CheckinFamilyQuota {
  * skip 账号（国际版 / 无 token）不计入签到分子分母——它们结构上签不成，计入会让
  * 「今日签到」永不达标；但额度仍要累加（国际版账号照样消耗额度池），账号数也照算
  * （否则只有国际版账号的产品族会被额度卡误判成「无账号」）。
+ *
+ * 顺带把各账号 `packages`（上次签到/额度探测落盘的权益包明细）汇成「7 天内到期」汇总，
+ * 供概览明细卡按渠道列出待作废积分——挑号用的是同一份 `isExpiringEntry` 口径。
+ * 到期条目按账号 `realm` 分桶（国内 / 国际版），因为那是两个互不相干的积分池。
  */
-async function aggregateCheckinFamily(env: Env, familyProviders: readonly Provider[]): Promise<CheckinFamilyQuota> {
-  const out: CheckinFamilyQuota = { accounts: 0, checkinAccounts: 0, checkedIn: 0, remain: 0, size: 0 }
+async function aggregateCheckinFamily(env: Env, familyProviders: readonly Provider[], now: number): Promise<CheckinFamilyQuota> {
+  const out: CheckinFamilyQuota = {
+    accounts: 0, checkinAccounts: 0, checkedIn: 0, remain: 0, size: 0,
+    expiringCn: { amount: 0, soonestAt: null, packs: 0 },
+    expiringGlobal: { amount: 0, soonestAt: null, packs: 0 },
+  }
+  const entriesCn: CreditExpiryEntry[] = []
+  const entriesGlobal: CreditExpiryEntry[] = []
   for (const p of familyProviders) {
     const r = await readCheckinResult(env, p.id)
     if (!r) continue
@@ -1139,10 +1163,30 @@ async function aggregateCheckinFamily(env: Env, familyProviders: readonly Provid
       }
       if (typeof a.totalRemain === 'number') out.remain += a.totalRemain
       if (typeof a.totalSize === 'number') out.size += a.totalSize
+      // realm 为 unknown 的一律并入国内桶：只有显式 global 才说明是海外域账号
+      const bucket = a.realm === 'global' ? entriesGlobal : entriesCn
+      for (const pkg of a.packages || []) bucket.push(packageExpiryEntry(pkg))
     }
   }
+  out.expiringCn = summarizeExpiringAt(entriesCn, now)
+  out.expiringGlobal = summarizeExpiringAt(entriesGlobal, now)
   return out
 }
+
+/** 概览「7 天内到期积分」明细的一行（一个独立的积分池）。 */
+export interface ExpiringChannel {
+  /** 稳定标识：workbuddy / workbuddy-global / qoder / qoder-global / trae-solo / trae-work */
+  key: string
+  /** 展示名：WorkBuddy / WorkBuddy 国际版 / QoderWork / TRAE SOLO / TRAE Work */
+  label: string
+  /** 该渠道窗口内到期且仍有剩余的积分合计 */
+  amount: number
+  /** 该渠道最早到期时刻 epoch ms */
+  soonestAt: number
+  /** 计入的权益包条数 */
+  packs: number
+}
+
 
 /**
  * GET /admin/api/overview：概览驾驶舱聚合数据（P2）。
@@ -1151,19 +1195,28 @@ async function aggregateCheckinFamily(env: Env, familyProviders: readonly Provid
  *
  * 额度按产品族分开返回：原先合并成一个数会让「WorkBuddy 可用额度」卡片把
  * QoderWork 账号的额度也算进去（标签与数字不符，且用户无法对账）。
+ *
+ * `expiring` 是「7 天内到期积分」明细（每个独立积分池一行：产品族 × 域，TRAE 按 SOLO/Work
+ * 双通道拆），数据源与挑号优先级判定同源：WorkBuddy/QoderWork 取签到快照的 `packages`
+ * （CST 墙钟到期），TRAE 取账号池 `packs`（Unix 秒到期）。两者都由「上次签到/积分探测」
+ * 写入，因此是**快照时点**的值，不是此刻实时值。
  */
 export async function handleAdminOverview(c: Context<{ Bindings: Env }>) {
+  const now = Date.now()
   const providers = (await getProviders(c.env)) as Provider[]
 
   const checkinProviders = providers.filter(participatesInCheckin)
-  const workbuddy = await aggregateCheckinFamily(c.env, checkinProviders.filter((p) => !isQoderFlow(p)))
-  const qoder = await aggregateCheckinFamily(c.env, checkinProviders.filter((p) => isQoderFlow(p)))
+  const workbuddy = await aggregateCheckinFamily(c.env, checkinProviders.filter((p) => !isQoderFlow(p)), now)
+  const qoder = await aggregateCheckinFamily(c.env, checkinProviders.filter((p) => isQoderFlow(p)), now)
 
   // TRAE SOLO：账号级签到结果与面板「今日签到」列同源；额度取账号池双通道合计
   // （SOLO 通用 + Work 专属）。只看 Work 会在没有 Work 权益包的账号上恒显 0——
   // 账号池里 credits/workCredits 由积分探测写入，两者互不替代。
+  // 到期明细同样按通道分开统计：两个通道各烧各的包，混在一起看不出是哪个通道要作废。
   let traeRemain = 0, traeSize = 0, traeAccounts = 0, traeSoloRemain = 0, traeWorkRemain = 0
   let traeCheckedIn = 0
+  const traeSoloEntries: CreditExpiryEntry[] = []
+  const traeWorkEntries: CreditExpiryEntry[] = []
   for (const p of providers.filter((x) => isTraeProvider(x))) {
     const results = await readTraeCheckinResults(c.env, p.id)
     const doneUids = new Set(results.filter((r) => r.checkedIn).map((r) => r.uid))
@@ -1176,9 +1229,33 @@ export async function handleAdminOverview(c: Context<{ Bindings: Env }>) {
       traeSoloRemain += solo
       traeWorkRemain += work
       traeRemain += solo + work
-      for (const pack of a.packs || []) traeSize += pack.limit
+      for (const pack of a.packs || []) {
+        traeSize += pack.limit
+        const entry: CreditExpiryEntry = {
+          expireAt: packExpireAtMs(pack),
+          remain: typeof pack.rem === 'number' ? pack.rem : 0,
+        }
+        if (pack.isWork === true) traeWorkEntries.push(entry)
+        else traeSoloEntries.push(entry)
+      }
     }
   }
+
+  // 明细只列「确实有积分快作废」的池；空的池不占行（面板另有整体空态文案兜底）。
+  const expiringChannels: ExpiringChannel[] = []
+  const pushChannel = (key: string, label: string, s: ExpiringCreditSummary) => {
+    if (s.amount > 0 && s.soonestAt !== null) {
+      expiringChannels.push({ key, label, amount: s.amount, soonestAt: s.soonestAt, packs: s.packs })
+    }
+  }
+  pushChannel('workbuddy', 'WorkBuddy', workbuddy.expiringCn)
+  pushChannel('workbuddy-global', 'WorkBuddy 国际版', workbuddy.expiringGlobal)
+  pushChannel('qoder', 'QoderWork', qoder.expiringCn)
+  pushChannel('qoder-global', 'QoderWork 国际版', qoder.expiringGlobal)
+  pushChannel('trae-solo', 'TRAE SOLO', summarizeExpiringAt(traeSoloEntries, now))
+  pushChannel('trae-work', 'TRAE Work', summarizeExpiringAt(traeWorkEntries, now))
+  // 到期越早越优先处理
+  expiringChannels.sort((a, b) => a.soonestAt - b.soonestAt)
 
   return c.json<ApiResponse>({
     success: true,
@@ -1193,6 +1270,13 @@ export async function handleAdminOverview(c: Context<{ Bindings: Env }>) {
       trae: {
         remain: traeRemain, size: traeSize, accounts: traeAccounts,
         soloRemain: traeSoloRemain, workRemain: traeWorkRemain,
+      },
+      // 7 天内到期积分明细：total/soonestAt 为跨渠道合计，channels 为逐渠道行
+      expiring: {
+        windowDays: CREDIT_EXPIRY_WINDOW_MS / 86400000,
+        total: expiringChannels.reduce((sum, ch) => sum + ch.amount, 0),
+        soonestAt: expiringChannels.length > 0 ? expiringChannels[0].soonestAt : null,
+        channels: expiringChannels,
       },
     },
   })

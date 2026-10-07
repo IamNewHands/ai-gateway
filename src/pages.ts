@@ -631,8 +631,9 @@ ${H('管理')}
           <div><span>${providers.length}</span><p>提供商</p><small>${enabledProvidersCount} 个已启用</small></div>
           <div><span>${modelsCount}</span><p>模型</p><small>${enabledModelsCount} 个可用</small></div>
           <div><span>${proxyKeys.length}</span><p>转发 Key</p><small>${enabledProxyKeysCount} 个可用</small></div>
-          <div><span class="status-dot status-dot--online"><i aria-hidden="true"></i>已配置</span><p>存储</p><small>Cloudflare KV</small></div>
         </div>
+        <!-- 7 天内到期积分明细（替代原「已配置 / 存储 Cloudflare KV」卡片，客户端拉 /admin/api/overview 填充） -->
+        <div id="overview-expiring" class="admin-expiring" aria-label="7 天内到期积分" hidden></div>
         <!-- P2：概览驾驶舱聚合 KPI（客户端拉取 /admin/api/overview 填充） -->
         <div id="overview-kpi" class="overview-kpi" aria-label="运营概况"></div>
       </section>
@@ -4978,10 +4979,11 @@ window.addEventListener('hashchange', function () {
   if (location.hash === '#m365-accounts') location.replace('#providers')
 })
 
-// P2：概览驾驶舱聚合 KPI —— 拉取 /admin/api/overview 渲染各产品族额度 + 签到进度卡片
+// P2：概览驾驶舱聚合 KPI —— 拉取 /admin/api/overview 渲染各产品族额度 + 签到进度 + 7 天内到期积分
 ;(async function loadOverviewKpi() {
   var root = document.getElementById('overview-kpi')
-  if (!root) return
+  var expRoot = document.getElementById('overview-expiring')
+  if (!root && !expRoot) return
   function kpiCard(value, label, sub, pct) {
     var bar = ''
     if (pct !== null && pct !== undefined) {
@@ -5002,10 +5004,37 @@ window.addEventListener('hashchange', function () {
     }
     return kpiCard('—', label, emptyText, null)
   }
+  // 到期倒计时文案：按自然日向上取整（今天到期 / N 天后）
+  function expireText(ms) {
+    if (typeof ms !== 'number' || !isFinite(ms) || ms <= 0) return ''
+    var d = Math.ceil((ms - Date.now()) / 86400000)
+    return d <= 0 ? '今天到期' : d + ' 天后'
+  }
+  // 7 天内到期积分明细：每个渠道一行（WorkBuddy / QoderWork / TRAE SOLO / TRAE Work）
+  function renderExpiring(ex) {
+    if (!expRoot) return
+    var e = ex || {}
+    var chans = e.channels || []
+    var head = '<div class="admin-expiring__head"><p>7 天内到期积分</p><small>' +
+      (chans.length > 0
+        ? '共 ' + chans.length + ' 个渠道 · 合计 ' + kpiNum(e.total) + ' · 最早 ' + expireText(e.soonestAt)
+        : '暂无：所有渠道 7 天内都没有积分到期') +
+      '</small></div>'
+    var rows = ''
+    for (var i = 0; i < chans.length; i++) {
+      var ch = chans[i] || {}
+      rows += '<div class="admin-expiring__row"><span>' + escapeHtml(ch.label) + '</span><b>' +
+        kpiNum(ch.amount) + '</b><i>' + expireText(ch.soonestAt) + '</i></div>'
+    }
+    expRoot.title = '数据来自各账号最近一次签到 / 积分探测（非实时），统计窗口 ' + (e.windowDays || 7) + ' 天'
+    expRoot.innerHTML = head + rows
+    expRoot.hidden = false
+  }
   try {
     var r = await fetch('/admin/api/overview')
     var d = await r.json()
     if (!d.success || !d.data) return
+    renderExpiring(d.data.expiring)
     var ck = d.data.checkin || {}
     var ckTotal = ck.totalAccounts || 0
     var html = ''
@@ -5025,7 +5054,7 @@ window.addEventListener('hashchange', function () {
     } else {
       html += kpiCard('—', '今日签到', '暂无签到数据', null)
     }
-    root.innerHTML = html
+    if (root) root.innerHTML = html
   } catch (e) { /* 聚合接口失败保持空白，不打扰配置统计展示 */ }
 })()
 

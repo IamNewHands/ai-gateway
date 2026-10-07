@@ -19,7 +19,9 @@ vi.mock('./storage', () => ({
 }))
 
 import { handleAdminOverview } from './checkin'
+import { formatCstWallClock } from './credit-expiry'
 
+const DAY = 24 * 60 * 60 * 1000
 const TRAE_BASE_URL = 'https://trae-api-cn.mchost.guru'
 
 function workbuddyProvider(id: string): Provider {
@@ -82,7 +84,18 @@ async function overview(env: Env) {
     workbuddy: { remain: number; size: number; accounts: number }
     qoder: { remain: number; size: number; accounts: number }
     trae: { remain: number; size: number; accounts: number; soloRemain: number; workRemain: number }
+    expiring: {
+      windowDays: number
+      total: number
+      soonestAt: number | null
+      channels: { key: string; label: string; amount: number; soonestAt: number; packs: number }[]
+    }
   }
+}
+
+/** WorkBuddy/Qoder 权益包：expireAt 为 CST 墙钟字符串（上游口径），daysFromNow 为到期倒计时 */
+function pkg(daysFromNow: number, size: number, used: number, name = '包') {
+  return { name, expireAt: formatCstWallClock(Date.now() + daysFromNow * DAY)!, size, used }
 }
 
 /** WorkBuddy 池账号签到结果条目 */
@@ -249,5 +262,130 @@ describe('handleAdminOverview：额度按产品族分开', () => {
     getProvidersMock.mockResolvedValue([workbuddyProvider('wb_only')])
     const d = await overview(makeEnv())
     expect(d.qoder).toEqual({ remain: 0, size: 0, accounts: 0 })
+  })
+})
+
+describe('handleAdminOverview：7 天内到期积分明细', () => {
+  it('WorkBuddy 只算窗口内、仍有剩余的包（窗口外与已用尽都不进明细）', async () => {
+    const now = Date.now()
+    const env = makeEnv({
+      'checkin:result:wb_exp': JSON.stringify({
+        providerId: 'wb_exp', name: 'wb_exp', realm: 'cn', success: true, reason: 'ok',
+        message: '', todayCheckedIn: true, updatedAt: now,
+        accounts: [{
+          ...acc('u1', 'ok', true, 500, 900),
+          packages: [
+            pkg(3, 200, 100),        // 窗口内，剩 100 → 计入
+            pkg(6, 300, 250),        // 窗口内，剩 50 → 计入
+            pkg(9, 800, 0),          // 窗口外 → 不计
+            pkg(2, 400, 400),        // 已用尽 → 不计
+            { name: '长期', expireAt: '', size: 999, used: 0 },  // 无到期时间 → 不计
+          ],
+        }],
+      }),
+    })
+    getProvidersMock.mockResolvedValue([workbuddyProvider('wb_exp')])
+
+    const d = await overview(env)
+    expect(d.expiring.windowDays).toBe(7)
+    expect(d.expiring.total).toBe(150)
+    expect(d.expiring.channels).toHaveLength(1)
+    expect(d.expiring.channels[0].key).toBe('workbuddy')
+    expect(d.expiring.channels[0].label).toBe('WorkBuddy')
+    expect(d.expiring.channels[0].amount).toBe(150)
+    expect(d.expiring.channels[0].packs).toBe(2)
+    // 最早到期取窗口内那两条里更早的（3 天）
+    expect(d.expiring.channels[0].soonestAt).toBeGreaterThan(now + 2.5 * DAY)
+    expect(d.expiring.channels[0].soonestAt).toBeLessThan(now + 3.5 * DAY)
+    expect(d.expiring.soonestAt).toBe(d.expiring.channels[0].soonestAt)
+  })
+
+  it('QoderWork 的到期包归 qoder 行，不混进 WorkBuddy 行', async () => {
+    const env = makeEnv({
+      'checkin:result:wb_mix': JSON.stringify({
+        providerId: 'wb_mix', name: 'wb_mix', realm: 'cn', success: true, reason: 'ok',
+        message: '', todayCheckedIn: true, updatedAt: Date.now(),
+        accounts: [{ ...acc('wb1', 'ok', true, 100, 200), packages: [pkg(2, 100, 0)] }],
+      }),
+      'checkin:result:q_mix': JSON.stringify({
+        providerId: 'q_mix', name: 'q_mix', realm: 'cn', success: true, reason: 'ok',
+        message: '', todayCheckedIn: true, updatedAt: Date.now(),
+        accounts: [{ ...acc('q1', 'ok', true, 60, 160), packages: [pkg(4, 60, 0)] }],
+      }),
+    })
+    getProvidersMock.mockResolvedValue([workbuddyProvider('wb_mix'), qoderProvider('q_mix')])
+
+    const d = await overview(env)
+    expect(d.expiring.total).toBe(160)
+    // 排在前面的是更早到期的 WorkBuddy（2 天 < 4 天）
+    expect(d.expiring.channels.map((c) => c.key)).toEqual(['workbuddy', 'qoder'])
+    expect(d.expiring.channels[0].amount).toBe(100)
+    expect(d.expiring.channels[1].amount).toBe(60)
+    expect(d.expiring.channels[1].label).toBe('QoderWork')
+  })
+
+  it('TRAE 按 SOLO / Work 双通道分行（各自烧各自的包）', async () => {
+    const nowSec = Math.floor(Date.now() / 1000)
+    const env = makeEnv({
+      'trae:pool:trae_exp': JSON.stringify({
+        u_a: {
+          credits: 100, workCredits: 20, disabled: false, until: 0, errCount: 0,
+          packs: [
+            // SOLO 包 5 天后到期，剩 50
+            { name: 'SOLO', limit: 500, used: 450, rem: 50, isWork: false, expireAt: nowSec + 5 * 86400 },
+            // Work 包 1 天后到期，剩 20
+            { name: 'Work', limit: 100, used: 80, rem: 20, isWork: true, expireAt: nowSec + 86400 },
+            // 窗口外（30 天）不计
+            { name: 'SOLO 长期', limit: 900, used: 0, rem: 900, isWork: false, expireAt: nowSec + 30 * 86400 },
+          ],
+        },
+      }),
+    })
+    getProvidersMock.mockResolvedValue([traeProvider('trae_exp', ['u_a'])])
+
+    const d = await overview(env)
+    // Work 通道 1 天后到期 → 排在 SOLO 之前
+    expect(d.expiring.channels.map((c) => c.key)).toEqual(['trae-work', 'trae-solo'])
+    expect(d.expiring.channels[0].label).toBe('TRAE Work')
+    expect(d.expiring.channels[0].amount).toBe(20)
+    expect(d.expiring.channels[1].label).toBe('TRAE SOLO')
+    expect(d.expiring.channels[1].amount).toBe(50)
+    expect(d.expiring.total).toBe(70)
+  })
+
+  it('国内版与国际版是两套账号池 → 各自一行，不合并成一个数', async () => {
+    const env = makeEnv({
+      'checkin:result:wb_pool': JSON.stringify({
+        providerId: 'wb_pool', name: 'wb_pool', realm: 'cn', success: true, reason: 'ok',
+        message: '', todayCheckedIn: true, updatedAt: Date.now(),
+        accounts: [
+          { ...acc('u_cn', 'ok', true, 500, 900), packages: [pkg(6, 300, 100)] },        // 国内剩 200
+          { ...acc('u_g', 'skipped_global', false, 80, 300), packages: [pkg(1, 200, 120)] }, // 国际版剩 80
+        ],
+      }),
+    })
+    getProvidersMock.mockResolvedValue([workbuddyProvider('wb_pool')])
+
+    const d = await overview(env)
+    // 国际版先到期（1 天 < 6 天）→ 排前面
+    expect(d.expiring.channels.map((c) => c.key)).toEqual(['workbuddy-global', 'workbuddy'])
+    expect(d.expiring.channels[0].label).toBe('WorkBuddy 国际版')
+    expect(d.expiring.channels[0].amount).toBe(80)
+    expect(d.expiring.channels[1].amount).toBe(200)
+    expect(d.expiring.total).toBe(280)
+  })
+
+  it('窗口内没有到期积分 → 明细为空且 total=0（面板据此显示空态而非消失）', async () => {
+    const env = makeEnv({
+      'checkin:result:wb_none': JSON.stringify({
+        providerId: 'wb_none', name: 'wb_none', realm: 'cn', success: true, reason: 'ok',
+        message: '', todayCheckedIn: true, updatedAt: Date.now(),
+        accounts: [{ ...acc('u1', 'ok', true, 100, 200), packages: [pkg(20, 100, 0)] }],
+      }),
+    })
+    getProvidersMock.mockResolvedValue([workbuddyProvider('wb_none')])
+
+    const d = await overview(env)
+    expect(d.expiring).toEqual({ windowDays: 7, total: 0, soonestAt: null, channels: [] })
   })
 })

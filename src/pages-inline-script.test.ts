@@ -1095,3 +1095,94 @@ describe('厂商预设下拉必须包含 deepseek-app（添加入口不可缺失
     expect(js).toContain('https://chat.deepseek.com')
   })
 })
+
+/**
+ * 概览顶部「7 天内到期积分」明细卡（替代原「已配置 / 存储 Cloudflare KV」展示格）。
+ *
+ * 为什么直接跑客户端代码：这块是**异步渲染**的——服务端只给空容器，行由
+ * loadOverviewKpi 拉 /admin/api/overview 后写进去。语法检查与「函数存在」断言都看不出
+ * 「接口字段名写错 / 容器 id 对不上 / 空态没兜底」这类错，而那正是用户唯一能看见的部分。
+ */
+describe('概览「7 天内到期积分」明细卡（DOM 替身驱动客户端渲染）', () => {
+  /** 抠出 loadOverviewKpi IIFE，注入 document/fetch 替身跑一遍，返回被写入的元素。 */
+  async function runKpi(payload: unknown) {
+    const js = inlineScripts(await render([traeProvider()])).join('\n')
+    const m = js.match(/;\(async function loadOverviewKpi\(\) \{[\s\S]*?\n\}\)\(\)/)
+    if (!m) throw new Error('未找到 loadOverviewKpi：概览 KPI 客户端脚本被删除或改名了？')
+    const els: Record<string, any> = {
+      'overview-kpi': { innerHTML: '' },
+      'overview-expiring': { innerHTML: '', hidden: true, title: '' },
+    }
+    const documentStub = { getElementById: (id: string) => els[id] ?? null }
+    const fetchStub = () => Promise.resolve({ json: async () => payload })
+    const factory = new Function(
+      'document', 'fetch', 'escapeHtml',
+      m[0] + '\nreturn new Promise(function (res) { setTimeout(res, 0) })'
+    )
+    await factory(documentStub, fetchStub, (s: unknown) => String(s == null ? '' : s))
+    return els
+  }
+
+  const data = (expiring: unknown) => ({
+    success: true,
+    data: {
+      checkin: { checkedIn: 2, totalAccounts: 2 },
+      workbuddy: { remain: 8151, size: 18747, accounts: 2 },
+      qoder: { remain: 895, size: 1300, accounts: 2 },
+      trae: { remain: 187, size: 1199, accounts: 2, soloRemain: 107, workRemain: 80 },
+      expiring,
+    },
+  })
+
+  it('每个渠道一行：渠道名 + 额度 + 到期倒计时，且容器从 hidden 转可见', async () => {
+    const soon = Date.now() + 3 * 24 * 60 * 60 * 1000
+    const els = await runKpi(data({
+      windowDays: 7, total: 170, soonestAt: soon,
+      channels: [
+        { key: 'trae-work', label: 'TRAE Work', amount: 20, soonestAt: Date.now() + 24 * 60 * 60 * 1000, packs: 1 },
+        { key: 'workbuddy', label: 'WorkBuddy', amount: 150, soonestAt: soon, packs: 2 },
+      ],
+    }))
+    const html = els['overview-expiring'].innerHTML
+    expect(els['overview-expiring'].hidden).toBe(false)
+    // 两个渠道都要列出来（用户要的就是「这几个渠道的都列出来」）
+    expect(html).toContain('TRAE Work')
+    expect(html).toContain('WorkBuddy')
+    expect(html).toContain('150')
+    expect(html).toContain('20')
+    // 倒计时按自然日向上取整
+    expect(html).toContain('1 天后')
+    expect(html).toContain('3 天后')
+    // 表头给出跨渠道合计与最早到期
+    expect(html).toContain('7 天内到期积分')
+    expect(html).toContain('共 2 个渠道')
+    expect(html).toContain('合计 170')
+  })
+
+  it('窗口内没有到期积分：卡片保留并说明「暂无」（不能整块消失，否则分不清是坏了还是没数据）', async () => {
+    const els = await runKpi(data({ windowDays: 7, total: 0, soonestAt: null, channels: [] }))
+    const html = els['overview-expiring'].innerHTML
+    expect(els['overview-expiring'].hidden).toBe(false)
+    expect(html).toContain('7 天内到期积分')
+    expect(html).toContain('暂无')
+    expect(html).not.toContain('admin-expiring__row')
+  })
+
+  it('额度卡的容器不被这次改动破坏（同一份响应仍渲染 4 张卡）', async () => {
+    const els = await runKpi(data({ windowDays: 7, total: 0, soonestAt: null, channels: [] }))
+    const html = els['overview-kpi'].innerHTML
+    expect(html).toContain('WorkBuddy 可用额度')
+    expect(html).toContain('QoderWork 可用额度')
+    expect(html).toContain('TRAE 可用额度')
+    expect(html).toContain('今日签到')
+  })
+
+  it('静态 HTML 里已删除「已配置 / 存储 / Cloudflare KV」展示格，改挂到期容器', async () => {
+    const html = await render([traeProvider()])
+    expect(html).toContain('id="overview-expiring"')
+    expect(html).not.toContain('<p>存储</p>')
+    expect(html).not.toContain('>Cloudflare KV<')
+    // 样式必须在同一份页面 CSS 里（否则明细行会挤成一行文本）
+    expect(html).toMatch(/\.admin-expiring__row[^{]*\{[^}]*grid-template-columns/)
+  })
+})

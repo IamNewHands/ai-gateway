@@ -12,6 +12,7 @@ import {
   parseCstWallClock,
   soonestExpiringAt,
   soonestPackageExpiryAt,
+  summarizeExpiringAt,
   type CreditExpiryEntry,
 } from './credit-expiry'
 import type { PackageInfo } from './types'
@@ -133,5 +134,47 @@ describe('soonestPackageExpiryAt：PackageInfo 形态（workbuddy / qoder 共用
       remain: 0,
     })
     expect(packageExpiryEntry({ name: 'x', expireAt: '', size: 10, used: 3 })).toEqual({ expireAt: null, remain: 7 })
+  })
+})
+
+describe('summarizeExpiringAt：明细面板用的窗口内到期汇总', () => {
+  const now = Date.UTC(2026, 8, 1, 0, 0, 0)
+  const entry = (expireAt: number | null, remain: number): CreditExpiryEntry => ({ expireAt, remain })
+
+  it('合计窗口内且有剩余的额度，并给出最早到期时刻与包数', () => {
+    const s = summarizeExpiringAt([entry(now + 5 * DAY, 30), entry(now + 2 * DAY, 70), entry(now + 1 * DAY, 1)], now)
+    expect(s).toEqual({ amount: 101, soonestAt: now + 1 * DAY, packs: 3 })
+  })
+
+  it('与 soonestExpiringAt 同口径：窗口外 / 已过期 / 已用尽 / 长期 一律不计', () => {
+    const s = summarizeExpiringAt(
+      [
+        entry(now + CREDIT_EXPIRY_WINDOW_MS + 1, 999),  // 窗口外
+        entry(now - DAY, 999),                          // 已过期
+        entry(now + DAY, 0),                            // 已用尽
+        entry(null, 999),                               // 长期有效
+        entry(0, 999),                                  // 未知
+        entry(now + 3 * DAY, 12),                       // 唯一计入
+      ],
+      now
+    )
+    expect(s).toEqual({ amount: 12, soonestAt: now + 3 * DAY, packs: 1 })
+  })
+
+  it('边界包：正好 7 天后到期计入；空输入 → 全 0（面板据此显示空态）', () => {
+    expect(summarizeExpiringAt([entry(now + CREDIT_EXPIRY_WINDOW_MS, 5)], now)).toEqual({
+      amount: 5,
+      soonestAt: now + CREDIT_EXPIRY_WINDOW_MS,
+      packs: 1,
+    })
+    expect(summarizeExpiringAt([], now)).toEqual({ amount: 0, soonestAt: null, packs: 0 })
+    expect(summarizeExpiringAt(null, now)).toEqual({ amount: 0, soonestAt: null, packs: 0 })
+    expect(summarizeExpiringAt(undefined, now)).toEqual({ amount: 0, soonestAt: null, packs: 0 })
+  })
+
+  it('窗口可覆盖（与 soonestExpiringAt 同步收窄）', () => {
+    const entries = [entry(now + 3 * DAY, 40), entry(now + 5 * DAY, 60)]
+    expect(summarizeExpiringAt(entries, now, 2 * DAY)).toEqual({ amount: 0, soonestAt: null, packs: 0 })
+    expect(summarizeExpiringAt(entries, now, 4 * DAY)).toEqual({ amount: 40, soonestAt: now + 3 * DAY, packs: 1 })
   })
 })

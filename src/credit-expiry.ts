@@ -107,13 +107,27 @@ export function soonestPackageExpiryAt(
 }
 
 /**
- * 「窗口期内到期且仍有剩余」的最早到期时刻（epoch ms）；没有则 null。
+ * 单条是否属于「窗口期内到期且仍有剩余」——**四条排除口径的唯一定义处**。
  *
- * 排除口径（四条都必须满足才计入）：
  *  - expireAt 为有限正数（长期/未知不参与——它们本来就不过期，无需救）；
  *  - expireAt **大于** now（已过期包不可再用，不参与）；
  *  - expireAt **不晚于** now + windowMs（窗口边界含等号：正好 7 天后到期算窗口内）；
  *  - remain > 0（已用尽的包不参与，避免把空包当成"即将作废的积分"）。
+ *
+ * `soonestExpiringAt`（挑号用）与 `summarizeExpiringAt`（明细面板用）共用本函数，
+ * 否则两处各写一遍判定，任一处改动都会静默漂移成「面板说 3 天后到期、挑号却不理它」。
+ */
+function isExpiringEntry(e: CreditExpiryEntry | null | undefined, now: number, limit: number): boolean {
+  if (!e) return false
+  const at = e.expireAt
+  if (typeof at !== 'number' || !Number.isFinite(at) || at <= 0) return false
+  if (at <= now || at > limit) return false
+  return e.remain > 0
+}
+
+/**
+ * 「窗口期内到期且仍有剩余」的最早到期时刻（epoch ms）；没有则 null。
+ * 排除口径见 `isExpiringEntry`。
  */
 export function soonestExpiringAt(
   entries: readonly CreditExpiryEntry[] | null | undefined,
@@ -124,12 +138,43 @@ export function soonestExpiringAt(
   const limit = now + windowMs
   let best: number | null = null
   for (const e of entries) {
-    if (!e) continue
-    const at = e.expireAt
-    if (typeof at !== 'number' || !Number.isFinite(at) || at <= 0) continue
-    if (at <= now || at > limit) continue
-    if (!(e.remain > 0)) continue
+    if (!isExpiringEntry(e, now, limit)) continue
+    const at = e.expireAt as number
     if (best === null || at < best) best = at
   }
   return best
+}
+
+/** 窗口期内到期积分的汇总（概览「7 天内到期积分」明细一行）。 */
+export interface ExpiringCreditSummary {
+  /** 窗口内到期且仍有剩余的积分合计；0 = 本渠道窗口内没有待救积分 */
+  amount: number
+  /** 其中最早到期时刻 epoch ms；无 → null */
+  soonestAt: number | null
+  /** 计入的权益包条数 */
+  packs: number
+}
+
+/**
+ * 汇总「窗口期内到期且仍有剩余」的积分：合计额度 + 最早到期时刻 + 包数。
+ *
+ * 与 `soonestExpiringAt` 同源同口径（共用 `isExpiringEntry`），区别只是它把额度加总，
+ * 供概览面板回答「哪些渠道有多少积分快作废了」；挑号仍只需要最早时刻。
+ */
+export function summarizeExpiringAt(
+  entries: readonly CreditExpiryEntry[] | null | undefined,
+  now: number,
+  windowMs: number = CREDIT_EXPIRY_WINDOW_MS
+): ExpiringCreditSummary {
+  const out: ExpiringCreditSummary = { amount: 0, soonestAt: null, packs: 0 }
+  if (!entries || entries.length === 0) return out
+  const limit = now + windowMs
+  for (const e of entries) {
+    if (!isExpiringEntry(e, now, limit)) continue
+    const at = e.expireAt as number
+    out.amount += e.remain
+    out.packs++
+    if (out.soonestAt === null || at < out.soonestAt) out.soonestAt = at
+  }
+  return out
 }
