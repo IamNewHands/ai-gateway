@@ -14,7 +14,7 @@ import type { Env, Provider } from '../types'
 import { withSSEKeepAlive } from '../opencode'
 import { getPerfSettings } from '../perf'
 import { TRAE_DEFAULT_MODEL, TRAE_KEEPALIVE_MS, TRAE_RAW_MAX_HISTORY_CHARS, TRAE_RAW_MAX_MESSAGES, TRAE_RAW_MAX_TOOL_SCHEMA_CHARS, TRAE_STATIC_MODEL_IDS, TRAE_STREAM_IDLE_TIMEOUT_MS, TRAE_WORK_CONSTANTS, isWorkModel, normalizeTraeModelName } from './constants'
-import { chatStream, chatWorkStream, exchangeToken, extractLastUserPrompt, isTraeRequestSideError, needsTraeRefresh, parseAuth, probeTraeCredits } from './upstream'
+import { chatStream, chatWorkStream, exchangeToken, extractLastUserPrompt, isTraeRequestSideError, needsTraeRefresh, parseAuth, probeTraeCredits, type TraeConnectTiming } from './upstream'
 import { isRemoteOnlyModel, type HistoryBudget } from './payload'
 import { aggregateSoloSse, aggregateWorkSse, soloStreamToOpenAIStream, workStreamToOpenAIStream } from './sse'
 import type { SOLOStreamError } from './types'
@@ -262,7 +262,26 @@ function traeClientParamsError(detail: string, httpStatus = 400): Response {
   })
 }
 
-/** HTTP 错误分类 → 冷却状态机（Go chatCompletions status >= 400 分支）。 */
+/**
+ * 连接层失败（网关↔TRAE 上游）落 KV 日志。
+ *
+ * 2026-10-07 定责（DSH 会话 `session-5890068d`）：这类 503 原先**一条日志都不落**，
+ * 面板「系统日志」完全看不到，只能靠翻 DSH 会话记录反推「每次 62s ≈ 2×30s 建连超时」。
+ * 与 cline 的 `[cline-attempt]` 同一纪律：定性字段必须落 KV，否则线上排查只能靠猜。
+ *
+ * 固定字段：`connect=<ms>`（连接阶段实际耗时）、`timeout=<true|false>`（是否被网关
+ * 自己的 30s 定时器掐断）。据此可判：30s 常量是否在误杀「其实 31-60s 才出响应头」
+ * 的合法请求（对照成功路径 `[trae-stream] ... connect=` 的分布），还是上游确实整段不通。
+ */
+function logTraeTransport(env: Env, msg: string): Promise<void> {
+  console.log(msg) // codeql-disable: 纯诊断日志，不含密钥/敏感 token
+  // 有意 await（与 cline `[cline-attempt]` 同口径）：响应返回时日志已落盘，
+  // 避免 isolate 收尾时丢掉这条唯一的定性线索。失败路径本来就是 30s 级，KV 往返可忽略。
+  return writeLog(env, 'warn', msg).catch(() => { /* 日志失败不影响响应 */ })
+}
+
+/**
+ * HTTP 错误分类 → 冷却状态机（Go chatCompletions status >= 400 分支）。 */
 async function applyChatError(env: Env, providerId: string, uid: string, kind: string, cd: TraeCooldownConfig): Promise<void> {
   switch (kind) {
     case 'plan_limit':
@@ -374,8 +393,10 @@ export async function executeWorkRequest(
     }
 
     let resp: Response
+    const timing: TraeConnectTiming = {}
+    const attemptStartedAt = Date.now()
     try {
-      resp = await chatWorkStream(account, workModel, prompt)
+      resp = await chatWorkStream(account, workModel, prompt, timing)
     } catch (e) {
       lastErr = e as Error
       const status = (e as any).status || 0
@@ -387,6 +408,12 @@ export async function executeWorkRequest(
         //「连接层/收尾层失败不是账号故障，禁止罚号」）。换号也没有信息增益——第 2 次
         // 撞的是同一条「网关↔上游建连」，故撞满 MAX_TRANSPORT_ATTEMPTS 即跳出。
         transportAttempts++
+        // Work 侧同口径落 KV：尾部的 503 文案可能带的是 Work 的错误消息，
+        // 少了这条就分不清「SOLO 撞满」还是「Work 也撞了」。
+        await logTraeTransport(env, `[trae-transport] provider=${provider.id} uid=${account.uid} model=${workModel}`
+          + ` phase=work attempt=${transportAttempts}/${MAX_TRANSPORT_ATTEMPTS}`
+          + ` connect=${timing.connectMs ?? -1}ms timeout=${timing.connectTimeout === true}`
+          + ` elapsed=${Date.now() - attemptStartedAt}ms err=${msg.slice(0, 160)}`)
         if (transportAttempts >= MAX_TRANSPORT_ATTEMPTS) break
       } else if (status === 429) {
         await cooldownTraeWorkAccount(env, provider.id, account.uid, cd.softMs, 'work 429 rate limit')
@@ -607,8 +634,11 @@ export async function proxyTraeChatRequest(
     }
 
     let resp: Response
+    // 本次尝试的连接阶段采样：成功路径进 [trae-stream] end= 日志，失败路径进 [trae-transport]。
+    const timing: TraeConnectTiming = {}
+    const attemptStartedAt = Date.now()
     try {
-      resp = await chatStream(account, body)
+      resp = await chatStream(account, body, timing)
     } catch (e) {
       lastErr = e as Error
       const kind = (e as any).kind || 'client'
@@ -630,6 +660,13 @@ export async function proxyTraeChatRequest(
         // 换号没有信息增益：transport 与账号无关（applyChatError 对它刻意不罚号），第 2 次撞的
         // 还是同一条「网关↔上游建连」。撞满 MAX_TRANSPORT_ATTEMPTS 即跳出，不再用健康账号白耗 30s。
         transportAttempts++
+        // 每次连接层失败都落 KV：`connect` 与实际耗时对比 `timeout` 标记，即可区分
+        // 「我们掐的 30s 建连超时」与「上游/网络自己断的」；改超时常量前先看这条日志。
+        await logTraeTransport(env, `[trae-transport] provider=${provider.id} uid=${account.uid} model=${configName}`
+          + ` phase=solo attempt=${transportAttempts}/${MAX_TRANSPORT_ATTEMPTS}`
+          + ` connect=${timing.connectMs ?? -1}ms timeout=${timing.connectTimeout === true}`
+          + ` elapsed=${Date.now() - attemptStartedAt}ms`
+          + ` err=${((e as Error).message || String(e)).slice(0, 160)}`)
         // Work 兜底只试一次：Work 侧同样撞「网关↔上游建连」，试过就不再重复（跳出后函数末尾
         // 也会按 workFallbackTried 跳过），否则同一条链路会被撞两轮、等待被放大成 2×。
         if (!hasTools && !workFallbackTried) {
@@ -710,7 +747,9 @@ export async function proxyTraeChatRequest(
           // idle 说明上游长时间无数据被 idle 兜底；complete 则是上游正常收尾。
           const secs = Math.round((Date.now() - startedAt) / 1000)
           const errInfo = lastSoloErr ? ` errCode=${lastSoloErr.code} errMsg=${lastSoloErr.msg}` : ''
-          const msg = `[trae-stream] provider=${provider.id} uid=${account.uid} model=${configName} end=${reason} duration=${secs}s${errInfo}`
+          // connect= 是「建连+响应头」耗时：成功样本的分布是判断 30s 常量是否过紧的唯一依据
+          // （若成功样本长期贴着 20-29s，说明临界；若普遍 <10s，则 30s 不是瓶颈）。
+          const msg = `[trae-stream] provider=${provider.id} uid=${account.uid} model=${configName} end=${reason} duration=${secs}s connect=${timing.connectMs ?? -1}ms${errInfo}`
           console.log(msg) // codeql-disable: 纯诊断日志，不含密钥/敏感 token
           writeLog(env, 'info', msg).catch(() => { /* 日志失败不影响流 */ })
           // 流真正结束后释放会话占用（只在 acquire 过时实际减计数；release 幂等）
@@ -799,6 +838,11 @@ export async function proxyTraeChatRequest(
   // TRAE_CHAT_CONNECT_TIMEOUT_MS），且 520ms 后重试即成功（池子健康）。
   // 仍用 503（客户端按可重试 5xx 处理，不变），只把 code/文案改成真因。
   if ((lastErr as any)?.kind === 'transport') {
+    // 聚合结论行：与每条尝试的 [trae-transport] 配对（同 cline `[cline-attempt]` 口径），
+    // 面板搜一次即可看到「这次请求总共撞了几次、有没有试过 Work 兜底」。
+    await logTraeTransport(env, `[trae-transport] provider=${provider.id} model=${configName}`
+      + ` end=503 upstream_unreachable attempts=${transportAttempts} tools=${hasTools} workFallback=${workFallbackTried}`
+      + ` err=${(lastErr?.message || '').slice(0, 160)}`)
     return openaiError(
       503,
       'upstream_unreachable',

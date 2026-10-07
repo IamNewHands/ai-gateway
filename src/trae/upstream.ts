@@ -650,17 +650,36 @@ export async function fetchUserEntUsageDetails(account: TraeAccount): Promise<Tr
 // ===== 对话（llm_utils_chat） =====
 
 /**
+ * 连接阶段（fetch 发起 → 收到响应头）耗时采样。由调用方传入，用于把
+ * 「30s 建连超时」写进 KV 日志/错误文案——2026-10-07 定责发现这类 503 原先
+ * 只有一句含糊的 `The operation was aborted`，且在面板上完全不可见。
+ */
+export interface TraeConnectTiming {
+  /** 本次连接阶段实际耗时 ms（成功=到响应头；失败=已等待时长） */
+  connectMs?: number
+  /** true = 到点被网关自己的 TRAE_CHAT_CONNECT_TIMEOUT_MS 掐断，而非上游/网络自己断 */
+  connectTimeout?: boolean
+}
+
+/**
  * 发 llm_utils_chat 请求（body 为已改写对象，内部再 prepareBody 序列化）。
  * 非 2xx 时抛带 kind/status/msg 的错误；成功返回 Response（stream=true 时为 SSE 流）。
  */
-export async function chatStream(account: TraeAccount, bodyObj: Record<string, any>): Promise<Response> {
+export async function chatStream(account: TraeAccount, bodyObj: Record<string, any>, timing?: TraeConnectTiming): Promise<Response> {
   const payload = prepareBody(JSON.stringify(bodyObj))
   // 流式响应不能设总超时：思考模型（glm-5.2/DeepSeek-V4-Pro 等）可能思考数十秒
   // 才出首字节，AbortSignal.timeout(30s) 会从 fetch 开始计时、在思考期间把整个流
   // 掐断（用户实测思考 ~25s 后输出被截断）。只对"建立连接 + 响应头"设超时，
   // 响应头到达后取消计时，body 流交给上层 withSSEKeepAlive（180s idle 兜底）自然结束。
   const controller = new AbortController()
-  const connectTimer = setTimeout(() => controller.abort(), TRAE_CHAT_CONNECT_TIMEOUT_MS)
+  const startedAt = Date.now()
+  const connectTimer = setTimeout(() => {
+    if (timing) timing.connectTimeout = true
+    // 自描述 abort reason：不再是裸 abort() 的含糊 "The operation was aborted"，
+    // 线上据此一眼区分「我们掐的 30s 建连超时」与「上游/网络自己断的」。
+    // （workerd 是否把 reason 透传成 fetch 的拒绝原因未在本地验证；不透传时行为不变。）
+    controller.abort(new Error(`connect timeout ${TRAE_CHAT_CONNECT_TIMEOUT_MS}ms`))
+  }, TRAE_CHAT_CONNECT_TIMEOUT_MS)
   let response: Response
   try {
     response = await fetch(TRAE_CONSTANTS.AgentHost + TRAE_CONSTANTS.EpChat, {
@@ -671,6 +690,7 @@ export async function chatStream(account: TraeAccount, bodyObj: Record<string, a
     })
   } catch (e) {
     clearTimeout(connectTimer)
+    if (timing) timing.connectMs = Date.now() - startedAt
     // 网络/连接中断（建立连接超时、客户端掐断、DNS/网络异常等）→ 标记为 transport。
     // 这类错误与账号健康无关（token/权益没问题），不能计入账号错误冷却，否则
     // 一次网络抖动会把整个账号池刷成 no_healthy_account。
@@ -679,6 +699,7 @@ export async function chatStream(account: TraeAccount, bodyObj: Record<string, a
     throw err
   }
   clearTimeout(connectTimer)
+  if (timing) timing.connectMs = Date.now() - startedAt
   if (response.status >= 400) {
     const raw = await response.text().catch(() => '')
     const kind = classifyTraeError(response.status, raw)
@@ -774,11 +795,16 @@ export function buildNativeTaskPayload(
 export async function chatWorkStream(
   account: TraeAccount,
   model: string,
-  prompt: string
+  prompt: string,
+  timing?: TraeConnectTiming
 ): Promise<Response> {
   const payload = buildNativeTaskPayload(account, model, prompt)
   const controller = new AbortController()
-  const connectTimer = setTimeout(() => controller.abort(), TRAE_CHAT_CONNECT_TIMEOUT_MS)
+  const startedAt = Date.now()
+  const connectTimer = setTimeout(() => {
+    if (timing) timing.connectTimeout = true
+    controller.abort(new Error(`connect timeout ${TRAE_CHAT_CONNECT_TIMEOUT_MS}ms`)) // 同 chatStream：自描述 abort reason
+  }, TRAE_CHAT_CONNECT_TIMEOUT_MS)
   let response: Response
   try {
     response = await fetch(TRAE_WORK_CONSTANTS.WorkTargetHost + TRAE_WORK_CONSTANTS.EpCreateAgentTask, {
@@ -789,11 +815,13 @@ export async function chatWorkStream(
     })
   } catch (e) {
     clearTimeout(connectTimer)
+    if (timing) timing.connectMs = Date.now() - startedAt
     const err = new Error(`chat work transport error: ${(e as Error).message || String(e)}`) as Error & { kind?: TraeErrKind }
     ;(err as any).kind = 'transport'
     throw err
   }
   clearTimeout(connectTimer)
+  if (timing) timing.connectMs = Date.now() - startedAt
   if (response.status >= 400) {
     const raw = await response.text().catch(() => '')
     const kind = classifyTraeError(response.status, raw)

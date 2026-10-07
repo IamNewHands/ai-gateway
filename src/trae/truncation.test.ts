@@ -1,7 +1,9 @@
-import { describe, it, expect } from 'vitest'
+import { describe, it, expect, vi } from 'vitest'
 import { aggregateSoloSse, aggregateWorkSse, soloStreamToOpenAIStream, type SoloDoneAudit, type SoloStreamEndInfo } from './sse'
 import { proxyTraeChatRequest } from './proxy'
 import { readTraePool, setTraeWorkCredits } from './pool'
+import { chatStream, type TraeConnectTiming } from './upstream'
+import { TRAE_CHAT_CONNECT_TIMEOUT_MS } from './constants'
 
 /**
  * 回归用例：静默截断/连接层失败不得再被伪装成正常收尾。
@@ -733,6 +735,155 @@ describe('Trae token 预刷新：连接层失败不罚号、撞满 2 次即跳�
         expect(pool[uid]?.reason ?? '').not.toContain('refresh')
         expect(pool[uid]?.workReason ?? '').not.toContain('refresh')
       }
+    } finally {
+      globalThis.fetch = originalFetch
+    }
+  })
+})
+
+/**
+ * 连接层失败可见性回归（2026-10-07，`trae/deepseek-v4.1-flash`，DSH 会话 `session-5890068d`）。
+ *
+ * 真相（会话记录实测 30 次失败，每次尝试 61.6–64.0s）：不是账号池问题、也不是客户端重试延迟，
+ * 而是网关自己的 `TRAE_CHAT_CONNECT_TIMEOUT_MS`(30s) 掐断了「建连 + 响应头」阶段；带 tools 时
+ * Work 兜底被跳过，于是白等 62s（≈2×30s）才回 503。而这条路径原先**一条日志都不落**，
+ * 面板「系统日志」完全查不到，只能靠翻 DSH 会话记录反推。
+ *
+ * 本组锁三件事：
+ *  1. abort 文案自描述（`connect timeout 30000ms`），不再是一句含糊的 `The operation was aborted`；
+ *  2. `TraeConnectTiming` 出口：失败侧 connectMs 达标且 connectTimeout=true，成功侧 connectMs 有值
+ *     ——「成功样本的 connect 分布」是判断 30s 常量是否过紧的唯一依据（别凭感觉放宽）；
+ *  3. 失败必须落 KV：每条尝试一行 `[trae-transport]`，收尾一行聚合结论（与 cline `[cline-attempt]` 同口径）。
+ */
+describe('Trae 连接层失败可见性：connect 耗时采样与 [trae-transport] 落 KV', () => {
+  const VIS_UIDS = ['u_vis_1', 'u_vis_2']
+
+  function makeEnv(): any {
+    return {
+      KV: {
+        data: new Map<string, string>(),
+        async get(key: string) { return this.data.get(key) || null },
+        async put(key: string, val: string) { this.data.set(key, val) },
+        async delete(key: string) { this.data.delete(key) },
+      },
+    }
+  }
+
+  function makeProvider(id: string): any {
+    return {
+      id,
+      name: 'TRAE visibility',
+      type: 'trae',
+      apiKeys: VIS_UIDS.map((uid) => ({
+        key: JSON.stringify({
+          uid,
+          token: `tok_${uid}`,
+          refreshToken: `ref_${uid}`,
+          expiresAt: Date.now() + 3600_000,
+        }),
+        enabled: true,
+      })),
+    }
+  }
+
+  /** KV 里的全部条目原文（池状态等非日志 JSON 也返回，由断言自行过滤）。 */
+  function kvTexts(env: any): string[] {
+    return [...env.KV.data.values()].map((v: string) => String(v))
+  }
+
+  const account = (uid: string) => ({
+    accessToken: 'tok',
+    refreshToken: 'ref',
+    expiresAt: Date.now() + 3600_000,
+    uid,
+  })
+
+  it('chatStream 到点 abort → 文案自描述含 connect timeout，connectTimeout=true 且 connectMs 达标', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] })
+    const originalFetch = globalThis.fetch
+    // 按规范语义模拟：signal 被 abort 时 fetch 以 signal.reason 拒绝。
+    // （workerd 是否把 reason 透传成拒绝原因未在本地验证；不透传时文案退回修复前形态，行为不变。）
+    globalThis.fetch = ((_input: any, init?: any) => new Promise((_resolve, reject) => {
+      const sig = init?.signal
+      const onAbort = () => reject(sig?.reason instanceof Error ? sig.reason : new Error('The operation was aborted'))
+      if (sig?.aborted) onAbort()
+      else sig?.addEventListener('abort', onAbort)
+    })) as any
+    try {
+      const timing: TraeConnectTiming = {}
+      const pending = chatStream(account('u_timeout'), { messages: [{ role: 'user', content: 'hi' }] }, timing)
+      const assertion = expect(pending).rejects.toThrow(/connect timeout 30000ms/)
+      await vi.advanceTimersByTimeAsync(TRAE_CHAT_CONNECT_TIMEOUT_MS + 100)
+      await assertion
+      expect(timing.connectTimeout).toBe(true)
+      expect(timing.connectMs).toBeGreaterThanOrEqual(TRAE_CHAT_CONNECT_TIMEOUT_MS)
+    } finally {
+      globalThis.fetch = originalFetch
+      vi.useRealTimers()
+    }
+  })
+
+  it('chatStream 成功 → connectMs 被填、且不被标记为超时（成功侧 connect= 分布的数据源）', async () => {
+    const originalFetch = globalThis.fetch
+    globalThis.fetch = (async () => new Response('event: done\ndata: {}\n\n', {
+      status: 200,
+      headers: { 'Content-Type': 'text/event-stream' },
+    })) as any
+    try {
+      const timing: TraeConnectTiming = {}
+      const resp = await chatStream(account('u_ok'), { messages: [{ role: 'user', content: 'hi' }] }, timing)
+      expect(resp.status).toBe(200)
+      expect(typeof timing.connectMs).toBe('number')
+      expect(timing.connectMs).toBeGreaterThanOrEqual(0)
+      expect(timing.connectTimeout).toBeUndefined()
+    } finally {
+      globalThis.fetch = originalFetch
+    }
+  })
+
+  it('带 tools + 2 账号：两次 SOLO 建连失败 → 2 条 phase=solo 日志 + 1 条 attempts=2 聚合行，且绝不试 Work', async () => {
+    const originalFetch = globalThis.fetch
+    let workCalls = 0
+    globalThis.fetch = (async (input: any) => {
+      if (String(input).includes('/api/agent/v3/create_agent_task')) {
+        workCalls++
+        return new Response('x', { status: 200 })
+      }
+      throw new Error('The operation was aborted')
+    }) as any
+    try {
+      const env = makeEnv()
+      const provider = makeProvider('trae-visibility')
+
+      const resp = await proxyTraeChatRequest(env, provider, {
+        model: 'glm-5.2',
+        messages: [{ role: 'user', content: 'hi' }],
+        stream: false,
+        tools: [{ type: 'function', function: { name: 'noop', parameters: { type: 'object', properties: {} } } }],
+      })
+
+      expect(resp.status).toBe(503)
+      // 带 tools → 不试 Work：这正是生产事故里「62s ≈ 2×30s」而不是「90s」的原因
+      expect(workCalls).toBe(0)
+
+      const logs = kvTexts(env)
+      const solo = logs.filter((t) => t.includes('[trae-transport]') && t.includes('phase=solo'))
+      expect(solo).toHaveLength(2)
+      expect(solo[0]).toContain('attempt=1/2')
+      expect(solo[1]).toContain('attempt=2/2')
+      for (const t of solo) {
+        expect(t).toContain('connect=')  // 连接阶段耗时：判断 30s 常量是否过紧的唯一依据
+        expect(t).toContain('timeout=')  // 是否被网关自己的定时器掐断（与「上游自己断」区分）
+        expect(t).toContain('uid=')
+        expect(t).toContain('err=chat transport error')
+      }
+
+      const summary = logs.filter((t) => t.includes('[trae-transport]') && t.includes('end=503'))
+      expect(summary).toHaveLength(1)
+      expect(summary[0]).toContain('attempts=2')
+      expect(summary[0]).toContain('tools=true')
+      expect(summary[0]).toContain('workFallback=false')
+      expect(logs.some((t) => t.includes('phase=work'))).toBe(false)
     } finally {
       globalThis.fetch = originalFetch
     }
