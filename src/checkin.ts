@@ -38,6 +38,7 @@ import type { TraeCheckinResult } from './trae/types'
 import {
   packageExpiryEntry,
   summarizeExpiringAt,
+  isExpiringCredit,
   CREDIT_EXPIRY_WINDOW_MS,
   type CreditExpiryEntry,
   type ExpiringCreditSummary,
@@ -1110,6 +1111,33 @@ export async function handleCheckinStatus(c: Context<{ Bindings: Env }>) {
   return c.json<ApiResponse>({ success: true, data: { workbuddy, trae } })
 }
 
+/**
+ * 一个待汇总的积分池：窗口内到期的条目 + 这些条目的**数据时点**。
+ *
+ * 时点只记「真正计入的条目」所属账号的探测时刻，并取其中**最早**的一个：
+ * 面板要说的是「这个数字有多旧」，用最新的一次会掩盖陈旧账号（一个 3 小时前探过、
+ * 一个有 2 天前的待救包 → 标「3 小时前」等于骗人）。
+ */
+interface ExpiringBucket {
+  entries: CreditExpiryEntry[]
+  /** 计入条目里最旧的探测时刻 epoch ms；无 → null */
+  at: number | null
+}
+
+/** 往桶里放一条：只有真正计入窗口的条目才参与「数据时点」（否则陈旧账号会污染标注）。 */
+function pushExpiring(bucket: ExpiringBucket, entry: CreditExpiryEntry, probedAt: number | undefined, now: number) {
+  if (!isExpiringCredit(entry, now)) return
+  bucket.entries.push(entry)
+  if (typeof probedAt !== 'number' || !Number.isFinite(probedAt) || probedAt <= 0) return
+  if (bucket.at === null || probedAt < bucket.at) bucket.at = probedAt
+}
+
+/** 汇总一个桶：额度合计 + 最早到期 + 数据时点（没有计入条目时时点归 null）。 */
+function summarizeBucket(bucket: ExpiringBucket, now: number): { summary: ExpiringCreditSummary; at: number | null } {
+  const summary = summarizeExpiringAt(bucket.entries, now)
+  return { summary, at: summary.amount > 0 ? bucket.at : null }
+}
+
 /** 一个签到产品族（WorkBuddy / QoderWork）的额度与签到进度快照。 */
 interface CheckinFamilyQuota {
   /** 账号总数（含国际版 / 无 token 等 skip 账号）：额度卡据此判断该族有没有数据 */
@@ -1126,9 +1154,9 @@ interface CheckinFamilyQuota {
    * 7 天窗口内到期且仍有剩余的积分，**按域拆开**：国内版与国际版是两套账号、
    * 两个独立积分池，合并成一个数看不出该去哪个账号救火（与签到族拆分同理）。
    */
-  expiringCn: ExpiringCreditSummary
+  expiringCn: ExpiringBucket
   /** 国际版（realm=global）账号窗口内到期的积分 */
-  expiringGlobal: ExpiringCreditSummary
+  expiringGlobal: ExpiringBucket
 }
 
 /**
@@ -1140,17 +1168,16 @@ interface CheckinFamilyQuota {
  * （否则只有国际版账号的产品族会被额度卡误判成「无账号」）。
  *
  * 顺带把各账号 `packages`（上次签到/额度探测落盘的权益包明细）汇成「7 天内到期」汇总，
- * 供概览明细卡按渠道列出待作废积分——挑号用的是同一份 `isExpiringEntry` 口径。
- * 到期条目按账号 `realm` 分桶（国内 / 国际版），因为那是两个互不相干的积分池。
+ * 供概览明细卡按渠道列出待作废积分——挑号用的是同一份 `isExpiringCredit` 口径。
+ * 到期条目按账号 `realm` 分桶（国内 / 国际版），因为那是两个互不相干的积分池；
+ * 数据时点取账号级 `updatedAt`（签到结果落盘时刻 = 额度明细的探测时刻）。
  */
 async function aggregateCheckinFamily(env: Env, familyProviders: readonly Provider[], now: number): Promise<CheckinFamilyQuota> {
   const out: CheckinFamilyQuota = {
     accounts: 0, checkinAccounts: 0, checkedIn: 0, remain: 0, size: 0,
-    expiringCn: { amount: 0, soonestAt: null, packs: 0 },
-    expiringGlobal: { amount: 0, soonestAt: null, packs: 0 },
+    expiringCn: { entries: [], at: null },
+    expiringGlobal: { entries: [], at: null },
   }
-  const entriesCn: CreditExpiryEntry[] = []
-  const entriesGlobal: CreditExpiryEntry[] = []
   for (const p of familyProviders) {
     const r = await readCheckinResult(env, p.id)
     if (!r) continue
@@ -1164,12 +1191,10 @@ async function aggregateCheckinFamily(env: Env, familyProviders: readonly Provid
       if (typeof a.totalRemain === 'number') out.remain += a.totalRemain
       if (typeof a.totalSize === 'number') out.size += a.totalSize
       // realm 为 unknown 的一律并入国内桶：只有显式 global 才说明是海外域账号
-      const bucket = a.realm === 'global' ? entriesGlobal : entriesCn
-      for (const pkg of a.packages || []) bucket.push(packageExpiryEntry(pkg))
+      const bucket = a.realm === 'global' ? out.expiringGlobal : out.expiringCn
+      for (const pkg of a.packages || []) pushExpiring(bucket, packageExpiryEntry(pkg), a.updatedAt, now)
     }
   }
-  out.expiringCn = summarizeExpiringAt(entriesCn, now)
-  out.expiringGlobal = summarizeExpiringAt(entriesGlobal, now)
   return out
 }
 
@@ -1185,6 +1210,11 @@ export interface ExpiringChannel {
   soonestAt: number
   /** 计入的权益包条数 */
   packs: number
+  /**
+   * 该渠道额度明细的**数据时点**（epoch ms，取计入条目里最旧的一次探测）；未知 → null。
+   * 面板据此标出「数据 N 小时前」——这个数字是快照值，不标就会被当成实时。
+   */
+  dataAt: number | null
 }
 
 
@@ -1199,7 +1229,8 @@ export interface ExpiringChannel {
  * `expiring` 是「7 天内到期积分」明细（每个独立积分池一行：产品族 × 域，TRAE 按 SOLO/Work
  * 双通道拆），数据源与挑号优先级判定同源：WorkBuddy/QoderWork 取签到快照的 `packages`
  * （CST 墙钟到期），TRAE 取账号池 `packs`（Unix 秒到期）。两者都由「上次签到/积分探测」
- * 写入，因此是**快照时点**的值，不是此刻实时值。
+ * 写入，因此是**快照时点**的值而不是此刻实时值——每行附 `dataAt`（最旧一次探测的时刻），
+ * 面板据此标出「数据 N 小时前」，否则快照值会被当成实时值读。
  */
 export async function handleAdminOverview(c: Context<{ Bindings: Env }>) {
   const now = Date.now()
@@ -1215,8 +1246,8 @@ export async function handleAdminOverview(c: Context<{ Bindings: Env }>) {
   // 到期明细同样按通道分开统计：两个通道各烧各的包，混在一起看不出是哪个通道要作废。
   let traeRemain = 0, traeSize = 0, traeAccounts = 0, traeSoloRemain = 0, traeWorkRemain = 0
   let traeCheckedIn = 0
-  const traeSoloEntries: CreditExpiryEntry[] = []
-  const traeWorkEntries: CreditExpiryEntry[] = []
+  const traeSolo: ExpiringBucket = { entries: [], at: null }
+  const traeWork: ExpiringBucket = { entries: [], at: null }
   for (const p of providers.filter((x) => isTraeProvider(x))) {
     const results = await readTraeCheckinResults(c.env, p.id)
     const doneUids = new Set(results.filter((r) => r.checkedIn).map((r) => r.uid))
@@ -1235,25 +1266,30 @@ export async function handleAdminOverview(c: Context<{ Bindings: Env }>) {
           expireAt: packExpireAtMs(pack),
           remain: typeof pack.rem === 'number' ? pack.rem : 0,
         }
-        if (pack.isWork === true) traeWorkEntries.push(entry)
-        else traeSoloEntries.push(entry)
+        // TRAE 的数据时点是账号池里的 packsAt（权益包探测时刻），不是签到时刻
+        pushExpiring(pack.isWork === true ? traeWork : traeSolo, entry, a.packsAt, now)
       }
     }
   }
 
   // 明细只列「确实有积分快作废」的池；空的池不占行（面板另有整体空态文案兜底）。
   const expiringChannels: ExpiringChannel[] = []
-  const pushChannel = (key: string, label: string, s: ExpiringCreditSummary) => {
-    if (s.amount > 0 && s.soonestAt !== null) {
-      expiringChannels.push({ key, label, amount: s.amount, soonestAt: s.soonestAt, packs: s.packs })
+  const pushChannel = (key: string, label: string, b: ExpiringBucket) => {
+    const { summary, at } = summarizeBucket(b, now)
+    if (summary.amount > 0 && summary.soonestAt !== null) {
+      expiringChannels.push({
+        key, label,
+        amount: summary.amount, soonestAt: summary.soonestAt, packs: summary.packs,
+        dataAt: at,
+      })
     }
   }
   pushChannel('workbuddy', 'WorkBuddy', workbuddy.expiringCn)
   pushChannel('workbuddy-global', 'WorkBuddy 国际版', workbuddy.expiringGlobal)
   pushChannel('qoder', 'QoderWork', qoder.expiringCn)
   pushChannel('qoder-global', 'QoderWork 国际版', qoder.expiringGlobal)
-  pushChannel('trae-solo', 'TRAE SOLO', summarizeExpiringAt(traeSoloEntries, now))
-  pushChannel('trae-work', 'TRAE Work', summarizeExpiringAt(traeWorkEntries, now))
+  pushChannel('trae-solo', 'TRAE SOLO', traeSolo)
+  pushChannel('trae-work', 'TRAE Work', traeWork)
   // 到期越早越优先处理
   expiringChannels.sort((a, b) => a.soonestAt - b.soonestAt)
 

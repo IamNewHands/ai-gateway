@@ -5010,7 +5010,19 @@ window.addEventListener('hashchange', function () {
     var d = Math.ceil((ms - Date.now()) / 86400000)
     return d <= 0 ? '今天到期' : d + ' 天后'
   }
-  // 7 天内到期积分明细：每个渠道一行（WorkBuddy / QoderWork / TRAE SOLO / TRAE Work）
+  // 数据时点文案：这些数字来自「最近一次签到/积分探测」的快照，不标出来会被当成实时值
+  function dataAgeText(ms) {
+    if (typeof ms !== 'number' || !isFinite(ms) || ms <= 0) return ''
+    var diff = Date.now() - ms
+    if (diff < 0) diff = 0
+    var min = Math.floor(diff / 60000)
+    if (min < 1) return '刚刚'
+    if (min < 60) return min + ' 分钟前'
+    var h = Math.floor(min / 60)
+    if (h < 24) return h + ' 小时前'
+    return Math.floor(h / 24) + ' 天前'
+  }
+  // 7 天内到期积分明细：每个独立积分池一行（国内/国际版、TRAE SOLO/Work 各算一个池）
   function renderExpiring(ex) {
     if (!expRoot) return
     var e = ex || {}
@@ -5023,7 +5035,12 @@ window.addEventListener('hashchange', function () {
     var rows = ''
     for (var i = 0; i < chans.length; i++) {
       var ch = chans[i] || {}
-      rows += '<div class="admin-expiring__row"><span>' + escapeHtml(ch.label) + '</span><b>' +
+      var age = dataAgeText(ch.dataAt)
+      // 时点写在标签后面（窄屏可换行），绝对值放 title —— 只给相对时间会看不出到底哪天探的
+      var ageTag = age
+        ? ' <small title="数据时点：' + escapeHtml(new Date(ch.dataAt).toLocaleString()) + '">数据 ' + age + '</small>'
+        : ' <small title="该渠道的额度明细未带探测时刻">数据时点未知</small>'
+      rows += '<div class="admin-expiring__row"><span>' + escapeHtml(ch.label) + ageTag + '</span><b>' +
         kpiNum(ch.amount) + '</b><i>' + expireText(ch.soonestAt) + '</i></div>'
     }
     expRoot.title = '数据来自各账号最近一次签到 / 积分探测（非实时），统计窗口 ' + (e.windowDays || 7) + ' 天'

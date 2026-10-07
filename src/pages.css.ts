@@ -325,6 +325,7 @@ label, legend { color: var(--color-ink-2); font-size: var(--text-xs); font-weigh
 .admin-expiring__head small { color: var(--color-muted); font-size: var(--text-xs); }
 .admin-expiring__row { min-width: 0; margin-block-start: var(--space-3xs); display: grid; grid-template-columns: minmax(0, 1fr) auto auto; align-items: baseline; gap: var(--space-xs); font-size: var(--text-xs); }
 .admin-expiring__row > span { min-width: 0; color: var(--color-ink-2); overflow-wrap: anywhere; }
+.admin-expiring__row > span > small { color: var(--color-muted); font-size: .6875rem; white-space: nowrap; }
 .admin-expiring__row > b { color: var(--color-ink); font-family: var(--font-display); font-size: var(--text-sm); font-weight: 600; }
 .admin-expiring__row > i { min-width: 4.25rem; color: var(--color-warn-ink); font-style: normal; text-align: end; }
 .workspace-section { margin-block-start: var(--space-xl); }

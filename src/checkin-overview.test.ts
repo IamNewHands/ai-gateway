@@ -88,7 +88,9 @@ async function overview(env: Env) {
       windowDays: number
       total: number
       soonestAt: number | null
-      channels: { key: string; label: string; amount: number; soonestAt: number; packs: number }[]
+      channels: {
+        key: string; label: string; amount: number; soonestAt: number; packs: number; dataAt: number | null
+      }[]
     }
   }
 }
@@ -387,5 +389,93 @@ describe('handleAdminOverview：7 天内到期积分明细', () => {
 
     const d = await overview(env)
     expect(d.expiring).toEqual({ windowDays: 7, total: 0, soonestAt: null, channels: [] })
+  })
+})
+
+describe('handleAdminOverview：到期明细的数据时点（快照值不能装成实时值）', () => {
+  it('时点取「真正计入的条目」里最旧的一次探测；包在窗口外的陈旧账号不污染标注', async () => {
+    const now = Date.now()
+    const fresh = now - 60 * 60 * 1000            // 1 小时前
+    const stale = now - 3 * 24 * 60 * 60 * 1000   // 3 天前
+    const env = makeEnv({
+      'checkin:result:wb_at': JSON.stringify({
+        providerId: 'wb_at', name: 'wb_at', realm: 'cn', success: true, reason: 'ok',
+        message: '', todayCheckedIn: true, updatedAt: fresh,
+        accounts: [
+          // 有 3 天内的待救包 → 参与，时点 = fresh
+          { ...acc('u_fresh', 'ok', true, 500, 900), updatedAt: fresh, packages: [pkg(3, 200, 100)] },
+          // 陈旧账号，但它的包 30 天后才到期（不计入）→ 不能把整行标成「3 天前」
+          { ...acc('u_stale', 'ok', true, 100, 200), updatedAt: stale, packages: [pkg(30, 100, 0)] },
+        ],
+      }),
+    })
+    getProvidersMock.mockResolvedValue([workbuddyProvider('wb_at')])
+
+    const d = await overview(env)
+    expect(d.expiring.channels).toHaveLength(1)
+    expect(d.expiring.channels[0].dataAt).toBe(fresh)
+  })
+
+  it('多个账号都有待救积分 → 取最旧的那个（用最新的一次会掩盖陈旧数据）', async () => {
+    const now = Date.now()
+    const older = now - 2 * 24 * 60 * 60 * 1000
+    const newer = now - 30 * 60 * 1000
+    const env = makeEnv({
+      'checkin:result:wb_at2': JSON.stringify({
+        providerId: 'wb_at2', name: 'wb_at2', realm: 'cn', success: true, reason: 'ok',
+        message: '', todayCheckedIn: true, updatedAt: newer,
+        accounts: [
+          { ...acc('u_a', 'ok', true, 50, 100), updatedAt: older, packages: [pkg(4, 50, 0)] },
+          { ...acc('u_b', 'ok', true, 60, 100), updatedAt: newer, packages: [pkg(2, 60, 0)] },
+        ],
+      }),
+    })
+    getProvidersMock.mockResolvedValue([workbuddyProvider('wb_at2')])
+
+    const d = await overview(env)
+    expect(d.expiring.total).toBe(110)
+    expect(d.expiring.channels[0].dataAt).toBe(older)
+  })
+
+  it('TRAE 时点取账号池 packsAt（未探测过权益包的账号不参与）', async () => {
+    const nowSec = Math.floor(Date.now() / 1000)
+    const packsAt = Date.now() - 5 * 60 * 60 * 1000
+    const env = makeEnv({
+      'trae:pool:trae_at': JSON.stringify({
+        u_a: {
+          credits: 10, workCredits: 0, disabled: false, until: 0, errCount: 0, packsAt,
+          packs: [{ name: 'SOLO', limit: 100, used: 40, rem: 60, isWork: false, expireAt: nowSec + 2 * 86400 }],
+        },
+        u_b: {
+          credits: 10, workCredits: 0, disabled: false, until: 0, errCount: 0,
+          packs: [{ name: 'SOLO2', limit: 100, used: 50, rem: 50, isWork: false, expireAt: nowSec + 3 * 86400 }],
+        },
+      }),
+    })
+    getProvidersMock.mockResolvedValue([traeProvider('trae_at', ['u_a', 'u_b'])])
+
+    const d = await overview(env)
+    expect(d.expiring.channels.map((c) => c.key)).toEqual(['trae-solo'])
+    expect(d.expiring.channels[0].amount).toBe(110)
+    // 只有 u_a 带 packsAt → 时点 = 它（u_b 未知不该把标注抹成 null）
+    expect(d.expiring.channels[0].dataAt).toBe(packsAt)
+  })
+
+  it('TRAE 账号池从未探测过权益包（无 packsAt）→ 时点 null，面板显示「未知」而不是编一个时间', async () => {
+    const nowSec = Math.floor(Date.now() / 1000)
+    // 用独立 providerId：trae/pool 有 1s 内存缓存，复用 id 会读到上一个用例的池
+    const env = makeEnv({
+      'trae:pool:trae_at2': JSON.stringify({
+        u_a: {
+          credits: 1, workCredits: 0, disabled: false, until: 0, errCount: 0,
+          packs: [{ name: 'p', limit: 9, used: 0, rem: 9, isWork: false, expireAt: nowSec + 86400 }],
+        },
+      }),
+    })
+    getProvidersMock.mockResolvedValue([traeProvider('trae_at2', ['u_a'])])
+
+    const d = await overview(env)
+    expect(d.expiring.channels[0].amount).toBe(9)
+    expect(d.expiring.channels[0].dataAt).toBeNull()
   })
 })

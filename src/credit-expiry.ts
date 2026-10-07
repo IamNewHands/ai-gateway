@@ -116,18 +116,26 @@ export function soonestPackageExpiryAt(
  *
  * `soonestExpiringAt`（挑号用）与 `summarizeExpiringAt`（明细面板用）共用本函数，
  * 否则两处各写一遍判定，任一处改动都会静默漂移成「面板说 3 天后到期、挑号却不理它」。
+ *
+ * 导出是给概览面板用的：它只给**真正计入**的条目记录「数据时点」，
+ * 免得一个两三天前探测过的账号（本次没有待救积分）把整行标注成陈旧。
  */
-function isExpiringEntry(e: CreditExpiryEntry | null | undefined, now: number, limit: number): boolean {
+export function isExpiringCredit(
+  e: CreditExpiryEntry | null | undefined,
+  now: number,
+  windowMs: number = CREDIT_EXPIRY_WINDOW_MS
+): boolean {
   if (!e) return false
   const at = e.expireAt
   if (typeof at !== 'number' || !Number.isFinite(at) || at <= 0) return false
+  const limit = now + windowMs
   if (at <= now || at > limit) return false
   return e.remain > 0
 }
 
 /**
  * 「窗口期内到期且仍有剩余」的最早到期时刻（epoch ms）；没有则 null。
- * 排除口径见 `isExpiringEntry`。
+ * 排除口径见 `isExpiringCredit`。
  */
 export function soonestExpiringAt(
   entries: readonly CreditExpiryEntry[] | null | undefined,
@@ -135,10 +143,9 @@ export function soonestExpiringAt(
   windowMs: number = CREDIT_EXPIRY_WINDOW_MS
 ): number | null {
   if (!entries || entries.length === 0) return null
-  const limit = now + windowMs
   let best: number | null = null
   for (const e of entries) {
-    if (!isExpiringEntry(e, now, limit)) continue
+    if (!isExpiringCredit(e, now, windowMs)) continue
     const at = e.expireAt as number
     if (best === null || at < best) best = at
   }
@@ -158,7 +165,7 @@ export interface ExpiringCreditSummary {
 /**
  * 汇总「窗口期内到期且仍有剩余」的积分：合计额度 + 最早到期时刻 + 包数。
  *
- * 与 `soonestExpiringAt` 同源同口径（共用 `isExpiringEntry`），区别只是它把额度加总，
+ * 与 `soonestExpiringAt` 同源同口径（共用 `isExpiringCredit`），区别只是它把额度加总，
  * 供概览面板回答「哪些渠道有多少积分快作废了」；挑号仍只需要最早时刻。
  */
 export function summarizeExpiringAt(
@@ -168,9 +175,8 @@ export function summarizeExpiringAt(
 ): ExpiringCreditSummary {
   const out: ExpiringCreditSummary = { amount: 0, soonestAt: null, packs: 0 }
   if (!entries || entries.length === 0) return out
-  const limit = now + windowMs
   for (const e of entries) {
-    if (!isExpiringEntry(e, now, limit)) continue
+    if (!isExpiringCredit(e, now, windowMs)) continue
     const at = e.expireAt as number
     out.amount += e.remain
     out.packs++

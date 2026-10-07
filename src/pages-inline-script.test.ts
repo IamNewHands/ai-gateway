@@ -1139,8 +1139,8 @@ describe('概览「7 天内到期积分」明细卡（DOM 替身驱动客户端�
     const els = await runKpi(data({
       windowDays: 7, total: 170, soonestAt: soon,
       channels: [
-        { key: 'trae-work', label: 'TRAE Work', amount: 20, soonestAt: Date.now() + 24 * 60 * 60 * 1000, packs: 1 },
-        { key: 'workbuddy', label: 'WorkBuddy', amount: 150, soonestAt: soon, packs: 2 },
+        { key: 'trae-work', label: 'TRAE Work', amount: 20, soonestAt: Date.now() + 24 * 60 * 60 * 1000, packs: 1, dataAt: Date.now() - 90 * 60 * 1000 },
+        { key: 'workbuddy', label: 'WorkBuddy', amount: 150, soonestAt: soon, packs: 2, dataAt: Date.now() - 3 * 24 * 60 * 60 * 1000 },
       ],
     }))
     const html = els['overview-expiring'].innerHTML
@@ -1157,6 +1157,28 @@ describe('概览「7 天内到期积分」明细卡（DOM 替身驱动客户端�
     expect(html).toContain('7 天内到期积分')
     expect(html).toContain('共 2 个渠道')
     expect(html).toContain('合计 170')
+  })
+
+  /**
+   * 数据时点标注。这个数字来自上次签到/积分探测的快照，标不出来就会被当成实时值——
+   * 用户会以为「刚才看过是 150，现在还是 150」，而实际可能是两天前的读数。
+   */
+  it('每行标出数据时点（相对时间 + 绝对时间 tooltip），未探测过则明说「未知」', async () => {
+    const els = await runKpi(data({
+      windowDays: 7, total: 170, soonestAt: Date.now() + 3 * 24 * 60 * 60 * 1000,
+      channels: [
+        { key: 'workbuddy', label: 'WorkBuddy', amount: 150, soonestAt: Date.now() + 3 * 24 * 60 * 60 * 1000, packs: 2, dataAt: Date.now() - 90 * 60 * 1000 },
+        { key: 'trae-solo', label: 'TRAE SOLO', amount: 20, soonestAt: Date.now() + 2 * 24 * 60 * 60 * 1000, packs: 1, dataAt: Date.now() - 3 * 24 * 60 * 60 * 1000 },
+        { key: 'qoder', label: 'QoderWork', amount: 5, soonestAt: Date.now() + 4 * 24 * 60 * 60 * 1000, packs: 1, dataAt: null },
+      ],
+    }))
+    const html = els['overview-expiring'].innerHTML
+    expect(html).toContain('数据 1 小时前')
+    expect(html).toContain('数据 3 天前')
+    // 没有时点不能沉默：沉默会让人以为它是新鲜的
+    expect(html).toContain('数据时点未知')
+    // tooltip 给绝对值（只给「3 天前」看不出到底是哪天探的）
+    expect(html).toMatch(/title="数据时点：[^"]+"/)
   })
 
   it('窗口内没有到期积分：卡片保留并说明「暂无」（不能整块消失，否则分不清是坏了还是没数据）', async () => {
