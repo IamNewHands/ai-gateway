@@ -21,7 +21,8 @@ import { getProviders } from './storage'
 import { getOauthAccessToken, detectTokenRealm, refreshQoderTokenPair } from './oauth'
 import { writeLog } from './admin'
 import { isQoderFlow } from './qoder/proxy'
-import { fetchQoderCheckinStatus, performQoderCheckin, fetchQoderUserResource, fetchQoderPaymentType, fetchQoderUserInfo, buildQoderPacks, normalizeQoderRealm, realmHasLegacyCheckin, type QoderRealm } from './qoder/billing'
+import { fetchQoderCheckinStatus, performQoderCheckin, fetchQoderUserResource, fetchQoderPaymentType, fetchQoderUserInfo, buildQoderPacks, legacyQoderAddonExpireAt, normalizeQoderRealm, realmHasLegacyCheckin, type QoderRealm } from './qoder/billing'
+import { reconcileQoderAddonGrants, type QoderAddonGrant } from './qoder/grants'
 import { getQoderDevice } from './qoder/device'
 import {
   readQoderPool,
@@ -201,28 +202,44 @@ async function fillCredits(env: Env, base: CheckinResult, token: string, realm: 
 // ===== QoderWork 签到（flowType=qoder，dt- token） =====
 
 /** 拉取 Qoder 额度 + 套餐填充到 base（失败只写日志，不影响签到结果）。
- *  返回额度接口的原始响应体（截断），供签到日志区分「真没额度」与「解析成 0」。
+ *  返回额度接口的原始响应体（截断，供签到日志区分「真没额度」与「解析成 0」）与更新后的加购账本。
  *
- *  同时把额度拆成两个带到期时间的包（buildQoderPacks）落进 base.packages：
+ *  同时把额度装成带各自到期时间的包（buildQoderPacks）落进 base.packages：
  *  面板据此显示「到期时间 + 剩 N 天」，挑号据此优先消耗快过期的积分。
- *  `rewardExpiresAt` = 本次新领积分的到期时刻（claim 响应），已签到路径没有新 grant，
- *  由 `prevPackages`（池里已存的包）兜底，避免每日「已签到」把到期时间擦掉。 */
+ *  **一个包 = 一笔**（套餐额度 + 账本里每笔签到/赠送），逐笔明细由 qoder/grants.ts 记账得来
+ *  —— 上游只给聚合桶，我们必须自己攒（见该文件头：旧实现把整桶标成"最后一笔"的到期时间，
+ *  会同时骗到面板和挑号）。`opts.claim` 是本次**新领**那一笔（含 claim 响应的到期时刻）；
+ *  已签到路径没有新 grant，账本与明细原样保留。 */
 async function fillQoderCredits(
   env: Env,
   base: CheckinResult,
   token: string,
   realm: QoderRealm,
-  opts?: { rewardExpiresAt?: number; prevPackages?: readonly PackageInfo[] }
-): Promise<string | undefined> {
+  opts?: {
+    claim?: { at?: number; size?: number; expireAt?: number }
+    prevGrants?: readonly QoderAddonGrant[]
+    prevPackages?: readonly PackageInfo[]
+  }
+): Promise<{ quotaRaw?: string; grants?: QoderAddonGrant[] }> {
   let quotaRaw: string | undefined
+  // 缺省 = 「本次没拿到额度」→ 调用方不写账本（空数组会被写进去，等于把已观测到的明细擦掉）
+  let grants: QoderAddonGrant[] | undefined
   try {
     const credits = await fetchQoderUserResource(token, realm)
     if (credits) {
+      // 先记账再建包：packages 必须是账本的渲染结果，否则面板与挑号会各看一份数据
+      grants = reconcileQoderAddonGrants({
+        prevGrants: opts?.prevGrants,
+        addon: credits.addonQuota,
+        claim: opts?.claim,
+        legacyExpireAt: legacyQoderAddonExpireAt(opts?.prevPackages),
+      })
+      const packs = buildQoderPacks(credits, grants)
       base.totalRemain = credits.totalRemain
       base.totalUsed = credits.totalUsed
       base.totalSize = credits.totalSize
-      base.packCount = credits.packCount
-      base.packages = buildQoderPacks(credits, opts?.rewardExpiresAt, opts?.prevPackages)
+      base.packCount = packs.length
+      base.packages = packs
       quotaRaw = credits.raw
     } else {
       try { await writeLog(env, 'warn', `[checkin] ${base.name} 额度无数据（quota/usage 响应为空）`, '') } catch { /* ignore */ }
@@ -234,7 +251,7 @@ async function fillQoderCredits(
     const pt = await fetchQoderPaymentType(token, realm)
     if (pt) base.paymentType = pt
   } catch { /* ignore */ }
-  return quotaRaw
+  return { quotaRaw, grants }
 }
 
 /**
@@ -308,8 +325,13 @@ async function checkinQoderPoolAccount(env: Env, provider: Provider, account: Qo
       base.reason = 'already'
       base.message = '今日已签到'
       base.lastCheckinAt = Date.now()
-      await fillQoderCredits(env, base, token, realm, { prevPackages: account.state?.packages })
-      await syncQoderPoolCredits(env, provider.id, account, base)
+      // 已签到也要落账本：额度可能已经从这笔里被消耗掉了，FIFO 结算必须写回，
+      // 否则账本会一直显示"全额还在"，挑号依据就是错的（只是没有新增笔而已）。
+      const { grants } = await fillQoderCredits(env, base, token, realm, {
+        prevGrants: account.state?.addonGrants,
+        prevPackages: account.state?.packages,
+      })
+      await syncQoderPoolCredits(env, provider.id, account, base, grants)
       return base
     }
   }
@@ -331,12 +353,19 @@ async function checkinQoderPoolAccount(env: Env, provider: Provider, account: Qo
     base.checkinCredit = res.rewardCredits
   }
 
-  // 签到成功后额度已变化，拉最新额度（本次新领的到期时刻来自 claim 响应）
-  const quotaRaw = await fillQoderCredits(env, base, token, realm, {
-    rewardExpiresAt: res.rewardExpiresAt,
+  // 签到成功后额度已变化，拉最新额度（本次新领的到期时刻来自 claim 响应）。
+  // `claim` 只在**本次新领**时给。判据用 `res.already`（它的定义就是「非本次新领」，
+  // 见 billing.QoderCheckinOutcome），与下面 checkinCredit 的写法同源，不另立一套。
+  // 说明：今天 replayed 分支本来就不带 rewardCredits，所以「金额 > 0」这道关已经能挡住重复记账；
+  // 但账本是**持久状态**——一旦上游哪天在 replayed 里也回一个 amount，就会每天多记一笔幽灵条目，
+  // 症状要到「挑号偏移」时才看得出来（那时已经错了几天），故这里显式按 already 拦一道。
+  const claim = res.already ? undefined : { at: Date.now(), size: res.rewardCredits, expireAt: res.rewardExpiresAt }
+  const { quotaRaw, grants } = await fillQoderCredits(env, base, token, realm, {
+    claim,
+    prevGrants: account.state?.addonGrants,
     prevPackages: account.state?.packages,
   })
-  await syncQoderPoolCredits(env, provider.id, account, base)
+  await syncQoderPoolCredits(env, provider.id, account, base, grants)
 
   // ===== 签到日志（落系统日志，供「提示成功但积分没增加」定位） =====
   // 关键是把**前后额度差**与**上游原始字段**一起留档：只有 message 时无法区分
@@ -372,16 +401,24 @@ async function checkinQoderPoolAccount(env: Env, provider: Provider, account: Qo
 }
 
 /**
- * 签到后把额度/额度包/昵称回写 Qoder 池：积分>0 的冷却账号自动解冻（对齐 WorkBuddy 池）。
+ * 签到后把额度/额度包明细/加购账本/昵称回写 Qoder 池：积分>0 的冷却账号自动解冻（对齐 WorkBuddy 池）。
  *
  * `totalRemain === 0`（额度真用尽）也要回写：那不是失败，`state.credits` 与额度包明细
  * （面板到期展示 + 「到期优先」挑号的数据源）都必须更新；解冻只在 remain > 0 时发生，
  * 由 reenableQoderIfCredits 内部把关。
+ *
+ * `grants` 缺省 = 本次没探到额度（拉取失败）→ 账本与明细原样保留，不被空值覆盖。
  */
-async function syncQoderPoolCredits(env: Env, providerId: string, account: QoderPoolAccount, base: CheckinResult): Promise<void> {
+async function syncQoderPoolCredits(
+  env: Env,
+  providerId: string,
+  account: QoderPoolAccount,
+  base: CheckinResult,
+  grants?: QoderAddonGrant[]
+): Promise<void> {
   try {
     if (typeof base.totalRemain === 'number') {
-      await reenableQoderIfCredits(env, providerId, account.uid, base.totalRemain, base.packages)
+      await reenableQoderIfCredits(env, providerId, account.uid, base.totalRemain, base.packages, grants)
     }
     if (base.nickname && base.nickname !== account.nickname) {
       await setQoderPoolAccountNickname(env, providerId, account.uid, base.nickname)

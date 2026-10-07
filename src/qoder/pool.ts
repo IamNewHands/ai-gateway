@@ -21,6 +21,7 @@ import type { Env, OAuthDeviceConfig, OAuthTokenState, PackageInfo, Provider } f
 import { KV_KEYS, OAUTH_TOKEN_REFRESH_MARGIN_MS } from '../config'
 import { readOauthToken } from '../oauth'
 import { CREDIT_EXPIRY_WINDOW_MS, soonestPackageExpiryAt } from '../credit-expiry'
+import type { QoderAddonGrant } from './grants'
 
 /** 池内账号状态（冷却/禁用/积分/额度包）。 */
 export interface QoderPoolState {
@@ -37,6 +38,15 @@ export interface QoderPoolState {
   packages?: PackageInfo[]
   /** packages 的探测时刻（面板据此说明数据新鲜度） */
   packagesAt?: number
+  /**
+   * 加购（签到/赠送）额度的**按笔记账**：上游只给聚合桶，逐笔明细与各自到期时间在这里攒
+   * （见 qoder/grants.ts 文件头）。它同时是 packages 里签到包的来源，也是「7 天内到期优先」
+   * 挑号能看见"最早那笔何时作废"的前提。
+   *
+   * 与 packages 的关系：packages = 套餐额度 + 账本里每一笔（billing.buildQoderPacks）。
+   * 缺省 = 该账号还没有账本（首次探测时由 reconcileQoderAddonGrants 迁移建账）。
+   */
+  addonGrants?: QoderAddonGrant[]
 }
 
 /** 池内账号（凭证 + 状态），存于 KV qoder:pool:<providerId> */
@@ -282,6 +292,7 @@ async function writeQoderQuota(
   uid: string,
   credits: number,
   packages: PackageInfo[] | undefined,
+  grants: QoderAddonGrant[] | undefined,
   unfreeze: boolean
 ): Promise<void> {
   const pool = await readQoderPool(env, providerId)
@@ -293,6 +304,11 @@ async function writeQoderQuota(
   if (Array.isArray(packages)) {
     acc.state = { ...acc.state, packages, packagesAt: Date.now() }
   }
+  // 账本与 packages 同一次写：packages 就是账本渲染出来的，两者分开写会出现
+  // 「面板显示 6 笔、挑号只看得见 2 笔」这种自相矛盾（下一次结算又会以账本为准覆盖 packages）
+  if (Array.isArray(grants)) {
+    acc.state = { ...acc.state, addonGrants: grants }
+  }
   if (unfreeze && credits > 0) {
     acc.state = { ...acc.state, until: 0, disabled: false, reason: '', errCount: 0 }
   }
@@ -300,7 +316,7 @@ async function writeQoderQuota(
 }
 
 /**
- * 只回写额度与额度包明细，**不动冷却/禁用**（面板「刷新账号池」的额度探测用）。
+ * 只回写额度、额度包明细与加购账本，**不动冷却/禁用**（面板「刷新账号池」的额度探测用）。
  * 见 writeQoderQuota 的 unfreeze 说明。
  */
 export async function setQoderPoolQuota(
@@ -308,9 +324,10 @@ export async function setQoderPoolQuota(
   providerId: string,
   uid: string,
   credits: number,
-  packages?: PackageInfo[]
+  packages?: PackageInfo[],
+  grants?: QoderAddonGrant[]
 ): Promise<void> {
-  await writeQoderQuota(env, providerId, uid, credits, packages, false)
+  await writeQoderQuota(env, providerId, uid, credits, packages, grants, false)
 }
 
 /**
@@ -330,9 +347,10 @@ export async function reenableQoderIfCredits(
   providerId: string,
   uid: string,
   remain: number,
-  packages?: PackageInfo[]
+  packages?: PackageInfo[],
+  grants?: QoderAddonGrant[]
 ): Promise<void> {
-  await writeQoderQuota(env, providerId, uid, remain, packages, true)
+  await writeQoderQuota(env, providerId, uid, remain, packages, grants, true)
 }
 
 /**

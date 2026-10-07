@@ -6,10 +6,10 @@
  * 数据刷新变成用户随时能点的动作。
  *
  * 两条最容易搞错、也最要紧的语义：
- *   1. 探测**只写额度与额度包，绝不解冻账号**——点一下刷新就把 429 冷却中的号放出来，
+ *   1. 探测**只写额度、额度包明细与账本，绝不解冻账号**——点一下刷新就把 429 冷却中的号放出来，
  *      等于绕过限流保护；禁用标记同理（留给签到，因为签到能证明 token 有效）。
- *   2. 探测**不能把签到包的到期时间擦成长期**（没有新 grant，必须用池里已存的值兜底），
- *      否则「到期优先」会静默失效。
+ *   2. 探测**不能把逐笔到期明细擦掉**：它没有新 grant，只能做结算（FIFO）与首次迁移，
+ *      账本里已观测到的每笔到期时间必须原样保留，否则「到期优先」会静默失效。
  */
 import { describe, it, expect, vi, afterEach } from 'vitest'
 import { Hono } from 'hono'
@@ -20,7 +20,7 @@ import { renderAdminPage } from '../pages'
 import { setProviders } from '../storage'
 import { cooldownQoderAccount, disableQoderAccount, listQoderPoolStatus, readQoderPool, writeQoderPool, type QoderPoolAccount } from './pool'
 import { probeQoderPoolQuota } from './probe'
-import { QODER_PACK_ADDON } from './billing'
+import { QODER_EXPIRE_UNKNOWN, QODER_PACK_ADDON, QODER_PACK_BASE, QODER_UNBOOKED_PACK_NAME } from './billing'
 import { formatCstWallClock, parseCstWallClock } from '../credit-expiry'
 import type { PackageInfo } from '../types'
 
@@ -103,7 +103,12 @@ describe('probeQoderPoolQuota：只写额度，绝不解冻账号', () => {
     const st = (await listQoderPoolStatus(env, 'qoder'))[0]
     expect(st.credits).toBe(400)
     const packs = st.packages as PackageInfo[]
-    expect(packs.map((p) => p.name)).toEqual(['套餐额度', QODER_PACK_ADDON])
+    // 首次迁移：还没有账本 → 上游那 100 分加购额度被记成**一笔**「未记账余额」
+    expect(packs.map((p) => p.name)).toEqual([QODER_PACK_BASE, QODER_UNBOOKED_PACK_NAME])
+    expect(packs[1]).toMatchObject({ size: 100, used: 0 })
+    // 这次没有历史到期时间可用 → 明确标「到期未知」，不编造日期（编了就会驱动「到期优先」挑号）
+    expect(packs[1].expireAt).toBe(QODER_EXPIRE_UNKNOWN)
+    expect(parseCstWallClock(packs[1].expireAt)).toBeNull()
     // 套餐包的到期 = 上游 quota/usage 顶层的 expiresAt（ms），落成 CST 墙钟串后往返一致
     // （墙钟串是**秒级**格式，故按秒对齐比较）
     expect(parseCstWallClock(packs[0].expireAt)).toBe(Math.floor(QUOTA_JSON.expiresAt / 1000) * 1000)
@@ -149,9 +154,47 @@ describe('probeQoderPoolQuota：只写额度，绝不解冻账号', () => {
     await probeQoderPoolQuota(env, qoderProvider())
 
     const packs = (await listQoderPoolStatus(env, 'qoder'))[0].packages as PackageInfo[]
-    const addon = packs.find((p) => p.name === QODER_PACK_ADDON)!
+    // 首次迁移沿用旧聚合包的上界（那是一次真观测到的值，不能丢）
+    const unbooked = packs.find((p) => p.name === QODER_UNBOOKED_PACK_NAME)!
+    expect(unbooked).toBeDefined()
     // 秒级取整误差内与原来的到期时刻一致
-    expect(Math.abs(Date.parse(prev[0].expireAt) - Date.parse(addon.expireAt))).toBeLessThan(1000)
+    expect(Math.abs(Date.parse(unbooked.expireAt) - Date.parse(prev[0].expireAt))).toBeLessThan(1000)
+  })
+
+  it('已有账本：逐笔明细原样保留（不因一次刷新被合并/擦掉），并按上游剩余量 FIFO 结算', async () => {
+    const { env } = makeEnv()
+    const day1 = Date.now() - 2 * DAY_MS
+    const day2 = Date.now() - DAY_MS
+    const grants = [
+      { at: day1, size: 100, used: 0, expireAt: day1 + 30 * DAY_MS },
+      { at: day2, size: 100, used: 0, expireAt: day2 + 30 * DAY_MS },
+    ]
+    await writeQoderPool(env, 'qoder', [account({ state: { credits: 200, disabled: false, until: 0, errCount: 0, addonGrants: grants } })])
+    // 上游说加购桶只剩 50：第一笔用完、第二笔用掉 50
+    const quota = { ...QUOTA_JSON, addOnQuota: { total: 200, used: 150, remaining: 50, unit: 'credits' } }
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify(quota), { status: 200 })))
+
+    await probeQoderPoolQuota(env, qoderProvider())
+
+    const acc = (await readQoderPool(env, 'qoder'))[0]
+    expect(acc.state.addonGrants).toHaveLength(1)
+    expect(acc.state.addonGrants![0]).toMatchObject({ at: day2, size: 100, used: 50 })
+    const packs = (await listQoderPoolStatus(env, 'qoder'))[0].packages as PackageInfo[]
+    expect(packs.filter((p) => p.name.startsWith('签到额度 '))).toHaveLength(1)
+    expect(packs.find((p) => p.name.startsWith('签到额度 '))).toMatchObject({ size: 100, used: 50 })
+  })
+
+  it('额度接口没数据/失败时，账本与明细原样保留（不让一次失败的探测把历史抹掉）', async () => {
+    const { env } = makeEnv()
+    const day1 = Date.now() - DAY_MS
+    const grants = [{ at: day1, size: 100, used: 0, expireAt: day1 + 30 * DAY_MS }]
+    await writeQoderPool(env, 'qoder', [account({ state: { credits: 100, disabled: false, until: 0, errCount: 0, addonGrants: grants } })])
+    vi.stubGlobal('fetch', vi.fn(async () => new Response('boom', { status: 500 })))
+
+    const out = await probeQoderPoolQuota(env, qoderProvider())
+    expect(out[0].ok).toBe(false)
+    const acc = (await readQoderPool(env, 'qoder'))[0]
+    expect(acc.state.addonGrants).toEqual(grants)
   })
 
   it('单个账号失败不影响其余账号，且失败原因如实带出', async () => {

@@ -15,9 +15,10 @@
 import type { Env, Provider } from '../types'
 import { OAUTH_TOKEN_REFRESH_MARGIN_MS } from '../config'
 import { refreshQoderTokenPair } from '../oauth'
-import { buildQoderPacks, fetchQoderUserInfo, fetchQoderUserResource, normalizeQoderRealm } from './billing'
+import { buildQoderPacks, fetchQoderUserInfo, fetchQoderUserResource, legacyQoderAddonExpireAt, normalizeQoderRealm } from './billing'
 import { isRealQoderNickname, readQoderPool, refreshQoderPoolAccountIfNeeded, setQoderPoolAccountNickname, setQoderPoolQuota } from './pool'
 import { isFallbackQoderUid, repairQoderPoolUid } from './identity'
+import { reconcileQoderAddonGrants } from './grants'
 
 /** 单个账号的探测结果（供面板逐条显示，脱敏：不含 token）。 */
 export interface QoderQuotaProbeOutcome {
@@ -77,9 +78,15 @@ export async function probeQoderPoolQuota(env: Env, provider: Provider): Promise
         out.push({ uid, ok: false, error: '额度接口无数据（响应为空或结构变了）' })
         continue
       }
-      // 没有新 grant → 签到包的到期时间用池里已存的值兜底（不让一次刷新把到期时间擦成长期）
-      const packs = buildQoderPacks(quota, undefined, acc.state?.packages)
-      await setQoderPoolQuota(env, provider.id, uid, quota.totalRemain, packs)
+      // 按笔记账：没有新 grant（探测不是领取）→ 只做结算 + 首次迁移建账，
+      // 账本里已观测到的每笔到期时间原样保留（不让一次刷新把明细擦掉）。
+      const grants = reconcileQoderAddonGrants({
+        prevGrants: acc.state?.addonGrants,
+        addon: quota.addonQuota,
+        legacyExpireAt: legacyQoderAddonExpireAt(acc.state?.packages),
+      })
+      const packs = buildQoderPacks(quota, grants)
+      await setQoderPoolQuota(env, provider.id, uid, quota.totalRemain, packs, grants)
       out.push({ uid, ok: true, credits: quota.totalRemain })
     } catch (e) {
       out.push({ uid, ok: false, error: (e as Error).message || '探测失败' })

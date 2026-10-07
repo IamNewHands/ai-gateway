@@ -182,6 +182,19 @@ describe('pickQoderAccount 两段式：7 天内到期的积分优先，窗口内
     expect((await pickQoderAccount(env, pid, new Set()))?.uid).toBe('soon')
   })
 
+  it('攒了多笔签到（每笔各自到期）→ 只要**最早那笔**进窗口就被优先挑中（整桶看最后一笔会漏掉它）', async () => {
+    const { env } = makeEnv()
+    const pid = 'qoder-pick-grants'
+    // 6 笔签到：最早那笔 2 天后作废，其余都在 30 天后（旧实现把整桶标成"最后一笔"的 36 天后
+    // → 整个账号永远进不了 7 天窗口 → 最早那 100 分作废也不会被优先消耗）
+    const packs = [2, 32, 33, 34, 35, 36].map((d, i) => pkg(d * DAY, { name: `签到额度 10-0${i + 1}` }))
+    await writeQoderPool(env, pid, [
+      accountWithPacks('hoarder', 600, packs),
+      accountWithPacks('other', 5000, [pkg(20 * DAY)]),
+    ])
+    expect((await pickQoderAccount(env, pid, new Set()))?.uid).toBe('hoarder')
+  })
+
   it('都在窗口外 → 回落「剩余积分最多者」（原自动策略完全不变）', async () => {
     const { env } = makeEnv()
     const pid = 'qoder-pick-2'

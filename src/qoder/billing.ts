@@ -1,5 +1,6 @@
 import { cosySessionFor, type CosySession } from './cosy'
 import { formatCstWallClock, parseCstWallClock } from '../credit-expiry'
+import { isQoderUnbookedGrant, type QoderAddonGrant } from './grants'
 import type { PackageInfo } from '../types'
 
 /**
@@ -284,8 +285,10 @@ export interface QoderCheckinOutcome {
   campaignKey?: string
   /**
    * 本次新领积分的到期时刻（epoch ms，来自 claim 响应的 expiresAt，30 天相对有效期）。
-   * 落进池状态的「签到/赠送额度」包，面板据此显示到期天数、挑号据此优先消耗快过期的积分。
-   * 仅在**本次新领**时有值：replayed（今日已领）没有新 grant，用池里已存的到期时间。
+   *
+   * 它是**这一笔**的到期时间（上游对加购桶只给聚合余额，逐笔到期只能靠它一笔笔攒，
+   * 见 qoder/grants.ts）：落进账本后，面板按笔显示各自到期、挑号据此优先消耗最早那笔。
+   * 仅在**本次新领**时有值：replayed（今日已领）没有新 grant，账本里已有那一笔的记录。
    */
   rewardExpiresAt?: number
   /**
@@ -569,9 +572,50 @@ export interface QoderQuotaSplit {
   remain: number
 }
 
-/** 面板与池状态里的两个额度包名——唯一定义处（checkin 写路径与测试都引用它）。 */
+/** 面板与池状态里的权益包名——唯一定义处（checkin 写路径与测试都引用它）。 */
 export const QODER_PACK_BASE = '套餐额度'
+/**
+ * 旧版**聚合**包名（把整个加购桶当成一个包）。
+ *
+ * 2026-10-07 起不再写入：它把「最后一笔签到的到期时间」当成整桶的到期时间，导致面板日期
+ * 每天往后跳、且挑号永远进不了 7 天窗口（详见 qoder/grants.ts 文件头）。
+ * 保留常量只为一件事：**首次迁移**时从池里读回那份历史到期时间当上界
+ * （legacyQoderAddonExpireAt），别把已经观测到的信息丢掉。
+ */
 export const QODER_PACK_ADDON = '签到/赠送额度'
+/** 每笔签到各占一行的包名前缀（与 WorkBuddy / TRAE 的按包明细同构）。 */
+export const QODER_GRANT_PACK_PREFIX = '签到额度'
+/** 未记账余额（记账前的历史余额 / 非签到发放的赠送分）的包名。 */
+export const QODER_UNBOOKED_PACK_NAME = '签到额度（未记账余额）'
+/**
+ * 到期时间未知时的展示值。
+ *
+ * 必须是**非空且不可解析**：空串会被面板渲染成「长期」（那是谎——这些分确实会过期），
+ * 不可解析的串会原样灰字显示（见 pages.ts wbPackExpireHtml），
+ * 且 credit-expiry 的判定只认有限正数 → 自动不参与「7 天内到期优先」。
+ */
+export const QODER_EXPIRE_UNKNOWN = '到期未知'
+
+/** 旧聚合包（QODER_PACK_ADDON）里记录的历史到期时间（epoch ms）；没有 → 0。仅首次迁移用。 */
+export function legacyQoderAddonExpireAt(prev: readonly PackageInfo[] | null | undefined): number {
+  if (!Array.isArray(prev)) return 0
+  const p = prev.find((x) => x && x.name === QODER_PACK_ADDON)
+  return parseCstWallClock(p?.expireAt) ?? 0
+}
+
+/** 账本里的一笔 → 一个权益包（面板一行），与 WorkBuddy 的包同形态。 */
+export function qoderGrantPack(g: QoderAddonGrant): PackageInfo {
+  const unbooked = isQoderUnbookedGrant(g)
+  // 包名带领取日期（CST），否则一屏「签到额度」无法区分哪笔是哪笔
+  const day = unbooked ? '' : formatCstWallClock(g.at).slice(5, 10)
+  return {
+    name: unbooked ? QODER_UNBOOKED_PACK_NAME : `${QODER_GRANT_PACK_PREFIX} ${day}`.trim(),
+    expireAt: g.expireAt > 0 ? formatCstWallClock(g.expireAt) : QODER_EXPIRE_UNKNOWN,
+    size: g.size,
+    used: g.used,
+    unit: 'credits',
+  }
+}
 
 /**
  * 组装权益包列表（`PackageInfo` 形态，`expireAt` 统一为 CST 墙钟串）。
@@ -579,22 +623,15 @@ export const QODER_PACK_ADDON = '签到/赠送额度'
  * 为什么要把 Qoder 的额度也装成 PackageInfo：这样面板的到期渲染/排序/「⏳ N 个包 7 天内到期」
  * 徽章、以及 credit-expiry 的到期优先判定，全部与 workbuddy 共用同一套实现（零新渲染逻辑）。
  *
- * 两个包的到期来源不同，必须分开对待：
- *   - 套餐额度（userQuota）：到期 = quota/usage 的顶层 `expiresAt`（套餐到期即基础额度作废）；
- *   - 签到/赠送额度（addOnQuota）：quota/usage **不返回**它的到期时间，只能取「最近一次领取
- *     的那笔 grant」的 expiresAt（claim 响应的 30 天相对有效期）。已领过的账号用池里已存的
- *     到期时间兜底（`prev`），避免每日「已签到」路径把到期时间擦掉。
+ * **一个包 = 一笔**（套餐额度 + 账本里每一笔签到/赠送）：上游只给聚合桶，逐笔明细由
+ * qoder/grants.ts 记账得来。这样「7 天内到期」的徽章与挑号依据、以及概览里
+ * 「N 天内到期 余 X」的金额，都自动按笔算准——旧实现把整桶标成一个到期时间时，
+ * 概览会把整桶都算成"即将作废"，挑号则永远看不到真正最早那笔。
  */
 export function buildQoderPacks(
-  quota: { baseQuota: QoderQuotaSplit; addonQuota: QoderQuotaSplit; planExpiresAt: number },
-  rewardExpiresAtMs: number | undefined,
-  prev?: readonly PackageInfo[] | null
+  quota: { baseQuota: QoderQuotaSplit; planExpiresAt: number },
+  grants: readonly QoderAddonGrant[]
 ): PackageInfo[] {
-  const prevAddon = Array.isArray(prev) ? prev.find((p) => p && p.name === QODER_PACK_ADDON) : undefined
-  const addonExpireAt =
-    typeof rewardExpiresAtMs === 'number' && Number.isFinite(rewardExpiresAtMs) && rewardExpiresAtMs > 0
-      ? rewardExpiresAtMs
-      : (parseCstWallClock(prevAddon?.expireAt) ?? 0)
   return [
     {
       name: QODER_PACK_BASE,
@@ -603,22 +640,17 @@ export function buildQoderPacks(
       used: quota.baseQuota.used,
       unit: 'credits',
     },
-    {
-      name: QODER_PACK_ADDON,
-      expireAt: formatCstWallClock(addonExpireAt),
-      size: quota.addonQuota.size,
-      used: quota.addonQuota.used,
-      unit: 'credits',
-    },
+    ...(grants || []).map(qoderGrantPack),
   ]
 }
 
 /**
- * 拉取额度：聚合 userQuota（基础额度）+ addOnQuota（赠送/签到额度）为两个包。
+ * 拉取额度：上游只有 userQuota（基础额度）+ addOnQuota（赠送/签到额度）两个聚合桶。
  * 返回 null 表示数据缺失（非耗尽）。
  *
- * 除聚合值外还返回**分项**与套餐到期时间：签到积分落在 addOnQuota 里，而它的到期时间
- * 决定「哪些积分会先作废」，只有拿到分项才能把两个包分别标上到期时间（buildQoderPacks）。
+ * 除聚合值外还返回**分项**与套餐到期时间：套餐到期来自顶层 `expiresAt`（基础额度作废时刻）；
+ * `addonQuota` 没有到期时间，它的**剩余量**是 qoder/grants.ts 逐笔记账的 FIFO 结算依据
+ * （明细由 claim 响应的 expiresAt 一笔笔攒，上游不给）。
  */
 export async function fetchQoderUserResource(token: string, realm: QoderRealm = 'cn'): Promise<{
   totalRemain: number
