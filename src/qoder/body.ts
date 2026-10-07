@@ -63,6 +63,11 @@ export function fallbackUnknownModel(model: string): string {
 export interface ChatMessage {
   role: string
   content: unknown
+  /** assistant 发起的工具调用（OpenAI 形态）。丢掉它，后续 tool 结果就失去配对。 */
+  tool_calls?: Array<{ id?: string; type?: string; function?: { name?: string; arguments?: unknown } }>
+  /** tool 消息对应的调用 id（与 assistant.tool_calls[].id 配对）。 */
+  tool_call_id?: string
+  name?: string
 }
 
 /** 模型列表的场景桶优先级（qoder2api internal/bridge/bridge.go:195-206 parseQoderModels）。 */
@@ -147,6 +152,125 @@ function deepClone(obj: unknown): any {
   return JSON.parse(JSON.stringify(obj))
 }
 
+// ===== 工具历史结构化直传（hub qoder_proxy.py task-32 / v1.2.6 563346c） =====
+
+/** 结构化工具历史开关：`on` 强制、`off` 关闭、`auto`（默认）按 id 齐备度自动判定。 */
+export type QoderStructuredToolMode = 'on' | 'off' | 'auto'
+
+/**
+ * 从环境读开关（`QODER_STRUCTURED_TOOL_HISTORY`，缺省 auto）。
+ *
+ * 参数类型全为可选，故 `Env` 可直接传入（TS 结构化类型），不必往 Env 上加字段。
+ */
+export function qoderStructuredToolMode(env?: { QODER_STRUCTURED_TOOL_HISTORY?: string }): QoderStructuredToolMode {
+  const raw = String(env?.QODER_STRUCTURED_TOOL_HISTORY || '').trim().toLowerCase()
+  if (!raw || raw === 'auto') return 'auto'
+  if (['1', 'on', 'true', 'yes', 'enable', 'enabled', 'force'].includes(raw)) return 'on'
+  if (['0', 'off', 'false', 'no', 'disable', 'disabled'].includes(raw)) return 'off'
+  return 'auto'
+}
+
+/**
+ * 工具历史的 id 是否齐备——**结构化直传的硬前提**。
+ *
+ * 上游对「role:tool 但配不上前一条 assistant.tool_calls」是直接拒绝的，实测原文：
+ * `Messages with role 'tool' must be a response to a preceding message with 'tool_calls'`。
+ * 故只要有一条 tool 缺 `tool_call_id`、或某个 `tool_calls` 条目缺 `id`，就不能走结构化
+ * （hub `_tool_ids_ok` 同口径：**任何模式下** id 不齐备都回退，宁可不发畸形请求）。
+ */
+export function qoderToolIdsComplete(messages: readonly ChatMessage[]): boolean {
+  for (const m of messages) {
+    if (!m || typeof m !== 'object') continue
+    if (m.role === 'tool') {
+      if (!String(m.tool_call_id || '').trim()) return false
+    } else if (m.role === 'assistant' && Array.isArray(m.tool_calls) && m.tool_calls.length > 0) {
+      for (const tc of m.tool_calls) {
+        if (!tc || typeof tc !== 'object' || !String(tc.id || '').trim()) return false
+      }
+    }
+  }
+  return true
+}
+
+/**
+ * 本次请求是否走结构化工具历史。
+ *
+ * - `off` → 恒 false（一键回退，出问题不用改代码）；
+ * - `on`  → 强制（id 仍须齐备）；
+ * - `auto`（默认）→ 仅在**确实存在工具历史**且 id 齐备时启用；纯对话请求形态不变
+ *   （不改变无工具请求的任何行为）。
+ *
+ * 注：hub 的 auto 另有一条「仅 CN + provider 白名单」限制，理由是 task-31 只在
+ * Qwen/GLM 上验过、DeepSeek/Kimi 待补验。本模块的模型 key 是 Qoder 自家 SKU
+ * （qmodel/dmodel/gm51model…），无法与 hub 的白名单直接对齐，故不照搬该限制——
+ * 改由 env 开关兜底（`off` 可一键回退）。
+ */
+export function useQoderStructuredToolHistory(
+  messages: readonly ChatMessage[],
+  mode: QoderStructuredToolMode = 'auto'
+): boolean {
+  if (mode === 'off') return false
+  if (!qoderToolIdsComplete(messages)) return false
+  if (mode === 'on') return true
+  return messages.some(
+    (m) =>
+      !!m &&
+      typeof m === 'object' &&
+      (m.role === 'tool' || (m.role === 'assistant' && Array.isArray(m.tool_calls) && m.tool_calls.length > 0))
+  )
+}
+
+/**
+ * tool 结果正文取字符串形态。
+ *
+ * tool 的 content 在 OpenAI 规范里就是字符串；这里额外兼容数组形态（Claude 风格的
+ * content block），只取 text 部分，避免把结构化 block 原样丢给上游。
+ */
+function qoderToolResultText(content: unknown): string {
+  if (typeof content === 'string') return content
+  if (Array.isArray(content)) {
+    const parts: string[] = []
+    for (const p of content) {
+      if (typeof p === 'string') {
+        parts.push(p)
+        continue
+      }
+      if (p && typeof p === 'object') {
+        const t = (p as { text?: unknown }).text
+        if (typeof t === 'string') parts.push(t)
+      }
+    }
+    return parts.join('\n')
+  }
+  if (content === null || content === undefined) return ''
+  return String(content)
+}
+
+/**
+ * assistant.tool_calls 归一为 OpenAI 规范形态（id / type / function.{name,arguments}）。
+ *
+ * `arguments` 统一成 **JSON 字符串**：dict/数组会被两侧的转换层按字符串处理，
+ * 字符串最稳（hub task-32 同口径）。返回 null = 没有可用的 tool_calls。
+ */
+function qoderNormalizeToolCalls(raw: unknown): any[] | null {
+  if (!Array.isArray(raw) || raw.length === 0) return null
+  const out: any[] = []
+  for (const tc of raw) {
+    if (!tc || typeof tc !== 'object') return null
+    const t = tc as { id?: unknown; type?: unknown; function?: { name?: unknown; arguments?: unknown } }
+    const fn = t.function && typeof t.function === 'object' ? t.function : {}
+    let args = fn.arguments
+    if (args && typeof args === 'object') args = JSON.stringify(args)
+    else if (typeof args !== 'string') args = args === null || args === undefined ? '' : String(args)
+    out.push({
+      id: String(t.id || ''),
+      type: typeof t.type === 'string' && t.type ? t.type : 'function',
+      function: { name: String(fn.name || ''), arguments: args },
+    })
+  }
+  return out
+}
+
 /**
  * buildQoderBody 渲染上游请求体 JSON 字符串。
  * @param messages OpenAI 格式消息
@@ -158,7 +282,8 @@ export function buildQoderBody(
   messages: ChatMessage[],
   modelKey: string,
   userType = 'personal_professional_trial',
-  tools?: unknown
+  tools?: unknown,
+  structuredToolHistory?: boolean
 ): string {
   const base = deepClone(basepromptJson)
   const prompt = extractLatestUserPrompt(messages)
@@ -192,7 +317,32 @@ export function buildQoderBody(
   // messages：保留模板中的 system 提示词，追加真实对话
   const systemMsgs: any[] = (Array.isArray(base.messages) ? base.messages : [])
     .filter((m: any) => m && m.role === 'system')
+  const structured = structuredToolHistory === true
   for (const m of messages) {
+    if (!m || typeof m !== 'object') continue
+    if (structured) {
+      // ===== 结构化直传（hub qoder_proxy.py flatten_messages structured 分支）=====
+      // 旧实现无条件只发 {role, content}：`role:'tool'` 丢掉 tool_call_id（上游判为
+      // 「配不上前一条 tool_calls」→ 直接拒绝）、assistant 丢掉 tool_calls（模型看不到
+      // 自己发起过什么调用）。多轮工具会话因此被截断成孤立文本。
+      if (m.role === 'tool') {
+        // content 恒为空字符串而非 null：hub task-31 实测 null 会让上游转换层丢掉
+        // 配对的 assistant 消息，DeepSeek/Kimi 直接 provider_error。
+        systemMsgs.push({
+          role: 'tool',
+          tool_call_id: String(m.tool_call_id || ''),
+          content: qoderToolResultText(m.content),
+        })
+        continue
+      }
+      if (m.role === 'assistant' && Array.isArray(m.tool_calls) && m.tool_calls.length > 0) {
+        const calls = qoderNormalizeToolCalls(m.tool_calls)
+        if (calls) {
+          systemMsgs.push({ role: 'assistant', content: qoderToolResultText(m.content), tool_calls: calls })
+          continue
+        }
+      }
+    }
     systemMsgs.push({ role: m.role, content: m.content })
   }
   base.messages = systemMsgs

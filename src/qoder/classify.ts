@@ -320,3 +320,213 @@ export function qoderOpenAIErrorBody(c: QoderClassified): string {
   }
   return JSON.stringify({ error: err })
 }
+
+// ===== 信封内层错误可观测性（hub qoder_proxy.py task-34 / v1.2.6 563346c） =====
+
+/**
+ * 内层错误的归类标签（用于首次告警去重与计数）。
+ *
+ * 与 `QoderErrorKind` 分开：后者是**面向客户端**的错误语义（决定 HTTP 状态码与是否换号），
+ * 这里是**面向排障**的形态标签，只进日志。两者刻意不合并——内层错误的外层信封是 200，
+ * 直接套用 QoderErrorKind 会把「上游藏在 200 里的失败」说成正常响应。
+ */
+export type QoderInnerErrorKind = 'content_policy' | 'rate_limit' | 'invalid_request' | 'auth' | 'other'
+
+/**
+ * 内层错误里「请求本身有问题」的标记。
+ *
+ * `must be a response` 是实测原文（hub task-34）：
+ * `Messages with role 'tool' must be a response to a preceding message with 'tool_calls'`
+ * ——上游对畸形工具历史的拒绝形态，正是 body.ts 丢弃 tool_call_id 时触发的报错。
+ */
+const INVALID_REQUEST_MARKERS = [
+  'invalid_request',
+  'invalid-parameter',
+  'invalid_parameter',
+  'provider_error',
+  'must be a response',
+  'unsupported',
+  'not found',
+  'bad request',
+]
+
+/**
+ * 把内层错误归类。返回 '' 表示「不是错误形态」（正常 chunk）。
+ *
+ * 判定顺序对齐 hub `_inner_error_kind`：内容审核 → 限流 → 请求畸形 → 鉴权 → 其它。
+ * 顺序有意义：内容审核文案里常同时出现别的关键词，放最后会被误判成 invalid_request。
+ */
+export function classifyQoderInnerError(code: string, message: string): QoderInnerErrorKind | '' {
+  const lower = `${code} ${message}`.toLowerCase().trim()
+  if (!lower) return ''
+  if (contentPolicyLike(lower)) return 'content_policy'
+  if (queueFullLike(lower) || rateLike(lower)) return 'rate_limit'
+  if (INVALID_REQUEST_MARKERS.some((m) => lower.includes(m))) return 'invalid_request'
+  if (authLike(lower)) return 'auth'
+  return 'other'
+}
+
+/**
+ * 从内层 chunk 的 JSON 文本里读出错误指示。返回 null = 正常 chunk。
+ *
+ * 兼容三种形态（hub `note_inner_upstream_error`）：
+ *   - `{"error":{"code":..,"message":..}}`（标准 OpenAI 错误体）
+ *   - `{"error":"<纯文本>"}`
+ *   - 无 error 字段 → 正常
+ */
+export function qoderInnerErrorDetail(rawChunk: string): { kind: QoderInnerErrorKind; code: string; message: string } | null {
+  let obj: any
+  try {
+    obj = JSON.parse(rawChunk)
+  } catch {
+    return null
+  }
+  if (!obj || typeof obj !== 'object') return null
+  const err = obj.error
+  let code = ''
+  let msg = ''
+  if (err && typeof err === 'object') {
+    code = String(err.code || err.type || '')
+    msg = String(err.message || '')
+  } else if (typeof err === 'string') {
+    msg = err
+  } else {
+    return null
+  }
+  const kind = classifyQoderInnerError(code, msg)
+  if (!kind) return null
+  return { kind, code, message: msg }
+}
+
+/**
+ * 内层错误 → 结构化分类（供**非流式**路径把「被 200 信封藏住的失败」如实报给客户端）。
+ *
+ * 为什么不直接 `classifyQoderError({ status: 200, body })`：那条路径按**信封**语义分类，
+ * 对 `invalid_request_error` 会落到 `unavailable` → 502 且 `failover=true`，于是池循环会
+ * 为一个**请求形状**问题去冷却并轮换其它账号，白烧它们的配额（这正是 content_policy
+ * 分支存在的原因）。内层错误的 kind 已知，直接按它定状态码与是否换号，不猜。
+ *
+ * 映射：
+ *   - content_policy / invalid_request → 400 且**不换号**（换号必然被同样拒绝）
+ *   - rate_limit / auth                → 沿用既有语义（429 / 403）并允许换号
+ *   - other                            → 502，允许换号
+ */
+export function qoderInnerErrorClassified(
+  kind: QoderInnerErrorKind,
+  code: string,
+  message: string
+): QoderClassified {
+  const detail = message.trim().slice(0, 300)
+  const base = {
+    failover: true,
+    cooldownSeconds: 0,
+    code: firstNonEmpty(code, 'upstream_error'),
+    type: 'upstream_error',
+  }
+  switch (kind) {
+    case 'content_policy':
+      return {
+        ...base,
+        status: 400,
+        kind: 'content_policy',
+        failover: false,
+        code: firstNonEmpty(code, 'content_policy_rejected'),
+        type: 'content_policy_rejected',
+        message:
+          '上游内容安全审核未通过（错误被藏在 HTTP 200 信封内层）：输入可能含不当内容，属确定性拒绝、重试无效。' +
+          (detail ? '上游详情：' + detail : ''),
+      }
+    case 'invalid_request':
+      // 请求形状问题（如工具历史缺配对 id）。换号无用，且会把畸形请求重放到别的账号上。
+      return {
+        ...base,
+        status: 400,
+        kind: 'unavailable',
+        failover: false,
+        code: firstNonEmpty(code, 'invalid_request_error'),
+        type: 'invalid_request_error',
+        message:
+          '上游拒绝了本次请求（错误被藏在 HTTP 200 信封内层，非账号故障、重试无效）：' +
+          (detail || '请求体不被上游接受'),
+      }
+    case 'rate_limit':
+      return {
+        ...base,
+        status: 429,
+        kind: 'rate_limit',
+        cooldownSeconds: 60,
+        code: firstNonEmpty(code, 'rate_limit_exceeded'),
+        type: 'rate_limit_exceeded',
+        message: '上游限流（错误被藏在 HTTP 200 信封内层）：' + (detail || '稍后重试'),
+      }
+    case 'auth':
+      return {
+        ...base,
+        status: 403,
+        kind: 'auth',
+        code: firstNonEmpty(code, 'unauthorized'),
+        message: '上游鉴权失败（错误被藏在 HTTP 200 信封内层）：' + (detail || '请重新登录该账号'),
+      }
+    default:
+      return {
+        ...base,
+        status: 502,
+        kind: 'unavailable',
+        message: '上游返回错误（被藏在 HTTP 200 信封内层）：' + (detail || '上游未给出详情'),
+      }
+  }
+}
+
+/**
+ * 内层错误计数快照（总数 + 按类别 + 已告警类别）。
+ *
+ * 为什么用模块级状态：Workers 每个 isolate 一份，只作**排障计数**用，不做跨 isolate 聚合
+ * （那需要 KV/DO，属另一件事）。这与 hub 的进程内计数语义等价。
+ */
+export interface QoderInnerErrorSnapshot {
+  total: number
+  kinds: Partial<Record<QoderInnerErrorKind, number>>
+  warned: QoderInnerErrorKind[]
+}
+
+const innerErrorStats: { total: number; kinds: Partial<Record<QoderInnerErrorKind, number>>; warned: Set<QoderInnerErrorKind> } = {
+  total: 0,
+  kinds: {},
+  warned: new Set(),
+}
+
+export function qoderInnerErrorSnapshot(): QoderInnerErrorSnapshot {
+  return { total: innerErrorStats.total, kinds: { ...innerErrorStats.kinds }, warned: [...innerErrorStats.warned] }
+}
+
+/** 仅测试用：清空计数，避免用例之间互相污染。 */
+export function resetQoderInnerErrorStats(): void {
+  innerErrorStats.total = 0
+  innerErrorStats.kinds = {}
+  innerErrorStats.warned.clear()
+}
+
+/**
+ * 观测一个内层 chunk 里的错误：计数 + **按类别首次**告警，返回命中类别（未命中返回 ''）。
+ *
+ * 为什么必须按类别只告警一次：这类错误是**每帧重复**的（上游把同一错误塞进多帧），
+ * 逐帧打日志会把日志刷爆，反而让真正的首因被埋掉。计数继续累加，只压日志。
+ *
+ * 只观测、不改行为：调用方照常走清洗/透传/聚合分支。是否把内层错误升级成可见错误
+ * 由调用点按路径决定（流式已原样透传给客户端，非流式会聚合掉，见 proxy.ts）。
+ */
+export function noteQoderInnerError(rawChunk: string, context?: string): QoderInnerErrorKind | '' {
+  const detail = qoderInnerErrorDetail(rawChunk)
+  if (!detail) return ''
+  const kind = detail.kind
+  innerErrorStats.total++
+  innerErrorStats.kinds[kind] = (innerErrorStats.kinds[kind] || 0) + 1
+  if (!innerErrorStats.warned.has(kind)) {
+    innerErrorStats.warned.add(kind)
+    // 截断到 300 字符：够定位，且不把内层正文（可能含用户内容）整段写进日志
+    console.warn(
+      `[qoder-inner-error] kind=${kind}${context ? ` ctx=${context}` : ''} total=${innerErrorStats.total} | ${rawChunk.slice(0, 300)}`
+    )
+  }
+  return kind
+}

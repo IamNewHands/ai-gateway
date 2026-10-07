@@ -735,6 +735,15 @@ export interface Env {
   /** 对外管理 API 的认证 Token；未配置时 /api/manage/* 返回 503 */
   MANAGEMENT_TOKEN?: string
   /**
+   * Qoder 工具历史结构化直传开关（可选）：`on` 强制 / `off` 关闭 / `auto`（缺省）。
+   *
+   * auto 仅在请求确实带工具历史且 tool_call_id 齐备时启用结构化直传（把 `role:'tool'`
+   * 与 `assistant.tool_calls` 原样发给上游，而不是只发 {role, content}）。上游对
+   * 「tool 配不上前一条 tool_calls」是直接拒绝的，出问题时设 `off` 即可一键回退到
+   * 旧的扁平形态，不必改代码或回滚部署。
+   */
+  QODER_STRUCTURED_TOOL_HISTORY?: string
+  /**
    * Cloudflare Access 加固开关（可选，仅作用于 /admin/*）。
    * 设 'true' 才启用；否则一律放行（不影响客户端 /v1/*，也不影响任何其它路径）。
    * 启用后需要同时配置 CF_ACCESS_AUD（Access Application 的 Audience/AUD 标签）与

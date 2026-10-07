@@ -15,9 +15,9 @@
 
 import type { Env, Provider } from '../types'
 import { getOauthAccessToken, readOauthToken, refreshOauthToken, refreshQoderTokenPair } from '../oauth'
-import { buildQoderBody, cpaToUpstreamKey, fallbackUnknownModel, pickQoderModels } from './body'
+import { buildQoderBody, cpaToUpstreamKey, fallbackUnknownModel, pickQoderModels, qoderStructuredToolMode, useQoderStructuredToolHistory } from './body'
 import { qoderEncode, cosySessionFor, cosyHeaders, buildBearer, type CosySession } from './cosy'
-import { classifyQoderError, qoderOpenAIErrorBody, type QoderClassified } from './classify'
+import { classifyQoderError, qoderOpenAIErrorBody, noteQoderInnerError, qoderInnerErrorDetail, qoderInnerErrorClassified, type QoderClassified } from './classify'
 import {
   seedQoderPoolFromSingle,
   readQoderPool,
@@ -491,6 +491,9 @@ async function openQoderSSE(upstreamBody: ReadableStream<Uint8Array>, _model: st
         break
       }
       if (!env.body || env.body === '[DONE]') continue
+      // 内层错误只观测、不改行为：流式把这个 chunk 原样透传给客户端（客户端能看到 error），
+      // 但网关侧此前**零痕迹**——排障时无法判断「客户端说上游报错」到底发生过没有。
+      noteQoderInnerError(env.body, 'stream')
       const cleaned = cleanQoderChunk(env.body)
       if (!cleaned) continue
       pending.push(cleaned)
@@ -528,6 +531,8 @@ async function openQoderSSE(upstreamBody: ReadableStream<Uint8Array>, _model: st
               break readLoop
             }
             if (!env.body || env.body === '[DONE]') continue
+            // 同闸门期：内层错误只观测（见 openQoderSSE 的说明）
+            noteQoderInnerError(env.body, 'stream')
             const cleaned = cleanQoderChunk(env.body)
             if (!cleaned) continue
             validFrames++
@@ -651,6 +656,16 @@ async function sendQoderChatOnce(
   const chunks: string[] = []
   const splitter = makeLineSplitter()
   let envelopeErr: QoderClassified | null = null
+  /**
+   * 内层错误（hub task-34 / v1.2.6）：外层信封 statusCodeValue=200，错误藏在**内层 chunk** 里。
+   *
+   * 为什么非流式**必须**处理而不能只记日志：流式路径把这个 chunk 原样转发给客户端，客户端
+   * 至少能看到 error；而非流式要聚合，`aggregateQoderChunks` 对没有 `choices` 的帧直接
+   * `continue` → 内层错误被整帧丢掉 → 网关返回「200 + 空 content + finish_reason: stop」。
+   * 客户端看到的是「模型什么都没说」，日志里没有任何痕迹，排障成本极高（hub 原文：
+   * 「客户端只看到 200 的空正文，排障成本极高」）。
+   */
+  let innerErr: QoderClassified | null = null
   readLoop: while (true) {
     const { done, value } = await reader.read()
     if (done) break
@@ -663,6 +678,14 @@ async function sendQoderChatOnce(
         break readLoop
       }
       if (!env.body || env.body === '[DONE]') continue
+      // 只观测（计数 + 按类别首次告警）；是否升级为可见错误由聚合结果决定（见下）
+      if (!innerErr) {
+        const inner = qoderInnerErrorDetail(env.body)
+        if (inner) {
+          noteQoderInnerError(env.body, 'nonstream')
+          innerErr = qoderInnerErrorClassified(inner.kind, inner.code, inner.message)
+        }
+      }
       chunks.push(`data: ${env.body}\n\n`)
     }
   }
@@ -676,12 +699,38 @@ async function sendQoderChatOnce(
     return { ok: false, classified: QODER_EMPTY_STREAM_CLASSIFIED }
   }
   const aggregated = aggregateQoderChunks(chunks.join(''), model)
+  // 内层错误 + 聚合不出任何正文 → 上游的失败被 200 信封藏住了，必须如实报错。
+  // 只在「正文为空」时升级：若上游先吐了正文再报错，那部分正文是真实产出，照常返回
+  // （与流式路径「已下发的内容不撤回」一致，也不改变任何有正文请求的行为）。
+  if (innerErr && qoderCompletionIsEmpty(aggregated)) {
+    return { ok: false, classified: innerErr }
+  }
   return {
     ok: true,
     response: new Response(aggregated, {
       status: 200,
       headers: { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store', ...extraHeaders },
     }),
+  }
+}
+
+/**
+ * 聚合结果是否「没有任何正文」：content 为空串、无 reasoning、且没有 tool_calls。
+ *
+ * 为什么要连 tool_calls 一起看：只有工具调用的回复 content 本来就为空，那是**正常**产出，
+ * 不能当成失败（否则会把纯工具调用的非流式请求误报成上游错误）。
+ */
+function qoderCompletionIsEmpty(aggregated: string): boolean {
+  try {
+    const obj = JSON.parse(aggregated)
+    const msg = obj?.choices?.[0]?.message
+    if (!msg || typeof msg !== 'object') return true
+    const content = typeof msg.content === 'string' ? msg.content.trim() : ''
+    const reasoning = typeof msg.reasoning_content === 'string' ? msg.reasoning_content.trim() : ''
+    const hasTools = Array.isArray(msg.tool_calls) && msg.tool_calls.length > 0
+    return content === '' && reasoning === '' && !hasTools
+  } catch {
+    return false
   }
 }
 
@@ -710,7 +759,10 @@ export async function proxyQoderChatRequest(
   const model = (forwardBody.model as string) || 'auto'
   const modelKey = opts?.modelKey || fallbackUnknownModel(cpaToUpstreamKey(stripProviderPrefix(model)))
   const messages = Array.isArray(forwardBody.messages) ? (forwardBody.messages as any[]) : []
-  const body = buildQoderBody(messages, modelKey, undefined, forwardBody.tools)
+  // 工具历史结构化直传（hub v1.2.6）：默认 auto —— 仅在确实存在工具历史且 id 齐备时启用，
+  // 纯对话请求形态与旧版逐字节一致。`QODER_STRUCTURED_TOOL_HISTORY=off` 可一键回退。
+  const structuredTools = useQoderStructuredToolHistory(messages, qoderStructuredToolMode(env))
+  const body = buildQoderBody(messages, modelKey, undefined, forwardBody.tools, structuredTools)
   const encodedBody = qoderEncode(body)
   const wantStream = opts?.stream ?? forwardBody.stream === true
 
