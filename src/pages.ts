@@ -5005,14 +5005,19 @@ window.addEventListener('hashchange', function () {
       html += kpiCard('—', 'WorkBuddy 可用额度', '暂无签到数据', null)
       html += kpiCard('—', '今日签到', '暂无签到数据', null)
     }
+    // TRAE Work 可用额度：账号池 work_credits 合计（挑号依据）；额度池取 Work 权益包上限
+    var tr = d.data.trae || {}
+    if (tr.accounts > 0) {
+      html += kpiCard(String(tr.workRemain ?? '—'), 'TRAE Work 可用额度', tr.workSize > 0 ? '额度池 ' + tr.workSize : tr.accounts + ' 个账号', tr.workSize > 0 ? tr.workRemain / tr.workSize * 100 : null)
+    } else {
+      html += kpiCard('—', 'TRAE Work 可用额度', '暂无 TRAE 账号', null)
+    }
     // 24h 调用：analytics 不可用时降级
     var u = d.data.usage
     if (u) {
       html += kpiCard(String(u.requests), '24h 调用量', 'Analytics Engine', null)
-      html += kpiCard(u.successRate.toFixed(1) + '%', '24h 成功率', u.successRate >= 95 ? '健康' : (u.successRate >= 80 ? '注意' : '异常'), u.successRate)
     } else {
       html += kpiCard('—', '24h 调用量', '统计未启用', null)
-      html += kpiCard('—', '24h 成功率', '统计未启用', null)
     }
     root.innerHTML = html
   } catch (e) { /* 聚合接口失败保持空白，不打扰配置统计展示 */ }

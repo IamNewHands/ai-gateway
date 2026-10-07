@@ -32,7 +32,8 @@ import {
   type QoderPoolAccount,
 } from './qoder/pool'
 import { isTraeProvider } from './trae/proxy'
-import { runTraeCheckins } from './trae/admin'
+import { runTraeCheckins, readTraeCheckinResults } from './trae/admin'
+import { listTraeStatus } from './trae/pool'
 import type { TraeCheckinResult } from './trae/types'
 import {
   isOAuthPoolProvider,
@@ -973,6 +974,19 @@ function participatesInCheckin(p: Provider): boolean {
 }
 
 /**
+ * 结构上不参与签到的账号（skip 语义，**不是**「待签」）：
+ * - skipped_global：国际版 WorkBuddy 无签到体系（`checkin.ts` realm==='global' 分支只做活跃上报）
+ * - skipped_no_token：账号没有可用 access token，本轮不可能签成
+ * 面板 KPI 若把它们计入分母，会长期显示「N 个待签」——用户已全部签到也无法清零。
+ */
+const CHECKIN_SKIPPED_REASONS = ['skipped_global', 'skipped_no_token'] as const
+
+/** 是否为 skip（非「待签」）账号。KPI 分母与 runAllCheckins 的 skipped 口径共用此判定。 */
+function isCheckinSkipped(r: Pick<CheckinResult, 'reason'>): boolean {
+  return (CHECKIN_SKIPPED_REASONS as readonly string[]).includes(r.reason)
+}
+
+/**
  * 全量签到（遍历所有参与签到的 provider）。
  *
  * opts.interactive：交互式端点（用户等待）→ 跳过防风控延时。
@@ -1014,7 +1028,7 @@ export async function runAllCheckins(env: Env, silent = false, opts?: { interact
   const success = results.filter((r) => r.reason === 'ok').length
   const already = results.filter((r) => r.reason === 'already').length
   const fail = results.filter((r) => r.reason === 'fail').length
-  const skipped = results.filter((r) => r.reason === 'skipped_global' || r.reason === 'skipped_no_token').length
+  const skipped = results.filter((r) => isCheckinSkipped(r)).length
 
   return { total: results.length, success, already, fail, skipped, results }
 }
@@ -1092,30 +1106,44 @@ export async function handleCheckinStatus(c: Context<{ Bindings: Env }>) {
 
 /**
  * GET /admin/api/overview：概览驾驶舱聚合数据（P2）。
- * 聚合两类来源：签到 KV（额度/签到进度）+ Analytics Engine 24h 调用概况。
- * 任一来源失败不阻塞另一来源（analytics 不可用时 usage 为 null，前端降级显示占位）。
+ * 聚合三类来源：WorkBuddy/QoderWork 签到 KV（额度/签到进度）+ TRAE SOLO 账号池与签到 KV
+ * + Analytics Engine 24h 调用概况。任一来源失败不阻塞其它来源（analytics 不可用时 usage 为 null）。
  */
 export async function handleAdminOverview(c: Context<{ Bindings: Env }>) {
   const providers = (await getProviders(c.env)) as Provider[]
 
-  // WorkBuddy/QoderWork 签到结果聚合：池账号逐个累加，单账号直接取
+  // WorkBuddy/QoderWork 签到结果聚合：池账号逐个累加，单账号直接取。
+  // skip 账号（国际版 / 无 token）不计入签到分子分母——它们结构上签不成，
+  // 计入会让「今日签到」永不达标；但额度仍要累加（国际版账号照样消耗额度池）。
   const oauthProviders = providers.filter(participatesInCheckin)
   let checkedIn = 0, totalAccounts = 0, remain = 0, size = 0
   for (const p of oauthProviders) {
     const r = await readCheckinResult(c.env, p.id)
     if (!r) continue
-    if (r.accounts && r.accounts.length > 0) {
-      for (const a of r.accounts) {
+    const accounts = r.accounts && r.accounts.length > 0 ? r.accounts : [r]
+    for (const a of accounts) {
+      if (!isCheckinSkipped(a)) {
         totalAccounts++
         if (a.todayCheckedIn) checkedIn++
-        if (typeof a.totalRemain === 'number') remain += a.totalRemain
-        if (typeof a.totalSize === 'number') size += a.totalSize
       }
-    } else {
+      if (typeof a.totalRemain === 'number') remain += a.totalRemain
+      if (typeof a.totalSize === 'number') size += a.totalSize
+    }
+  }
+
+  // TRAE SOLO：账号级签到结果与面板「今日签到」列同源；额度取账号池 work_credits
+  // （Work 专属通道是挑号依据，见 trae/pool.ts pick），额度池上限来自 Work 权益包。
+  let traeWorkRemain = 0, traeWorkSize = 0, traeAccounts = 0
+  for (const p of providers.filter((x) => isTraeProvider(x))) {
+    const results = await readTraeCheckinResults(c.env, p.id)
+    const doneUids = new Set(results.filter((r) => r.checkedIn).map((r) => r.uid))
+    const accounts = await listTraeStatus(c.env, p)
+    for (const a of accounts) {
+      traeAccounts++
       totalAccounts++
-      if (r.todayCheckedIn) checkedIn++
-      if (typeof r.totalRemain === 'number') remain += r.totalRemain
-      if (typeof r.totalSize === 'number') size += r.totalSize
+      if (doneUids.has(a.uid)) checkedIn++
+      if (typeof a.workCredits === 'number') traeWorkRemain += a.workCredits
+      for (const pack of a.packs || []) if (pack.isWork) traeWorkSize += pack.limit
     }
   }
 
@@ -1130,6 +1158,7 @@ export async function handleAdminOverview(c: Context<{ Bindings: Env }>) {
     success: true,
     data: {
       checkin: { checkedIn, totalAccounts, remain, size },
+      trae: { workRemain: traeWorkRemain, workSize: traeWorkSize, accounts: traeAccounts },
       usage,
     },
   })

@@ -263,7 +263,8 @@ export async function handleTraeLoginCallback(c: Context<AppEnv>) {
 const checkinKey = (providerId: string) => `${KV_KEYS.TRAE_CHECKIN_PREFIX}${providerId}`
 const CHECKIN_TTL_SEC = 2 * 24 * 60 * 60
 
-async function readCheckinResults(env: Env, providerId: string): Promise<TraeCheckinResult[]> {
+/** 读取 TRAE 账号级签到结果（KV）。概览 KPI 与面板「今日签到」列同源。 */
+export async function readTraeCheckinResults(env: Env, providerId: string): Promise<TraeCheckinResult[]> {
   try {
     const raw = await env.KV.get(checkinKey(providerId))
     if (!raw) return []
@@ -520,7 +521,7 @@ export async function handleTraeStatus(c: Context<AppEnv>) {
   const provider = await getProvider(c.env, id)
   if (!provider) return c.json<ApiResponse>({ success: false, message: '提供商不存在' }, 404)
   const accounts: TraeAccountStatus[] = await listTraeStatus(c.env, provider)
-  const checkin = await readCheckinResults(c.env, id)
+  const checkin = await readTraeCheckinResults(c.env, id)
   return c.json<ApiResponse>({
     success: true,
     data: { accounts, checkin, accountCount: getTraeAccounts(provider).length, preferTraeUid: provider.preferTraeUid || '' },
