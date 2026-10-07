@@ -1575,8 +1575,11 @@ export async function handleOAuthStatus(c: Context<AppEnv>) {
     data.connected = qpool.length > 0
     data.accountCount = qpool.length
     // 首选账号（面板下拉框）：Qoder 池的首选与 WorkBuddy 池同机制同字段，
-    // 由 handleOAuthPoolSetPrefer 写入，挑号时作为客户端 X-Qoder-Account 之后的兜底
-    data.preferUid = provider.preferOauthUid || ''
+    // 由 handleOAuthPoolSetPrefer 写入，挑号时作为客户端 X-Qoder-Account 之后的兜底。
+    // 重新读一次而不是用上面的 provider：额度探测可能刚把「兜底 uid」归正成权威 uid
+    // 并同步迁移了 preferOauthUid（见 qoder/identity.ts），沿用旧值会让面板下拉框
+    // 悄悄弹回「自动挑选」，看不出发生了迁移。provider 列表有内存缓存，这次读几乎不花钱。
+    data.preferUid = (await getProvider(c.env, id))?.preferOauthUid || ''
   }
   return c.json<ApiResponse>({ success: true, data })
 }

@@ -18,7 +18,7 @@ import type { AppEnv, Provider } from '../types'
 import { handleOAuthStatus } from '../admin'
 import { renderAdminPage } from '../pages'
 import { setProviders } from '../storage'
-import { cooldownQoderAccount, disableQoderAccount, listQoderPoolStatus, writeQoderPool, type QoderPoolAccount } from './pool'
+import { cooldownQoderAccount, disableQoderAccount, listQoderPoolStatus, readQoderPool, writeQoderPool, type QoderPoolAccount } from './pool'
 import { probeQoderPoolQuota } from './probe'
 import { QODER_PACK_ADDON } from './billing'
 import { formatCstWallClock, parseCstWallClock } from '../credit-expiry'
@@ -238,6 +238,105 @@ describe('probeQoderPoolQuota：只写额度，绝不解冻账号', () => {
 
     await probeQoderPoolQuota(env, qoderProvider())
     expect((await listQoderPoolStatus(env, 'qoder'))[0].nickname).toBe('Shiro')
+  })
+})
+
+/**
+ * uid 归正（2026-10-07 用户批准）：uid 是池主键，「首选账号」/X-Qoder-Account 记的都是它；
+ * 而兜底 uid（`dt-…` token 切片）会随 token 刷新变化，同一账号重新登录后就裂成两条。
+ * 「刷新账号池」是用户随时能点、且本来就每账号打一次上游的动作，归正放在这里最自然。
+ */
+describe('probeQoderPoolQuota：顺手把兜底 uid 归正成上游权威 uid', () => {
+  const REAL_UID = '01a0fb50-84b9-7848-a8d1-240c89950b79'
+  const FALLBACK_UID = 'dt-OlN11abcdefghij'
+
+  /** userinfo 按 Authorization 里的 access_token 精确分派（每个账号问自己的身份）。 */
+  function userInfoStub(tokenToId: Record<string, string>, name = 'Shiro') {
+    return vi.fn(async (input: unknown, init?: RequestInit) => {
+      const url = String(input)
+      if (url.includes('/api/v1/userinfo')) {
+        const auth = String(((init?.headers || {}) as Record<string, string>)['Authorization'] || '')
+        const id = tokenToId[auth.replace(/^Bearer\s+/, '')]
+        return new Response(JSON.stringify(id ? { id, name } : {}), { status: 200 })
+      }
+      return new Response(JSON.stringify(QUOTA_JSON), { status: 200 })
+    })
+  }
+
+  /** 池账号 + 显式 token（userinfo 分派靠 token，不能沿用默认的 dt-test）。 */
+  function fallbackAccount(token: string, over: Partial<QoderPoolAccount> = {}): QoderPoolAccount {
+    return account({
+      uid: FALLBACK_UID,
+      nickname: undefined,
+      token: { access_token: token, refresh_token: 'r', expires_at: Date.now() + DAY_MS, updated_at: 0 },
+      ...over,
+    })
+  }
+
+  it('兜底 uid → 换成 userinfo 的 id；摘要里的 uid 也同步（否则看起来像「刷新后账号没了」）', async () => {
+    const { env } = makeEnv()
+    await writeQoderPool(env, 'qoder', [fallbackAccount('dt-tok-1')])
+    vi.stubGlobal('fetch', userInfoStub({ 'dt-tok-1': REAL_UID }))
+
+    const out = await probeQoderPoolQuota(env, qoderProvider())
+
+    const pool = await readQoderPool(env, 'qoder')
+    expect(pool.map((a) => a.uid)).toEqual([REAL_UID])
+    expect(pool[0].state.credits).toBe(400)   // 归正不丢额度
+    expect(out).toEqual([{ uid: REAL_UID, ok: true, credits: 400 }])
+  })
+
+  it('归正时同步迁移面板首选账号，且响应里的 preferUid 就是新值（面板下拉不会弹回自动）', async () => {
+    const { env } = makeEnv()
+    await setProviders(env as never, [{ ...qoderProvider(), preferOauthUid: FALLBACK_UID } as unknown as Provider])
+    await writeQoderPool(env, 'qoder', [fallbackAccount('dt-tok-2')])
+    vi.stubGlobal('fetch', userInfoStub({ 'dt-tok-2': REAL_UID }))
+
+    const { c, captured } = statusCtx(env, { credits: '1' })
+    await handleOAuthStatus(c)
+
+    expect(captured.body.data.pool.map((a: any) => a.uid)).toEqual([REAL_UID])
+    expect(captured.body.data.preferUid).toBe(REAL_UID)
+  })
+
+  it('正常 uid 不动（不擅自给账号重新编号），且已有真昵称时不请求 userinfo', async () => {
+    const { env } = makeEnv()
+    await writeQoderPool(env, 'qoder', [account({ uid: REAL_UID, nickname: 'Shiro' })])
+    const urls: string[] = []
+    vi.stubGlobal('fetch', vi.fn(async (input: unknown) => {
+      urls.push(String(input))
+      return new Response(JSON.stringify(QUOTA_JSON), { status: 200 })
+    }))
+
+    await probeQoderPoolQuota(env, qoderProvider())
+
+    expect((await readQoderPool(env, 'qoder'))[0].uid).toBe(REAL_UID)
+    expect(urls.some((u) => u.includes('/api/v1/userinfo'))).toBe(false)
+  })
+
+  /**
+   * 迭代安全：合并会把旧兜底那条从池数组里删掉，而探测正 `for...of` 迭代同一个数组。
+   * 若在循环里就地删，后面那个账号会被跳过——表现是「点一下刷新，某个账号的额度没更新」，
+   * 而且不报错。这里用一个三段池把这条钉死：无论删除发生在中间还是结尾，三个号都必须被探到。
+   */
+  it('中间发生合并也不会跳账号：三个账号都被探测到', async () => {
+    const { env } = makeEnv()
+    const third = '7f3c1c2e-0000-4444-8888-999999999999'
+    await writeQoderPool(env, 'qoder', [
+      fallbackAccount('dt-' + FALLBACK_UID),
+      account({ uid: REAL_UID, nickname: 'Shiro', token: { access_token: 'dt-real', refresh_token: 'r', expires_at: Date.now() + DAY_MS, updated_at: 0 } }),
+      account({ uid: third, nickname: 'Third', token: { access_token: 'dt-third', refresh_token: 'r', expires_at: Date.now() + DAY_MS, updated_at: 0 } }),
+    ])
+    vi.stubGlobal('fetch', userInfoStub({ ['dt-' + FALLBACK_UID]: REAL_UID }))
+
+    const out = await probeQoderPoolQuota(env, qoderProvider())
+
+    // 三个号都探到了（合并后前两条共用权威 uid，故按 uid 去重后是 2 个）
+    expect(out).toHaveLength(3)
+    expect(out.every((o) => o.ok)).toBe(true)
+    expect(new Set(out.map((o) => o.uid))).toEqual(new Set([REAL_UID, third]))
+    // 池里只剩两条（兜底那条已并入权威 uid 那条）
+    expect((await readQoderPool(env, 'qoder')).map((a) => a.uid).sort()).toEqual([third, REAL_UID].sort())
   })
 })
 

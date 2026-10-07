@@ -17,6 +17,7 @@ import { OAUTH_TOKEN_REFRESH_MARGIN_MS } from '../config'
 import { refreshQoderTokenPair } from '../oauth'
 import { buildQoderPacks, fetchQoderUserInfo, fetchQoderUserResource, normalizeQoderRealm } from './billing'
 import { isRealQoderNickname, readQoderPool, refreshQoderPoolAccountIfNeeded, setQoderPoolAccountNickname, setQoderPoolQuota } from './pool'
+import { isFallbackQoderUid, repairQoderPoolUid } from './identity'
 
 /** 单个账号的探测结果（供面板逐条显示，脱敏：不含 token）。 */
 export interface QoderQuotaProbeOutcome {
@@ -32,6 +33,15 @@ export interface QoderQuotaProbeOutcome {
 export async function probeQoderPoolQuota(env: Env, provider: Provider): Promise<QoderQuotaProbeOutcome[]> {
   const pool = await readQoderPool(env, provider.id)
   const out: QoderQuotaProbeOutcome[] = []
+  /**
+   * 待归正的兜底 uid（`dt-…` token 切片），循环结束后统一落地。两个理由都不能省：
+   *   1. 合并会从池数组里删掉一条，而这里正 `for...of` 迭代同一个数组，中途删元素会跳账号
+   *      （表现是「点一下刷新，某个号的额度没更新」且不报错）；
+   *   2. 就地改名会让紧随其后的 `setQoderPoolQuota(uid=旧值)` **静默落空**——刚探到的额度白探了
+   *      （原本会写成 credits=0）。归正本身不影响本次探测结论，延后到循环外做最省事。
+   * 两条都已用测试反向验证过。
+   */
+  const pendingUidRepairs: Array<{ from: string; to: string }> = []
   for (const acc of pool) {
     const uid = acc.uid || ''
     try {
@@ -47,13 +57,20 @@ export async function probeQoderPoolQuota(env: Env, provider: Provider): Promise
           if (refreshed) token = refreshed.token.access_token
         } catch { /* 刷新失败继续用旧 token，让上游如实报错 */ }
       }
-      // 昵称回填（2026-10-07）：面板「刷新账号池」已经是「每账号打一次上游」的动作，
-      // 顺手补一次名字，用户就不必等到下一次签到才看到昵称。
-      // 注意：这里**只写 nickname 这一个纯展示字段**，文件头「不动冷却/禁用状态」的不变式照旧
-      // （setQoderPoolAccountNickname 只改 nickname，不碰 state）。
-      if (!isRealQoderNickname(acc.nickname, uid)) {
+      // 身份回填（2026-10-07）：面板「刷新账号池」已经是「每账号打一次上游」的动作，
+      // 顺手取一次 userinfo，同时解决两件事——昵称与兜底 uid。
+      // 只在**确实需要**时才请求（有真昵称且 uid 正常就跳过），不给正常账号白发请求。
+      // 注意：这里只写 nickname（纯展示）与 uid（主键归正），文件头「不动冷却/禁用状态」
+      // 的不变式照旧。
+      const needsNickname = !isRealQoderNickname(acc.nickname, uid)
+      const needsUidRepair = isFallbackQoderUid(uid)
+      if (needsNickname || needsUidRepair) {
         const ui = await fetchQoderUserInfo(token, normalizeQoderRealm(acc.realm))
-        if (ui?.name) await setQoderPoolAccountNickname(env, provider.id, uid, ui.name)
+        if (ui?.name && needsNickname) await setQoderPoolAccountNickname(env, provider.id, uid, ui.name)
+        // uid 归正：uid 是池主键，「首选账号」/X-Qoder-Account 记的都是它；而兜底 uid
+        // （`dt-…` token 切片）会随 token 刷新变化 → 同一账号重新登录后裂成两条，
+        // 旧那条的首选指定再也匹配不上。userinfo 的 id 是权威 uid（见 qoder/identity.ts）。
+        if (ui?.uid && needsUidRepair) pendingUidRepairs.push({ from: uid, to: ui.uid })
       }
       const quota = await fetchQoderUserResource(token, normalizeQoderRealm(acc.realm))
       if (!quota) {
@@ -67,6 +84,13 @@ export async function probeQoderPoolQuota(env: Env, provider: Provider): Promise
     } catch (e) {
       out.push({ uid, ok: false, error: (e as Error).message || '探测失败' })
     }
+  }
+  // 归正延后到这里落地（见 pendingUidRepairs 的说明），并把摘要里的 uid 一并改成新值，
+  // 否则面板刚刷新完显示的仍是那个已经不存在于池里的旧 uid，看起来像「刷新后账号没了」。
+  for (const r of pendingUidRepairs) {
+    const mig = await repairQoderPoolUid(env, provider, r.from, r.to)
+    if (!mig) continue
+    for (const o of out) if (o.uid === mig.fromUid) o.uid = mig.toUid
   }
   return out
 }

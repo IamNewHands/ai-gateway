@@ -116,6 +116,29 @@ describe('Qoder OAuth 域路由（poll/refresh）', () => {
     expect(pool[0]).toMatchObject({ uid: 'u1', nickname: 'Shiro', realm: 'global' })
   })
 
+  it('轮询响应缺 user_id → 用 userinfo 的权威 id，而不是 token 切片（否则账号会被编成一个会变的号）', async () => {
+    const { env, store } = makeKV()
+    const TOKEN = 'dt-abcdefghijklmnop'   // slice(0,16) 就是兜底 uid 的形状
+    const fetchMock = vi.fn(async (input: unknown) => {
+      const url = String(input)
+      if (url.includes('/api/v1/userinfo')) {
+        return new Response(JSON.stringify({ id: '01a0fb50-84b9-7848-a8d1-240c89950b79', name: 'Shiro' }), { status: 200 })
+      }
+      // 只有 token/refresh_token，没有 user_id
+      return new Response(JSON.stringify({ token: TOKEN, refresh_token: 'drt-1' }), { status: 200 })
+    })
+    vi.stubGlobal('fetch', fetchMock)
+
+    const r = await pollOauthQoderFlow(env, 'qoder-mig', cfg(), vdevice())
+    expect(r.status).toBe('success')
+
+    const pool = JSON.parse(store.get('qoder:pool:qoder-mig')!) as Array<{ uid: string; nickname?: string }>
+    // token 切片是 `dt-abcdefghijklmn`——不稳定（每次刷新 token 都变），不能当账号身份
+    expect(pool[0].uid).toBe('01a0fb50-84b9-7848-a8d1-240c89950b79')
+    expect(pool[0].nickname).toBe('Shiro')
+    expect(pool[0].uid).not.toBe(TOKEN.slice(0, 16))
+  })
+
   it('refresh 按 prev.realm=global 走 global 刷新端点 openapi.qoder.sh', async () => {
     const c = cfg({ globalRefreshTokenUrl: 'https://openapi.qoder.sh/api/v1/deviceToken/refresh' })
     const fetchMock = vi.fn(async (_input: unknown) => new Response(

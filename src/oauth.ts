@@ -660,12 +660,17 @@ export async function pollOauthQoderFlow(env: Env, providerId: string, cfg: OAut
     // /api/v1/userinfo 是唯一来源，失败返回 null（不阻断登录）——见 qoder/billing.ts fetchQoderUserInfo。
     const userInfo = await fetchQoderUserInfo(token, realm)
 
+    // uid 优先用轮询响应的 user_id（与池内既有账号一致，避免同一个号被重新编号）；
+    // 它缺失时才退到 userinfo 的权威 id，**最后**才用 token 切片——切片不是账号身份，
+    // 会随 token 刷新变化，拿它当 uid 会让同一账号重新登录后裂成两条（见 qoder/identity.ts）。
+    const uid = data.user_id || userInfo?.uid || undefined
+
     await writeOauthToken(env, providerId, {
       access_token: token,
       refresh_token: data.refresh_token,
       expires_at: qoderExpiryUnix(data),
       updated_at: Date.now(),
-      user_id: data.user_id || undefined,
+      user_id: uid,
       // 上游没给名字时留 undefined（**不要**退回 uid：那会让面板把 UUID 当昵称显示）
       nickname: userInfo?.name || undefined,
       realm,
@@ -677,7 +682,7 @@ export async function pollOauthQoderFlow(env: Env, providerId: string, cfg: OAut
       refresh_token: data.refresh_token,
       expires_at: qoderExpiryUnix(data),
       updated_at: Date.now(),
-      user_id: data.user_id || undefined,
+      user_id: uid,
       nickname: userInfo?.name || undefined,
       realm,
     })
