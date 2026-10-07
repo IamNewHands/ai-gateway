@@ -926,9 +926,9 @@ describe('WorkBuddy 面板「即将到期」标记（客户端口径 = 后端挑
       ...traeProvider(), id: 'qoder', name: 'QoderWork', authType: 'oauth-device', oauth: { flowType: 'qoder' },
     } as Provider])
     const js = inlineScripts(html).join('\n')
-    const m = js.match(/function renderQoderPoolAccounts\(id, accs, ciByUid, ciAccounts\) \{([\s\S]*?)\n\}/)
+    const m = js.match(/function renderQoderPoolAccounts\(([^)]*)\) \{([\s\S]*?)\n\}/)
     expect(m, '未找到 renderQoderPoolAccounts：Qoder 账号池渲染被删除或改名了？').not.toBeNull()
-    const body = m![1]
+    const body = m![2]
     // 数据源：池状态 a.packages 优先，回退签到结果 ci.packages（与 WorkBuddy 同口径）
     expect(body).toContain('Array.isArray(a.packages) ? a.packages')
     expect(body).toContain('wbExpiringBadge(pkgs)')
@@ -1206,5 +1206,67 @@ describe('概览「7 天内到期积分」明细卡（DOM 替身驱动客户端�
     expect(html).not.toContain('>Cloudflare KV<')
     // 样式必须在同一份页面 CSS 里（否则明细行会挤成一行文本）
     expect(html).toMatch(/\.admin-expiring__row[^{]*\{[^}]*grid-template-columns/)
+  })
+})
+
+/**
+ * 账号池「首选账号」：三个池（WorkBuddy / Qoder / TRAE）共用同一份下拉与保存实现，
+ * 且「自动挑选」的文案必须写出真实规则（7 天内到期的积分优先）。
+ *
+ * 为什么要盯文案：TRAE 面板曾经写「自动挑选（按可用积分）」，而实际挑号是两段式
+ * ——读文案的人会以为网关只比积分高低，从而得出「这个池不救快过期的额度」的错误结论。
+ */
+describe('账号池「首选账号」：三个池同一交互与文案', () => {
+  /** 从一个顶层 function 定义切到下一个顶层 function（不依赖大括号配对，避免被嵌套块截断）。 */
+  function fnBody(js: string, name: string): string {
+    const start = js.indexOf('function ' + name + '(')
+    expect(start, `未找到 function ${name}：函数被删除或改名了？`).toBeGreaterThanOrEqual(0)
+    const rest = js.slice(start)
+    const next = rest.indexOf('\nfunction ')
+    return next < 0 ? rest : rest.slice(0, next)
+  }
+
+  const qoderProviderUi = () => ({
+    ...traeProvider(), id: 'qoder', name: 'QoderWork', authType: 'oauth-device', oauth: { flowType: 'qoder' },
+  } as Provider)
+
+  it('Qoder 池渲染首选账号下拉，并把它接到该池自己的保存与重取上', async () => {
+    const js = inlineScripts(await render([qoderProviderUi()])).join('\n')
+    const body = fnBody(js, 'renderQoderPoolAccounts')
+    expect(body).toContain("preferBarHtml('qdp', id, preferOpts, 'qoderPoolSetPrefer')")
+    // 状态接口回显的首选值必须传进渲染函数，否则下拉框永远显示「自动挑选」
+    expect(js).toContain("renderQoderPoolAccounts(id, pool, ciByUid, ciAccounts, (d.data && d.data.preferUid) || '')")
+    // 面板静态说明也要提到这个入口（否则用户不知道存在）
+    const html = await render([qoderProviderUi()])
+    expect(html).toContain('「首选账号」可按 uid 固定使用某个账号')
+    expect(html).toContain('X-Qoder-Account')
+  })
+
+  it('三个池都走共享实现，自动挑选文案统一写明「7 天内到期的积分优先」', async () => {
+    const js = inlineScripts(await render([traeProvider(), qoderProviderUi()])).join('\n')
+    for (const prefix of ['wbp', 'qdp', 'trae']) {
+      expect(js, `${prefix} 池没有接上共享的首选账号控件`).toContain(`preferBarHtml('${prefix}'`)
+    }
+    expect(js).toContain('自动挑选（7 天内到期的积分优先）')
+    // 旧的误导文案不得残留（与实际的两段式挑号不符）
+    expect(js).not.toContain('自动挑选（按可用积分）')
+    // tooltip 要讲清「指定压过自动」与「自动时窗口内优先」两件事
+    expect(js).toContain('留空 = 自动挑选：池内有 7 天内到期且仍有剩余的积分时只在其中挑')
+  })
+
+  it('保存后按服务端结果回显，并各自重取自己的池（三个 reload 都要传对）', async () => {
+    const js = inlineScripts(await render([traeProvider(), qoderProviderUi()])).join('\n')
+    expect(js).toContain('reload: oauthPoolStatus')
+    expect(js).toContain('reload: qoderPoolStatus')
+    expect(js).toContain('reload: traeStatus')
+    // 三处 save 不能各写一遍 fetch：共享实现只出现一次
+    expect((js.match(/function poolSetPrefer\(/g) || []).length).toBe(1)
+    expect(js).toContain("opts.prefix + '-prefer-' + id")
+  })
+
+  it('TRAE 面板说明写明双通道各自按自己的包判到期（不混用）', async () => {
+    const html = await render([traeProvider()])
+    expect(html).toContain('两个通道各自按「7 天内到期且有剩余的权益包」优先')
+    expect(html).toContain('SOLO 只看通用包、Work 只看 Work 包')
   })
 })

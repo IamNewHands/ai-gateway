@@ -16,6 +16,7 @@ import {
   OPENCODE_STREAM_IDLE_TIMEOUT_MS,
 } from './opencode'
 import { isQoderFlow, proxyQoderChatRequest } from './qoder/proxy'
+import { resolveQoderPreferUid } from './qoder/pool'
 import { isClineProvider, proxyClineChatRequest } from './cline/proxy'
 import { isVisionBridgeProvider, buildVisionBridgeRequestBody } from './vision/bridge'
 import { isGeminiProvider, proxyGeminiChatRequest } from './gemini/proxy'
@@ -1616,8 +1617,10 @@ export async function forwardProxy(
     // 下面的通用 OpenAI 转发，POST 到 {baseUrl}/chat/completions（不是 Qoder 接口），
     // 边缘 ALB 回 503 HTML —— 真实推理同样会中招，不只是测试按钮。
     if (isQoderFlow(provider)) {
-      // 账号固定：客户端可带 X-Qoder-Account 请求头强制使用指定池账号（uid）
-      const preferUid = (c.req.header('X-Qoder-Account') || '').trim() || undefined
+      // 首选账号：客户端可带 X-Qoder-Account 请求头强制指定池账号（uid），
+      // 未带时回落到面板「首选账号」（provider.preferOauthUid）；两者都没有才走
+      // 到期优先的自动挑选。
+      const preferUid = resolveQoderPreferUid(c.req.header('X-Qoder-Account'), provider)
       const response = await proxyQoderChatRequest(c.env, provider, forwardBody as Record<string, unknown>, {
         preferUid,
       })
@@ -4071,7 +4074,7 @@ async function handleAnthropicQoder(
     delete upstreamBody['max_completion_tokens']
   }
 
-  const preferUid = (c.req.header('X-Qoder-Account') || '').trim() || undefined
+  const preferUid = resolveQoderPreferUid(c.req.header('X-Qoder-Account'), provider)
   const response = await proxyQoderChatRequest(c.env, provider, upstreamBody, { stream: true, preferUid })
 
   if (!response.ok) {

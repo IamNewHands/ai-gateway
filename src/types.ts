@@ -206,9 +206,14 @@ export interface Provider {
    */
   traeMaxToolSchemaChars?: number
   /**
-   * WorkBuddy/Qoder 多账号池首选账号 UID（面板下拉框手工指定，仅 OAuth pool 提供商生效）。
+   * WorkBuddy / Qoder 多账号池首选账号 UID（面板下拉框手工指定，两个池共用同一字段）。
    * 填写后转发时优先使用该账号（按 uid 精确匹配），
-   * 被冷却/禁用/失败时才回退到池内其他账号。留空 = 维持按剩余积分自动挑选。
+   * 被冷却/禁用/失败时才回退到池内其他账号。留空 = 自动挑选。
+   *
+   * 自动挑选是两段式：池内存在「7 天内到期且仍有剩余」的积分时只在其中挑（到期越早越优先），
+   * 否则按剩余积分最多者挑选——两个池共用 credit-expiry.ts 的同一份判定，本字段不改该规则，
+   * 只在被指定时压过它。
+   * Qoder 侧客户端还可用 X-Qoder-Account 请求头按次指定，那个比本字段优先（更具体）。
    */
   preferOauthUid?: string
   /**

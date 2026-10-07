@@ -150,8 +150,25 @@ export function soonestQoderExpiryAt(
 }
 
 /**
+ * 挑号用的「首选账号」：客户端请求头优先，其次面板指定。
+ *
+ * 两者都是用户的明确意图，但请求头是**本次请求**级的、更具体，所以压过 provider 级设置
+ * （与 WorkBuddy 池 `stickyUid || provider.preferOauthUid` 同序，两池不各立一套语义）。
+ * 空白请求头视为未指定（常见于客户端把变量留空的场景），此时回落到面板指定。
+ *
+ * 为什么要单独一个函数：这段优先级有两个调用点（OpenAI / Anthropic 两条转发路径），
+ * 各写一遍 `header || provider.preferOauthUid` 迟早会漂移成两套行为。
+ */
+export function resolveQoderPreferUid(headerValue: string | null | undefined, provider: Provider): string | undefined {
+  const fromHeader = String(headerValue ?? '').trim()
+  if (fromHeader) return fromHeader
+  const pinned = String(provider?.preferOauthUid ?? '').trim()
+  return pinned || undefined
+}
+
+/**
  * 挑号（两段式，与 trae / workbuddy 池同口径）：
- *  - 指定 preferUid（客户端 X-Qoder-Account 固定账号）且健康 → 直接用它；
+ *  - 指定 preferUid（客户端 X-Qoder-Account 或面板首选账号）且健康 → 直接用它；
  *  - 第二段：**7 天内到期且有剩余**的账号里，到期最早者优先（同到期比积分高低）。
  *    为什么必须这样：积分带到期时间，高分号若一直占坑，低分号整包额度会直接作废；
  *  - 第三段（兜底）：窗口内没有待救积分 → 原策略「剩余积分最多者优先」。

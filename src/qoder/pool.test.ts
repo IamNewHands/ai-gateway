@@ -20,13 +20,14 @@ import {
   noteQoderError,
   pickQoderAccount,
   reenableQoderIfCredits,
+  resolveQoderPreferUid,
   soonestQoderExpiryAt,
   writeQoderPool,
   type QoderPoolAccount,
 } from './pool'
 import { CREDIT_EXPIRY_WINDOW_MS, formatCstWallClock } from '../credit-expiry'
 import { QODER_PACK_ADDON, QODER_PACK_BASE } from './billing'
-import type { Env, PackageInfo } from '../types'
+import type { Env, PackageInfo, Provider } from '../types'
 
 /** 假 KV：只实现池读写用到的 get/put/delete。 */
 function makeEnv() {
@@ -255,5 +256,37 @@ describe('pickQoderAccount 两段式：7 天内到期的积分优先，窗口内
     const st = (await listQoderPoolStatus(env, pid))[0]
     expect(st.credits).toBe(50)
     expect((st.packages as PackageInfo[]).length).toBe(1)
+  })
+})
+
+/**
+ * 首选账号的两级来源：客户端请求头（按次）> 面板指定（provider 级，preferOauthUid）。
+ *
+ * 为什么单测这一段：优先级只有两个调用点（OpenAI / Anthropic 两条转发路径），各写一遍
+ * `header || provider.preferOauthUid` 很容易演变成「一条路径认面板设置、另一条不认」——
+ * 那种错在页面上完全看不出来（面板显示已指定，实际请求仍走别的账号）。
+ */
+describe('resolveQoderPreferUid：请求头优先，面板指定兜底', () => {
+  const providerWith = (uid?: string) => ({ id: 'qoder', preferOauthUid: uid }) as unknown as Provider
+
+  it('请求头有值 → 用请求头（本次请求级意图更具体）', () => {
+    expect(resolveQoderPreferUid('from-header', providerWith('from-panel'))).toBe('from-header')
+  })
+
+  it('请求头缺省/空白 → 回落面板指定（客户端把变量留空是很常见的调用方式）', () => {
+    for (const header of [undefined, null, '', '   ', '\t']) {
+      expect(resolveQoderPreferUid(header, providerWith('from-panel'))).toBe('from-panel')
+    }
+  })
+
+  it('两者都没有/都空白 → undefined（交给到期优先的自动挑选）', () => {
+    expect(resolveQoderPreferUid(undefined, providerWith(undefined))).toBeUndefined()
+    expect(resolveQoderPreferUid('  ', providerWith('  '))).toBeUndefined()
+    expect(resolveQoderPreferUid('', {} as Provider)).toBeUndefined()
+  })
+
+  it('返回值已 trim：带空格的面板设置不会因为精确匹配失败而静默失效', () => {
+    expect(resolveQoderPreferUid('', providerWith(' u1 '))).toBe('u1')
+    expect(resolveQoderPreferUid(' u2 ', providerWith(undefined))).toBe('u2')
   })
 })

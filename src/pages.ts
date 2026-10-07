@@ -774,7 +774,7 @@ ${H('管理')}
                     <div class="fc mt-1 field-row" style="gap:8px"><input type="number" id="cd-plan-${escapePageHtml(p.id)}" value="${p.cooldown&&p.cooldown.planMs?Math.round(p.cooldown.planMs/60000):''}" style="width:88px" placeholder="plan冷却" title="余额/权益耗尽（402）的硬冷却时长（分钟）。到期到次日 04:00，签到恢复后自动解冻。"><input type="number" id="cd-soft-${escapePageHtml(p.id)}" value="${p.cooldown&&p.cooldown.softMs?Math.round(p.cooldown.softMs/1000):''}" style="width:88px" placeholder="429冷却" title="429 限流 / WAF 403 / 404 / 5xx（无 Retry-After 头时）的默认软冷却时长（秒）。"><input type="number" id="cd-err-${escapePageHtml(p.id)}" value="${p.cooldown&&p.cooldown.errThreshold?p.cooldown.errThreshold:''}" style="width:76px" placeholder="错误阈值" title="连续 5xx 错误次数阈值：达到后把该账号冷却 errMs 分钟。偶发 502 若携带 Retry-After 头会优先按其时长软冷却、不再触发本计数。"><input type="number" id="cd-errms-${escapePageHtml(p.id)}" value="${p.cooldown&&p.cooldown.errMs?Math.round(p.cooldown.errMs/60000):''}" style="width:88px" placeholder="错误冷却" title="达到错误阈值后的账号级冷却时长（分钟）。"><span class="mu" style="font-size:12px">冷却参数（保存后生效）</span></div>
                   </fieldset>`:''}
                   ${(p.oauth&&p.oauth.flowType==='qoder')||p.id==='qoder'?`
-                  <fieldset class="form-group" id="qdp-fs-${escapePageHtml(p.id)}"><legend>Qoder 多账号池</legend><span class="form-helper">设备授权流每次成功登录都会把该账号加入账号池（按 user_id 去重，多登一个 = 多个账号）。转发挑号：<b>7 天内到期的积分优先消耗</b>（到期越早越优先），窗口内没有待救积分时才按剩余积分最多者挑选；账号行上的「⏳ N 个包 7 天内到期」徽章与额度包明细里琥珀色的到期时间就是该规则的依据（到期时间按北京时间 CST 判定，数据来自最近一次签到，或点「刷新账号池」时即时探测）。「额度包明细」分「套餐额度」（到期 = 套餐到期，即基础额度作废时刻）与「签到/赠送额度」（到期 = 最近一次领取的那笔 30 天有效期）两项，<b>已用完的包自动隐藏</b>，其余按到期升序排列（快过期的在最上面）。额度耗尽/429/鉴权失败按策略冷却或禁用并自动轮换下一个账号；每日签到后积分恢复自动解冻（<b>签到成功也一并清除「需重新登录」的禁用标记</b>——签到通过鉴权就是 token 有效的直接证据）。冷却参数留空 = 默认（额度耗尽 12h / 429 60s / 连续 5 次错误冷却 10m）。</span>
+                  <fieldset class="form-group" id="qdp-fs-${escapePageHtml(p.id)}"><legend>Qoder 多账号池</legend><span class="form-helper">设备授权流每次成功登录都会把该账号加入账号池（按 user_id 去重，多登一个 = 多个账号）。转发挑号：<b>7 天内到期的积分优先消耗</b>（到期越早越优先），窗口内没有待救积分时才按剩余积分最多者挑选；账号行上的「⏳ N 个包 7 天内到期」徽章与额度包明细里琥珀色的到期时间就是该规则的依据（到期时间按北京时间 CST 判定，数据来自最近一次签到，或点「刷新账号池」时即时探测）。「首选账号」可按 uid 固定使用某个账号（冷却/禁用/失败时自动回退）；客户端还能用 <code>X-Qoder-Account</code> 请求头按次指定账号，请求头优先于面板设置。「额度包明细」分「套餐额度」（到期 = 套餐到期，即基础额度作废时刻）与「签到/赠送额度」（到期 = 最近一次领取的那笔 30 天有效期）两项，<b>已用完的包自动隐藏</b>，其余按到期升序排列（快过期的在最上面）。额度耗尽/429/鉴权失败按策略冷却或禁用并自动轮换下一个账号；每日签到后积分恢复自动解冻（<b>签到成功也一并清除「需重新登录」的禁用标记</b>——签到通过鉴权就是 token 有效的直接证据）。冷却参数留空 = 默认（额度耗尽 12h / 429 60s / 连续 5 次错误冷却 10m）。</span>
                     <div class="fc mt-1 field-row"><button class="btn btn-s" onclick="qoderPoolStatus('${escapePageJsx(p.id)}')" title="重新读取池状态，并顺便向每个账号探一次额度（会更新「额度包明细」与到期天数）"><i class="fas fa-sync" aria-hidden="true"></i>刷新账号池</button><button class="btn btn-s" onclick="oauthConnect('${escapePageJsx(p.id)}')"><i class="fas fa-sign-in-alt" aria-hidden="true"></i>登录新账号</button><button class="btn btn-gh btn-xs" onclick="oauthPoolExportModal('${escapePageJsx(p.id)}')"><i class="fas fa-file-export" aria-hidden="true"></i>导出凭证/Token</button><button class="btn btn-p" onclick="triggerCheckin('${escapePageJsx(p.id)}')"><i class="fas fa-calendar-check" aria-hidden="true"></i>立即签到</button><span id="qdp-st-${escapePageHtml(p.id)}" class="oauth-status"></span></div>
                     <div id="qdp-acc-${escapePageHtml(p.id)}" class="mt-1"></div>
                     <div class="fc mt-1 field-row" style="gap:8px"><input type="number" id="cd-plan-${escapePageHtml(p.id)}" value="${p.cooldown&&p.cooldown.planMs?Math.round(p.cooldown.planMs/60000):''}" style="width:88px" placeholder="额度耗尽冷却" title="额度/权益耗尽（402）的硬冷却时长（分钟）。到期到次日 04:00，签到恢复后自动解冻。"><input type="number" id="cd-soft-${escapePageHtml(p.id)}" value="${p.cooldown&&p.cooldown.softMs?Math.round(p.cooldown.softMs/1000):''}" style="width:88px" placeholder="429冷却" title="429 限流的默认软冷却时长（秒）。"><input type="number" id="cd-err-${escapePageHtml(p.id)}" value="${p.cooldown&&p.cooldown.errThreshold?p.cooldown.errThreshold:''}" style="width:76px" placeholder="错误阈值" title="连续错误次数阈值：达到后把该账号冷却「错误冷却」时长。"><input type="number" id="cd-errms-${escapePageHtml(p.id)}" value="${p.cooldown&&p.cooldown.errMs?Math.round(p.cooldown.errMs/60000):''}" style="width:88px" placeholder="错误冷却" title="达到错误阈值后的账号级冷却时长（分钟）。"><span class="mu" style="font-size:12px">冷却参数（保存后生效）</span></div>
@@ -946,7 +946,7 @@ if ($waitForHuman) {
               <div class="fg"><button class="btn btn-p btn-sm" onclick="kukuQrLogin('${escapePageJsx(p.id)}')" type="button"><i class="fas fa-qrcode" aria-hidden="true"></i> 扫码登录自动写 Cookie</button><span class="form-helper">用手机百度 App 扫码，后台自动写入 BDUSS Cookie（已保存的提供商将直接更新 Key）。</span></div>` : ''}
               <fieldset class="form-group" id="models-fs-${escapePageHtml(p.id)}" data-effort="${isWorkbuddyProviderUI(p)?'1':'0'}"><legend>模型</legend><div id="ml-${escapePageHtml(p.id)}">${p.models.map((m,mi)=>{ const pol=((p.oauth&&p.oauth.effortPolicy)||{})[m.id]||[]; return `<div class="fc mb-3 field-row" data-idx="${mi}"><input type="text" value="${escapePageHtml(m.id)}" class="fx1" id="mid-${escapePageHtml(p.id)}-${mi}" placeholder="模型 ID"><label class="tg" title="启用模型"><input type="checkbox" ${m.enabled?'checked':''} id="men-${escapePageHtml(p.id)}-${mi}" aria-label="启用模型"><span class="sl"></span></label><label class="tg" title="启用思维引导注入"><input type="checkbox" ${(p.thinkingInject||[]).includes(m.id)?'checked':''} id="mit-${escapePageHtml(p.id)}-${mi}" aria-label="启用思维引导注入"><span class="sl"></span></label><label class="tg" title="启用缓存前缀注入"><input type="checkbox" ${(p.cachePrefixInject||[]).includes(m.id)?'checked':''} id="mcp-${escapePageHtml(p.id)}-${mi}" aria-label="启用缓存前缀注入"><span class="sl"></span></label>${effDdEditHtml(p.id, mi, pol, !isWorkbuddyProviderUI(p))}<button class="btn btn-gh btn-xs" onclick="testMdl('${escapePageJsx(p.id)}','${escapePageJsx(m.id)}',${mi})" title="测试模型"><i class="fas fa-plug" aria-hidden="true"></i><span>测试</span></button><button class="icon-btn" onclick="rmMdl('${escapePageJsx(p.id)}',${mi})" aria-label="移除模型"><i class="fas fa-times" aria-hidden="true"></i></button></div>`}).join('')}</div><div class="fc mt-1 field-row"><input type="text" id="nmid-${escapePageHtml(p.id)}" placeholder="新的模型 ID" class="fx1"><button class="btn btn-s btn-xs" onclick="addMdl('${escapePageJsx(p.id)}')"><i class="fas fa-plus" aria-hidden="true"></i>添加</button></div><span class="form-helper">每个模型行「启用模型」开关旁的开关依次为「思维引导注入」「缓存前缀注入」，勾选后该模型转发前会被注入对应固定提示词；不勾选则原样转发。「effort」下拉声明该模型的 reasoning_effort 支持档位（多选），仅对 WorkBuddy / CodeBuddy 提供商显示——其余上游不消费该配置。</span></fieldset>
               ${isTraeProviderUI(p)?`
-              <fieldset class="form-group" id="trae-fs-${escapePageHtml(p.id)}"><legend>TRAE 账号池（SOLO / Work 双通道）</legend><span class="form-helper">多账号双积分反代：自动隔离通用积分 (SOLO) 与 Work 专属积分。正常调用优先消耗通用积分；当遇到 4008 额度耗尽或 429 限流时，系统自动无缝降级到 Work 专有通道。支持一键刷新双通道积分与每日自动签到补积分。</span>
+              <fieldset class="form-group" id="trae-fs-${escapePageHtml(p.id)}"><legend>TRAE 账号池（SOLO / Work 双通道）</legend><span class="form-helper">多账号双积分反代：自动隔离通用积分 (SOLO) 与 Work 专属积分。正常调用优先消耗通用积分；当遇到 4008 额度耗尽或 429 限流时，系统自动无缝降级到 Work 专有通道。支持一键刷新双通道积分与每日自动签到补积分。转发挑号：<b>两个通道各自按「7 天内到期且有剩余的权益包」优先</b>（到期越早越优先），窗口内没有待救积分时才比较积分高低——SOLO 只看通用包、Work 只看 Work 包，混用会把另一个通道的额度提前烧掉。「首选账号」一个下拉同时管两个通道：指定后优先用该账号，被冷却/禁用/失败时自动回退。</span>
                 <div class="fc mt-1 field-row">
                   <button class="btn btn-s" onclick="traeLogin('${escapePageJsx(p.id)}')"><i class="fas fa-sign-in-alt" aria-hidden="true"></i>登录账号</button>
                   <button class="btn btn-s" onclick="traeCheckin('${escapePageJsx(p.id)}')"><i class="fas fa-calendar-check" aria-hidden="true"></i>全部签到</button>
@@ -2555,6 +2555,23 @@ function traePackDisplayList(packs) {
   return { rows: rows, hidden: hidden, total: all.length };
 }
 /* WB_EXPIRY_END */
+/* 账号池「首选账号」控件的单一实现（WorkBuddy / Qoder / TRAE 三处共用）。
+   留空必须写明是「自动挑选」且说明它的规则，否则用户不知道不选时会发生什么
+   —— 三个池的自动挑选都是两段式（7 天内到期的积分优先 → 否则比积分），文案必须一致。 */
+function preferAutoOption() {
+  return '<option value="">自动挑选（7 天内到期的积分优先）</option>'
+}
+function preferBarHtml(prefix, id, opts, saveFn) {
+  const title = '指定后优先使用该账号（被冷却/禁用/失败时自动回退池内其他账号）。'
+    + '留空 = 自动挑选：池内有 7 天内到期且仍有剩余的积分时只在其中挑（到期越早越优先），'
+    + '没有待救积分时才按剩余积分最多者挑选。'
+  return '<div class="fc mt-1 field-row" style="align-items:center;gap:8px;flex-wrap:wrap">' +
+    '<label style="margin:0;white-space:nowrap">首选账号：</label>' +
+    '<select id="' + escapeHtml(prefix) + '-prefer-' + escapeHtml(id) + '" class="select-sm" style="max-width:280px" title="' + escapeHtml(title) + '">' + opts + '</select>' +
+    '<button class="btn btn-s btn-xs" onclick="' + saveFn + '(\\'' + escapeJsAttr(id) + '\\')">指定</button>' +
+    '<button class="btn btn-gh btn-xs" onclick="' + saveFn + '(\\'' + escapeJsAttr(id) + '\\',\\'\\')">恢复自动</button>' +
+    '<span id="' + escapeHtml(prefix) + '-prefer-msg-' + escapeHtml(id) + '"></span></div>'
+}
 function renderOauthPoolAccounts(id, accs, ciByUid, ciByNick, ciAccounts, preferUid) {
   const box = document.getElementById('wbp-acc-' + id)
   if (!box) return
@@ -2563,16 +2580,12 @@ function renderOauthPoolAccounts(id, accs, ciByUid, ciByNick, ciAccounts, prefer
   ciByUid = ciByUid || {}
   ciByNick = ciByNick || {}
   ciAccounts = ciAccounts || []
-  // 首选账号下拉（对齐 TRAE 面板的手工指定交互）：留空 = 按剩余积分自动挑选
-  const opts = ['<option value="">自动挑选（即将到期优先）</option>'].concat(accs.map(function (a) {
+  // 首选账号下拉（三个池同一交互与文案）：留空 = 自动挑选（7 天内到期的积分优先）
+  const preferOpts = [preferAutoOption()].concat(accs.map(function (a) {
     const sel = a.uid === preferUid ? ' selected' : ''
     return '<option value="' + escapeHtml(a.uid) + '"' + sel + '>' + escapeHtml((a.nickname || a.uid)) + '</option>'
   })).join('')
-  const preferBar = '<div class="fc mt-1 field-row" style="align-items:center;gap:8px"><label style="margin:0;white-space:nowrap">首选账号：</label>' +
-    '<select id="wbp-prefer-' + escapeHtml(id) + '" class="select-sm" style="max-width:280px">' + opts + '</select>' +
-    '<button class="btn btn-s btn-xs" onclick="oauthPoolSetPrefer(\\'' + escapeJsAttr(id) + '\\')">指定</button>' +
-    '<button class="btn btn-gh btn-xs" onclick="oauthPoolSetPrefer(\\'' + escapeJsAttr(id) + '\\',\\'\\')">恢复自动</button>' +
-    '<span id="wbp-prefer-msg-' + escapeHtml(id) + '"></span></div>'
+  const preferBar = preferBarHtml('wbp', id, preferOpts, 'oauthPoolSetPrefer')
   // 旧 KV 签到数据无 uid 且昵称可能两侧均空：账号数一致时按池顺序对齐作最后兜底
   const idxFallback = ciAccounts.length === accs.length ? ciAccounts : null
   box.innerHTML = preferBar + accs.map(function(a, i) {
@@ -2711,21 +2724,33 @@ function oauthPoolRemove(id, uid) {
   })
 }
 // WorkBuddy 多账号池：设置首选账号（对齐 TRAE 面板交互；forcedUid 传入 '' 恢复自动挑选）
-function oauthPoolSetPrefer(id, forcedUid) {
-  const sel = document.getElementById('wbp-prefer-' + id)
-  const msg = document.getElementById('wbp-prefer-msg-' + id)
+/* 账号池「首选账号」保存的单一实现（WorkBuddy / Qoder / TRAE 三处共用）。
+   各池端点与重取函数不同，其余交互（取值 → POST → 回显 → 重取该池）完全一致；
+   各写一遍迟早漂移成「一个池保存后有回显、另一个池静默」。 */
+function poolSetPrefer(opts, forcedUid) {
+  const id = opts.id
+  const sel = document.getElementById(opts.prefix + '-prefer-' + id)
+  const msg = document.getElementById(opts.prefix + '-prefer-msg-' + id)
   const uid = (forcedUid !== undefined ? forcedUid : ((sel || {}).value || '')).trim()
   if (msg) msg.textContent = ''
-  fetch('/admin/api/oauth/' + encodeURIComponent(id) + '/pool/prefer', {
+  fetch(opts.url, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ uid: uid }),
-  }).then(r => r.json()).then(function(d) {
+  }).then(function (r) { return r.json() }).then(function (d) {
     if (!d.success) { if (msg) { msg.textContent = (d.message || '设置失败'); msg.style.color = 'var(--color-danger,#ef4444)' } return }
     if (msg) { msg.textContent = (d.message || '已设置'); msg.style.color = 'var(--color-success,#16a34a)' }
     if (sel) sel.value = uid
-    setTimeout(function () { oauthPoolStatus(id) }, 800)
-  }).catch(function() { if (msg) { msg.textContent = '网络错误，请重试'; msg.style.color = 'var(--color-danger,#ef4444)' } })
+    // 重取该池状态：保存后的回显以服务端为准（而不是本地以为存下的值）
+    setTimeout(function () { opts.reload(id) }, 800)
+  }).catch(function () { if (msg) { msg.textContent = '网络错误，请重试'; msg.style.color = 'var(--color-danger,#ef4444)' } })
+}
+function oauthPoolSetPrefer(id, forcedUid) {
+  poolSetPrefer({ id: id, prefix: 'wbp', url: '/admin/api/oauth/' + encodeURIComponent(id) + '/pool/prefer', reload: oauthPoolStatus }, forcedUid)
+}
+// Qoder 池与 WorkBuddy 池共用同一个端点与同一条字段（preferOauthUid），只是面板元素前缀不同
+function qoderPoolSetPrefer(id, forcedUid) {
+  poolSetPrefer({ id: id, prefix: 'qdp', url: '/admin/api/oauth/' + encodeURIComponent(id) + '/pool/prefer', reload: qoderPoolStatus }, forcedUid)
 }
 
 // ===== 账号池 Token 复制与全量导出 =====
@@ -2837,17 +2862,24 @@ function qoderPoolStatus(id) {
       if (a.uid) ciByUid[a.uid] = a
       a.__idx = ai
     })
-    renderQoderPoolAccounts(id, pool, ciByUid, ciAccounts)
+    renderQoderPoolAccounts(id, pool, ciByUid, ciAccounts, (d.data && d.data.preferUid) || '')
   }).catch(() => { if (st) showResult(st, false, '查询失败') })
 }
-function renderQoderPoolAccounts(id, accs, ciByUid, ciAccounts) {
+function renderQoderPoolAccounts(id, accs, ciByUid, ciAccounts, preferUid) {
   const box = document.getElementById('qdp-acc-' + id)
   if (!box) return
   if (!accs.length) { box.innerHTML = '<p class="mu">账号池为空：点「登录新账号」每授权一个 Qoder 账号即自动加入（可登录多个账号，老单账号会自动迁入）。</p>'; return }
   ciByUid = ciByUid || {}
   ciAccounts = ciAccounts || []
+  preferUid = preferUid || ''
   const idxFallback = ciAccounts.length === accs.length ? ciAccounts : null
-  box.innerHTML = accs.map(function(a, i) {
+  // 首选账号下拉（与 WorkBuddy / TRAE 面板同一交互）：留空 = 自动挑选（7 天内到期的积分优先）
+  const preferOpts = [preferAutoOption()].concat(accs.map(function (a) {
+    const sel = a.uid === preferUid ? ' selected' : ''
+    return '<option value="' + escapeHtml(a.uid) + '"' + sel + '>' + escapeHtml((a.nickname || a.uid)) + '</option>'
+  })).join('')
+  const preferBar = preferBarHtml('qdp', id, preferOpts, 'qoderPoolSetPrefer')
+  box.innerHTML = preferBar + accs.map(function(a, i) {
     const isOff = a.disabled || a.enabled === false
     const ci = ciByUid[a.uid] || (idxFallback ? idxFallback[i] : null)
     let ciBadge = ''
@@ -3312,15 +3344,12 @@ function traeStatus(id) {
       box.innerHTML = '<p class="form-helper">暂无账号。点击「登录账号」添加第一个 TRAE 账号。</p>'
     } else {
       const preferUid = d.data.preferTraeUid || ''
-      const opts = ['<option value="">自动挑选（按可用积分）</option>'].concat(accs.map(function (a) {
+      const preferOpts = [preferAutoOption()].concat(accs.map(function (a) {
         const sel = a.uid === preferUid ? ' selected' : ''
         return '<option value="' + escapeHtml(a.uid) + '"' + sel + '>' + escapeHtml((a.nickname || a.uid)) + '</option>'
       })).join('')
-      const preferBar = '<div class="fc mt-1 field-row" style="align-items:center;gap:8px"><label style="margin:0;white-space:nowrap">首选账号：</label>' +
-        '<select id="trae-prefer-' + escapeHtml(id) + '" class="select-sm" style="max-width:320px">' + opts + '</select>' +
-        '<button class="btn btn-s btn-xs" onclick="traeSetPrefer(\\'' + escapeJsAttr(id) + '\\')">指定</button>' +
-        '<button class="btn btn-gh btn-xs" onclick="traeSetPrefer(\\'' + escapeJsAttr(id) + '\\',\\'\\')">恢复自动</button>' +
-        '<span id="trae-prefer-msg-' + escapeHtml(id) + '"></span></div>'
+      // 一个下拉同时管 SOLO 与 Work 两个通道（两通道各按自己的包类型判到期，见 pickTraeWorkAccount）
+      const preferBar = preferBarHtml('trae', id, preferOpts, 'traeSetPrefer')
       const ciOk = accs.filter(function (a) { const r = ciByUid[a.uid]; return r && (r.success || r.checkedIn) }).length
       box.innerHTML = preferBar +
         '<div style="max-height:260px;overflow:auto"><table class="usage-log-table" style="margin:0">' +
@@ -3380,20 +3409,11 @@ function traeStatus(id) {
   }).catch(() => { if (st) showResult(st, false, '网络错误，请重试') })
 }
 function traeSetPrefer(id, forcedUid) {
-  const sel = document.getElementById('trae-prefer-' + id)
-  const msg = document.getElementById('trae-prefer-msg-' + id)
-  const uid = (forcedUid !== undefined ? forcedUid : ((sel || {}).value || '')).trim()
-  if (msg) msg.textContent = ''
-  fetch('/admin/api/trae/' + encodeURIComponent(id) + '/account/prefer', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ uid: uid }),
-  }).then(r => r.json()).then(d => {
-    if (!d.success) { if (msg) { msg.textContent = (d.message || '设置失败'); msg.style.color = 'var(--color-danger,#ef4444)' } return }
-    if (msg) { msg.textContent = (d.message || '已设置'); msg.style.color = 'var(--color-success,#16a34a)' }
-    if (sel) sel.value = uid
-    setTimeout(function () { traeStatus(id) }, 800)
-  }).catch(() => { if (msg) { msg.textContent = '网络错误，请重试'; msg.style.color = 'var(--color-danger,#ef4444)' } })
+  poolSetPrefer({
+    id: id, prefix: 'trae',
+    url: '/admin/api/trae/' + encodeURIComponent(id) + '/account/prefer',
+    reload: traeStatus,
+  }, forcedUid)
 }
 function traeRemoveAccount(id, uid) {
   cM('确定删除账号 ' + uid + ' 吗？该账号将退出账号池。').then(function (ok) {

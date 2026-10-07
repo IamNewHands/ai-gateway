@@ -1574,6 +1574,9 @@ export async function handleOAuthStatus(c: Context<AppEnv>) {
     data.pool = qpool
     data.connected = qpool.length > 0
     data.accountCount = qpool.length
+    // 首选账号（面板下拉框）：Qoder 池的首选与 WorkBuddy 池同机制同字段，
+    // 由 handleOAuthPoolSetPrefer 写入，挑号时作为客户端 X-Qoder-Account 之后的兜底
+    data.preferUid = provider.preferOauthUid || ''
   }
   return c.json<ApiResponse>({ success: true, data })
 }
@@ -1610,9 +1613,14 @@ export async function handleOAuthPoolSetPrefer(c: Context<AppEnv>) {
   }
   const body = await readOptionalJSONLimited<{ uid?: string }>(c.req.raw, MAX_ADMIN_REQUEST_BYTES)
   const uid = String(body?.uid || '').trim()
-  // 校验 uid 必须是池内账号，防止乱填
+  // 校验 uid 必须是池内账号，防止乱填。
+  // 两个池的 KV 是分开的（oauth:pool: / qoder:pool:）：拿错池校验会让 Qoder 面板的
+  // 每一次「指定」都返回「账号不存在」——功能看起来在、实际永远用不了。
   if (uid) {
-    const uids = (await listOauthPoolStatus(c.env, id)).map(a => String(a.uid))
+    const uids = (isQoder
+      ? await listQoderPoolStatus(c.env, id)
+      : await listOauthPoolStatus(c.env, id)
+    ).map(a => String(a.uid))
     if (!uids.includes(uid)) return c.json<ApiResponse>({ success: false, message: '账号不存在' }, 400)
   }
   await updateProvider(c.env, id, { preferOauthUid: uid || undefined })
