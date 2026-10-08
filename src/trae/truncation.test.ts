@@ -484,14 +484,14 @@ describe('Trae SOLO 收尾审计：done 次数与 done 之后的内容', () => {
 
 /**
  * transport 换号无信息增益：`transport` 与账号健康无关（`applyChatError` 对它刻意不罚号），
- * 第 2 次撞的仍是同一条「网关↔上游建连」。故撞满 `MAX_TRANSPORT_ATTEMPTS`(2) 即跳出，
- * 不再拿健康账号白耗 30s/次（实测 2026-09-27 连撞两个账号 62s，520ms 后重试即成功）。
+ * 撞的始终是同一条「网关↔上游建连」。故撞满 `MAX_TRANSPORT_ATTEMPTS`(1) 即跳出，不再拿健康
+ * 账号白耗一个建连超时（实测坏路径 connect 恰好撞满上限、0.5s 后重试即成功）。
  *
  * 两个 owner 都要覆盖：
- *  - SOLO 主循环（proxyTraeChatRequest）：3 个账号在池里，但只允许撞 2 次；
- *  - Work 循环（executeWorkRequest）：transport 既不罚号（workErrCount 保持 0），也只撞 2 次。
+ *  - SOLO 主循环（proxyTraeChatRequest）：3 个账号在池里，但只允许撞 1 次；
+ *  - Work 循环（executeWorkRequest）：transport 既不罚号（workErrCount 保持 0），也只撞 1 次。
  */
-describe('Trae transport：撞满 2 次即跳出（换号无信息增益）', () => {
+describe('Trae transport：撞满 1 次即跳出（换号无信息增益）', () => {
   const PROVIDER_ID = 'trae-transport-cap'
   const UIDS = ['u_cap_1', 'u_cap_2', 'u_cap_3']
 
@@ -525,7 +525,7 @@ describe('Trae transport：撞满 2 次即跳出（换号无信息增益）', ()
     }
   }
 
-  it('SOLO 与 Work 双双 transport → SOLO 只撞 2 次（池里还有第 3 个账号也不撞）', async () => {
+  it('SOLO 与 Work 双双 transport → SOLO 只撞 1 次（池里还有第 2、3 个账号也不撞）', async () => {
     const originalFetch = globalThis.fetch
     let soloCalls = 0
     let workCalls = 0
@@ -553,10 +553,10 @@ describe('Trae transport：撞满 2 次即跳出（换号无信息增益）', ()
         stream: false,
       })
 
-      // 修复前是 3（MAX_ROTATE）；现在第 2 次 transport 即定性，跳出
-      expect(soloCalls).toBe(2)
-      // Work 兜底同样撞满 2 次即停
-      expect(workCalls).toBe(2)
+      // 修复前是 3（MAX_ROTATE）；2026-10-08 前是 2；现在是第 1 次 transport 即定性，跳出
+      expect(soloCalls).toBe(1)
+      // Work 兜底同样撞满 1 次即停
+      expect(workCalls).toBe(1)
       expect(resp.status).toBe(503)
       const body = await resp.json() as any
       expect(body.error.code).toBe('upstream_unreachable')
@@ -609,7 +609,7 @@ describe('Trae transport：撞满 2 次即跳出（换号无信息增益）', ()
  *
  * 用 `expiresAt: 0` 强制 `needsTraeRefresh` 为真，使请求在**刷新阶段**就失败（不碰转发端点）。
  */
-describe('Trae token 预刷新：连接层失败不罚号、撞满 2 次即跳出', () => {
+describe('Trae token 预刷新：连接层失败不罚号、撞满 1 次即跳出', () => {
   const PROVIDER_ID = 'trae-refresh-transport'
   const UIDS = ['u_rf_1', 'u_rf_2', 'u_rf_3']
 
@@ -644,7 +644,7 @@ describe('Trae token 预刷新：连接层失败不罚号、撞满 2 次即跳�
 
   const EXCHANGE = '/cloudide/api/v3/trae/oauth/ExchangeToken'
 
-  it('SOLO 循环：刷新阶段 transport → 只撞 2 次、不冷却账号、503 upstream_unreachable', async () => {
+  it('SOLO 循环：刷新阶段 transport → 只撞 1 次、不冷却账号、503 upstream_unreachable', async () => {
     const originalFetch = globalThis.fetch
     let exchangeCalls = 0
     let forwardCalls = 0
@@ -670,8 +670,8 @@ describe('Trae token 预刷新：连接层失败不罚号、撞满 2 次即跳�
         tools: [{ type: 'function', function: { name: 'noop', parameters: { type: 'object', properties: {} } } }],
       })
 
-      // 修复前是 3（MAX_ROTATE）；现在第 2 次 transport 即定性，跳出
-      expect(exchangeCalls).toBe(2)
+      // 修复前是 3（MAX_ROTATE）；2026-10-08 前是 2；现在是第 1 次 transport 即定性，跳出
+      expect(exchangeCalls).toBe(1)
       // 刷新就失败 → 从未打到转发端点
       expect(forwardCalls).toBe(0)
       expect(resp.status).toBe(503)
@@ -692,7 +692,7 @@ describe('Trae token 预刷新：连接层失败不罚号、撞满 2 次即跳�
     }
   })
 
-  it('Work 循环：刷新阶段 transport → 同样只撞 2 次、不罚号（含 workErrCount）', async () => {
+  it('Work 循环：刷新阶段 transport → 同样只撞 1 次、不罚号（含 workErrCount）', async () => {
     const originalFetch = globalThis.fetch
     let exchangeCalls = 0
     let workCalls = 0
@@ -717,9 +717,9 @@ describe('Trae token 预刷新：连接层失败不罚号、撞满 2 次即跳�
         stream: false,
       })
 
-      // 三个刷新阶段各封顶 2 次：Work 主路径 2 + SOLO 兜底路径 2 + 函数末尾 Work 兜底 2。
-      // 未封顶时每段都是 3（MAX_ROTATE）→ 合计 9。
-      expect(exchangeCalls).toBe(6)
+      // 三个刷新阶段各封顶 1 次：Work 主路径 1 + SOLO 兜底路径 1 + 函数末尾 Work 兜底 1。
+      // 未封顶时每段都是 3（MAX_ROTATE）→ 合计 9；封顶 2 次时合计 6。
+      expect(exchangeCalls).toBe(3)
       // 刷新全部失败 → 从未打到 Work 转发端点
       expect(workCalls).toBe(0)
       expect(resp.status).toBe(503)
@@ -842,7 +842,7 @@ describe('Trae 连接层失败可见性：connect 耗时采样与 [trae-transpor
     }
   })
 
-  it('带 tools + 2 账号：两次 SOLO 建连失败 → 2 条 phase=solo 日志 + 1 条 attempts=2 聚合行，且绝不试 Work', async () => {
+  it('带 tools + 2 账号：一次 SOLO 建连失败即收手 → 1 条 phase=solo 日志 + 1 条 attempts=1 聚合行，且绝不试 Work', async () => {
     const originalFetch = globalThis.fetch
     let workCalls = 0
     globalThis.fetch = (async (input: any) => {
@@ -864,16 +864,15 @@ describe('Trae 连接层失败可见性：connect 耗时采样与 [trae-transpor
       })
 
       expect(resp.status).toBe(503)
-      // 带 tools → 不试 Work：这正是生产事故里「62s ≈ 2×30s」而不是「90s」的原因
+      // 带 tools → 不试 Work：生产事故里「62s ≈ 2×30s」的形态；本改动把死等砍到 1×30s
       expect(workCalls).toBe(0)
 
       const logs = kvTexts(env)
       const solo = logs.filter((t) => t.includes('[trae-transport]') && t.includes('phase=solo'))
-      expect(solo).toHaveLength(2)
-      expect(solo[0]).toContain('attempt=1/2')
-      expect(solo[1]).toContain('attempt=2/2')
+      expect(solo).toHaveLength(1)   // MAX_TRANSPORT_ATTEMPTS=1：池里还有第 2 个账号也不撞
+      expect(solo[0]).toContain('attempt=1/1')
       for (const t of solo) {
-        expect(t).toContain('connect=')  // 连接阶段耗时：判断 30s 常量是否过紧的唯一依据
+        expect(t).toContain('connect=')  // 连接阶段耗时：判断超时常量是否过紧的唯一依据
         expect(t).toContain('timeout=')  // 是否被网关自己的定时器掐断（与「上游自己断」区分）
         expect(t).toContain('uid=')
         expect(t).toContain('err=chat transport error')
@@ -881,7 +880,7 @@ describe('Trae 连接层失败可见性：connect 耗时采样与 [trae-transpor
 
       const summary = logs.filter((t) => t.includes('[trae-transport]') && t.includes('end=503'))
       expect(summary).toHaveLength(1)
-      expect(summary[0]).toContain('attempts=2')
+      expect(summary[0]).toContain('attempts=1')
       expect(summary[0]).toContain('tools=true')
       expect(summary[0]).toContain('workFallback=false')
       expect(logs.some((t) => t.includes('phase=work'))).toBe(false)

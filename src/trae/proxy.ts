@@ -45,16 +45,24 @@ export const TRAE_PROVIDER_ID = 'trae'
 const MAX_ROTATE = 3
 
 /**
- * transport（建连超时/被掐断）连续撞满几次即停止换号。
+ * transport（建连超时/被掐断）撞满几次即停止换号。
  *
  * 依据：transport 与账号健康无关（`applyChatError` 对它刻意不罚号），**换号没有信息增益**——
- * 第 2 次仍是同一个「网关↔上游建连」问题，只是再白耗一个 `TRAE_CHAT_CONNECT_TIMEOUT_MS`(30s)。
- * 实测 2026-09-27：连撞两个账号 62s ≈ 2×30s，而 520ms 后重试即成功（池子本来是健康的）。
+ * 撞的始终是同一条「网关↔上游建连」（SOLO 只有一个入口 `TRAE_CONSTANTS.AgentHost`）。
  *
- * 保留 2 次而非 1 次：单次失败可能只是瞬时抖动，换一个账号再试一次仍有信息量（能区分
- * 「抖动」与「链路持续不可达」）；第 2 次仍失败即可定性为后者，继续轮转纯属浪费。
+ * 2026-10-08 由 2 收到 1，依据是三天取证：
+ *  - `[trae-transport]` 实测坏路径恰好撞满上限（30s 时 5/5 次 `connect=30000ms timeout=true`，
+ *    60s 实验期同样撞满），而 0.5s 后重试的请求几秒内就完成（好路径 `connect=2636ms/5052ms`）
+ *    ⇒ 卡住的连接是「死」不是「慢」：等更久不会成功（60s 实验已证），第 2 次尝试只是把单次
+ *    失败的死等从 31s 拉到 62s（带 tools 时 Work 兜底本来就被跳过）；
+ *  - 客户端失败后 0.5s 自行重试，历史 30/30 次失败都在重试后恢复 —— 「换一条连接」这件事交给
+ *    客户端做，网关侧没必要先白等一轮。
+ *
+ * 不变的纪律：`transport` 仍不罚号、仍按真因报 503 `upstream_unreachable`。本改动只缩短死等。
+ * 若日后 `[trae-transport]` 里出现 `timeout=false`（上游自己断）或第 2 次尝试确有实质成功率，
+ * 说明坏连接不是永久死，再调回 2。
  */
-const MAX_TRANSPORT_ATTEMPTS = 2
+const MAX_TRANSPORT_ATTEMPTS = 1
 
 /** 是否是 TRAE SOLO 提供商（id 固定或用 trae 域）。 */
 export function isTraeProvider(provider: Provider): boolean {
