@@ -71,8 +71,25 @@ export const TRAE_KEEPALIVE_MS = 8000
 /** 流式 idle 兜底：上游超过该时长完全无数据视为挂起，主动结束流（防无限挂起）。 */
 export const TRAE_STREAM_IDLE_TIMEOUT_MS = 180000
 
-/** chatStream 连接+响应头超时：仅覆盖建立连接与收到响应头的阶段，响应头到达后取消。 */
-export const TRAE_CHAT_CONNECT_TIMEOUT_MS = 30000
+/**
+ * chatStream 连接+响应头超时：仅覆盖建立连接与收到响应头的阶段，响应头到达后取消。
+ *
+ * 2026-10-08 起 30s → 60s（**单变量实验**）：10-07 / 10-08 实测每次失败都恰好撞满该值
+ * （`[trae-transport] ... connect=30000ms timeout=true elapsed≈30.3s`，两个不同账号都撞），
+ * 而「30–60s」这一档被 30s 上限按构造遮住——不放开就永远看不到「上游其实 31–60s 才给
+ * 响应头」这种情形。成功样本 `connect=` 只有 2.6s / 5.1s 两条，定不了尾，故先用实验取证。
+ *
+ * 判据（跑 1 天，只看 `[trae-transport]` 与 `[trae-stream] connect=`）：
+ *   1. 仍出现 `connect=60000ms timeout=true` → 60s 无用（链路是「死」不是「慢」）→ 回 30s，
+ *      并考虑降到 12s + `MAX_TRANSPORT_ATTEMPTS=1`（死等 62s → 12s，由客户端 0.5s 重试接管）；
+ *   2. 出现 `[trae-stream] ... connect=3xxxx–5xxxx ms ... end=complete` → 30s 确实在误杀，保留 60s；
+ *   3. `[trae-transport]` 归零 → 同样保留 60s。
+ * 实验期最坏代价：单次失败死等 62s → 122s（2 × 60s）。
+ *
+ * 注意：proxy.ts 里若干注释写的「30s / 62s」是 2026-09-27、10-07 的历史实测口径，不是现值，
+ * 勿据此推断当前超时。
+ */
+export const TRAE_CHAT_CONNECT_TIMEOUT_MS = 60000
 
 // ===== raw/remote 省输入积分预算默认值（对齐 Trae2api-cn TRAE_RAW_* 常量） =====
 /** 保留的非 system 历史消息条数上限 */

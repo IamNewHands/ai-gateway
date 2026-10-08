@@ -750,7 +750,8 @@ describe('Trae token 预刷新：连接层失败不罚号、撞满 2 次即跳�
  * 面板「系统日志」完全查不到，只能靠翻 DSH 会话记录反推。
  *
  * 本组锁三件事：
- *  1. abort 文案自描述（`connect timeout 30000ms`），不再是一句含糊的 `The operation was aborted`；
+ *  1. abort 文案自描述（`connect timeout <ms>`，毫秒数即当前常量值），不再是一句含糊的
+ *     `The operation was aborted`；
  *  2. `TraeConnectTiming` 出口：失败侧 connectMs 达标且 connectTimeout=true，成功侧 connectMs 有值
  *     ——「成功样本的 connect 分布」是判断 30s 常量是否过紧的唯一依据（别凭感觉放宽）；
  *  3. 失败必须落 KV：每条尝试一行 `[trae-transport]`，收尾一行聚合结论（与 cline `[cline-attempt]` 同口径）。
@@ -812,7 +813,7 @@ describe('Trae 连接层失败可见性：connect 耗时采样与 [trae-transpor
     try {
       const timing: TraeConnectTiming = {}
       const pending = chatStream(account('u_timeout'), { messages: [{ role: 'user', content: 'hi' }] }, timing)
-      const assertion = expect(pending).rejects.toThrow(/connect timeout 30000ms/)
+      const assertion = expect(pending).rejects.toThrow(new RegExp(`connect timeout ${TRAE_CHAT_CONNECT_TIMEOUT_MS}ms`))
       await vi.advanceTimersByTimeAsync(TRAE_CHAT_CONNECT_TIMEOUT_MS + 100)
       await assertion
       expect(timing.connectTimeout).toBe(true)
