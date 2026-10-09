@@ -40,6 +40,7 @@ import { qoderExclusiveRealm } from './model-meta'
 import { getQoderDevice } from './device'
 import type { QoderDeviceIdentity } from './billing'
 import { streamFetchWithTimeout, withSSEKeepAlive, OPENCODE_STREAM_IDLE_TIMEOUT_MS } from '../opencode'
+import { getPerfSettings } from '../perf'
 
 export const QODER_PROVIDER_ID = 'qoder'
 export const QODER_GATEWAY = 'https://gateway.qoder.com.cn'
@@ -534,8 +535,25 @@ type QoderSSEOpenResult =
  *  2. **空流**：建流成功但首帧即正常关流且零有效内容 → 不建流，按 `upstream_parse` 处理。
  *
  * 闸门之后的流内仍保留同样的信封检测：上游完全可能首帧正常、第 N 帧才报错。
+ *
+ * ## 时间上限（`gateMaxWaitMs`）：为什么必须有
+ *
+ * 闸门**卡在发头之前**，而上游 xhigh 首字节实测 40–71s。没有时间上限时，这 40–71s 里
+ * 客户端收不到任何字节——包括 SSE 响应头——于是心跳没有可注入的地方，中间代理照旧断连。
+ * 分块上限（`QODER_GATE_MAX_READS`）只能约束「来得很慢但一直在来」，对「完全静默」无效。
+ *
+ * 超时**不是错误**：它意味着「首帧还没到，但流是好的」，故照常建流并交给下游心跳保活；
+ * 若之后真的零有效帧，流内收尾仍会补错误帧（`QODER_EMPTY_STREAM_FRAME`），不构成假成功。
+ *
+ * 实现细节：超时那一刻**可能有一次 read 正在进行**，其结果不能丢（丢了就丢上游数据）。
+ * 故用 `pendingRead` 把它保存下来，下一轮先消费它，而不是 `Promise.race` 直接丢弃。
  */
-async function openQoderSSE(upstreamBody: ReadableStream<Uint8Array>, _model: string): Promise<QoderSSEOpenResult> {
+async function openQoderSSE(
+  upstreamBody: ReadableStream<Uint8Array>,
+  _model: string,
+  gateMaxWaitMs: number = QODER_GATE_MAX_WAIT_MS,
+  gateTimeout: QoderGateTimeoutFn = defaultQoderGateTimeout
+): Promise<QoderSSEOpenResult> {
   const reader = upstreamBody.pipeThrough(new TextDecoderStream()).getReader()
   const encoder = new TextEncoder()
   const splitter = makeLineSplitter()
@@ -543,10 +561,26 @@ async function openQoderSSE(upstreamBody: ReadableStream<Uint8Array>, _model: st
   const pending: string[] = []
   let envelopeError: QoderClassified | null = null
   let streamEnded = false
+  /** 超时释放时正在进行的那次 read：结果必须留给流内阶段消费，不能丢。 */
+  let pendingRead: Promise<ReadableStreamReadResult<string>> | null = null
 
   let gateReads = 0
   while (pending.length === 0 && !envelopeError && gateReads < QODER_GATE_MAX_READS) {
-    const { done, value } = await reader.read()
+    // 超时只对「还在等第一块」的静默生效；已有 pending 时循环条件已不成立，不会走到这里
+    const gate = gateTimeout(gateMaxWaitMs)
+    const read = pendingRead || reader.read()
+    pendingRead = null
+    const outcome = await Promise.race([
+      read.then((r) => ({ kind: 'read' as const, r })),
+      gate.promise.then(() => ({ kind: 'timeout' as const })),
+    ])
+    gate.cancel()
+    if (outcome.kind === 'timeout') {
+      // 首帧未到：保留这次 read 的结果给流内阶段，先发头（下游心跳接管静默期）
+      pendingRead = read
+      break
+    }
+    const { done, value } = outcome.r
     gateReads++
     if (done) {
       streamEnded = true
@@ -590,7 +624,10 @@ async function openQoderSSE(upstreamBody: ReadableStream<Uint8Array>, _model: st
 
       try {
         readLoop: while (true) {
-          const { done, value } = await reader.read()
+          // 闸门超时释放时可能留了一次 in-flight read，必须先消费它，否则那块上游数据被丢掉
+          const next = pendingRead ? pendingRead : reader.read()
+          pendingRead = null
+          const { done, value } = await next
           if (done) break
           for (const line of splitter(value)) {
             const env = readQoderFrame(line)
@@ -666,6 +703,15 @@ export interface QoderProxyOptions {
   delay?: QoderDelayFn
   /** 入站请求的取消信号：客户端断开时中止上游 fetch，且**不**重试（避免白烧配额）。 */
   signal?: AbortSignal
+  /**
+   * 流式保活旋钮（心跳/闸门时限）。缺省按 qoder 内置值（5s 心跳 + 5s 闸门上限）。
+   *
+   * 由调用方从「性能设置」读入后传入：管理员能在后台调心跳，但 `resolveQoderKeepAliveMs`
+   * 只允许往更紧的方向调（见该函数注释）。
+   *
+   * 命名避开 `stream`：本接口的 `stream` 已被「客户端是否要求流式」占用。
+   */
+  streamKnobs?: QoderStreamKnobs
 }
 
 /** 单次上游发送的结果：成功 Response，或分类后的错误（供池循环决定冷却与轮转）。 */
@@ -677,6 +723,26 @@ type QoderSendResult =
 export type QoderDelayFn = (ms: number) => Promise<void>
 
 const defaultQoderDelay: QoderDelayFn = (ms) => new Promise((r) => setTimeout(r, ms))
+
+/**
+ * 流式保活相关的可注入旋钮（尾部选项对象）。
+ *
+ * 为什么单独打包成一个对象而不是继续加位置参数：这个函数的位置参数已有十个，
+ * 再逐个追加会让「第 9 个参数是 signal 还是 idleTimeout」变成需要数数才能读懂的代码。
+ *
+ * 全部可注入是硬要求：否则用例只能睡真实秒数（5s 心跳 × 多轮 = 测试套件从毫秒涨到秒级），
+ * 且无法断言「确实注了心跳、注了几次」。
+ */
+export interface QoderStreamKnobs {
+  /** 客户端心跳间隔（0 = 不注入）；缺省 `QODER_SSE_HEARTBEAT_MS` */
+  keepAliveMs?: number
+  /** 流 idle 兜底；缺省 `OPENCODE_STREAM_IDLE_TIMEOUT_MS` */
+  idleTimeoutMs?: number
+  /** 首帧闸门最长等待；缺省 `QODER_GATE_MAX_WAIT_MS` */
+  gateMaxWaitMs?: number
+  /** 闸门限时等待工厂（测试注入）；缺省 `defaultQoderGateTimeout` */
+  gateTimeout?: QoderGateTimeoutFn
+}
 
 /**
  * 用给定 COSY 会话发送一次 chat 请求并构造客户端响应（流式/非流式）。
@@ -695,6 +761,16 @@ const defaultQoderDelay: QoderDelayFn = (ms) => new Promise((r) => setTimeout(r,
  * 算进签名（cosy.ts:344-354），复用上一次的头集合会因 date/requestId 与签名不匹配被上游拒。
  *
  * 入站请求被客户端取消（AbortError）不重试：那会白烧上游配额，且客户端已经不要这个响应了。
+ *
+ * ## 客户端 SSE 心跳（hub `sse_with_heartbeat`，`QD_SSE_HEARTBEAT` 默认 5s）
+ *
+ * 上游 xhigh 长上下文首字节实测 40–71s。这段时间若网关对客户端一言不发，客户端/中间代理
+ * 按空闲超时断连重连（表现为「一直重连」）。心跳注释行 `: keep-alive` 客户端会忽略，
+ * 但能重置 idle 计时器。
+ *
+ * ⚠️ 心跳**必须注在面向客户端的流上**，不能靠给 `streamFetchWithTimeout` 传 `keepAliveMs`：
+ * 那层包的是**上游信封流**，而 `openQoderSSE` 只认 `data:` 行——心跳会被当噪声丢掉，
+ * 且会占掉闸门 4 块的预读预算，等于既没保活又推迟了首帧判定。
  */
 async function sendQoderChatOnce(
   session: CosySession,
@@ -706,7 +782,8 @@ async function sendQoderChatOnce(
   realm: 'cn' | 'global' = 'cn',
   delay: QoderDelayFn = defaultQoderDelay,
   outerSignal?: AbortSignal,
-  device?: QoderDeviceIdentity
+  device?: QoderDeviceIdentity,
+  knobs?: QoderStreamKnobs
 ): Promise<QoderSendResult> {
   const chatUrl = qoderChatUrl(realm)
 
@@ -781,12 +858,30 @@ async function sendQoderChatOnce(
     : {}
 
   if (wantStream) {
-    // 有界首帧闸门：信封错误/空流在此被拦下，池循环得以冷却并轮转下一个账号
-    const opened = await openQoderSSE(resp.body, model)
+    // 有界首帧闸门：信封错误/空流在此被拦下，池循环得以冷却并轮转下一个账号。
+    // 闸门带时间上限：上游 40–71s 首字静默时先发头，别让客户端连 SSE 头都收不到。
+    const opened = await openQoderSSE(
+      resp.body, model, knobs?.gateMaxWaitMs, knobs?.gateTimeout
+    )
     if (!opened.ok) return { ok: false, classified: opened.classified }
+    /**
+     * 客户端流包心跳 + idle 兜底（hub `sse_with_heartbeat`）。
+     *
+     * `keepAliveMs` 只在**这里**有意义：这是面向客户端的流。上游信封流那层（`streamFetchWithTimeout`）
+     * 传它反而有害——心跳行会被 `openQoderSSE` 的 `data:` 过滤丢掉，还白占闸门预读预算。
+     *
+     * 恒定包一层（`keepAliveMs=0` 时 `withSSEKeepAlive` 内部不放心跳，见其 `armHeartbeat`）：
+     * 这样「管理员关掉心跳」只关心跳，**不会连带丢掉 idle 兜底**——上游彻底挂死时仍能收流，
+     * 与 `passthroughResponse` 的 `withSSEKeepAlive(readable, 0, …)` 同一写法。
+     */
+    const body = withSSEKeepAlive(
+      opened.stream,
+      knobs?.keepAliveMs ?? QODER_SSE_HEARTBEAT_MS,
+      knobs?.idleTimeoutMs ?? OPENCODE_STREAM_IDLE_TIMEOUT_MS
+    )
     return {
       ok: true,
-      response: new Response(opened.stream, {
+      response: new Response(body, {
         status: 200,
         headers: {
           'Content-Type': 'text/event-stream',
@@ -947,12 +1042,24 @@ export async function proxyQoderChatRequest(
    */
   const qoderDevice = await getQoderDevice(env)
 
+  /**
+   * 流式保活旋钮：心跳间隔从「性能设置」读入（后台可调），闸门上限固定内置。
+   *
+   * 为什么心跳要允许后台调：不同客户端/中间代理的空闲阈值不同，出问题时管理员需要
+   * 能立刻调紧而不必重新部署。`resolveQoderKeepAliveMs` 保证「只能更紧，不能更松」。
+   *
+   * 只在流式请求上读 KV：非流式没有心跳可言，白读一次是纯开销。
+   */
+  const streamKnobs: QoderStreamKnobs = opts?.streamKnobs || (wantStream
+    ? { keepAliveMs: resolveQoderKeepAliveMs((await getPerfSettings(env)).keepAliveMs) }
+    : {})
+
   // 会话注入（测试/工具）：单次直发，不经过池。域由调用方显式给出，缺省 cn。
   if (opts?.session) {
     const encodedBody = renderBody(opts?.realm === 'global' ? 'global' : 'cn')
     const r = await sendQoderChatOnce(
       opts.session.session, encodedBody, modelKey, model, wantStream, undefined, 'cn', opts?.delay, opts?.signal,
-      qoderDevice
+      qoderDevice, streamKnobs
     )
     return r.ok ? r.response : classifiedErrorResponse(r.classified)
   }
@@ -1034,7 +1141,7 @@ export async function proxyQoderChatRequest(
       const encodedBody = renderBody(accountRealm)
       const r = await sendQoderChatOnce(
         session, encodedBody, modelKey, model, wantStream, account.uid, accountRealm, delayFn, opts?.signal,
-        qoderDevice
+        qoderDevice, streamKnobs
       )
       if (r.ok) {
         await noteQoderSuccess(env, provider.id, account.uid)
@@ -1120,7 +1227,7 @@ export async function proxyQoderChatRequest(
   }
   const r = await sendQoderChatOnce(
     data.session, renderBody(data.realm), modelKey, model, wantStream, undefined, data.realm, undefined, undefined,
-    qoderDevice
+    qoderDevice, streamKnobs
   )
   return r.ok ? r.response : classifiedErrorResponse(r.classified)
 }

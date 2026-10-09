@@ -15,7 +15,7 @@ import {
   isEventStreamResponse,
   OPENCODE_STREAM_IDLE_TIMEOUT_MS,
 } from './opencode'
-import { isQoderFlow, proxyQoderChatRequest } from './qoder/proxy'
+import { isQoderFlow, proxyQoderChatRequest, QODER_SSE_HEARTBEAT_MS } from './qoder/proxy'
 import { resolveQoderPreferUid } from './qoder/pool'
 import { isClineProvider, proxyClineChatRequest } from './cline/proxy'
 import { isVisionBridgeProvider, buildVisionBridgeRequestBody } from './vision/bridge'
@@ -4161,7 +4161,24 @@ async function handleAnthropicQoder(
       },
     })
 
-    return new Response(readable, {
+    /**
+     * Anthropic 客户端也要心跳，且**必须注在这层**。
+     *
+     * 为什么不能依赖 qoder 层已注入的心跳：上面这个转换循环只处理 `data:` 行
+     * （`if (!trimmed.startsWith('data:')) continue`），`: keep-alive` 注释行会被**丢掉**——
+     * qoder 层的心跳在 OpenAI 路径有效，到 Anthropic 路径就消失了。
+     *
+     * 对 Anthropic SSE 注入 `:` 注释行是安全的：SSE 规范要求客户端忽略注释行，
+     * Claude Code 等解析器同样如此（与 OpenAI 路径同一手段）。
+     *
+     * 恒定包一层：`keepAliveMs=0`（管理员关掉心跳）时 `withSSEKeepAlive` 内部不放心跳，
+     * 但 idle 兜底仍生效——关心跳不该连带把「上游挂死时主动收流」也关掉。
+     */
+    const perf = await getPerfSettings(c.env)
+    const keepAliveMs = perf.keepAliveMs === 0 ? 0 : Math.min(perf.keepAliveMs, QODER_SSE_HEARTBEAT_MS)
+    const withBeat = withSSEKeepAlive(readable, keepAliveMs, perf.idleTimeoutMs || OPENCODE_STREAM_IDLE_TIMEOUT_MS)
+
+    return new Response(withBeat, {
       status: 200,
       headers: {
         'Content-Type': 'text/event-stream',

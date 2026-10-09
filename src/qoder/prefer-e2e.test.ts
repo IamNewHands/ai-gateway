@@ -15,7 +15,7 @@ import { Hono } from 'hono'
 import type { AppEnv, Provider } from '../types'
 import { setProviders } from '../storage'
 import { handleOAuthStatus, handleOAuthPoolSetPrefer } from '../admin'
-import { handleProxy } from '../proxy'
+import { handleProxy, handleAnthropicMessages } from '../proxy'
 import { writeQoderPool, type QoderPoolAccount } from './pool'
 import { formatCstWallClock } from '../credit-expiry'
 
@@ -242,5 +242,84 @@ describe('Qoder 首选账号在转发路径上真的生效（出站 Cosy-User �
     expect(res.status, body).toBe(200)
     expect(users).toContain('soon')
     expect(users).not.toContain('rich')
+  })
+})
+
+/**
+ * Anthropic（`/v1/messages`，Claude Code 走这条）路径的心跳端到端证明。
+ *
+ * 为什么必须单独测这条：`handleAnthropicQoder` 把 OpenAI SSE 逐行转成 Anthropic SSE，
+ * 而它的循环只处理 `data:` 开头的行（`if (!trimmed.startsWith('data:')) continue`）——
+ * 于是 qoder 层注入的 `: keep-alive` 注释行会在这一层被**丢掉**。
+ * 只看 `qoder/proxy.ts` 的测试会以为心跳已经生效，而 Claude Code 用户实际一个心跳都收不到。
+ *
+ * 这个用例就是「不许只测一层」的证据：同一个上游静默，两条入口都必须有心跳。
+ */
+describe('Anthropic 入口的心跳：转换层不得把注释行吃掉', () => {
+  const PID = 'qoder-beat-anthropic'
+
+  /** 上游：先给一帧（让闸门放行建流），随后长时间静默。 */
+  function slowUpstream() {
+    const enc = new TextEncoder()
+    let ctrl: ReadableStreamDefaultController<Uint8Array> | null = null
+    const body = new ReadableStream<Uint8Array>({
+      start(c) {
+        ctrl = c
+        const inner = JSON.stringify({
+          id: 'c1', model: 'auto',
+          choices: [{ index: 0, delta: { role: 'assistant', content: 'hi' } }],
+        })
+        c.enqueue(enc.encode('data: ' + JSON.stringify({ headers: {}, body: inner }) + '\n\n'))
+      },
+    })
+    return { body, push: (s: string) => ctrl!.enqueue(enc.encode(s)), close: () => ctrl!.close() }
+  }
+
+  it('上游静默 → Anthropic 客户端收到 `: keep-alive`（修复前该行被转换循环丢弃）', async () => {
+    vi.useFakeTimers()
+    try {
+      const env = makeEnv()
+      await setProviders(env as never, [qoderProvider({
+        id: PID,
+        models: [{ id: 'auto', enabled: true }] as never,
+      })])
+      await writeQoderPool(env, PID, [poolAccount('u1')])
+
+      const up = slowUpstream()
+      vi.stubGlobal('fetch', vi.fn(async () => new Response(up.body, {
+        status: 200, headers: { 'Content-Type': 'text/event-stream' },
+      })))
+
+      const app = new Hono<AppEnv>()
+      app.post('/v1/messages', (c) => handleAnthropicMessages(c))
+      const req = new Request('https://gw.test/v1/messages', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          model: `${PID}/auto`, stream: true, max_tokens: 64,
+          messages: [{ role: 'user', content: 'hi' }],
+        }),
+      })
+      const res = await app.fetch(req, env, { waitUntil: () => {}, passThroughOnException: () => {} } as unknown as ExecutionContext)
+      expect(res.status).toBe(200)
+
+      const parts: string[] = []
+      const dec = new TextDecoder()
+      const consume = (async () => {
+        const reader = res.body!.getReader()
+        for (;;) {
+          const { done, value } = await reader.read()
+          if (done) break
+          parts.push(dec.decode(value, { stream: true }))
+        }
+      })()
+      // 上游静默：推进时间必须触发心跳（默认 5s，这里推 6s）
+      await vi.advanceTimersByTimeAsync(6000)
+      up.close()
+      await vi.advanceTimersByTimeAsync(50)
+      await consume
+      const text = parts.join('')
+      expect(text, 'Anthropic 客户端必须收到心跳注释行').toContain(': keep-alive')
+    } finally { vi.useRealTimers() }
   })
 })

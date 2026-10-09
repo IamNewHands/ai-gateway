@@ -43,7 +43,7 @@ import {
   writeQoderPool,
   type QoderPoolAccount,
 } from './pool'
-import { markQoderAccountClassified, proxyQoderChatRequest } from './proxy'
+import { markQoderAccountClassified, proxyQoderChatRequest, resolveQoderKeepAliveMs } from './proxy'
 import { cosySessionFor } from './cosy'
 import { isQoderTransientUpstream, isQoderTransientTransport } from './classify'
 import type { Env, Provider } from '../types'
@@ -1237,5 +1237,206 @@ describe('短冷却等待：全池只是短暂冷却时等待，而不是报「�
     expect(waits[0]).toBeGreaterThan(0)
     expect(waits[0]).toBeLessThanOrEqual(9250)
     expect(resp.status, JSON.stringify(await resp.clone().json().catch(() => ({})))).toBe(200)
+  })
+})
+
+// ===== 之后做第 5 项：SSE 心跳（hub sse_with_heartbeat / QD_SSE_HEARTBEAT） =====
+describe('SSE 心跳：上游长静默期间不再让客户端空等', () => {
+  const okBody = JSON.stringify({
+    id: 'c1', model: 'auto',
+    choices: [{ index: 0, message: { role: 'assistant', content: '好' }, finish_reason: 'stop' }],
+  })
+  const frame = (body: string) => `data: ${JSON.stringify({ headers: {}, body })}\n\n`
+
+  /**
+   * 造一个可控上游流：首帧**同步**入队（这样闸门的 read 能立刻拿到，不会自锁），
+   * 之后由测试显式 push/close。绝不睡真实秒数。
+   */
+  function controlledUpstream(initial = '') {
+    let ctrl: ReadableStreamDefaultController<Uint8Array> | null = null
+    const enc = new TextEncoder()
+    const body = new ReadableStream<Uint8Array>({
+      start(controller) {
+        ctrl = controller
+        if (initial) controller.enqueue(enc.encode(initial))
+      },
+    })
+    return {
+      body,
+      push: (c: string) => ctrl!.enqueue(enc.encode(c)),
+      close: () => ctrl!.close(),
+    }
+  }
+
+  /** 闸门永不超时（只靠 read 先到）：用于「首帧正常」的用例。 */
+  const noGateTimeout = () => ({ promise: new Promise<void>(() => {}), cancel: () => {} })
+
+  async function callStream(
+    fetchImpl: (url: string, init?: RequestInit) => Promise<Response>,
+    streamKnobs?: { keepAliveMs?: number; idleTimeoutMs?: number; gateMaxWaitMs?: number; gateTimeout?: unknown }
+  ) {
+    const session = await cosySessionFor('dt-beat', 'drt-b', 'uid-beat', 'B')
+    vi.stubGlobal('fetch', vi.fn(fetchImpl))
+    return proxyQoderChatRequest({} as Env, { id: 'qoder' } as Provider, {
+      model: 'auto', stream: true, messages: [{ role: 'user', content: 'hi' }],
+    }, {
+      session: { session }, stream: true,
+      streamKnobs: streamKnobs as never,
+    })
+  }
+
+  /** 把流读到结束，返回全文。 */
+  async function readAll(resp: Response): Promise<string> {
+    const dec = new TextDecoder()
+    const reader = resp.body!.getReader()
+    let out = ''
+    for (;;) {
+      const { done, value } = await reader.read()
+      if (done) break
+      out += dec.decode(value, { stream: true })
+    }
+    return out
+  }
+
+  it('**不该注心跳**：上游持续出帧时正文里不插注释行', async () => {
+    vi.useFakeTimers()
+    try {
+      // keepAliveMs 极小，让「有帧就不注」这件事必须靠 lastOutputAt 判定而不是靠间隔够大
+      const resp = await callStream(async () => new Response(
+        frame(okBody) + frame('[DONE]'),
+        { status: 200, headers: { 'Content-Type': 'text/event-stream' } },
+      ), { keepAliveMs: 50, gateTimeout: noGateTimeout })
+      const text = await readAll(resp)
+      expect(text).toContain('"content":"好"')
+      expect(text).not.toContain(': keep-alive')
+    } finally { vi.useRealTimers() }
+  })
+
+  it('keepAliveMs=0（管理员显式关闭）→ 不注心跳，但流仍正常收尾（idle 兜底不被连带关掉）', async () => {
+    const resp = await callStream(async () => new Response(
+      frame(okBody) + frame('[DONE]'),
+      { status: 200, headers: { 'Content-Type': 'text/event-stream' } },
+    ), { keepAliveMs: 0, gateTimeout: noGateTimeout })
+    const text = await readAll(resp)
+    expect(text).not.toContain(': keep-alive')
+    expect(text).toContain('"content":"好"')
+    // 关键：关掉心跳不能把 idle 兜底也关掉（仍走 withSSEKeepAlive，只是 keepAliveMs=0）
+    expect(text).toContain('[DONE]')
+  })
+
+  it('**核心**：上游静默超过心跳间隔 → 注入 `: keep-alive`，且正文照常到达', async () => {
+    vi.useFakeTimers()
+    try {
+      // 首帧同步入队：闸门立刻拿到 pending 并建流（不发头前不等待）
+      const up = controlledUpstream(frame(okBody))
+      const resp = await callStream(async () => new Response(up.body, {
+        status: 200, headers: { 'Content-Type': 'text/event-stream' },
+      }), { keepAliveMs: 1000, gateTimeout: noGateTimeout })
+      const parts: string[] = []
+      const dec = new TextDecoder()
+      const consume = (async () => {
+        const reader = resp.body!.getReader()
+        for (;;) {
+          const { done, value } = await reader.read()
+          if (done) break
+          parts.push(dec.decode(value, { stream: true }))
+        }
+      })()
+      // 首帧已到；此后上游静默 → 推进时间应触发心跳
+      await vi.advanceTimersByTimeAsync(50)
+      await vi.advanceTimersByTimeAsync(1200)
+      up.push(frame('[DONE]'))
+      up.close()
+      await vi.advanceTimersByTimeAsync(50)
+      await consume
+      const text = parts.join('')
+      expect(text).toContain(': keep-alive')
+      expect(text).toContain('"content":"好"')
+    } finally { vi.useRealTimers() }
+  })
+
+  it('闸门时间上限：上游首帧前静默 → 先放行建流（不再卡住 SSE 头），且那次 in-flight read 不丢数据', async () => {
+    vi.useFakeTimers()
+    try {
+      // 首帧**不**入队：闸门只能靠注入的「立即到点」超时释放。
+      // 同时记录被传入的 ms —— 否则「上限值有没有真的接到闸门上」无人验证
+      // （注入的工厂若不看 ms，把 gateMaxWaitMs 写错/丢掉都不会红）。
+      const armed: number[] = []
+      const up = controlledUpstream()
+      const resp = await callStream(async () => new Response(up.body, {
+        status: 200, headers: { 'Content-Type': 'text/event-stream' },
+      }), {
+        keepAliveMs: 1000,
+        gateMaxWaitMs: 5000,
+        gateTimeout: (ms: number) => {
+          armed.push(ms)
+          return { promise: Promise.resolve(), cancel: () => {} }
+        },
+      })
+      expect(armed, '闸门必须按 gateMaxWaitMs 设上限').toContain(5000)
+      // 闸门超时释放 → 已建流（头已发出），而不是继续卡在预读
+      expect(resp.status).toBe(200)
+      expect(resp.headers.get('Content-Type')).toContain('text/event-stream')
+      const parts: string[] = []
+      const dec = new TextDecoder()
+      const consume = (async () => {
+        const reader = resp.body!.getReader()
+        for (;;) {
+          const { done, value } = await reader.read()
+          if (done) break
+          parts.push(dec.decode(value, { stream: true }))
+        }
+      })()
+      // 静默期应补心跳
+      await vi.advanceTimersByTimeAsync(1200)
+      // 关键：超时释放时那次 in-flight read 不能被丢弃 —— 现在推首帧，正文必须到达
+      up.push(frame(okBody))
+      await vi.advanceTimersByTimeAsync(50)
+      up.push(frame('[DONE]'))
+      up.close()
+      await vi.advanceTimersByTimeAsync(50)
+      await consume
+      const text = parts.join('')
+      expect(text).toContain('"content":"好"')
+      expect(text).toContain(': keep-alive')
+    } finally { vi.useRealTimers() }
+  })
+
+  it('闸门超时但上游确实零帧 → 仍补空流错误帧，**不构成假成功**', async () => {
+    vi.useFakeTimers()
+    try {
+      const resp = await callStream(async () => new Response('', {
+        status: 200, headers: { 'Content-Type': 'text/event-stream' },
+      }), {
+        keepAliveMs: 0,
+        gateTimeout: () => ({ promise: Promise.resolve(), cancel: () => {} }),
+      })
+      const text = await readAll(resp)
+      // 闸门超时只是「先发头」，零有效帧的判定不能被它绕过
+      expect(text).toContain('empty upstream stream')
+      expect(text).toContain('[DONE]')
+    } finally { vi.useRealTimers() }
+  })
+
+  it('解析器：尊重显式关闭，但不允许比 5s 更松（调松正是会让客户端断连的方向）', () => {
+    expect(resolveQoderKeepAliveMs(0)).toBe(0)                 // 显式关闭 → 尊重
+    expect(resolveQoderKeepAliveMs(15000)).toBe(5000)          // 通用默认 15s → 收紧到 5s
+    expect(resolveQoderKeepAliveMs(3000)).toBe(3000)           // 更紧 → 保留
+    expect(resolveQoderKeepAliveMs(5000)).toBe(5000)
+    expect(resolveQoderKeepAliveMs(120000)).toBe(5000)
+  })
+
+  it('上游信封流**不**被注入心跳（心跳注在上游流会被 data: 过滤丢掉，还白占闸门预算）', async () => {
+    const resp = await callStream(async () => new Response(
+      frame(okBody) + frame('[DONE]'),
+      { status: 200, headers: { 'Content-Type': 'text/event-stream' } },
+    ), { keepAliveMs: 1000, gateTimeout: noGateTimeout })
+    const text = await readAll(resp)
+    // 客户端拿到的是**解包后的内层 chunk**（这正是 openQoderSSE 的职责），
+    // 而不是上游信封原文 —— 若信封被原样透传，说明解包层没生效。
+    expect(text).toContain('data: ' + okBody)
+    expect(text).not.toContain('"headers":{}')
+    // 有帧时不该注心跳（这条用例同时守住「注释行没混进上游流」）
+    expect(text).not.toContain(': keep-alive')
   })
 })
