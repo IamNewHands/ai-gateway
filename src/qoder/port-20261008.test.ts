@@ -15,11 +15,13 @@
  */
 import { describe, it, expect, vi, afterEach } from 'vitest'
 import { buildQoderBody, cpaToUpstreamKey } from './body'
-import { qoderModelMeta, normalizeQoderReasoningEffort, QODER_DEFAULT_MAX_INPUT_TOKENS } from './model-meta'
+import { qoderModelMeta, normalizeQoderReasoningEffort, QODER_DEFAULT_MAX_INPUT_TOKENS, qoderExclusiveRealm } from './model-meta'
 import {
   proEligibility,
   proClaim,
   performQoderCheckin,
+  qoderNextCheckinWindow,
+  qoderDailyRoundOpen,
   QODER_PRO_REWARD_CREDIT,
   isQoderCouponKind,
   qoderCouponKindLabel,
@@ -30,6 +32,8 @@ import {
   cooldownQoderAccountModel,
   clearQoderModelCooldown,
   isQoderAccountHealthy,
+  qoderPoolServesModel,
+  qoderAccountServesModel,
   listQoderPoolStatus,
   setQoderCampaignCode,
   blockQoderCampaign,
@@ -763,5 +767,217 @@ describe('P5 max_tokens / reasoning_effort：不再被静默丢弃（hub qoder_p
       realm: 'cn', reasoningEffort: 'high',
     }))
     expect(q.parameters.reasoning_effort).toBeUndefined()
+  })
+})
+
+// ===== Q-3：模型 → 独占区域（hub exclusive_realm，qoder_proxy.py:146-159） =====
+describe('Q-3 模型区域路由：区域错配的账号被跳过，而不是拿一个必然的 403', () => {
+  it('独占表按源逐条同构：国际 5 个 + 国内 2 个，其余共享', () => {
+    for (const m of ['ultimate', 'performance', 'efficient', 'smodel', 'cmodel']) {
+      expect(qoderExclusiveRealm(m), m).toBe('global')
+    }
+    for (const m of ['q37fmodel', 'gm51model']) {
+      expect(qoderExclusiveRealm(m), m).toBe('cn')
+    }
+    // 两区共享 → 空串（不参与过滤）
+    for (const m of ['qmodel', 'dmodel', 'dfmodel', 'auto', 'kmodel', 'mmodel', 'gmodel']) {
+      expect(qoderExclusiveRealm(m), m).toBe('')
+    }
+    expect(qoderExclusiveRealm('')).toBe('')
+    expect(qoderExclusiveRealm(undefined, null)).toBe('')
+  })
+
+  it('前缀匹配：官方带后缀变体（ultimate-1 等）也判独占', () => {
+    expect(qoderExclusiveRealm('ultimate-1')).toBe('global')
+    expect(qoderExclusiveRealm('performance-pro')).toBe('global')
+    expect(qoderExclusiveRealm('gm51model-v2')).toBe('cn')
+    // 大小写不敏感
+    expect(qoderExclusiveRealm('GM51MODEL')).toBe('cn')
+  })
+
+  it('多候选：上游 key 与客户端原名任一命中即算（源对 (resolved, 原始) 各查一次）', () => {
+    // glm-5.2 是客户端名（不在表里），gm51model 是上游 key（在表里）
+    expect(qoderExclusiveRealm('glm-5.2')).toBe('')          // 单传客户端名：表里没有
+    expect(qoderExclusiveRealm('glm-5.2', 'gm51model')).toBe('cn')  // 带上上游 key 即命中
+    // 顺序无关
+    expect(qoderExclusiveRealm('gm51model', 'glm-5.2')).toBe('cn')
+  })
+
+  it('**核心**：池内混区时，cn 独占模型绝不挑国际号（反之亦然）', async () => {
+    const { env } = makeEnv()
+    const pid = 'qoder-realm-1'
+    await writeQoderPool(env, pid, [
+      account({ uid: 'intl', realm: 'global', state: { credits: 9999, disabled: false, until: 0, errCount: 0 } }),
+      account({ uid: 'cn', realm: 'cn', state: { credits: 1, disabled: false, until: 0, errCount: 0 } }),
+    ])
+    // gm51model 是 CN 独占：即使国际号积分高得多，也必须挑 cn 号
+    // （否则上游必 403，且该号被白冻 60 秒 —— 见 markQoderAccountClassified 的 auth 分支）
+    const pickedCn = await pickQoderAccount(env, pid, new Set(), undefined, 'gm51model', 'cn')
+    expect(pickedCn?.uid).toBe('cn')
+    // 国际独占模型反过来挑国际号
+    const pickedIntl = await pickQoderAccount(env, pid, new Set(), undefined, 'smodel', 'global')
+    expect(pickedIntl?.uid).toBe('intl')
+    // 共享模型：不受区域限制，回到「积分高者优先」
+    expect((await pickQoderAccount(env, pid, new Set(), undefined, 'dmodel', ''))?.uid).toBe('intl')
+  })
+
+  it('全池区域都不匹配 → 挑号返回 null（调用方据此报「模型选错」而非「账号都不可用」）', async () => {
+    const { env } = makeEnv()
+    const pid = 'qoder-realm-2'
+    await writeQoderPool(env, pid, [
+      account({ uid: 'intl1', realm: 'global' }),
+      account({ uid: 'intl2', realm: 'global' }),
+    ])
+    // 池里只有国际号，要一个 CN 独占模型 → 挑不到
+    expect(await pickQoderAccount(env, pid, new Set(), undefined, 'gm51model', 'cn')).toBeNull()
+    // 且必须能与「全冷却」区分开：池子里**确实**没有 cn 账号
+    const pool = await readQoderPool(env, pid)
+    expect(qoderPoolServesModel(pool, 'cn')).toBe(false)
+    expect(qoderPoolServesModel(pool, 'global')).toBe(true)
+    expect(qoderPoolServesModel(pool, '')).toBe(true)
+  })
+
+  it('区域过滤对「用户固定账号」同样生效：固定的账号若区域错配也不能选', async () => {
+    const { env } = makeEnv()
+    const pid = 'qoder-realm-3'
+    await writeQoderPool(env, pid, [
+      account({ uid: 'intl', realm: 'global' }),
+      account({ uid: 'cn', realm: 'cn' }),
+    ])
+    // 用户把国际号设为首选，但请求的是 CN 独占模型 → 不能因为「用户指定了」就发出去
+    const pinned = await pickQoderAccount(env, pid, new Set(), 'intl', 'gm51model', 'cn')
+    expect(pinned?.uid).toBe('cn')
+  })
+
+  it('realm 缺省的账号按 cn 处理（既有部署不带该字段）', async () => {
+    const { env } = makeEnv()
+    const pid = 'qoder-realm-4'
+    const a = account({ uid: 'norealm' })
+    delete (a as { realm?: string }).realm
+    await writeQoderPool(env, pid, [a])
+    // 缺省 cn → cn 独占模型可挑，国际独占模型挑不到
+    expect((await pickQoderAccount(env, pid, new Set(), undefined, 'gm51model', 'cn'))?.uid).toBe('norealm')
+    expect(await pickQoderAccount(env, pid, new Set(), undefined, 'smodel', 'global')).toBeNull()
+  })
+
+  it('禁用账号不计入「本区有号」：避免报成「模型选错」而实际是账号被禁', async () => {
+    const { env } = makeEnv()
+    const pid = 'qoder-realm-5'
+    await writeQoderPool(env, pid, [
+      account({ uid: 'cn-off', realm: 'cn', enabled: false, state: { credits: 0, disabled: true, until: 0, errCount: 0 } }),
+    ])
+    const pool = await readQoderPool(env, pid)
+    expect(qoderPoolServesModel(pool, 'cn')).toBe(false)
+  })
+
+  it('**回归**：不带 requiredRealm 时行为与改动前完全一致（既有调用方零影响）', async () => {
+    const { env } = makeEnv()
+    const pid = 'qoder-realm-6'
+    await writeQoderPool(env, pid, [
+      account({ uid: 'intl', realm: 'global', state: { credits: 9999, disabled: false, until: 0, errCount: 0 } }),
+      account({ uid: 'cn', realm: 'cn', state: { credits: 1, disabled: false, until: 0, errCount: 0 } }),
+    ])
+    // 不传区域 → 不做任何区域过滤，仍是积分高者优先
+    expect((await pickQoderAccount(env, pid, new Set()))?.uid).toBe('intl')
+    expect((await pickQoderAccount(env, pid, new Set(), undefined, 'gm51model'))?.uid).toBe('intl')
+  })
+
+  it('qoderAccountServesModel 直判：缺省账号按 cn，undefined 区域恒放行', () => {
+    const intl = account({ realm: 'global' })
+    const cn = account({ realm: 'cn' })
+    expect(qoderAccountServesModel(intl, 'global')).toBe(true)
+    expect(qoderAccountServesModel(intl, 'cn')).toBe(false)
+    expect(qoderAccountServesModel(cn, 'cn')).toBe(true)
+    expect(qoderAccountServesModel(cn, 'global')).toBe(false)
+    // 空区域 = 共享模型，两个账号都放行
+    expect(qoderAccountServesModel(intl, '')).toBe(true)
+    expect(qoderAccountServesModel(cn, undefined)).toBe(true)
+  })
+})
+
+// ===== 项 9：下一轮放量窗口（hub next_checkin_window，qoder_accounts.py:850） =====
+describe('项 9 next_available_at：告诉用户是「今天」还是「明天」的 10:00', () => {
+  it('CST 10:00 之前 → 指向**今天** 10:00', () => {
+    // 2026-10-05 09:00 CST = 01:00Z
+    const w = qoderNextCheckinWindow(Date.parse('2026-10-05T01:00:00Z'))
+    expect(w.at).toBe(Date.parse('2026-10-05T02:00:00Z'))   // 10:00 CST
+    expect(w.label).toBe('10-05 10:00（UTC+8）')
+  })
+
+  it('恰好 10:00 → 指向**明天** 10:00（今天的已放完）', () => {
+    const w = qoderNextCheckinWindow(Date.parse('2026-10-05T02:00:00Z'))
+    expect(w.at).toBe(Date.parse('2026-10-06T02:00:00Z'))
+    expect(w.label).toBe('10-06 10:00（UTC+8）')
+  })
+
+  it('10:00 之后 → 指向明天；边界前后各差一分钟都判对', () => {
+    // 09:59 CST → 今天
+    expect(qoderNextCheckinWindow(Date.parse('2026-10-05T01:59:00Z')).label).toBe('10-05 10:00（UTC+8）')
+    // 10:01 CST → 明天
+    expect(qoderNextCheckinWindow(Date.parse('2026-10-05T02:01:00Z')).label).toBe('10-06 10:00（UTC+8）')
+    // 23:00 CST → 明天
+    expect(qoderNextCheckinWindow(Date.parse('2026-10-05T15:00:00Z')).label).toBe('10-06 10:00（UTC+8）')
+    // 次日 00:30 CST（= 前一天 16:30Z）→ 今天（即 10-06）10:00，不是 10-07
+    expect(qoderNextCheckinWindow(Date.parse('2026-10-05T16:30:00Z')).label).toBe('10-06 10:00（UTC+8）')
+  })
+
+  it('与 qoderDailyRoundOpen 的语义不矛盾：过了 10:00 时前者 true、后者指向明天', () => {
+    const at = Date.parse('2026-10-05T05:00:00Z') // 13:00 CST
+    expect(qoderDailyRoundOpen(at)).toBe(true)                  // 今天这轮已开
+    expect(qoderNextCheckinWindow(at).label).toBe('10-06 10:00（UTC+8）') // 下次是明天
+  })
+
+  it('跨月/跨年边界（日期进位不能算错）', () => {
+    // 2026-10-31 11:00 CST → 11-01
+    expect(qoderNextCheckinWindow(Date.parse('2026-10-31T03:00:00Z')).label).toBe('11-01 10:00（UTC+8）')
+    // 2026-12-31 11:00 CST → 次年 01-01
+    expect(qoderNextCheckinWindow(Date.parse('2026-12-31T03:00:00Z')).label).toBe('01-01 10:00（UTC+8）')
+    // 2026-02-28 11:00 CST → 02-29（2026 非闰年 → 03-01）
+    expect(qoderNextCheckinWindow(Date.parse('2026-02-28T03:00:00Z')).label).toBe('03-01 10:00（UTC+8）')
+  })
+
+  it('**核心**：每条「没领到」的结局都带上下次窗口（含 10:00 前那条最容易漏的分支）', async () => {
+    // 2026-10-09 09:00 CST：轮次未刷新 —— 正是用户点「领兑换码」拿到签到报错的场景
+    const before = Date.UTC(2026, 9, 9, 1, 0, 0)
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify({
+      campaigns: [{
+        campaignId: 'c1', campaignKey: 'daily', actionType: 'CLAIM_BENEFIT',
+        claimStatus: 'CLAIMED', benefit: { kind: 'CREDITS', amount: 100 },
+      }],
+    }), { status: 200 })))
+    const r = await performQoderCheckin('dt-t', 'cn', 'u1', undefined, undefined, { now: before })
+    expect(r.success).toBe(false)
+    expect(r.message).toContain('尚未刷新')
+    expect(r.nextAvailableLabel).toBe('10-09 10:00（UTC+8）')   // 今天，不是明天
+    expect(r.nextAvailableAt).toBe(Math.floor(Date.parse('2026-10-09T02:00:00Z') / 1000))
+  })
+
+  it('无活动（列表为空）这类失败也带下次窗口', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify({ campaigns: [] }), { status: 200 })))
+    const r = await performQoderCheckin('dt-t', 'cn', 'u1', undefined, undefined, { now: Date.UTC(2026, 9, 9, 5, 0, 0) })
+    expect(r.success).toBe(false)
+    expect(r.nextAvailableLabel).toBe('10-10 10:00（UTC+8）')   // 13:00 CST → 明天
+  })
+
+  it('领取成功也带下次窗口（面板常显，不必等到失败才知道）', async () => {
+    // claim 与 campaigns 列表是两个不同 URL，必须分别 stub —— 只回一个 body 会让 claim 解析失败
+    vi.stubGlobal('fetch', vi.fn(async (input: unknown) => {
+      const url = String(input)
+      if (url.endsWith('/sash/api/v1/me/campaigns')) {
+        return new Response(JSON.stringify({
+          campaigns: [{
+            campaignId: 'c1', campaignKey: 'daily', actionType: 'CLAIM_BENEFIT',
+            claimStatus: 'CLAIMABLE', benefit: { kind: 'CREDITS', amount: 100 },
+          }],
+        }), { status: 200 })
+      }
+      if (url.endsWith('/sash/api/v1/me/campaigns/c1/claim')) {
+        return new Response(JSON.stringify({ status: 'CLAIMED', replayed: false, benefit: { kind: 'CREDITS', amount: 100 } }), { status: 200 })
+      }
+      throw new Error(`unexpected url ${url}`)
+    }))
+    const r = await performQoderCheckin('dt-t', 'cn', 'u1', undefined, undefined, { now: Date.UTC(2026, 9, 9, 5, 0, 0) })
+    expect(r.success, JSON.stringify(r)).toBe(true)
+    expect(r.nextAvailableLabel).toBe('10-10 10:00（UTC+8）')
   })
 })

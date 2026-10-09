@@ -667,6 +667,14 @@ export interface CheckinResult {
    */
   campaignCodes?: Array<{ campaign: string; code: string }>
   /**
+   * 下一轮放量时刻（epoch **秒**）与可读文案，如 `10-05 10:00（UTC+8）`。
+   *
+   * 面板提示「10:00 后再试」时用户最需要知道的是**今天还是明天**的 10:00。
+   * 每条「没领到」的结局都会带上（含未刷新 / 名额发完 / 无活动）。
+   */
+  nextAvailableAt?: number
+  nextAvailableLabel?: string
+  /**
    * Pro 升级包（一次性 +1800）领取结果：`ok` = 领取成功（`already` 时表示之前已领过，
    * 此时 **不计入** 本次积分）。
    */

@@ -113,6 +113,54 @@ const CN_MODEL_META: Record<string, QoderModelMeta> = {
 /** 表里没有该 key 时 `max_input_tokens` 的兜底值（hub `or 180000` 同口径）。 */
 export const QODER_DEFAULT_MAX_INPUT_TOKENS = 180000
 
+// ===== 模型 → 独占区域（hub `exclusive_realm`，qoder_proxy.py:146-159） =====
+
+/**
+ * 只在**国际版**出口提供的上游 key / 前缀（hub `qoder_catalog.py:1510-1513`）。
+ *
+ * 前缀项存在的原因：官方会发 `ultimate-1`、`performance-pro` 这类带后缀的变体，
+ * 精确集合盖不住；hub 对 (解析后 key, 原始小写名) 两个候选各查一次精确集合**或**前缀。
+ */
+const INTL_EXCLUSIVE = ['efficient', 'cmodel', 'smodel', 'ultimate', 'performance']
+const INTL_EXCLUSIVE_PREFIXES = ['ultimate', 'performance', 'efficient', 'smodel', 'cmodel']
+
+/** 只在**国内版**出口提供的上游 key / 前缀（hub 同处）。 */
+const CN_EXCLUSIVE = ['q37fmodel', 'gm51model']
+const CN_EXCLUSIVE_PREFIXES = ['q37fmodel', 'gm51model']
+
+/**
+ * 该模型**只**由哪个区域出口提供；两区共享（或未知模型）→ 空串。
+ *
+ * ## 为什么需要它（比「按 realm 过滤账号」更准）
+ *
+ * 池内可以混区（`QoderPoolAccount.realm`）。`gm51model` 是 `CN_EXCLUSIVE` 成员，
+ * 落到国际号上**必然 403**。而目标此前对 403 的分类是 `auth` → `cooldownQoderAccount`
+ * 60 秒（proxy.ts:187-194，非会话失效不永久禁用）——**一个完全健康的账号被一次
+ * 模型/区域错配白冻 60 秒**，且客户端只看到一句 403。
+ *
+ * 只按账号 `realm` 过滤解决不了这个：同区账号也可能不提供该模型。`exclusive_realm`
+ * 是**模型→区域的静态映射**，零上游调用、零成本，正好避开「在选号热路径做同步
+ * `model/list`」的问题（Workers 不宜照搬源方案的运行时目录查询）。
+ *
+ * ## 与源逐条同构
+ *
+ * 源先 `resolve_upstream_key()` 再判独占，并对 `(resolved, 原始小写)` **两个候选**
+ * 各查一次。这里保留「多候选」语义（调用方传 `[上游 key, 原始名]`），但**不做别名解析**
+ * ——别名解析是 `body.ts` 的 `cpaToUpstreamKey` 职责，model-meta 不能反向依赖它
+ * （body.ts 已 import 本模块，反向 import 会成环）。
+ *
+ * 判定顺序也照源：每个候选**先查国际再查国内**，两个集合都命中时返回国际。
+ */
+export function qoderExclusiveRealm(...candidates: Array<string | undefined | null>): QoderMetaRealm | '' {
+  for (const raw of candidates) {
+    const c = String(raw ?? '').trim().toLowerCase()
+    if (!c) continue
+    if (INTL_EXCLUSIVE.includes(c) || INTL_EXCLUSIVE_PREFIXES.some((p) => c.startsWith(p))) return 'global'
+    if (CN_EXCLUSIVE.includes(c) || CN_EXCLUSIVE_PREFIXES.some((p) => c.startsWith(p))) return 'cn'
+  }
+  return ''
+}
+
 /** 按账号域取该 key 的元数据；表里没有 → null（调用方按「未知 key」兜底，不编造能力）。 */
 export function qoderModelMeta(modelKey: string, realm: QoderMetaRealm = 'cn'): QoderModelMeta | null {
   const table = realm === 'global' ? INTL_MODEL_META : CN_MODEL_META

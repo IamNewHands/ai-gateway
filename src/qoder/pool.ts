@@ -21,6 +21,7 @@ import type { Env, OAuthDeviceConfig, OAuthTokenState, PackageInfo, Provider } f
 import { KV_KEYS, OAUTH_TOKEN_REFRESH_MARGIN_MS } from '../config'
 import { readOauthToken } from '../oauth'
 import { CREDIT_EXPIRY_WINDOW_MS, soonestPackageExpiryAt } from '../credit-expiry'
+import { qoderExclusiveRealm, type QoderMetaRealm } from './model-meta'
 import type { QoderAddonGrant } from './grants'
 
 /** 池内账号状态（冷却/禁用/积分/额度包）。 */
@@ -217,6 +218,48 @@ export function resolveQoderPreferUid(headerValue: string | null | undefined, pr
 }
 
 /**
+ * 该账号的域（缺省 cn）。
+ *
+ * 为什么单独一个函数：`acc.realm === 'global' ? 'global' : 'cn'` 这个三元式在
+ * proxy.ts 里已散落 4 处（renderBody 调用点、sendQoderChatOnce 参数、debug 等），
+ * 再加一处区域过滤就会漂移出两套口径。
+ */
+export function qoderAccountRealm(acc: QoderPoolAccount | undefined | null): QoderMetaRealm {
+  return acc?.realm === 'global' ? 'global' : 'cn'
+}
+
+/**
+ * 该账号能否服务**要求某区域**的模型；`requiredRealm` 为空 → true。
+ *
+ * 只解决「模型只在另一区提供」这一种错配：`gm51model` 落到国际号**必然 403**。
+ * 不解决「同区但该账号套餐不含此模型」——那要问上游，不是静态表能答的。
+ *
+ * 为什么收「区域」而不是「模型名」：独占判定的输入必须同时含**上游 key 与原始客户端名**
+ * （`glm-5.2` → `gm51model` 的别名解析在 body.ts），而 pool 不能依赖 body（会成环）。
+ * 故由调用方（proxy.ts，两处名字都在手）用 `qoderExclusiveRealm` 算出区域后传进来，
+ * 本模块只做过滤——模型→区域的**唯一数据源**仍是 model-meta。
+ */
+export function qoderAccountServesModel(
+  acc: QoderPoolAccount | undefined | null,
+  requiredRealm?: QoderMetaRealm | ''
+): boolean {
+  if (!requiredRealm) return true
+  return requiredRealm === qoderAccountRealm(acc)
+}
+
+/**
+ * 池内是否有账号能服务要求该区域的模型。
+ *
+ * 调用方据此把「区域错配」与「全部冷却/禁用」分成两种可读结局：前者是**模型选错**，
+ * 换账号或等待都没用；后者等待即可。混成一句 503「所有账号均不可用」会让用户
+ * 在错误的模型上反复重试（对照 2026-10-09 三个同类缺陷：可区分状态被塌缩成一句话）。
+ */
+export function qoderPoolServesModel(pool: QoderPool, requiredRealm?: QoderMetaRealm | ''): boolean {
+  if (!requiredRealm) return true
+  return pool.some((a) => a.enabled !== false && qoderAccountRealm(a) === requiredRealm)
+}
+
+/**
  * 挑号（两段式，与 trae / workbuddy 池同口径）：
  *  - 指定 preferUid（客户端 X-Qoder-Account 或面板首选账号）且健康 → 直接用它；
  *  - 第二段：**7 天内到期且有剩余**的账号里，到期最早者优先（同到期比积分高低）。
@@ -227,20 +270,28 @@ export function resolveQoderPreferUid(headerValue: string | null | undefined, pr
  *
  * `model` 非空时把**模型级**冷却纳入健康判定（hub `ready(model)`）：某模型被频控的账号
  * 只是在该模型上不可用，仍可服务其它模型。缺省不传 = 只看账号级冷却，既有调用方行为不变。
+ *
+ * 同时按 `requiredRealm` 做**区域**过滤（见 `qoderAccountServesModel`）：区域错配的账号被跳过，
+ * 而不是选中后拿一个必然的 403（那还会白冻该账号 60 秒，见 proxy.ts markQoderAccountClassified）。
+ * 全池都错配时返回 null —— 调用方用 `qoderPoolServesModel` 区分「错配」与「全冷却」。
  */
 export async function pickQoderAccount(
   env: Env,
   providerId: string,
   tried: Set<string>,
   preferUid?: string,
-  model?: string
+  model?: string,
+  requiredRealm?: QoderMetaRealm | ''
 ): Promise<QoderPoolAccount | null> {
   const pool = await readQoderPool(env, providerId)
   const now = Date.now()
+  // 区域错配的账号一律不选（含用户固定账号：固定的是「账号」，而该模型根本不在这个区）
+  const usable = (a: QoderPoolAccount) =>
+    isQoderAccountHealthy(a, now, model) && qoderAccountServesModel(a, requiredRealm)
   // 账号固定：客户端 X-Qoder-Account 指定的账号（uid）若健康则强制使用
   if (preferUid) {
     const pinned = pool.find((a) => a.uid === preferUid)
-    if (pinned && !tried.has(pinned.uid) && isQoderAccountHealthy(pinned, now, model)) return pinned
+    if (pinned && !tried.has(pinned.uid) && usable(pinned)) return pinned
   }
   // 第二段：7 天内到期的积分优先（到期越早越优先，同到期比积分高低）
   let best: QoderPoolAccount | null = null
@@ -248,7 +299,7 @@ export async function pickQoderAccount(
   let bestExpiryCredits = -Infinity
   for (const a of pool) {
     if (tried.has(a.uid)) continue
-    if (!isQoderAccountHealthy(a, now, model)) continue
+    if (!usable(a)) continue
     const exp = soonestQoderExpiryAt(a.state, now)
     if (exp === null) continue
     const credits = a.state?.credits ?? 0
@@ -263,7 +314,7 @@ export async function pickQoderAccount(
   let bestCredits = -Infinity
   for (const a of pool) {
     if (tried.has(a.uid)) continue
-    if (!isQoderAccountHealthy(a, now, model)) continue
+    if (!usable(a)) continue
     const credits = a.state?.credits ?? 0
     if (credits > bestCredits) {
       best = a

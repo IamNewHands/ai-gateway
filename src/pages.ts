@@ -2931,6 +2931,12 @@ function renderQoderPoolAccounts(id, accs, ciByUid, ciAccounts, preferUid) {
         : ' <span class="bd bd-danger">签到失败</span>'
       // 成功时 message 是纯状态文案（如「签到成功」）会与徽章重复，仅失败时展示错误原因
       if (ci.message && !ci.success) ciBadge += ' <span style="color:var(--muted)">' + escapeHtml(ci.message) + '</span>'
+      // 下一轮放量时刻：失败文案里已含「本轮 X 放量后可再试」，但那是长句；这里给一个
+      // 可一眼看到的独立徽章（成功/已签也有值，故不限于失败分支）。
+      // 关键信息是**今天还是明天**的 10:00 —— 只说「10:00 后再试」用户无从判断。
+      if (ci.nextAvailableLabel) {
+        ciBadge += ' <span class="bd bd-off" title="Qoder 每轮 CST 10:00 放量新名额">下轮 ' + escapeHtml(ci.nextAvailableLabel) + '</span>'
+      }
     } else {
       ciBadge = ' <span class="bd bd-off">未签</span>'
     }

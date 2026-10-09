@@ -23,6 +23,8 @@ import {
   seedQoderPoolFromSingle,
   readQoderPool,
   pickQoderAccount,
+  qoderAccountServesModel,
+  qoderPoolServesModel,
   refreshQoderPoolAccountIfNeeded,
   cooldownQoderAccount,
   cooldownQoderAccountModel,
@@ -33,6 +35,7 @@ import {
   resolveQoderCooldown,
   type QoderPoolAccount,
 } from './pool'
+import { qoderExclusiveRealm } from './model-meta'
 import { streamFetchWithTimeout } from '../opencode'
 
 export const QODER_PROVIDER_ID = 'qoder'
@@ -781,6 +784,15 @@ export async function proxyQoderChatRequest(
 ): Promise<Response> {
   const model = (forwardBody.model as string) || 'auto'
   const modelKey = opts?.modelKey || fallbackUnknownModel(cpaToUpstreamKey(stripProviderPrefix(model)))
+  /**
+   * 该模型是否**只**由某一区提供（hub `exclusive_realm`）。
+   *
+   * 必须同时传上游 key 与原始客户端名：别名解析（`glm-5.2` → `gm51model`）在 body.ts，
+   * 而独占表里既有 `gm51model` 这类上游 key、也可能出现客户端原名，两个候选都要查
+   * （源同样对 `(resolved, 原始小写)` 各查一次）。`stripProviderPrefix` 过的裸名更接近
+   * 客户端原名，故一并传入。
+   */
+  const exclusiveRealm = qoderExclusiveRealm(modelKey, model, stripProviderPrefix(model))
   const messages = Array.isArray(forwardBody.messages) ? (forwardBody.messages as any[]) : []
   // 工具历史结构化直传（hub v1.2.6）：默认 auto —— 仅在确实存在工具历史且 id 齐备时启用，
   // 纯对话请求形态与旧版逐字节一致。`QODER_STRUCTURED_TOOL_HISTORY=off` 可一键回退。
@@ -812,11 +824,11 @@ export async function proxyQoderChatRequest(
 
   // 池路径：兼容迁移（池空时把单 token 种子进池），然后挑号轮转
   try { await seedQoderPoolFromSingle(env, provider.id) } catch { /* ignore */ }
-  let poolLen = 0
+  let pool: QoderPoolAccount[] = []
   try {
-    const pool = await readQoderPool(env, provider.id)
-    poolLen = pool.length
+    pool = await readQoderPool(env, provider.id)
   } catch { /* ignore */ }
+  const poolLen = pool.length
 
   if (poolLen > 0) {
     const tried = new Set<string>()
@@ -827,7 +839,8 @@ export async function proxyQoderChatRequest(
       try {
         // 账号固定：首轮优先用 X-Qoder-Account 指定的 uid，之后自动挑号轮转。
         // 传 model：模型级冷却的账号在该模型上被跳过，但在其它模型上仍可服务。
-        account = await pickQoderAccount(env, provider.id, tried, i === 0 ? opts?.preferUid : undefined, model)
+        // 传 exclusiveRealm：区域错配的账号直接跳过（避免一次必然的 403 + 白冻 60 秒）。
+        account = await pickQoderAccount(env, provider.id, tried, i === 0 ? opts?.preferUid : undefined, model, exclusiveRealm)
       } catch { /* ignore */ }
       if (!account) break
       tried.add(account.uid)
@@ -876,7 +889,25 @@ export async function proxyQoderChatRequest(
       // 全部账号失败：把最后一个（或最有代表性的）错误返回给客户端
       return classifiedErrorResponse(lastErr)
     }
-    // 无健康账号可用（全冷却/禁用）
+    // 无健康账号可用：先区分「区域错配」与「全冷却/禁用」——前者换号或等待都无用，
+    // 必须说清是**模型选错**，否则用户会在一个本区不提供的模型上反复重试
+    // （对照 2026-10-09 三个同类缺陷：可区分状态被塌缩成一句话）。
+    if (!qoderPoolServesModel(pool, exclusiveRealm)) {
+      const served = exclusiveRealm === 'global' ? '国际版' : '国内版'
+      return new Response(
+        JSON.stringify({
+          error: {
+            message:
+              `模型 ${model} 只在${served}提供（上游 key ${modelKey}），但账号池里没有${served}账号。` +
+              `请改用本区提供的模型，或登录一个${served}账号。`,
+            type: 'invalid_request_error',
+            code: 'model_realm_mismatch',
+            kind: 'model_realm_mismatch',
+          },
+        }),
+        { status: 400, headers: { 'Content-Type': 'application/json; charset=utf-8' } }
+      )
+    }
     return new Response(
       JSON.stringify({
         error: {
@@ -898,6 +929,24 @@ export async function proxyQoderChatRequest(
         error: { message: 'OAuth 未连接或 Token 已失效，请在管理后台重新授权', type: 'oauth_not_connected' },
       }),
       { status: 502, headers: { 'Content-Type': 'application/json; charset=utf-8' } }
+    )
+  }
+  // 单 token 路径也要过区域闸门：这里只有一个账号，错配时发出去必然 403，
+  // 不如直接说清是模型选错（与池路径同一判定，避免两条路各有一套行为）。
+  if (!qoderAccountServesModel({ realm: data.realm } as QoderPoolAccount, exclusiveRealm)) {
+    const served = exclusiveRealm === 'global' ? '国际版' : '国内版'
+    return new Response(
+      JSON.stringify({
+        error: {
+          message:
+            `模型 ${model} 只在${served}提供（上游 key ${modelKey}），但当前登录的是` +
+            `${data.realm === 'global' ? '国际版' : '国内版'}账号。请改用本区提供的模型，或登录一个${served}账号。`,
+          type: 'invalid_request_error',
+          code: 'model_realm_mismatch',
+          kind: 'model_realm_mismatch',
+        },
+      }),
+      { status: 400, headers: { 'Content-Type': 'application/json; charset=utf-8' } }
     )
   }
   const r = await sendQoderChatOnce(data.session, renderBody(data.realm), modelKey, model, wantStream, undefined, data.realm)

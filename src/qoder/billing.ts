@@ -93,6 +93,40 @@ export function qoderDailyRoundOpen(nowMs: number): boolean {
   return new Date(nowMs + 8 * 60 * 60 * 1000).getUTCHours() >= 10
 }
 
+/** 下一轮放量的时刻（epoch ms）与可读文案（CST 展示）。 */
+export interface QoderNextWindow {
+  /** 下一轮开始时刻（epoch ms） */
+  at: number
+  /** 可读文案，如 `10-05 10:00（UTC+8）`（hub `next_checkin_window()` 同款格式） */
+  label: string
+}
+
+/**
+ * 下一轮放量窗口（hub `next_checkin_window()`，qoder_accounts.py:850）。
+ *
+ * 边界规则（与 `qoderDailyRoundOpen` **共用同一个 10:00 定义**，两处不能各写一份）：
+ *   - 今天 10:00 **之前** → 今天 10:00（本轮还没开始，等今天的）；
+ *   - 已到达/晚于 10:00 → 明天 10:00（今天的已放完，等明天的）。
+ *
+ * 注意与 `qoderDailyRoundOpen` 的语义差异：那个回答「今天这轮开了没」，
+ * 这个回答「下次什么时候开」——已过 10:00 时前者为 true、后者指向明天，两者都对。
+ *
+ * 纯函数、显式收 now（不读 Date.now），便于单测固定时刻。
+ */
+export function qoderNextCheckinWindow(nowMs: number): QoderNextWindow {
+  const CST = 8 * 60 * 60 * 1000
+  const cst = new Date(nowMs + CST)
+  // 用 UTC getter 读「加了 8 小时」的时刻，等价于读 CST 的日历字段（与 qoderDailyRoundOpen 同法）
+  const y = cst.getUTCFullYear()
+  const mo = cst.getUTCMonth()
+  const d = cst.getUTCDate()
+  const todayOpen = Date.UTC(y, mo, d, 10, 0, 0) - CST
+  const at = nowMs < todayOpen ? todayOpen : todayOpen + 24 * 60 * 60 * 1000
+  const l = new Date(at + CST)
+  const pad = (n: number) => String(n).padStart(2, '0')
+  return { at, label: `${pad(l.getUTCMonth() + 1)}-${pad(l.getUTCDate())} ${pad(l.getUTCHours())}:00（UTC+8）` }
+}
+
 /** 统一认证头（billing 端点用明文 Bearer，不需要 COSY）。 */
 function billingHeaders(token: string): Record<string, string> {
   return {
@@ -393,6 +427,17 @@ export interface QoderCheckinOutcome {
    */
   rewardExpiresAt?: number
   /**
+   * 下一轮放量时刻（epoch **秒**，与上游 `nextClaimAt` 同单位，便于面板统一格式化）。
+   *
+   * 为什么要有：面板只能提示「10:00 后再试」这句话，用户仍不知道**是今天还是明天**的
+   * 10:00。hub 无论是否领到都给出该值（`campaign_checkin` docstring），且有两个来源
+   * ——上游 `nextClaimAt` 字段 + 本地按 CST 10:00 自算窗口（`next_checkin_window()`），
+   * 互为兜底。这里同样两路都留：优先取上游给的，缺失才自算。
+   */
+  nextAvailableAt?: number
+  /** `nextAvailableAt` 的可读文案（如 `10-05 10:00（UTC+8）`），便于直接展示。 */
+  nextAvailableLabel?: string
+  /**
    * 诊断详情（供签到日志落盘；**绝不含 token 原文**）。
    *
    * 为什么必须带出来：线上出现「提示签到成功但积分没增加」，而面板只显示一句
@@ -590,6 +635,14 @@ export async function performQoderCheckin(
   // 轮次是否已滚动到「今天这一轮」：未滚动时，列表里的 CLAIMED 是上一轮残留，
   // 不能当作「今日已领」的证据。
   const roundOpen = qoderDailyRoundOpen(nowMs)
+  /**
+   * 下一轮放量窗口。**无论是否领到都给**（hub `campaign_checkin` docstring 同口径）：
+   * 用户看到「10:00 后再试」时最需要知道的正是「今天还是明天」。
+   * 上游 `nextClaimAt` 更权威，但它只在 legacy status 里有、campaigns 列表不带，
+   * 故这里以本地按 CST 10:00 自算的窗口为准（两路互为兜底，见 QoderCheckinOutcome 注释）。
+   */
+  const nextWin = qoderNextCheckinWindow(nowMs)
+  const nextFields = { nextAvailableAt: Math.floor(nextWin.at / 1000), nextAvailableLabel: nextWin.label }
 
   /**
    * 领券（含逐条码回传与同人去重冷却回报）。
@@ -676,6 +729,8 @@ export async function performQoderCheckin(
     const couponSuffix = couponRes.notes.length > 0 ? `；券类福利：${couponRes.notes.join('；')}` : ''
     const withCoupons = (out: QoderCheckinOutcome): QoderCheckinOutcome => ({
       ...out,
+      // 每条「没领到」的分支都要带上下次窗口：这正是用户最需要它的时刻
+      ...nextFields,
       message: out.message + couponSuffix,
       couponCodes: couponRes.codes.length > 0 ? couponRes.codes : undefined,
       couponBlocked: couponRes.blocked.length > 0 ? couponRes.blocked : undefined,
@@ -736,7 +791,8 @@ export async function performQoderCheckin(
           success: false,
           message:
             `每日签到活动尚未刷新（Qoder 每轮 CST 10:00 放量）：列表里的已领取记录` +
-            `${keys ? `（${keys}）` : ''}属于上一轮，不能证明今天已领。请在 10:00 后重试。`,
+            `${keys ? `（${keys}）` : ''}属于上一轮，不能证明今天已领。` +
+            `本轮 ${nextWin.label} 放量后可再试。`,
           debug: dbg,
         })
       }
@@ -771,10 +827,12 @@ export async function performQoderCheckin(
     })
   }
   const campaignId = target.campaignId
-  if (!campaignId) return { success: false, message: '签到活动缺少 campaignId', debug: dbg }
+  if (!campaignId) return { success: false, message: '签到活动缺少 campaignId', debug: dbg, ...nextFields }
 
   const claimed = await claimQoderCampaign(token, realm, s, device, campaignId, target.campaignKey, dbg)
-  if (claimed.outcome) return claimed.outcome
+  // 领取失败/已领/名额发完等结局同样带上下次窗口：这些恰恰是最需要它的分支。
+  // claimQoderCampaign 拿不到 nextWin（纯函数只依赖 now），故在这一层补。
+  if (claimed.outcome) return { ...claimed.outcome, ...nextFields }
 
   const amount = claimed.amount
   // 券类活动一并领取（仅在调用方显式要求时；见 includeCoupons 说明）。
@@ -797,6 +855,7 @@ export async function performQoderCheckin(
     confirming: claimed.confirming || undefined,
     // claim 响应的 expiresAt 是 ISO 串（如 "2026-11-01T10:52:18.531379Z"，= 领取时刻 + 30 天）
     rewardExpiresAt: parseCstWallClock(claimed.expiresAt) ?? undefined,
+    ...nextFields,
     debug: dbg,
   }
 }

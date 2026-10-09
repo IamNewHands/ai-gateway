@@ -364,6 +364,9 @@ async function checkinQoderPoolAccount(
   })
   base.success = res.success
   base.message = res.message
+  // 下一轮放量窗口：无论成败都带出（面板提示「10:00 后再试」时用户要知道是今天还是明天）
+  if (typeof res.nextAvailableAt === 'number') base.nextAvailableAt = res.nextAvailableAt
+  if (res.nextAvailableLabel) base.nextAvailableLabel = res.nextAvailableLabel
   // already = 今日已领取（replayed / 列表 CLAIMED），与「本次新领」区分开：
   // 面板按 reason 聚合「成功/已签」，混在一起会让当日实际领取数虚高。
   //
