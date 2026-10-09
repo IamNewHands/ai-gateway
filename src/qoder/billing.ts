@@ -487,6 +487,13 @@ export function qoderCouponKindLabel(kind: unknown): string {
  * 为什么默认不领（与源 `run_checkin(only_daily=True)` 同口径，qoder_tasks.py:635）：
  * 「每日签到」按钮的语义是领积分；券类福利涉及不可恢复资产，应由用户显式触发
  * （面板「领取福利/兑换码」入口传 true），而不是每天自动替他领掉。
+ *
+ * `opts.couponsOnly`（缺省 false）：**只领券、完全不碰每日签到判定**。
+ *
+ * 为什么必须单独一个模式（2026-10-09 实测缺陷）：每日签到在「本轮未刷新」（CST 10:00 前）
+ * 时会**提前 return**（`!target` 分支），而券类领取写在那个 return 之后 —— 于是 10:00 前点
+ * 「领兑换码」拿到的是**每日签到的报错**（「签到活动尚未刷新，请在 10:00 后重试」），
+ * 券类那段代码根本没被执行。券类与每日活动是**互相独立**的两件事，不能共用一个前置判定。
  */
 export async function performQoderCheckin(
   token: string,
@@ -494,9 +501,11 @@ export async function performQoderCheckin(
   uid = '',
   sess?: CosySession,
   device?: QoderDeviceIdentity,
-  opts?: { includeCoupons?: boolean }
+  opts?: { includeCoupons?: boolean; couponsOnly?: boolean }
 ): Promise<QoderCheckinOutcome> {
-  const includeCoupons = opts?.includeCoupons === true
+  const couponsOnly = opts?.couponsOnly === true
+  // couponsOnly 隐含 includeCoupons：只领券的调用方显然要券
+  const includeCoupons = opts?.includeCoupons === true || couponsOnly
   const s = await checkinSession(token, uid, sess)
   let res: Response
   try {
@@ -577,19 +586,112 @@ export async function performQoderCheckin(
   // 不能当作「今日已领」的证据。
   const roundOpen = qoderDailyRoundOpen(Date.now())
 
+  /**
+   * 领券（含逐条码回传与同人去重冷却回报）。
+   *
+   * 抽成闭包的原因（2026-10-09 实测缺陷）：券类领取原先只写在「每日签到成功」那条路径的
+   * 末尾，而每日签到有多条**提前 return**（未刷新 / 名额发完 / 无活动）。10:00 前点
+   * 「领兑换码」拿到的就是每日签到的报错，券类那段代码压根没执行。
+   * 券类与每日签到是**互相独立**的两件事，必须在所有分支上都能走到。
+   */
+  const claimCoupons = async () => {
+    const notes: string[] = []
+    const codes: Array<{ campaignId: string; campaign: string; code: string }> = []
+    const blocked: string[] = []
+    /** 真正失败的条目数（同人去重与「发放确认中」都不算失败） */
+    let failed = 0
+    if (!includeCoupons || coupons.length === 0) return { notes, codes, blocked, failed }
+    for (const c of coupons) {
+      const cid = c.campaignId
+      if (!cid) continue
+      const label = c.campaignKey || cid
+      const kindLabel = qoderCouponKindLabel(c.benefit?.kind)
+      const r = await claimQoderCampaign(token, realm, s, device, cid, label, dbg)
+      if (r.outcome?.blocked) {
+        blocked.push(cid)
+        notes.push(`${label}（${kindLabel}）：同人已领取，本轮跳过`)
+        continue
+      }
+      if (r.outcome && !r.outcome.success) {
+        failed++
+        notes.push(`${label}（${kindLabel}）：${r.outcome.message}`)
+        continue
+      }
+      if (r.code) {
+        // 码只回一次：回传给调用方落盘（KV），并在 message 里明示，避免用户以为没领到
+        codes.push({ campaignId: cid, campaign: label, code: r.code })
+        notes.push(`${label}（${kindLabel}）：兑换码 ${r.code}`)
+      } else if (r.confirming) {
+        notes.push(`${label}（${kindLabel}）：已领取，兑换码发放确认中`)
+      } else {
+        notes.push(`${label}（${kindLabel}）：已领取`)
+      }
+    }
+    return { notes, codes, blocked, failed }
+  }
+
+  /**
+   * 券类结果的统一出口（只领券模式下，它就是整个操作的结果）。
+   *
+   * `success` 用**显式失败计数**判定，不靠文案匹配：只有「一条都没成功且确实有失败」
+   * 才算失败（部分成功也如实算成功，并把失败项写在 message 里）。
+   */
+  const couponOutcome = (r: Awaited<ReturnType<typeof claimCoupons>>, fallbackMessage: string): QoderCheckinOutcome => {
+    const attempted = r.notes.length + r.blocked.length
+    return {
+      success: !(r.failed > 0 && attempted === r.failed),
+      message: r.notes.length > 0 ? `券类福利：${r.notes.join('；')}` : fallbackMessage,
+      couponCodes: r.codes.length > 0 ? r.codes : undefined,
+      couponBlocked: r.blocked.length > 0 ? r.blocked : undefined,
+      redemptionCode: r.codes[0]?.code,
+      debug: dbg,
+    }
+  }
+
+  // 只领券模式：完全不参与每日签到判定（它有自己的前置条件，与本操作无关）
+  if (couponsOnly) {
+    if (coupons.length === 0) {
+      return {
+        success: true,
+        already: true,
+        message: raw.length === 0
+          ? '当前没有可领取的活动（活动列表为空）'
+          : '当前没有可领取的兑换码/券类活动（可能已领过，或本轮未开放）',
+        debug: dbg,
+      }
+    }
+    return couponOutcome(await claimCoupons(), '当前没有可领取的兑换码/券类活动')
+  }
+
   if (!target) {
+    // 每日签到本身没有可领项 —— 但**券类仍然要领**（若调用方要求）。
+    // 2026-10-09 实测缺陷：旧实现直接 return，于是 10:00 前点「领兑换码」拿到的
+    // 是每日签到的报错，券类那段代码根本没执行。两者是独立的事，不能共用一个前置判定。
+    const couponRes = await claimCoupons()
+    const couponSuffix = couponRes.notes.length > 0 ? `；券类福利：${couponRes.notes.join('；')}` : ''
+    const withCoupons = (out: QoderCheckinOutcome): QoderCheckinOutcome => ({
+      ...out,
+      message: out.message + couponSuffix,
+      couponCodes: couponRes.codes.length > 0 ? couponRes.codes : undefined,
+      couponBlocked: couponRes.blocked.length > 0 ? couponRes.blocked : undefined,
+      redemptionCode: couponRes.codes[0]?.code,
+      // 每日签到没领到、但券领到了：整体仍算成功（券是独立收益），否则面板会报「失败」
+      // 而用户明明拿到了码 —— 那正是「码只回一次却显示失败」的误导。
+      success: out.success || couponRes.codes.length > 0,
+    })
+
     // 区分两种「没活动」：真的没有活动 vs 服务端把本客户端判定为非官方身份而过滤掉全部活动。
     // hub qoder_accounts.py:929-1005 用 showCampaign 标记这一点，并靠刷新机器身份重试；
     // 不区分就会把「身份被过滤」误报成「今天没活动」，让人以为签到正常。
     const showCampaign = list.showCampaign
     if (showCampaign === false) {
-      return {
+      return withCoupons({
         success: false,
         message:
           '活动列表被上游按机器身份过滤（showCampaign=false）：服务端未认可本客户端的设备身份，' +
           '故「每日领取 Credits」等设备定向活动未下发。这不是「今天没有活动」。',
         debug: dbg,
-      }
+      })
     }
 
     const formatNotClaimable = (items: QoderCampaign[]) => items
@@ -612,11 +714,11 @@ export async function performQoderCheckin(
       const outOfStockItems = notClaimable.filter((c) => String(c.unavailableReason || '').toUpperCase() === 'REDEMPTION_CODE_OUT_OF_STOCK')
       const hasClaimedCredits = alreadyClaimedList.some((c) => (c.benefit?.amount || 0) > 0)
       if (!hasClaimedCredits && outOfStockItems.length > 0) {
-        return {
+        return withCoupons({
           success: false,
           message: `签到活动名额已发完（${formatNotClaimable(outOfStockItems)}）`,
           debug: dbg,
-        }
+        })
       }
 
       const keys = alreadyClaimedList.map((c) => c.campaignKey || c.campaignId).filter(Boolean).join('、')
@@ -625,43 +727,43 @@ export async function performQoderCheckin(
       // 若照旧报 already，就会重演「自动签到假成功、积分一整天不落账」——宁可如实
       // 报「本轮未刷新、10:00 后重试」，也不要给一个会误导人的绿勾。
       if (!roundOpen) {
-        return {
+        return withCoupons({
           success: false,
           message:
             `每日签到活动尚未刷新（Qoder 每轮 CST 10:00 放量）：列表里的已领取记录` +
             `${keys ? `（${keys}）` : ''}属于上一轮，不能证明今天已领。请在 10:00 后重试。`,
           debug: dbg,
-        }
+        })
       }
 
       let msg = keys ? `今日已领取（${keys}）` : '今日已领取'
       if (notClaimable.length > 0) {
         msg += `；另有活动暂不可领：${formatNotClaimable(notClaimable)}`
       }
-      return {
+      return withCoupons({
         success: true,
         already: true,
         message: msg,
         campaignKey: alreadyClaimedList[0]?.campaignKey,
         debug: dbg,
-      }
+      })
     }
 
     // 有活动但都不可领：把上游原因码如实带出来（hub qoder_accounts.py:1145-1148 同样分类：
     // REDEMPTION_CODE_OUT_OF_STOCK=名额发完、ACHIEVEMENT_NOT_COMPLETED=需先完成新人任务）。
     // 全部塌缩成一句「没有 CLAIMABLE 的 CLAIM_BENEFIT」会让人无从判断下一步。
     if (notClaimable.length > 0) {
-      return {
+      return withCoupons({
         success: false,
         message: `签到活动暂不可领取（共 ${raw.length} 个活动，${notClaimable.length} 个奖励类活动均不可领）—— ${formatNotClaimable(notClaimable)}`,
         debug: dbg,
-      }
+      })
     }
-    return {
+    return withCoupons({
       success: false,
       message: `无可用签到活动（${raw.length} 个活动里没有可领取的 Credits 奖励活动）`,
       debug: dbg,
-    }
+    })
   }
   const campaignId = target.campaignId
   if (!campaignId) return { success: false, message: '签到活动缺少 campaignId', debug: dbg }
@@ -670,43 +772,13 @@ export async function performQoderCheckin(
   if (claimed.outcome) return claimed.outcome
 
   const amount = claimed.amount
-  // 券类活动一并领取（仅在调用方显式要求时；见 includeCoupons 说明）
-  const couponNotes: string[] = []
-  /** 券类活动领到的码：按 campaignId 记，供调用方逐条落盘 */
-  const couponCodes: Array<{ campaignId: string; campaign: string; code: string }> = []
-  /** 本次被服务端按人判重的券类活动：调用方据此记 6h 冷却，避免每轮重复 POST */
-  const couponBlocked: string[] = []
-  if (includeCoupons && coupons.length > 0) {
-    for (const c of coupons) {
-      const cid = c.campaignId
-      if (!cid) continue
-      const label = c.campaignKey || cid
-      const r = await claimQoderCampaign(token, realm, s, device, cid, label, dbg)
-      const kindLabel = qoderCouponKindLabel(c.benefit?.kind)
-      if (r.outcome?.blocked) {
-        couponBlocked.push(cid)
-        couponNotes.push(`${label}（${kindLabel}）：同人已领取，本轮跳过`)
-        continue
-      }
-      if (r.outcome && !r.outcome.success) {
-        couponNotes.push(`${label}（${kindLabel}）：${r.outcome.message}`)
-        continue
-      }
-      if (r.code) {
-        // 码只回一次：回传给调用方落盘（KV），并在 message 里明示，避免用户以为没领到
-        couponCodes.push({ campaignId: cid, campaign: label, code: r.code })
-        couponNotes.push(`${label}（${kindLabel}）：兑换码 ${r.code}`)
-      } else if (r.confirming) {
-        couponNotes.push(`${label}（${kindLabel}）：已领取，兑换码发放确认中`)
-      } else {
-        couponNotes.push(`${label}（${kindLabel}）：已领取`)
-      }
-    }
-  }
+  // 券类活动一并领取（仅在调用方显式要求时；见 includeCoupons 说明）。
+  // 走 claimCoupons 闭包：与「只领券」模式共用同一段实现，避免两处漂移。
+  const couponRes = await claimCoupons()
 
   let message = amount ? `领取成功 +${amount} ${target.campaignKey || ''}`.trim() : '签到成功'
   if (claimed.code) message += `，兑换码：${claimed.code}`
-  if (couponNotes.length > 0) message += `；福利：${couponNotes.join('；')}`
+  if (couponRes.notes.length > 0) message += `；福利：${couponRes.notes.join('；')}`
   return {
     success: true,
     message,
@@ -714,9 +786,9 @@ export async function performQoderCheckin(
     campaignKey: target.campaignKey,
     campaignId,
     // 积分活动本身也可能带码（券类活动的积分变体），一并带出
-    redemptionCode: claimed.code || couponCodes[0]?.code,
-    couponCodes: couponCodes.length > 0 ? couponCodes : undefined,
-    couponBlocked: couponBlocked.length > 0 ? couponBlocked : undefined,
+    redemptionCode: claimed.code || couponRes.codes[0]?.code,
+    couponCodes: couponRes.codes.length > 0 ? couponRes.codes : undefined,
+    couponBlocked: couponRes.blocked.length > 0 ? couponRes.blocked : undefined,
     confirming: claimed.confirming || undefined,
     // claim 响应的 expiresAt 是 ISO 串（如 "2026-11-01T10:52:18.531379Z"，= 领取时刻 + 30 天）
     rewardExpiresAt: parseCstWallClock(claimed.expiresAt) ?? undefined,

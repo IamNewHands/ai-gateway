@@ -261,16 +261,17 @@ async function fillQoderCredits(
  *
  * `opts.includeCoupons`（缺省 false）：是否**同时领取券类活动**（兑换码/券）。
  *
- * 为什么默认不领：每日签到的语义是领积分；券类涉及不可恢复资产（码只回一次），
- * 应由用户显式触发（面板「领取福利/兑换码」入口传 true），而不是每天自动替他领掉
- * （与源 `run_checkin(only_daily=True)` 同口径，qoder_tasks.py:635）。
+ * `opts.couponsOnly`（缺省 false）：**只领券**，完全不参与每日签到判定。
+ * 面板「领兑换码」按钮走这条 —— 它与「今天是否已签到 / 本轮是否刷新」都无关
+ * （见 billing.performQoderCheckin 的同名字段说明与 2026-10-09 实测缺陷）。
  */
 async function checkinQoderPoolAccount(
   env: Env,
   provider: Provider,
   account: QoderPoolAccount,
-  opts?: { includeCoupons?: boolean }
+  opts?: { includeCoupons?: boolean; couponsOnly?: boolean }
 ): Promise<CheckinResult> {
+  const couponsOnly = opts?.couponsOnly === true
   const now = Date.now()
   // 账号域：签到端点与 legacy 能力都按域区分（国际版 legacy 接口不存在）
   const realm = normalizeQoderRealm(account.realm)
@@ -333,7 +334,10 @@ async function checkinQoderPoolAccount(
     base.streakDays = status.streakDays
     base.totalCredits = status.totalCredits
     base.dailyCredit = status.dailyCredit
-    if (status.todayCheckedIn) {
+    // 只领券模式**不能**在这里早退：本模式与「今天是否已签到」无关
+    // （2026-10-09 实测缺陷：旧实现让「领兑换码」复用签到流程，于是已签到的账号
+    //  点它只会得到「今日已签到」，券类那段代码永远走不到）。
+    if (status.todayCheckedIn && !couponsOnly) {
       base.success = true
       base.reason = 'already'
       base.message = '今日已签到'
@@ -356,14 +360,22 @@ async function checkinQoderPoolAccount(
   const device = await getQoderDevice(env)
   const res = await performQoderCheckin(token, realm, account.uid, undefined, device, {
     includeCoupons: opts?.includeCoupons === true,
+    couponsOnly,
   })
   base.success = res.success
   base.message = res.message
   // already = 今日已领取（replayed / 列表 CLAIMED），与「本次新领」区分开：
   // 面板按 reason 聚合「成功/已签」，混在一起会让当日实际领取数虚高。
-  base.reason = res.success ? (res.already ? 'already' : 'ok') : 'fail'
-  base.lastCheckinAt = Date.now()
-  if (res.success) base.todayCheckedIn = true
+  //
+  // 只领券模式不参与签到口径：它的成功只表示「券的结果已拿到」，既不是「签到成功」也不是
+  // 「今日已签」。沿用 ok/already 会让面板的签到 KPI 把一次领券算成当天签到过。
+  base.reason = couponsOnly ? 'ok' : (res.success ? (res.already ? 'already' : 'ok') : 'fail')
+  // 只领券不写 lastCheckinAt / todayCheckedIn：那两个字段的语义是「每日签到」，
+  // 被领券操作污染后，面板会显示「今日已签」而用户当天其实没签到。
+  if (!couponsOnly) {
+    base.lastCheckinAt = Date.now()
+    if (res.success) base.todayCheckedIn = true
+  }
   if (!res.already && typeof res.rewardCredits === 'number' && res.rewardCredits > 0) {
     base.checkinCredit = res.rewardCredits
   }
@@ -469,9 +481,10 @@ async function syncQoderPoolCredits(
 async function checkinQoderPoolAccounts(
   env: Env,
   provider: Provider,
-  opts?: { includeCoupons?: boolean }
+  opts?: { includeCoupons?: boolean; couponsOnly?: boolean }
 ): Promise<CheckinResult> {
   const includeCoupons = opts?.includeCoupons === true
+  const couponsOnly = opts?.couponsOnly === true
   const now = Date.now()
   const base: CheckinResult = {
     providerId: provider.id,
@@ -496,7 +509,7 @@ async function checkinQoderPoolAccounts(
   let success = 0, already = 0, fail = 0, skipped = 0
   for (const acc of pool) {
     try {
-      const r = await checkinQoderPoolAccount(env, provider, acc, { includeCoupons })
+      const r = await checkinQoderPoolAccount(env, provider, acc, { includeCoupons, couponsOnly })
       accounts.push(r)
       if (r.success) {
         if (r.reason === 'already') already++
@@ -518,6 +531,20 @@ async function checkinQoderPoolAccounts(
   }
 
   base.accounts = accounts
+  // 只领券模式**不写签到结果 KV**：那份 KV 是面板「今日签到 KPI / 每账号签到徽章」的
+  // 数据源（readCheckinResult）。用它承载一次领券操作，会把 KPI 从真实签到状态改成
+  // 「券的结果」——用户当天没签到却看到绿色徽章，正是要避免的误导。
+  // 券的结果由接口响应直接回给面板（含码），并已落进池状态 campaignCodes。
+  if (couponsOnly) {
+    const codes = accounts.flatMap((a) => a.campaignCodes || [])
+    base.success = codes.length > 0 || accounts.some((a) => a.success)
+    base.reason = base.success ? 'ok' : 'fail'
+    base.message = codes.length > 0
+      ? `共 ${accounts.length} 个账号：领到 ${codes.length} 个兑换码`
+      : `共 ${accounts.length} 个账号：无可领取的券类福利`
+    base.campaignCodes = codes.length > 0 ? codes : undefined
+    return base
+  }
   base.todayCheckedIn = accounts.some((a) => a.todayCheckedIn)
   base.success = success > 0 || already > 0
   base.reason = success > 0 ? 'ok' : (already > 0 ? 'already' : (fail > 0 ? 'fail' : 'skipped_no_token'))
@@ -887,11 +914,12 @@ async function checkinOauthPoolAccounts(
  * cron 后台路径保持缺省（false）。
  * opts.includeCoupons：Qoder 专用——同时领取券类活动（兑换码/券），缺省 false（见
  * checkinQoderPoolAccount 的说明）。
+ * opts.couponsOnly：Qoder 专用——**只领券**，不参与每日签到判定（面板「领兑换码」按钮）。
  */
 export async function checkinOneAccount(
   env: Env,
   provider: Provider,
-  opts?: { interactive?: boolean; includeCoupons?: boolean }
+  opts?: { interactive?: boolean; includeCoupons?: boolean; couponsOnly?: boolean }
 ): Promise<CheckinResult> {
   // WorkBuddy 多账号池：browser 登录流提供商遍历池内所有账号各自签到，返回带 accounts 的汇总结果
   if (isOAuthPoolProvider(provider)) {
@@ -1569,7 +1597,11 @@ export async function handleOAuthProClaim(c: Context<{ Bindings: Env }>) {
  *
  * 与「立即签到」分开的**唯一理由**：券类是**不可恢复资产**（码只回一次），
  * 必须由用户显式触发并当场看到码，而不是被每日自动签到替他领掉。
- * 走的是同一条 campaigns 领取管线（`includeCoupons: true`），只是不领积分活动之外的东西。
+ *
+ * 走 `couponsOnly: true`（**不是** `includeCoupons`）：后者会先跑每日签到判定，
+ * 于是 10:00 前或今日已签到时，用户点「领兑换码」拿到的会是每日签到的报错/「已签到」，
+ * 券类那段代码根本执行不到（2026-10-09 实测缺陷）。券类与每日签到互相独立，
+ * 必须完全不经过签到的前置判定。
  */
 export async function handleOAuthCouponClaim(c: Context<{ Bindings: Env }>) {
   const id = c.req.param('id')?.trim()
@@ -1577,8 +1609,8 @@ export async function handleOAuthCouponClaim(c: Context<{ Bindings: Env }>) {
   const p = providers.find((x) => x.id === id)
   if (!p) return c.json<ApiResponse>({ success: false, message: '提供商不存在' }, 404)
   if (!isQoderFlow(p)) return c.json<ApiResponse>({ success: false, message: '该提供商不是 QoderWork' }, 400)
-  // interactive: true（用户等待）+ includeCoupons: true（本次显式领券）
-  const result = await checkinOneAccount(c.env, p, { interactive: true, includeCoupons: true })
+  // interactive: true（用户等待）+ couponsOnly: true（本次只领券，不碰每日签到）
+  const result = await checkinOneAccount(c.env, p, { interactive: true, couponsOnly: true })
   try {
     await writeLog(c.env, 'info', `[qoder-coupons] ${p.name} → ${result.reason}`, JSON.stringify(result).substring(0, 4000))
   } catch { /* 日志失败不影响结果 */ }

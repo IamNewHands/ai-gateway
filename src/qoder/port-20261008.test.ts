@@ -343,6 +343,95 @@ describe('P2 兑换码：券类活动领取 + 码持久化（hub qoder_accounts.
     // 未记录的活动不受影响
     expect(isQoderCampaignBlocked(st, 'other', now)).toBe(false)
   })
+
+  /**
+   * 2026-10-09 实测缺陷：点「领兑换码」拿到的是**每日签到的报错**。
+   *
+   * 根因：券类领取原先写在「每日签到成功」那条路径的末尾，而每日签到有多条提前 return
+   * （本轮未刷新 / 今日已领 / 名额发完 / 无活动）。10:00 前或今日已签到时，用户点「领兑换码」
+   * 得到的全是签到的前置判定结论，券类那段代码根本没执行。
+   *
+   * 券类与每日签到是**互相独立**的两件事，必须用 couponsOnly 完全绕开签到判定。
+   */
+  it('couponsOnly：本轮未刷新（10:00 前）**仍然领券**，不被签到前置判定挡住', async () => {
+    // 构造「只有 CLAIMED 的每日活动 + 一个 CLAIMABLE 的券」= 用户实测的 10:00 前形态
+    vi.stubGlobal('fetch', vi.fn(async (input: unknown) => {
+      const url = String(input)
+      if (url.endsWith('/campaigns')) {
+        return new Response(JSON.stringify({
+          campaigns: [
+            { campaignId: 'daily-old', campaignKey: 'act-20260930-660', actionType: 'CLAIM_BENEFIT', claimStatus: 'CLAIMED', benefit: { kind: 'CREDITS', amount: 100 } },
+            { campaignId: 'coupon-9', campaignKey: 'coupon-9', actionType: 'CLAIM_BENEFIT', claimStatus: 'CLAIMABLE', benefit: { kind: 'REDEMPTION_CODE' } },
+          ],
+        }), { status: 200 })
+      }
+      if (url.includes('/coupon-9/claim')) {
+        return new Response(JSON.stringify({ status: 'CLAIMED', redemptionCode: 'CODE-10AM' }), { status: 200 })
+      }
+      throw new Error(`不该请求 ${url}：couponsOnly 不得触碰每日签到`)
+    }))
+    const r = await performQoderCheckin('dt-t', 'cn', 'u1', undefined, undefined, { couponsOnly: true })
+    expect(r.success).toBe(true)
+    expect(r.couponCodes).toEqual([{ campaignId: 'coupon-9', campaign: 'coupon-9', code: 'CODE-10AM' }])
+    // 结果里不能出现「签到尚未刷新」这类与券无关的报错
+    expect(r.message).not.toContain('尚未刷新')
+    expect(r.message).toContain('CODE-10AM')
+  })
+
+  it('couponsOnly：没有券可领时给中性结论，不谎报失败也不报签到错误', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify({
+      campaigns: [
+        { campaignId: 'daily-old', campaignKey: 'act-1', actionType: 'CLAIM_BENEFIT', claimStatus: 'CLAIMED', benefit: { kind: 'CREDITS', amount: 100 } },
+      ],
+    }), { status: 200 })))
+    const r = await performQoderCheckin('dt-t', 'cn', 'u1', undefined, undefined, { couponsOnly: true })
+    expect(r.success).toBe(true)
+    expect(r.message).toContain('没有可领取的兑换码')
+    expect(r.message).not.toContain('尚未刷新')
+    expect(r.message).not.toContain('无可用签到活动')
+  })
+
+  it('couponsOnly：券类失败时如实报失败（不因「没有签到」而谎报成功）', async () => {
+    vi.stubGlobal('fetch', vi.fn(async (input: unknown) => {
+      const url = String(input)
+      if (url.endsWith('/campaigns')) {
+        return new Response(JSON.stringify({
+          campaigns: [
+            { campaignId: 'c-bad', campaignKey: 'c-bad', actionType: 'CLAIM_BENEFIT', claimStatus: 'CLAIMABLE', benefit: { kind: 'REDEMPTION_CODE' } },
+          ],
+        }), { status: 200 })
+      }
+      return new Response(JSON.stringify({ status: 'NOT_ELIGIBLE', failureCode: 'RISK_BLOCKED' }), { status: 200 })
+    }))
+    const r = await performQoderCheckin('dt-t', 'cn', 'u1', undefined, undefined, { couponsOnly: true })
+    expect(r.success).toBe(false)
+    expect(r.message).toContain('风控拦截')
+  })
+
+  it('includeCoupons（非 couponsOnly）：每日签到未刷新时**也**把券领了，且结果不被签到报错吞掉', async () => {
+    // 这条钉住 withCoupons 的行为：签到本身没领到（未刷新）但券领到了 → 整体成功 + 带码，
+    // 否则用户明明拿到码却看到「失败」。
+    vi.stubGlobal('fetch', vi.fn(async (input: unknown) => {
+      const url = String(input)
+      if (url.endsWith('/campaigns')) {
+        return new Response(JSON.stringify({
+          campaigns: [
+            { campaignId: 'daily-old', campaignKey: 'act-old', actionType: 'CLAIM_BENEFIT', claimStatus: 'CLAIMED', benefit: { kind: 'CREDITS', amount: 100 } },
+            { campaignId: 'c-ok', campaignKey: 'c-ok', actionType: 'CLAIM_BENEFIT', claimStatus: 'CLAIMABLE', benefit: { kind: 'REDEMPTION_CODE' } },
+          ],
+        }), { status: 200 })
+      }
+      if (url.includes('/c-ok/claim')) {
+        return new Response(JSON.stringify({ status: 'CLAIMED', redemptionCode: 'CODE-MIX' }), { status: 200 })
+      }
+      throw new Error(`不该请求 ${url}`)
+    }))
+    const r = await performQoderCheckin('dt-t', 'cn', 'u1', undefined, undefined, { includeCoupons: true })
+    expect(r.success).toBe(true)                       // 券到手 → 整体成功
+    expect(r.redemptionCode).toBe('CODE-MIX')
+    expect(r.message).toContain('尚未刷新')            // 签到的真实状态仍如实保留
+    expect(r.message).toContain('CODE-MIX')
+  })
 })
 
 // ===== P3：模型级冷却 =====
