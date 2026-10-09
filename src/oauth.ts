@@ -1405,6 +1405,15 @@ export async function refreshAllOauthTokens(env: Env, providers: ProviderLike[])
       fail += r.fail
       continue
     }
+    // QoderWork（flowType=qoder）：token 存在**自己的池**（qoder:pool:{id}），
+    // 既不是单 token key 也不是 oauth:pool。旧实现让 qoder 落到下面的单 token 路径
+    // → **池内账号永不刷新**（与 M365 / WorkBuddy 修过的是同一处漏了第三个）。
+    if (flow === 'qoder') {
+      const r = await refreshAllQoderPoolTokens(env, p)
+      ok += r.ok
+      fail += r.fail
+      continue
+    }
     const state = await readOauthToken(env, p.id)
     if (!state?.refresh_token) continue
     if (state.expires_at - Date.now() > 5 * 60 * 1000) continue // 未临近过期，跳过
@@ -1505,6 +1514,166 @@ async function refreshAllBrowserPoolTokens(env: Env, p: ProviderLike): Promise<{
       }
     }
     await env.KV.put(OAUTH_POOL_KV_PREFIX + p.id, JSON.stringify(parsed))
+  } catch { /* KV 读/写失败不阻断 Cron */ }
+  return { ok, fail }
+}
+
+/**
+ * CST（UTC+8）小时数 0–23。
+ *
+ * 为什么必须显式 +8：Workers 运行时本地时区**恒为 UTC**，`new Date().getHours()` 拿到的是
+ * UTC 小时；「每日 22:00 保活」按 CST 定义，直接用 UTC 会整整错 8 小时。
+ */
+export function qoderCstHour(nowMs: number): number {
+  return new Date(nowMs + 8 * 60 * 60 * 1000).getUTCHours()
+}
+
+/** 每日集中保活的小时（CST），对齐 hub `Scheduler.keepalive_hours = [22]`。 */
+export const QODER_KEEPALIVE_HOUR_CST = 22
+
+/**
+ * 剩余寿命低于该值即提前刷新，对齐 hub `run_keepalive(threshold_seconds=4*3600)`。
+ *
+ * ⚠️ 单靠这个阈值**不足以保活**：Qoder 刷新响应的 `expires_in` 常缺省，而
+ * `qoderExpiryUnix` 缺省给 **30 天**（见该函数）。纯阈值下闲置账号要约 29.8 天才被刷到一次，
+ * 起不到「防上游闲置失效」的作用 —— 真正的主力是每日集中全量刷新（见 force 分支）。
+ */
+export const QODER_KEEPALIVE_THRESHOLD_MS = 4 * 60 * 60 * 1000
+
+/** CST 日期戳 `YYYY-MM-DD`（每日一次的去重标记用）。 */
+function cstDayStamp(nowMs: number): string {
+  return new Date(nowMs + 8 * 60 * 60 * 1000).toISOString().slice(0, 10)
+}
+
+/**
+ * QoderWork 账号池保活刷新（Cron 专用）。
+ *
+ * ## 为什么需要它（本函数修的缺陷）
+ *
+ * `refreshAllOauthTokens` 原实现只覆盖 M365 与 WorkBuddy 两个池，`flowType === 'qoder'`
+ * 落到**单 token** 路径。而 Qoder 的账号存在**自己的池**（`qoder:pool:{id}`），于是
+ * **池内账号的 cron 永不刷新**。请求路径只对「被选中的账号」做临期刷新，低权重/长期冷却/
+ * 已禁用的账号可能数周不被选中，其 `refresh_token` 若上游有闲置失效策略就会丢失，
+ * 届时只能重新登录。M365 与 WorkBuddy 都已为同一问题修过，这是漏掉的第三个。
+ *
+ * ## 两条刷新路径（与 hub 同构）
+ *
+ *  1. **临期**：剩余寿命 ≤ `QODER_KEEPALIVE_THRESHOLD_MS`（4h）→ 提前刷新；
+ *  2. **每日集中**：CST 22:00 那一轮**全量**刷新（hub `force=keepalive_due`）——
+ *     这条才是长寿命 token 的保活主力，理由见 `QODER_KEEPALIVE_THRESHOLD_MS`。
+ *
+ * ## 三个必须处理的细节（都来自实际代码约束）
+ *
+ * ① **realm 在账号上，不在 token 上**：`refreshQoderTokenPair` 按 `prev.realm` 选刷新端点
+ *    （cn → openapi.qoder.com.cn / global → openapi.qoder.sh），而 `acc.token.realm` 可能缺失。
+ *    不显式补齐就会把国际版账号的 refresh_token 打到国内端点 → 必然失败。
+ *
+ * ② **两阶段提交**（同 `refreshAllBrowserPoolTokens` 的丢失更新修复）：池被请求路径
+ *    频繁并发写（冷却 / 积分 / errCount / 模型级冷却）。若持有快照期间逐个 await 刷新、
+ *    最后整体覆盖，这些并发写入会被静默吞掉（丢了冷却 → 坏号立刻被再选；丢了禁用 → 风控号复活）。
+ *    故刷新阶段只产出「uid → 新 token」补丁，提交阶段**重新读池**再按 uid 打补丁。
+ *
+ * ③ **每日只跑一次**：两条 cron（每 2 小时 / 每小时）都会在 14:00 UTC（=22:00 CST）触发，
+ *    不加去重标记会在同一分钟把全池打两遍（hub 用 `keepalive_hours` + `sleep 65` 达到同效）。
+ *
+ * ## 刻意不做 sleep
+ *
+ * hub 在账号间 `time.sleep(1.0)`。这里不做：目标的两个既有池刷新（browser / M365）都不睡，
+ * 且 22:00 要刷全池，逐账号 1s 会让多账号场景明显变慢。上游刷新端点无频控记载。
+ */
+async function refreshAllQoderPoolTokens(
+  env: Env,
+  p: ProviderLike,
+  opts?: { now?: number; force?: boolean }
+): Promise<{ ok: number; fail: number }> {
+  const cfg = p.oauth!
+  const now = opts?.now ?? Date.now()
+  let ok = 0
+  let fail = 0
+
+  /**
+   * 池内账号的结构化视图。
+   *
+   * 为什么不 import `qoder/pool.ts` 的 `QoderPoolAccount`：`qoder/pool.ts` 从本模块
+   * import `readOauthToken`，反向 import 会形成循环依赖。这里按浏览器分支同款做法
+   * 只声明用到的字段（结构兼容，无需强制转换）。
+   */
+  interface QoderPoolAcc {
+    uid: string
+    token?: OAuthTokenState
+    enabled?: boolean
+    state?: { disabled?: boolean }
+    realm?: 'cn' | 'global'
+    updatedAt?: number
+  }
+
+  let pool: QoderPoolAcc[] = []
+  try {
+    const raw = await env.KV.get(KV_KEYS.QODER_POOL_PREFIX + p.id)
+    const parsed = raw ? JSON.parse(raw) : []
+    pool = Array.isArray(parsed) ? (parsed as QoderPoolAcc[]) : []
+  } catch {
+    return { ok: 0, fail: 0 } // 池损坏/不可读：不阻断其他 provider 的刷新
+  }
+  if (pool.length === 0) return { ok: 0, fail: 0 }
+
+  const force = opts?.force ?? (qoderCstHour(now) === QODER_KEEPALIVE_HOUR_CST)
+  const dayKey = KV_KEYS.QODER_KEEPALIVE_PREFIX + p.id
+  const today = cstDayStamp(now)
+  if (force) {
+    // 当日已集中保活过 → 直接跳过（见函数头 ③）
+    try {
+      if ((await env.KV.get(dayKey)) === today) return { ok: 0, fail: 0 }
+    } catch { /* KV 读失败不阻断：宁可多刷一次也不漏保活 */ }
+  }
+
+  const updates = new Map<string, OAuthTokenState>()
+  for (const acc of pool) {
+    if (!acc || typeof acc.uid !== 'string' || !acc.token?.refresh_token) continue
+    // 禁用账号需人工重登，刷新必然失败 → 跳过（不白打上游、不产生噪音）
+    if (acc.enabled === false || acc.state?.disabled) continue
+    const remain = (typeof acc.token.expires_at === 'number' ? acc.token.expires_at : 0) - now
+    if (!force && remain > QODER_KEEPALIVE_THRESHOLD_MS) continue
+
+    // 见函数头 ①：realm **只认账号**，与 pool.ts `qoderAccountRealm` 完全同口径
+    // （缺省 = cn）。刻意不回落到 `acc.token.realm`：realm 的 owner 是账号——推理走哪个
+    // 网关由账号决定，刷新若另有一套判定就会与推理不一致（国际版账号的 refresh_token
+    // 被打到国内端点 → 必然失败，表现为「怎么刷都刷不动」）。
+    const realm: 'cn' | 'global' = acc.realm === 'global' ? 'global' : 'cn'
+    const fresh = await refreshQoderTokenPair(cfg, acc.token.refresh_token, { ...acc.token, realm })
+    if (fresh) {
+      updates.set(acc.uid, fresh)
+      ok++
+    } else {
+      fail++
+      console.error(`[oauth] Qoder 池账号刷新失败，可能需要重新登录 provider=${p.id} uid=${acc.uid.slice(0, 8)} ${new Date().toISOString()}`)
+    }
+  }
+
+  // 标记当日已集中保活（无论成败）：失败多为上游瞬时问题，下一小时的常规巡检仍会按
+  // 4h 阈值兜住临期账号；此处不标记会让两条重叠 cron 在同一分钟重复打全池。
+  if (force) {
+    try { await env.KV.put(dayKey, today, { expirationTtl: 3 * 24 * 60 * 60 }) } catch { /* ignore */ }
+  }
+
+  if (updates.size === 0) return { ok, fail }
+
+  // 提交阶段（见函数头 ②）：重新读池拿最新状态 → 按 uid 打补丁 → 写回。
+  // 读失败/池损坏/非数组时**放弃写回**：宁肯本次不落盘，也不能用空池或坏池覆盖真实账号。
+  try {
+    const raw = await env.KV.get(KV_KEYS.QODER_POOL_PREFIX + p.id)
+    const parsed = raw ? JSON.parse(raw) : []
+    if (!Array.isArray(parsed)) throw new Error('qoder pool is not an array')
+    for (const acc of parsed as QoderPoolAcc[]) {
+      if (!acc || typeof acc.uid !== 'string') continue
+      const patch = updates.get(acc.uid)
+      if (!patch) continue
+      acc.token = patch
+      acc.updatedAt = now
+      // 刷新响应一般不回 realm；保持账号既有域（缺失时用补丁里的）
+      if (!acc.realm) acc.realm = patch.realm === 'global' ? 'global' : 'cn'
+    }
+    await env.KV.put(KV_KEYS.QODER_POOL_PREFIX + p.id, JSON.stringify(parsed))
   } catch { /* KV 读/写失败不阻断 Cron */ }
   return { ok, fail }
 }
