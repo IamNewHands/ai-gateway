@@ -88,7 +88,9 @@ describe('P1 Pro 升级包：资格查询与领取（hub qoder_accounts.py:1290-
     })
     vi.stubGlobal('fetch', fetchMock)
     const r = await proEligibility('dt-pro', 'cn', 'uid-pro')
-    expect(r).toEqual({ ok: true, eligible: true })
+    expect(r.ok).toBe(true)
+    expect(r.eligible).toBe(true)
+    expect(r.httpStatus).toBe(200)
   })
 
   it('机器/会话 ID 按 uid 稳定派生（同一账号两次调用同值，不同账号不同值）', async () => {
@@ -105,13 +107,57 @@ describe('P1 Pro 升级包：资格查询与领取（hub qoder_accounts.py:1290-
     expect(seen[0][0]).not.toBe(seen[2][0])     // 隔离：不同账号不同值
   })
 
-  it('404/403/410 → 查询成功但不可领取（不是查询失败）', async () => {
-    // 端点不存在/活动下线时，账号侧正确结论就是「没得领」；报成失败会让批量汇总
-    // 每次都多一条假告警（hub 明确注释了这一点）。
-    for (const status of [404, 403, 410]) {
+  it('404/403/410 → 查询成功但不可领取，且**标出端点缺失**（不是「已领过」）', async () => {
+    // 端点不存在/活动下线时，账号侧结论是「没得领」；但必须与「已领过」分开——
+    // 2026-10-09 实测：国际版账号点「领 Pro 包」显示「已领过 1」，而它从没领到过。
+    for (const status of [404, 403, 405, 410]) {
       vi.stubGlobal('fetch', vi.fn(async () => new Response('nope', { status })))
-      expect(await proEligibility('t', 'cn', 'u')).toEqual({ ok: true, eligible: false })
+      const r = await proEligibility('t', 'cn', 'u')
+      expect(r.ok).toBe(true)
+      expect(r.eligible).toBe(false)
+      expect(r.endpointMissing, `HTTP ${status} 应标记端点缺失`).toBe(true)
+      expect(r.httpStatus).toBe(status)
     }
+  })
+
+  it('200 + eligible:false → 接口存在但不可领（**不**标记端点缺失）', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify({ eligible: false }), { status: 200 })))
+    const r = await proEligibility('t', 'cn', 'u')
+    expect(r.ok).toBe(true)
+    expect(r.eligible).toBe(false)
+    expect(r.endpointMissing).toBeUndefined()
+    expect(r.httpStatus).toBe(200)
+  })
+
+  it('claim 的 403/404/410 → endpointMissing（不报成「领取失败」）', async () => {
+    for (const status of [404, 403, 410]) {
+      vi.stubGlobal('fetch', vi.fn(async () => new Response('nf', { status })))
+      const r = await proClaim('t', 'cn', 'u')
+      expect(r.ok, `HTTP ${status}`).toBe(true)
+      expect(r.outcome).toBe('endpointMissing')
+      expect(r.rewardCredits).toBeUndefined()
+    }
+  })
+
+  it('三态 outcome 互斥且语义正确（claimed / already / endpointMissing / unavailable / failed）', async () => {
+    // claimed：唯一会加积分的情形
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify({ success: true }), { status: 200 })))
+    let r = await proClaim('t', 'cn', 'u')
+    expect(r.outcome).toBe('claimed')
+    expect(r.rewardCredits).toBe(1800)
+
+    // already：409 → 已领过，不加积分
+    vi.stubGlobal('fetch', vi.fn(async () => new Response('ALREADY', { status: 409 })))
+    r = await proClaim('t', 'cn', 'u')
+    expect(r.outcome).toBe('already')
+    expect(r.already).toBe(true)
+    expect(r.rewardCredits).toBeUndefined()
+
+    // failed：500
+    vi.stubGlobal('fetch', vi.fn(async () => new Response('boom', { status: 500 })))
+    r = await proClaim('t', 'cn', 'u')
+    expect(r.outcome).toBe('failed')
+    expect(r.ok).toBe(false)
   })
 
   it('其他错误码 → 查询失败（不谎报「不可领取」）', async () => {
@@ -411,6 +457,10 @@ describe('P2 兑换码：券类活动领取 + 码持久化（hub qoder_accounts.
   it('includeCoupons（非 couponsOnly）：每日签到未刷新时**也**把券领了，且结果不被签到报错吞掉', async () => {
     // 这条钉住 withCoupons 的行为：签到本身没领到（未刷新）但券领到了 → 整体成功 + 带码，
     // 否则用户明明拿到码却看到「失败」。
+    //
+    // 必须注入 now（CST 10:00 之前）：轮次判定决定走「未刷新」还是「已领取」，
+    // 不注入就会随运行时刻飘红 —— 这正是时间可注入是硬要求的原因。
+    const beforeRound = Date.UTC(2026, 9, 9, 1, 0, 0) // 2026-10-09 09:00 CST
     vi.stubGlobal('fetch', vi.fn(async (input: unknown) => {
       const url = String(input)
       if (url.endsWith('/campaigns')) {
@@ -426,7 +476,7 @@ describe('P2 兑换码：券类活动领取 + 码持久化（hub qoder_accounts.
       }
       throw new Error(`不该请求 ${url}`)
     }))
-    const r = await performQoderCheckin('dt-t', 'cn', 'u1', undefined, undefined, { includeCoupons: true })
+    const r = await performQoderCheckin('dt-t', 'cn', 'u1', undefined, undefined, { includeCoupons: true, now: beforeRound })
     expect(r.success).toBe(true)                       // 券到手 → 整体成功
     expect(r.redemptionCode).toBe('CODE-MIX')
     expect(r.message).toContain('尚未刷新')            // 签到的真实状态仍如实保留

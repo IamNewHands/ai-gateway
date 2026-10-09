@@ -1521,6 +1521,14 @@ export async function handleOAuthDaily(c: Context<{ Bindings: Env }>) {
  *
  * 顺序与源一致：**先查资格再领**（`pro_eligibility` → 不可领则直接返回），
  * 避免对不可领的账号白发一次 POST。
+ *
+ * ## 三种「不可领取」必须分开报（2026-10-09 实测缺陷）
+ *
+ * 旧实现把「端点不存在」与「已领过」都塞进 `already: true` + 同一句
+ * 「不可领取（已领或活动未开放）」，于是国际版账号点了得到
+ * 「已领过 1」——**用户从没领到过**，且那个功能可能永远不开放。
+ * 现在分成三态：`endpointMissing`（该区域无此功能）/ `already`（真的领过）/
+ * `unavailable`（活动未开放）。
  */
 async function claimQoderProForAccount(
   env: Env,
@@ -1535,11 +1543,25 @@ async function claimQoderProForAccount(
   }
   const elig = await proEligibility(token, realm, account.uid)
   if (!elig.ok) {
-    return { uid: account.uid, nickname, rewardCredit: 0, result: { ok: false, message: `Pro 升级包资格查询失败: ${elig.error || ''}`, error: elig.error } }
+    return { uid: account.uid, nickname, rewardCredit: 0, result: { ok: false, outcome: 'failed', message: `Pro 升级包资格查询失败: ${elig.error || ''}`, error: elig.error } }
+  }
+  if (elig.endpointMissing) {
+    // 该区域没有这个端点（国际版很可能如此）：不是「已领过」，也不是失败，
+    // 而是**本区域不提供该福利**。如实说明，别让用户以为自己领过。
+    const realmLabel = realm === 'global' ? '国际版' : '国内版'
+    return {
+      uid: account.uid, nickname, rewardCredit: 0,
+      result: {
+        ok: true, outcome: 'endpointMissing',
+        message: `Pro 升级包在本账号所在区域不可用（${realmLabel}账号，上游 HTTP ${elig.httpStatus ?? '4xx'}：该区域无此端点）。这不是「已领过」。`,
+      },
+    }
   }
   if (!elig.eligible) {
-    // 查询成功但不可领：**不是失败**（已领过 / 活动未开放），rewardCredit 必须为 0
-    return { uid: account.uid, nickname, rewardCredit: 0, result: { ok: true, already: true, message: 'Pro 升级包不可领取（已领或活动未开放）' } }
+    // 查询成功（200）但不可领：活动未开放 / 已领过。rewardCredit 必须为 0。
+    // 注：真正的「已领过」只有 claim 返回 409/ALREADY 才能确认，资格接口这里无法区分，
+    // 故措辞不写死成「已领过」。
+    return { uid: account.uid, nickname, rewardCredit: 0, result: { ok: true, outcome: 'unavailable', message: 'Pro 升级包当前不可领取（活动未开放，或该账号已领过）' } }
   }
   const claimed = await proClaim(token, realm, account.uid)
   // 只有**本次新领**才计积分：already 分支若也算 1800，就是源记载的那个虚增缺陷
@@ -1567,7 +1589,7 @@ export async function handleOAuthProClaim(c: Context<{ Bindings: Env }>) {
     return c.json<ApiResponse>({ success: false, message: '账号池为空（未登录任何账号）' }, 400)
   }
 
-  const results: Array<{ uid: string; nickname: string; ok: boolean; already: boolean; message: string; rewardCredit: number }> = []
+  const results: Array<{ uid: string; nickname: string; ok: boolean; outcome: string; already: boolean; message: string; rewardCredit: number }> = []
   let totalCredit = 0
   for (const acc of pool) {
     try {
@@ -1575,17 +1597,28 @@ export async function handleOAuthProClaim(c: Context<{ Bindings: Env }>) {
       totalCredit += r.rewardCredit
       results.push({
         uid: r.uid, nickname: r.nickname,
-        ok: r.result.ok, already: r.result.already === true,
+        ok: r.result.ok, outcome: r.result.outcome || (r.result.ok ? 'unavailable' : 'failed'),
+        already: r.result.outcome === 'already',
         message: r.result.message, rewardCredit: r.rewardCredit,
       })
     } catch (e) {
-      results.push({ uid: acc.uid, nickname: acc.uid.slice(0, 8), ok: false, already: false, message: (e as Error).message || String(e), rewardCredit: 0 })
+      results.push({ uid: acc.uid, nickname: acc.uid.slice(0, 8), ok: false, outcome: 'failed', already: false, message: (e as Error).message || String(e), rewardCredit: 0 })
     }
   }
-  const claimedCount = results.filter((r) => r.ok && !r.already).length
-  const alreadyCount = results.filter((r) => r.already).length
-  const failedCount = results.filter((r) => !r.ok).length
-  const summary = `共 ${results.length} 个账号：新领 ${claimedCount} / 已领过 ${alreadyCount} / 失败 ${failedCount}，本次新增积分 +${totalCredit}`
+  const claimedCount = results.filter((r) => r.outcome === 'claimed').length
+  const alreadyCount = results.filter((r) => r.outcome === 'already').length
+  const failedCount = results.filter((r) => r.outcome === 'failed').length
+  // 「不可领取」既不是新领也不是失败：它包含「该区域无此端点」「活动未开放」。
+  // 旧实现把它们全塞进 already，于是国际版账号点一次就显示「已领过 1」——
+  // 而那个账号从来没领到过（2026-10-09 实测）。这里单列，并把原因写进 message。
+  const unavailableCount = results.filter((r) => r.outcome === 'endpointMissing' || r.outcome === 'unavailable').length
+  const detail = results
+    .filter((r) => r.outcome === 'endpointMissing' || r.outcome === 'unavailable')
+    .map((r) => `${r.nickname}: ${r.message}`)
+    .join('；')
+  const summary = claimedCount > 0
+    ? `共 ${results.length} 个账号：新领 ${claimedCount} / 已领过 ${alreadyCount} / 不可领 ${unavailableCount} / 失败 ${failedCount}，本次新增积分 +${totalCredit}`
+    : `共 ${results.length} 个账号：无新领（已领过 ${alreadyCount} / 不可领 ${unavailableCount} / 失败 ${failedCount}）${detail ? `—— ${detail}` : ''}`
   try {
     await writeLog(c.env, 'info', `[qoder-pro-claim] ${p.name} → ${summary}`, JSON.stringify({ results }).substring(0, 4000))
   } catch { /* 日志失败不影响结果 */ }

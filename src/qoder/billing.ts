@@ -494,6 +494,10 @@ export function qoderCouponKindLabel(kind: unknown): string {
  * 时会**提前 return**（`!target` 分支），而券类领取写在那个 return 之后 —— 于是 10:00 前点
  * 「领兑换码」拿到的是**每日签到的报错**（「签到活动尚未刷新，请在 10:00 后重试」），
  * 券类那段代码根本没被执行。券类与每日活动是**互相独立**的两件事，不能共用一个前置判定。
+ *
+ * `opts.now`（缺省 `Date.now()`）：判定「本轮是否已滚动到 CST 10:00」的时刻。
+ * **可注入**是硬要求（时间相关逻辑不得只能靠真实挂钟测试）：轮次判定直接决定
+ * 「报已领取」还是「报未刷新」，不注入就只能写出随运行时刻飘红的用例。
  */
 export async function performQoderCheckin(
   token: string,
@@ -501,11 +505,12 @@ export async function performQoderCheckin(
   uid = '',
   sess?: CosySession,
   device?: QoderDeviceIdentity,
-  opts?: { includeCoupons?: boolean; couponsOnly?: boolean }
+  opts?: { includeCoupons?: boolean; couponsOnly?: boolean; now?: number }
 ): Promise<QoderCheckinOutcome> {
   const couponsOnly = opts?.couponsOnly === true
   // couponsOnly 隐含 includeCoupons：只领券的调用方显然要券
   const includeCoupons = opts?.includeCoupons === true || couponsOnly
+  const nowMs = typeof opts?.now === 'number' && Number.isFinite(opts.now) ? opts.now : Date.now()
   const s = await checkinSession(token, uid, sess)
   let res: Response
   try {
@@ -584,7 +589,7 @@ export async function performQoderCheckin(
   const alreadyClaimedList = daily.filter((c) => c.claimStatus === 'CLAIMED')
   // 轮次是否已滚动到「今天这一轮」：未滚动时，列表里的 CLAIMED 是上一轮残留，
   // 不能当作「今日已领」的证据。
-  const roundOpen = qoderDailyRoundOpen(Date.now())
+  const roundOpen = qoderDailyRoundOpen(nowMs)
 
   /**
    * 领券（含逐条码回传与同人去重冷却回报）。
@@ -1220,6 +1225,16 @@ export interface QoderProEligibility {
   ok: boolean
   /** 是否可领取 */
   eligible: boolean
+  /**
+   * 端点在本区域**不存在**（HTTP 403/404/405/410）。
+   *
+   * 必须与「活动未开放」分开（2026-10-09 实测缺陷）：国际版账号的 legacy `/sash/` 端点
+   * 已实测返回 404，Pro 端点是另一个 `/sash/` 端点、同样可能只在国内版开放。
+   * 把它报成「已领过」等于告诉用户「你领过了」——而他从来没领到过、也可能永远领不到。
+   */
+  endpointMissing?: boolean
+  /** 上游 HTTP 状态码（ok=true 时也有意义：200 = 接口存在，404/405/410 = 该区域无此端点） */
+  httpStatus?: number
   /** 查询失败时的原因 */
   error?: string
 }
@@ -1227,9 +1242,16 @@ export interface QoderProEligibility {
 /**
  * 查询 Pro 升级包资格（GET，hub `pro_eligibility`，qoder_accounts.py:1290-1303）。
  *
- * `404/403/410` 一律按「**查询成功但不可领取**」处理（`ok:true, eligible:false`）：
- * 端点不存在 / 活动已下线时，账号侧的正确结论就是「没得领」，报成查询失败会让批量汇总
- * 每次都多一条假告警。
+ * ## 403/404/405/410 的语义必须与「活动未开放」分开
+ *
+ * hub 把 `404/403/410` 一律按「查询成功但不可领取」处理（`ok:true, eligible:false`），
+ * 理由是「端点不存在 / 活动已下线时，账号侧的正确结论就是没得领」，这样批量汇总不会多报
+ * 假告警。但它在**用户可见层**丢掉了「**为什么**没得领」：
+ *   - 403/404/405/410 → 该区域根本没有这个功能（国际版很可能如此），**永久**不可领；
+ *   - 200 + eligible:false → 活动未开放，以后可能能领；
+ *   - 409/ALREADY（claim 时才可见）→ 真的已领过，一次性、永久不可再领。
+ * 三者对用户的含义完全不同，故这里保留 `endpointMissing` + `httpStatus`，
+ * 由调用方决定怎么表达（**不再把它们塌缩成 `already`**）。
  */
 export async function proEligibility(token: string, realm: QoderRealm = 'cn', uid = ''): Promise<QoderProEligibility> {
   let res: Response
@@ -1243,13 +1265,13 @@ export async function proEligibility(token: string, realm: QoderRealm = 'cn', ui
     return { ok: false, eligible: false, error: (e as Error).message || '网络请求失败' }
   }
   if (!res.ok) {
-    if (res.status === 404 || res.status === 403 || res.status === 410) {
-      return { ok: true, eligible: false }
+    if (res.status === 403 || res.status === 404 || res.status === 405 || res.status === 410) {
+      return { ok: true, eligible: false, endpointMissing: true, httpStatus: res.status }
     }
-    return { ok: false, eligible: false, error: `HTTP ${res.status}` }
+    return { ok: false, eligible: false, httpStatus: res.status, error: `HTTP ${res.status}` }
   }
   const body = (await res.json().catch(() => null)) as Record<string, unknown> | null
-  return { ok: true, eligible: body?.eligible === true }
+  return { ok: true, eligible: body?.eligible === true, httpStatus: res.status }
 }
 
 /** Pro 升级包领取结果。 */
@@ -1257,6 +1279,15 @@ export interface QoderProClaimResult {
   ok: boolean
   /** true = 之前已经领过（幂等命中，不是失败） */
   already?: boolean
+  /**
+   * 本次操作的**明确结论**（三态互斥，供调用方分类汇总，不要靠 message 猜）：
+   *   - `claimed`        本次新领成功（唯一会加积分的情形）
+   *   - `already`        确认已领过（claim 返回 409 / ALREADY）
+   *   - `endpointMissing` 该区域没有此端点（国际版很可能如此），**不是**「已领过」
+   *   - `unavailable`    接口存在但当前不可领（活动未开放）
+   *   - `failed`         查询/领取失败
+   */
+  outcome?: 'claimed' | 'already' | 'endpointMissing' | 'unavailable' | 'failed'
   message: string
   /** 领取成功时的积分（上游不回传金额则用 QODER_PRO_REWARD_CREDIT 兜底） */
   rewardCredits?: number
@@ -1289,28 +1320,32 @@ export async function proClaim(token: string, realm: QoderRealm = 'cn', uid = ''
   const text = await res.text().catch(() => '')
   if (!res.ok) {
     if (res.status === 409 || text.toUpperCase().includes('ALREADY')) {
-      return { ok: true, already: true, message: 'Pro 升级包已领取过' }
+      return { ok: true, already: true, outcome: 'already', message: 'Pro 升级包已领取过' }
     }
-    return { ok: false, message: `领取失败 http ${res.status}: ${text.substring(0, 160)}`, error: `HTTP ${res.status}` }
+    // 403/404/405/410：本区域无此端点（与资格查询同口径，别报成「领取失败」）
+    if (res.status === 403 || res.status === 404 || res.status === 405 || res.status === 410) {
+      return { ok: true, outcome: 'endpointMissing', message: `Pro 升级包端点在本区域不存在（HTTP ${res.status}）` }
+    }
+    return { ok: false, outcome: 'failed', message: `领取失败 http ${res.status}: ${text.substring(0, 160)}`, error: `HTTP ${res.status}` }
   }
   let body: Record<string, unknown> | null = null
   try {
     body = text ? (JSON.parse(text) as Record<string, unknown>) : null
   } catch {
-    return { ok: false, message: `领取响应格式异常: ${text.substring(0, 160)}`, error: 'parse' }
+    return { ok: false, outcome: 'failed', message: `领取响应格式异常: ${text.substring(0, 160)}`, error: 'parse' }
   }
   // `ALREADY` 出现在**任何**位置都按「已领过」处理（不限于 HTTP 409 与 success:false）。
   // 为什么比源更宽一格：源只在 HTTPError 分支扫这个字样，而 200 信封里同样可能带它。
   // 把它误判成「本次新领」会让批量汇总的积分虚增 +1800 —— 这正是源明确记载的历史缺陷，
   // 故宁可多认一层，也不冒虚增的风险（判错的代价不对称：少算一次 vs 多算一次）。
   if (text.toUpperCase().includes('ALREADY')) {
-    return { ok: true, already: true, message: 'Pro 升级包已领取过' }
+    return { ok: true, already: true, outcome: 'already', message: 'Pro 升级包已领取过' }
   }
   if (body?.success === false) {
     const msg = String(body?.message || text).substring(0, 160)
-    return { ok: false, message: `领取失败: ${msg}`, error: msg }
+    return { ok: false, outcome: 'failed', message: `领取失败: ${msg}`, error: msg }
   }
   // 上游可能回传真实金额；没有则用源同款兜底 1800
   const amount = typeof body?.amount === 'number' ? (body.amount as number) : QODER_PRO_REWARD_CREDIT
-  return { ok: true, message: `Pro 升级包领取成功 +${amount}`, rewardCredits: amount }
+  return { ok: true, outcome: 'claimed', message: `Pro 升级包领取成功 +${amount}`, rewardCredits: amount }
 }
