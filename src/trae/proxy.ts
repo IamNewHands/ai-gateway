@@ -13,11 +13,11 @@
 import type { Env, Provider } from '../types'
 import { withSSEKeepAlive } from '../opencode'
 import { getPerfSettings } from '../perf'
-import { TRAE_DEFAULT_MODEL, TRAE_KEEPALIVE_MS, TRAE_RAW_MAX_HISTORY_CHARS, TRAE_RAW_MAX_MESSAGES, TRAE_RAW_MAX_TOOL_SCHEMA_CHARS, TRAE_STATIC_MODEL_IDS, TRAE_STREAM_IDLE_TIMEOUT_MS, TRAE_WORK_CONSTANTS, isWorkModel, normalizeTraeModelName } from './constants'
+import { TRAE_CONNECT_DEADLINES_MS, TRAE_DEFAULT_MODEL, TRAE_KEEPALIVE_MS, TRAE_RAW_MAX_HISTORY_CHARS, TRAE_RAW_MAX_MESSAGES, TRAE_RAW_MAX_TOOL_SCHEMA_CHARS, TRAE_STATIC_MODEL_IDS, TRAE_STREAM_IDLE_TIMEOUT_MS, TRAE_WORK_CONSTANTS, isWorkModel, normalizeTraeModelName } from './constants'
 import { chatStream, chatWorkStream, exchangeToken, extractLastUserPrompt, isTraeRequestSideError, needsTraeRefresh, parseAuth, probeTraeCredits, type TraeConnectTiming } from './upstream'
 import { isRemoteOnlyModel, type HistoryBudget } from './payload'
 import { aggregateSoloSse, aggregateWorkSse, soloStreamToOpenAIStream, workStreamToOpenAIStream } from './sse'
-import type { SOLOStreamError } from './types'
+import type { SOLOStreamError, TraeAccount } from './types'
 import { writeLog } from '../admin'
 import {
   acquireTraeSession,
@@ -45,24 +45,47 @@ export const TRAE_PROVIDER_ID = 'trae'
 const MAX_ROTATE = 3
 
 /**
- * transport（建连超时/被掐断）撞满几次即停止换号。
+ * token 预刷新阶段（`exchangeToken` → `doJson`）的连接层失败撞满几次即停止换号。
  *
- * 依据：transport 与账号健康无关（`applyChatError` 对它刻意不罚号），**换号没有信息增益**——
- * 撞的始终是同一条「网关↔上游建连」（SOLO 只有一个入口 `TRAE_CONSTANTS.AgentHost`）。
- *
- * 2026-10-08 由 2 收到 1，依据是三天取证：
- *  - `[trae-transport]` 实测坏路径恰好撞满上限（30s 时 5/5 次 `connect=30000ms timeout=true`，
- *    60s 实验期同样撞满），而 0.5s 后重试的请求几秒内就完成（好路径 `connect=2636ms/5052ms`）
- *    ⇒ 卡住的连接是「死」不是「慢」：等更久不会成功（60s 实验已证），第 2 次尝试只是把单次
- *    失败的死等从 31s 拉到 62s（带 tools 时 Work 兜底本来就被跳过）；
- *  - 客户端失败后 0.5s 自行重试，历史 30/30 次失败都在重试后恢复 —— 「换一条连接」这件事交给
- *    客户端做，网关侧没必要先白等一轮。
- *
- * 不变的纪律：`transport` 仍不罚号、仍按真因报 503 `upstream_unreachable`。本改动只缩短死等。
- * 若日后 `[trae-transport]` 里出现 `timeout=false`（上游自己断）或第 2 次尝试确有实质成功率，
- * 说明坏连接不是永久死，再调回 2。
+ * 与转发阶段的区别：刷新打的是另一个端点、失败后账号已被 `tried` 排除，且刷新失败本就
+ * 走客户端重试，没有必要再为它排阶梯。保持 1（2026-10-08 由 2 收到 1），语义不变。
  */
 const MAX_TRANSPORT_ATTEMPTS = 1
+
+/**
+ * 转发阶段（`chatStream` / `chatWorkStream`）的建连死线阶梯：第 n 段（0 基）取
+ * `TRAE_CONNECT_DEADLINES_MS[n]`，越界钳到最后一段（正常不会越界——重发条件里已判过）。
+ *
+ * 用「段」而不是「次数」：2026-10-08 把尝试次数 2→1 只是缩短死等，**没有引入任何成功率**
+ * ——两段用的是同一个 30s 死线，坏连接两段都会撞满。改为阶梯后，第 1 段（10s）一撞就立刻
+ * 换新连接重发，坏窗口不再需要客户端兜底。理由与实测见 `constants.ts` 的
+ * `TRAE_CONNECT_DEADLINES_MS` 注释。
+ */
+function transportStageDeadlineMs(stage: number): number {
+  const i = Math.min(Math.max(stage, 0), TRAE_CONNECT_DEADLINES_MS.length - 1)
+  return TRAE_CONNECT_DEADLINES_MS[i]
+}
+
+/** 阶梯是否还有下一段（`usedStages` = 已用掉的段数）。 */
+function hasNextTransportStage(usedStages: number): boolean {
+  return usedStages < TRAE_CONNECT_DEADLINES_MS.length
+}
+
+/**
+ * transport 失败是否该在原账号上换一条新连接重发。
+ *
+ * 两个条件缺一不可：
+ *  - `connectTimeout === true`：这次失败是**网关自己的定时器**掐的（连接是「死」的）。
+ *    上游/网络自己断的（`timeout=false`）不重发——那有可能是真错误，交给原有兜底链，
+ *    否则会把「上游明确拒绝」变成「再撞一次」。
+ *  - 阶梯还有下一段：第 2 段用的是 30s，保证改前能成功的请求改后仍能成功。
+ *
+ * 刻意**不换账号**：transport 与账号健康无关（`applyChatError` 对它不罚号），换号只是白耗
+ * 健康号配额；唯一要变的变量就是「连接」本身。
+ */
+function shouldRetryOnFreshConnection(connectTimeout: boolean, usedStages: number): boolean {
+  return connectTimeout && hasNextTransportStage(usedStages)
+}
 
 /** 是否是 TRAE SOLO 提供商（id 固定或用 trae 域）。 */
 export function isTraeProvider(provider: Provider): boolean {
@@ -358,7 +381,8 @@ export async function executeWorkRequest(
   const cd = resolveTraeCooldown(provider)
   const tried = new Set<string>()
   let lastErr: Error | null = null
-  // transport 计数：与账号无关的链路故障，换号无信息增益（见 MAX_TRANSPORT_ATTEMPTS）。
+  // transport 计数：与账号无关的链路故障，换号无信息增益。同时充当**建连阶梯的段计数器**
+  //（见 transportStageDeadlineMs / shouldRetryOnFreshConnection）。
   let transportAttempts = 0
   // 非流式聚合见过「上游没发 done」：Work 是最后一层兜底，此时不能回半句话，
   // 也不能用 no_healthy_account 把网络截断说成账号池不可用（曾把排查引到账号上）。
@@ -370,8 +394,13 @@ export async function executeWorkRequest(
     workModel = TRAE_WORK_CONSTANTS.DefaultWorkModel
   }
 
-  for (let i = 0; i < MAX_ROTATE; i++) {
-    const account = await pickTraeWorkAccount(env, provider.id, accounts, tried, provider.preferTraeUid)
+  // 阶梯重发槽位：非 null 时本轮不走账号轮转，直接复用该账号、只换一条新连接重发。
+  // 加长循环上界容纳阶梯段数（多出的轮次只有 transport 重发能用到，账号轮转仍受 `tried` 约束）。
+  let retryAccount: TraeAccount | null = null
+
+  for (let i = 0; i < MAX_ROTATE + TRAE_CONNECT_DEADLINES_MS.length; i++) {
+    const account: TraeAccount | null = retryAccount ?? await pickTraeWorkAccount(env, provider.id, accounts, tried, provider.preferTraeUid)
+    retryAccount = null
     if (!account) break
     tried.add(account.uid)
 
@@ -404,7 +433,7 @@ export async function executeWorkRequest(
     const timing: TraeConnectTiming = {}
     const attemptStartedAt = Date.now()
     try {
-      resp = await chatWorkStream(account, workModel, prompt, timing)
+      resp = await chatWorkStream(account, workModel, prompt, timing, transportStageDeadlineMs(transportAttempts))
     } catch (e) {
       lastErr = e as Error
       const status = (e as any).status || 0
@@ -413,16 +442,21 @@ export async function executeWorkRequest(
       if (kind === 'transport') {
         // 连接层失败（建连超时/被掐断）与账号健康无关：**不冷却、不累计 workErrCount**
         //（与 SOLO 侧 `applyChatError` 的 transport 分支同纪律，见 CODING_NOTES
-        //「连接层/收尾层失败不是账号故障，禁止罚号」）。换号也没有信息增益——第 2 次
-        // 撞的是同一条「网关↔上游建连」，故撞满 MAX_TRANSPORT_ATTEMPTS 即跳出。
+        //「连接层/收尾层失败不是账号故障，禁止罚号」）。
         transportAttempts++
         // Work 侧同口径落 KV：尾部的 503 文案可能带的是 Work 的错误消息，
-        // 少了这条就分不清「SOLO 撞满」还是「Work 也撞了」。
+        // 少了这条就分不清「SOLO 撞满阶梯」还是「Work 也撞了」。
         await logTraeTransport(env, `[trae-transport] provider=${provider.id} uid=${account.uid} model=${workModel}`
-          + ` phase=work attempt=${transportAttempts}/${MAX_TRANSPORT_ATTEMPTS}`
+          + ` phase=work attempt=${transportAttempts}/${TRAE_CONNECT_DEADLINES_MS.length}`
+          + ` stage=${transportStageDeadlineMs(transportAttempts - 1)}ms`
           + ` connect=${timing.connectMs ?? -1}ms timeout=${timing.connectTimeout === true}`
           + ` elapsed=${Date.now() - attemptStartedAt}ms err=${msg.slice(0, 160)}`)
-        if (transportAttempts >= MAX_TRANSPORT_ATTEMPTS) break
+        // 阶梯内还有下一段 → 立刻在原账号上换一条新连接重发（见 shouldRetryOnFreshConnection）。
+        if (shouldRetryOnFreshConnection(timing.connectTimeout === true, transportAttempts)) {
+          retryAccount = account
+          continue
+        }
+        break
       } else if (status === 429) {
         await cooldownTraeWorkAccount(env, provider.id, account.uid, cd.softMs, 'work 429 rate limit')
       } else if (status === 401 || status === 403) {
@@ -598,7 +632,8 @@ export async function proxyTraeChatRequest(
   const cd = resolveTraeCooldown(provider)
   const tried = new Set<string>()
   let lastErr: Error | null = null
-  // transport 计数：与账号无关的链路故障，换号无信息增益（见 MAX_TRANSPORT_ATTEMPTS）。
+  // transport 计数：与账号无关的链路故障，换号无信息增益。同时充当**建连阶梯的段计数器**
+  //（见 transportStageDeadlineMs / shouldRetryOnFreshConnection）。
   let transportAttempts = 0
   // Work 兜底是否已在本循环内尝试过：跳出后函数末尾还会再兜底一次，每次兜底都是
   // 2×30s 的建连等待。已在循环内试过就不再重复（同一 body、同一时刻、同一条链路）。
@@ -607,8 +642,13 @@ export async function proxyTraeChatRequest(
   const concurrency = typeof provider.traeConcurrency === 'number' ? provider.traeConcurrency : 0
   const idleMs = typeof provider.traeSessionIdleMs === 'number' ? provider.traeSessionIdleMs : 0
 
-  for (let i = 0; i < MAX_ROTATE; i++) {
-    const account = await pickTraeAccount(env, provider.id, accounts, tried, provider.preferTraeUid, concurrency, idleMs)
+  // 阶梯重发槽位：非 null 时本轮不走账号轮转，直接复用该账号、只换一条新连接重发。
+  // 加长循环上界容纳阶梯段数（多出的轮次只有 transport 重发能用到，账号轮转仍受 `tried` 约束）。
+  let retryAccount: TraeAccount | null = null
+
+  for (let i = 0; i < MAX_ROTATE + TRAE_CONNECT_DEADLINES_MS.length; i++) {
+    const account: TraeAccount | null = retryAccount ?? await pickTraeAccount(env, provider.id, accounts, tried, provider.preferTraeUid, concurrency, idleMs)
+    retryAccount = null
     if (!account) break
     tried.add(account.uid)
     // 占用会话：并发控制开启时 +1 计数；否则仅刷新活跃时刻（始终便于空闲感知）
@@ -646,7 +686,7 @@ export async function proxyTraeChatRequest(
     const timing: TraeConnectTiming = {}
     const attemptStartedAt = Date.now()
     try {
-      resp = await chatStream(account, body, timing)
+      resp = await chatStream(account, body, timing, transportStageDeadlineMs(transportAttempts))
     } catch (e) {
       lastErr = e as Error
       const kind = (e as any).kind || 'client'
@@ -665,25 +705,30 @@ export async function proxyTraeChatRequest(
       // 同一个建连超时只会把 30s×N 白耗完再回 503（实测 2026-09-27 连撞两个账号 62s）。
       // Work 走的是另一条 host/协议（chatWorkStream），是同因不同路的真兜底。
       if (kind === 'transport') {
-        // 换号没有信息增益：transport 与账号无关（applyChatError 对它刻意不罚号），第 2 次撞的
-        // 还是同一条「网关↔上游建连」。撞满 MAX_TRANSPORT_ATTEMPTS 即跳出，不再用健康账号白耗 30s。
         transportAttempts++
-        // 每次连接层失败都落 KV：`connect` 与实际耗时对比 `timeout` 标记，即可区分
-        // 「我们掐的 30s 建连超时」与「上游/网络自己断的」；改超时常量前先看这条日志。
+        // 每次连接层失败都落 KV：`connect` 与实际耗时对比 `timeout`/`stage` 标记，即可区分
+        // 「我们掐的建连死线（哪一段）」与「上游/网络自己断的」；调死线前先看这条日志。
         await logTraeTransport(env, `[trae-transport] provider=${provider.id} uid=${account.uid} model=${configName}`
-          + ` phase=solo attempt=${transportAttempts}/${MAX_TRANSPORT_ATTEMPTS}`
+          + ` phase=solo attempt=${transportAttempts}/${TRAE_CONNECT_DEADLINES_MS.length}`
+          + ` stage=${transportStageDeadlineMs(transportAttempts - 1)}ms`
           + ` connect=${timing.connectMs ?? -1}ms timeout=${timing.connectTimeout === true}`
           + ` elapsed=${Date.now() - attemptStartedAt}ms`
           + ` err=${((e as Error).message || String(e)).slice(0, 160)}`)
-        // Work 兜底只试一次：Work 侧同样撞「网关↔上游建连」，试过就不再重复（跳出后函数末尾
-        // 也会按 workFallbackTried 跳过），否则同一条链路会被撞两轮、等待被放大成 2×。
+        // 阶梯内还有下一段 → 立刻在原账号上换一条新连接重发（见 shouldRetryOnFreshConnection）。
+        // 这条路径优先于 Work 兜底：兜底会换成另一条协议/模型（丢 tools 语义），而重发只是
+        // 换一条连接，能用同一条请求拿回结果就不该降级。
+        if (shouldRetryOnFreshConnection(timing.connectTimeout === true, transportAttempts)) {
+          retryAccount = account
+          continue
+        }
+        // 阶梯耗尽：Work 兜底只试一次（Work 侧同样撞「网关↔上游建连」，试过就不再重复；
+        // 跳出后函数末尾也会按 workFallbackTried 跳过），否则等待会被放大成 2×。
         if (!hasTools && !workFallbackTried) {
           workFallbackTried = true
           const fallbackResp = await executeWorkRequest(env, provider, body, configName, prompt, stream)
           if (fallbackResp) return fallbackResp
         }
-        if (transportAttempts >= MAX_TRANSPORT_ATTEMPTS) break
-        continue
+        break
       }
       if ((kind === 'plan_limit' || kind === 'soft_rate') && !hasTools) {
         const fallbackResp = await executeWorkRequest(env, provider, body, configName, prompt, stream)

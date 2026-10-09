@@ -657,15 +657,23 @@ export async function fetchUserEntUsageDetails(account: TraeAccount): Promise<Tr
 export interface TraeConnectTiming {
   /** 本次连接阶段实际耗时 ms（成功=到响应头；失败=已等待时长） */
   connectMs?: number
-  /** true = 到点被网关自己的 TRAE_CHAT_CONNECT_TIMEOUT_MS 掐断，而非上游/网络自己断 */
+  /** true = 到点被网关自己的建连死线（`TRAE_CONNECT_DEADLINES_MS` 当前段 / 默认 `TRAE_CHAT_CONNECT_TIMEOUT_MS`）掐断，而非上游/网络自己断 */
   connectTimeout?: boolean
 }
 
 /**
  * 发 llm_utils_chat 请求（body 为已改写对象，内部再 prepareBody 序列化）。
  * 非 2xx 时抛带 kind/status/msg 的错误；成功返回 Response（stream=true 时为 SSE 流）。
+ *
+ * `connectTimeoutMs`：本段的建连死线。调用方按 `TRAE_CONNECT_DEADLINES_MS` 逐段传入；
+ * 不传则用默认单段上限（行为与改前一致）。
  */
-export async function chatStream(account: TraeAccount, bodyObj: Record<string, any>, timing?: TraeConnectTiming): Promise<Response> {
+export async function chatStream(
+  account: TraeAccount,
+  bodyObj: Record<string, any>,
+  timing?: TraeConnectTiming,
+  connectTimeoutMs: number = TRAE_CHAT_CONNECT_TIMEOUT_MS
+): Promise<Response> {
   const payload = prepareBody(JSON.stringify(bodyObj))
   // 流式响应不能设总超时：思考模型（glm-5.2/DeepSeek-V4-Pro 等）可能思考数十秒
   // 才出首字节，AbortSignal.timeout(30s) 会从 fetch 开始计时、在思考期间把整个流
@@ -678,8 +686,8 @@ export async function chatStream(account: TraeAccount, bodyObj: Record<string, a
     // 自描述 abort reason：不再是裸 abort() 的含糊 "The operation was aborted"，
     // 线上据此一眼区分「我们掐的 30s 建连超时」与「上游/网络自己断的」。
     // （workerd 是否把 reason 透传成 fetch 的拒绝原因未在本地验证；不透传时行为不变。）
-    controller.abort(new Error(`connect timeout ${TRAE_CHAT_CONNECT_TIMEOUT_MS}ms`))
-  }, TRAE_CHAT_CONNECT_TIMEOUT_MS)
+    controller.abort(new Error(`connect timeout ${connectTimeoutMs}ms`))
+  }, connectTimeoutMs)
   let response: Response
   try {
     response = await fetch(TRAE_CONSTANTS.AgentHost + TRAE_CONSTANTS.EpChat, {
@@ -791,20 +799,22 @@ export function buildNativeTaskPayload(
 
 /**
  * 发送 Work 通道请求（create_agent_task，纯协议 HTTP/2 直连）。
+ * `connectTimeoutMs` 同 `chatStream`：按 `TRAE_CONNECT_DEADLINES_MS` 逐段传入。
  */
 export async function chatWorkStream(
   account: TraeAccount,
   model: string,
   prompt: string,
-  timing?: TraeConnectTiming
+  timing?: TraeConnectTiming,
+  connectTimeoutMs: number = TRAE_CHAT_CONNECT_TIMEOUT_MS
 ): Promise<Response> {
   const payload = buildNativeTaskPayload(account, model, prompt)
   const controller = new AbortController()
   const startedAt = Date.now()
   const connectTimer = setTimeout(() => {
     if (timing) timing.connectTimeout = true
-    controller.abort(new Error(`connect timeout ${TRAE_CHAT_CONNECT_TIMEOUT_MS}ms`)) // 同 chatStream：自描述 abort reason
-  }, TRAE_CHAT_CONNECT_TIMEOUT_MS)
+    controller.abort(new Error(`connect timeout ${connectTimeoutMs}ms`)) // 同 chatStream：自描述 abort reason
+  }, connectTimeoutMs)
   let response: Response
   try {
     response = await fetch(TRAE_WORK_CONSTANTS.WorkTargetHost + TRAE_WORK_CONSTANTS.EpCreateAgentTask, {

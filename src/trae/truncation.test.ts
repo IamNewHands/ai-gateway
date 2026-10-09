@@ -3,7 +3,7 @@ import { aggregateSoloSse, aggregateWorkSse, soloStreamToOpenAIStream, type Solo
 import { proxyTraeChatRequest } from './proxy'
 import { readTraePool, setTraeWorkCredits } from './pool'
 import { chatStream, type TraeConnectTiming } from './upstream'
-import { TRAE_CHAT_CONNECT_TIMEOUT_MS } from './constants'
+import { TRAE_CHAT_CONNECT_TIMEOUT_MS, TRAE_CONNECT_DEADLINES_MS } from './constants'
 
 /**
  * 回归用例：静默截断/连接层失败不得再被伪装成正常收尾。
@@ -842,7 +842,7 @@ describe('Trae 连接层失败可见性：connect 耗时采样与 [trae-transpor
     }
   })
 
-  it('带 tools + 2 账号：一次 SOLO 建连失败即收手 → 1 条 phase=solo 日志 + 1 条 attempts=1 聚合行，且绝不试 Work', async () => {
+  it('带 tools + 2 账号：上游自己断（timeout=false）→ 不走阶梯重发，1 条 phase=solo 日志 + 1 条 attempts=1 聚合行，且绝不试 Work', async () => {
     const originalFetch = globalThis.fetch
     let workCalls = 0
     globalThis.fetch = (async (input: any) => {
@@ -864,16 +864,19 @@ describe('Trae 连接层失败可见性：connect 耗时采样与 [trae-transpor
       })
 
       expect(resp.status).toBe(503)
-      // 带 tools → 不试 Work：生产事故里「62s ≈ 2×30s」的形态；本改动把死等砍到 1×30s
+      // 带 tools → 不试 Work：生产事故里「62s ≈ 2×30s」的形态
       expect(workCalls).toBe(0)
 
       const logs = kvTexts(env)
       const solo = logs.filter((t) => t.includes('[trae-transport]') && t.includes('phase=solo'))
-      expect(solo).toHaveLength(1)   // MAX_TRANSPORT_ATTEMPTS=1：池里还有第 2 个账号也不撞
-      expect(solo[0]).toContain('attempt=1/1')
+      // 阶梯只对「网关自己的定时器掐断」（timeout=true）重发；这里是 fetch 当场抛错（timeout=false），
+      // 属于「上游/网络自己断」→ 保持改前语义：一次即收手，不拿第二次白撞。
+      expect(solo).toHaveLength(1)
+      expect(solo[0]).toContain('attempt=1/2')
+      expect(solo[0]).toContain('stage=10000ms')
+      expect(solo[0]).toContain('timeout=false')
       for (const t of solo) {
-        expect(t).toContain('connect=')  // 连接阶段耗时：判断超时常量是否过紧的唯一依据
-        expect(t).toContain('timeout=')  // 是否被网关自己的定时器掐断（与「上游自己断」区分）
+        expect(t).toContain('connect=')  // 连接阶段耗时：判断死线是否过紧的唯一依据
         expect(t).toContain('uid=')
         expect(t).toContain('err=chat transport error')
       }
@@ -887,5 +890,175 @@ describe('Trae 连接层失败可见性：connect 耗时采样与 [trae-transpor
     } finally {
       globalThis.fetch = originalFetch
     }
+  })
+})
+
+/**
+ * 建连死线阶梯（2026-10-09，`TRAE_CONNECT_DEADLINES_MS`）。
+ *
+ * 真相：坏连接是「死」不是「慢」（60s 实验已证），等满上限毫无收益，唯一有信息量的动作是
+ * 「换一条连接」。线上会话 session-1e29c762 实测每次坏连接让客户端白等 32–34s 并各收一次 503，
+ * 而它 0.5s 后的重试全成功 ⇒ 第 1 段（10s）一撞就立刻在原账号换新连接重发。
+ *
+ * 本组锁三件事：
+ *  1. 第 1 段撞满 → **原账号**（Authorization 不变）换新连接重发，第 2 段成功即 200，
+ *     且只留 1 条 `[trae-transport]`（stage=10000ms）——坏窗口不再向客户端报错；
+ *  2. 两段都撞满 → 503，逐段死线 10000ms / 30000ms 各一条日志，聚合 `attempts=2`；
+ *  3. 不变量：默认单段上限恒等于阶梯最后一段（保证「不走阶梯」的调用点行为不变）。
+ */
+describe('Trae 建连死线阶梯：第一段快失败 → 原账号换连接重发', () => {
+  const LADDER_ID = 'trae-ladder'
+  const LADDER_UIDS = ['u_lad_1', 'u_lad_2']
+
+  function makeEnv(): any {
+    return {
+      KV: {
+        data: new Map<string, string>(),
+        async get(key: string) { return this.data.get(key) || null },
+        async put(key: string, val: string) { this.data.set(key, val) },
+        async delete(key: string) { this.data.delete(key) },
+      },
+    }
+  }
+
+  function makeProvider(id: string): any {
+    return {
+      id,
+      name: 'TRAE ladder',
+      type: 'trae',
+      apiKeys: LADDER_UIDS.map((uid) => ({
+        key: JSON.stringify({
+          uid,
+          token: `tok_${uid}`,
+          refreshToken: `ref_${uid}`,
+          expiresAt: Date.now() + 3600_000,
+        }),
+        enabled: true,
+      })),
+    }
+  }
+
+  /** 永不回响应头的连接：只有 signal abort 才拒绝（模拟生产里的死连接）。 */
+  function hangingFetch(onAuth: (auth: string) => void) {
+    return (_input: any, init?: any) => new Promise((_resolve, reject) => {
+      onAuth(String(init?.headers?.Authorization ?? init?.headers?.authorization ?? ''))
+      const sig = init?.signal
+      const onAbort = () => reject(sig?.reason instanceof Error ? sig.reason : new Error('The operation was aborted'))
+      if (sig?.aborted) onAbort()
+      else sig?.addEventListener('abort', onAbort)
+    })
+  }
+
+  it('第 1 段（10s）撞满 → 同账号换新连接重发 → 第 2 段成功，客户端拿到 200 而非 503', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] })
+    const originalFetch = globalThis.fetch
+    const auths: string[] = []
+    let call = 0
+    globalThis.fetch = ((input: any, init?: any) => {
+      if (String(input).includes('/api/agent/v3/create_agent_task')) {
+        return Promise.resolve(new Response('x', { status: 200 }))
+      }
+      call++
+      // 第 1 次：死连接（只在我们 10s 死线到点时才拒绝）；第 2 次：好连接，几秒内回响应头。
+      if (call === 1) return hangingFetch((a) => auths.push(a))(input, init)
+      auths.push(String(init?.headers?.Authorization ?? ''))
+      return Promise.resolve(new Response(
+        'event: output\ndata: {"response":"重发成功"}\n\nevent: done\ndata: {"finish_reason":"stop"}\n\n',
+        { status: 200, headers: { 'Content-Type': 'text/event-stream' } },
+      ))
+    }) as any
+    try {
+      const env = makeEnv()
+      const provider = makeProvider(`${LADDER_ID}-ok`)
+      const pending = proxyTraeChatRequest(env, provider, {
+        model: 'glm-5.2',
+        messages: [{ role: 'user', content: 'hi' }],
+        stream: false,
+        tools: [{ type: 'function', function: { name: 'noop', parameters: { type: 'object', properties: {} } } }],
+      })
+      await vi.advanceTimersByTimeAsync(TRAE_CONNECT_DEADLINES_MS[0] + 100)
+      const resp = await pending
+
+      expect(resp.status).toBe(200)
+      const body = await resp.json() as any
+      expect(body.choices[0].message.content).toBe('重发成功')
+
+      // 两次请求必须是**同一个账号**（只换连接，不换号——transport 与账号健康无关）
+      expect(auths).toHaveLength(2)
+      expect(auths[0]).toBe(auths[1])
+
+      const solo = [...env.KV.data.values()].map(String).filter((t) => t.includes('[trae-transport]') && t.includes('phase=solo'))
+      expect(solo).toHaveLength(1)          // 只有第 1 段失败过一次，重发成功不落失败日志
+      expect(solo[0]).toContain('attempt=1/2')
+      expect(solo[0]).toContain('stage=10000ms')
+      expect(solo[0]).toContain('timeout=true')
+      // 成功路径的 connect 采样走 [trae-stream] end= 日志（仅流式路径落），非流式不落；非流式的
+      // 「第 2 段实际耗时」由上面 auths 两次 + 200 结果共同证明，不另设日志。
+    } finally {
+      globalThis.fetch = originalFetch
+      vi.useRealTimers()
+    }
+  })
+
+  it('两段都撞满 → 503，逐段死线 10000ms/30000ms 各落一条，聚合 attempts=2', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] })
+    const originalFetch = globalThis.fetch
+    const auths: string[] = []
+    globalThis.fetch = ((input: any, init?: any) => {
+      if (String(input).includes('/api/agent/v3/create_agent_task')) {
+        return Promise.resolve(new Response('x', { status: 200 }))
+      }
+      return hangingFetch((a) => auths.push(a))(input, init)
+    }) as any
+    try {
+      const env = makeEnv()
+      const provider = makeProvider(`${LADDER_ID}-dead`)
+      const pending = proxyTraeChatRequest(env, provider, {
+        model: 'glm-5.2',
+        messages: [{ role: 'user', content: 'hi' }],
+        stream: false,
+        tools: [{ type: 'function', function: { name: 'noop', parameters: { type: 'object', properties: {} } } }],
+      })
+      await vi.advanceTimersByTimeAsync(TRAE_CONNECT_DEADLINES_MS[0] + 100)
+      await vi.advanceTimersByTimeAsync(TRAE_CONNECT_DEADLINES_MS[1] + 100)
+      const resp = await pending
+
+      expect(resp.status).toBe(503)
+      const body = await resp.json() as any
+      expect(body.error.code).toBe('upstream_unreachable')
+
+      // 池里有第 2 个账号，但阶梯重发只用原账号：不拿健康号去撞同一条链路
+      expect(auths).toHaveLength(2)
+      expect(auths[0]).toBe(auths[1])
+
+      const logs = [...env.KV.data.values()].map(String)
+      const solo = logs.filter((t) => t.includes('[trae-transport]') && t.includes('phase=solo'))
+      expect(solo).toHaveLength(2)
+      expect(solo[0]).toContain('attempt=1/2')
+      expect(solo[0]).toContain('stage=10000ms')
+      expect(solo[1]).toContain('attempt=2/2')
+      expect(solo[1]).toContain('stage=30000ms')
+      for (const t of solo) expect(t).toContain('timeout=true')
+
+      const summary = logs.filter((t) => t.includes('[trae-transport]') && t.includes('end=503'))
+      expect(summary).toHaveLength(1)
+      expect(summary[0]).toContain('attempts=2')
+      expect(summary[0]).toContain('tools=true')
+      expect(logs.some((t) => t.includes('phase=work'))).toBe(false)
+    } finally {
+      globalThis.fetch = originalFetch
+      vi.useRealTimers()
+    }
+  })
+
+  it('不变量：默认单段上限恒等于阶梯最后一段（不走阶梯的调用点行为不变）', () => {
+    expect(TRAE_CONNECT_DEADLINES_MS.length).toBeGreaterThanOrEqual(2)
+    expect(TRAE_CHAT_CONNECT_TIMEOUT_MS).toBe(TRAE_CONNECT_DEADLINES_MS[TRAE_CONNECT_DEADLINES_MS.length - 1])
+    // 逐段放宽：后面的段必须 ≥ 前面的段，否则「重发」会越来越紧
+    for (let i = 1; i < TRAE_CONNECT_DEADLINES_MS.length; i++) {
+      expect(TRAE_CONNECT_DEADLINES_MS[i]).toBeGreaterThanOrEqual(TRAE_CONNECT_DEADLINES_MS[i - 1])
+    }
+    // 最后一段必须 ≥ 原 30s：只有如此才能保证「改前能成功的请求，改后仍然成功」
+    expect(TRAE_CHAT_CONNECT_TIMEOUT_MS).toBeGreaterThanOrEqual(30000)
   })
 })
