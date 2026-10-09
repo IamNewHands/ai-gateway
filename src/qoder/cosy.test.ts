@@ -15,14 +15,42 @@ describe('COSY 对齐 keirouter（身份字段/指纹常量/头集）', () => {
     expect(headers['Cosy-Version']).toBe('1.0.0')
   })
 
-  it('指纹常量对齐 keirouter：data-policy=disagree、clienttype=5、machineos=x86_64_windows、login-version=v2、clientip=127.0.0.1', async () => {
+  it('指纹常量对齐参考实现：data-policy=agree、clienttype=5、machineos=x86_64_windows、login-version=v2', async () => {
     const sess = await cosySessionFor('dt-test1', 'drt', 'u1', 'n')
     const headers = cosyHeaders(sess, '{}', 'https://api3.qoder.sh/algo/api/v2/model/list', 'application/json', false)
-    expect(headers['Cosy-Data-Policy']).toBe('disagree')
+    // 两套参考实现都发 agree（qoder2api internal/bridge/client.go:36 / hub qoder_sign.py:584）。
+    // 本模块曾刻意发 disagree——那是唯一一处与两个实现都不一致的身份字段，2026-10-09 改回。
+    expect(headers['Cosy-Data-Policy']).toBe('agree')
     expect(headers['Cosy-Clienttype']).toBe('5')
     expect(headers['Cosy-Machineos']).toBe('x86_64_windows')
     expect(headers['Login-Version']).toBe('v2')
-    expect(headers['Cosy-Clientip']).toBe('127.0.0.1')
+    // 伪造的 clientip 已删：qoder2api 根本不发这个头，127.0.0.1 是编造值。
+    expect(headers['Cosy-Clientip']).toBeUndefined()
+  })
+
+  it('真机身份（machineToken 非空）覆盖机器头；未配置时保持 uid 派生值', async () => {
+    const sess = await cosySessionFor('dt-dev1', 'drt', 'uid-dev-1', 'n')
+    const url = 'https://api3.qoder.sh/algo/api/v2/service/pro/sse/agent_chat_generation?Encode=1'
+
+    // 无设备配置 → 与旧行为逐字节一致（不改变未配置部署的出站形态）
+    const derived = cosyHeaders(sess, '{}', url, 'text/event-stream', true)
+    expect(derived['Cosy-Machineid']).toBe(sess.machineId)
+    expect(derived['Cosy-Machinetoken']).toBe(sess.machineToken)
+
+    // 只有 machineId（没有 machineToken）**不算**真机身份（与签到 checkinHeaders 同判据）
+    const partial = cosyHeaders(sess, '{}', url, 'text/event-stream', true, { machineId: 'real-id' })
+    expect(partial['Cosy-Machineid']).toBe(sess.machineId)
+
+    const real = cosyHeaders(sess, '{}', url, 'text/event-stream', true, {
+      machineId: 'real-id',
+      machineToken: 'real-token',
+      machineType: '13fc94419140c338cf',
+      machineOS: 'x86_64_win32',
+    })
+    expect(real['Cosy-Machineid']).toBe('real-id')
+    expect(real['Cosy-Machinetoken']).toBe('real-token')
+    expect(real['Cosy-Machinetype']).toBe('13fc94419140c338cf')
+    expect(real['Cosy-Machineos']).toBe('x86_64_win32')
   })
 
   it('补齐了 Cosy-Bodyhash / Cosy-Bodylength / Cosy-Sigpath / X-Request-Id / 空的组织头', async () => {

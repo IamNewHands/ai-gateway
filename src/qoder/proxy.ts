@@ -37,7 +37,9 @@ import {
   type QoderPoolAccount,
 } from './pool'
 import { qoderExclusiveRealm } from './model-meta'
-import { streamFetchWithTimeout } from '../opencode'
+import { getQoderDevice } from './device'
+import type { QoderDeviceIdentity } from './billing'
+import { streamFetchWithTimeout, withSSEKeepAlive, OPENCODE_STREAM_IDLE_TIMEOUT_MS } from '../opencode'
 
 export const QODER_PROVIDER_ID = 'qoder'
 export const QODER_GATEWAY = 'https://gateway.qoder.com.cn'
@@ -469,6 +471,53 @@ const QODER_EMPTY_STREAM_CLASSIFIED: QoderClassified = {
  */
 const QODER_GATE_MAX_READS = 4
 
+/**
+ * 首帧闸门最长等待（毫秒）：到点即放弃闸门、**先把 SSE 头发给客户端**。
+ *
+ * 为什么「最多读 4 块」不够：上游 xhigh 长上下文的**首字节实测 40–71 秒**（hub README）。
+ * 闸门位于「发头之前」的预读阶段，静默期里客户端连 SSE 响应头都收不到——此时心跳无处可注，
+ * 中间代理照样按空闲断连。分块数上限对「一块都不来」的静默完全无效，只有时间上限能拉回来。
+ *
+ * 取 5s 与心跳同值：静默超过 5s 已不属于「首帧很快」那类，继续等只是推迟发头。
+ */
+export const QODER_GATE_MAX_WAIT_MS = 5000
+
+/**
+ * 客户端 SSE 心跳间隔（毫秒），对齐 hub `QD_SSE_HEARTBEAT` 默认 5。
+ *
+ * 为什么不沿用仓库通用的 15s（`DEFAULT_PERF_SETTINGS.keepAliveMs`）：上游首字节实测
+ * 40–71s，而部分客户端（AI SDK / iOS 严格解析器）的空闲阈值就在 15s 量级——
+ * 15s 心跳等于没注。见 `resolveQoderKeepAliveMs`。
+ */
+export const QODER_SSE_HEARTBEAT_MS = 5000
+
+/**
+ * 解析 qoder 实际使用的心跳间隔：尊重「显式关闭」，但不允许比 5s 更慢。
+ *
+ * - `0`：管理员显式关闭心跳 → 尊重（与 perf.ts 对「0 = 不注入心跳」的定义一致）。
+ * - 其它：取 `min(perf, 5s)`。管理员可以调更紧，但调不到比上游需要的更松——
+ *   「更松」正是会让客户端在首字等待期断连的那个方向。
+ */
+export function resolveQoderKeepAliveMs(perfKeepAliveMs: number): number {
+  if (perfKeepAliveMs === 0) return 0
+  return Math.min(perfKeepAliveMs, QODER_SSE_HEARTBEAT_MS)
+}
+
+/**
+ * 可注入的「限时等待」工厂：闸门用 `Promise.race(read, timeout)` 实现时间上限。
+ *
+ * 为什么必须能取消：read 先到时若不清计时器，每个请求都会留一个悬挂 setTimeout
+ * （Workers 里会拖住请求生命周期）。测试注入 `{ promise: 立即 resolve }` 即可确定性地
+ * 模拟「上游静默超时」，不必睡真实秒数。
+ */
+export type QoderGateTimeoutFn = (ms: number) => { promise: Promise<void>; cancel: () => void }
+
+export const defaultQoderGateTimeout: QoderGateTimeoutFn = (ms) => {
+  let timer: ReturnType<typeof setTimeout> | null = null
+  const promise = new Promise<void>((resolve) => { timer = setTimeout(resolve, ms) })
+  return { promise, cancel: () => { if (timer !== null) clearTimeout(timer) } }
+}
+
 type QoderSSEOpenResult =
   | { ok: true; stream: ReadableStream<Uint8Array> }
   | { ok: false; classified: QoderClassified }
@@ -656,7 +705,8 @@ async function sendQoderChatOnce(
   accountUid?: string,
   realm: 'cn' | 'global' = 'cn',
   delay: QoderDelayFn = defaultQoderDelay,
-  outerSignal?: AbortSignal
+  outerSignal?: AbortSignal,
+  device?: QoderDeviceIdentity
 ): Promise<QoderSendResult> {
   const chatUrl = qoderChatUrl(realm)
 
@@ -665,7 +715,7 @@ async function sendQoderChatOnce(
 
   for (let attempt = 0; attempt <= QODER_TRANSIENT_MAX_RETRIES; attempt++) {
     // 头集合**每次重算**（date/requestId 参与签名，不能跨尝试复用）
-    const headers = cosyHeaders(session, encodedBody, chatUrl, 'text/event-stream', true)
+    const headers = cosyHeaders(session, encodedBody, chatUrl, 'text/event-stream', true, device)
     headers['x-model-key'] = modelKey
     headers['x-model-source'] = 'system'
 
@@ -886,11 +936,23 @@ export async function proxyQoderChatRequest(
     }))
   const wantStream = opts?.stream ?? forwardBody.stream === true
 
+  /**
+   * 出站客户端身份里的**机器字段**（面板配置、KV `qoder:device`）。
+   *
+   * 为什么推理链路要读它：上游按机器身份判定客户端是否官方（活动接口已实证「全套派生值」
+   * 会被整条过滤掉），而 2026-10-09 的现象是**所有模型**都被丢进 `p3` 低优先级队列——
+   * 那是身份级、不是模型级的惩罚。未配置时 cosyHeaders 保持原有派生值（行为不变）。
+   *
+   * 每个客户端请求一次 KV 读：device.ts 刻意不做内存缓存（面板改完立刻生效）。
+   */
+  const qoderDevice = await getQoderDevice(env)
+
   // 会话注入（测试/工具）：单次直发，不经过池。域由调用方显式给出，缺省 cn。
   if (opts?.session) {
     const encodedBody = renderBody(opts?.realm === 'global' ? 'global' : 'cn')
     const r = await sendQoderChatOnce(
-      opts.session.session, encodedBody, modelKey, model, wantStream, undefined, 'cn', opts?.delay, opts?.signal
+      opts.session.session, encodedBody, modelKey, model, wantStream, undefined, 'cn', opts?.delay, opts?.signal,
+      qoderDevice
     )
     return r.ok ? r.response : classifiedErrorResponse(r.classified)
   }
@@ -971,7 +1033,8 @@ export async function proxyQoderChatRequest(
       const accountRealm: QoderMetaRealm = account.realm === 'global' ? 'global' : 'cn'
       const encodedBody = renderBody(accountRealm)
       const r = await sendQoderChatOnce(
-        session, encodedBody, modelKey, model, wantStream, account.uid, accountRealm, delayFn, opts?.signal
+        session, encodedBody, modelKey, model, wantStream, account.uid, accountRealm, delayFn, opts?.signal,
+        qoderDevice
       )
       if (r.ok) {
         await noteQoderSuccess(env, provider.id, account.uid)
@@ -1055,7 +1118,10 @@ export async function proxyQoderChatRequest(
       { status: 400, headers: { 'Content-Type': 'application/json; charset=utf-8' } }
     )
   }
-  const r = await sendQoderChatOnce(data.session, renderBody(data.realm), modelKey, model, wantStream, undefined, data.realm)
+  const r = await sendQoderChatOnce(
+    data.session, renderBody(data.realm), modelKey, model, wantStream, undefined, data.realm, undefined, undefined,
+    qoderDevice
+  )
   return r.ok ? r.response : classifiedErrorResponse(r.classified)
 }
 

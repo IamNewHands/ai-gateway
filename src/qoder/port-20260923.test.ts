@@ -11,6 +11,8 @@ import { performQoderCheckin, normalizeQoderRealm, realmHasLegacyCheckin, qoderD
 import { QODER_DEVICE_FIELDS } from './device'
 import { classifyQoderError, type QoderClassified } from './classify'
 import { proxyQoderChatRequest, isQoderFlow, testQoderModel, markQoderAccountClassified, isQoderSessionDead } from './proxy'
+import baseprompt from './baseprompt.json'
+import { KV_KEYS } from '../config'
 import type { Env, Provider } from '../types'
 
 const CHAT_URL = 'https://gateway.qoder.com.cn/algo/api/v2/service/pro/sse/agent_chat_generation?Encode=1'
@@ -92,17 +94,18 @@ describe('P0-2 cosyHeaders 补齐 content-type / accept / user-agent / scene / b
     expect(h['Cosy-Business-Type']).toBe('agent')
   })
 
-  it('不发 cosy-business-product：取值取决于未定的 cli/ide 结论，硬编码会让头与体自相矛盾', async () => {
+  it('发 cosy-business-product，且取值等于 baseprompt 的 business.product（头与体不许自相矛盾）', async () => {
     const sess = await makeSession()
     const h = cosyHeaders(sess, '{}', CHAT_URL, 'application/json', false)
-    expect(h['Cosy-Business-Product']).toBeUndefined()
-    expect(Object.keys(h).map((k) => k.toLowerCase())).not.toContain('cosy-business-product')
+    // 取值不是拍脑袋写死的：直接与模板比对。改模板不改常量会在这一条上红。
+    expect(h['Cosy-Business-Product']).toBe(baseprompt.business.product)
+    expect(h['Cosy-Business-Product']).toBeTruthy()
   })
 
-  it('data-policy 仍是目标侧刻意选择的 disagree（不随本次移植改成 agree）', async () => {
+  it('data-policy = agree（对齐 qoder2api 与 hub 两套参考实现）', async () => {
     const sess = await makeSession()
     const h = cosyHeaders(sess, '{}', CHAT_URL, 'application/json', false)
-    expect(h['Cosy-Data-Policy']).toBe('disagree')
+    expect(h['Cosy-Data-Policy']).toBe('agree')
   })
 })
 
@@ -1045,5 +1048,70 @@ describe('池策略：401/403 只在会话被吊销时停用账号，其余冷�
     expect(isQoderSessionDead('Offline user session not found')).toBe(true)
     expect(isQoderSessionDead('permission denied')).toBe(false)
     expect(isQoderSessionDead(QUEUE_BODY)).toBe(false)
+  })
+})
+
+// ===== 2026-10-09：推理链路的出站客户端身份（真机机器头 / business-product / data-policy）=====
+// 现象：用户报「**所有模型**都返回 10605（queueType=p3 低优先级队列 + serviceAvailable=false）」。
+// 队列优先级是账号/身份级的量、不是模型级的量，故把面板里的真机设备身份接进推理链路
+// （判据与签到 checkinHeaders 一致：只有 machineToken 非空才算真机），并补齐两处与参考实现
+// 不一致的常量。本组用例是「KV 里的设备配置 → 真实出站头」的粘合点。
+describe('推理链路出站身份：真机机器头 + business-product + data-policy', () => {
+  /** 预置一份设备身份 → 走会话注入路径 → 捕获真实出站头。 */
+  async function headersWithDevice(device?: Record<string, string>) {
+    const store = new Map<string, string>()
+    if (device) store.set(KV_KEYS.QODER_DEVICE, JSON.stringify(device))
+    const env = {
+      KV: {
+        // 模仿真 KV：带 'json' 时返回已解析对象（getQoderDeviceConfig 读的就是它）
+        get: async (k: string, type?: string) => {
+          const v = store.get(k) ?? null
+          return v && type === 'json' ? JSON.parse(v) : v
+        },
+        put: async (k: string, v: string) => { store.set(k, v) },
+      },
+    } as unknown as Env
+    const session = await makeSession()
+    let seen: Record<string, string> = {}
+    vi.stubGlobal('fetch', vi.fn(async (_i: unknown, init?: RequestInit) => {
+      seen = (init?.headers || {}) as Record<string, string>
+      return new Response(sseBody([envelope(INNER_CHUNK)]), {
+        status: 200,
+        headers: { 'Content-Type': 'text/event-stream' },
+      })
+    }))
+    await proxyQoderChatRequest(env, { id: 'qoder' } as Provider, {
+      model: 'auto',
+      stream: true,
+      messages: [{ role: 'user', content: 'hi' }],
+    }, { session: { session }, stream: true })
+    return seen
+  }
+
+  it('配了真机身份 → 出站机器头是真机值（不再发 uid 派生值）', async () => {
+    const h = await headersWithDevice({
+      machineId: 'real-id',
+      machineToken: 'real-token',
+      machineType: '13fc94419140c338cf',
+      machineOS: 'x86_64_win32',
+    })
+    expect(h['Cosy-Machineid']).toBe('real-id')
+    expect(h['Cosy-Machinetoken']).toBe('real-token')
+    expect(h['Cosy-Machinetype']).toBe('13fc94419140c338cf')
+    expect(h['Cosy-Machineos']).toBe('x86_64_win32')
+  })
+
+  it('没配真机身份 → 出站机器头仍是 uid 派生值（未配置部署零行为变化）', async () => {
+    const session = await makeSession()
+    const h = await headersWithDevice()
+    expect(h['Cosy-Machinetoken']).toBe(session.machineToken)
+    expect(h['Cosy-Machineid']).toBe(session.machineId)
+  })
+
+  it('出站头带 business-product（等于模板值）与 agree，且不含伪造 clientip', async () => {
+    const h = await headersWithDevice()
+    expect(h['Cosy-Business-Product']).toBe(baseprompt.business.product)
+    expect(h['Cosy-Data-Policy']).toBe('agree')
+    expect(h['Cosy-Clientip']).toBeUndefined()
   })
 })

@@ -13,20 +13,37 @@
  */
 
 import { md5Hex } from './md5'
+import type { QoderDeviceIdentity } from './billing'
 
 // ===== COSY 指纹常量（对齐 keirouter constants.go） =====
 // 这些值不是任意的——上游签名校验会把它们与签名时的值比对。
 const IDE_VERSION = '1.0.0'
 const CLIENT_TYPE = '5'
-const DATA_POLICY = 'disagree'
+/**
+ * 数据策略。**两套参考实现都发 agree**（qoder2api `internal/bridge/client.go:36`、
+ * hub `qoder_sign.py:584`），本模块此前刻意发 `disagree`——那是唯一一处与两个实现
+ * 都不一致的身份字段，且没有任何实测依据支撑。
+ *
+ * 2026-10-09 现象：**所有模型**都返回 `10605`（`queueType=p3` 低优先级队列 +
+ * `serviceAvailable=false`）。队列优先级正是 consent 类字段最可能影响的东西，
+ * 故改回 `agree` 对齐两套实现（见 port-20260923.test.ts 的回归断言）。
+ */
+const DATA_POLICY = 'agree'
 const LOGIN_VERSION = 'v2'
 const MACHINE_OS = 'x86_64_windows'
 const MACHINE_TYPE = '5'
-const CLIENT_IP = '127.0.0.1'
 // qoder2api internal/bridge/client.go:50-53 抓包确认的传输层头常量。
 const USER_AGENT = 'Go-http-client/2.0'
 const COSY_SCENE = 'assistant'
 const COSY_BUSINESS_TYPE = 'agent'
+/**
+ * `cosy-business-product` **必须与请求体 `business.product` 一致**（baseprompt.json 模板值）。
+ *
+ * 旧实现两个都不发（「cli/ide 未定」）；qoder2api 发 `ide` 且其模板同为 ide 形态。
+ * 本模板是 `cli` / `0.1.43`，故发 `cli`。**改模板必须同时改这里**——
+ * port-20260923.test.ts 有一条断言把这两个值绑在一起，防止日后再次自相矛盾。
+ */
+const COSY_BUSINESS_PRODUCT = 'cli'
 
 // ===== QoderEncoding（encoding.go） =====
 
@@ -363,14 +380,33 @@ export function buildBearer(sess: CosySession, body: string, rawUrl: string): Co
  * 字符串 body 默认 `text/plain;charset=UTF-8`，与上游期望的 application/json 不符。
  * accept 同理：SSE 端点需要 `text/event-stream` 才会得到流式响应。
  *
- * 刻意不发 `cosy-business-product`：该头取值与请求体 `business.product` 必须一致，
- * 而目标模板目前是 `cli`、qoder2api 是 `ide`（见移植分析 P1-5，需实测确定）。
- * 在结论落地前硬编码任一值都会让头与体自相矛盾。
+ * `cosy-business-product` 现已发送：取值与请求体 `business.product` 绑定（见常量注释）。
+ * 旧实现刻意不发，理由是「cli/ide 未定」——但两套参考实现都发（qoder2api 发 `ide`），
+ * 而本模板 body 明确是 `cli`，一致性可直接从模板推出，不必等结论。
+ *
+ * ## `device`：真机身份（与签到链路同口径）
+ *
+ * 推理链路此前**完全没有接**面板里的设备身份（`qoder:device` KV），出站的是 uid 派生的
+ * 假 machineId/Token/Type——而同一个上游已经实证会按机器身份判定客户端是否官方
+ * （活动接口上「全套派生值」会被整条过滤，见 billing.ts checkinHeaders 注释）。
+ *
+ * 判据与签到一致：**只有配了 `machineToken` 才算真机身份**（hub issue #10 的逐头隔离实验）。
+ * 但与签到刻意不同的一点：未配置时**保持原来的派生值**，不改成「一个机器头都不发」——
+ * 推理接口缺机器头是否可接受从未实测，贸然跟随会引入新的失败面；签到那条规则来自活动接口的
+ * 实测，不能直接外推到推理接口。
  *
  * `_sse` 仅保留调用方语义（流式/非流式），不再影响头集：参考实现恒定发送
  * `cache-control: no-cache`，这里保持恒定以逐字节对齐。
  */
-export function cosyHeaders(sess: CosySession, body: string, rawUrl: string, accept: string, _sse: boolean): Record<string, string> {
+export function cosyHeaders(
+  sess: CosySession,
+  body: string,
+  rawUrl: string,
+  accept: string,
+  _sse: boolean,
+  device?: QoderDeviceIdentity
+): Record<string, string> {
+  const dev = device?.machineToken ? device : undefined
   const { date, bearer } = buildBearer(sess, body, rawUrl)
   const u = new URL(rawUrl)
   let sigPath = u.pathname
@@ -384,20 +420,23 @@ export function cosyHeaders(sess: CosySession, body: string, rawUrl: string, acc
     'Cosy-User': sess.uid,
     'Cosy-Date': date,
     'Cosy-Version': IDE_VERSION,
-    'Cosy-Machineid': sess.machineId,
+    // 真机身份优先（dev 只在 machineToken 非空时存在，见函数头）：
+    // 缺字段仍回退 uid 派生值/内置默认，与签到 checkinHeaders 的「native 分支」同构。
+    'Cosy-Machineid': dev?.machineId || sess.machineId,
     // machineToken 是**独立**的凭证值，不能复用 machineId：
     // qoder2api client.go:48 与 qoder2api-hub qoder_sign.py:597 都发各自的
     // machineToken。旧实现生成 machineToken 却发 machineId，等于让派生值白算。
-    'Cosy-Machinetoken': sess.machineToken,
-    'Cosy-Machinetype': sess.machineType,
-    'Cosy-Machineos': MACHINE_OS,
+    'Cosy-Machinetoken': dev?.machineToken || sess.machineToken,
+    'Cosy-Machinetype': dev?.machineType || sess.machineType,
+    'Cosy-Machineos': dev?.machineOS || MACHINE_OS,
     'Cosy-Clienttype': CLIENT_TYPE,
-    'Cosy-Clientip': CLIENT_IP,
     'Cosy-Bodyhash': md5Hex(body),
     'Cosy-Bodylength': String(body.length),
     'Cosy-Sigpath': sigPath,
     'Cosy-Scene': COSY_SCENE,
     'Cosy-Business-Type': COSY_BUSINESS_TYPE,
+    // 与 body 的 business.product 绑定（常量注释）；旧实现不发这个头。
+    'Cosy-Business-Product': COSY_BUSINESS_PRODUCT,
     'Cosy-Data-Policy': DATA_POLICY,
     'Cosy-Organization-Id': '',
     'Cosy-Organization-Tags': '',
