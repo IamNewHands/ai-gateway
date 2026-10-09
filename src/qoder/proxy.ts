@@ -18,13 +18,14 @@ import { getOauthAccessToken, readOauthToken, refreshOauthToken, refreshQoderTok
 import { buildQoderBody, cpaToUpstreamKey, fallbackUnknownModel, pickQoderModels, qoderStructuredToolMode, useQoderStructuredToolHistory } from './body'
 import type { QoderMetaRealm } from './model-meta'
 import { qoderEncode, cosySessionFor, cosyHeaders, buildBearer, type CosySession } from './cosy'
-import { classifyQoderError, qoderOpenAIErrorBody, noteQoderInnerError, qoderInnerErrorDetail, qoderInnerErrorClassified, type QoderClassified } from './classify'
+import { classifyQoderError, isQoderTransientTransport, isQoderTransientUpstream, qoderOpenAIErrorBody, noteQoderInnerError, qoderInnerErrorDetail, qoderInnerErrorClassified, QODER_TRANSIENT_MAX_RETRIES, QODER_TRANSIENT_BACKOFF_MS, type QoderClassified } from './classify'
 import {
   seedQoderPoolFromSingle,
   readQoderPool,
   pickQoderAccount,
   qoderAccountServesModel,
   qoderPoolServesModel,
+  qoderShortCooldownWait,
   refreshQoderPoolAccountIfNeeded,
   cooldownQoderAccount,
   cooldownQoderAccountModel,
@@ -607,6 +608,15 @@ export interface QoderProxyOptions {
    * 让调用方能显式指定国际版账号，从而拿到正确的 model_config 元数据。
    */
   realm?: QoderMetaRealm
+  /**
+   * 可注入的等待函数（瞬时重试退避 + 短冷却等待都用它）。
+   *
+   * 时间相关逻辑必须可注入：否则用例只能睡真实秒数（1s/2s 退避 × 多次重试会让
+   * 测试套件从毫秒级涨到秒级），且无法断言「确实等待了、等了几毫秒」。
+   */
+  delay?: QoderDelayFn
+  /** 入站请求的取消信号：客户端断开时中止上游 fetch，且**不**重试（避免白烧配额）。 */
+  signal?: AbortSignal
 }
 
 /** 单次上游发送的结果：成功 Response，或分类后的错误（供池循环决定冷却与轮转）。 */
@@ -614,7 +624,29 @@ type QoderSendResult =
   | { ok: true; response: Response }
   | { ok: false; classified: QoderClassified }
 
-/** 用给定 COSY 会话发送一次 chat 请求并构造客户端响应（流式/非流式）。 */
+/** 可注入的等待函数（测试用；默认 setTimeout）。时间相关逻辑必须可注入，否则用例只能睡真实秒数。 */
+export type QoderDelayFn = (ms: number) => Promise<void>
+
+const defaultQoderDelay: QoderDelayFn = (ms) => new Promise((r) => setTimeout(r, ms))
+
+/**
+ * 用给定 COSY 会话发送一次 chat 请求并构造客户端响应（流式/非流式）。
+ *
+ * ## 瞬时故障同账号重试（hub `TRANSIENT_MAX_RETRIES = 2`，退避 1s/2s）
+ *
+ * 动机（源实测记载）：「对 qoder.sh 的 TLS/连接抖动很常见」。旧实现单次 fetch 失败即
+ * 分类换号 → **一次 TLS 抖动烧掉一个账号的冷却**（账号本身完全健康）。
+ *
+ * 两条重试路径，与源逐条同构：
+ *   1. **传输层**（fetch 抛错：SSL EOF / 连接重置 / 超时）→ 原地重试；
+ *   2. **瞬时 HTTP**（418/5xx、或 4xx 带 provider_error）→ 原地重试。
+ * 401/403/429 与客户端参数错**不重试**（`isQoderTransientUpstream`），它们各自有专门路径。
+ *
+ * ⚠️ 每次重试都必须**重新签名**：`buildBearer` 把「当前秒级 date + 随机 requestId」
+ * 算进签名（cosy.ts:344-354），复用上一次的头集合会因 date/requestId 与签名不匹配被上游拒。
+ *
+ * 入站请求被客户端取消（AbortError）不重试：那会白烧上游配额，且客户端已经不要这个响应了。
+ */
 async function sendQoderChatOnce(
   session: CosySession,
   encodedBody: string,
@@ -622,36 +654,75 @@ async function sendQoderChatOnce(
   model: string,
   wantStream: boolean,
   accountUid?: string,
-  realm: 'cn' | 'global' = 'cn'
+  realm: 'cn' | 'global' = 'cn',
+  delay: QoderDelayFn = defaultQoderDelay,
+  outerSignal?: AbortSignal
 ): Promise<QoderSendResult> {
   const chatUrl = qoderChatUrl(realm)
-  const headers = cosyHeaders(session, encodedBody, chatUrl, 'text/event-stream', true)
-  headers['x-model-key'] = modelKey
-  headers['x-model-source'] = 'system'
 
-  let resp: Response
-  try {
-    resp = await streamFetchWithTimeout(chatUrl, {
-      method: 'POST',
-      headers,
-      body: encodedBody,
-    })
-  } catch (err) {
-    return {
-      ok: false,
-      classified: classifyQoderError({ status: 0, body: (err as Error).message || '网络请求失败' }),
+  let resp: Response | null = null
+  let lastClassified: QoderClassified | null = null
+
+  for (let attempt = 0; attempt <= QODER_TRANSIENT_MAX_RETRIES; attempt++) {
+    // 头集合**每次重算**（date/requestId 参与签名，不能跨尝试复用）
+    const headers = cosyHeaders(session, encodedBody, chatUrl, 'text/event-stream', true)
+    headers['x-model-key'] = modelKey
+    headers['x-model-source'] = 'system'
+
+    try {
+      resp = await streamFetchWithTimeout(chatUrl, {
+        method: 'POST',
+        headers,
+        body: encodedBody,
+      }, { signal: outerSignal })
+    } catch (err) {
+      // 客户端主动断开：不重试（重试只会白烧上游配额）
+      if (outerSignal?.aborted || (err as { name?: string })?.name === 'AbortError') {
+        return {
+          ok: false,
+          classified: classifyQoderError({ status: 0, body: (err as Error).message || '请求已被取消' }),
+        }
+      }
+      const transient = isQoderTransientTransport(err)
+      if (transient && attempt < QODER_TRANSIENT_MAX_RETRIES) {
+        const backoff = QODER_TRANSIENT_BACKOFF_MS * (attempt + 1)
+        console.warn(
+          `[qoder-transient] transport error on '${model}' (try ${attempt + 1}/${QODER_TRANSIENT_MAX_RETRIES + 1}): ` +
+          `${String((err as Error).message || err).slice(0, 120)} - retry in ${backoff}ms`
+        )
+        await delay(backoff)
+        continue
+      }
+      lastClassified = classifyQoderError({ status: 0, body: (err as Error).message || '网络请求失败' })
+      return { ok: false, classified: lastClassified }
     }
+
+    if (resp.ok && resp.body) break
+
+    // 非 2xx 或无 body：读错误体并判断是否值得原地重试
+    const errText = await resp.text().catch(() => '')
+    if (isQoderTransientUpstream(resp.status, errText) && attempt < QODER_TRANSIENT_MAX_RETRIES) {
+      const backoff = QODER_TRANSIENT_BACKOFF_MS * (attempt + 1)
+      console.warn(
+        `[qoder-transient] upstream HTTP ${resp.status} on '${model}' ` +
+        `(try ${attempt + 1}/${QODER_TRANSIENT_MAX_RETRIES + 1}) - retry in ${backoff}ms`
+      )
+      await delay(backoff)
+      resp = null
+      continue
+    }
+    lastClassified = classifyQoderError({
+      status: resp.status,
+      body: errText,
+      retryAfter: resp.headers.get('retry-after') || undefined,
+    })
+    return { ok: false, classified: lastClassified }
   }
 
-  if (!resp.ok || !resp.body) {
-    const errText = await resp.text().catch(() => '')
+  if (!resp || !resp.ok || !resp.body) {
     return {
       ok: false,
-      classified: classifyQoderError({
-        status: resp.status,
-        body: errText,
-        retryAfter: resp.headers.get('retry-after') || undefined,
-      }),
+      classified: lastClassified || classifyQoderError({ status: 0, body: '上游未返回可用响应' }),
     }
   }
 
@@ -818,7 +889,9 @@ export async function proxyQoderChatRequest(
   // 会话注入（测试/工具）：单次直发，不经过池。域由调用方显式给出，缺省 cn。
   if (opts?.session) {
     const encodedBody = renderBody(opts?.realm === 'global' ? 'global' : 'cn')
-    const r = await sendQoderChatOnce(opts.session.session, encodedBody, modelKey, model, wantStream)
+    const r = await sendQoderChatOnce(
+      opts.session.session, encodedBody, modelKey, model, wantStream, undefined, 'cn', opts?.delay, opts?.signal
+    )
     return r.ok ? r.response : classifiedErrorResponse(r.classified)
   }
 
@@ -833,8 +906,16 @@ export async function proxyQoderChatRequest(
   if (poolLen > 0) {
     const tried = new Set<string>()
     let lastErr: QoderClassified | null = null
+    /**
+     * 短冷却等待只允许一次（hub `waited_cool` 标志）。
+     *
+     * 为什么 +2 次迭代预算：等待本身要占一次迭代（pick 返回 null → 等 → continue），
+     * 冷却到期后还要再 pick 一次。正常轮换仍由 `tried` 集合自然终止，不会因此多轮。
+     */
+    let waitedCool = false
+    const delayFn = opts?.delay || defaultQoderDelay
 
-    for (let i = 0; i < poolLen; i++) {
+    for (let i = 0; i < poolLen + 2; i++) {
       let account: QoderPoolAccount | null = null
       try {
         // 账号固定：首轮优先用 X-Qoder-Account 指定的 uid，之后自动挑号轮转。
@@ -842,7 +923,30 @@ export async function proxyQoderChatRequest(
         // 传 exclusiveRealm：区域错配的账号直接跳过（避免一次必然的 403 + 白冻 60 秒）。
         account = await pickQoderAccount(env, provider.id, tried, i === 0 ? opts?.preferUid : undefined, model, exclusiveRealm)
       } catch { /* ignore */ }
-      if (!account) break
+      if (!account) {
+        /**
+         * 无健康账号可用时，先看池里是否只是**短冷却**（≤10s）。
+         *
+         * 旧实现此处直接跳出 → 报「所有账号均不可用（冷却中或已禁用）」503。但瞬时错误
+         * （传输抖动/5xx）触发的短冷却几秒后就恢复，让客户端收 503 是错的
+         * （hub `_short_error_cooldown_wait` 正是为此：等 ≤10s 而不是失败）。
+         *
+         * 只等一次：若等完仍挑不到，说明不是短冷却问题，如实报错。
+         */
+        if (!waitedCool) {
+          const wait = qoderShortCooldownWait(pool, tried, Date.now(), { model, realm: exclusiveRealm })
+          if (wait > 0) {
+            waitedCool = true
+            console.warn(
+              `[qoder-cooldown] accounts in short error-cooldown for '${model}' ` +
+              `(${Math.round(wait)}ms left) - waiting instead of failing`
+            )
+            await delayFn(wait + 250)
+            continue
+          }
+        }
+        break
+      }
       tried.add(account.uid)
 
       // 会话构造（含按账号刷新 token）；刷新失败视为鉴权失效 → 禁用并轮转
@@ -866,7 +970,9 @@ export async function proxyQoderChatRequest(
 
       const accountRealm: QoderMetaRealm = account.realm === 'global' ? 'global' : 'cn'
       const encodedBody = renderBody(accountRealm)
-      const r = await sendQoderChatOnce(session, encodedBody, modelKey, model, wantStream, account.uid, accountRealm)
+      const r = await sendQoderChatOnce(
+        session, encodedBody, modelKey, model, wantStream, account.uid, accountRealm, delayFn, opts?.signal
+      )
       if (r.ok) {
         await noteQoderSuccess(env, provider.id, account.uid)
         // 该账号在该模型上刚成功 → 清掉它的模型级冷却（hub `clear_error(model=)`

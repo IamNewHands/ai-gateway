@@ -34,6 +34,7 @@ import {
   isQoderAccountHealthy,
   qoderPoolServesModel,
   qoderAccountServesModel,
+  qoderShortCooldownWait,
   listQoderPoolStatus,
   setQoderCampaignCode,
   blockQoderCampaign,
@@ -42,7 +43,9 @@ import {
   writeQoderPool,
   type QoderPoolAccount,
 } from './pool'
-import { markQoderAccountClassified } from './proxy'
+import { markQoderAccountClassified, proxyQoderChatRequest } from './proxy'
+import { cosySessionFor } from './cosy'
+import { isQoderTransientUpstream, isQoderTransientTransport } from './classify'
 import type { Env, Provider } from '../types'
 
 afterEach(() => { vi.unstubAllGlobals() })
@@ -979,5 +982,260 @@ describe('项 9 next_available_at：告诉用户是「今天」还是「明天�
     const r = await performQoderCheckin('dt-t', 'cn', 'u1', undefined, undefined, { now: Date.UTC(2026, 9, 9, 5, 0, 0) })
     expect(r.success, JSON.stringify(r)).toBe(true)
     expect(r.nextAvailableLabel).toBe('10-10 10:00（UTC+8）')
+  })
+})
+
+// ===== 之后做第 3 项：瞬时故障同账号重试 + 短冷却等待 =====
+describe('瞬时故障：同账号重试，不再一次抖动就烧掉一个账号', () => {
+  /** 构造一个可注入会话的直发调用（不经过池），记录等待时长。 */
+  async function callDirect(
+    fetchImpl: (url: string, init?: RequestInit) => Promise<Response>,
+    opts?: { delay?: (ms: number) => Promise<void>; signal?: AbortSignal }
+  ) {
+    const session = await cosySessionFor('dt-transient', 'drt-t', 'uid-transient', 'T')
+    vi.stubGlobal('fetch', vi.fn(fetchImpl))
+    const waits: number[] = []
+    const delay = opts?.delay || (async (ms: number) => { waits.push(ms) })
+    const resp = await proxyQoderChatRequest({} as Env, { id: 'qoder' } as Provider, {
+      model: 'auto', stream: false, messages: [{ role: 'user', content: 'hi' }],
+    }, { session: { session }, stream: false, delay, signal: opts?.signal })
+    return { resp, waits }
+  }
+
+  const okBody = JSON.stringify({
+    id: 'c1', model: 'auto',
+    choices: [{ index: 0, message: { role: 'assistant', content: '好' }, finish_reason: 'stop' }],
+  })
+  // 上游帧必须包在信封里（外层 {headers, body}），内层才是 OpenAI chunk；
+  // 直接发裸 chunk 会被 readQoderFrame 判为非信封帧 → 零有效帧 → 502。
+  const sseOk = `data: ${JSON.stringify({ headers: {}, body: okBody })}\n\ndata: ${JSON.stringify({ headers: {}, body: '[DONE]' })}\n\n`
+
+  it('传输层抖动（SSL EOF）→ 原地重试并成功，**不换号**', async () => {
+    let calls = 0
+    const { resp, waits } = await callDirect(async () => {
+      calls++
+      if (calls === 1) throw new Error('SSL: UNEXPECTED_EOF_WHILE_READING')
+      return new Response(sseOk, { status: 200, headers: { 'Content-Type': 'text/event-stream' } })
+    })
+    expect(calls).toBe(2)              // 第一次抛错，第二次成功
+    expect(resp.status).toBe(200)
+    expect(waits).toEqual([1000])      // 退避 1s（第 1 次重试）
+  })
+
+  it('连续两次抖动 → 共 3 次尝试（1 + 2 次重试），退避 1s、2s', async () => {
+    let calls = 0
+    const { resp, waits } = await callDirect(async () => {
+      calls++
+      if (calls <= 2) throw new Error('connection reset by peer')
+      return new Response(sseOk, { status: 200, headers: { 'Content-Type': 'text/event-stream' } })
+    })
+    expect(calls).toBe(3)
+    expect(resp.status).toBe(200)
+    expect(waits).toEqual([1000, 2000])
+  })
+
+  it('三次都抖动 → 用尽重试后如实报错（不再无限重试）', async () => {
+    let calls = 0
+    const { resp, waits } = await callDirect(async () => {
+      calls++
+      throw new Error('fetch failed: network error')
+    })
+    expect(calls).toBe(3)              // 1 次原始 + 2 次重试
+    expect(waits).toEqual([1000, 2000])
+    expect(resp.status).toBe(502)      // 归类为不可用
+  })
+
+  it('瞬时 HTTP（503/418）→ 原地重试；**每次都重新签名**（date/requestId 参与签名，不能复用）', async () => {
+    const auths: string[] = []
+    let calls = 0
+    const { resp } = await callDirect(async (_url, init) => {
+      calls++
+      auths.push(String((init?.headers as Record<string, string>)?.Authorization || ''))
+      if (calls === 1) return new Response('upstream boom', { status: 503 })
+      return new Response(sseOk, { status: 200, headers: { 'Content-Type': 'text/event-stream' } })
+    })
+    expect(calls).toBe(2)
+    expect(resp.status).toBe(200)
+    // 两次都带 COSY Bearer；且**不是同一个串**（requestId 是随机 uuid）
+    expect(auths[0]).toContain('Bearer COSY.')
+    expect(auths[1]).toContain('Bearer COSY.')
+    expect(auths[0]).not.toBe(auths[1])
+  })
+
+  it('**不该重试**：401/403/429 立即返回（各自有专门路径，重试只会加剧）', async () => {
+    for (const status of [401, 403, 429]) {
+      let calls = 0
+      const { resp } = await callDirect(async () => {
+        calls++
+        return new Response(JSON.stringify({ error: { message: 'nope' } }), { status })
+      })
+      expect(calls, `HTTP ${status} 不应重试`).toBe(1)
+      expect(resp.status).toBe(status === 429 ? 429 : (status === 401 ? 401 : 403))
+    }
+  })
+
+  it('**不该重试**：客户端参数错（invalid_request_error）即使状态是 500', async () => {
+    let calls = 0
+    const { resp } = await callDirect(async () => {
+      calls++
+      return new Response(JSON.stringify({ error: { code: 'invalid_request_error', message: 'Range of max_tokens is invalid' } }), { status: 500 })
+    })
+    expect(calls).toBe(1)              // 命中 CLIENT_FAULT_MARKERS → 不重试
+    expect(resp.status).toBeGreaterThanOrEqual(400)
+  })
+
+  it('**不该重试**：内容审核（确定性拒绝，重试必然再失败）', async () => {
+    let calls = 0
+    const { resp } = await callDirect(async () => {
+      calls++
+      return new Response(JSON.stringify({ error: { message: 'DataInspectionFailed: Input text data may contain inappropriate content.' } }), { status: 500 })
+    })
+    expect(calls).toBe(1)
+    expect(resp.status).toBe(400)      // 内容审核归 400（让客户端改输入）
+  })
+
+  it('客户端已断开（AbortError）→ 不重试（否则白烧上游配额）', async () => {
+    const ac = new AbortController()
+    let calls = 0
+    const { resp } = await callDirect(async () => {
+      calls++
+      ac.abort()
+      throw Object.assign(new Error('The operation was aborted'), { name: 'AbortError' })
+    }, { signal: ac.signal })
+    expect(calls).toBe(1)
+    expect(resp.status).toBeGreaterThanOrEqual(400)
+  })
+
+  it('判定函数本身：瞬时/非瞬时的边界逐条对齐源', () => {
+    // 瞬时：418 / 5xx / 4xx+provider_error
+    expect(isQoderTransientUpstream(418, 'provider_error')).toBe(true)
+    expect(isQoderTransientUpstream(500, '')).toBe(true)
+    expect(isQoderTransientUpstream(502, 'bad gateway')).toBe(true)
+    expect(isQoderTransientUpstream(504, '')).toBe(true)
+    expect(isQoderTransientUpstream(400, 'provider_error: upstream failed')).toBe(true)
+    // 非瞬时：凭证/频控
+    for (const s of [401, 403, 429]) expect(isQoderTransientUpstream(s, 'provider_error'), `HTTP ${s}`).toBe(false)
+    // 非瞬时：客户端确定性错误（即使 5xx）
+    expect(isQoderTransientUpstream(500, 'invalid_parameter_error')).toBe(false)
+    expect(isQoderTransientUpstream(500, 'DataInspectionFailed')).toBe(false)
+    expect(isQoderTransientUpstream(500, 'permission_error')).toBe(false)
+    // 非瞬时：普通 400（无 provider_error）
+    expect(isQoderTransientUpstream(400, 'bad request')).toBe(false)
+  })
+
+  it('传输层判定：AbortError 不算瞬时（由调用方按「谁中止的」处理）', () => {
+    expect(isQoderTransientTransport(new Error('SSL: UNEXPECTED_EOF_WHILE_READING'))).toBe(true)
+    expect(isQoderTransientTransport(new Error('connection reset by peer'))).toBe(true)
+    expect(isQoderTransientTransport(new Error('fetch failed: network error'))).toBe(true)
+    expect(isQoderTransientTransport(new Error('operation timed out'))).toBe(true)
+    expect(isQoderTransientTransport(Object.assign(new Error('aborted'), { name: 'AbortError' }))).toBe(false)
+    expect(isQoderTransientTransport(new Error('some unrelated failure'))).toBe(false)
+  })
+})
+
+describe('短冷却等待：全池只是短暂冷却时等待，而不是报「所有账号不可用」', () => {
+  it('账号级短冷却（≤10s）→ 返回最短剩余；超过上限 → 不等', async () => {
+    const { env } = makeEnv()
+    const pid = 'qoder-shortcool-1'
+    await writeQoderPool(env, pid, [account({ uid: 'a' })])
+    const now = Date.now()
+    // 5s 冷却 → 在窗口内
+    await cooldownQoderAccount(env, pid, 'a', 5000, '瞬时抖动')
+    const pool = await readQoderPool(env, pid)
+    const w = qoderShortCooldownWait(pool, new Set(), Date.now())
+    expect(w).toBeGreaterThan(0)
+    expect(w).toBeLessThanOrEqual(5000)
+    // 60s 冷却 → 超过 10s 上限，不等
+    await cooldownQoderAccount(env, pid, 'a', 60000, '长冷却')
+    const pool2 = await readQoderPool(env, pid)
+    expect(qoderShortCooldownWait(pool2, new Set(), Date.now())).toBe(0)
+  })
+
+  it('exclude 里的账号不算：等它也不会被本请求使用，纯属浪费', async () => {
+    const { env } = makeEnv()
+    const pid = 'qoder-shortcool-2'
+    await writeQoderPool(env, pid, [account({ uid: 'a' })])
+    await cooldownQoderAccount(env, pid, 'a', 5000, '抖动')
+    const pool = await readQoderPool(env, pid)
+    expect(qoderShortCooldownWait(pool, new Set(), Date.now())).toBeGreaterThan(0)
+    // 已试过该账号 → 不再为它等待
+    expect(qoderShortCooldownWait(pool, new Set(['a']), Date.now())).toBe(0)
+  })
+
+  it('该模型正被上游频控（429 语义）→ 返回 0，不在这里等', async () => {
+    const { env } = makeEnv()
+    const pid = 'qoder-shortcool-3'
+    await writeQoderPool(env, pid, [account({ uid: 'a' })])
+    await cooldownQoderAccount(env, pid, 'a', 5000, '抖动')
+    await cooldownQoderAccountModel(env, pid, 'a', 'qmodel', 30000, '429')
+    const pool = await readQoderPool(env, pid)
+    // 不带 model：可等
+    expect(qoderShortCooldownWait(pool, new Set(), Date.now())).toBeGreaterThan(0)
+    // 带被频控的 model：交给 429 路径，不等待
+    expect(qoderShortCooldownWait(pool, new Set(), Date.now(), { model: 'qmodel' })).toBe(0)
+  })
+
+  it('禁用账号不计入等待；区域过滤生效', async () => {
+    const { env } = makeEnv()
+    const pid = 'qoder-shortcool-4'
+    await writeQoderPool(env, pid, [
+      account({ uid: 'off', enabled: false }),
+      account({ uid: 'intl', realm: 'global' }),
+    ])
+    await cooldownQoderAccount(env, pid, 'off', 5000, 'x')
+    await cooldownQoderAccount(env, pid, 'intl', 5000, 'x')
+    const pool = await readQoderPool(env, pid)
+    // 只有 intl 在冷却且未禁用：要 cn 区域 → 不等（intl 不服务 cn）
+    expect(qoderShortCooldownWait(pool, new Set(), Date.now(), { realm: 'cn' })).toBe(0)
+    // 要 global 区域 → 等 intl
+    expect(qoderShortCooldownWait(pool, new Set(), Date.now(), { realm: 'global' })).toBeGreaterThan(0)
+  })
+
+  it('**端到端**：池内唯一账号处于短冷却 → 等待后续用同一账号成功，而不是返回 503', async () => {
+    const { env } = makeEnv()
+    const pid = 'qoder-shortcool-e2e'
+    // 该账号带真实 token（buildQoderAccountSession 会用它）
+    const session = await cosySessionFor('dt-e2e', 'drt-e2e', 'uid-e2e', 'E')
+    await writeQoderPool(env, pid, [account({
+      uid: 'uid-e2e',
+      token: { access_token: 'dt-e2e', refresh_token: 'drt-e2e', expires_at: Date.now() + 86400000, updated_at: 0 },
+    })])
+    // 冷却 9s：既在 10s 等待上限内，又留出足够宽的容差——用 3s 时，整机在高负载
+    // （126 个测试文件并行）下卡顿几秒就会让冷却自然到期，用例随机失败。
+    await cooldownQoderAccount(env, pid, 'uid-e2e', 9000, '瞬时抖动')
+    // 上游正常；账号冷却在第一次 pick 时被跳过 → 等待 → 冷却到期 → 成功
+    const body = JSON.stringify({
+      id: 'c1', model: 'auto',
+      choices: [{ index: 0, message: { role: 'assistant', content: '好' }, finish_reason: 'stop' }],
+    })
+    const frame = `data: ${JSON.stringify({ headers: {}, body })}\n\ndata: ${JSON.stringify({ headers: {}, body: '[DONE]' })}\n\n`
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(frame, {
+      status: 200, headers: { 'Content-Type': 'text/event-stream' },
+    })))
+    const waits: number[] = []
+    const resp = await proxyQoderChatRequest(env, {
+      id: pid,
+      // buildQoderAccountSession 需要 provider.oauth 才会构造会话；缺了它会被当成
+      // 「token 刷新失败」→ 禁用账号（与本用例要验的短冷却等待无关，属测试装置缺失）。
+      oauth: { flowType: 'qoder', loginRealm: 'cn' },
+    } as unknown as Provider, {
+      model: 'auto', stream: false, messages: [{ role: 'user', content: 'hi' }],
+    }, {
+      stream: false,
+      // 等待时把冷却真正走完（否则 pick 仍然挑不到）：注入的 delay 里推进真实时钟不可行，
+      // 故这里直接清掉冷却，模拟「等待期间冷却到期」。
+      delay: async (ms) => {
+        waits.push(ms)
+        await clearQoderModelCooldown(env, pid, 'uid-e2e')
+        const pool = await readQoderPool(env, pid)
+        const acc = pool.find((a) => a.uid === 'uid-e2e')!
+        acc.state = { ...acc.state, until: 0 }
+        await writeQoderPool(env, pid, pool)
+      },
+    })
+    expect(waits.length, '应当等待了短冷却').toBe(1)
+    expect(waits[0]).toBeGreaterThan(0)
+    expect(waits[0]).toBeLessThanOrEqual(9250)
+    expect(resp.status, JSON.stringify(await resp.clone().json().catch(() => ({})))).toBe(200)
   })
 })

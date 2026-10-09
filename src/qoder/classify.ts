@@ -30,6 +30,84 @@ export interface QoderClassified {
 
 const MAX_RETRY_AFTER_MS = 10 * 60 * 1000
 
+// ===== 瞬时故障判定（hub `_is_transient_upstream` / `_is_transient_transport`）=====
+
+/**
+ * 同账号额外重试次数（hub `TRANSIENT_MAX_RETRIES = 2`，退避 1s、2s）。
+ *
+ * 为什么是 2 而不是目标的 1（`TRANSIENT_RETRY_MAX`）：目标那条是**通用**转发路径的
+ * 单次重试；Qoder 这条要对 qoder.sh 的 TLS 抖动（hub 原文「对 qoder.sh 的 TLS/连接抖动
+ * 很常见」）留出第二次机会。两次都失败才换号。
+ */
+export const QODER_TRANSIENT_MAX_RETRIES = 2
+
+/** 退避基准（毫秒）：第 n 次重试等 `n * 该值`，与 hub 的 `time.sleep(tries + 1)` 同形。 */
+export const QODER_TRANSIENT_BACKOFF_MS = 1000
+
+/** hub `TRANSIENT_HTTP_CODES = (418, 500, 502, 503, 504)`。 */
+const TRANSIENT_HTTP_CODES = [418, 500, 502, 503, 504]
+
+/**
+ * 客户端侧确定性错误标记（hub `_CLIENT_FAULT_MARKERS`）：命中即**永不重试**。
+ *
+ * 重试这些错误纯属浪费：参数非法、鉴权失败、权限不足、内容审核都是「同样输入必然同样结果」。
+ */
+const CLIENT_FAULT_MARKERS = [
+  'invalid_parameter_error',
+  'invalid_request_error',
+  'authentication_error',
+  'permission_error',
+  '"range of ',
+  'datainspectionfailed',
+  'inappropriate content',
+  'input text data may contain',
+  'contentfilter',
+  'sensitivecontent',
+]
+
+/** 传输层瞬时故障的字符串特征（hub `_is_transient_transport` 的字符串分支）。 */
+const TRANSIENT_TRANSPORT_MARKERS = ['ssl', 'eof', 'reset', 'timed out', 'broken pipe', 'connection', 'network', 'fetch failed', 'aborted']
+
+/**
+ * 一次上游 HTTP 错误是否**瞬时**（可同账号重试）。
+ *
+ * 规则（与源逐条同构）：
+ *   - `401/403/429` 永不重试：凭证/频控各自有专门路径，重试只会加剧；
+ *   - 命中客户端确定性错误标记 → 永不重试；
+ *   - `418`/`5xx` → 瞬时（418 是上游把自己的 provider 故障包装成 418）；
+ *   - 其余 4xx 带 `provider_error` → 瞬时。
+ *
+ * 为什么 418 要单列：上游把 provider 故障以 **HTTP200 信封 + statusCodeValue=418**
+ * 投递（见 proxy.ts 的信封处理），fetch 层重试覆盖不到那种形态，但真发 418 时同样是瞬时。
+ */
+export function isQoderTransientUpstream(status: number, body: string): boolean {
+  if (status === 401 || status === 403 || status === 429) return false
+  const lower = (body || '').toLowerCase()
+  if (CLIENT_FAULT_MARKERS.some((m) => lower.includes(m))) return false
+  if (TRANSIENT_HTTP_CODES.includes(status) || status >= 500) return true
+  if (status >= 400 && status < 500 && lower.includes('provider_error')) return true
+  return false
+}
+
+/**
+ * 传输层异常是否**瞬时**（TLS EOF / 连接重置 / 超时 / DNS 抖动）。
+ *
+ * 为什么按字符串判断而不只看异常类型：Workers 的 fetch 抛出的是普通 `TypeError`
+ * 或 `DOMException`，没有 Node 那套 `ECONNRESET`/`SSLError` 类型层级；错误原因只体现在
+ * message 里（如 "SSL: UNEXPECTED_EOF_WHILE_READING"、"The operation was aborted"）。
+ * 源在 Python 侧同样有字符串兜底分支（`isinstance(exc, str)`），语义一致。
+ *
+ * `AbortError` 需调用方另行区分：入站请求被客户端取消时不该重试（那会白烧上游配额），
+ * 故本函数不把裸 `abort` 当瞬时——由调用方按「是谁中止的」判断。
+ */
+export function isQoderTransientTransport(err: unknown): boolean {
+  const name = (err as { name?: string })?.name || ''
+  if (name === 'AbortError') return false
+  const msg = String((err as Error)?.message || err || '').toLowerCase()
+  if (!msg) return false
+  return TRANSIENT_TRANSPORT_MARKERS.some((m) => msg.includes(m))
+}
+
 /** 解析 Retry-After：支持秒数或 RFC1123 时间；封顶 10 分钟；fallback<0 返回 0。 */
 function parseRetryAfter(raw: string | undefined, fallbackMs: number): number {
   const text = (raw || '').trim()

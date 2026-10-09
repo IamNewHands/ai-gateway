@@ -260,6 +260,52 @@ export function qoderPoolServesModel(pool: QoderPool, requiredRealm?: QoderMetaR
 }
 
 /**
+ * 短冷却最长等待上限（hub `ERROR_COOLDOWN_WAIT_MAX = 10.0` 秒）。
+ *
+ * 为什么是 10 秒：足够覆盖「瞬时错误触发的短冷却」（默认 softMs 60s 太长、note_error 的
+ * 15s 也超），又不至于让客户端请求挂到超时。超过这个值就如实报错。
+ */
+export const QODER_ERROR_COOLDOWN_WAIT_MAX_MS = 10 * 1000
+
+/**
+ * 池内**短冷却**账号的最短剩余等待（毫秒）；不适用 → 0（hub `_short_error_cooldown_wait`，
+ * qoder_proxy.py:3696-3718，`ERROR_COOLDOWN_WAIT_MAX = 10.0`）。
+ *
+ * 动机（源实测）：账号因**瞬时错误**（传输抖动 / 5xx）被短冷却后，全池可能暂时无健康号，
+ * 此时直接报「所有账号不可用」是错的——等几秒它们就回来了。等 10 秒内的短冷却
+ * 比让客户端收一个 503 更划算。
+ *
+ * 三条边界（与源逐条同构）：
+ *   1. 只看账号级 `until`；若该账号在**该模型**上被上游频控（modelCooldowns）→ 返回 0，
+ *      交给 429 路径处理（两者语义严格分开，等它也不会好）；
+ *   2. `exclude`（本请求已试过的账号）**不算**：等它冷却好了也不会再被本请求使用，纯属浪费；
+ *   3. 只等 `(0, maxWaitMs]` 区间内的；超过上限的不等（宁可报错也不让请求挂太久）。
+ *
+ * `realm` 非空时只统计该区域的账号（源同样按 realm 过滤）。
+ */
+export function qoderShortCooldownWait(
+  pool: QoderPool,
+  exclude: Set<string>,
+  now: number,
+  opts?: { model?: string; realm?: QoderMetaRealm | ''; maxWaitMs?: number }
+): number {
+  const maxWaitMs = opts?.maxWaitMs ?? QODER_ERROR_COOLDOWN_WAIT_MAX_MS
+  const model = opts?.model
+  const realm = opts?.realm
+  const waits: number[] = []
+  for (const a of pool) {
+    if (a.enabled === false || a.state?.disabled) continue
+    if (exclude.has(a.uid)) continue
+    if (realm && qoderAccountRealm(a) !== realm) continue
+    // 该模型正被上游频控 → 正当 429 语义，不在这里等
+    if (model && (a.state?.modelCooldowns?.[model] || 0) > now) return 0
+    const remain = (a.state?.until || 0) - now
+    if (remain > 0 && remain <= maxWaitMs) waits.push(remain)
+  }
+  return waits.length > 0 ? Math.min(...waits) : 0
+}
+
+/**
  * 挑号（两段式，与 trae / workbuddy 池同口径）：
  *  - 指定 preferUid（客户端 X-Qoder-Account 或面板首选账号）且健康 → 直接用它；
  *  - 第二段：**7 天内到期且有剩余**的账号里，到期最早者优先（同到期比积分高低）。

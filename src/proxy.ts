@@ -1623,6 +1623,8 @@ export async function forwardProxy(
       const preferUid = resolveQoderPreferUid(c.req.header('X-Qoder-Account'), provider)
       const response = await proxyQoderChatRequest(c.env, provider, forwardBody as Record<string, unknown>, {
         preferUid,
+        // 客户端断开时中止上游并**放弃重试**：否则一次断连会触发 1s+2s 退避白烧上游配额
+        signal: c.req.raw.signal,
       })
       const logLevel = response.ok ? 'request' : (response.status >= 500 ? 'error' : 'warn')
       try {
