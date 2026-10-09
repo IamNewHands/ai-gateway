@@ -659,6 +659,18 @@ export interface CheckinResult {
   nickname?: string
   /** 权益包明细（每个包的名称 + 到期时间），来自 get-user-resource Accounts[] */
   packages?: PackageInfo[]
+  /**
+   * 本次领到的兑换码（券类活动）：面板据此展示与复制。
+   *
+   * 它是**不可恢复资产**（码只回一次），权威副本存在池状态 `QoderPoolState.campaignCodes`
+   * 里；这里只是本次操作的回报，随签到结果 KV 的 TTL 一起过期，不作为唯一来源。
+   */
+  campaignCodes?: Array<{ campaign: string; code: string }>
+  /**
+   * Pro 升级包（一次性 +1800）领取结果：`ok` = 领取成功（`already` 时表示之前已领过，
+   * 此时 **不计入** 本次积分）。
+   */
+  proClaim?: { ok: boolean; already?: boolean; message: string; rewardCredit?: number }
   /** 对话活跃上报结果（P2） */
   activityReport?: { success: boolean; message: string }
   /** 猫猫旅行状态与收益（P2） */

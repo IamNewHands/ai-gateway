@@ -47,6 +47,37 @@ export interface QoderPoolState {
    * 缺省 = 该账号还没有账本（首次探测时由 reconcileQoderAddonGrants 迁移建账）。
    */
   addonGrants?: QoderAddonGrant[]
+  /**
+   * **模型级**冷却：上游 key → 冷却至 epoch ms。
+   *
+   * 为什么必须与账号级 `until` 分开（hub `model_cooldowns`，qoder_accounts.py:483/597/615）：
+   * 上游的 429 常是**单个模型**的频控，不是账号不可用。旧实现一律写账号级 `until`，于是
+   * 「在 qmodel 上撞限流」会把该账号在 dmodel/gm51model 上也一起冻结——白白少用一个健康账号，
+   * 并把「模型级限流」误报成「账号坏了」。
+   *
+   * hub 的写法（`note_error(model=…)`）：**model 非空时只写模型级冷却并 return**，
+   * 不动账号级 `cooldown_until`；`ready(model)` 两者都查；`throttle_wait(model)` 取两者最大值。
+   * 这里同口径。
+   */
+  modelCooldowns?: Record<string, number>
+  /**
+   * 券类活动已领到的**兑换码**：campaignId → code（hub `campaignCodes`，
+   * qoder_accounts.py:489/529/1074）。
+   *
+   * 为什么必须持久化：`redemptionCode` **只回一次**，错过永久丢失——这是本模块唯一涉及
+   * 不可恢复用户资产的字段。服务端只在 claim 响应里给码，之后再查活动列表也拿不回来。
+   * 落在这里（与 addonGrants 同级）而不是签到结果 KV：签到结果的 TTL 只有 2 天
+   * （config.CHECKIN_RESULT_TTL_SEC），码会跟着过期消失。
+   */
+  campaignCodes?: Record<string, string>
+  /**
+   * 券类活动的**同人去重冷却**：campaignId → 冷却至 epoch ms（hub `campaignBlockedUntil`，
+   * qoder_accounts.py:492/1173，固定 6 小时）。
+   *
+   * 服务端按「人」去重（SAME_PERSON_ALREADY_CLAIMED）：同一设备/身份下其他账号本轮已领时，
+   * 本账号再 POST 也只会被同样拒绝。不记冷却就会每轮重复 POST 同一活动，白白消耗请求。
+   */
+  campaignBlockedUntil?: Record<string, number>
 }
 
 /** 池内账号（凭证 + 状态），存于 KV qoder:pool:<providerId> */
@@ -116,11 +147,20 @@ export async function writeQoderPool(env: Env, providerId: string, pool: QoderPo
   } catch { /* KV 写失败不阻断主流程 */ }
 }
 
-/** 账号是否健康：启用、未禁用、不在冷却期。无状态（新账号）视为健康。 */
-export function isQoderAccountHealthy(acc: QoderPoolAccount, now: number): boolean {
+/**
+ * 账号是否健康：启用、未禁用、不在冷却期。无状态（新账号）视为健康。
+ *
+ * `model` 非空时**叠加**模型级冷却检查（hub `ready(model)` 同口径，qoder_accounts.py:592-598）：
+ * 账号级冷却与模型级冷却都要过。缺省不传 = 只看账号级（既有调用方行为不变）。
+ */
+export function isQoderAccountHealthy(acc: QoderPoolAccount, now: number, model?: string): boolean {
   if (!acc || acc.enabled === false) return false
   if (acc.state?.disabled) return false
   if (acc.state?.until && acc.state.until > now) return false
+  if (model) {
+    const until = acc.state?.modelCooldowns?.[model] || 0
+    if (until > now) return false
+  }
   return true
 }
 
@@ -184,19 +224,23 @@ export function resolveQoderPreferUid(headerValue: string | null | undefined, pr
  *  - 第三段（兜底）：窗口内没有待救积分 → 原策略「剩余积分最多者优先」。
  *
  * 注：积分最低但马上要过期的号会赢过积分最高的长期号——这正是本段的目的。
+ *
+ * `model` 非空时把**模型级**冷却纳入健康判定（hub `ready(model)`）：某模型被频控的账号
+ * 只是在该模型上不可用，仍可服务其它模型。缺省不传 = 只看账号级冷却，既有调用方行为不变。
  */
 export async function pickQoderAccount(
   env: Env,
   providerId: string,
   tried: Set<string>,
-  preferUid?: string
+  preferUid?: string,
+  model?: string
 ): Promise<QoderPoolAccount | null> {
   const pool = await readQoderPool(env, providerId)
   const now = Date.now()
   // 账号固定：客户端 X-Qoder-Account 指定的账号（uid）若健康则强制使用
   if (preferUid) {
     const pinned = pool.find((a) => a.uid === preferUid)
-    if (pinned && !tried.has(pinned.uid) && isQoderAccountHealthy(pinned, now)) return pinned
+    if (pinned && !tried.has(pinned.uid) && isQoderAccountHealthy(pinned, now, model)) return pinned
   }
   // 第二段：7 天内到期的积分优先（到期越早越优先，同到期比积分高低）
   let best: QoderPoolAccount | null = null
@@ -204,7 +248,7 @@ export async function pickQoderAccount(
   let bestExpiryCredits = -Infinity
   for (const a of pool) {
     if (tried.has(a.uid)) continue
-    if (!isQoderAccountHealthy(a, now)) continue
+    if (!isQoderAccountHealthy(a, now, model)) continue
     const exp = soonestQoderExpiryAt(a.state, now)
     if (exp === null) continue
     const credits = a.state?.credits ?? 0
@@ -219,7 +263,7 @@ export async function pickQoderAccount(
   let bestCredits = -Infinity
   for (const a of pool) {
     if (tried.has(a.uid)) continue
-    if (!isQoderAccountHealthy(a, now)) continue
+    if (!isQoderAccountHealthy(a, now, model)) continue
     const credits = a.state?.credits ?? 0
     if (credits > bestCredits) {
       best = a
@@ -241,6 +285,60 @@ export async function cooldownQoderAccount(
   const acc = pool.find((a) => a.uid === uid)
   if (!acc) return
   acc.state = { ...(acc.state || { credits: 0, disabled: false, until: 0, errCount: 0 }), until: Date.now() + ms, reason, errCount: 0 }
+  await writeQoderPool(env, providerId, pool)
+}
+
+/**
+ * **模型级**冷却该账号至 now+ms（hub `note_error(model=…)`，qoder_accounts.py:610-616）。
+ *
+ * 与 `cooldownQoderAccount` 的关键差异：**不动账号级 `until`，也不清 `errCount`**。
+ * 上游的 429 常是单个模型的频控——账号本身健康，其它模型照常可用；写成账号级冷却会让
+ * 一次 qmodel 限流冻结整账号在 dmodel/gm51model 上的可用性。
+ *
+ * `reason` 仍会写：面板要能说明「为什么这个号这次没被选中」。
+ */
+export async function cooldownQoderAccountModel(
+  env: Env,
+  providerId: string,
+  uid: string,
+  model: string,
+  ms: number,
+  reason: string
+): Promise<void> {
+  if (!model) return
+  const pool = await readQoderPool(env, providerId)
+  const acc = pool.find((a) => a.uid === uid)
+  if (!acc) return
+  const st = acc.state || { credits: 0, disabled: false, until: 0, errCount: 0 }
+  const modelCooldowns = { ...(st.modelCooldowns || {}), [model]: Date.now() + ms }
+  acc.state = { ...st, modelCooldowns, reason }
+  await writeQoderPool(env, providerId, pool)
+}
+
+/**
+ * 清掉该账号在指定模型上的冷却（hub `clear_error(model=)`，qoder_accounts.py:630-633）。
+ * 不传 model 时清空全部模型级冷却。账号级冷却/禁用不在此函数职责内。
+ */
+export async function clearQoderModelCooldown(
+  env: Env,
+  providerId: string,
+  uid: string,
+  model?: string
+): Promise<void> {
+  const pool = await readQoderPool(env, providerId)
+  const acc = pool.find((a) => a.uid === uid)
+  if (!acc) return
+  const st = acc.state
+  if (!st?.modelCooldowns) return
+  let next: Record<string, number>
+  if (model) {
+    if (!(model in st.modelCooldowns)) return
+    next = { ...st.modelCooldowns }
+    delete next[model]
+  } else {
+    next = {}
+  }
+  acc.state = { ...st, modelCooldowns: next }
   await writeQoderPool(env, providerId, pool)
 }
 
@@ -354,6 +452,64 @@ export async function reenableQoderIfCredits(
 }
 
 /**
+ * 记录券类活动领到的兑换码（hub `campaign_codes[campaign_id] = code` + save，
+ * qoder_accounts.py:1072-1076）。
+ *
+ * **只在拿到非空码时写**：码是幂等的事实（同一活动重复领取返回同一个码），
+ * 用空值覆盖会把已观测到的码擦掉——而那是**不可恢复**的资产。
+ */
+export async function setQoderCampaignCode(
+  env: Env,
+  providerId: string,
+  uid: string,
+  campaignId: string,
+  code: string
+): Promise<void> {
+  const cid = String(campaignId || '').trim()
+  const c = String(code || '').trim()
+  if (!cid || !c) return
+  const pool = await readQoderPool(env, providerId)
+  const acc = pool.find((a) => a.uid === uid)
+  if (!acc) return
+  const st = acc.state || { credits: 0, disabled: false, until: 0, errCount: 0 }
+  if (st.campaignCodes?.[cid] === c) return
+  acc.state = { ...st, campaignCodes: { ...(st.campaignCodes || {}), [cid]: c } }
+  await writeQoderPool(env, providerId, pool)
+}
+
+/**
+ * 记一次券类活动的**同人去重冷却**（hub `campaign_blocked_until[cid] = time.time() + 6*3600`，
+ * qoder_accounts.py:1173）。
+ *
+ * 6 小时是源定值：每日活动按 CST 10:00 换轮，6h 足以跨过「同设备多号轮流试」的窗口，
+ * 又不至于把下一轮也挡掉。
+ */
+export const QODER_CAMPAIGN_BLOCK_MS = 6 * 60 * 60 * 1000
+
+export async function blockQoderCampaign(
+  env: Env,
+  providerId: string,
+  uid: string,
+  campaignId: string,
+  ms: number = QODER_CAMPAIGN_BLOCK_MS
+): Promise<void> {
+  const cid = String(campaignId || '').trim()
+  if (!cid) return
+  const pool = await readQoderPool(env, providerId)
+  const acc = pool.find((a) => a.uid === uid)
+  if (!acc) return
+  const st = acc.state || { credits: 0, disabled: false, until: 0, errCount: 0 }
+  acc.state = { ...st, campaignBlockedUntil: { ...(st.campaignBlockedUntil || {}), [cid]: Date.now() + ms } }
+  await writeQoderPool(env, providerId, pool)
+}
+
+/** 该活动当前是否处于同人去重冷却中（hub `campaign_blocked_until.get(cid,0) > now`）。 */
+export function isQoderCampaignBlocked(state: QoderPoolState | undefined, campaignId: string, now: number): boolean {
+  const until = state?.campaignBlockedUntil?.[campaignId] || 0
+  return until > now
+}
+
+/**
  * 昵称是否可用作展示名（而不是 uid 的复读）。
  *
  * 背景：旧签到路径把 `account.nickname || account.uid` 当昵称回写进池，于是 uid 被当成昵称
@@ -409,6 +565,20 @@ export async function listQoderPoolStatus(env: Env, providerId: string): Promise
     until: a.state?.until || 0,
     reason: a.state?.reason || '',
     errCount: a.state?.errCount || 0,
+    /**
+     * 仍在冷却中的**模型级**频控（模型 → 剩余秒数）。
+     *
+     * 为什么要透出：账号级 `cooling` 为 false 时，面板看起来「这个号完全可用」，
+     * 但它可能在某个模型上被上游频控——不显示就只能靠猜为什么某模型请求被跳过。
+     * 已过期的条目不列出（面板只关心当下挡着什么）。
+     */
+    modelCooldowns: Object.fromEntries(
+      Object.entries(a.state?.modelCooldowns || {})
+        .filter(([, until]) => until > now)
+        .map(([m, until]) => [m, Math.max(1, Math.round((until - now) / 1000))])
+    ),
+    /** 已领到的兑换码（campaignId → code）：不可恢复资产，面板要能展示与复制。 */
+    campaignCodes: a.state?.campaignCodes || {},
     tokenExpiresAt: a.token?.expires_at || 0,
     updatedAt: a.updatedAt || 0,
     tokenMask: a.token?.access_token ? `${a.token.access_token.slice(0, 8)}••••${a.token.access_token.slice(-6)}` : '',

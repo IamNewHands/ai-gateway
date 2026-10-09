@@ -775,7 +775,7 @@ ${H('管理')}
                   </fieldset>`:''}
                   ${(p.oauth&&p.oauth.flowType==='qoder')||p.id==='qoder'?`
                   <fieldset class="form-group" id="qdp-fs-${escapePageHtml(p.id)}"><legend>Qoder 多账号池</legend><span class="form-helper">设备授权流每次成功登录都会把该账号加入账号池（按 user_id 去重，多登一个 = 多个账号）。转发挑号：<b>7 天内到期的积分优先消耗</b>（到期越早越优先），窗口内没有待救积分时才按剩余积分最多者挑选；账号行上的「⏳ N 个包 7 天内到期」徽章与额度包明细里琥珀色的到期时间就是该规则的依据（到期时间按北京时间 CST 判定，数据来自最近一次签到，或点「刷新账号池」时即时探测）。「首选账号」可按 uid 固定使用某个账号（冷却/禁用/失败时自动回退）；客户端还能用 <code>X-Qoder-Account</code> 请求头按次指定账号，请求头优先于面板设置。「额度包明细」= 一行「套餐额度」（到期 = 套餐到期，即基础额度作废时刻）+ <b>每一笔签到/赠送各占一行</b>（到期 = 那一笔自己的有效期，取自领取响应；上游只给一个聚合桶，逐笔明细由网关记账），<b>已用完的包自动隐藏</b>，其余按到期升序排列（快过期的在最上面）。所以「7 天内到期」徽章与上面的挑号看的是<b>最早那笔</b>，而不是最后一次领取的时间（早先按聚合桶标一个到期时间，会让这些账号永远进不了 7 天窗口，最早那笔分作废了也不会被优先消耗）。「签到额度（未记账余额）」= 记账前就存在的余额或非签到发放的赠送分：这类分拿不到逐笔到期时间，会标「到期未知」（不编造日期，也不参与到期优先）。额度耗尽/429/鉴权失败按策略冷却或禁用并自动轮换下一个账号；每日签到后积分恢复自动解冻（<b>签到成功也一并清除「需重新登录」的禁用标记</b>——签到通过鉴权就是 token 有效的直接证据）。冷却参数留空 = 默认（额度耗尽 12h / 429 60s / 连续 5 次错误冷却 10m）。</span>
-                    <div class="fc mt-1 field-row"><button class="btn btn-s" onclick="qoderPoolStatus('${escapePageJsx(p.id)}')" title="重新读取池状态，并顺便向每个账号探一次额度（会更新「额度包明细」与到期天数）"><i class="fas fa-sync" aria-hidden="true"></i>刷新账号池</button><button class="btn btn-s" onclick="oauthConnect('${escapePageJsx(p.id)}')"><i class="fas fa-sign-in-alt" aria-hidden="true"></i>登录新账号</button><button class="btn btn-gh btn-xs" onclick="oauthPoolExportModal('${escapePageJsx(p.id)}')"><i class="fas fa-file-export" aria-hidden="true"></i>导出凭证/Token</button><button class="btn btn-p" onclick="triggerCheckin('${escapePageJsx(p.id)}')"><i class="fas fa-calendar-check" aria-hidden="true"></i>立即签到</button><span id="qdp-st-${escapePageHtml(p.id)}" class="oauth-status"></span></div>
+                    <div class="fc mt-1 field-row"><button class="btn btn-s" onclick="qoderPoolStatus('${escapePageJsx(p.id)}')" title="重新读取池状态，并顺便向每个账号探一次额度（会更新「额度包明细」与到期天数）"><i class="fas fa-sync" aria-hidden="true"></i>刷新账号池</button><button class="btn btn-s" onclick="oauthConnect('${escapePageJsx(p.id)}')"><i class="fas fa-sign-in-alt" aria-hidden="true"></i>登录新账号</button><button class="btn btn-gh btn-xs" onclick="oauthPoolExportModal('${escapePageJsx(p.id)}')"><i class="fas fa-file-export" aria-hidden="true"></i>导出凭证/Token</button><button class="btn btn-p" onclick="triggerCheckin('${escapePageJsx(p.id)}')"><i class="fas fa-calendar-check" aria-hidden="true"></i>立即签到</button><button class="btn btn-gh btn-xs" onclick="qoderProClaim('${escapePageJsx(p.id)}')" title="领取一次性 Pro 升级包（+1800 积分 = 18 天签到量）。每个账号一次，领过的会明确显示「已领过」且不重复计分。"><i class="fas fa-gift" aria-hidden="true"></i>领 Pro 包</button><button class="btn btn-gh btn-xs" onclick="qoderCouponClaim('${escapePageJsx(p.id)}')" title="领取兑换码/兑换券类福利。兑换码只回一次、错过永久丢失，故不随每日签到自动领取，需要你在这里显式点。领到的码会存在账号行上（可复制）。"><i class="fas fa-ticket-alt" aria-hidden="true"></i>领兑换码</button><span id="qdp-st-${escapePageHtml(p.id)}" class="oauth-status"></span></div>
                     <div id="qdp-acc-${escapePageHtml(p.id)}" class="mt-1"></div>
                     <div class="fc mt-1 field-row" style="gap:8px"><input type="number" id="cd-plan-${escapePageHtml(p.id)}" value="${p.cooldown&&p.cooldown.planMs?Math.round(p.cooldown.planMs/60000):''}" style="width:88px" placeholder="额度耗尽冷却" title="额度/权益耗尽（402）的硬冷却时长（分钟）。到期到次日 04:00，签到恢复后自动解冻。"><input type="number" id="cd-soft-${escapePageHtml(p.id)}" value="${p.cooldown&&p.cooldown.softMs?Math.round(p.cooldown.softMs/1000):''}" style="width:88px" placeholder="429冷却" title="429 限流的默认软冷却时长（秒）。"><input type="number" id="cd-err-${escapePageHtml(p.id)}" value="${p.cooldown&&p.cooldown.errThreshold?p.cooldown.errThreshold:''}" style="width:76px" placeholder="错误阈值" title="连续错误次数阈值：达到后把该账号冷却「错误冷却」时长。"><input type="number" id="cd-errms-${escapePageHtml(p.id)}" value="${p.cooldown&&p.cooldown.errMs?Math.round(p.cooldown.errMs/60000):''}" style="width:88px" placeholder="错误冷却" title="达到错误阈值后的账号级冷却时长（分钟）。"><span class="mu" style="font-size:12px">冷却参数（保存后生效）</span></div>
                     <div class="qoder-device-block" data-qoder-device="${escapePageHtml(p.id)}" style="margin-top:10px;border-top:1px solid var(--border,#e5e7eb);padding-top:8px">
@@ -2865,6 +2865,49 @@ function qoderPoolStatus(id) {
     renderQoderPoolAccounts(id, pool, ciByUid, ciAccounts, (d.data && d.data.preferUid) || '')
   }).catch(() => { if (st) showResult(st, false, '查询失败') })
 }
+/**
+ * 领取 Qoder Pro 升级包（一次性 +1800 积分）。
+ *
+ * 单独入口而不是塞进「立即签到」：Pro 包是一次性动作，混进每日汇总会让积分每次虚增 1800
+ * （源记载的历史缺陷）。这里把「新领 / 已领过 / 失败」三种结果分开报，用户一眼能分辨。
+ */
+function qoderProClaim(id) {
+  const st = document.getElementById('qdp-st-' + id)
+  if (st) st.innerHTML = '<span class="mu"><i class="fas fa-spinner fa-spin"></i> 正在查询并领取 Pro 升级包…</span>'
+  fetch('/admin/api/oauth/' + encodeURIComponent(id) + '/pro-claim', { method: 'POST' })
+    .then(r => r.json())
+    .then(d => {
+      if (!d.success) { if (st) showResult(st, false, d.message || '领取失败'); return }
+      if (st) showResult(st, true, d.message || '已处理')
+      // 领到积分后额度变了，刷新账号池让「积分 / 额度包明细」立刻反映（credits=1 顺带探额度）
+      qoderPoolStatus(id)
+    })
+    .catch(() => { if (st) showResult(st, false, '请求失败') })
+}
+
+/**
+ * 领取 Qoder 券类福利（兑换码 / 兑换券 / 优惠券）。
+ *
+ * 与「立即签到」分开：券类的码**只回一次**，是不可恢复资产，必须由用户显式触发并当场看到。
+ * 领取结果里的码同时会由后端落进池状态（QoderPoolState.campaignCodes），
+ * 所以刷新账号池后账号行上仍能看到并可复制——不会因为签到结果 KV 的 2 天 TTL 而消失。
+ */
+function qoderCouponClaim(id) {
+  const st = document.getElementById('qdp-st-' + id)
+  if (st) st.innerHTML = '<span class="mu"><i class="fas fa-spinner fa-spin"></i> 正在领取兑换码/券类福利…</span>'
+  fetch('/admin/api/oauth/' + encodeURIComponent(id) + '/coupons', { method: 'POST' })
+    .then(r => r.json())
+    .then(d => {
+      if (!d.success) { if (st) showResult(st, false, d.message || '领取失败'); return }
+      const data = d.data || {}
+      // 把结果文案直接显示出来：兑换码就在 message 里，用户需要马上看到并复制
+      if (st) showResult(st, true, data.message || d.message || '已处理')
+      // 刷新账号池：码已落进池状态，账号行会显示「兑换码」并带复制按钮
+      qoderPoolStatus(id)
+    })
+    .catch(() => { if (st) showResult(st, false, '请求失败') })
+}
+
 function renderQoderPoolAccounts(id, accs, ciByUid, ciAccounts, preferUid) {
   const box = document.getElementById('qdp-acc-' + id)
   if (!box) return
@@ -2912,8 +2955,29 @@ function renderQoderPoolAccounts(id, accs, ciByUid, ciAccounts, preferUid) {
     else if (a.cooling && a.until) coolDetail = ' 冷却至 ' + new Date(a.until).toLocaleString() + (a.reason ? '（' + escapeHtml(a.reason) + '）' : '')
     else if (a.reason) coolDetail = '（上次：' + escapeHtml(a.reason) + '）'
     line += ' ' + coolBadge + '<span class="mu">' + coolDetail + '</span>'
+    // 模型级冷却徽章（仅在有值时出现）：账号级「无冷却」不代表每个模型都能用——
+    // 上游 429 常是单模型频控（qoder/pool.ts modelCooldowns）。不显示就只能靠猜
+    // 为什么某个模型的请求被跳过。
+    const mcEntries = (a.modelCooldowns && typeof a.modelCooldowns === 'object') ? Object.keys(a.modelCooldowns) : []
+    if (mcEntries.length > 0) {
+      const mcText = mcEntries.map(function(m) { return m + ' ' + a.modelCooldowns[m] + 's' }).join('、')
+      line += ' <span class="bd bd-warn" title="这些模型被上游频控，冷却结束前该账号在这几个模型上会被跳过（其它模型不受影响）">模型限流 ' + escapeHtml(mcText) + '</span>'
+    }
     if (a.tokenMask) {
       line += ' · <code class="mu" style="font-size:11px" title="已存储于网关 KV">Token: ' + escapeHtml(a.tokenMask) + '</code>'
+    }
+    // 兑换码（不可恢复资产）：存在池状态里，与签到结果 KV 的 2 天 TTL 无关。
+    // 码只回一次，故这里必须可复制——用户要去官方活动页兑换。
+    const codeEntries = (a.campaignCodes && typeof a.campaignCodes === 'object') ? Object.keys(a.campaignCodes) : []
+    let codeHtml = ''
+    if (codeEntries.length > 0) {
+      const rows = codeEntries.map(function(cid) {
+        const code = String(a.campaignCodes[cid] || '')
+        return '<div style="margin-top:2px">🎟 <code style="font-size:11px">' + escapeHtml(code) + '</code>' +
+          ' <button class="btn btn-gh btn-xs" onclick="copyText(\\'' + escapeJsAttr(code) + '\\',this)" title="复制兑换码"><i class="fas fa-copy" aria-hidden="true"></i>复制</button>' +
+          ' <span class="mu" style="font-size:11px">活动 ' + escapeHtml(cid) + '</span></div>'
+      }).join('')
+      codeHtml = '<div class="mu" style="margin-top:4px">兑换码（' + codeEntries.length + '）—— 请到官方活动页兑换：</div>' + rows
     }
     // 额度包折叠表（与 WorkBuddy 池同款结构；Qoder 上游没有「周期结束」概念，故少一列）：
     // 隐藏已用完的包，其余按到期升序（快过期的在最上面），到期时间单元格带「剩 N 天」。
@@ -2935,7 +2999,7 @@ function renderQoderPoolAccounts(id, accs, ciByUid, ciAccounts, preferUid) {
     } else if (pkgDisp.total > 0) {
       pkgHtml = '<div class="mu" style="margin-top:2px">额度包明细：' + pkgDisp.total + ' 个包已全部用完</div>'
     }
-    return '<div class="fc mb-2 field-row" style="align-items:flex-start"><div class="fx1" style="font-size:12px;min-width:0"><div>' + line + ' ' + ciBadge + '</div>' + creditLine + pkgHtml + '</div><div class="fc" style="gap:4px"><button class="btn btn-gh btn-xs" onclick="oauthPoolCopyToken(\\'' + escapeJsAttr(id) + '\\',\\'' + escapeJsAttr(a.uid) + '\\')" title="复制 Access Token"><i class="fas fa-copy" aria-hidden="true"></i>复制Token</button><button class="btn btn-gh btn-xs" onclick="oauthPoolRemove(\\'' + escapeJsAttr(id) + '\\',\\'' + escapeJsAttr(a.uid) + '\\')"><i class="fas fa-trash" aria-hidden="true"></i>移除</button></div></div>'
+    return '<div class="fc mb-2 field-row" style="align-items:flex-start"><div class="fx1" style="font-size:12px;min-width:0"><div>' + line + ' ' + ciBadge + '</div>' + creditLine + codeHtml + pkgHtml + '</div><div class="fc" style="gap:4px"><button class="btn btn-gh btn-xs" onclick="oauthPoolCopyToken(\\'' + escapeJsAttr(id) + '\\',\\'' + escapeJsAttr(a.uid) + '\\')" title="复制 Access Token"><i class="fas fa-copy" aria-hidden="true"></i>复制Token</button><button class="btn btn-gh btn-xs" onclick="oauthPoolRemove(\\'' + escapeJsAttr(id) + '\\',\\'' + escapeJsAttr(a.uid) + '\\')"><i class="fas fa-trash" aria-hidden="true"></i>移除</button></div></div>'
   }).join('')
   // 绑定额度包折叠按钮（与 WorkBuddy 池相同的 toggleCollapse 交互）
   box.querySelectorAll('[data-pkg]').forEach(function(btn) {

@@ -21,7 +21,7 @@ import { getProviders } from './storage'
 import { getOauthAccessToken, detectTokenRealm, refreshQoderTokenPair } from './oauth'
 import { writeLog } from './admin'
 import { isQoderFlow } from './qoder/proxy'
-import { fetchQoderCheckinStatus, performQoderCheckin, fetchQoderUserResource, fetchQoderPaymentType, fetchQoderUserInfo, buildQoderPacks, legacyQoderAddonExpireAt, normalizeQoderRealm, realmHasLegacyCheckin, qoderMachineHeadersState, type QoderRealm } from './qoder/billing'
+import { fetchQoderCheckinStatus, performQoderCheckin, fetchQoderUserResource, fetchQoderPaymentType, fetchQoderUserInfo, buildQoderPacks, legacyQoderAddonExpireAt, normalizeQoderRealm, realmHasLegacyCheckin, qoderMachineHeadersState, proEligibility, proClaim, QODER_PRO_REWARD_CREDIT, type QoderRealm, type QoderProClaimResult } from './qoder/billing'
 import { reconcileQoderAddonGrants, type QoderAddonGrant } from './qoder/grants'
 import { getQoderDevice, hasQoderDevice } from './qoder/device'
 import {
@@ -30,6 +30,8 @@ import {
   refreshQoderPoolAccountIfNeeded,
   reenableQoderIfCredits,
   setQoderPoolAccountNickname,
+  setQoderCampaignCode,
+  blockQoderCampaign,
   isRealQoderNickname,
   type QoderPoolAccount,
 } from './qoder/pool'
@@ -256,8 +258,19 @@ async function fillQoderCredits(
 
 /**
  * QoderWork 池内单账号签到：状态探测 → 已签跳过 → 否则签到 → 拉额度 → 回写池（积分/解冻/昵称）。
+ *
+ * `opts.includeCoupons`（缺省 false）：是否**同时领取券类活动**（兑换码/券）。
+ *
+ * 为什么默认不领：每日签到的语义是领积分；券类涉及不可恢复资产（码只回一次），
+ * 应由用户显式触发（面板「领取福利/兑换码」入口传 true），而不是每天自动替他领掉
+ * （与源 `run_checkin(only_daily=True)` 同口径，qoder_tasks.py:635）。
  */
-async function checkinQoderPoolAccount(env: Env, provider: Provider, account: QoderPoolAccount): Promise<CheckinResult> {
+async function checkinQoderPoolAccount(
+  env: Env,
+  provider: Provider,
+  account: QoderPoolAccount,
+  opts?: { includeCoupons?: boolean }
+): Promise<CheckinResult> {
   const now = Date.now()
   // 账号域：签到端点与 legacy 能力都按域区分（国际版 legacy 接口不存在）
   const realm = normalizeQoderRealm(account.realm)
@@ -341,7 +354,9 @@ async function checkinQoderPoolAccount(env: Env, provider: Provider, account: Qo
   // 设备标识才下发每日活动；未配置时回退 uid 派生值——派生值拿不到「每日领取 100 Credits」，
   // 日志里标出是哪一种。
   const device = await getQoderDevice(env)
-  const res = await performQoderCheckin(token, realm, account.uid, undefined, device)
+  const res = await performQoderCheckin(token, realm, account.uid, undefined, device, {
+    includeCoupons: opts?.includeCoupons === true,
+  })
   base.success = res.success
   base.message = res.message
   // already = 今日已领取（replayed / 列表 CLAIMED），与「本次新领」区分开：
@@ -351,6 +366,24 @@ async function checkinQoderPoolAccount(env: Env, provider: Provider, account: Qo
   if (res.success) base.todayCheckedIn = true
   if (!res.already && typeof res.rewardCredits === 'number' && res.rewardCredits > 0) {
     base.checkinCredit = res.rewardCredits
+  }
+
+  // ===== 兑换码落盘（**不可恢复资产**，必须在这里写） =====
+  // 码只在 claim 响应里回一次，之后再查活动列表也拿不回来。旧实现连字段都没定义，
+  // 服务端回了码也接不住、直接丢——连「丢过」都无从察觉。
+  // 落进池状态（与 addonGrants 同级）而不是签到结果 KV：后者的 TTL 只有 2 天。
+  if (res.couponCodes?.length) {
+    for (const c of res.couponCodes) {
+      try { await setQoderCampaignCode(env, provider.id, account.uid, c.campaignId, c.code) } catch { /* 落盘失败不影响签到结果 */ }
+    }
+    base.campaignCodes = res.couponCodes.map((c) => ({ campaign: c.campaign, code: c.code }))
+  }
+  // 同人去重（SAME_PERSON_ALREADY_CLAIMED）→ 记 6h 活动冷却，避免每轮重复 POST
+  // 同一活动（hub `campaign_blocked_until`，qoder_accounts.py:1173）。
+  if (res.couponBlocked?.length) {
+    for (const cid of res.couponBlocked) {
+      try { await blockQoderCampaign(env, provider.id, account.uid, cid) } catch { /* ignore */ }
+    }
   }
 
   // 签到成功后额度已变化，拉最新额度（本次新领的到期时刻来自 claim 响应）。
@@ -433,7 +466,12 @@ async function syncQoderPoolCredits(
 /**
  * QoderWork 多账号池签到：遍历池内所有账号各自签到，返回带 accounts 的汇总结果。
  */
-async function checkinQoderPoolAccounts(env: Env, provider: Provider): Promise<CheckinResult> {
+async function checkinQoderPoolAccounts(
+  env: Env,
+  provider: Provider,
+  opts?: { includeCoupons?: boolean }
+): Promise<CheckinResult> {
+  const includeCoupons = opts?.includeCoupons === true
   const now = Date.now()
   const base: CheckinResult = {
     providerId: provider.id,
@@ -458,7 +496,7 @@ async function checkinQoderPoolAccounts(env: Env, provider: Provider): Promise<C
   let success = 0, already = 0, fail = 0, skipped = 0
   for (const acc of pool) {
     try {
-      const r = await checkinQoderPoolAccount(env, provider, acc)
+      const r = await checkinQoderPoolAccount(env, provider, acc, { includeCoupons })
       accounts.push(r)
       if (r.success) {
         if (r.reason === 'already') already++
@@ -847,11 +885,13 @@ async function checkinOauthPoolAccounts(
  * 单 provider 签到。
  * opts.interactive：交互式端点（管理后台手动触发，用户等待 HTTP 响应）→ 跳过防风控延时；
  * cron 后台路径保持缺省（false）。
+ * opts.includeCoupons：Qoder 专用——同时领取券类活动（兑换码/券），缺省 false（见
+ * checkinQoderPoolAccount 的说明）。
  */
 export async function checkinOneAccount(
   env: Env,
   provider: Provider,
-  opts?: { interactive?: boolean }
+  opts?: { interactive?: boolean; includeCoupons?: boolean }
 ): Promise<CheckinResult> {
   // WorkBuddy 多账号池：browser 登录流提供商遍历池内所有账号各自签到，返回带 accounts 的汇总结果
   if (isOAuthPoolProvider(provider)) {
@@ -860,7 +900,7 @@ export async function checkinOneAccount(
 
   // QoderWork 多账号池：遍历池内所有账号各自签到，返回带 accounts 的汇总结果
   if (isQoderFlow(provider)) {
-    return checkinQoderPoolAccounts(env, provider)
+    return checkinQoderPoolAccounts(env, provider, opts)
   }
 
   const now = Date.now()
@@ -1439,5 +1479,109 @@ export async function handleOAuthDaily(c: Context<{ Bindings: Env }>) {
   // interactive: true —— 一键日常是用户等待的交互式操作
   const result = await checkinOneAccount(c.env, p, { interactive: true })
   return c.json<ApiResponse<CheckinResult>>({ success: true, message: '已完成一键日常任务', data: result })
+}
+
+// ===== Qoder Pro 升级包（一次性 +1800） =====
+
+/**
+ * 为单个 Qoder 池账号领取 Pro 升级包（hub `run_pro_claim`，qoder_tasks.py:713-735）。
+ *
+ * ## 为什么必须区分 `already` 与「本次新领」
+ *
+ * hub 的注释（qoder_tasks.py:745-752）明确记载这是**历史缺陷**：不区分会让批量汇总的
+ * `credit_added` **每次虚增 +1800**。故 `already` 时 `rewardCredit` 记 0。
+ *
+ * 顺序与源一致：**先查资格再领**（`pro_eligibility` → 不可领则直接返回），
+ * 避免对不可领的账号白发一次 POST。
+ */
+async function claimQoderProForAccount(
+  env: Env,
+  provider: Provider,
+  account: QoderPoolAccount
+): Promise<{ uid: string; nickname: string; result: QoderProClaimResult; rewardCredit: number }> {
+  const realm = normalizeQoderRealm(account.realm)
+  const nickname = isRealQoderNickname(account.nickname, account.uid) ? String(account.nickname) : account.uid.slice(0, 8)
+  const token = account.token?.access_token || ''
+  if (!token) {
+    return { uid: account.uid, nickname, rewardCredit: 0, result: { ok: false, message: '无 access token', error: 'no_token' } }
+  }
+  const elig = await proEligibility(token, realm, account.uid)
+  if (!elig.ok) {
+    return { uid: account.uid, nickname, rewardCredit: 0, result: { ok: false, message: `Pro 升级包资格查询失败: ${elig.error || ''}`, error: elig.error } }
+  }
+  if (!elig.eligible) {
+    // 查询成功但不可领：**不是失败**（已领过 / 活动未开放），rewardCredit 必须为 0
+    return { uid: account.uid, nickname, rewardCredit: 0, result: { ok: true, already: true, message: 'Pro 升级包不可领取（已领或活动未开放）' } }
+  }
+  const claimed = await proClaim(token, realm, account.uid)
+  // 只有**本次新领**才计积分：already 分支若也算 1800，就是源记载的那个虚增缺陷
+  const rewardCredit = claimed.ok && !claimed.already ? (claimed.rewardCredits || QODER_PRO_REWARD_CREDIT) : 0
+  return { uid: account.uid, nickname, rewardCredit, result: claimed }
+}
+
+/**
+ * POST /admin/api/oauth/:id/pro-claim：领取 Qoder Pro 升级包（一次性 +1800 积分）。
+ *
+ * 为什么单开一个入口而不是塞进「立即签到」：Pro 包是**一次性**动作（领过就永久不可领），
+ * 混进每日签到会让汇总积分每次都虚增 +1800（源记载的历史缺陷）。单开入口 + 明确区分
+ * `already`，用户点一次就知道结果，汇总也准。
+ */
+export async function handleOAuthProClaim(c: Context<{ Bindings: Env }>) {
+  const id = c.req.param('id')?.trim()
+  const providers = (await getProviders(c.env)) as Provider[]
+  const p = providers.find((x) => x.id === id)
+  if (!p) return c.json<ApiResponse>({ success: false, message: '提供商不存在' }, 404)
+  if (!isQoderFlow(p)) return c.json<ApiResponse>({ success: false, message: '该提供商不是 QoderWork' }, 400)
+
+  try { await seedQoderPoolFromSingle(c.env, p.id) } catch { /* ignore */ }
+  const pool = await readQoderPool(c.env, p.id)
+  if (pool.length === 0) {
+    return c.json<ApiResponse>({ success: false, message: '账号池为空（未登录任何账号）' }, 400)
+  }
+
+  const results: Array<{ uid: string; nickname: string; ok: boolean; already: boolean; message: string; rewardCredit: number }> = []
+  let totalCredit = 0
+  for (const acc of pool) {
+    try {
+      const r = await claimQoderProForAccount(c.env, p, acc)
+      totalCredit += r.rewardCredit
+      results.push({
+        uid: r.uid, nickname: r.nickname,
+        ok: r.result.ok, already: r.result.already === true,
+        message: r.result.message, rewardCredit: r.rewardCredit,
+      })
+    } catch (e) {
+      results.push({ uid: acc.uid, nickname: acc.uid.slice(0, 8), ok: false, already: false, message: (e as Error).message || String(e), rewardCredit: 0 })
+    }
+  }
+  const claimedCount = results.filter((r) => r.ok && !r.already).length
+  const alreadyCount = results.filter((r) => r.already).length
+  const failedCount = results.filter((r) => !r.ok).length
+  const summary = `共 ${results.length} 个账号：新领 ${claimedCount} / 已领过 ${alreadyCount} / 失败 ${failedCount}，本次新增积分 +${totalCredit}`
+  try {
+    await writeLog(c.env, 'info', `[qoder-pro-claim] ${p.name} → ${summary}`, JSON.stringify({ results }).substring(0, 4000))
+  } catch { /* 日志失败不影响结果 */ }
+  return c.json<ApiResponse>({ success: true, message: summary, data: { results, creditAdded: totalCredit } })
+}
+
+/**
+ * POST /admin/api/oauth/:id/coupons：领取 Qoder 券类福利（兑换码 / 兑换券 / 优惠券）。
+ *
+ * 与「立即签到」分开的**唯一理由**：券类是**不可恢复资产**（码只回一次），
+ * 必须由用户显式触发并当场看到码，而不是被每日自动签到替他领掉。
+ * 走的是同一条 campaigns 领取管线（`includeCoupons: true`），只是不领积分活动之外的东西。
+ */
+export async function handleOAuthCouponClaim(c: Context<{ Bindings: Env }>) {
+  const id = c.req.param('id')?.trim()
+  const providers = (await getProviders(c.env)) as Provider[]
+  const p = providers.find((x) => x.id === id)
+  if (!p) return c.json<ApiResponse>({ success: false, message: '提供商不存在' }, 404)
+  if (!isQoderFlow(p)) return c.json<ApiResponse>({ success: false, message: '该提供商不是 QoderWork' }, 400)
+  // interactive: true（用户等待）+ includeCoupons: true（本次显式领券）
+  const result = await checkinOneAccount(c.env, p, { interactive: true, includeCoupons: true })
+  try {
+    await writeLog(c.env, 'info', `[qoder-coupons] ${p.name} → ${result.reason}`, JSON.stringify(result).substring(0, 4000))
+  } catch { /* 日志失败不影响结果 */ }
+  return c.json<ApiResponse<CheckinResult>>({ success: true, message: '已完成券类福利领取', data: result })
 }
 

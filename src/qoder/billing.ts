@@ -1,6 +1,7 @@
 import { cosySessionFor, type CosySession } from './cosy'
 import { formatCstWallClock, parseCstWallClock } from '../credit-expiry'
 import { isQoderUnbookedGrant, type QoderAddonGrant } from './grants'
+import { md5Hex } from './md5'
 import type { PackageInfo } from '../types'
 
 /**
@@ -34,6 +35,15 @@ import type { PackageInfo } from '../types'
 export const QODER_OPENAPI: Record<'cn' | 'global', string> = {
   cn: 'https://openapi.qoder.com.cn',
   global: 'https://openapi.qoder.sh',
+}
+
+/**
+ * 按账号域取官网基地址（hub REALM_CONFIGS 的 `website`，qoder_accounts.py:42/64）。
+ * 用作 Pro 升级包端点的 `Origin` / `Referer`——与签到端点同源要求。
+ */
+export const QODER_WEBSITE: Record<'cn' | 'global', string> = {
+  cn: 'https://qoder.com.cn',
+  global: 'https://qoder.com',
 }
 
 /** 账号域类型（缺省 cn）。 */
@@ -311,6 +321,20 @@ interface QoderClaimResponse {
   replayed?: boolean
   benefit?: { kind?: string; amount?: number }
   expiresAt?: string
+  /**
+   * 兑换码类奖励的码（hub qoder_accounts.py:1072）。
+   *
+   * 旧实现**连字段都没定义** → 服务端回了码也接不住、直接丢。这是本模块唯一涉及
+   * **不可恢复用户资产**的字段：积分丢了还能再攒，兑换码只回一次，错过永久丢失。
+   *
+   * 官方客户端语义（hub `claim_campaign` 同款）：`status=CLAIMED` **且** `redemptionCode`
+   * 非空才算真拿到；仅 CLAIMED 无码 = 发放确认中（`confirming`）。
+   */
+  redemptionCode?: string
+  /** 上游失败码（如 SAME_PERSON_ALREADY_CLAIMED / REDEMPTION_CODE_OUT_OF_STOCK）。 */
+  failureCode?: string
+  /** 部分响应把金额放在顶层而非 benefit 里（hub `r.get("amount")` 兜底）。 */
+  amount?: number
 }
 
 export interface QoderCheckinOutcome {
@@ -321,6 +345,45 @@ export interface QoderCheckinOutcome {
   already?: boolean
   /** 命中的活动 key，便于排查是哪个活动发的积分 */
   campaignKey?: string
+  /**
+   * 命中的活动 id（campaignId）。
+   *
+   * 兑换码与同人去重冷却都按 **campaignId** 落盘（hub `campaign_codes[campaign_id]` /
+   * `campaign_blocked_until[cid]`）——key 是活动的可读名（含日期），会随轮次变化，
+   * 拿它当持久化键会让下一轮的码认不回同一个活动。
+   */
+  campaignId?: string
+  /**
+   * 本次领取到的**兑换码**（券类活动的 `redemptionCode`，hub qoder_accounts.py:1072-1074）。
+   *
+   * 只回一次、错过永久丢失，故必须一路带出到调用方落盘（QoderPoolState.campaignCodes）。
+   * 非券类活动与「发放确认中」都没有值。
+   */
+  redemptionCode?: string
+  /**
+   * 逐条券类活动的兑换码（含 campaignId，供调用方**按活动**落盘）。
+   *
+   * 为什么不能只给一个 `redemptionCode`：码按 campaignId 持久化（hub 同款），
+   * 一轮可能领到多张券，只带最后一个会让前面的码在落盘前丢掉。
+   */
+  couponCodes?: Array<{ campaignId: string; campaign: string; code: string }>
+  /**
+   * 本次被服务端按「人」判重的券类活动 id：调用方据此记 6h 冷却
+   * （hub `campaign_blocked_until`），避免每轮重复 POST 同一活动。
+   */
+  couponBlocked?: string[]
+  /**
+   * `status=CLAIMED` 但 `redemptionCode` 为空 = **发放确认中**（hub 同名字段，
+   * qoder_accounts.py:1089）。与「已拿到码」是两种状态，不能混报成成功领取。
+   */
+  confirming?: boolean
+  /**
+   * 上游按「人」去重：同一设备/身份下其他账号本轮已领（hub `SAME_PERSON_ALREADY_CLAIMED`）。
+   *
+   * 这不是「失败」——账号本身没问题、请求也合法，只是服务端按人去重。旧实现把它塌缩成
+   * 「领取失败 http N」，让人以为账号坏了。调用方据此记 6h 活动冷却，避免每轮重复 POST。
+   */
+  blocked?: boolean
   /**
    * 本次新领积分的到期时刻（epoch ms，来自 claim 响应的 expiresAt，30 天相对有效期）。
    *
@@ -367,6 +430,44 @@ export interface QoderCheckinDebug {
 }
 
 /**
+ * 活动领取失败码 → 中文说明（hub `_CAMPAIGN_FAILURE_CN`，qoder_accounts.py:293-299，
+ * 与官方 growth-page/activity-iframe 前端一致）。
+ *
+ * 旧实现只处理前两条（名额发完 / 成就未完成），其余塌缩成「未知状态: X」——
+ * 风控拦截与活动结束被报成含糊状态，用户无从判断下一步该做什么。
+ */
+const QODER_CAMPAIGN_FAILURE_CN: Record<string, string> = {
+  REDEMPTION_CODE_OUT_OF_STOCK: '今日名额已发完（每日 10:00 刷新，次日再来）',
+  ACHIEVEMENT_NOT_COMPLETED: '需先完成新人任务（成就未完成）',
+  CAMPAIGN_NOT_ACTIVE: '活动已结束/未开始',
+  RISK_BLOCKED: '风控拦截（当前设备/账号不可领取）',
+  RISK_DEPENDENCY_UNAVAILABLE: '风控服务不可用，稍后重试',
+}
+
+/**
+ * 服务端按「人」去重的失败码/状态（hub qoder_accounts.py:1059）：
+ * `failureCode == "SAME_PERSON_ALREADY_CLAIMED"` 或 `status == "BLOCKED"`。
+ */
+const QODER_SAME_PERSON_MARKERS = ['SAME_PERSON_ALREADY_CLAIMED', 'BLOCKED']
+
+/** 券类奖励（非积分）：这些活动的 claim 会回 `redemptionCode`。 */
+export function isQoderCouponKind(kind: unknown): boolean {
+  const k = String(kind || '').toUpperCase()
+  // 空 kind 视为积分类（hub 的 only_kinds=("", "CREDITS") 把 "" 与 CREDITS 并列）
+  if (k === '' || k === 'CREDITS') return false
+  return true
+}
+
+/** 券类活动的中文名（hub `_extra_campaign_rows` 的 kind 映射，qoder_tasks.py:349）。 */
+export function qoderCouponKindLabel(kind: unknown): string {
+  const k = String(kind || '').toUpperCase()
+  if (k === 'REDEMPTION_CODE') return '兑换码'
+  if (k === 'REDEMPTION_COUPON') return '兑换券'
+  if (k === 'COUPON') return '优惠券'
+  return k || '奖励'
+}
+
+/**
  * 执行签到：走 campaigns 流程（qoder2api checkin.go:408-504，commit 99ab022）。
  *
  *   1. GET  /sash/api/v1/me/campaigns
@@ -379,14 +480,23 @@ export interface QoderCheckinDebug {
  *
  * 活动平台**双区域通用**（qoder2api-hub qoder_accounts.py:929「双区域通用」）：
  * 国际版账号同样走这里，只是 openapi 基地址换成 openapi.qoder.sh。
+ *
+ * `opts.includeCoupons`（缺省 false，= 旧行为）：是否**同时领取券类活动**
+ * （REDEMPTION_CODE 等非 Credits 奖励，见 qoderCouponKindLabel）。
+ *
+ * 为什么默认不领（与源 `run_checkin(only_daily=True)` 同口径，qoder_tasks.py:635）：
+ * 「每日签到」按钮的语义是领积分；券类福利涉及不可恢复资产，应由用户显式触发
+ * （面板「领取福利/兑换码」入口传 true），而不是每天自动替他领掉。
  */
 export async function performQoderCheckin(
   token: string,
   realm: QoderRealm = 'cn',
   uid = '',
   sess?: CosySession,
-  device?: QoderDeviceIdentity
+  device?: QoderDeviceIdentity,
+  opts?: { includeCoupons?: boolean }
 ): Promise<QoderCheckinOutcome> {
+  const includeCoupons = opts?.includeCoupons === true
   const s = await checkinSession(token, uid, sess)
   let res: Response
   try {
@@ -425,6 +535,8 @@ export async function performQoderCheckin(
   }
   /** 奖励类（Credits）活动：只有这些参与每日签到判定 */
   const daily: QoderCampaign[] = []
+  /** 券类活动（非 Credits）：只有 includeCoupons 时才进入领取流程 */
+  const coupons: QoderCampaign[] = []
   /** 非 CLAIMABLE/CLAIMED 的奖励类活动：带原因码，用于把「领不到」讲清楚 */
   const notClaimable: QoderCampaign[] = []
   for (const c of raw) {
@@ -439,8 +551,15 @@ export async function performQoderCheckin(
     // 只认 Credits 积分奖励（对齐 hub campaign_checkin 的 only_kinds=("", "CREDITS")，
     // qoder_accounts.py:1123-1126）：兑换券/周边类活动（REDEMPTION_CODE 等）与每日签到
     // 无关，混进来会让「已领过一张券」被当成「今天积分已领」→ 假 already、当天 0 积分。
+    //
+    // 但**不是丢弃**：券类是唯一涉及不可恢复资产的活动（码只回一次），
+    // 故单独收进 coupons，由 includeCoupons 决定是否领取——旧实现直接 continue 掉，
+    // 等于连「丢」都无从察觉。
     const kind = String(c.benefit?.kind || '').toUpperCase()
-    if (kind !== '' && kind !== 'CREDITS') continue
+    if (isQoderCouponKind(kind)) {
+      if (c.claimStatus === 'CLAIMABLE') coupons.push(c)
+      continue
+    }
 
     daily.push(c)
     if (c.claimStatus !== 'CLAIMABLE' && c.claimStatus !== 'CLAIMED') notClaimable.push(c)
@@ -547,47 +666,183 @@ export async function performQoderCheckin(
   const campaignId = target.campaignId
   if (!campaignId) return { success: false, message: '签到活动缺少 campaignId', debug: dbg }
 
+  const claimed = await claimQoderCampaign(token, realm, s, device, campaignId, target.campaignKey, dbg)
+  if (claimed.outcome) return claimed.outcome
+
+  const amount = claimed.amount
+  // 券类活动一并领取（仅在调用方显式要求时；见 includeCoupons 说明）
+  const couponNotes: string[] = []
+  /** 券类活动领到的码：按 campaignId 记，供调用方逐条落盘 */
+  const couponCodes: Array<{ campaignId: string; campaign: string; code: string }> = []
+  /** 本次被服务端按人判重的券类活动：调用方据此记 6h 冷却，避免每轮重复 POST */
+  const couponBlocked: string[] = []
+  if (includeCoupons && coupons.length > 0) {
+    for (const c of coupons) {
+      const cid = c.campaignId
+      if (!cid) continue
+      const label = c.campaignKey || cid
+      const r = await claimQoderCampaign(token, realm, s, device, cid, label, dbg)
+      const kindLabel = qoderCouponKindLabel(c.benefit?.kind)
+      if (r.outcome?.blocked) {
+        couponBlocked.push(cid)
+        couponNotes.push(`${label}（${kindLabel}）：同人已领取，本轮跳过`)
+        continue
+      }
+      if (r.outcome && !r.outcome.success) {
+        couponNotes.push(`${label}（${kindLabel}）：${r.outcome.message}`)
+        continue
+      }
+      if (r.code) {
+        // 码只回一次：回传给调用方落盘（KV），并在 message 里明示，避免用户以为没领到
+        couponCodes.push({ campaignId: cid, campaign: label, code: r.code })
+        couponNotes.push(`${label}（${kindLabel}）：兑换码 ${r.code}`)
+      } else if (r.confirming) {
+        couponNotes.push(`${label}（${kindLabel}）：已领取，兑换码发放确认中`)
+      } else {
+        couponNotes.push(`${label}（${kindLabel}）：已领取`)
+      }
+    }
+  }
+
+  let message = amount ? `领取成功 +${amount} ${target.campaignKey || ''}`.trim() : '签到成功'
+  if (claimed.code) message += `，兑换码：${claimed.code}`
+  if (couponNotes.length > 0) message += `；福利：${couponNotes.join('；')}`
+  return {
+    success: true,
+    message,
+    rewardCredits: amount,
+    campaignKey: target.campaignKey,
+    campaignId,
+    // 积分活动本身也可能带码（券类活动的积分变体），一并带出
+    redemptionCode: claimed.code || couponCodes[0]?.code,
+    couponCodes: couponCodes.length > 0 ? couponCodes : undefined,
+    couponBlocked: couponBlocked.length > 0 ? couponBlocked : undefined,
+    confirming: claimed.confirming || undefined,
+    // claim 响应的 expiresAt 是 ISO 串（如 "2026-11-01T10:52:18.531379Z"，= 领取时刻 + 30 天）
+    rewardExpiresAt: parseCstWallClock(claimed.expiresAt) ?? undefined,
+    debug: dbg,
+  }
+}
+
+/** 单次活动领取的解析结果（供每日积分活动与券类活动共用）。 */
+interface QoderClaimOutcome {
+  /** 非 null = 该结果应直接作为整个签到结果返回（失败/已领/同人已领） */
+  outcome: QoderCheckinOutcome | null
+  amount?: number
+  code?: string
+  confirming?: boolean
+  expiresAt?: string
+}
+
+/**
+ * POST 一次活动领取并解析响应（hub `claim_campaign`，qoder_accounts.py:1050-1096）。
+ *
+ * 抽出来的原因：每日积分活动与券类活动走的是**同一个端点、同一套响应语义**
+ * （hub 也是同一个 `claim_campaign`），各写一遍必然漂移——而这里每一条分支都对应
+ * 一种用户可见的结论（已领 / 同人去重 / 风控拦截 / 发放确认中 / 拿到码）。
+ */
+async function claimQoderCampaign(
+  token: string,
+  realm: QoderRealm,
+  s: CosySession,
+  device: QoderDeviceIdentity | undefined,
+  campaignId: string,
+  campaignKey: string | undefined,
+  dbg: QoderCheckinDebug
+): Promise<QoderClaimOutcome> {
+  const label = campaignKey || campaignId
   let claimRes: Response
   try {
     claimRes = await checkinRequest('POST', `/sash/api/v1/me/campaigns/${campaignId}/claim`, token, realm, s, device)
   } catch (e) {
-    return { success: false, message: (e as Error).message || '网络请求失败', debug: dbg }
+    return { outcome: { success: false, message: (e as Error).message || '网络请求失败', debug: dbg } }
   }
   const claimText = await claimRes.text().catch(() => '')
   dbg.claimHttp = claimRes.status
   dbg.claimBody = claimText.substring(0, 500)
+
+  const upperBody = claimText.toUpperCase()
   if (!claimRes.ok) {
-    return { success: false, message: `领取失败 http ${claimRes.status}: ${claimText.substring(0, 200)}`, debug: dbg }
+    // 409 或 body 含 ALREADY = 幂等命中（服务端说「已经领过了」），不是失败。
+    // hub pro_claim 同口径（qoder_accounts.py:1316）；签到路径同理：把「已领」报成
+    // 「领取失败 http 409」会让人以为账号坏了，实际是重复请求的正常结果。
+    if (claimRes.status === 409 || upperBody.includes('ALREADY')) {
+      return { outcome: { success: true, already: true, message: `今日已领取（${label}）`, campaignKey, debug: dbg } }
+    }
+    // 上游失败码优先于 HTTP 状态码：`_CAMPAIGN_FAILURE_CN` 的文案比「http 4xx」有用得多
+    const failure = matchQoderFailureCode(upperBody)
+    if (failure) {
+      return { outcome: { success: false, message: `${label}：${QODER_CAMPAIGN_FAILURE_CN[failure]}`, campaignKey, debug: dbg } }
+    }
+    return { outcome: { success: false, message: `领取失败 http ${claimRes.status}: ${claimText.substring(0, 200)}`, debug: dbg } }
   }
+
   let cr: QoderClaimResponse
   try {
     cr = claimText ? JSON.parse(claimText) : {}
   } catch {
-    return { success: false, message: `领取响应格式异常: ${claimText.substring(0, 200)}`, debug: dbg }
+    return { outcome: { success: false, message: `领取响应格式异常: ${claimText.substring(0, 200)}`, debug: dbg } }
   }
 
-  if (cr.status === 'CLAIMED') {
-    if (cr.replayed) {
-      return {
-        success: true,
-        already: true,
-        message: target.campaignKey ? `今日已领取（${target.campaignKey}）` : '今日已领取',
-        campaignKey: target.campaignKey,
-        debug: dbg,
-      }
-    }
-    const amount = typeof cr.benefit?.amount === 'number' ? cr.benefit.amount : undefined
+  const status = String(cr.status || '').toUpperCase()
+  const failure = String(cr.failureCode || '').toUpperCase()
+
+  // 服务端按「人」去重：同设备/身份下其他账号本轮已领（hub qoder_accounts.py:1059）。
+  // 账号本身没问题，请求也合法——旧实现把它塌缩成「未知状态: BLOCKED」，
+  // 用户只看到一句含糊状态，无从知道「换个号也没用、要等下一轮」。
+  if (QODER_SAME_PERSON_MARKERS.includes(failure) || status === 'BLOCKED') {
     return {
-      success: true,
-      message: amount ? `领取成功 +${amount} ${target.campaignKey || ''}`.trim() : '签到成功',
-      rewardCredits: amount,
-      campaignKey: target.campaignKey,
-      // claim 响应的 expiresAt 是 ISO 串（如 "2026-11-01T10:52:18.531379Z"，= 领取时刻 + 30 天）
-      rewardExpiresAt: parseCstWallClock(cr.expiresAt) ?? undefined,
-      debug: dbg,
+      outcome: {
+        success: false,
+        blocked: true,
+        message: `${label}：同人已领取（同一设备/身份下其他账号本轮已领，服务端按人去重）`,
+        campaignKey,
+        debug: dbg,
+      },
     }
   }
-  return { success: false, message: `未知状态: ${cr.status || '(空)'}`, debug: dbg }
+
+  if (!status && cr.replayed !== undefined && cr.status === undefined) {
+    // 响应既无 status 也无明确成功标记 → 交由下面统一按未知状态处理
+  }
+
+  // 兑换码类奖励：官方客户端语义 = CLAIMED 且 redemptionCode 非空才算拿到；
+  // 仅 CLAIMED 无码 = 发放确认中（hub qoder_accounts.py:1070-1072/1089）。
+  const code = String(cr.redemptionCode || '').trim()
+
+  if (failure && QODER_CAMPAIGN_FAILURE_CN[failure]) {
+    return {
+      outcome: { success: false, message: `${label}：${QODER_CAMPAIGN_FAILURE_CN[failure]}`, campaignKey, redemptionCode: code || undefined, debug: dbg },
+    }
+  }
+
+  if (status === 'CLAIMED' || status === 'GRANTED' || status === 'SUCCESS') {
+    if (cr.replayed) {
+      return { outcome: { success: true, already: true, message: `今日已领取（${label}）`, campaignKey, redemptionCode: code || undefined, debug: dbg } }
+    }
+    return {
+      outcome: null,
+      amount: typeof cr.benefit?.amount === 'number' ? cr.benefit.amount : (typeof cr.amount === 'number' ? cr.amount : undefined),
+      code: code || undefined,
+      confirming: status === 'CLAIMED' && !code,
+      expiresAt: cr.expiresAt,
+    }
+  }
+  return { outcome: { success: false, message: `${label}：未知状态 ${cr.status || '(空)'}`, campaignKey, debug: dbg } }
+}
+
+/**
+ * 从响应文本里认出官方失败码（hub `_CAMPAIGN_FAILURE_CN` 的键）。
+ *
+ * 为什么要扫文本而不是只读结构化字段：`failureCode` 有时只出现在**嵌套的错误体字符串**里
+ * （HTTP 4xx 的 body 就是原始 JSON 文本），只读字段会漏掉「风控拦截」这类关键结论。
+ */
+function matchQoderFailureCode(upperText: string): string | null {
+  for (const code of Object.keys(QODER_CAMPAIGN_FAILURE_CN)) {
+    if (upperText.includes(code)) return code
+  }
+  if (upperText.includes('SAME_PERSON_ALREADY_CLAIMED')) return 'SAME_PERSON_ALREADY_CLAIMED'
+  return null
 }
 
 /** GET /api/v2/quota/usage 响应。 */
@@ -819,4 +1074,171 @@ export function isQoderCreditsExhausted(cr: { totalRemain: number; totalUsed: nu
   if (!cr) return false
   if (cr.totalRemain > 0) return false
   return cr.totalUsed > 0 || cr.totalSize > 0
+}
+
+// ===== Pro 升级包（一次性 +1800 积分，hub qoder_accounts.py:1289-1323） =====
+
+/** Pro 升级包端点（hub PATH_PRO_ELIGIBILITY / PATH_PRO_CLAIM，qoder_accounts.py:96-97）。 */
+export const QODER_PATH_PRO_ELIGIBILITY = '/sash/api/v1/me/pro-upgrade/eligibility'
+export const QODER_PATH_PRO_CLAIM = '/sash/api/v1/me/pro-upgrade/claim'
+
+/**
+ * 上游不回传金额时的兜底（hub `PRO_REWARD_CREDIT`，qoder_tasks.py:739）。
+ *
+ * 1800 = **18 天签到量**（每日 100）。这是每个账号一次性的白拿额度，旧实现完全没做。
+ */
+export const QODER_PRO_REWARD_CREDIT = 1800
+
+/**
+ * 派生一个 36 位设备/会话标识（hub `derive_id`，qoder_fingerprint.py:20-26）。
+ *
+ * `md5(salt + ":" + uid)` 的十六进制；md5 本身就是 32 位，故 `[:36]` 即全量
+ * （与 cosy.ts 的 `md5Hex('machine:' + seed)` 逐字节同值）。
+ * 幂等：同一账号每次调用产生相同值，避免随机机器码触发上游风控。
+ */
+function qoderDeriveId(uid: string, salt: string): string {
+  return md5Hex(`${salt}:${uid || 'anonymous'}`)
+}
+
+/**
+ * 带稳定前缀 + 微秒后缀的防风控请求 ID（hub `generate_request_id`，
+ * qoder_fingerprint.py:29-33）。
+ *
+ * 前缀按 uid 派生（可溯源到账号），后缀取当前微秒的低 6 位（防重放）。
+ */
+function qoderGenerateRequestId(uid: string): string {
+  const prefix = qoderDeriveId(uid, 'req')
+  const suffix = String(Date.now() % 1000000).padStart(6, '0')
+  return `${prefix}-${suffix}`
+}
+
+/**
+ * Pro 升级包端点专用头（hub `Account.headers()`，qoder_accounts.py:640-652）。
+ *
+ * ## 为什么不能复用 checkinHeaders
+ *
+ * 两者是**两套不同口径**，混用会把错误的身份形态发给上游：
+ *   - 本函数（hub `headers()`）：纯 Bearer + `X-Machine-ID`/`X-Session-ID`/`X-Request-ID`
+ *     + Origin/Referer，**没有任何 cosy-machine\*** 头；
+ *   - `checkinHeaders`（hub `desktop_headers()`，qoder_accounts.py:654-686）：桌面端
+ *     活动平台口径，带六个 `cosy-machine*`。
+ *
+ * Pro 端点走前者（hub 的 `pro_eligibility`/`pro_claim` 都调 `self.headers()`）。
+ * 这不是「少发几个头」——hub 的逐头隔离实验（issue #10）证明机器头形态本身就是
+ * 服务端的判别信号，发错形态会被按非官方客户端处理。
+ */
+function proHeaders(token: string, uid: string, realm: QoderRealm): Record<string, string> {
+  const site = QODER_WEBSITE[realm]
+  return {
+    'Content-Type': 'application/json',
+    'Accept': 'application/json, text/plain, */*',
+    'User-Agent': 'Go-http-client/2.0',
+    'Authorization': `Bearer ${token}`,
+    'X-Request-ID': qoderGenerateRequestId(uid),
+    'X-Machine-ID': qoderDeriveId(uid, 'machine'),
+    'X-Session-ID': qoderDeriveId(uid, 'session'),
+    'Origin': site,
+    'Referer': site + '/',
+  }
+}
+
+/** Pro 升级包资格查询结果。 */
+export interface QoderProEligibility {
+  /** 查询本身是否成功（**不代表可领取**） */
+  ok: boolean
+  /** 是否可领取 */
+  eligible: boolean
+  /** 查询失败时的原因 */
+  error?: string
+}
+
+/**
+ * 查询 Pro 升级包资格（GET，hub `pro_eligibility`，qoder_accounts.py:1290-1303）。
+ *
+ * `404/403/410` 一律按「**查询成功但不可领取**」处理（`ok:true, eligible:false`）：
+ * 端点不存在 / 活动已下线时，账号侧的正确结论就是「没得领」，报成查询失败会让批量汇总
+ * 每次都多一条假告警。
+ */
+export async function proEligibility(token: string, realm: QoderRealm = 'cn', uid = ''): Promise<QoderProEligibility> {
+  let res: Response
+  try {
+    res = await fetch(QODER_OPENAPI[realm] + QODER_PATH_PRO_ELIGIBILITY, {
+      method: 'GET',
+      headers: proHeaders(token, uid, realm),
+      signal: AbortSignal.timeout(15000),
+    })
+  } catch (e) {
+    return { ok: false, eligible: false, error: (e as Error).message || '网络请求失败' }
+  }
+  if (!res.ok) {
+    if (res.status === 404 || res.status === 403 || res.status === 410) {
+      return { ok: true, eligible: false }
+    }
+    return { ok: false, eligible: false, error: `HTTP ${res.status}` }
+  }
+  const body = (await res.json().catch(() => null)) as Record<string, unknown> | null
+  return { ok: true, eligible: body?.eligible === true }
+}
+
+/** Pro 升级包领取结果。 */
+export interface QoderProClaimResult {
+  ok: boolean
+  /** true = 之前已经领过（幂等命中，不是失败） */
+  already?: boolean
+  message: string
+  /** 领取成功时的积分（上游不回传金额则用 QODER_PRO_REWARD_CREDIT 兜底） */
+  rewardCredits?: number
+  error?: string
+}
+
+/**
+ * 领取 Pro 升级包（POST 空 JSON body，hub `pro_claim`，qoder_accounts.py:1305-1323）。
+ *
+ * ## 必须区分 `claimed_now` 与 `already`（源明确记载的历史缺陷）
+ *
+ * hub `run_pro_claim` 的注释（qoder_tasks.py:745-752）写着：不区分会让批量汇总的
+ * `credit_added` **每次虚增 +1800**。故这里 `already` 时**不给** `rewardCredits`，
+ * 由调用方据此决定是否记账。
+ *
+ * 幂等判据与源逐字同构：`HTTP 409` 或 body 含 `ALREADY` → 已领取过（成功语义）。
+ */
+export async function proClaim(token: string, realm: QoderRealm = 'cn', uid = ''): Promise<QoderProClaimResult> {
+  let res: Response
+  try {
+    res = await fetch(QODER_OPENAPI[realm] + QODER_PATH_PRO_CLAIM, {
+      method: 'POST',
+      headers: proHeaders(token, uid, realm),
+      body: '{}',
+      signal: AbortSignal.timeout(15000),
+    })
+  } catch (e) {
+    return { ok: false, message: (e as Error).message || '网络请求失败', error: (e as Error).message }
+  }
+  const text = await res.text().catch(() => '')
+  if (!res.ok) {
+    if (res.status === 409 || text.toUpperCase().includes('ALREADY')) {
+      return { ok: true, already: true, message: 'Pro 升级包已领取过' }
+    }
+    return { ok: false, message: `领取失败 http ${res.status}: ${text.substring(0, 160)}`, error: `HTTP ${res.status}` }
+  }
+  let body: Record<string, unknown> | null = null
+  try {
+    body = text ? (JSON.parse(text) as Record<string, unknown>) : null
+  } catch {
+    return { ok: false, message: `领取响应格式异常: ${text.substring(0, 160)}`, error: 'parse' }
+  }
+  // `ALREADY` 出现在**任何**位置都按「已领过」处理（不限于 HTTP 409 与 success:false）。
+  // 为什么比源更宽一格：源只在 HTTPError 分支扫这个字样，而 200 信封里同样可能带它。
+  // 把它误判成「本次新领」会让批量汇总的积分虚增 +1800 —— 这正是源明确记载的历史缺陷，
+  // 故宁可多认一层，也不冒虚增的风险（判错的代价不对称：少算一次 vs 多算一次）。
+  if (text.toUpperCase().includes('ALREADY')) {
+    return { ok: true, already: true, message: 'Pro 升级包已领取过' }
+  }
+  if (body?.success === false) {
+    const msg = String(body?.message || text).substring(0, 160)
+    return { ok: false, message: `领取失败: ${msg}`, error: msg }
+  }
+  // 上游可能回传真实金额；没有则用源同款兜底 1800
+  const amount = typeof body?.amount === 'number' ? (body.amount as number) : QODER_PRO_REWARD_CREDIT
+  return { ok: true, message: `Pro 升级包领取成功 +${amount}`, rewardCredits: amount }
 }

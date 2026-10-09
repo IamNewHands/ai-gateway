@@ -16,6 +16,7 @@
 import type { Env, Provider } from '../types'
 import { getOauthAccessToken, readOauthToken, refreshOauthToken, refreshQoderTokenPair } from '../oauth'
 import { buildQoderBody, cpaToUpstreamKey, fallbackUnknownModel, pickQoderModels, qoderStructuredToolMode, useQoderStructuredToolHistory } from './body'
+import type { QoderMetaRealm } from './model-meta'
 import { qoderEncode, cosySessionFor, cosyHeaders, buildBearer, type CosySession } from './cosy'
 import { classifyQoderError, qoderOpenAIErrorBody, noteQoderInnerError, qoderInnerErrorDetail, qoderInnerErrorClassified, type QoderClassified } from './classify'
 import {
@@ -24,6 +25,8 @@ import {
   pickQoderAccount,
   refreshQoderPoolAccountIfNeeded,
   cooldownQoderAccount,
+  cooldownQoderAccountModel,
+  clearQoderModelCooldown,
   disableQoderAccount,
   noteQoderError,
   noteQoderSuccess,
@@ -145,18 +148,24 @@ export function isQoderSessionDead(text: string): boolean {
 /**
  * 按错误分类对池账号施加冷却/禁用（对齐 cli2api pool.MarkClassified 语义）：
  *   quota      → 长冷却（planMs，签到恢复积分后自动解冻）
- *   rate_limit → 短冷却（上游 retryAfterSeconds / Retry-After 优先，回退 softMs）
+ *   rate_limit → **模型级**短冷却（上游 retryAfterSeconds / Retry-After 优先，回退 softMs）
  *   auth       → **只有会话被上游吊销才停用**；其余 401/403 冷却 60s 后轮换
  *                （hub qoder_proxy.py:2642-2656 口径：dead→300s+停用，非 dead→60s）
  *   content_policy → **不记任何状态**：这是客户端输入被审核拒绝，账号本身没问题；
  *                    记错误会让连续几次敏感输入把好账号冷却掉
  *   其余       → 分类器给出的冷却时长（>0 时），并记一次连续错误
+ *
+ * `model` 非空时 **rate_limit 只写模型级冷却**（hub `note_error(model=…)`，
+ * qoder_accounts.py:610-616）：上游的 429 常是单个模型的频控，账号本身仍可服务其它模型。
+ * 旧实现一律写账号级 `until`，于是「在 qmodel 上撞限流」会把该账号在 dmodel/gm51model 上
+ * 也一起冻结——白白少用一个健康账号，并把「模型级限流」误报成「账号不可用」。
  */
 export async function markQoderAccountClassified(
   env: Env,
   provider: Provider,
   uid: string,
-  c: QoderClassified
+  c: QoderClassified,
+  model?: string
 ): Promise<void> {
   const cd = resolveQoderCooldown(provider)
   switch (c.kind) {
@@ -185,9 +194,16 @@ export async function markQoderAccountClassified(
         )
       }
       break
-    case 'rate_limit':
-      await cooldownQoderAccount(env, provider.id, uid, (c.cooldownSeconds || 0) * 1000 || cd.softMs, '限流（429）')
+    case 'rate_limit': {
+      const ms = (c.cooldownSeconds || 0) * 1000 || cd.softMs
+      // 有模型上下文 → 只冻这个模型（账号级状态不动）
+      if (model) {
+        await cooldownQoderAccountModel(env, provider.id, uid, model, ms, `限流（429，仅模型 ${model}）`)
+      } else {
+        await cooldownQoderAccount(env, provider.id, uid, ms, '限流（429）')
+      }
       break
+    }
     default:
       if (c.cooldownSeconds > 0) {
         await cooldownQoderAccount(env, provider.id, uid, c.cooldownSeconds * 1000, c.kind + ': ' + c.message.substring(0, 60))
@@ -581,6 +597,13 @@ export interface QoderProxyOptions {
   session?: { session: CosySession }
   /** 请求头 X-Qoder-Account：客户端固定使用指定账号（池内 uid）。缺省自动挑选。 */
   preferUid?: string
+  /**
+   * 会话注入路径的账号域（`opts.session` 时生效，缺省 cn）。
+   *
+   * 池路径的域来自 `account.realm`，不走这里；这条只服务「测试/工具注入会话」的单次直发，
+   * 让调用方能显式指定国际版账号，从而拿到正确的 model_config 元数据。
+   */
+  realm?: QoderMetaRealm
 }
 
 /** 单次上游发送的结果：成功 Response，或分类后的错误（供池循环决定冷却与轮转）。 */
@@ -762,12 +785,27 @@ export async function proxyQoderChatRequest(
   // 工具历史结构化直传（hub v1.2.6）：默认 auto —— 仅在确实存在工具历史且 id 齐备时启用，
   // 纯对话请求形态与旧版逐字节一致。`QODER_STRUCTURED_TOOL_HISTORY=off` 可一键回退。
   const structuredTools = useQoderStructuredToolHistory(messages, qoderStructuredToolMode(env))
-  const body = buildQoderBody(messages, modelKey, undefined, forwardBody.tools, structuredTools)
-  const encodedBody = qoderEncode(body)
+  /**
+   * 请求体渲染按**账号域**取模型元数据（两区同 key 的 display_name/is_vl/is_reasoning/
+   * max_input_tokens 确实不同，见 model-meta.ts 文件头）。
+   *
+   * 为什么渲染必须放进账号循环：域是**账号**属性（`account.realm`），池内可以混区。
+   * 在循环外渲染一次只能瞎猜一个域，混区时必然有一半账号拿到另一区的元数据。
+   * 代价只有一次 JSON.stringify + 一次 qoderEncode（仅在该账号上重试时才重算）。
+   */
+  const renderBody = (realm: QoderMetaRealm) =>
+    qoderEncode(buildQoderBody(messages, modelKey, undefined, forwardBody.tools, structuredTools, {
+      realm,
+      // 兼容 max_tokens / max_completion_tokens 两种写法（源 translate_max_completion_tokens 同口径）
+      maxTokens: forwardBody.max_tokens ?? forwardBody.max_completion_tokens,
+      // 兼容 reasoning_effort / reasoning.effort / thinking.effort / thinking.level（源同款）
+      reasoningEffort: pickQoderReasoningEffort(forwardBody),
+    }))
   const wantStream = opts?.stream ?? forwardBody.stream === true
 
-  // 会话注入（测试/工具）：单次直发，不经过池
+  // 会话注入（测试/工具）：单次直发，不经过池。域由调用方显式给出，缺省 cn。
   if (opts?.session) {
+    const encodedBody = renderBody(opts?.realm === 'global' ? 'global' : 'cn')
     const r = await sendQoderChatOnce(opts.session.session, encodedBody, modelKey, model, wantStream)
     return r.ok ? r.response : classifiedErrorResponse(r.classified)
   }
@@ -787,8 +825,9 @@ export async function proxyQoderChatRequest(
     for (let i = 0; i < poolLen; i++) {
       let account: QoderPoolAccount | null = null
       try {
-        // 账号固定：首轮优先用 X-Qoder-Account 指定的 uid，之后自动挑号轮转
-        account = await pickQoderAccount(env, provider.id, tried, i === 0 ? opts?.preferUid : undefined)
+        // 账号固定：首轮优先用 X-Qoder-Account 指定的 uid，之后自动挑号轮转。
+        // 传 model：模型级冷却的账号在该模型上被跳过，但在其它模型上仍可服务。
+        account = await pickQoderAccount(env, provider.id, tried, i === 0 ? opts?.preferUid : undefined, model)
       } catch { /* ignore */ }
       if (!account) break
       tried.add(account.uid)
@@ -812,9 +851,15 @@ export async function proxyQoderChatRequest(
         continue
       }
 
-      const r = await sendQoderChatOnce(session, encodedBody, modelKey, model, wantStream, account.uid, account.realm === 'global' ? 'global' : 'cn')
+      const accountRealm: QoderMetaRealm = account.realm === 'global' ? 'global' : 'cn'
+      const encodedBody = renderBody(accountRealm)
+      const r = await sendQoderChatOnce(session, encodedBody, modelKey, model, wantStream, account.uid, accountRealm)
       if (r.ok) {
         await noteQoderSuccess(env, provider.id, account.uid)
+        // 该账号在该模型上刚成功 → 清掉它的模型级冷却（hub `clear_error(model=)`
+        // qoder_proxy.py:2885：成功一次就解除该模型的频控标记，不必等冷却自然到期）。
+        // 只在确实有冷却记录时才写 KV（clearQoderModelCooldown 内部判空）。
+        try { await clearQoderModelCooldown(env, provider.id, account.uid, model) } catch { /* ignore */ }
         return r.response
       }
       // 内容审核是**请求**属性而非账号属性：换号必然被同样拒绝，继续轮转只会白烧
@@ -822,8 +867,8 @@ export async function proxyQoderChatRequest(
       if (r.classified.kind === 'content_policy') {
         return classifiedErrorResponse(r.classified)
       }
-      // 失败：按分类冷却/禁用，然后轮转下一个账号
-      await markQoderAccountClassified(env, provider, account.uid, r.classified)
+      // 失败：按分类冷却/禁用，然后轮转下一个账号（带 model → 429 只冻该模型）
+      await markQoderAccountClassified(env, provider, account.uid, r.classified, model)
       lastErr = r.classified
     }
 
@@ -855,8 +900,30 @@ export async function proxyQoderChatRequest(
       { status: 502, headers: { 'Content-Type': 'application/json; charset=utf-8' } }
     )
   }
-  const r = await sendQoderChatOnce(data.session, encodedBody, modelKey, model, wantStream, undefined, data.realm)
+  const r = await sendQoderChatOnce(data.session, renderBody(data.realm), modelKey, model, wantStream, undefined, data.realm)
   return r.ok ? r.response : classifiedErrorResponse(r.classified)
+}
+
+/**
+ * 从客户端请求体里取思考档位，兼容四种写法（hub qoder_proxy.py:2389-2395 同款）：
+ *   `reasoning_effort` / `reasoning.effort` / `thinking.effort` / `thinking.level`
+ *
+ * 为什么要兼容：不同客户端（Claude Code / Cline / Roo / 各 SDK）把档位放在不同位置，
+ * 只认顶层 `reasoning_effort` 会让其余客户端的档位设置静默失效。
+ */
+function pickQoderReasoningEffort(forwardBody: Record<string, unknown>): unknown {
+  if (forwardBody.reasoning_effort) return forwardBody.reasoning_effort
+  const reasoning = forwardBody.reasoning
+  if (reasoning && typeof reasoning === 'object') {
+    const e = (reasoning as Record<string, unknown>).effort
+    if (e) return e
+  }
+  const thinking = forwardBody.thinking
+  if (thinking && typeof thinking === 'object') {
+    const t = thinking as Record<string, unknown>
+    return t.effort || t.level
+  }
+  return undefined
 }
 
 /**

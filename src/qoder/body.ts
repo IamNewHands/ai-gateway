@@ -4,6 +4,7 @@
  */
 
 import basepromptJson from './baseprompt.json'
+import { normalizeQoderReasoningEffort, qoderModelMeta, QODER_DEFAULT_MAX_INPUT_TOKENS, type QoderMetaRealm } from './model-meta'
 
 /** 上游模型 key 映射（cpaToUpstreamKey）。未知名称原样透传（上游静默路由到 auto）。 */
 const MODEL_KEY_MAP: Record<string, string> = {
@@ -277,16 +278,24 @@ function qoderNormalizeToolCalls(raw: unknown): any[] | null {
  * @param modelKey 上游模型 key（已通过 cpaToUpstreamKey 映射）
  * @param userType aliyun_user_type，默认 personal_professional_trial
  * @param tools 客户端 tools 定义；传入时**覆盖**模板内置的 14 个 Qoder CLI 工具
+ * @param structuredToolHistory 是否结构化直传工具历史（见 useQoderStructuredToolHistory）
+ * @param opts 本轮新增的可选参数（全部缺省时与旧行为逐字节一致）：
+ *   - `realm`：账号域，决定 `model_config` 元数据取哪张表（两区同 key 的元数据确实不同）
+ *   - `maxTokens`：客户端 `max_tokens` / `max_completion_tokens`，覆盖模板写死的 32768
+ *   - `reasoningEffort`：客户端思考档位，按该模型官方档位表归一后下发
  */
 export function buildQoderBody(
   messages: ChatMessage[],
   modelKey: string,
   userType = 'personal_professional_trial',
   tools?: unknown,
-  structuredToolHistory?: boolean
+  structuredToolHistory?: boolean,
+  opts?: { realm?: QoderMetaRealm; maxTokens?: unknown; reasoningEffort?: unknown }
 ): string {
   const base = deepClone(basepromptJson)
   const prompt = extractLatestUserPrompt(messages)
+  const realm: QoderMetaRealm = opts?.realm === 'global' ? 'global' : 'cn'
+  const meta = qoderModelMeta(modelKey, realm)
 
   const nid = crypto.randomUUID()
   base.request_id = nid
@@ -297,8 +306,24 @@ export function buildQoderBody(
   base.aliyun_user_type = userType
   base.agent_id = 'agent_common'
 
+  // ===== model_config 逐字段赋值（hub qoder_proxy.py:2341-2363） =====
+  // 旧实现只写 `key`，其余全是模板残留（display_name 恒 "Lite"、is_vl/is_reasoning 恒 false、
+  // max_input_tokens 恒 180000）——VL 模型带着 is_vl:false 发出，1M 上下文的模型被报成 18 万。
+  //
+  // 未知 key 的兜底**刻意最小**：只写 display_name = key，布尔开关与上限保持模板值。
+  // 把未知模型标成 is_vl:false 等于替上游宣称「它不支持图片」，而模板本来就是 false，
+  // 保持原样才是零信息变更（不编造能力）。
   if (base.model_config && typeof base.model_config === 'object') {
-    base.model_config.key = modelKey
+    const mc = base.model_config
+    mc.key = modelKey
+    if (meta) {
+      mc.display_name = meta.displayName
+      mc.is_vl = meta.isVl
+      mc.is_reasoning = meta.isReasoning
+      mc.max_input_tokens = meta.maxInputTokens || QODER_DEFAULT_MAX_INPUT_TOKENS
+    } else {
+      mc.display_name = modelKey
+    }
   }
 
   if (base.chat_context && typeof base.chat_context === 'object') {
@@ -308,10 +333,39 @@ export function buildQoderBody(
       if (cc.extra.originalContent && typeof cc.extra.originalContent === 'object') {
         cc.extra.originalContent.text = prompt
       }
+      // chat_context.extra.modelConfig 是 model_config 的副本（hub 同款 `extra["modelConfig"] = dict(mc)`）。
+      // 模板里这份只有 {is_reasoning,key} 两个字段，旧实现同样只改 key → 与顶层 model_config
+      // 自相矛盾（顶层 is_vl:true、副本连 is_vl 都没有）。这里整体同步。
       if (cc.extra.modelConfig && typeof cc.extra.modelConfig === 'object') {
-        cc.extra.modelConfig.key = modelKey
+        const emc = cc.extra.modelConfig
+        emc.key = modelKey
+        if (meta) {
+          emc.display_name = meta.displayName
+          emc.is_vl = meta.isVl
+          emc.is_reasoning = meta.isReasoning
+          emc.max_input_tokens = meta.maxInputTokens || QODER_DEFAULT_MAX_INPUT_TOKENS
+        } else {
+          emc.display_name = modelKey
+        }
       }
     }
+  }
+
+  // ===== parameters：max_tokens / reasoning_effort（hub qoder_proxy.py:2381-2403） =====
+  // 模板写死 `parameters:{"max_tokens":32768}`，旧实现从不覆盖 → 客户端要 4096 也拿 32768。
+  // `max_completion_tokens` 是 `max_tokens` 的别名（源 translate_max_completion_tokens 同口径）。
+  if (base.parameters && typeof base.parameters === 'object') {
+    const params = base.parameters
+    const rawMax = opts?.maxTokens
+    if (rawMax !== undefined && rawMax !== null && rawMax !== '') {
+      const n = typeof rawMax === 'number' ? rawMax : Number(rawMax)
+      // 只接受有限正整数：NaN/0/负数会让上游按「未指定」处理，写进去等于自造畸形字段
+      if (Number.isFinite(n) && n > 0) params.max_tokens = Math.floor(n)
+    }
+    // 档位归一需要模型的官方档位表（依赖上面的 meta）；表缺失时按 hub 策略处理：
+    // 无 thinking_config → 原样透传，有 thinking_config 无档位表 → 除 none 外不下发。
+    const effort = normalizeQoderReasoningEffort(opts?.reasoningEffort, meta)
+    if (effort) params.reasoning_effort = effort
   }
 
   // messages：保留模板中的 system 提示词，追加真实对话

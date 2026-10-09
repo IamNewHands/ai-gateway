@@ -102,6 +102,8 @@ import {
   handleOAuthActivity,
   handleOAuthTravel,
   handleOAuthDaily,
+  handleOAuthProClaim,
+  handleOAuthCouponClaim,
 } from './checkin'
 import { autoCleanupAll, healthCheckM365All } from './m365/auto-cleanup'
 import { healthCheckClineAll } from './cline/proxy'
@@ -245,6 +247,10 @@ app.get('/admin/api/oauth/:id/pool/export', handleOAuthPoolExport)
 app.post('/admin/api/oauth/:id/activity', handleOAuthActivity)
 app.post('/admin/api/oauth/:id/travel', handleOAuthTravel)
 app.post('/admin/api/oauth/:id/daily', handleOAuthDaily)
+// Qoder 专用：Pro 升级包（一次性 +1800）与券类福利（兑换码，不可恢复资产）。
+// 各自单开入口的理由见 checkin.ts 的 handleOAuthProClaim / handleOAuthCouponClaim。
+app.post('/admin/api/oauth/:id/pro-claim', handleOAuthProClaim)
+app.post('/admin/api/oauth/:id/coupons', handleOAuthCouponClaim)
 // S5：模型拉取有副作用（请求上游并自动合并保存到 provider.models），改 POST 防链接型 CSRF
 app.post('/admin/api/oauth/:id/models', handleOAuthModels)
 // Cline 动态模型同步（item6）

@@ -950,6 +950,50 @@ describe('WorkBuddy 面板「即将到期」标记（客户端口径 = 后端挑
     expect(body).toContain("(a.nickname ? '（' + escapeHtml(a.nickname) + '）' : '')")
     expect(body).not.toContain("a.nickname ? escapeHtml(a.nickname) : 'uid='")
   })
+
+  /**
+   * 第三轮移植项的**面板接线**（2026-10-08）。
+   *
+   * 为什么必须函数体级断言：后端能力（Pro 包 / 兑换码 / 模型级冷却）全部就绪、
+   * 页面语法也合法，但按钮没接上或账号行没渲染 —— 用户在面板上就是看不到、点不到，
+   * 而这在 tsc 与语法检查里完全无感（函数全局存在 ≠ 被用上）。
+   */
+  it('P1/P2：面板有「领 Pro 包」「领兑换码」入口，且指向正确的管理接口', async () => {
+    const html = await render([{
+      ...traeProvider(), id: 'qoder', name: 'QoderWork', authType: 'oauth-device', oauth: { flowType: 'qoder' },
+    } as Provider])
+    const js = inlineScripts(html).join('\n')
+    // 两个入口的函数与按钮都在
+    expect(js).toContain('function qoderProClaim')
+    expect(js).toContain('function qoderCouponClaim')
+    expect(html).toContain("qoderProClaim('qoder')")
+    expect(html).toContain("qoderCouponClaim('qoder')")
+    // 端点路径不能拼错（拼错 = 点了报 404）
+    expect(js).toContain("'/admin/api/oauth/' + encodeURIComponent(id) + '/pro-claim'")
+    expect(js).toContain("'/admin/api/oauth/' + encodeURIComponent(id) + '/coupons'")
+    // 领完必须刷新账号池：Pro 包改变积分、兑换码要显示到账号行上
+    expect(js).toMatch(/function qoderProClaim[\s\S]*?qoderPoolStatus\(id\)/)
+    expect(js).toMatch(/function qoderCouponClaim[\s\S]*?qoderPoolStatus\(id\)/)
+    // 兑换码结果必须直接显示（码只回一次，藏在日志里等于丢了）
+    expect(js).toMatch(/function qoderCouponClaim[\s\S]*?showResult\(st, true/)
+  })
+
+  it('P2/P3：Qoder 账号行渲染兑换码与模型级冷却徽章（后端有数据也要能看见）', async () => {
+    const html = await render([{
+      ...traeProvider(), id: 'qoder', name: 'QoderWork', authType: 'oauth-device', oauth: { flowType: 'qoder' },
+    } as Provider])
+    const js = inlineScripts(html).join('\n')
+    const m = js.match(/function renderQoderPoolAccounts\(([^)]*)\) \{([\s\S]*?)\n\}/)
+    expect(m, '未找到 renderQoderPoolAccounts').not.toBeNull()
+    const body = m![2]
+    // 兑换码：读 a.campaignCodes 并给复制按钮（不可恢复资产，必须可复制）
+    expect(body).toContain('a.campaignCodes')
+    expect(body).toContain('兑换码')
+    expect(body).toContain('copyText(')
+    // 模型级冷却：读 a.modelCooldowns 并显示模型名 + 剩余秒数
+    expect(body).toContain('a.modelCooldowns')
+    expect(body).toContain('模型限流')
+  })
 })
 
 /**
