@@ -17,7 +17,23 @@ import type { QoderDeviceIdentity } from './billing'
 
 // ===== COSY 指纹常量（对齐 keirouter constants.go） =====
 // 这些值不是任意的——上游签名校验会把它们与签名时的值比对。
-const IDE_VERSION = '1.0.0'
+/**
+ * COSY SDK 版本（同时进签名 payload 的 `cosyVersion` 与出站头 `Cosy-Version`，两处必须一致）。
+ *
+ * 三套实现的取值：本模块原为 `1.0.0`、qoder2api `internal/cosy/session.go:17` 是 `1.0.10`、
+ * hub `qoder_sign.py` 是 `1.1.64`。后两者都实测可用，故取值本身不是硬门槛；本模块取 `1.1.64`
+ * 的理由是**它已经在同一个账号 + 同一个上游上被证明可用**——签到链路（checkinHeaders 的
+ * 桌面端默认值 `QODER_DESKTOP_DEFAULTS.version`）用的就是这个值，少引入一个未知量。
+ */
+const IDE_VERSION = '1.1.64'
+/**
+ * 客户端类型：**5 = CLI**。
+ *
+ * 两套参考实现的推理链路都发 5（qoder2api `client.go:39`、hub `qoder_sign.py:587`），
+ * 而 10 是**桌面端**的值、只用于签到链路（`checkinHeaders`）。这里刻意不改成 10：
+ * 本模块的请求体声明的是 CLI 会话（`session_type: qodercli` + `business.product: cli`），
+ * 头里改称桌面端会让头与体自相矛盾。
+ */
 const CLIENT_TYPE = '5'
 /**
  * 数据策略。**两套参考实现都发 agree**（qoder2api `internal/bridge/client.go:36`、

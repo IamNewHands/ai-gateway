@@ -9,10 +9,10 @@ describe('COSY 对齐 keirouter（身份字段/指纹常量/头集）', () => {
     expect(headers['Authorization']).toMatch(/^Bearer COSY\.\S+\.[0-9a-f]{32}$/)
   })
 
-  it('cosyVersion 为 1.0.0（对齐 keirouter IDEVersion）', async () => {
+  it('cosyVersion 为 1.1.64（与签到链路同值；payload 与头两处必须一致）', async () => {
     const sess = await cosySessionFor('dt-test1', 'drt', 'u1', 'n')
     const headers = cosyHeaders(sess, '{}', 'https://api3.qoder.sh/algo/api/v2/model/list', 'application/json', false)
-    expect(headers['Cosy-Version']).toBe('1.0.0')
+    expect(headers['Cosy-Version']).toBe('1.1.64')
   })
 
   it('指纹常量对齐参考实现：data-policy=agree、clienttype=5、machineos=x86_64_windows、login-version=v2', async () => {
