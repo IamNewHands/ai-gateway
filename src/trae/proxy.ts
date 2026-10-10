@@ -314,6 +314,35 @@ function logTraeTransport(env: Env, msg: string): Promise<void> {
 }
 
 /**
+ * 救援可见性：第 1..N 段建连失败后终于成功时落一条 **awaited** 日志（`rescued=true`）。
+ *
+ * 为什么必须单独一条：成功侧 `[trae-stream] ... connect=` 是 `writeLog(...).catch()` 的
+ * fire-and-forget，isolate 收尾时可能丢；而「救援」恰好是调阶梯**段数**唯一需要的样本——
+ * 每多一段到底救回多少、救回时那段的 connect 有多大。只在与失败配对时才落（首段成功不落），
+ * 量很小（坏窗口约每 20 分钟几条，好窗口为 0）。
+ *
+ * 判读：`failedStages` 分布 + `attempt=N/M` 给出各段的边际价值（第 3 段几乎救不回东西就该砍）；
+ * `connect=` 若长期贴着该段死线，说明死线临界、加时长才有意义。与失败行同 warn 级同前缀，
+ * 面板筛一次 `[trae-transport]` 就能同时看到「撞死几段」与「第几段救回来」。
+ */
+function logTraeRescue(
+  env: Env,
+  providerId: string,
+  phase: 'solo' | 'work',
+  uid: string,
+  model: string,
+  failedStages: number,
+  timing: TraeConnectTiming,
+  elapsedMs: number,
+): Promise<void> {
+  return logTraeTransport(env, `[trae-transport] provider=${providerId} uid=${uid} model=${model}`
+    + ` phase=${phase} rescued=true failedStages=${failedStages}`
+    + ` attempt=${failedStages + 1}/${TRAE_CONNECT_DEADLINES_MS.length}`
+    + ` stage=${transportStageDeadlineMs(failedStages)}ms`
+    + ` connect=${timing.connectMs ?? -1}ms elapsed=${elapsedMs}ms`)
+}
+
+/**
  * HTTP 错误分类 → 冷却状态机（Go chatCompletions status >= 400 分支）。 */
 async function applyChatError(env: Env, providerId: string, uid: string, kind: string, cd: TraeCooldownConfig): Promise<void> {
   switch (kind) {
@@ -469,6 +498,12 @@ export async function executeWorkRequest(
         await noteTraeWorkError(env, provider.id, account.uid, cd.errThreshold, cd.errMs)
       }
       continue
+    }
+
+    // 走到这里说明本段建连成功。若之前有段撞死，落一条 awaited 救援日志（见 logTraeRescue：
+    // 成功侧 `[trae-stream] connect=` 是 fire-and-forget，不能作为调段数的依据）。
+    if (transportAttempts > 0) {
+      await logTraeRescue(env, provider.id, 'work', account.uid, workModel, transportAttempts, timing, Date.now() - attemptStartedAt)
     }
 
     await noteTraeWorkSuccess(env, provider.id, account.uid)
@@ -737,6 +772,12 @@ export async function proxyTraeChatRequest(
         if (fallbackResp) return fallbackResp
       }
       continue
+    }
+
+    // 走到这里说明本段建连成功。若之前有段撞死，落一条 awaited 救援日志（见 logTraeRescue：
+    // 成功侧 `[trae-stream] connect=` 是 fire-and-forget，不能作为调段数的依据）。
+    if (transportAttempts > 0) {
+      await logTraeRescue(env, provider.id, 'solo', account.uid, configName, transportAttempts, timing, Date.now() - attemptStartedAt)
     }
 
     if (stream) {

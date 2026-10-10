@@ -202,14 +202,22 @@ turn4/step5 连续 5 次 503 后 `Connection error`）。代价只有最坏死�
 带 tools 时不走 Work 兜底，所以坏窗口里客户端看到的 503 由它自己重试兜底。
 
 **不变量与验证**：每段必须 > 实测最慢活连接（现为 9187ms）；逐段不得收紧（`[i] >= [i-1]`）；
-`src/trae/truncation.test.ts` 的阶梯组锁三件事——第 1 段撞满→同账号换连接成功、每段都撞满→503 + 逐段日志 +
-`attempts=段数`、默认单段 = 最后一段。断言一律按 `TRAE_CONNECT_DEADLINES_MS` 取值，**不写死段数**。
-验证命令：`npx tsc --noEmit` + `npx vitest run --pool=threads src/trae`。
+`src/trae/truncation.test.ts` 的阶梯组锁四件事——第 1 段撞满→同账号换连接成功、每段都撞满→503 + 逐段日志 +
+`attempts=段数`、救援行必须落且 `connect` 已采到、默认单段 = 最后一段。断言一律按 `TRAE_CONNECT_DEADLINES_MS`
+取值，**不写死段数**。验证命令：`npx tsc --noEmit` + `npx vitest run --pool=threads src/trae`。
 
-**已知观测缺口（调参前先看这条）**：成功侧 `[trae-stream] ... connect=` 是 `writeLog(...).catch()` 的
-fire-and-forget（`trae/proxy.ts` 的 onEnd 回调），isolate 收尾时可能丢；失败侧 `[trae-transport]` 是 `await`
-落盘。⇒ **调死线最需要的那条数据恰好最不可靠**（2026-10-10 想核对旧口径第 2 段的 `connect=` 分布时，面板里
-已经没有这块数据）。要数据驱动调参，得先把救援事件（第 1 段撞死后第 N 段成功）落一条 awaited 日志。
+**救援日志（2026-10-10 补，调段数就靠它）**：第 1..N 段撞死后终于成功时，`logTraeRescue` 落一条 **awaited**
+的 warn 行（与失败行同前缀同级别，面板筛一次 `[trae-transport]` 就能同时看到「撞死几段」与「第几段救回来」）：
+
+    [trae-transport] ... phase=solo rescued=true failedStages=1 attempt=2/3 stage=10000ms connect=1820ms elapsed=10250ms
+
+为什么必须单独一条：成功侧 `[trae-stream] ... connect=` 是 `writeLog(...).catch()` 的 fire-and-forget
+（`trae/proxy.ts` 的 onEnd 回调），isolate 收尾时可能丢；失败侧 `[trae-transport]` 才是 `await` 落盘。
+⇒ 修这条之前，**调死线最需要的那条数据恰好最不可靠**（2026-10-10 想核对旧口径第 2 段的 `connect=` 分布时，
+面板里已经没有这块数据）。救援行只在「有段撞死」时落，好窗口为 0，不会污染日志。
+
+判读：`failedStages` 分布给出各段的边际价值——若 `attempt=3/3` 的救援长期≈0，第 3 段就该砍；
+`connect=` 若长期贴着该段死线（如 9–10s），说明死线临界、该加时长而不是加段。
 
 **未做（候选，未拍板）**：① 对冲重试——第 1 条发出后 ~3s 并行发第 2 条，谁先回响应头用谁：成功路径不再付
 10s 死等、最坏仍 30s 且有 2 次机会；代价是坏窗口上游收到约 2× 请求，**是否重复计费未实测**。

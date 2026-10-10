@@ -997,12 +997,20 @@ describe('Trae 建连死线阶梯：第一段快失败 → 原账号换连接重
       expect(auths[0]).toBe(auths[1])
 
       const solo = [...env.KV.data.values()].map(String).filter((t) => t.includes('[trae-transport]') && t.includes('phase=solo'))
-      expect(solo).toHaveLength(1)          // 只有第 1 段失败过一次，重发成功不落失败日志
-      expect(solo[0]).toContain(`attempt=1/${TRAE_CONNECT_DEADLINES_MS.length}`)
-      expect(solo[0]).toContain(`stage=${TRAE_CONNECT_DEADLINES_MS[0]}ms`)
-      expect(solo[0]).toContain('timeout=true')
-      // 成功路径的 connect 采样走 [trae-stream] end= 日志（仅流式路径落），非流式不落；非流式的
-      // 「第 2 段实际耗时」由上面 auths 两次 + 200 结果共同证明，不另设日志。
+      // 两条：1 条「第 1 段撞死」失败行 + 1 条「第 2 段救回」救援行。
+      // 救援必须 awaited 落盘（成功侧 `[trae-stream] connect=` 是 fire-and-forget，调段数不能靠它）。
+      expect(solo).toHaveLength(2)
+      const fail = solo.filter((t) => t.includes('timeout=true'))
+      const rescue = solo.filter((t) => t.includes('rescued=true'))
+      expect(fail).toHaveLength(1)
+      expect(fail[0]).toContain(`attempt=1/${TRAE_CONNECT_DEADLINES_MS.length}`)
+      expect(fail[0]).toContain(`stage=${TRAE_CONNECT_DEADLINES_MS[0]}ms`)
+      expect(rescue).toHaveLength(1)
+      expect(rescue[0]).toContain('failedStages=1')
+      expect(rescue[0]).toContain(`attempt=2/${TRAE_CONNECT_DEADLINES_MS.length}`)
+      expect(rescue[0]).toContain(`stage=${TRAE_CONNECT_DEADLINES_MS[1]}ms`)
+      // 救回那一段的 connect 必须被采到（`-1` 表示没采到，调参就没依据了）
+      expect(rescue[0]).not.toContain('connect=-1')
     } finally {
       globalThis.fetch = originalFetch
       vi.useRealTimers()
@@ -1048,6 +1056,8 @@ describe('Trae 建连死线阶梯：第一段快失败 → 原账号换连接重
         expect(solo[i]).toContain(`stage=${TRAE_CONNECT_DEADLINES_MS[i]}ms`)
         expect(solo[i]).toContain('timeout=true')
       }
+      // 全死就没有救援行（救援只在与失败配对时落，否则量会失控）
+      expect(logs.some((t) => t.includes('rescued=true'))).toBe(false)
 
       const summary = logs.filter((t) => t.includes('[trae-transport]') && t.includes('end=503'))
       expect(summary).toHaveLength(1)
