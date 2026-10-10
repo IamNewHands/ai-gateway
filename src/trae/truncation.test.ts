@@ -12,7 +12,7 @@ import { TRAE_CHAT_CONNECT_TIMEOUT_MS, TRAE_CONNECT_DEADLINES_MS } from './const
  *  1. 回复停在半句，DSH 记到 finish=stop + turn/end=completed —— 因为 sse.ts 兜底把
  *     「上游没发 done 就断」合成成 stop，客户端无任何依据报错或重试；
  *  2. 同一时段 503 no_healthy_account，文案称账号池 cooling/disabled，实际是网关↔上游
- *     30s 建连超时连撞两个账号（62s ≈ 2×TRAE_CHAT_CONNECT_TIMEOUT_MS），账号未被罚。
+ *     建连超时连撞两个账号（当时单段上限 30s，共白等 62s），账号未被罚。
  */
 
 /** 收集流输出（Uint8Array → string）。 */
@@ -745,15 +745,15 @@ describe('Trae token 预刷新：连接层失败不罚号、撞满 1 次即跳�
  * 连接层失败可见性回归（2026-10-07，`trae/deepseek-v4.1-flash`，DSH 会话 `session-5890068d`）。
  *
  * 真相（会话记录实测 30 次失败，每次尝试 61.6–64.0s）：不是账号池问题、也不是客户端重试延迟，
- * 而是网关自己的 `TRAE_CHAT_CONNECT_TIMEOUT_MS`(30s) 掐断了「建连 + 响应头」阶段；带 tools 时
- * Work 兜底被跳过，于是白等 62s（≈2×30s）才回 503。而这条路径原先**一条日志都不落**，
+ * 而是网关自己的建连死线（当时 `TRAE_CHAT_CONNECT_TIMEOUT_MS` = 30s）掐断了「建连 + 响应头」阶段；
+ * 带 tools 时 Work 兜底被跳过，于是白等 62s（≈2×30s）才回 503。而这条路径原先**一条日志都不落**，
  * 面板「系统日志」完全查不到，只能靠翻 DSH 会话记录反推。
  *
  * 本组锁三件事：
  *  1. abort 文案自描述（`connect timeout <ms>`，毫秒数即当前常量值），不再是一句含糊的
  *     `The operation was aborted`；
  *  2. `TraeConnectTiming` 出口：失败侧 connectMs 达标且 connectTimeout=true，成功侧 connectMs 有值
- *     ——「成功样本的 connect 分布」是判断 30s 常量是否过紧的唯一依据（别凭感觉放宽）；
+ *     ——「成功样本的 connect 分布」是判断建连死线是否过紧的唯一依据（别凭感觉放宽或收紧）；
  *  3. 失败必须落 KV：每条尝试一行 `[trae-transport]`，收尾一行聚合结论（与 cline `[cline-attempt]` 同口径）。
  */
 describe('Trae 连接层失败可见性：connect 耗时采样与 [trae-transport] 落 KV', () => {
@@ -894,17 +894,21 @@ describe('Trae 连接层失败可见性：connect 耗时采样与 [trae-transpor
 })
 
 /**
- * 建连死线阶梯（2026-10-09，`TRAE_CONNECT_DEADLINES_MS`）。
+ * 建连死线阶梯（2026-10-09 落地 `TRAE_CONNECT_DEADLINES_MS`，2026-10-10 由 [10s,30s] 收紧为 [10s,10s]）。
  *
  * 真相：坏连接是「死」不是「慢」（60s 实验已证），等满上限毫无收益，唯一有信息量的动作是
  * 「换一条连接」。线上会话 session-1e29c762 实测每次坏连接让客户端白等 32–34s 并各收一次 503，
- * 而它 0.5s 后的重试全成功 ⇒ 第 1 段（10s）一撞就立刻在原账号换新连接重发。
+ * 而它 0.5s 后的重试全成功 ⇒ 每段一撞就立刻在原账号换新连接重发。
+ *
+ * 收紧依据（2026-10-10 成功侧 `connect=` 实测）：9 个样本全部 ≤ 9187ms（中位 2283ms），
+ * 10–30s 区间零样本，故最后一段不再需要 30s；同窗口反证 21:25:06 两段皆死报 503、
+ * 21:25:12 新连接 connect=1820ms 成功 ⇒ 活连接 2 秒回话，在死连接上多等 20s 无收益。
  *
  * 本组锁三件事：
  *  1. 第 1 段撞满 → **原账号**（Authorization 不变）换新连接重发，第 2 段成功即 200，
  *     且只留 1 条 `[trae-transport]`（stage=10000ms）——坏窗口不再向客户端报错；
- *  2. 两段都撞满 → 503，逐段死线 10000ms / 30000ms 各一条日志，聚合 `attempts=2`；
- *  3. 不变量：默认单段上限恒等于阶梯最后一段（保证「不走阶梯」的调用点行为不变）。
+ *  2. 两段都撞满 → 503，逐段死线各一条日志，聚合 `attempts=2`；
+ *  3. 不变量：默认单段上限恒等于阶梯最后一段（保证「不走阶梯」的调用点与主路径同一套判据）。
  */
 describe('Trae 建连死线阶梯：第一段快失败 → 原账号换连接重发', () => {
   const LADDER_ID = 'trae-ladder'
@@ -990,7 +994,7 @@ describe('Trae 建连死线阶梯：第一段快失败 → 原账号换连接重
       const solo = [...env.KV.data.values()].map(String).filter((t) => t.includes('[trae-transport]') && t.includes('phase=solo'))
       expect(solo).toHaveLength(1)          // 只有第 1 段失败过一次，重发成功不落失败日志
       expect(solo[0]).toContain('attempt=1/2')
-      expect(solo[0]).toContain('stage=10000ms')
+      expect(solo[0]).toContain(`stage=${TRAE_CONNECT_DEADLINES_MS[0]}ms`)
       expect(solo[0]).toContain('timeout=true')
       // 成功路径的 connect 采样走 [trae-stream] end= 日志（仅流式路径落），非流式不落；非流式的
       // 「第 2 段实际耗时」由上面 auths 两次 + 200 结果共同证明，不另设日志。
@@ -1000,7 +1004,7 @@ describe('Trae 建连死线阶梯：第一段快失败 → 原账号换连接重
     }
   })
 
-  it('两段都撞满 → 503，逐段死线 10000ms/30000ms 各落一条，聚合 attempts=2', async () => {
+  it('两段都撞满 → 503，逐段死线各落一条（stage=10000ms/10000ms），聚合 attempts=2', async () => {
     vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] })
     const originalFetch = globalThis.fetch
     const auths: string[] = []
@@ -1035,9 +1039,9 @@ describe('Trae 建连死线阶梯：第一段快失败 → 原账号换连接重
       const solo = logs.filter((t) => t.includes('[trae-transport]') && t.includes('phase=solo'))
       expect(solo).toHaveLength(2)
       expect(solo[0]).toContain('attempt=1/2')
-      expect(solo[0]).toContain('stage=10000ms')
+      expect(solo[0]).toContain(`stage=${TRAE_CONNECT_DEADLINES_MS[0]}ms`)
       expect(solo[1]).toContain('attempt=2/2')
-      expect(solo[1]).toContain('stage=30000ms')
+      expect(solo[1]).toContain(`stage=${TRAE_CONNECT_DEADLINES_MS[1]}ms`)
       for (const t of solo) expect(t).toContain('timeout=true')
 
       const summary = logs.filter((t) => t.includes('[trae-transport]') && t.includes('end=503'))
@@ -1058,7 +1062,8 @@ describe('Trae 建连死线阶梯：第一段快失败 → 原账号换连接重
     for (let i = 1; i < TRAE_CONNECT_DEADLINES_MS.length; i++) {
       expect(TRAE_CONNECT_DEADLINES_MS[i]).toBeGreaterThanOrEqual(TRAE_CONNECT_DEADLINES_MS[i - 1])
     }
-    // 最后一段必须 ≥ 原 30s：只有如此才能保证「改前能成功的请求，改后仍然成功」
-    expect(TRAE_CHAT_CONNECT_TIMEOUT_MS).toBeGreaterThanOrEqual(30000)
+    // 最后一段必须 > 实测最慢的活连接：2026-10-10 成功侧 connect 分布 9 个样本最大 9187ms
+    //（中位 2283ms），10s 是下限——再低就开始误杀真实慢连接（不是靠感觉定的）。
+    expect(TRAE_CHAT_CONNECT_TIMEOUT_MS).toBeGreaterThanOrEqual(10_000)
   })
 })

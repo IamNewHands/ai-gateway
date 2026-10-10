@@ -57,9 +57,11 @@ const MAX_TRANSPORT_ATTEMPTS = 1
  * `TRAE_CONNECT_DEADLINES_MS[n]`，越界钳到最后一段（正常不会越界——重发条件里已判过）。
  *
  * 用「段」而不是「次数」：2026-10-08 把尝试次数 2→1 只是缩短死等，**没有引入任何成功率**
- * ——两段用的是同一个 30s 死线，坏连接两段都会撞满。改为阶梯后，第 1 段（10s）一撞就立刻
- * 换新连接重发，坏窗口不再需要客户端兜底。理由与实测见 `constants.ts` 的
- * `TRAE_CONNECT_DEADLINES_MS` 注释。
+ * ——两段用的是同一个 30s 死线，坏连接两段都会撞满。改为阶梯后，每段一撞就立刻换新连接重发。
+ *
+ * 注意（2026-10-10 实测）：阶梯只降低死等、并多给一次「换连接」的机会，**并不能消除 503**
+ * ——上线后 36/36 次 503 全是「两段皆死」。坏窗口的最终兜底仍是客户端 0.5s 重试。
+ * 理由与实测见 `constants.ts` 的 `TRAE_CONNECT_DEADLINES_MS` 注释。
  */
 function transportStageDeadlineMs(stage: number): number {
   const i = Math.min(Math.max(stage, 0), TRAE_CONNECT_DEADLINES_MS.length - 1)
@@ -887,8 +889,8 @@ export async function proxyTraeChatRequest(
 
   // 连接层失败（建连超时/掐断）不会罚号（applyChatError 的 transport 分支），此时报
   // 「所有账号 cooling/disabled」是把排查方向引到账号上——实测 2026-09-27 用户据此去查
-  // 账号池，真因却是网关↔上游的 30s 建连超时连续撞了两个账号（62s ≈ 2×
-  // TRAE_CHAT_CONNECT_TIMEOUT_MS），且 520ms 后重试即成功（池子健康）。
+  // 账号池，真因却是网关↔上游的建连超时连续撞了两个账号（当时单段上限 30s，共白等 62s），
+  // 且 520ms 后重试即成功（池子健康）。
   // 仍用 503（客户端按可重试 5xx 处理，不变），只把 code/文案改成真因。
   if ((lastErr as any)?.kind === 'transport') {
     // 聚合结论行：与每条尝试的 [trae-transport] 配对（同 cline `[cline-attempt]` 口径），
