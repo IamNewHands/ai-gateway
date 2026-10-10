@@ -872,7 +872,7 @@ describe('Trae 连接层失败可见性：connect 耗时采样与 [trae-transpor
       // 阶梯只对「网关自己的定时器掐断」（timeout=true）重发；这里是 fetch 当场抛错（timeout=false），
       // 属于「上游/网络自己断」→ 保持改前语义：一次即收手，不拿第二次白撞。
       expect(solo).toHaveLength(1)
-      expect(solo[0]).toContain('attempt=1/2')
+      expect(solo[0]).toContain(`attempt=1/${TRAE_CONNECT_DEADLINES_MS.length}`)
       expect(solo[0]).toContain('stage=10000ms')
       expect(solo[0]).toContain('timeout=false')
       for (const t of solo) {
@@ -894,7 +894,8 @@ describe('Trae 连接层失败可见性：connect 耗时采样与 [trae-transpor
 })
 
 /**
- * 建连死线阶梯（2026-10-09 落地 `TRAE_CONNECT_DEADLINES_MS`，2026-10-10 由 [10s,30s] 收紧为 [10s,10s]）。
+ * 建连死线阶梯（2026-10-09 落地 `TRAE_CONNECT_DEADLINES_MS`，2026-10-10 由 [10s,30s] 先收紧为
+ * [10s,10s]、当晚再加一段到 [10s,10s,10s]）。
  *
  * 真相：坏连接是「死」不是「慢」（60s 实验已证），等满上限毫无收益，唯一有信息量的动作是
  * 「换一条连接」。线上会话 session-1e29c762 实测每次坏连接让客户端白等 32–34s 并各收一次 503，
@@ -904,10 +905,14 @@ describe('Trae 连接层失败可见性：connect 耗时采样与 [trae-transpor
  * 10–30s 区间零样本，故最后一段不再需要 30s；同窗口反证 21:25:06 两段皆死报 503、
  * 21:25:12 新连接 connect=1820ms 成功 ⇒ 活连接 2 秒回话，在死连接上多等 20s 无收益。
  *
+ * 加段依据（2026-10-10 当晚）：坏窗口实测 q ≈ 0.5（约一半新连接是死的），加段不增加上游负载
+ * （连接成功前需打开的连接数期望恒为 1/q，与段数无关），只把一次客户端重试搬进网关，
+ * 保护客户端那 5 次重试预算。断言一律按 `TRAE_CONNECT_DEADLINES_MS` 取值，不写死段数。
+ *
  * 本组锁三件事：
  *  1. 第 1 段撞满 → **原账号**（Authorization 不变）换新连接重发，第 2 段成功即 200，
  *     且只留 1 条 `[trae-transport]`（stage=10000ms）——坏窗口不再向客户端报错；
- *  2. 两段都撞满 → 503，逐段死线各一条日志，聚合 `attempts=2`；
+ *  2. 每段都撞满 → 503，逐段死线各一条日志，聚合 `attempts=段数`；
  *  3. 不变量：默认单段上限恒等于阶梯最后一段（保证「不走阶梯」的调用点与主路径同一套判据）。
  */
 describe('Trae 建连死线阶梯：第一段快失败 → 原账号换连接重发', () => {
@@ -993,7 +998,7 @@ describe('Trae 建连死线阶梯：第一段快失败 → 原账号换连接重
 
       const solo = [...env.KV.data.values()].map(String).filter((t) => t.includes('[trae-transport]') && t.includes('phase=solo'))
       expect(solo).toHaveLength(1)          // 只有第 1 段失败过一次，重发成功不落失败日志
-      expect(solo[0]).toContain('attempt=1/2')
+      expect(solo[0]).toContain(`attempt=1/${TRAE_CONNECT_DEADLINES_MS.length}`)
       expect(solo[0]).toContain(`stage=${TRAE_CONNECT_DEADLINES_MS[0]}ms`)
       expect(solo[0]).toContain('timeout=true')
       // 成功路径的 connect 采样走 [trae-stream] end= 日志（仅流式路径落），非流式不落；非流式的
@@ -1004,7 +1009,7 @@ describe('Trae 建连死线阶梯：第一段快失败 → 原账号换连接重
     }
   })
 
-  it('两段都撞满 → 503，逐段死线各落一条（stage=10000ms/10000ms），聚合 attempts=2', async () => {
+  it('每段都撞满 → 503，逐段死线各落一条日志，聚合 attempts=段数', async () => {
     vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] })
     const originalFetch = globalThis.fetch
     const auths: string[] = []
@@ -1023,8 +1028,7 @@ describe('Trae 建连死线阶梯：第一段快失败 → 原账号换连接重
         stream: false,
         tools: [{ type: 'function', function: { name: 'noop', parameters: { type: 'object', properties: {} } } }],
       })
-      await vi.advanceTimersByTimeAsync(TRAE_CONNECT_DEADLINES_MS[0] + 100)
-      await vi.advanceTimersByTimeAsync(TRAE_CONNECT_DEADLINES_MS[1] + 100)
+      for (const ms of TRAE_CONNECT_DEADLINES_MS) await vi.advanceTimersByTimeAsync(ms + 100)
       const resp = await pending
 
       expect(resp.status).toBe(503)
@@ -1032,21 +1036,22 @@ describe('Trae 建连死线阶梯：第一段快失败 → 原账号换连接重
       expect(body.error.code).toBe('upstream_unreachable')
 
       // 池里有第 2 个账号，但阶梯重发只用原账号：不拿健康号去撞同一条链路
-      expect(auths).toHaveLength(2)
-      expect(auths[0]).toBe(auths[1])
+      const stages = TRAE_CONNECT_DEADLINES_MS.length
+      expect(auths).toHaveLength(stages)
+      expect(new Set(auths).size).toBe(1)
 
       const logs = [...env.KV.data.values()].map(String)
       const solo = logs.filter((t) => t.includes('[trae-transport]') && t.includes('phase=solo'))
-      expect(solo).toHaveLength(2)
-      expect(solo[0]).toContain('attempt=1/2')
-      expect(solo[0]).toContain(`stage=${TRAE_CONNECT_DEADLINES_MS[0]}ms`)
-      expect(solo[1]).toContain('attempt=2/2')
-      expect(solo[1]).toContain(`stage=${TRAE_CONNECT_DEADLINES_MS[1]}ms`)
-      for (const t of solo) expect(t).toContain('timeout=true')
+      expect(solo).toHaveLength(stages)
+      for (let i = 0; i < stages; i++) {
+        expect(solo[i]).toContain(`attempt=${i + 1}/${stages}`)
+        expect(solo[i]).toContain(`stage=${TRAE_CONNECT_DEADLINES_MS[i]}ms`)
+        expect(solo[i]).toContain('timeout=true')
+      }
 
       const summary = logs.filter((t) => t.includes('[trae-transport]') && t.includes('end=503'))
       expect(summary).toHaveLength(1)
-      expect(summary[0]).toContain('attempts=2')
+      expect(summary[0]).toContain(`attempts=${stages}`)
       expect(summary[0]).toContain('tools=true')
       expect(logs.some((t) => t.includes('phase=work'))).toBe(false)
     } finally {
