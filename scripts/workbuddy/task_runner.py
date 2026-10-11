@@ -121,9 +121,29 @@ MAPPING = {
     # Sequential_Tasks_3 = 小程序内完成 5 次有效对话：与 Tasks_1 判据同形状（mp 指纹
     # chat_request_send 无 activityId），只是 target=5 —— 按上报条数累加，无需新事件形状
     "Sequential_Tasks_3":     {"kind": "minichat",    "target": 5, "src": "无(mini 对话×5 无activityId)"},
+    # ---- 移植 WorkBuddy-Daily v3.6（L0NE-6/WorkBuddy-Daily）补齐 4~7 环 ----
+    # Tasks_4~7 与此前 1~3 同属 mp 链式下发口径（完成一环后**次日零点**解锁下一环）。
+    # 未解锁时任务行 `locked=true`（实测 b68ef9e8 的 Tasks_4 即 locked），
+    # process_minichat_task 已在 accept 失败时按 locked 提示跳过，不会误判为失败。
+    # Sequential_Tasks_4 = 小程序内创建 1 个定时任务。判据是 **mp 指纹**
+    # automated_task_create_suc —— ideName=wx_app_cloud + mode=CLOUD，
+    # **不带** schedule/rrule 对象（桌面 automation_1 的 rrule 虚拟对象是另一域口径，
+    # 照抄会失去 mp 关联）。
+    "Sequential_Tasks_4":     {"kind": "mpautomation", "target": 1, "src": "无(mp 定时任务指纹)"},
+    # Sequential_Tasks_5 = 小程序内使用 1 次 GLM5.2：与 minichat 同形状 + 模型字段
+    "Sequential_Tasks_5":     {"kind": "mpmodelchat", "target": 1, "src": "无(mini chat+glm-5.2)"},
+    # Sequential_Tasks_6 = 小程序内完成 10 次对话：判据与 Tasks_1/3 完全同形状，只是 target=10
+    # —— 复用 minichat，不新造事件形状（与 Tasks_3 对 Tasks_1 的处理一致）。
+    "Sequential_Tasks_6":     {"kind": "minichat",    "target": 10, "src": "无(mini 对话×10 无activityId)"},
+    # Sequential_Tasks_7 = 小程序内体验灵感功能：mp 指纹 playbook_cta_click + playbook_prompt_send
+    "Sequential_Tasks_7":     {"kind": "mpplaybook",  "target": 1, "src": "playbook 案例 id(mp)"},
     # 不可伪造（真实业务副作用）
     "Expert_Philanthropy":    {"unforgeable": True, "reason": "真实捐款动作(M8)"},
 }
+
+# mp 链式下发口径的 kind 集合：这些 code 在默认（无 mp 头）任务列表里不下发，
+# 必须由 process_minichat_task 专段处理（进 growth 主循环必然 query 任务不存在）。
+MP_KINDS = ("minichat", "schoolseason", "miniexpert", "mpautomation", "mpmodelchat", "mpplaybook")
 
 # 夜猫时段（CST）23:00 - 次日 08:00
 def within_night_window():
@@ -469,9 +489,11 @@ def ids_for(kind, auth, need, offset=0):
     if kind == "miniexpert":
         # 专家 id 取自小程序自身的专家市场端点（mp 口径，与 school 段的 school 分类不同源）
         return _dedup_slice(_fetch_market_experts(auth), offset, need)
-    if kind in ("buddy5", "library", "minichat", "schoolseason"):
-        # history/current 不是顺序语义：buddy5/library/minichat/schoolseason 是固定事件组
-        # 按需补 1 次（offset 无意义）
+    if kind == "mpplaybook":
+        # Sequential_Tasks_7（体验灵感功能）：判据是 playbook 案例 id，复用既有 playbook 源
+        return _dedup_slice(_fetch_playbook_cases(), offset, need)
+    if kind in ("buddy5", "library", "minichat", "schoolseason", "mpautomation", "mpmodelchat"):
+        # history/current 不是顺序语义：这些 kind 是固定事件组，按需补 1 次（offset 无意义）
         return [("", {}) for _ in range(need)]
     return []
 
@@ -793,6 +815,51 @@ def build_event(auth, kind, obj_id, meta, idx):
         # 移植 e45f39f 的「复用不复制」口径）。
         return school.mini_chat_event(auth, cid)
 
+    if kind == "mpautomation":
+        # Sequential_Tasks_4（小程序内创建 1 个定时任务）判据：**mp 指纹**
+        # automated_task_create_suc。形状对齐官方小程序源码快照
+        # （dynamic-common appservice TaskFormSheet 创建成功）：
+        #   · ideName=wx_app_cloud + mode=CLOUD（mp 身份）
+        #   · **不带** schedule/rrule 对象——那是桌面 automation_1 的域口径，
+        #     照抄会失去 mp 关联（源实现注释明确点出这个坑）
+        #   · scheduleType 取小程序表单频率枚举（daily/interval/once）
+        return {"eventCode": "automated_task_create_suc", "timestamp": now, "reportDelay": 0,
+                "mode": "CLOUD", "name": "每日读书提醒", "source": "manually",
+                "skills": "", "skillCount": 0, "scheduleType": "daily",
+                "ideName": "wx_app_cloud", "ideType": "WorkBuddy_MP",
+                "extName": "workbuddy-mp", "extVersion": "2.2.8", "product": "SaaS",
+                "source": "mini_program", "os": "android", "osVersion": "14",
+                "arch": "arm64", "timezone": "Asia/Shanghai",
+                "machineId": derive_id(auth, "machine"), "userId": uid}
+
+    if kind == "mpmodelchat":
+        # Sequential_Tasks_5（小程序内使用 1 次 GLM5.2）：与 minichat 同形状，
+        # 只是补上模型字段（判据靠 requestModelId 区分用的是哪个模型）。
+        return {"eventCode": "chat_request_send", "timestamp": now, "reportDelay": 0,
+                "source": "mini_program", "ideName": "wx_app_cloud",
+                "ideType": "WorkBuddy_MP", "extName": "workbuddy-mp",
+                "extVersion": "2.2.8", "mode": "chat",
+                "conversationId": cid, "requestId": cid, "inputLength": 12,
+                "requestModelId": "glm-5.2", "requestModelName": "GLM-5.2",
+                "mentionContexts": [], "mentionContextCount": 0, "userId": uid}
+
+    if kind == "mpplaybook":
+        # Sequential_Tasks_7（小程序内体验灵感功能）判据：mp 指纹
+        # playbook_cta_click + playbook_prompt_send（两条一组）。
+        # 该函数返回**两条事件**，故 process_minichat_task 的 report_mp_events 需按
+        # 列表展开——build_event 的调用方已用 report_mp_events(auth, [ev])，
+        # 这里把两条都塞进同一列表即可（上游按事件逐条计）。
+        return [{"eventCode": "playbook_cta_click", "timestamp": now, "reportDelay": 0,
+                 "id": obj_id, "name": m.get("name") or obj_id, "type": "document",
+                 "categoryId": "", "categoryName": "", "skills": "", "skillNames": "",
+                 "source": "discover", "position": 1, "extVersion": "2.2.8",
+                 "userId": uid},
+                {"eventCode": "playbook_prompt_send", "timestamp": now, "reportDelay": 0,
+                 "id": obj_id, "name": m.get("name") or obj_id, "type": "document",
+                 "categoryId": "", "categoryName": "", "skills": "", "skillNames": "",
+                 "source": "discover", "promptLength": 96, "isOfficial": 1,
+                 "conversationId": cid, "extVersion": "2.2.8", "userId": uid}]
+
     raise ValueError(f"unknown kind: {kind}")
 
 
@@ -910,6 +977,17 @@ def process_minichat_task(auth, code, opts, stats):
     target = prog.get("target") or spec.get("target") or 1
     stats["total"] += 1
 
+    # 链式任务未解锁（任务行 locked=true）：**不是失败**，是"次日零点自动解锁"。
+    # 实测 ba670e9d 的 Sequential_Tasks_4 处于该态，且 accept 会返回
+    # `status=error`（服务端未下发），若按失败记账会让每轮汇总都报假失败。
+    # 这里提前短路并打印解锁提示（对齐源实现的 locked 分支）。
+    if t.get("locked"):
+        vs = str(t.get("valid_start") or "")[:10] or "见任务页"
+        print(f"[task_runner] {uid8} {code}: 未到上线时间（解锁 {vs}），"
+              f"链式任务次日零点自动推进，skip")
+        stats["skip"] += 1
+        return
+
     if ast == "claimed":
         print(f"[task_runner] {uid8} {code}: query claimed({cur}/{target}) -> 已领，跳过")
         stats["already"] += 1
@@ -956,10 +1034,14 @@ def process_minichat_task(auth, code, opts, stats):
     # 2) 判据上报：mini 指纹 chat_request_send（minichat 无 activityId /
     #    schoolseason 带 activityId=school_open_day_2026），走 codebuddy.cn 域
     #    （本仓 report_mp_events 与源 school.report_events 同域同头）
+    #    build_event 可能返回**事件列表**（mpplaybook 的 cta_click + prompt_send 是两条一组），
+    #    统一归一成 list 再上报，避免把列表当成单条事件塞进信封。
     for i, (obj_id, meta) in enumerate(ids):
         ev = build_event(auth, kind, obj_id, meta, i)
-        st, sc = report_mp_events(auth, [ev])
-        print(f"[task_runner] {uid8} {code}: report {i + 1}/{need} {st} code={sc} (mini growth)")
+        evs = ev if isinstance(ev, list) else [ev]
+        st, sc = report_mp_events(auth, evs)
+        print(f"[task_runner] {uid8} {code}: report {i + 1}/{need} {st} code={sc} "
+              f"({len(evs)} 事件, mini growth)")
         time.sleep(opts.gap)
 
     time.sleep(2.0)  # 服务端归账留时
@@ -1238,7 +1320,7 @@ def process_account(auth, opts, stats):
     # 由 process_minichat_task 专段处理，不进 process_task（否则必然 query 任务不存在）。
     # 移植 e45f39f/ee3c694：schoolseason、miniexpert 与 minichat 同属 mp 下发口径，一并纳入本段。
     minichat_in_map = [c for c in MAPPING
-                       if MAPPING[c].get("kind") in ("minichat", "schoolseason", "miniexpert")]
+                       if MAPPING[c].get("kind") in MP_KINDS]
     if opts.only_codes:
         codes = [c for c in opts.only_codes if c not in minichat_in_map]
         process_minichat = bool(set(opts.only_codes) & set(minichat_in_map))
@@ -1246,7 +1328,7 @@ def process_account(auth, opts, stats):
         # mp 下发口径的 code 均排除在 growth 主循环外（它们在默认列表里不存在，
         # 进了主循环必然 query 任务不存在）；由下面的 mp 专段处理。
         codes = [c for c in MAPPING
-                 if MAPPING[c].get("kind") not in ("minichat", "schoolseason", "miniexpert")]
+                 if MAPPING[c].get("kind") not in MP_KINDS]
         process_minichat = True
         # 未在映射表但存在于任务列表的（如 first_buddy）——只计数展示
         for t in tasks:

@@ -896,12 +896,116 @@ export interface WorkbuddyBuddyInfo {
   name: string
 }
 
-/** 猫猫旅行状态 */
-export interface WorkbuddyTravelState {
-  state: 'idle' | 'traveling' | 'arrived' | string
-  daily_limit_reached: boolean
-  record_id?: number
-  reward_credit?: number
+/** 盲盒配额（GET /activity/growth/buddy/quota）。 */
+export interface WorkbuddyBlindBoxQuota {
+  /** 当前可开次数（能量 / cost_per_open 取整，上游已算好） */
+  affordable: number
+  /** 当前能量余额 */
+  balance: number
+  /** 每次开启消耗的能量（实测 10） */
+  costPerOpen: number
+  /** 单次运行最多开几个（上游上限，实测 5） */
+  maxOpenCount: number
+}
+
+/**
+ * 查询盲盒配额：GET /activity/growth/buddy/quota。
+ *
+ * 失败返回 null（调用方跳过本轮，不改变签到语义）。
+ */
+export async function fetchWorkbuddyBlindBoxQuota(
+  token: string,
+  realm: 'cn' | 'global',
+  opts?: { uid?: string; enterpriseId?: string; deviceToken?: string }
+): Promise<WorkbuddyBlindBoxQuota | null> {
+  try {
+    const data = await growthCall(token, '/activity/growth/buddy/quota', realm, {
+      method: 'GET',
+      extraHeaders: growthIdentityHeaders(opts),
+    })
+    if (!data || typeof data !== 'object') return null
+    return {
+      affordable: Number(data.affordable) || 0,
+      balance: Number(data.balance) || 0,
+      costPerOpen: Number(data.cost_per_open) || 10,
+      maxOpenCount: Number(data.max_open_count) || 5,
+    }
+  } catch {
+    return null
+  }
+}
+
+/** 单次开盲盒的结果（上游 `data.results[0]` 的 instance/template 两段）。 */
+export interface WorkbuddyBlindBoxItem {
+  name: string
+  rarity: string
+}
+
+/**
+ * 开一次盲盒：POST /activity/growth/buddy/open `{"count":1}`。
+ *
+ * 能量不足时上游返回业务错误 → 返回 null（正常态，调用方静默）。
+ */
+export async function openWorkbuddyBlindBox(
+  token: string,
+  realm: 'cn' | 'global',
+  opts?: { uid?: string; enterpriseId?: string; deviceToken?: string }
+): Promise<WorkbuddyBlindBoxItem | null> {
+  try {
+    const data = await growthCall(token, '/activity/growth/buddy/open', realm, {
+      method: 'POST',
+      body: { count: 1 },
+      extraHeaders: growthIdentityHeaders(opts),
+    })
+    const first = (data?.results || [])[0]
+    if (!first) return null
+    const ins = first.instance || {}
+    const tpl = first.template || {}
+    return {
+      name: String(ins.name || tpl.name || ''),
+      rarity: String(ins.rarity || tpl.rarity || ''),
+    }
+  } catch {
+    return null
+  }
+}
+
+/**
+ * 盲盒全流程：查配额 → 按可开次数开（上限 maxOpenCount）→ 汇总开出的物品。
+ *
+ * 为什么需要它：源实现（WorkBuddy-Daily `t_blindbox`）把它算作「互动玩法」8 项之一，
+ * 是能量（energy）唯一的消耗出口 —— 能量攒着不用就是沉没成本。
+ *
+ * 正常态静默：能量不足（affordable=0）直接返回 `acted:false`，不发写请求；
+ * 单次开启失败即停（避免能量刚够时连发把配额打空后继续报错）。
+ * 每个 realm 都可用（实测 workbuddy.ai 的 quota 端点同样 200）。
+ */
+export async function runWorkbuddyBlindBox(
+  token: string,
+  realm: 'cn' | 'global',
+  opts?: { uid?: string; enterpriseId?: string; deviceToken?: string }
+): Promise<{ acted: boolean; opened: number; items: WorkbuddyBlindBoxItem[]; message: string }> {
+  const quota = await fetchWorkbuddyBlindBoxQuota(token, realm, opts)
+  if (!quota) return { acted: false, opened: 0, items: [], message: '盲盒配额查询失败' }
+  if (quota.affordable <= 0) {
+    return {
+      acted: false, opened: 0, items: [],
+      message: `能量不足（${quota.balance}/${quota.costPerOpen}），无需开盒`,
+    }
+  }
+
+  const cap = Math.min(quota.affordable, quota.maxOpenCount)
+  const items: WorkbuddyBlindBoxItem[] = []
+  for (let i = 0; i < cap; i++) {
+    const item = await openWorkbuddyBlindBox(token, realm, opts)
+    if (!item) break // 上游拒绝（能量变化/配额打空）即停，不继续连发
+    items.push(item)
+  }
+  if (items.length === 0) {
+    return { acted: false, opened: 0, items: [], message: '盲盒开启失败（上游拒绝）' }
+  }
+  const names = items.map((it) => (it.rarity ? `${it.name}(${it.rarity})` : it.name)).join('、')
+  return { acted: true, opened: items.length, items, message: `开出 ${items.length} 个：${names}` }
 }
 
 /** 查询当前猫档案：GET /activity/growth/buddy/info。null 表示无猫。 */
@@ -959,6 +1063,14 @@ export async function adoptWorkbuddyFirstBuddy(
     }
     return { success: false, message: `领养失败: ${msg}` }
   }
+}
+
+/** 猫猫旅行状态 */
+export interface WorkbuddyTravelState {
+  state: 'idle' | 'traveling' | 'arrived' | string
+  daily_limit_reached: boolean
+  record_id?: number
+  reward_credit?: number
 }
 
 /** 查询猫猫旅行状态：GET /activity/growth/buddy/travel/status */
@@ -1170,11 +1282,17 @@ export function pickWorkbuddyRedeemTier(state: WorkbuddyRewardState): string | n
 /**
  * 判定错误消息是否为「本月已领取」幂等态（409 duplicate / 已领取）。正常态，不刷 WARN。
  * 注意 `growthCall` 抛的是 `new Error('http 409 …')` 形态，故按状态码 + 关键词双匹配。
+ *
+ * **两种 realm 的文案不同**（2026-10-11 实测）：
+ *   · CN 站：`该奖励已领取` / `duplicate`
+ *   · 国际版：`该档位本月已兑换`（"兑换"而非"领取"）
+ * 旧实现只认「已领取」，于是国际版已领过的档位被当成**真失败**上报，既刷噪声又
+ * 让 `runWorkbuddyGrowthRewards` 的 `not_enough_days` 防抖分支漏记。两个词都认。
  */
 export function isRedeemAlreadyClaimed(errMsg: string): boolean {
   if (!/\bhttp 409\b/.test(errMsg)) return false
   const lower = errMsg.toLowerCase()
-  return lower.includes('duplicate') || errMsg.includes('已领取')
+  return lower.includes('duplicate') || errMsg.includes('已领取') || errMsg.includes('已兑换')
 }
 
 /** 判定是否为「连续登录天数不足」（403）。正常态（本次连登天数 < 该档门槛）。 */
@@ -1477,6 +1595,67 @@ export interface WorkbuddyLotteryOutcome {
 }
 
 /**
+ * 把当前**所有**抽奖次数抽完（对齐源实现 WorkBuddy-Daily `t_lottery`：`for i in range(chances)`）。
+ *
+ * 为什么需要单独一个函数（2026-10-11 实测发现的真缺口）：
+ * 旧实现在 `runWorkbuddyGrowthRewards` 里**只抽一次**，且只在 redeem 成功后抽。两个后果：
+ *   1. 结余次数 > 1 时只抽掉 1 次，其余闲置；
+ *   2. 无档可领（`pickWorkbuddyRedeemTier` 返回 null）时**提前 return**，
+ *      即使账上明明有次数也一次都不抽 —— 实测国际版两个账号各积压 1 次抽奖机会。
+ * 次数是**有价权益且不累积收益**，闲置即浪费，故独立成函数并在两条路径都调用。
+ *
+ * 正常态静默：无次数 / 抽奖未开启（disabled）都立即停，不算失败。
+ * `maxDraws` 兜底防止异常大的余额把上游打爆（缺省 20，远高于正常结余）。
+ */
+export async function drawAllWorkbuddyLottery(
+  token: string,
+  realm: 'cn' | 'global',
+  opts?: {
+    uid?: string
+    enterpriseId?: string
+    deviceToken?: string
+    maxDraws?: number
+    /**
+     * 本次 redeem 刚送的次数（`chances_granted`）。作为**下限**与余额取 max。
+     *
+     * 为什么需要：余额端点是独立读，可能落后于 redeem 响应（刚入账还没反映到余额）。
+     * 旧实现正是为此在 `chances > 0` 时跳过余额查询。这里两者都取：既能吃到刚送的
+     * 次数，也能吃到历史结余（旧实现只做前者，导致结余长期闲置）。
+     */
+    hintChances?: number
+  }
+): Promise<{ drawn: number; prizes: string[]; credit: number; message: string }> {
+  const identity = { uid: opts?.uid, enterpriseId: opts?.enterpriseId, deviceToken: opts?.deviceToken }
+  const hint = Math.max(0, opts?.hintChances ?? 0)
+  const queried = await fetchWorkbuddyLotteryChances(token, realm, identity)
+  // 余额查询失败时退回 hint（redeem 刚明确告知有次数，不该因读失败而放弃）
+  const balance = queried === null ? hint : Math.max(queried, hint)
+  if (balance <= 0) return { drawn: 0, prizes: [], credit: 0, message: '无抽奖次数' }
+
+  const cap = Math.min(balance, opts?.maxDraws ?? 20)
+  const prizes: string[] = []
+  let credit = 0
+  for (let i = 0; i < cap; i++) {
+    const draw = await drawWorkbuddyLottery(token, realm, identity)
+    if (!draw.success || !draw.result) {
+      // 无次数 / 未开启 / 网络失败都立即停：继续循环只会对上游空打
+      if (i === 0 && draw.normal) return { drawn: 0, prizes: [], credit: 0, message: draw.message }
+      break
+    }
+    if (draw.result.prize_name) prizes.push(draw.result.prize_name)
+    credit += draw.result.credit_amount || 0
+  }
+  if (prizes.length === 0) return { drawn: 0, prizes: [], credit: 0, message: '抽奖未获得奖品' }
+  return {
+    drawn: prizes.length,
+    prizes,
+    credit,
+    message: `抽奖 ${prizes.length} 次: ${prizes.join('、')}${credit > 0 ? ` +${credit} 积分` : ''}`,
+  }
+}
+
+
+/**
  * 抽一次奖：POST /activity/growth/lottery/draw。
  *
  * `client_token` 每次新生成（SPA `doDraw` 每次用新键）：抽奖对幂等键敏感，复用旧键会被吞掉。
@@ -1575,10 +1754,23 @@ export interface WorkbuddyRewardRunResult {
  * 都不算失败，不刷 WARN、不改变 `base.success`。三个新动作同样**各自独立 try/catch**，
  * 失败只落 `message`，绝不冒泡污染签到结果。
  *
- * **global 门控**：调用方**不应**对 global realm 调用本函数——实测 global 新号
- * `GET /activity/growth/streak` 返回 500，证据不足以证明 redeem/draw 在 global 可用，
- * 故整链跳过（与既有"global 无签到/无猫猫旅行"的 D4 门控一致）。函数内也做一次防御性
- * 检查，避免误用。
+ * **global 门控已解除**（2026-10-11 实测推翻旧结论）：
+ * 旧实现以"global 新号 `GET /activity/growth/streak` 返回 500"为由整链跳过。实测
+ * `workbuddy.ai` 上 growth 域**与 CN 同构且完全可用**（Go-http-client UA 亦然）：
+ *   · `GET  /activity/growth/streak`     → 200，`streak.days` / `redemption_status` / `makeup_cards` 三段齐全
+ *   · `GET  /activity/growth/heatmap`    → 200，cells 齐全
+ *   · `GET  /activity/growth/lottery/chances` → 200
+ *   · `POST /activity/growth/redeem`     → **200 `code:0`**，`credit_granted/energy_granted/cards_granted/chances_granted` 真实入账
+ * 故不再跳过：国际版同样有连登奖励体系，跳过等于每月白丢 7d/14d/28d 三档奖励。
+ *
+ * 为何仍然安全：本链每一步都**失败静默**——`fetchWorkbuddyRewardState` 在 streak 失败时
+ * 返回 null，函数随即返回 `acted:false, message:'无法获取连登奖励状态'`，与旧门控的净效果
+ * 一致（不写上游、不改 `base.success`）。因此解除门控对"streak 真的不可用"的账号零回归，
+ * 只对"streak 可用"的账号多领奖励。
+ *
+ * 唯一的 realm 差异是**礼包/补偿**：`workbuddy.ai` 上这两个端点返回 400
+ * `10001 赠送活动未开启或已过期`，属既有静默路径（`claimWorkbuddyBillingCredit` 返回
+ * `success:false`），不产生噪声也不影响 redeem。
  */
 export async function runWorkbuddyGrowthRewards(
   token: string,
@@ -1602,9 +1794,6 @@ export async function runWorkbuddyGrowthRewards(
     state?: WorkbuddyRewardState | null
   }
 ): Promise<WorkbuddyRewardRunResult> {
-  if (realm === 'global') {
-    return { acted: false, message: 'global 无连登奖励体系（门控跳过）' }
-  }
   if (!uid) return { acted: false, message: 'uid 缺失，跳过' }
 
   // 按天幂等闸（KV）：今日已领过则整链跳过
@@ -1646,19 +1835,24 @@ export async function runWorkbuddyGrowthRewards(
 
   const tier = pickWorkbuddyRedeemTier(state)
   if (!tier) {
-    // 无档可领：但礼包/补偿/补签若真的到账/生效，本身就是本日的动作，不应被吞掉
-    // （源实现对应位置有独立日志行 `gift ok (+N credit)` / `makeup ok ...`）。
-    if (bonusParts.length === 0 && !makeupDate) {
-      return { acted: false, message: `无可领档位（连登 ${state.days} 天）` }
-    }
+    // 无档可领：但**抽奖次数仍要抽掉**（2026-10-11 实测缺口：国际版两个账号各积压
+    // 1 次机会，旧实现在这里直接 return，次数永远用不掉；次数是有价权益，闲置即浪费）。
+    const idleDraw = await drawAllWorkbuddyLottery(token, realm, identity)
     const idleParts = [...bonusParts]
     if (makeupDate) idleParts.push(`补签 ${makeupDate}（保住连登）`)
     idleParts.push(`无可领档位（连登 ${state.days} 天）`)
+    if (idleDraw.drawn > 0) idleParts.push(idleDraw.message)
+    if (bonusParts.length === 0 && !makeupDate && idleDraw.drawn === 0) {
+      return { acted: false, message: idleParts.join('，') }
+    }
     return {
       acted: true,
       giftCredit: gift.success && gift.credit > 0 ? gift.credit : undefined,
       compensationCredit: compensation.success && compensation.credit > 0 ? compensation.credit : undefined,
       makeupDate: makeupDate || undefined,
+      chances: idleDraw.drawn > 0 ? idleDraw.drawn : undefined,
+      prize: idleDraw.prizes.length > 0 ? idleDraw.prizes.join('、') : undefined,
+      prizeCredit: idleDraw.credit > 0 ? idleDraw.credit : undefined,
       message: idleParts.join('，'),
     }
   }
@@ -1686,25 +1880,16 @@ export async function runWorkbuddyGrowthRewards(
   if (credit > 0) parts.push(`+${credit} 积分`)
   if (chances > 0) parts.push(`+${chances} 抽奖次数`)
 
-  // 有抽奖次数才抽（chances 也可能来自历史结余，故再查一次余额）
+  // 抽奖：把**当前所有**次数抽完（不只是本次 redeem 送的那几次）。
+  // 旧实现只抽一次且只在 chances>0 时抽，结余次数会长期闲置；
+  // drawAllWorkbuddyLottery 自己查余额并循环，正常态（无次数/未开启）静默。
   let prize: string | undefined
   let prizeCredit: number | undefined
-  const balance = chances > 0 ? chances : await fetchWorkbuddyLotteryChances(token, realm, {
-    uid, enterpriseId: opts?.enterpriseId, deviceToken: opts?.deviceToken,
-  })
-  if (typeof balance === 'number' && balance > 0) {
-    const draw = await drawWorkbuddyLottery(token, realm, {
-      uid, enterpriseId: opts?.enterpriseId, deviceToken: opts?.deviceToken,
-    })
-    if (draw.success && draw.result) {
-      prize = draw.result.prize_name || undefined
-      prizeCredit = draw.result.credit_amount || undefined
-      if (prize) parts.push(`抽奖: ${prize}`)
-      if (prizeCredit && prizeCredit > 0) parts.push(`+${prizeCredit} 积分`)
-    } else if (!draw.normal) {
-      // 非正常态失败（网络/未知错误）也记入消息，便于面板定位
-      parts.push(draw.message)
-    }
+  const drawAll = await drawAllWorkbuddyLottery(token, realm, { ...identity, hintChances: chances })
+  if (drawAll.drawn > 0) {
+    prize = drawAll.prizes.join('、')
+    prizeCredit = drawAll.credit > 0 ? drawAll.credit : undefined
+    parts.push(drawAll.message)
   }
 
   return {

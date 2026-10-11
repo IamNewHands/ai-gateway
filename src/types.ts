@@ -685,7 +685,8 @@ export interface CheckinResult {
   catTravel?: { state: string; reward?: number; message: string; buddyName?: string }
   /**
    * 连登奖励兑换 + 连登抽奖结果（P2，移植 workbuddy2api 91418c5）。
-   * 仅 CN 账号执行；global 无该体系（门控跳过，不写此字段）。
+   * CN 与 global 都执行（2026-10-11 实测解除 global 门控：workbuddy.ai 的 growth 域
+   * 与 CN 同构可用，redeem 返回 code:0 并真实入账）。
    */
   growthReward?: {
     acted: boolean
@@ -694,6 +695,22 @@ export interface CheckinResult {
     chances?: number
     prize?: string
     prizeCredit?: number
+    message: string
+  }
+  /**
+   * 夜猫子 black_cat 任务结果（仅 CN；global 无该任务体系）。
+   * 官方规则「每天 1 次 × 累计 3 天」，仅在 CST 23:00–08:00 窗口内计数；
+   * 非窗口期 state='skipped' 且不发任何上游请求。
+   */
+  nightCat?: { state: string; message: string }
+  /**
+   * 盲盒结果（CN 与 global 都执行）：能量（energy）的唯一消耗出口。
+   * 能量不足时 acted=false 且不发写请求（正常态，非失败）。
+   */
+  blindBox?: {
+    acted: boolean
+    opened: number
+    items: Array<{ name: string; rarity: string }>
     message: string
   }
   /**

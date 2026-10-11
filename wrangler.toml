@@ -54,9 +54,13 @@ USAGE_ANALYTICS_DATASET = "ai_gateway_usage"
 binding = "USAGE_ANALYTICS"
 dataset = "ai_gateway_usage"
 
-# 定时任务：OAuth token 刷新（每 2 小时）+ 签到（每日 10:05/22:05 北京时间 = 02:05/14:05 UTC，避开 Qoder 10:00 刷新放量节点）+ M365 对话清理（每小时）+ M365 账号健康检查（每日 04:00 北京时间 = 20:00 UTC）
+# 定时任务：OAuth token 刷新（每 2 小时）+ 签到（每日 10:05/22:05 北京时间 = 02:05/14:05 UTC，避开 Qoder 10:00 刷新放量节点）+ M365 对话清理（每小时）+ M365 账号健康检查（每日 04:00 北京时间 = 20:00 UTC）+ 夜猫子（23:30 北京时间 = 15:30 UTC）
+#
+# 夜猫子 black_cat 只在 CST 23:00–08:00 窗口内计数（官方规则「每天 1 次 × 累计 3 天」），
+# 而签到的 10:05/22:05 都不在窗口内 —— 没有这条 cron，夜猫子永远不会被点亮。
+# 取 23:30 而非 23:00：避开窗口边界，且给当日的活跃上报留出时间。
 [triggers]
-crons = ["0 */2 * * *", "5 2,14 * * *", "0 * * * *", "0 20 * * *"]
+crons = ["0 */2 * * *", "5 2,14 * * *", "0 * * * *", "0 20 * * *", "30 15 * * *"]
 
 # Admin credentials (set these in Cloudflare Dashboard > Workers > Variables)
 # [vars]

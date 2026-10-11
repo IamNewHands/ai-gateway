@@ -6,6 +6,9 @@ import {
   fetchWorkbuddyBuddyInfo,
   agreeWorkbuddyBuddyAgreement,
   adoptWorkbuddyFirstBuddy,
+  fetchWorkbuddyBlindBoxQuota,
+  openWorkbuddyBlindBox,
+  runWorkbuddyBlindBox,
   fetchWorkbuddyTravelStatus,
   departWorkbuddyTravel,
   claimWorkbuddyTravelReward,
@@ -30,6 +33,7 @@ import {
   redeemWorkbuddyGrowth,
   fetchWorkbuddyLotteryChances,
   drawWorkbuddyLottery,
+  drawAllWorkbuddyLottery,
   runWorkbuddyGrowthRewards,
   cstDay,
   cstYesterday,
@@ -589,6 +593,10 @@ describe('连登奖励兑换 + 连登抽奖（growth_reward）', () => {
   it('正常态判定：409 duplicate / 403 天数不足 / 400 无次数 / 400 disabled', () => {
     expect(isRedeemAlreadyClaimed('http 409 /activity/growth/redeem: {"code":409,"msg":"duplicate"}')).toBe(true)
     expect(isRedeemAlreadyClaimed('http 409 /x: {"msg":"该奖励已领取"}')).toBe(true)
+    // 国际版文案是「已兑换」而非「已领取」（2026-10-11 实测 workbuddy.ai 返回
+    // 409 {"code":409,"msg":"该档位本月已兑换"}）：只认「已领取」会把幂等正常态
+    // 误报成真失败，故两个词都必须认。
+    expect(isRedeemAlreadyClaimed('http 409 /x: {"code":409,"msg":"该档位本月已兑换"}')).toBe(true)
     expect(isRedeemAlreadyClaimed('http 403 /x: 连续登录天数不足')).toBe(false)
 
     expect(isRedeemNotEnoughDays('http 403 /x: {"msg":"连续登录天数不足"}')).toBe(true)
@@ -728,8 +736,10 @@ describe('连登奖励兑换 + 连登抽奖（growth_reward）', () => {
     expect(res.chances).toBe(1)
     expect(res.prize).toBe('10 积分')
     expect(res.prizeCredit).toBe(10)
-    // 未查 chances 端点（兑换已带回 chances=1）
-    expect(calls.some((u) => u.includes('lottery/chances'))).toBe(false)
+    // 现在会查一次 chances 端点（drawAllWorkbuddyLottery 需要知道历史结余，
+    // 旧实现只在 chances=0 时才查，导致结余次数长期闲置）。
+    // hintChances 保证 redeem 刚送的次数不会被落后的余额读数吞掉。
+    expect(calls.some((u) => u.includes('lottery/chances'))).toBe(true)
   })
 
   it('runWorkbuddyGrowthRewards 无 chances 时查余额，余额 0 则不抽奖', async () => {
@@ -765,13 +775,44 @@ describe('连登奖励兑换 + 连登抽奖（growth_reward）', () => {
     expect(res.message).toContain('无可领档位')
   })
 
-  it('runWorkbuddyGrowthRewards global 门控：整链跳过（不发任何请求）', async () => {
-    const fetchSpy = vi.fn()
-    globalThis.fetch = fetchSpy
+  it('runWorkbuddyGrowthRewards global 不再整链跳过：streak 可用时正常兑换（2026-10-11 实测解除门控）', async () => {
+    const calls: string[] = []
+    globalThis.fetch = vi.fn().mockImplementation(async (url: string) => {
+      calls.push(String(url))
+      if (String(url).includes('/activity/growth/streak')) {
+        return new Response(JSON.stringify({
+          code: 0, msg: 'ok',
+          data: { streak: { days: 10 }, redemption_status: { tier_7d_status: 'available' }, makeup_cards: { balance: 0, max: 4 } },
+        }), { status: 200 })
+      }
+      if (String(url).includes('/activity/growth/redeem')) {
+        return new Response(JSON.stringify({
+          code: 0, msg: 'ok',
+          data: { credit_granted: 0, energy_granted: 2, cards_granted: 1, chances_granted: 1 },
+        }), { status: 200 })
+      }
+      return new Response(JSON.stringify({ code: 0, msg: 'ok', data: {} }), { status: 200 })
+    })
+
+    const res = await runWorkbuddyGrowthRewards('tok', 'global', 'u1')
+    // 旧实现此处 acted=false 且零请求；现在应真的打到 workbuddy.ai 并兑换 7d 档
+    expect(res.acted).toBe(true)
+    expect(res.tier).toBe('7d')
+    expect(calls.some((u) => u.includes('www.workbuddy.ai'))).toBe(true)
+    expect(calls.some((u) => u.includes('/activity/growth/redeem'))).toBe(true)
+  })
+
+  it('runWorkbuddyGrowthRewards global：streak 不可用时静默跳过（不写上游、不抛）', async () => {
+    const calls: string[] = []
+    globalThis.fetch = vi.fn().mockImplementation(async (url: string) => {
+      calls.push(String(url))
+      if (String(url).includes('/activity/growth/streak')) return new Response('boom', { status: 500 })
+      return new Response(JSON.stringify({ code: 0, msg: 'ok', data: {} }), { status: 200 })
+    })
     const res = await runWorkbuddyGrowthRewards('tok', 'global', 'u1')
     expect(res.acted).toBe(false)
-    expect(res.message).toContain('global')
-    expect(fetchSpy).not.toHaveBeenCalled()
+    // 解除门控后仍安全：streak 失败即返回，不再打 redeem
+    expect(calls.some((u) => u.includes('/activity/growth/redeem'))).toBe(false)
   })
 
   it('KV 日键幂等：同日二次调用直接跳过（不打上游）', async () => {
@@ -1338,12 +1379,290 @@ describe('连登管家三动作（补签卡 / 新手礼包 / 活动补偿，grow
     expect(calls.length).toBe(n) // 二次调用零请求：礼包/补偿也没重发
   })
 
-  it('global 门控：整链跳过，三动作零请求', async () => {
-    const fetchSpy = vi.fn()
-    globalThis.fetch = fetchSpy as unknown as typeof fetch
+  it('global 不再门控：streak 可用则兑换 7d（2026-10-11 实测解除，取代旧的"整链跳过"断言）', async () => {
+    const calls: string[] = []
+    globalThis.fetch = vi.fn().mockImplementation(async (url: string) => {
+      calls.push(String(url))
+      if (String(url).includes('/activity/growth/streak')) {
+        return new Response(JSON.stringify({
+          code: 0, msg: 'ok',
+          data: { streak: { days: 10 }, redemption_status: { tier_7d_status: 'available' }, makeup_cards: { balance: 0, max: 4 } },
+        }), { status: 200 })
+      }
+      return new Response(JSON.stringify({
+        code: 0, msg: 'ok',
+        data: { credit_granted: 0, energy_granted: 2, cards_granted: 1, chances_granted: 0 },
+      }), { status: 200 })
+    })
+
     const res = await runWorkbuddyGrowthRewards('tok', 'global', 'u1')
+    expect(res.acted).toBe(true)
+    expect(res.tier).toBe('7d')
+    // 必须打到国际版域，且真的发过 redeem
+    expect(calls.some((u) => u.includes('www.workbuddy.ai'))).toBe(true)
+    expect(calls.some((u) => u.includes('/activity/growth/redeem'))).toBe(true)
+  })
+})
+
+describe('抽奖次数抽完 drawAllWorkbuddyLottery（移植 WorkBuddy-Daily t_lottery）', () => {
+  const originalFetch = globalThis.fetch
+  afterEach(() => { globalThis.fetch = originalFetch })
+
+  it('余额 3 → 连抽 3 次并汇总奖品（旧实现只抽 1 次）', async () => {
+    let draws = 0
+    globalThis.fetch = vi.fn(async (url: string) => {
+      if (String(url).includes('lottery/chances')) {
+        return new Response(JSON.stringify({ code: 0, msg: 'ok', data: { balance: 3 } }), { status: 200 })
+      }
+      draws++
+      return new Response(JSON.stringify({
+        code: 0, msg: 'ok', data: { prize_name: `奖${draws}`, credit_amount: 5 },
+      }), { status: 200 })
+    }) as unknown as typeof fetch
+
+    const res = await drawAllWorkbuddyLottery('tok', 'cn')
+    expect(res.drawn).toBe(3)
+    expect(draws).toBe(3)
+    expect(res.prizes).toEqual(['奖1', '奖2', '奖3'])
+    expect(res.credit).toBe(15)
+  })
+
+  it('余额 0 → 不抽（正常态，不发 draw 请求）', async () => {
+    let draws = 0
+    globalThis.fetch = vi.fn(async (url: string) => {
+      if (String(url).includes('lottery/chances')) {
+        return new Response(JSON.stringify({ code: 0, msg: 'ok', data: { balance: 0 } }), { status: 200 })
+      }
+      draws++
+      return new Response(JSON.stringify({ code: 0, msg: 'ok', data: {} }), { status: 200 })
+    }) as unknown as typeof fetch
+
+    const res = await drawAllWorkbuddyLottery('tok', 'cn')
+    expect(res.drawn).toBe(0)
+    expect(draws).toBe(0)
+  })
+
+  it('hintChances 兜底：余额端点读到 0 但 redeem 刚说送了 1 次 → 仍抽 1 次', async () => {
+    // 余额端点可能落后于 redeem 响应（刚入账还没反映），hint 必须能兜住，
+    // 否则「兑换送的次数」会被落后的读数吞掉（旧实现正是靠 chances>0 短路绕过这点）。
+    let draws = 0
+    globalThis.fetch = vi.fn(async (url: string) => {
+      if (String(url).includes('lottery/chances')) {
+        return new Response(JSON.stringify({ code: 0, msg: 'ok', data: { balance: 0 } }), { status: 200 })
+      }
+      draws++
+      return new Response(JSON.stringify({
+        code: 0, msg: 'ok', data: { prize_name: 'x', credit_amount: 0 },
+      }), { status: 200 })
+    }) as unknown as typeof fetch
+
+    const res = await drawAllWorkbuddyLottery('tok', 'cn', { hintChances: 1 })
+    expect(res.drawn).toBe(1)
+    expect(draws).toBe(1)
+  })
+
+  it('抽奖未开启（disabled）→ 立即停，不算失败也不继续连发', async () => {
+    let draws = 0
+    globalThis.fetch = vi.fn(async (url: string) => {
+      if (String(url).includes('lottery/chances')) {
+        return new Response(JSON.stringify({ code: 0, msg: 'ok', data: { balance: 5 } }), { status: 200 })
+      }
+      draws++
+      return new Response('lottery disabled', { status: 400 })
+    }) as unknown as typeof fetch
+
+    const res = await drawAllWorkbuddyLottery('tok', 'global')
+    expect(res.drawn).toBe(0)
+    expect(draws).toBe(1) // 只试一次
+    expect(res.message).toContain('抽奖未开启')
+  })
+
+  it('maxDraws 兜底：异常大的余额不会把上游打爆', async () => {
+    let draws = 0
+    globalThis.fetch = vi.fn(async (url: string) => {
+      if (String(url).includes('lottery/chances')) {
+        return new Response(JSON.stringify({ code: 0, msg: 'ok', data: { balance: 9999 } }), { status: 200 })
+      }
+      draws++
+      return new Response(JSON.stringify({
+        code: 0, msg: 'ok', data: { prize_name: 'x', credit_amount: 0 },
+      }), { status: 200 })
+    }) as unknown as typeof fetch
+
+    const res = await drawAllWorkbuddyLottery('tok', 'cn', { maxDraws: 2 })
+    expect(res.drawn).toBe(2)
+    expect(draws).toBe(2)
+  })
+
+  it('无档可领时仍抽掉结余次数（runWorkbuddyGrowthRewards 的闲置缺口）', async () => {
+    // 实测国际版两个账号各积压 1 次：连登 10 天、7d 档已领、14d 未达标，
+    // 旧实现在 pickWorkbuddyRedeemTier 返回 null 处直接 return，次数永远用不掉。
+    let draws = 0
+    globalThis.fetch = vi.fn(async (url: string) => {
+      const u = String(url)
+      if (u.includes('/activity/growth/streak')) {
+        return new Response(JSON.stringify({
+          code: 0, msg: 'ok',
+          data: { streak: { days: 10 }, redemption_status: { tier_7d_status: 'claimed' }, makeup_cards: { balance: 0 } },
+        }), { status: 200 })
+      }
+      if (u.includes('lottery/chances')) {
+        return new Response(JSON.stringify({ code: 0, msg: 'ok', data: { balance: 1 } }), { status: 200 })
+      }
+      if (u.includes('lottery/draw')) {
+        draws++
+        return new Response(JSON.stringify({
+          code: 0, msg: 'ok', data: { prize_name: '5 积分', credit_amount: 5 },
+        }), { status: 200 })
+      }
+      return new Response(JSON.stringify({ code: 0, msg: 'ok', data: {} }), { status: 200 })
+    }) as unknown as typeof fetch
+
+    const res = await runWorkbuddyGrowthRewards('tok', 'global', 'u1')
+    expect(draws).toBe(1)
+    // 有档可领时 acted=true；无档但抽到了次数也算本日动作
+    expect(res.acted).toBe(true)
+    expect(res.message).toContain('无可领档位')
+  })
+})
+
+describe('盲盒 blindbox（移植 WorkBuddy-Daily t_blindbox）', () => {
+  const originalFetch = globalThis.fetch
+  afterEach(() => { globalThis.fetch = originalFetch })
+
+  it('fetchWorkbuddyBlindBoxQuota 解析 affordable/balance/cost_per_open/max_open_count', async () => {
+    globalThis.fetch = vi.fn(async () => new Response(JSON.stringify({
+      code: 0, msg: 'ok',
+      data: { affordable: 3, balance: 32, cost_per_open: 10, max_open_count: 5 },
+    }), { status: 200 })) as unknown as typeof fetch
+
+    const q = await fetchWorkbuddyBlindBoxQuota('tok', 'cn')
+    expect(q).toEqual({ affordable: 3, balance: 32, costPerOpen: 10, maxOpenCount: 5 })
+  })
+
+  it('fetchWorkbuddyBlindBoxQuota：网络失败返回 null（调用方跳过，不抛）', async () => {
+    globalThis.fetch = vi.fn(async () => { throw new Error('boom') }) as unknown as typeof fetch
+    expect(await fetchWorkbuddyBlindBoxQuota('tok', 'cn')).toBeNull()
+  })
+
+  it('openWorkbuddyBlindBox：POST /activity/growth/buddy/open 体为 {"count":1}，解析 instance/template', async () => {
+    const calls: Array<{ url: string; body: string }> = []
+    globalThis.fetch = vi.fn(async (url: string, init: any) => {
+      calls.push({ url: String(url), body: String(init?.body || '') })
+      return new Response(JSON.stringify({
+        code: 0, msg: 'ok',
+        data: { results: [{ instance: { name: '小海豹', rarity: 'rare' }, template: {} }] },
+      }), { status: 200 })
+    }) as unknown as typeof fetch
+
+    const item = await openWorkbuddyBlindBox('tok', 'cn')
+    expect(calls[0].url).toBe('https://copilot.tencent.com/activity/growth/buddy/open')
+    expect(calls[0].body).toBe('{"count":1}')
+    expect(item).toEqual({ name: '小海豹', rarity: 'rare' })
+  })
+
+  it('openWorkbuddyBlindBox：上游业务错误（能量不足）→ null，不抛', async () => {
+    globalThis.fetch = vi.fn(async () => new Response(JSON.stringify({
+      code: 400, msg: 'insufficient energy',
+    }), { status: 400 })) as unknown as typeof fetch
+    expect(await openWorkbuddyBlindBox('tok', 'cn')).toBeNull()
+  })
+
+  it('runWorkbuddyBlindBox：能量不足 → acted=false 且**不发开启请求**', async () => {
+    const calls: string[] = []
+    globalThis.fetch = vi.fn(async (url: string) => {
+      calls.push(String(url))
+      return new Response(JSON.stringify({
+        code: 0, msg: 'ok',
+        data: { affordable: 0, balance: 4, cost_per_open: 10, max_open_count: 5 },
+      }), { status: 200 })
+    }) as unknown as typeof fetch
+
+    const res = await runWorkbuddyBlindBox('tok', 'cn')
     expect(res.acted).toBe(false)
-    expect(res.message).toContain('global')
-    expect(fetchSpy).not.toHaveBeenCalled()
+    expect(res.opened).toBe(0)
+    expect(res.message).toContain('能量不足')
+    // 只查了配额，没有发开启请求（省能量、不打上游）
+    expect(calls.some((u) => u.includes('/buddy/open'))).toBe(false)
+  })
+
+  it('runWorkbuddyBlindBox：可开 3 次 → 开 3 个并汇总（受 maxOpenCount 与 affordable 双重约束）', async () => {
+    let openCount = 0
+    globalThis.fetch = vi.fn(async (url: string) => {
+      if (String(url).includes('/buddy/quota')) {
+        return new Response(JSON.stringify({
+          code: 0, msg: 'ok',
+          data: { affordable: 3, balance: 32, cost_per_open: 10, max_open_count: 5 },
+        }), { status: 200 })
+      }
+      openCount++
+      return new Response(JSON.stringify({
+        code: 0, msg: 'ok',
+        data: { results: [{ instance: { name: `盒${openCount}`, rarity: 'common' } }] },
+      }), { status: 200 })
+    }) as unknown as typeof fetch
+
+    const res = await runWorkbuddyBlindBox('tok', 'cn')
+    expect(res.acted).toBe(true)
+    expect(res.opened).toBe(3)
+    expect(openCount).toBe(3)
+    expect(res.items.map((i) => i.name)).toEqual(['盒1', '盒2', '盒3'])
+  })
+
+  it('runWorkbuddyBlindBox：affordable 超过 maxOpenCount 时按上限开（不超发）', async () => {
+    let openCount = 0
+    globalThis.fetch = vi.fn(async (url: string) => {
+      if (String(url).includes('/buddy/quota')) {
+        return new Response(JSON.stringify({
+          code: 0, msg: 'ok',
+          data: { affordable: 99, balance: 990, cost_per_open: 10, max_open_count: 5 },
+        }), { status: 200 })
+      }
+      openCount++
+      return new Response(JSON.stringify({
+        code: 0, msg: 'ok', data: { results: [{ instance: { name: 'x', rarity: '' } }] },
+      }), { status: 200 })
+    }) as unknown as typeof fetch
+
+    const res = await runWorkbuddyBlindBox('tok', 'cn')
+    expect(res.opened).toBe(5)
+    expect(openCount).toBe(5)
+  })
+
+  it('runWorkbuddyBlindBox：首次开启即被拒 → acted=false 且不继续连发', async () => {
+    let openCount = 0
+    globalThis.fetch = vi.fn(async (url: string) => {
+      if (String(url).includes('/buddy/quota')) {
+        return new Response(JSON.stringify({
+          code: 0, msg: 'ok',
+          data: { affordable: 3, balance: 32, cost_per_open: 10, max_open_count: 5 },
+        }), { status: 200 })
+      }
+      openCount++
+      return new Response(JSON.stringify({ code: 400, msg: 'insufficient energy' }), { status: 400 })
+    }) as unknown as typeof fetch
+
+    const res = await runWorkbuddyBlindBox('tok', 'cn')
+    expect(res.acted).toBe(false)
+    expect(openCount).toBe(1) // 只试了一次就停
+  })
+
+  it('runWorkbuddyBlindBox：global 打到 workbuddy.ai 域（两个 realm 都可用）', async () => {
+    const calls: string[] = []
+    globalThis.fetch = vi.fn(async (url: string) => {
+      calls.push(String(url))
+      if (String(url).includes('/buddy/quota')) {
+        return new Response(JSON.stringify({
+          code: 0, msg: 'ok',
+          data: { affordable: 1, balance: 12, cost_per_open: 10, max_open_count: 5 },
+        }), { status: 200 })
+      }
+      return new Response(JSON.stringify({
+        code: 0, msg: 'ok', data: { results: [{ instance: { name: 'x', rarity: '' } }] },
+      }), { status: 200 })
+    }) as unknown as typeof fetch
+
+    await runWorkbuddyBlindBox('tok', 'global')
+    expect(calls.every((u) => u.includes('www.workbuddy.ai'))).toBe(true)
   })
 })

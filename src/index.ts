@@ -559,6 +559,19 @@ async function scheduled(event: ScheduledEvent, env: Env, ctx: ExecutionContext)
     console.log(`[trae-checkin] cron done: total=${trae.total} ok=${trae.ok} already=${trae.already} fail=${trae.fail}`)
     return
   }
+  if (event.cron === '30 15 * * *') {
+    // 夜猫子窗口（CST 23:30）：签到链里的 runWorkbuddyNightCat 只在 23:00–08:00 计数，
+    // 而日常签到 cron 的 10:05/22:05 都不在窗口内，故必须单开一条窗口内 cron，
+    // 否则夜猫子永远点不亮（函数早已实现但无触发时机）。
+    // 复用签到链：它内部按 realm 分流，夜猫子只对 CN 账号发上报（global 无该体系）。
+    try {
+      const summary = await runAllCheckins(env)
+      console.log(`[night-cat] cron done: total=${summary.total} ok=${summary.success} already=${summary.already} fail=${summary.fail}`)
+    } catch (err) {
+      console.error(`[night-cat] cron error: ${(err as Error).message}`)
+    }
+    return
+  }
   if (event.cron === '0 * * * *') {
     // M365 对话自动清理
     try {

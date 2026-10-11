@@ -152,19 +152,21 @@ describe('连登奖励接线（checkinOneAccount → runWorkbuddyGrowthRewards�
     expect(growthCalls[0]).not.toContain('workbuddy.ai')
   })
 
-  it('global 账号不调用兑换/抽奖端点（门控跳过），也不写 growthReward', async () => {
+  it('global 账号同样走兑换/抽奖链（2026-10-11 实测解除门控），并写 growthReward', async () => {
     const { env } = makeEnv([makeProvider()])
     await seed(env, [{ uid: 'global-user', token: makeToken(GLOBAL_JWT) }])
 
     const result = await checkinOneAccount(env, makeProvider(), { interactive: true })
 
-    // global 门控：兑换与抽奖链一次都不该被调用。
-    // 注意 `/activity/growth/streak` 是**既有**行为——global 路径一直读连登天数用于面板展示
-    // （checkin.ts 的 global 分支），本移植没有改动它，故这里不断言该端点。
-    expect(calls.some((u) => u.includes('/activity/growth/redeem'))).toBe(false)
-    expect(calls.some((u) => u.includes('/activity/growth/lottery'))).toBe(false)
-    // 也不该写 growthReward 字段
-    expect(result.accounts?.[0]?.growthReward).toBeUndefined()
+    // 旧断言是"global 门控 → redeem/lottery 一次都不调用"。实测推翻该前提：
+    // workbuddy.ai 的 growth 域与 CN 同构可用，redeem 返回 code:0 并真实入账，
+    // 故 global 现在与 CN 走同一条链，只是打到 workbuddy.ai 域。
+    expect(calls.some((u) => u.includes('/activity/growth/redeem'))).toBe(true)
+    // 国际版域（不是 CN 域）
+    const redeemCall = calls.find((u) => u.includes('/activity/growth/redeem'))
+    expect(redeemCall).toContain('www.workbuddy.ai')
+    // 结果写进池账号结果
+    expect(result.accounts?.[0]?.growthReward).toBeDefined()
   })
 
   it('幂等闸生效：签到两次，第二次不再打兑换/抽奖端点', async () => {

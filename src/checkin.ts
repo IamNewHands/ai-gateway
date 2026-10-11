@@ -67,6 +67,8 @@ import {
   fetchWorkbuddyStreak,
   runWorkbuddyCatTravel,
   runWorkbuddyGrowthRewards,
+  runWorkbuddyNightCat,
+  runWorkbuddyBlindBox,
   fetchWorkbuddyRewardState,
   type WorkbuddyRewardState,
   isAlreadyCheckin,
@@ -706,6 +708,31 @@ async function checkinOauthPoolAccount(
       if (typeof streak === 'number') base.streakDays = streak
     } catch { /* ignore */ }
 
+    // 国际版**连登奖励兑换 + 补签 + 抽奖**（2026-10-11 实测解除 global 门控）：
+    // 旧实现以"global 新号 streak 返回 500"为由整链跳过，实测推翻——workbuddy.ai 的
+    // growth 域与 CN 同构且可用（streak/heatmap/lottery 均 200，redeem 返回 code:0 并
+    // 真实入账 energy/cards/chances）。跳过等于每月白丢 7d/14d/28d 三档。
+    // 安全性：runWorkbuddyGrowthRewards 每步失败静默，streak 不可用时自行返回 acted:false，
+    // 与旧门控净效果一致（见该函数文档）。state 复用上面那次 streak 读取，不打两遍。
+    try {
+      base.growthReward = await runWorkbuddyGrowthRewards(token, 'global', uid, {
+        enterpriseId,
+        deviceToken: devTokenGlobal,
+        env,
+        providerId: provider.id,
+      })
+    } catch (e) {
+      base.growthReward = { acted: false, message: (e as Error).message }
+    }
+
+    // 国际版盲盒（同 runWorkbuddyBlindBox，实测 workbuddy.ai 的 buddy/quota 同样 200）：
+    // 与 redeem 同序（先领 energy 再花）。失败静默，不改 base.success。
+    try {
+      base.blindBox = await runWorkbuddyBlindBox(token, 'global', { uid, enterpriseId, deviceToken: devTokenGlobal })
+    } catch (e) {
+      base.blindBox = { acted: false, opened: 0, items: [], message: (e as Error).message }
+    }
+
     // 国际版注册激活自愈（移植 workbuddy2api activate_region / complete_flow）：
     // 补齐 register + 地区，解决上游 chat 429 code 14017「trial not activated」。
     // 失败只记录，不改 base.success（global 签到语义仍算"跳过"）。uid 缺失则跳过。
@@ -803,6 +830,17 @@ async function checkinOauthPoolAccount(
     base.catTravel = { state: 'error', message: (e as Error).message }
   }
 
+  // 夜猫子 black_cat（2026-10-11 接线）：官方规则「每天 1 次 × 累计 3 天」，
+  // 且**只在 CST 23:00–08:00 窗口内计数**。函数内部自行判窗口，非窗口期直接返回
+  // skipped 且**不发任何上游请求**，故这里无条件调用是安全的。
+  // 为什么之前一直没生效：runWorkbuddyNightCat 早已实现并有测试，但**零调用方**，
+  // 且 cron 的 10:05/22:05 都不在窗口内——接线后仍需一个窗口内的 cron（见 wrangler.toml）。
+  try {
+    base.nightCat = await runWorkbuddyNightCat(token, 'cn', uid, { enterpriseId, deviceToken: devToken })
+  } catch (e) {
+    base.nightCat = { state: 'error', message: (e as Error).message }
+  }
+
   // 连登奖励兑换 + 连登抽奖（移植 workbuddy2api 91418c5）：在活跃上报 + streak 自检之后执行，
   // 与源实现 scheduler.runActivity 的末段同序（活跃上报点亮连登 → 才有可领档位）。
   // 幂等闸用 KV 日键（`redeemTriedToday`），多 isolate 一致；正常态（已领/未达标/无次数）静默，
@@ -818,6 +856,15 @@ async function checkinOauthPoolAccount(
     })
   } catch (e) {
     base.growthReward = { acted: false, message: (e as Error).message }
+  }
+
+  // 盲盒（移植 WorkBuddy-Daily t_blindbox）：能量（energy）的**唯一消耗出口**，
+  // 攒着不用就是沉没成本。放在连登兑换之后——redeem 会发 energy，先领再花。
+  // 正常态静默：能量不足时 runWorkbuddyBlindBox 直接返回 acted:false 且不发写请求。
+  try {
+    base.blindBox = await runWorkbuddyBlindBox(token, 'cn', { uid, enterpriseId, deviceToken: devToken })
+  } catch (e) {
+    base.blindBox = { acted: false, opened: 0, items: [], message: (e as Error).message }
   }
 
   // 额度信息 + 解冻（签到就是为了解冻冷却账号，对齐 workbuddy-wild ReenableIfCredits）
@@ -982,6 +1029,23 @@ export async function checkinOneAccount(
       const streak = await fetchWorkbuddyStreak(token, 'global', { uid, enterpriseId, deviceToken: devTokenGlobal })
       if (typeof streak === 'number') base.streakDays = streak
     } catch { /* ignore */ }
+    // 国际版连登奖励兑换 + 补签 + 抽奖（2026-10-11 实测解除 global 门控，理由见池化路径）
+    try {
+      base.growthReward = await runWorkbuddyGrowthRewards(token, 'global', uid, {
+        enterpriseId,
+        deviceToken: devTokenGlobal,
+        env,
+        providerId: provider.id,
+      })
+    } catch (e) {
+      base.growthReward = { acted: false, message: (e as Error).message }
+    }
+    // 国际版盲盒（同上）
+    try {
+      base.blindBox = await runWorkbuddyBlindBox(token, 'global', { uid, enterpriseId, deviceToken: devTokenGlobal })
+    } catch (e) {
+      base.blindBox = { acted: false, opened: 0, items: [], message: (e as Error).message }
+    }
     // 国际版注册激活自愈（同池化路径，移植 workbuddy2api activate_region / complete_flow）：
     // 补齐 register + 地区，解决上游 chat 429 code 14017「trial not activated」。
     if (uid) {
