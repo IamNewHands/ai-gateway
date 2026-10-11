@@ -68,6 +68,29 @@ export function classifyTraeError(status: number, body: string): TraeErrKind {
   return 'none'
 }
 
+/**
+ * 账号级**额度耗尽**判据（SOLO 流内 error 用）。
+ *
+ * 上游把配额耗尽放在两种形态里：业务码 4008（实测也会下发成数字字符串 `"4008"`），
+ * 以及只有文案没有码的 `requests have exceeded the quota` / `quota exceeded` /
+ * `exceeded the quota`。对齐 Trae2api-cn `_is_account_quota_error`（2026-10-10 `85978c3`）。
+ *
+ * **只认结构化码与这三条英文原文**，不做模糊关键词匹配：把模型侧的空回答误判成额度耗尽，
+ * 会让健康账号吃一次 planMs 长冷却，代价远大于漏判一次。
+ *
+ * 与 1005（plan 权益不足）分开：两者都走 planMs 冷却，但日志原因不同，排查时要能分辨。
+ */
+export function isTraeQuotaError(code: number | string, msg: string): boolean {
+  const text = typeof code === 'number' ? String(code) : String(code ?? '').trim()
+  if (text === '4008') return true
+  const lower = String(msg || '').toLowerCase()
+  return (
+    lower.includes('requests have exceeded the quota') ||
+    lower.includes('quota exceeded') ||
+    lower.includes('exceeded the quota')
+  )
+}
+
 /** ExchangeToken 的 TokenExpireAt 归一化为 Unix 秒（上游毫秒 ~1.7e12，秒 ~1.7e9）。 */
 export function normalizeExpiresAt(v: number): number {
   if (v > 1e12) return Math.floor(v / 1000)
@@ -440,7 +463,12 @@ export async function fetchTraeModels(account: TraeAccount): Promise<TraeModelIn
       maxTokens: Number(cfg?.max_output_tokens) || 0,
     })
   }
-  if (out.length === 0) throw new Error('models api returned empty list')
+  if (out.length === 0) {
+    // 空列表**不是失败**：不抛错，把「要不要负缓存」的决定权交给调用方。
+    // 对齐 Trae2api-cn `get_models`（83a782d）：上游目录为空时不写缓存，下次请求立刻重试
+    // —— 抛错会让 admin 侧按「失败」负缓存 5min，把一次空响应放大成 5 分钟看不见新模型。
+    return out
+  }
   return out
 }
 

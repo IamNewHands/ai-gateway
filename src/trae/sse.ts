@@ -45,10 +45,19 @@ export function parseSoloLine(eventName: string, dataLine: string): SOLOEvent | 
     case 'done':
       if (typeof raw['finish_reason'] === 'string') ev.finishReason = raw['finish_reason']
       break
-    case 'error':
-      if (typeof raw['code'] === 'number') ev.errorCode = raw['code']
-      if (typeof raw['message'] === 'string') ev.errorMessage = raw['message']
+    case 'error': {
+      // 上游实测会把业务码下发成数字**或数字字符串**（`"4008"`），键名也见过
+      // error_code / errorCode。只认 `typeof code === 'number'` 会让 1005 / 4008 / 4027
+      // 三条判据同时失效（errorCode 停在 0），账号策略退化成「普通错误计数」——
+      // 额度已耗尽的账号不会被冷却，继续占 MAX_ROTATE 轮转位。
+      const code = toCount(raw['code'] ?? raw['error_code'] ?? raw['errorCode'])
+      if (code !== null) ev.errorCode = code
+      // 文案键同样不止 message 一种；只取字符串，避免把对象拼成 "[object Object]" 后
+      // 再拿去做额度文案匹配（isTraeQuotaError 依赖那几条英文原文）。
+      const message = raw['message'] ?? raw['msg'] ?? raw['detail'] ?? raw['reason']
+      if (typeof message === 'string') ev.errorMessage = message
       break
+    }
   }
   return ev
 }

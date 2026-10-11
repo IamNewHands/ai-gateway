@@ -14,7 +14,7 @@ import type { Env, Provider } from '../types'
 import { withSSEKeepAlive } from '../opencode'
 import { getPerfSettings } from '../perf'
 import { TRAE_CONNECT_DEADLINES_MS, TRAE_DEFAULT_MODEL, TRAE_KEEPALIVE_MS, TRAE_RAW_MAX_HISTORY_CHARS, TRAE_RAW_MAX_MESSAGES, TRAE_RAW_MAX_TOOL_SCHEMA_CHARS, TRAE_STATIC_MODEL_IDS, TRAE_STREAM_IDLE_TIMEOUT_MS, TRAE_WORK_CONSTANTS, isWorkModel, normalizeTraeModelName } from './constants'
-import { chatStream, chatWorkStream, exchangeToken, extractLastUserPrompt, isTraeRequestSideError, needsTraeRefresh, parseAuth, probeTraeCredits, type TraeConnectTiming } from './upstream'
+import { chatStream, chatWorkStream, exchangeToken, extractLastUserPrompt, isTraeQuotaError, isTraeRequestSideError, needsTraeRefresh, parseAuth, probeTraeCredits, type TraeConnectTiming } from './upstream'
 import { isRemoteOnlyModel, type HistoryBudget } from './payload'
 import { aggregateSoloSse, aggregateWorkSse, soloStreamToOpenAIStream, workStreamToOpenAIStream } from './sse'
 import type { SOLOStreamError, TraeAccount } from './types'
@@ -95,9 +95,31 @@ export function isTraeProvider(provider: Provider): boolean {
 }
 
 /**
+ * 大小写不敏感查找已知模型名（对齐 Trae2api-cn `_UPSTREAM_MODEL_CASE`，83a782d）。
+ *
+ * 上游 config_name 带大小写（`DeepSeek-V4.1-Flash`），而 `/v1/models` 之外的手写调用方
+ * 常回投小写（`deepseek-v4.1-flash`）；`normalizeTraeModelName` 只做 `_`→`-` 与首字母大写，
+ * 会把 `DeepSeek` 变成 `Deepseek`，于是这类请求此前一律 400 unknown model。
+ *
+ * **命中唯一才返回**：若已知表里存在仅大小写不同的两个真实模型，返回 null 让调用方报错，
+ * 不在两个模型之间猜。
+ */
+function caseInsensitiveModelLookup(known: ReadonlySet<string>, model: string): string | null {
+  const lower = model.toLowerCase()
+  let hit: string | null = null
+  for (const id of known) {
+    if (id.toLowerCase() !== lower) continue
+    if (hit !== null && hit !== id) return null
+    hit = id
+  }
+  return hit
+}
+
+/**
  * 模型映射（SPEC §4.5）：
  *   "glm-5.2"（config_name）    → 直接转发
  *   "glm-5.2__dev"（内部名）    → 去掉后缀映射回 config_name
+ *   "deepseek-v4.1-flash"（小写）→ 大小写不敏感回映射到上游 config_name
  *   "auto" / ""                 → 默认模型
  *   其他未知（归一化后仍不匹配） → 抛错
  */
@@ -110,10 +132,14 @@ export function mapTraeModel(model: string, known: ReadonlySet<string>): string 
   if (i >= 0) base = m.substring(0, i)
   if (known.has(base)) return base
   if (isWorkModel(base)) return base
-  // 宽松匹配：下划线 → 横线，大小写不敏感（deepseek_v4_pro → DeepSeek-V4-Pro）
+  const ciBase = caseInsensitiveModelLookup(known, base)
+  if (ciBase !== null) return ciBase
+  // 宽松匹配：下划线 → 横线（deepseek_v4_pro → Deepseek-V4-Pro）
   const norm = normalizeTraeModelName(base)
   if (known.has(norm)) return norm
   if (isWorkModel(norm)) return norm
+  const ciNorm = caseInsensitiveModelLookup(known, norm)
+  if (ciNorm !== null) return ciNorm
   throw new Error(`unknown model ${model}`)
 }
 
@@ -374,7 +400,12 @@ async function applyChatError(env: Env, providerId: string, uid: string, kind: s
 }
 
 /**
- * 流内业务错误 → 冷却状态机（Go handleStreamError：1005 plan → 长冷却；其余累计错误）。
+ * 流内业务错误 → 冷却状态机（Go handleStreamError：1005 plan / 4008 配额 → 长冷却；其余累计错误）。
+ *
+ * 1005 与 4008 必须**同一档**：两者都是账号级额度耗尽，换号有效、同号重放无效。
+ * 此前只判 1005，4008 落到 noteTraeError 累计错误计数 → 额度已耗尽的账号不会被立即冷却，
+ * 会在 MAX_ROTATE 轮转里继续被选中，白烧轮转位与客户端重试预算（同文件 HTTP 路径 495 行
+ * 与聚合路径 881 行都已判 4008，只有这条流式路径漏了）。
  *
  * @returns true = 请求侧错误：**不罚号**，调用方须走 4xx 终态且不轮转。
  */
@@ -382,6 +413,8 @@ async function applyStreamError(env: Env, providerId: string, uid: string, se: S
   if (isTraeRequestSideError(se.code, se.msg)) return true
   if (se.code === 1005) {
     await cooldownTraeAccount(env, providerId, uid, cd.planMs, 'plan 权益不足')
+  } else if (isTraeQuotaError(se.code, se.msg)) {
+    await cooldownTraeAccount(env, providerId, uid, cd.planMs, `额度耗尽（${se.code === 4008 ? '4008' : 'quota'}）`)
   } else {
     await noteTraeError(env, providerId, uid, cd.errThreshold, cd.errMs)
   }

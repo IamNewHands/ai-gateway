@@ -466,7 +466,11 @@ async function fetchTraeModelsCached(env: Env, provider: Provider): Promise<{ en
         } catch { /* ignore */ }
         return { entries: toOpenAIModelEntries(infos), from: 'dynamic' }
       }
-    } catch { /* fall through to static */ }
+      // 上游这次给了空目录：**不是失败**，不写负缓存，下次请求立刻重试。
+      // 写负缓存会把一次空响应放大成 MODELS_FAIL_COOLDOWN_MS 内所有请求都退回静态表
+      // （对齐 Trae2api-cn `get_models`：Not cached, so the next request retries the upstream list）。
+      return { entries: TRAE_STATIC_MODELS as unknown as Array<Record<string, any>>, from: 'static' }
+    } catch { /* 真失败（网络/解析/非 200）→ 落到下面的负缓存 */ }
   }
   try {
     await env.KV.put(modelsKey(provider.id), JSON.stringify({ failAt: now }))
