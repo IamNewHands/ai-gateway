@@ -117,6 +117,24 @@ export function soloHeaders(account: TraeAccount, stream: boolean): Record<strin
     'X-OS-Version': TRAE_CONSTANTS.OSVersion,
     'X-Device-Brand': TRAE_CONSTANTS.DeviceBrand,
     'Request-Traffic-Type': 'prod',
+    // CN/SOLO 原生客户端同款头（对齐 Trae2api-cn `4f9451e` 的 SOLO 头补齐）。
+    //
+    // ⚠️ **未经验证的实验，不是缺陷修复**：目标侧不带这四个头今天也能跑通，加它们只是
+    // 「与原生客户端对齐」。**回退方式**：删掉下面四行即可（`git revert` 亦可）。
+    //
+    // 只取「纯别名 + 设备元数据」四头。刻意**不**复刻源侧的 x-lscbd-aid / x-lscbd-platform /
+    // x-ss-dp / x-plugin-channel（账号与插件渠道元数据，我们不知道真实值）、
+    // x-bridge-transport: aha / x-ahanet-timeout（ZMQ 传输层）、x-lgw-req-sdk-type /
+    // x-net-sdk-domain-dispatch / x-ttnet-bypass-*（腾讯网络 SDK 内部量）——这些在 Workers
+    // 的 fetch 里没有对应实体，照抄没有依据。
+    //
+    // 判读指标（本仓已有插桩，见 CODING_NOTES「建连死线阶梯」）：上线后对比
+    // `[trae-stream] ... connect=<ms>` 分布与 `rescued=true failedStages=` 救援率；
+    // 若死连接率或救援率无改善，直接删掉这四行。
+    'X-Device-Platform': 'windows',
+    'X-Version-Code': TRAE_CONSTANTS.IdeVersionCode,
+    'app-version': TRAE_CONSTANTS.IdeVersion,
+    'package-type': 'stable_cn',
   }
   if (account.uid) h['X-Uid'] = account.uid
   if (account.machineId) h['X-Machine-Id'] = account.machineId
