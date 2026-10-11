@@ -186,8 +186,7 @@ export function aggregateSoloSse(text: string, opts?: { readError?: boolean }): 
   let reasoning = ''
   let finishReason = 'stop'
   let usage: Record<string, any> | null = null
-  const toolCalls = new Map<number, Record<string, any>>()
-  const toolOrder: number[] = []
+  const toolMerger = new SoloToolCallMerger()
   let upstreamErr: SOLOStreamError | null = null
   let sawDone = false
 
@@ -196,7 +195,7 @@ export function aggregateSoloSse(text: string, opts?: { readError?: boolean }): 
       case 'output':
         content += ev.response
         reasoning += ev.reasoning
-        mergeToolCallJSON(toolCalls, toolOrder, ev.toolCalls)
+        toolMerger.add(ev.toolCalls)
         break
       case 'token_usage':
         usage = normalizeSoloUsage(ev.usage)
@@ -212,12 +211,16 @@ export function aggregateSoloSse(text: string, opts?: { readError?: boolean }): 
   }
   if (upstreamErr) return { resp: null, err: upstreamErr, truncated: null }
 
+  // 工具调用先落定（repair → split → drop 三档降级），后续所有「有没有工具调用」的判定
+  // 都必须以这个结果为准，不能再看原始帧数 —— 被丢弃的孤立帧不算工具调用。
+  const mergedToolCalls = toolMerger.results()
+
   // 推理退化（runaway.ts 的行重复判据）：非流式没有「中途抑制」的机会，只能事后处置。
   //  - 全程无正文/工具调用 → 不是成功结果：返回 truncated（调用方按可重试失败处理，
   //    且**不得罚号**——退化成因在模型侧）。拿垃圾推理当答案返回，就是本防护要消灭的假成功；
   //  - 有正文 → 只剔除退化推理文本，正文照常返回（不能因为思考脏了就丢掉可用答案）。
   if (isDegenerateReasoningText(reasoning)) {
-    if (content === '' && toolOrder.length === 0) {
+    if (content === '' && mergedToolCalls.length === 0) {
       return {
         resp: null,
         err: null,
@@ -235,31 +238,23 @@ export function aggregateSoloSse(text: string, opts?: { readError?: boolean }): 
 
   const message: Record<string, any> = { role: 'assistant', content }
   if (reasoning !== '') message['reasoning_content'] = reasoning
-  if (toolOrder.length > 0) {
-    toolOrder.sort((a, b) => a - b)
-    // OpenAI 非流式 tool_call：不含 index（index 仅流式增量用），type 缺省补 function
-    message['tool_calls'] = toolOrder.map((idx) => {
-      const call = toolCalls.get(idx)
-      if (call && typeof call === 'object') {
-        delete call['index']
-        if (typeof call['type'] !== 'string' || call['type'] === '') call['type'] = 'function'
-      }
-      return call
-    })
+  if (mergedToolCalls.length > 0) {
+    // OpenAI 非流式 tool_call：不含 index（index 仅流式增量用），type 由合并器补 function
+    message['tool_calls'] = mergedToolCalls
     // 本回合模型发起工具调用 → finish_reason 必须是 tool_calls（上游常自报 stop）
     finishReason = 'tool_calls'
   }
 
   // 非流式没有错误帧可发，finish_reason 是客户端唯一可见的收尾信号：没收到 done 就不能给
   // stop 的假象（有工具调用时保留 tool_calls —— 那是可执行动作，不该被降级成 length）。
-  if (!sawDone && toolOrder.length === 0) finishReason = 'length'
+  if (!sawDone && mergedToolCalls.length === 0) finishReason = 'length'
 
   // 无 done = 上游半路断流（或读体异常）。调用方必须据此判失败，不得把 resp 当成功返回。
   const truncated: SoloStreamEndInfo | null = sawDone ? null : {
     kind: opts?.readError ? 'read_error' : 'no_done',
     contentChars: content.length,
     reasoningChars: reasoning.length,
-    sawToolCalls: toolOrder.length > 0,
+    sawToolCalls: mergedToolCalls.length > 0,
     sawUsage: usage !== null,
   }
 
@@ -274,60 +269,398 @@ export function aggregateSoloSse(text: string, opts?: { readError?: boolean }): 
   return { resp, err: null, truncated }
 }
 
-/**
- * 把 SOLO output.tool_calls（可能 null/对象/数组）合并进 toolCalls（按 index）。
- */
-function mergeToolCallJSON(toolCalls: Map<number, Record<string, any>>, toolOrder: number[], raw: unknown): void {
-  if (raw === null || raw === undefined || raw === 'null') return
-  let arr: Record<string, any>[] | null = null
-  if (Array.isArray(raw)) {
-    arr = raw as Record<string, any>[]
-  } else if (typeof raw === 'object') {
-    arr = [raw as Record<string, any>]
-  } else if (typeof raw === 'string') {
-    try {
-      const parsed = JSON.parse(raw)
-      if (Array.isArray(parsed)) arr = parsed
-      else if (parsed && typeof parsed === 'object') arr = [parsed]
-    } catch { return }
-  }
-  if (!arr) return
-  for (const call of arr) {
-    if (!call || typeof call !== 'object') continue
-    let idx = 0
-    if (typeof call['index'] === 'number') idx = call['index']
-    let merged = toolCalls.get(idx)
-    if (!merged) {
-      merged = { index: idx, type: 'function' }
-      toolCalls.set(idx, merged)
-      toolOrder.push(idx)
-    }
-    mergeToolCallDelta(merged, call)
+// ===== SOLO 工具调用合并 / 参数修复（移植自 Trae2api-cn 4f9451e + 85978c3）=====
+//
+// 上游 SOLO 原生工具流的实测坏形态（Trae2api-cn issue #8，2026-10-05，d4.1f 最明显，
+// 并发 4 工具修前 0/12、修后 15/15）：
+//  1. 分片截断      `{"command": "git status"` 缺闭合 `}`
+//  2. 同 index 压栈  `{"a":1}{"b":2}` 拼进同一个 arguments
+//  3. 跨调用交织    Bash 尾部 + Write body 混合
+//  4. 孤立闭合帧    单独一个 `}` 成为 tool_call
+//  5. 无 name/id 续片 被「按数组位补 index」归并到错误调用
+// 任一形态都会让客户端报 `inputSchema validation failed`（旧实现更早的版本直接整请求 502）。
+//
+// 三条纪律（对齐源侧 ToolCallAccumulator）：
+//  - 首帧带 id+name、续片不带（上游实测）⇒ **无 index 的续片不得按数组位补 index**，
+//    只能并入「最近一个未闭合调用」；
+//  - 已闭合（arguments 已是合法 JSON）的调用再收到以 `{`/`[` 开头的片段 = 新逻辑调用，
+//    必须开新 index，绝不字符串拼接；
+//  - 无归属的孤立闭合/空片段直接丢弃，不得污染前一个完整调用。
+//
+// 对外 index 由合并器**按创建顺序**分配（0,1,2…），不透传上游 index：上游 index 会被
+// 并发调用复用，透传就会让两个逻辑调用撞同一 index，而客户端对同一 index 是拼接语义。
+
+/** 合法 JSON 文本（含标量）→ true；空串与解析失败 → false。 */
+export function isJsonText(text: string): boolean {
+  if (text === '') return false
+  try {
+    JSON.parse(text)
+    return true
+  } catch {
+    return false
   }
 }
 
+/** 片段是否像一个新 JSON 值的起点（`{` 或 `[`，允许前导空白）。 */
+function startsNewJsonValue(text: string): boolean {
+  const c = text.replace(/^\s+/, '').slice(0, 1)
+  return c === '{' || c === '['
+}
+
+/** 上游遗留的孤立闭合/空片段（丢弃用）。 */
+function isOrphanClosingFragment(text: string): boolean {
+  const s = text.trim()
+  return s === '' || s === '}' || s === ']' || s === '{}' || s === '[]'
+}
+
 /**
- * 把流式 tool_call 片段合并到累计对象：id/type/function.name 直覆盖，function.arguments 拼接。
- * 上游 SOLO 用 `function_call` 字段（实测），OpenAI 标准用 `function`；两者都兼容。
+ * 尽力补全被截断的 JSON 参数（补未闭合字符串与括号栈）。
+ * 对齐源侧 `_repair_json_arguments`：只在结果能通过 `JSON.parse` 时才返回新值，否则原样返回
+ * —— 宁可不修，也不编造一个能过 schema 的错误参数。
  */
-function mergeToolCallDelta(merged: Record<string, any>, delta: Record<string, any>): void {
-  if (typeof delta['id'] === 'string' && delta['id'] !== '') merged['id'] = delta['id']
-  if (typeof delta['type'] === 'string' && delta['type'] !== '') merged['type'] = delta['type']
-  let df = delta['function']
-  if (!df || typeof df !== 'object') df = delta['function_call']
-  if (!df || typeof df !== 'object') return
-  // 清理 SOLO 专属字段，只保留标准 OpenAI function 结构(name/arguments)
-  delete df['namespace']
-  delete df['partial_arguments']
-  let mf = merged['function']
-  if (!mf || typeof mf !== 'object') {
-    mf = {}
-    merged['function'] = mf
+export function repairJsonArguments(argumentsText: string): string {
+  if (!argumentsText || isJsonText(argumentsText)) return argumentsText
+  let repaired = argumentsText.replace(/\s+$/, '')
+  const stack: string[] = []
+  let inStr = false
+  let esc = false
+  for (const ch of repaired) {
+    if (inStr) {
+      if (esc) esc = false
+      else if (ch === '\\') esc = true
+      else if (ch === '"') inStr = false
+      continue
+    }
+    if (ch === '"') inStr = true
+    else if (ch === '{' || ch === '[') stack.push(ch)
+    else if (ch === '}' || ch === ']') {
+      if (stack.length > 0) stack.pop()
+    }
   }
-  if (typeof df['name'] === 'string' && df['name'] !== '') mf['name'] = df['name']
-  if (typeof df['arguments'] === 'string' && df['arguments'] !== '') {
-    if (typeof mf['arguments'] === 'string' && mf['arguments'] !== '') mf['arguments'] += df['arguments']
-    else mf['arguments'] = df['arguments']
+  if (inStr) repaired += '"'
+  for (let i = stack.length - 1; i >= 0; i--) repaired += stack[i] === '{' ? '}' : ']'
+  return isJsonText(repaired) ? repaired : argumentsText
+}
+
+/** 返回从 start 起的完整 JSON 值的结束下标（不含）；失败返回 -1。 */
+function jsonValueEnd(text: string, start: number): number {
+  let depth = 0
+  let inStr = false
+  let esc = false
+  for (let i = start; i < text.length; i++) {
+    const ch = text[i]
+    if (inStr) {
+      if (esc) esc = false
+      else if (ch === '\\') esc = true
+      else if (ch === '"') inStr = false
+      continue
+    }
+    if (ch === '"') inStr = true
+    else if (ch === '{' || ch === '[') depth++
+    else if (ch === '}' || ch === ']') {
+      depth--
+      if (depth === 0) return i + 1
+      if (depth < 0) return -1
+    }
+  }
+  return -1
+}
+
+/**
+ * 从 `{..}{..}` 拼接串里切出一个个合法 JSON 值（对齐 Python `raw_decode` 语义）。
+ * 起点不是 `{`/`[`、或中途截断 → 返回 null（调用方再走 repair / drop）。
+ */
+export function splitJsonStream(text: string): unknown[] | null {
+  const out: unknown[] = []
+  let i = 0
+  while (i < text.length) {
+    while (i < text.length && /\s/.test(text[i])) i++
+    if (i >= text.length) break
+    const first = text[i]
+    if (first !== '{' && first !== '[') return null
+    const end = jsonValueEnd(text, i)
+    if (end < 0) return null
+    try {
+      out.push(JSON.parse(text.slice(i, end)))
+    } catch {
+      return null
+    }
+    i = end
+  }
+  return out.length > 0 ? out : null
+}
+
+/** 上游 tool_calls 的三种承载形态（null/对象/数组/JSON 字符串）→ 数组。 */
+function toToolCallArray(raw: unknown): Record<string, any>[] | null {
+  if (raw === null || raw === undefined || raw === 'null') return null
+  if (Array.isArray(raw)) return raw as Record<string, any>[]
+  if (typeof raw === 'object') return [raw as Record<string, any>]
+  if (typeof raw === 'string') {
+    try {
+      const parsed = JSON.parse(raw)
+      if (Array.isArray(parsed)) return parsed as Record<string, any>[]
+      if (parsed && typeof parsed === 'object') return [parsed as Record<string, any>]
+    } catch {
+      return null
+    }
+  }
+  return null
+}
+
+/** 取 function / function_call 子对象（SOLO 用前者，OpenAI 标准用后者）。 */
+function pickFunctionDelta(call: Record<string, any>): Record<string, any> | null {
+  const fn = call['function']
+  if (fn && typeof fn === 'object' && !Array.isArray(fn)) return fn as Record<string, any>
+  const legacy = call['function_call']
+  if (legacy && typeof legacy === 'object' && !Array.isArray(legacy)) return legacy as Record<string, any>
+  return null
+}
+
+interface MergedSoloToolCall {
+  outIndex: number
+  id: string
+  name: string
+  args: string
+  hadUpstreamIndex: boolean
+}
+
+/**
+ * SOLO 工具调用合并器：流式（增量下发）与非流式（事后聚合）共用的唯一 owner。
+ *
+ * 两条路径必须共用同一套归并规则，否则流式与非流式对同一段上游流会给出不同的工具调用
+ * —— 客户端拿非流式结果和流式结果会对不上（这正是把两处实现合并成一个类的原因）。
+ */
+export class SoloToolCallMerger {
+  private calls = new Map<number, MergedSoloToolCall>()
+  private order: number[] = []
+  private idToOut = new Map<string, number>()
+  private upstreamToOut = new Map<number, number>()
+  private nextOut = 0
+  private dropped = 0
+  private repaired = 0
+  private splits = 0
+
+  /** 合并一帧上游 tool_calls；返回本帧应下发的 OpenAI 增量（整帧被丢则为空数组）。 */
+  add(raw: unknown): Record<string, any>[] {
+    const arr = toToolCallArray(raw)
+    if (!arr) return []
+    const deltas: Record<string, any>[] = []
+    for (const call of arr) {
+      if (!call || typeof call !== 'object') continue
+      const delta = this.mergeOne(call)
+      if (delta) deltas.push(delta)
+    }
+    return deltas
+  }
+
+  /** 累计结果（已做 repair / split / drop），供非流式 `message.tool_calls` 使用。 */
+  results(): Record<string, any>[] {
+    const out: Record<string, any>[] = []
+    const completeSignatures = new Set<string>()
+    for (const outIndex of this.order) {
+      const merged = this.calls.get(outIndex)
+      if (!merged) continue
+      const calls = this.normalizeMerged(merged)
+      if (calls.length === 0) {
+        this.dropped += 1
+        continue
+      }
+      for (const call of calls) {
+        const args = String((call['function'] as Record<string, any>)['arguments'] ?? '')
+        // 无上游 id 的完整重复调用 = 上游重放：同一 (name, args) 只保留第一条。
+        // 带 id 的调用不参与去重 —— 上游给了不同 id 就是两个逻辑调用（哪怕参数相同）。
+        if (merged.id === '' && isJsonText(args)) {
+          const signature = `${merged.name}\u0000${args}`
+          if (completeSignatures.has(signature)) {
+            this.dropped += 1
+            continue
+          }
+          completeSignatures.add(signature)
+        }
+        out.push(call)
+      }
+    }
+    const { dropped, repaired, splits } = this.stats()
+    if (dropped > 0 || repaired > 0 || splits > 0) {
+      console.warn(`[trae-tool-calls] repaired=${repaired} dropped=${dropped} splits=${splits}`)
+    }
+    return out
+  }
+
+  /** 诊断计数（供调用方记日志/告警）。 */
+  stats(): { dropped: number; repaired: number; splits: number } {
+    return { dropped: this.dropped, repaired: this.repaired, splits: this.splits }
+  }
+
+  private mergeOne(call: Record<string, any>): Record<string, any> | null {
+    const fnRaw = pickFunctionDelta(call)
+    const name = fnRaw && typeof fnRaw['name'] === 'string' ? fnRaw['name'].trim() : ''
+    const args = fnRaw && typeof fnRaw['arguments'] === 'string' ? fnRaw['arguments'] : ''
+    const id = typeof call['id'] === 'string' ? call['id'].trim() : ''
+    const upstreamIndex =
+      typeof call['index'] === 'number' && Number.isFinite(call['index']) ? call['index'] : null
+
+    // 噪音帧（如 {index:0} / {function:{}}）：无 name、无 id、无参数 → 丢弃，不下发空增量
+    if (name === '' && id === '' && args === '') return null
+
+    const resolved = this.resolveTarget(name, id, args, upstreamIndex)
+    if (resolved === null) {
+      this.dropped += 1
+      return null
+    }
+    const { outIndex, isNew } = resolved
+    const merged = this.calls.get(outIndex)
+    if (!merged) return null
+
+    let emitId = ''
+    if (id !== '' && merged.id !== id) {
+      merged.id = id
+      this.idToOut.set(id, outIndex)
+      emitId = id
+    }
+    if (isNew) {
+      // 拆出来的新调用可能继承同 index 前一个调用的函数名（见 resolveTarget 形态2），
+      // 此时本帧没有 name，不得用空名覆盖。
+      if (name !== '') merged.name = name
+      merged.args = args
+      merged.hadUpstreamIndex = upstreamIndex !== null
+    } else {
+      if (name !== '' && merged.name === '') merged.name = name
+      merged.args += args
+    }
+
+    // 续片且既无 name 又无参数 → 无可下发内容（不得发空 id/name 冲掉首帧已落定的值）
+    if (!isNew && name === '' && args === '') return null
+
+    const delta: Record<string, any> = { index: outIndex }
+    if (isNew) delta['type'] = 'function'
+    if (emitId !== '') delta['id'] = emitId
+    const fn: Record<string, any> = {}
+    if (name !== '') fn['name'] = name
+    if (args !== '') fn['arguments'] = args
+    if (Object.keys(fn).length > 0) delta['function'] = fn
+    return delta
+  }
+
+  private resolveTarget(
+    name: string,
+    id: string,
+    args: string,
+    upstreamIndex: number | null,
+  ): { outIndex: number; isNew: boolean } | null {
+    // 1) 带 id 且该 id 已归并过 → 同一逻辑调用
+    if (id !== '') {
+      const known = this.idToOut.get(id)
+      if (known !== undefined) return { outIndex: known, isNew: false }
+    }
+
+    if (name !== '') {
+      // 2) 具名帧：同一上游 index 上「同名且未闭合」视为 name 重复的续片
+      if (upstreamIndex !== null) {
+        const cand = this.byUpstreamIndex(upstreamIndex)
+        if (cand && cand.name === name && !this.isClosed(cand.outIndex)) {
+          return { outIndex: cand.outIndex, isNew: false }
+        }
+      }
+      // 3) 其余具名帧一律是新逻辑调用（含上游 index 复用）
+      return { outIndex: this.allocate(upstreamIndex), isNew: true }
+    }
+
+    // 4) 无 name 的续片
+    if (upstreamIndex !== null) {
+      const cand = this.byUpstreamIndex(upstreamIndex)
+      if (!cand) {
+        // 无 name 的帧是续片，不能凭空开新调用：只有看起来是新 JSON 值起点才接受。
+        // 否则就是一条没有归属的孤立闭合/垃圾帧（形态4）→ 丢弃，绝不下发。
+        if (!startsNewJsonValue(args)) return null
+        return { outIndex: this.allocate(upstreamIndex), isNew: true }
+      }
+      if (this.isClosed(cand.outIndex)) {
+        if (startsNewJsonValue(args)) {
+          // 形态2：同一 index 串了新调用 → 开新 index，并把该上游 index 改指向新调用，
+          // 否则新调用的后续续片会被误判成「已闭合调用的遗留帧」而丢弃。
+          this.splits += 1
+          const outIndex = this.allocate(null)
+          this.upstreamToOut.set(upstreamIndex, outIndex)
+          const fresh = this.calls.get(outIndex)
+          // 继承被复用 index 的调用名：源侧同款（`current_name or previous["name"]`）。
+          // 不继承会让「无 id 的完整重复调用」去重签名对不上（名字为空 vs 有名字）。
+          if (fresh) fresh.name = cand.name
+          return { outIndex, isNew: true }
+        }
+        // 形态4：遗留闭合/空帧 → 丢弃
+        return null
+      }
+      return { outIndex: cand.outIndex, isNew: false }
+    }
+
+    // 5) 无 index 无 name：并入最近一个未闭合调用；无归属则丢弃（**不按数组位补 index**）
+    const open = this.latestOpen()
+    return open === null ? null : { outIndex: open, isNew: false }
+  }
+
+  private byUpstreamIndex(upstreamIndex: number): MergedSoloToolCall | null {
+    const out = this.upstreamToOut.get(upstreamIndex)
+    if (out === undefined) return null
+    return this.calls.get(out) ?? null
+  }
+
+  private isClosed(outIndex: number): boolean {
+    const call = this.calls.get(outIndex)
+    return !!call && isJsonText(call.args)
+  }
+
+  private latestOpen(): number | null {
+    for (let i = this.order.length - 1; i >= 0; i--) {
+      if (!this.isClosed(this.order[i])) return this.order[i]
+    }
+    return null
+  }
+
+  private allocate(upstreamIndex: number | null): number {
+    const outIndex = this.nextOut++
+    this.calls.set(outIndex, { outIndex, id: '', name: '', args: '', hadUpstreamIndex: upstreamIndex !== null })
+    this.order.push(outIndex)
+    if (upstreamIndex !== null) this.upstreamToOut.set(upstreamIndex, outIndex)
+    return outIndex
+  }
+
+  /** 单个累计调用 → 0..N 条 OpenAI tool_call（repair → split → drop 三档降级）。 */
+  private normalizeMerged(merged: MergedSoloToolCall): Record<string, any>[] {
+    const baseId = merged.id !== '' ? merged.id : `call_${merged.outIndex}`
+    const build = (args: string, id: string): Record<string, any> => ({
+      id,
+      type: 'function',
+      function: { name: merged.name, arguments: args },
+    })
+
+    // 零参数调用与已合法参数原样保留（不编造、不重写）
+    if (merged.args === '' || isJsonText(merged.args)) return [build(merged.args, baseId)]
+
+    const parts = splitJsonStream(merged.args)
+    if (parts !== null && parts.length > 0) {
+      this.splits += 1
+      const seen = new Set<string>()
+      const out: Record<string, any>[] = []
+      for (let i = 0; i < parts.length; i++) {
+        const args = JSON.stringify(parts[i])
+        const signature = `${merged.name}\u0000${args}`
+        if (seen.has(signature)) continue
+        seen.add(signature)
+        out.push(build(args, i === 0 ? baseId : `${baseId}:${i}`))
+      }
+      if (out.length > 0) return out
+    }
+
+    const fixed = repairJsonArguments(merged.args)
+    if (isJsonText(fixed)) {
+      this.repaired += 1
+      return [build(fixed, baseId)]
+    }
+
+    // 孤立闭合/垃圾帧与不可用参数都不下发（宁可少一个调用，也不给客户端坏 schema）
+    if (!isOrphanClosingFragment(merged.args)) this.repaired += 1
+    return []
   }
 }
 
@@ -440,6 +773,10 @@ export function soloStreamToOpenAIStream(
       let postDoneContentChars = 0
       let postDoneReasoningChars = 0
       let postDoneToolCalls = 0
+      // 工具调用合并器：与非流式聚合共用同一套归并规则（见 SoloToolCallMerger）。
+      // 必须在流式路径上增量归并，而不是逐帧原样透传 —— 上游会把多个并发调用压在同一个
+      // index 上，透传后由客户端拼接 `arguments` 就会得到 `{"a":1}{"b":2}`。
+      const toolMerger = new SoloToolCallMerger()
 
       const writeChunk = (delta: Record<string, any>, finish: string, extra?: Record<string, unknown>): void => {
         // OpenAI 兼容客户端通常期望首块 delta 带 role（openai SDK / AI SDK 均按此解析）
@@ -514,8 +851,8 @@ export function soloStreamToOpenAIStream(
               if (ev.response !== '') delta['content'] = ev.response
               if (ev.reasoning !== '' && !guard.suppressed) delta['reasoning_content'] = ev.reasoning
               if (ev.toolCalls !== null && ev.toolCalls !== undefined && ev.toolCalls !== 'null') {
-                const tc = normalizeStreamToolCalls(ev.toolCalls)
-                if (tc) {
+                const tc = toolMerger.add(ev.toolCalls)
+                if (tc.length > 0) {
                   delta['tool_calls'] = tc
                   sawToolCalls = true
                   if (sawDone) postDoneToolCalls += 1
@@ -675,53 +1012,10 @@ export function soloStreamToOpenAIStream(
   })
 }
 
-/**
- * 把 SOLO output.tool_calls 条目转成 OpenAI 标准（function_call → function，清 SOLO 专属字段）。
- * 过滤空 tool_calls 数组 / 空 function 对象等噪音（strict 客户端会因空数组解码失败），
- * 并补齐流式必填的 index 字段。
- */
-function normalizeStreamToolCalls(raw: unknown): unknown[] | null {
-  let arr: any[] | null = null
-  if (Array.isArray(raw)) {
-    arr = raw
-  } else if (typeof raw === 'object' && raw !== null) {
-    arr = [raw]
-  } else {
-    try {
-      const parsed = JSON.parse(String(raw))
-      if (Array.isArray(parsed)) arr = parsed
-      else if (parsed && typeof parsed === 'object') arr = [parsed]
-    } catch { return null }
-  }
-  if (!arr || arr.length === 0) return null
-  const out: any[] = []
-  for (let i = 0; i < arr.length; i++) {
-    const call = arr[i]
-    if (!call || typeof call !== 'object') continue
-    if (call['function_call'] && typeof call['function_call'] === 'object') {
-      call['function'] = call['function_call']
-      delete call['function_call']
-    }
-    const fn = call['function']
-    if (fn && typeof fn === 'object') {
-      delete fn['namespace']
-      delete fn['partial_arguments']
-    }
-    // 流式 tool_call 增量必须带 index，缺失时按数组位补
-    if (typeof call['index'] !== 'number') call['index'] = i
-    // 空字符串 id / name 直接删掉，只保留非空值：
-    // 严格客户端（openai-node 等）对增量可能"覆盖"而非"补缺"，空 id/name 会把
-    // 首个 chunk 已落定的合法值冲掉，最终工具调用 id/函数名丢失 → 解析失败/报错。
-    if (typeof call['id'] === 'string' && call['id'] === '') delete call['id']
-    if (fn && typeof fn === 'object' && typeof fn['name'] === 'string' && fn['name'] === '') delete fn['name']
-    // 剔除无实质内容的空条目（如 {index:0} 或 {function:{}}），避免噪音
-    const hasId = typeof call['id'] === 'string' && call['id'] !== ''
-    const hasFn = !!fn && typeof fn === 'object' && Object.keys(fn).length > 0
-    if (!hasId && !hasFn && call['type'] === undefined) continue
-    out.push(call)
-  }
-  return out.length > 0 ? out : null
-}
+// 原 `normalizeStreamToolCalls`（形状归一 + 按数组位补 index + 剔空 id/name）已由
+// `SoloToolCallMerger` 取代：形状归一（function_call→function、清 namespace/partial_arguments）
+// 与「不落空 id/name」两条纪律保留，但**按数组位补 index 被刻意去掉** —— 那正是
+// 「无 name/id 续片归并到错误调用」这条坏形态（Trae2api-cn issue #8 形态 5）的成因。
 
 // ===== Work 通道流式与非流式转换 (移植自 trae2api StreamWorkToOpenAI / AggregateWork) =====
 
