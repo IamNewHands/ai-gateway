@@ -44,6 +44,8 @@ import {
   claimWorkbuddyGift,
   claimWorkbuddyCompensation,
   makeupWorkbuddyYesterday,
+  TRANSIENT_RETRY_MAX,
+  __setTransientRetryDelayForTests,
 } from './workbuddy-billing'
 
 describe('夜猫子任务 black_cat（移植 task_runner.py black_cat 分支）', () => {
@@ -187,7 +189,7 @@ describe('billingCall 多路径 fallback 语义（仅 404 换下一条）', () =
     expect(seen[1]).toContain('workbuddy.ai/v2/billing/meter/get-user-resource')
   })
 
-  it('首条 500 → **不** fallback，直接抛出（不掩盖真实故障）', async () => {
+  it('首条 500 → 瞬时重试后仍失败 → **不** fallback，直接抛出（不掩盖真实故障）', async () => {
     const seen: string[] = []
     globalThis.fetch = vi.fn(async (url: string) => {
       seen.push(url)
@@ -196,7 +198,10 @@ describe('billingCall 多路径 fallback 语义（仅 404 换下一条）', () =
 
     const paths = billingMeterPaths('get-user-resource', 'global')
     await expect(billingCall('tok', paths[0], 'global', { paths })).rejects.toThrow()
-    expect(seen.length).toBe(1)
+    // 5xx 属瞬时失败：同一条候选重试 TRANSIENT_RETRY_MAX 次，但**不换候选**
+    expect(seen.length).toBe(TRANSIENT_RETRY_MAX + 1)
+    expect(seen.every((u) => u.includes('/billing/meter/get-user-resource'))).toBe(true)
+    expect(seen.some((u) => u.includes('/v2/billing/meter/'))).toBe(false)
   })
 
   it('全部候选 404 → 抛出（含最后一次错误）', async () => {

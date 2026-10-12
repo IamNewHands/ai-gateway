@@ -8,6 +8,7 @@ import {
   ADOPT_TRIED_KV_PREFIX,
   reportWorkbuddyChatActivity,
   runWorkbuddyCatTravel,
+  TRANSIENT_RETRY_MAX,
 } from './workbuddy-billing'
 import type { Env } from './types'
 
@@ -83,22 +84,43 @@ describe('reportWorkbuddyChatActivity 条间间隔（对齐 activityReportGap = 
     expect(waits).toEqual([100, 100])
   })
 
-  it('上报失败时立即返回（不再续发，也不等待）', async () => {
+  it('上报持续失败 → 第 1 条用满瞬时重试后返回（不续发剩余条目，也不再多等）', async () => {
     let n = 0
     globalThis.fetch = vi.fn(async () => {
       n++
-      if (n === 2) return new Response('boom', { status: 500 })
-      return new Response(JSON.stringify({ code: 0 }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      return new Response('boom', { status: 500 })
     }) as unknown as typeof fetch
     const waits: number[] = []
     const r = await reportWorkbuddyChatActivity('tok', 'cn', 'u1', {
       count: 5,
       delay: async (ms) => { waits.push(ms) },
     })
-    // 第 2 条失败 → 只等了第 1→2 条之间的 1 次
-    expect(waits).toEqual([1500])
+    // 第 1 条 500 → 瞬时重试（共 1+TRANSIENT_RETRY_MAX 次请求）后仍失败 → 立即返回
+    expect(n).toBe(TRANSIENT_RETRY_MAX + 1)
+    // 注入的 delay 同时用于重试退避与条间间隔；这里只断言**没有**条间间隔（1500）
+    expect(waits.includes(ACTIVITY_REPORT_GAP_MS)).toBe(false)
+    expect(r.reported).toBe(0)
+    expect(r.success).toBe(false)
+    expect(r.message).toContain('第 1/5 条上报失败')
+  })
+
+  it('上报中途持续失败 → 已成功的条数保留，success 仍为 true', async () => {
+    let n = 0
+    globalThis.fetch = vi.fn(async () => {
+      n++
+      // 第 1 条成功；此后持续失败（含该条的重试）
+      if (n === 1) return new Response(JSON.stringify({ code: 0 }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      return new Response('boom', { status: 500 })
+    }) as unknown as typeof fetch
+    const waits: number[] = []
+    const r = await reportWorkbuddyChatActivity('tok', 'cn', 'u1', {
+      count: 5,
+      delay: async (ms) => { waits.push(ms) },
+    })
     expect(r.reported).toBe(1)
     expect(r.success).toBe(true) // 已成功 1 条
+    // 第 1→2 条之间的 1 次条间间隔仍在
+    expect(waits.filter((w) => w === ACTIVITY_REPORT_GAP_MS).length).toBe(1)
   })
 
   it('5 条共用同一 conversationId，requestId 各条独立（源实现语义）', async () => {

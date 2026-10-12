@@ -138,12 +138,13 @@ async function billingCallOnce(
   }
   if (opts?.extraHeaders) Object.assign(headers, opts.extraHeaders)
   const body = opts && opts.body !== undefined ? JSON.stringify(opts.body) : '{}'
-  const res = await fetch(base + path, {
+  // 瞬时失败（网络层 / 5xx / 无信封 403）原样重发；见 fetchWithTransientRetry。
+  const res = await fetchWithTransientRetry(() => fetch(base + path, {
     method: 'POST',
     headers,
     body,
     signal: AbortSignal.timeout(30000),
-  })
+  }))
 
   const text = await res.text()
   if (!res.ok) {
@@ -154,7 +155,7 @@ async function billingCallOnce(
       const parsed = JSON.parse(text) as { code?: unknown }
       if (typeof parsed?.code === 'number') code = parsed.code
     } catch { /* 非 JSON body（网关/WAF 纯文本页）：code 保持 null */ }
-    throw new BillingError(`http ${res.status} ${path}: ${text.substring(0, 200)}`, { code, status: res.status })
+    throw new BillingError(describeHttpFailure(res.status, text, path), { code, status: res.status })
   }
   let env: BillingEnvelope
   try {
@@ -169,8 +170,147 @@ async function billingCallOnce(
   return env.data
 }
 
-import { parseJwtClaims } from './workbuddy-upstream'
+import { parseJwtClaims, isWafBlocked } from './workbuddy-upstream'
 import { newMessageId } from './workbuddy-session-ids'
+
+// ===== 瞬时失败重试与失败原因整形（国际版 CF 边缘拦截页兜底） =====
+
+/**
+ * 瞬时失败的最大重试次数（首次尝试之外的次数）。
+ *
+ * 为什么是 2：实测故障形态是 Cloudflare 边缘路由抖动，重发子请求有较大概率落到另一个
+ * 边缘节点即成功；再多只是拉长面板等待。
+ */
+export const TRANSIENT_RETRY_MAX = 2
+
+/** 瞬时失败重试基准间隔（ms）。实际间隔 = 基准 × 2^(n-1) × [0.5, 1.5) 抖动。 */
+export const TRANSIENT_RETRY_BASE_MS = 200
+
+/**
+ * 重试间隔实现（可被测试替换以跳过真实等待）。
+ *
+ * 为什么不复用 `defaultDelay`：真实退避会让「用满重试额度」的用例各自空等约 600ms，
+ * 在 2700+ 用例的全量套件里会明显拖慢。这里与 `__resetOauthPoolRuntimeForTests` 同惯例，
+ * 暴露一个仅测试使用的开关；生产路径始终是真实 `setTimeout`。
+ */
+let transientRetryDelay: DelayFn = (ms) => new Promise((r) => setTimeout(r, ms))
+
+/** 测试专用：替换重试间隔实现。传 null 恢复真实 setTimeout。 */
+export function __setTransientRetryDelayForTests(fn: DelayFn | null): void {
+  transientRetryDelay = fn || ((ms) => new Promise((r) => setTimeout(r, ms)))
+}
+
+/**
+ * 判定响应体是否为 Cloudflare 自身生成的边缘错误页。
+ *
+ * 实测原文：`error code: 1002`（**纯文本**，无 JSON 信封）。1002 = "DNS points to Prohibited IP"：
+ * `www.workbuddy.ai` 本身在 Cloudflare 之后，而本 Worker 开了 Smart Placement（wrangler.toml
+ * `[placement]`）。当子请求落到某边缘节点、该节点把目标域名解析成 CF 自己的 anycast IP 时，
+ * CF 的防环回守卫直接拦下并回自己的错误页 —— **请求从未到达腾讯**。故障与边缘节点相关，
+ * 故表现为间歇：同一账号同一动作重跑即成功（register / trial / /v2/report 三条链路同时 403）。
+ *
+ * 只认 CF 的机器可读标记（`error code: NNNN`）与 HTML `<title>Error NNNN</title>`，
+ * 避免把上游业务文案里的 "error" 误判成边缘页。
+ */
+export function isCloudflareEdgeError(text: string): boolean {
+  return /error code:\s*1\d{3}/i.test(text) || /<title>\s*error\s+1\d{3}/i.test(text)
+}
+
+/**
+ * 把非 2xx 响应整形成可读失败原因（**单一事实来源**）。
+ *
+ * 为什么必须集中：此前多处直接 `res.json()`，把「HTTP 403 + CF 纯文本拦截页」变成
+ * `Unexpected token 'e', "error code: 1002" is not valid JSON` —— HTTP 状态这个最有用的
+ * 事实被 JSON 语法错吞掉，面板上完全看不出是边缘拦截还是上游拒绝。
+ *
+ * 非 CF 形态**逐字保持**原有 `http <status>[ <path>]: <body 前 200 字>` 拼写：
+ * 幂等/文案匹配（isAlreadyCheckin / isRedeemNotEnoughDays 等）依赖该文本。
+ */
+export function describeHttpFailure(status: number, text: string, path?: string): string {
+  const where = path ? ` ${path}` : ''
+  const raw = text || ''
+  if (isCloudflareEdgeError(raw)) {
+    const snippet = raw.trim().replace(/\s+/g, ' ').slice(0, 80)
+    return `http ${status}${where}: Cloudflare 边缘拦截页（${snippet}）；子请求未到达上游`
+  }
+  return raw ? `http ${status}${where}: ${raw.substring(0, 200)}` : `http ${status}${where}（空响应体）`
+}
+
+/**
+ * 该响应是否属于「瞬时失败」（值得原样重发）。
+ *
+ * 判据：5xx（上游临时故障）或 403 且响应体无业务信封（`isWafBlocked`，CF 边缘拦截页形态，
+ * 与 proxy.ts 的 `waf_block` 分类同源）。
+ */
+function isTransientResponse(res: Response, bodyText: string): boolean {
+  if (res.status >= 500) return true
+  return isWafBlocked(res.status, bodyText)
+}
+
+/**
+ * 带瞬时重试的子请求出口。
+ *
+ * 重试判据（只重试「根本没到上游」或「上游临时故障」）：
+ *  - fetch 抛错（网络层失败 / AbortSignal 超时）；
+ *  - HTTP 5xx；
+ *  - HTTP 403 且响应体无业务信封（CF 边缘拦截页形态）。
+ *
+ * 明确**不**重试：带业务信封的 4xx（code/msg 是真实业务回复，重发会重复副作用）、
+ * 404（`billingCall` 靠它做路径 fallback）、其余 4xx（确定性客户端错误，重试无意义）。
+ */
+async function fetchWithTransientRetry(
+  attempt: () => Promise<Response>,
+  opts?: { delay?: DelayFn; maxRetries?: number }
+): Promise<Response> {
+  const delay = opts?.delay || transientRetryDelay
+  const maxRetries = opts?.maxRetries ?? TRANSIENT_RETRY_MAX
+  for (let i = 0; i <= maxRetries; i++) {
+    if (i > 0) {
+      const backoff = TRANSIENT_RETRY_BASE_MS * Math.pow(2, i - 1) * (0.5 + Math.random())
+      await delay(backoff)
+    }
+    let res: Response
+    try {
+      res = await attempt()
+    } catch (e) {
+      // 网络层失败：还有重试额度就继续，否则抛出原错误（保持既有错误分类语义）。
+      if (i === maxRetries) throw e
+      continue
+    }
+    if (i === maxRetries) return res
+    // 读副本判形态：原响应体不被消费，调用方的 res.json()/res.text() 语义不变。
+    let bodyText = ''
+    try {
+      bodyText = await res.clone().text()
+    } catch {
+      return res // 副本读取失败（流已消费等）：不改变既有行为
+    }
+    if (!isTransientResponse(res, bodyText)) return res
+  }
+  // 循环必然 return 或 throw；此行为类型完整性兜底。
+  throw new Error('unreachable: transient retry loop')
+}
+
+/**
+ * 读取并解析 JSON 响应体；非 JSON 响应返回可读失败原因（**不抛错**）。
+ *
+ * 供 global web 域这些「以返回值报告失败」的函数复用：此前它们无条件 `res.json()`，
+ * 遇到 CF 边缘拦截页（纯文本 403）只会抛出 `Unexpected token 'e'` 这类 JSON 语法错，
+ * HTTP 状态与拦截页原文全被吞掉。
+ *
+ * 优先级：**能解析出 JSON 就用 JSON**（业务信封优先于 HTTP 状态）——上游常在 HTTP 500/403
+ * 的 body 里带 `code`（如 register 的 `code=500` 表示"需补地区"），按状态短路会丢掉这个语义。
+ * 只有在 body 根本不是 JSON 时才回落到 `describeHttpFailure`。
+ */
+async function readJsonOrFailure<T>(res: Response, path: string): Promise<{ ok: true; body: T } | { ok: false; msg: string }> {
+  const text = await res.text()
+  try {
+    return { ok: true, body: JSON.parse(text) as T }
+  } catch {
+    if (!res.ok) return { ok: false, msg: describeHttpFailure(res.status, text, path) }
+    return { ok: false, msg: `parse failed ${path}: ${text.substring(0, 200)}` }
+  }
+}
 
 // ===== 签到幂等判定（移植 workbuddy2api cmd/signin/main.go） =====
 
@@ -471,14 +611,17 @@ function globalWebHeaders(token?: string, extra?: Record<string, string>): Recor
  * intlOnly=true 时按国际版白名单过滤。
  */
 export async function fetchIntlCountries(intlOnly = true): Promise<{ ok: boolean; list: RegionCountry[]; msg: string }> {
+  const path = '/billing/area/get-country-code'
   try {
-    const res = await fetch(GLOBAL_BASE + '/billing/area/get-country-code', {
+    const res = await fetchWithTransientRetry(() => fetch(GLOBAL_BASE + path, {
       method: 'POST',
       headers: globalWebHeaders(),
       body: JSON.stringify({ filterForbidden: 1 }),
       signal: AbortSignal.timeout(20000),
-    })
-    const outer = await res.json() as { code?: number; msg?: string; data?: unknown }
+    }))
+    const parsed = await readJsonOrFailure<{ code?: number; msg?: string; data?: unknown }>(res, path)
+    if (!parsed.ok) return { ok: false, list: [], msg: parsed.msg }
+    const outer = parsed.body
     if (outer?.code !== 0) return { ok: false, list: [], msg: outer?.msg || `code=${outer?.code}` }
     const inner = typeof outer.data === 'string' ? JSON.parse(outer.data) : (outer.data as any) || {}
     const all: RegionCountry[] = inner?.data?.list || []
@@ -493,14 +636,17 @@ export async function fetchIntlCountries(intlOnly = true): Promise<{ ok: boolean
 
 /** 检测当前注册地区（POST /billing/area/get-user-area-info）。返回 ios2 码。 */
 export async function detectUserRegion(token: string): Promise<{ ok: boolean; ios2: string; enName: string; msg: string }> {
+  const path = '/billing/area/get-user-area-info'
   try {
-    const res = await fetch(GLOBAL_BASE + '/billing/area/get-user-area-info', {
+    const res = await fetchWithTransientRetry(() => fetch(GLOBAL_BASE + path, {
       method: 'POST',
       headers: globalWebHeaders(token),
       body: JSON.stringify({ action: 'getUserAreaInfo' }),
       signal: AbortSignal.timeout(20000),
-    })
-    const outer = await res.json() as { code?: number; msg?: string; data?: unknown }
+    }))
+    const parsed = await readJsonOrFailure<{ code?: number; msg?: string; data?: unknown }>(res, path)
+    if (!parsed.ok) return { ok: false, ios2: '', enName: '', msg: parsed.msg }
+    const outer = parsed.body
     if (outer?.code !== 0) return { ok: false, ios2: '', enName: '', msg: outer?.msg || `code=${outer?.code}` }
     const inner = typeof outer.data === 'string' ? JSON.parse(outer.data) : (outer.data as any) || {}
     const data = inner?.data || {}
@@ -512,19 +658,22 @@ export async function detectUserRegion(token: string): Promise<{ ok: boolean; io
 
 /** 提交注册地区（POST /console/login/account）。实测幂等。 */
 export async function submitUserRegion(token: string, country: RegionCountry): Promise<{ ok: boolean; msg: string }> {
+  const path = '/console/login/account'
   try {
     const attrs = {
       countryCode: [String(country.Code)],
       countryFullName: [String(country.EnName)],
       countryName: [String(country.IOS2)],
     }
-    const res = await fetch(GLOBAL_BASE + '/console/login/account', {
+    const res = await fetchWithTransientRetry(() => fetch(GLOBAL_BASE + path, {
       method: 'POST',
       headers: globalWebHeaders(token),
       body: JSON.stringify({ attributes: attrs }),
       signal: AbortSignal.timeout(20000),
-    })
-    const body = await res.json() as { code?: number; msg?: string }
+    }))
+    const parsed = await readJsonOrFailure<{ code?: number; msg?: string }>(res, path)
+    if (!parsed.ok) return { ok: false, msg: parsed.msg }
+    const body = parsed.body
     if (body?.code === 0) return { ok: true, msg: 'ok' }
     return { ok: false, msg: body?.msg || `code=${body?.code}` }
   } catch (e) {
@@ -545,14 +694,17 @@ export async function activateGlobalRegister(
   token: string,
   uid: string
 ): Promise<{ ok: boolean; needsRegion: boolean; msg: string }> {
+  const path = '/auth/realms/copilot/overseas/user/register'
   try {
-    const url = `${GLOBAL_BASE}/auth/realms/copilot/overseas/user/register?userId=${encodeURIComponent(uid)}`
-    const res = await fetch(url, {
+    const url = `${GLOBAL_BASE}${path}?userId=${encodeURIComponent(uid)}`
+    const res = await fetchWithTransientRetry(() => fetch(url, {
       method: 'GET',
       headers: globalWebHeaders(token, { 'X-User-Id': uid }),
       signal: AbortSignal.timeout(20000),
-    })
-    const body = await res.json() as { code?: number; msg?: string }
+    }))
+    const parsed = await readJsonOrFailure<{ code?: number; msg?: string }>(res, path)
+    if (!parsed.ok) return { ok: false, needsRegion: false, msg: parsed.msg }
+    const body = parsed.body
     const code = body?.code
     const msg = String(body?.msg || '')
     if (code === 200) return { ok: true, needsRegion: false, msg: 'register success' }
@@ -577,13 +729,14 @@ export async function activateGlobalRegister(
  * HTTP 200 + 业务 code 非 0 时是 `code=14051`；HTTP 4xx 时原始 body 里是 `"code":14051`。
  */
 export async function claimGlobalTrial(token: string): Promise<{ ok: boolean; already: boolean; msg: string }> {
+  const path = '/billing/ide/trial'
   try {
-    const res = await fetch(GLOBAL_BASE + '/billing/ide/trial', {
+    const res = await fetchWithTransientRetry(() => fetch(GLOBAL_BASE + path, {
       method: 'POST',
       headers: globalWebHeaders(token),
       body: '{}',
       signal: AbortSignal.timeout(20000),
-    })
+    }))
     const raw = await res.text()
     let body: { code?: number; msg?: string } | null = null
     try { body = JSON.parse(raw) } catch { body = null }
@@ -593,7 +746,7 @@ export async function claimGlobalTrial(token: string): Promise<{ ok: boolean; al
     if (raw.includes('14051')) return { ok: true, already: true, msg: '已领取' }
     if (!res.ok) {
       // 非 JSON 4xx（网关/WAF 纯文本页）：按文本判幂等，否则报 http 状态
-      return { ok: false, already: false, msg: `http ${res.status}: ${raw.slice(0, 120)}` }
+      return { ok: false, already: false, msg: describeHttpFailure(res.status, raw, path) }
     }
     return { ok: false, already: false, msg: body?.msg || raw.slice(0, 150) }
   } catch (e) {
@@ -654,15 +807,15 @@ export async function growthCall(
   if (opts?.extraHeaders) Object.assign(headers, opts.extraHeaders)
   const method = opts?.method || (opts?.body !== undefined ? 'POST' : 'GET')
   const body = method === 'GET' ? undefined : JSON.stringify(opts?.body ?? {})
-  const res = await fetch(base + path, {
+  const res = await fetchWithTransientRetry(() => fetch(base + path, {
     method,
     headers,
     body,
     signal: AbortSignal.timeout(30000),
-  })
+  }))
   const text = await res.text()
   if (!res.ok) {
-    throw new Error(`http ${res.status} ${path}: ${text.substring(0, 200)}`)
+    throw new Error(describeHttpFailure(res.status, text, path))
   }
   let env: BillingEnvelope
   try {
