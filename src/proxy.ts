@@ -1013,6 +1013,42 @@ function isTransientStatus(status: number): boolean {
 }
 
 /**
+ * OAuth 账号路径的瞬时重试上限（**刻意高于**通用路径的 `TRANSIENT_RETRY_MAX = 1`）。
+ *
+ * 为什么不复用同一个常量：两条路径重试失败的代价不对称。
+ *  - 通用（apiKey）路径：重试耗尽只是把错误透传给客户端，客户端自己会重试；
+ *  - OAuth 池路径：重试耗尽会**冷却一个健康账号**（下方 WAF 403 分支
+ *    `cooldownOauthAccount` + 粘性解绑），而国际版池常常只有 1–2 个号 ——
+ *    `MAX_OAUTH_ROTATE = 3` 但池里没号可换，两个号各中一次就是整池不可用
+ *    （`no healthy account (cooling/disabled)`）。
+ * 所以这里用更宽的预算换「不罚号」：多发一两个子请求，远便宜于冷掉一个号。
+ */
+const OAUTH_TRANSIENT_RETRY_MAX = 2
+
+/**
+ * 该响应是否值得对**同一账号**原地重发（瞬时失败）。
+ *
+ * 判据：
+ *  - 5xx（`isTransientStatus`）；
+ *  - **403 且响应体无业务信封**（`isWafBlocked`）—— APISIX / Cloudflare 边缘拦截页形态。
+ *    这类 403 在 OAuth 路径上会走 WAF 分支：软冷却账号 + 粘性解绑 + 换号。但拦截页
+ *    反映的是**边缘节点/出口 IP** 的瞬时风控，账号本身健康（见 WAF 分支注释），
+ *    原地重发有很大概率落到另一个边缘节点即成功。先重试、再罚号，恢复成本差一个数量级。
+ *
+ * 只在 403 时读 body 副本：5xx 直接返回 true，避免对正常（流式）响应做多余的 clone/tee。
+ * 副本读取失败（流不可克隆等）按「不重试」保守处理，保持既有行为不变。
+ */
+async function isRetryableUpstreamResponse(res: Response): Promise<boolean> {
+  if (isTransientStatus(res.status)) return true
+  if (res.status !== 403) return false
+  try {
+    return isWafBlocked(res.status, await res.clone().text())
+  } catch {
+    return false
+  }
+}
+
+/**
  * Anthropic 原生上游转发（provider.apiType === 'anthropic'，如 api.anthropic.com）。
  * 请求体 / 认证 / 路径都走 Anthropic 原生格式：
  * - URL：{base}/v1/messages（自动去掉 baseUrl 末尾的 /v1）
@@ -2319,9 +2355,14 @@ async function proxyOAuthRequestPooledCore(
   const doFetchWithRetry = async (token: string, cookies: string | undefined, realm?: 'cn' | 'global', account?: OAuthPoolAccount, systemOverride?: string) => {
     let result = await doFetch(token, cookies, realm, account, systemOverride)
     let transientRetries = 0
-    while (isTransientStatus(result.resp.status) && transientRetries < TRANSIENT_RETRY_MAX) {
+    // 用 isRetryableUpstreamResponse 而非 isTransientStatus：把「403 + 无业务信封」
+    // （WAF / CF 边缘拦截页）也纳入原地重试，避免一次边缘抖动就冷却一个健康账号。
+    while (transientRetries < OAUTH_TRANSIENT_RETRY_MAX && await isRetryableUpstreamResponse(result.resp)) {
       transientRetries++
+      try { c.executionCtx.waitUntil(writeLog(c.env, 'warn', `[${provider.name}] ${reqModel || ''} → 瞬时 ${result.resp.status}，同号重试 ${transientRetries}/${OAUTH_TRANSIENT_RETRY_MAX}`)) } catch {}
       await new Promise((r) => setTimeout(r, TRANSIENT_RETRY_DELAY_MS * transientRetries))
+      // 重试前必须放掉上一次的响应体：流式响应未消费的 body 会占住连接（Workers 有并发连接上限）。
+      try { await result.resp.body?.cancel() } catch { /* 已消费/已取消：忽略 */ }
       result = await doFetch(token, cookies, realm, account, systemOverride)
     }
     return result
@@ -2893,15 +2934,17 @@ async function proxyOAuthRequest(
     }, (body as Record<string, unknown>).stream === true || isWorkbuddyProvider(provider)).then(resp => ({ resp, originalStream }))
   }
 
-  // 瞬时错误自动重试：对同一 token 的瞬时 5xx / 网络抖动重试 1 次，
+  // 瞬时错误自动重试：对同一 token 的瞬时 5xx / 网络抖动 / WAF 403 原地重发，
   // 消除"偶发 500，客户端重试一次又正常"的体验问题（复用 doFetch 的流式/非流式语义）。
+  // 非池化路径没有账号可罚，故纯粹是省一次失败往返。
   const doFetchWithRetry = async (token: string, realm?: 'cn' | 'global', systemOverride?: string) => {
     let result = await doFetch(token, realm, systemOverride)
     let transientRetries = 0
-    while (isTransientStatus(result.resp.status) && transientRetries < TRANSIENT_RETRY_MAX) {
+    while (transientRetries < OAUTH_TRANSIENT_RETRY_MAX && await isRetryableUpstreamResponse(result.resp)) {
       transientRetries++
-      try { c.executionCtx.waitUntil(writeLog(c.env, 'warn', `[${provider.name}] ${model} → 瞬时 ${result.resp.status}，${transientRetries}/${TRANSIENT_RETRY_MAX} 次重试`)) } catch {}
+      try { c.executionCtx.waitUntil(writeLog(c.env, 'warn', `[${provider.name}] ${model} → 瞬时 ${result.resp.status}，${transientRetries}/${OAUTH_TRANSIENT_RETRY_MAX} 次重试`)) } catch {}
       await new Promise((r) => setTimeout(r, TRANSIENT_RETRY_DELAY_MS * transientRetries))
+      try { await result.resp.body?.cancel() } catch { /* 已消费/已取消：忽略 */ }
       result = await doFetch(token, realm, systemOverride)
     }
     return result

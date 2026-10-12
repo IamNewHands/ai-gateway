@@ -393,6 +393,157 @@ describe('WorkBuddy 池化代理端到端（粘性 + 会话头族 + 协议头）
     expect(inFlightOf(PID, 'u1')).toBe(0)
   })
 
+  // ===== WAF / CF 边缘 403 的原地重试（先重试、再罚号）=====
+
+  /** 读池内某账号的冷却状态。 */
+  function poolState(store: Map<string, string>, uid: string) {
+    const pool = JSON.parse(store.get(OAUTH_POOL_KV_PREFIX + PID)!) as Array<{
+      uid: string
+      state: { until?: number; reason?: string; disabled?: boolean; errCount?: number }
+    }>
+    return pool.find((a) => a.uid === uid)!.state
+  }
+
+  it('WAF 403（无信封拦截页）→ 同号原地重试成功，**不冷却、不轮转**', async () => {
+    const { env, store, app } = makeEnv([makeProvider()])
+    await seedPool(env, ['u1'])
+
+    let call = 0
+    vi.stubGlobal('fetch', vi.fn(async (url: string | URL | Request, init?: RequestInit) => {
+      call++
+      const raw = (init?.headers || {}) as Record<string, string>
+      const h: Record<string, string> = {}
+      for (const k of Object.keys(raw)) h[k.toLowerCase()] = String(raw[k])
+      calls.push({
+        url: typeof url === 'string' ? url : String(url),
+        headers: h,
+        body: typeof init?.body === 'string' ? init.body : '',
+      })
+      // 第 1 次撞 CF 边缘拦截页（纯文本、无业务信封），第 2 次即恢复
+      if (call === 1) return new Response('error code: 1002', { status: 403 })
+      return sseResponse()
+    }))
+
+    const res = await app.post({
+      model: `${PID}/deepseek-v4-flash`,
+      messages: [{ role: 'user', content: 'hi' }],
+      stream: false,
+    })
+
+    expect(res.status).toBe(200)
+    // 同号重试：两次都打同一个账号，没有换号
+    expect(calls.length).toBe(2)
+    expect(calls[0].headers['x-user-id']).toBe('u1')
+    expect(calls[1].headers['x-user-id']).toBe('u1')
+    // **核心价值**：账号没被冷却（这正是修复前会发生的：一次边缘抖动冷掉一个健康号）
+    const st = poolState(store, 'u1')
+    expect(st.until ?? 0).toBe(0)
+    expect(st.reason ?? '').not.toContain('waf')
+    expect(st.disabled).toBeFalsy()
+  })
+
+  it('WAF 403 持续 → 用满重试额度后才软冷却 + 轮转（不禁用）', async () => {
+    const { env, store, app } = makeEnv([makeProvider({ preferOauthUid: 'blocked' })])
+    await seedPool(env, ['blocked', 'good'])
+
+    vi.stubGlobal('fetch', vi.fn(async (url: string | URL | Request, init?: RequestInit) => {
+      const raw = (init?.headers || {}) as Record<string, string>
+      const h: Record<string, string> = {}
+      for (const k of Object.keys(raw)) h[k.toLowerCase()] = String(raw[k])
+      calls.push({
+        url: typeof url === 'string' ? url : String(url),
+        headers: h,
+        body: typeof init?.body === 'string' ? init.body : '',
+      })
+      if (h['x-user-id'] === 'blocked') return new Response('error code: 1002', { status: 403 })
+      return sseResponse()
+    }))
+
+    const res = await app.post({
+      model: `${PID}/deepseek-v4-flash`,
+      messages: [{ role: 'user', content: 'hi' }],
+      stream: false,
+    })
+
+    expect(res.status).toBe(200)
+    // blocked 号：1 次首发 + 2 次原地重试 = 3；随后冷却轮转到 good 号 1 次
+    expect(calls.length).toBe(4)
+    expect(calls.slice(0, 3).every((c) => c.headers['x-user-id'] === 'blocked')).toBe(true)
+    expect(calls[3].headers['x-user-id']).toBe('good')
+
+    const st = poolState(store, 'blocked')
+    expect(st.reason).toBe('waf 403 block')
+    expect(st.until!).toBeGreaterThan(Date.now())
+    // WAF 是 IP/指纹维频控，账号健康 → **绝不永久禁用**
+    expect(st.disabled).toBeFalsy()
+  })
+
+  it('403 带业务信封（非 WAF）→ **不**重试，一次定责（不浪费上游请求）', async () => {
+    const { env, app } = makeEnv([makeProvider()])
+    await seedPool(env, ['u1'])
+
+    vi.stubGlobal('fetch', vi.fn(async (url: string | URL | Request, init?: RequestInit) => {
+      const raw = (init?.headers || {}) as Record<string, string>
+      const h: Record<string, string> = {}
+      for (const k of Object.keys(raw)) h[k.toLowerCase()] = String(raw[k])
+      calls.push({
+        url: typeof url === 'string' ? url : String(url),
+        headers: h,
+        body: typeof init?.body === 'string' ? init.body : '',
+      })
+      // 带 code/msg 信封 → 真实业务回复，重发会重复副作用
+      return new Response('{"code":11140,"msg":"request illegal"}', {
+        status: 403,
+        headers: { 'Content-Type': 'application/json' },
+      })
+    }))
+
+    const res = await app.post({
+      model: `${PID}/deepseek-v4-flash`,
+      messages: [{ role: 'user', content: 'hi' }],
+      stream: false,
+    })
+
+    expect(res.status).not.toBe(200)
+    // 只统计**推理**出站（chat/completions）；403 后还有一次 token 刷新尝试，那不是重试。
+    const inferCalls = calls.filter((c) => c.url.includes('/chat/completions'))
+    expect(inferCalls.length).toBe(1)
+  })
+
+  it('连续 2 次 5xx → OAuth 路径重试额度为 2（第 3 次成功，不冷却账号）', async () => {
+    const { env, store, app } = makeEnv([makeProvider()])
+    await seedPool(env, ['u1'])
+
+    let call = 0
+    vi.stubGlobal('fetch', vi.fn(async (url: string | URL | Request, init?: RequestInit) => {
+      call++
+      const raw = (init?.headers || {}) as Record<string, string>
+      const h: Record<string, string> = {}
+      for (const k of Object.keys(raw)) h[k.toLowerCase()] = String(raw[k])
+      calls.push({
+        url: typeof url === 'string' ? url : String(url),
+        headers: h,
+        body: typeof init?.body === 'string' ? init.body : '',
+      })
+      if (call <= 2) return new Response('boom', { status: 500 })
+      return sseResponse()
+    }))
+
+    const res = await app.post({
+      model: `${PID}/deepseek-v4-flash`,
+      messages: [{ role: 'user', content: 'hi' }],
+      stream: false,
+    })
+
+    expect(res.status).toBe(200)
+    // 通用路径的 TRANSIENT_RETRY_MAX=1 只能扛 1 次 5xx；OAuth 路径放宽到 2，故 3 次请求
+    expect(calls.length).toBe(3)
+    expect(calls.every((c) => c.headers['x-user-id'] === 'u1')).toBe(true)
+    const st = poolState(store, 'u1')
+    expect(st.until ?? 0).toBe(0)
+    expect(st.errCount ?? 0).toBe(0)
+  })
+
   it('内容拦截：立即 400 返回防火墙文案，**不轮转换号**', async () => {
     const { env, app } = makeEnv([makeProvider()])
     // 3 个账号：若发生轮转，会打到多个账号
