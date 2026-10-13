@@ -1,9 +1,12 @@
 /**
- * auth-keys.test.ts — 凭据字段诊断（Remote 传输可行性探测）。
+ * auth-keys.test.ts — 凭据字段诊断（Remote 传输可观测性）。
  *
- * 背景：Remote 传输的 `common_params` 需要 `webId` / `bizUserId` / `userUniqueId`，而这三个
- * 键不在 `parseAuth` 的读取白名单里 ⇒ 凭据 JSON 里**即便有**也读不出来。本诊断直接读原始
- * JSON 的键名 + accessToken 的 JWT claims，为「要不要移植 Remote」提供事实依据。
+ * ⚠️ **这三个字段不是 Remote 的前置条件**（2026-10-09 实测：本机 storage.json 里
+ * `webId`/`bizUserId`/`userUniqueId` 全缺，纯 OAuth token 直打 `/api/remote/v1`
+ * 仍返 200，models 34775 字节、chat_sessions 200）。本诊断是**可观测性**用途。
+ *
+ * 它们不在 `parseAuth` 的读取白名单里 ⇒ 凭据 JSON 里**即便有**也读不出来，面板也看不到
+ * （`handleGetProviders` 只回掩码），只能直接读原始 JSON 键名 + accessToken 的 JWT claims。
  *
  * 两条硬约束（本文件重点验证）：
  *  1. **绝不回传凭据值**：报告里只能出现字段名与长度，任何值本身都不得出现。
@@ -20,8 +23,8 @@ function makeJwt(claims: Record<string, unknown>): string {
 
 const REQUIRED = ['webId', 'bizUserId', 'userUniqueId']
 
-describe('inspectTraeAuthKeys：Remote 必需字段探测', () => {
-  it('必需字段名清单与 Remote common_params 对齐（三个，不可少）', () => {
+describe('inspectTraeAuthKeys：Remote 读取字段探测（不阻塞移植）', () => {
+  it('字段名清单与 Remote common_params 对齐（三个）', () => {
     expect([...TRAE_REMOTE_REQUIRED_FIELD_NAMES]).toEqual(REQUIRED)
   })
 
@@ -62,12 +65,16 @@ describe('inspectTraeAuthKeys：Remote 必需字段探测', () => {
     }
   })
 
-  it('三层都没有、JWT 里也没有 → 全部未命中（这是「需要先解决 webId 来源」的信号）', () => {
+  it('三层都没有、JWT 里也没有 → 全部未命中（可观测性信号，**不是**立项门槛）', () => {
     const raw = JSON.stringify({ accessToken: makeJwt({ uid: 'u3' }), uid: 'u3' })
     const r = inspectTraeAuthKeys(raw)
     expect(r.requiredFields.every((f) => !f.found)).toBe(true)
     expect(r.jwtRequiredFields.every((f) => !f.found)).toBe(true)
     expect(r.jwtClaimKeys).toContain('uid')
+    // 关键：诊断仍然可用 —— 三缺时 parseAuth 照常成功，账号照常参与转发挑号。
+    // 2026-10-09 实测已证：三缺时 Remote 端点仍返 200 ⇒ 本结果不构成阻塞。
+    expect(r.parseOk).toBe(true)
+    expect(r.uid).toBe('u3')
   })
 
   it('JSON 里没有、但 JWT claims 里齐全 → jwt 位置命中（可从 token 补）', () => {
@@ -133,8 +140,7 @@ describe('inspectTraeAuthKeys：Remote 必需字段探测', () => {
     expect(r.requiredFields.every((f) => f.found)).toBe(true)
   })
 
-  it('可选字段（有默认值、不阻塞建会话）单独列出且不混入必需项', () => {
-    const raw = JSON.stringify({
+  it('可选字段（有默认值、不阻塞建会话）单独列出且不混入必需项', () => {    const raw = JSON.stringify({
       accessToken: 'tok',
       uid: 'u7',
       scope: 'marscode-cn',

@@ -298,14 +298,22 @@ export function parseAuth(jsonText: string): TraeAccount {
 // ===== 凭据字段诊断（Remote 传输可行性探测） =====
 
 /**
- * Remote 传输**必需但无默认值**的 provider_specific 字段（源侧 `common_params`）。
+ * Remote 传输会读取、但**已实测非阻塞**的 provider_specific 字段（源侧 `common_params`）。
  *
- * 源侧 `common_params` 其余字段都有默认值（scope/tenant/region/appLanguage/appVersion/
- * userRegion/userIdentity），缺了不阻塞建会话；只有这三个缺了上游无法绑定账号身份。
- * 它们不在 `parseAuth` 的读取白名单里，所以凭据 JSON 里**即便有也读不到** —— 本诊断
- * 直接看原始 JSON 的键名，绕过白名单。
+ * ⚠️ **重要更正（2026-10-09 实测，2026-10-13 复核）**：这三个字段**不是** Remote 的前置条件。
+ * 当时用本机 Trae SOLO CN 凭据直打 `trae-api-cn.mchost.guru` 的 `/api/remote/v1`：
+ *   - Host 通、端点存在（`GET /api/remote/v1/models` 返 401 而非 404，POST 才 404）；
+ *   - **纯 OAuth token 即返 200**（models 34775 字节、`chat_sessions` 200）；
+ *   - 本机 `storage.json` 里这三个字段**全部缺失**，照样通。
+ * ⇒ Remote 传输**不需要**先解决 webId 来源，可以直接移植。本诊断因此降级为
+ *   「可观测性」用途：知道这三个字段有没有值，便于日后排查上游行为差异，
+ *   **不再是立项前置门槛**。
+ *
+ * 保留本探测的理由：源侧 `common_params` 确实会读这三个值（`web_id`/`biz_user_id`/
+ * `user_unique_id`），为空时上游按空值处理。若日后出现「Remote 行为与 web 端不一致」，
+ * 第一个要看的变量就是它们。
  */
-const TRAE_REMOTE_REQUIRED_FIELDS: ReadonlyArray<{ field: string; aliases: string[] }> = [
+const TRAE_REMOTE_READ_FIELDS: ReadonlyArray<{ field: string; aliases: string[] }> = [
   { field: 'webId', aliases: ['webId', 'web_id', 'WebId'] },
   { field: 'bizUserId', aliases: ['bizUserId', 'biz_user_id', 'BizUserId'] },
   { field: 'userUniqueId', aliases: ['userUniqueId', 'user_unique_id', 'UserUniqueId'] },
@@ -323,8 +331,8 @@ const TRAE_REMOTE_OPTIONAL_FIELDS: ReadonlyArray<{ field: string; aliases: strin
   { field: 'userIdentity', aliases: ['userIdentity', 'user_identity'] },
 ]
 
-/** 供面板展示的必需字段名清单（与 TRAE_REMOTE_REQUIRED_FIELDS 同源，避免 UI 硬编码）。 */
-export const TRAE_REMOTE_REQUIRED_FIELD_NAMES: readonly string[] = TRAE_REMOTE_REQUIRED_FIELDS.map((s) => s.field)
+/** 供面板展示的字段名清单（与 TRAE_REMOTE_READ_FIELDS 同源，避免 UI 硬编码）。 */
+export const TRAE_REMOTE_REQUIRED_FIELD_NAMES: readonly string[] = TRAE_REMOTE_READ_FIELDS.map((s) => s.field)
 
 /** 单个目标字段的命中情况。**只带值长度，不带值本身。** */
 export interface TraeAuthFieldHit {
@@ -418,7 +426,7 @@ export function inspectTraeAuthKeys(rawKey: string): TraeAuthKeyReport {
     { name: 'account', obj: account },
     { name: 'root', obj },
   ]
-  report.requiredFields = TRAE_REMOTE_REQUIRED_FIELDS.map((s) => findAuthField(sources, s))
+  report.requiredFields = TRAE_REMOTE_READ_FIELDS.map((s) => findAuthField(sources, s))
   report.optionalFields = TRAE_REMOTE_OPTIONAL_FIELDS.map((s) => findAuthField(sources, s))
 
   // JWT claims：Remote 要的字段有时只在 token 里，不在 JSON 里。
@@ -426,7 +434,7 @@ export function inspectTraeAuthKeys(rawKey: string): TraeAuthKeyReport {
   const claims = token ? decodeJwtClaims(token) : null
   report.jwtClaimKeys = claims ? Object.keys(claims).sort() : []
   report.jwtRequiredFields = claims
-    ? TRAE_REMOTE_REQUIRED_FIELDS.map((s) => findAuthField([{ name: 'jwt', obj: claims }], s))
+    ? TRAE_REMOTE_READ_FIELDS.map((s) => findAuthField([{ name: 'jwt', obj: claims }], s))
     : []
 
   // 顺带确认这行能否被 parseAuth 正常解析（决定它是否参与转发挑号）

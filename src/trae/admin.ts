@@ -628,12 +628,16 @@ export async function handleTraeCreditsRefresh(c: Context<AppEnv>) {
 }
 
 /**
- * GET /admin/api/trae/:id/auth-keys：诊断每行凭据里有没有 Remote 传输所需字段。
+ * GET /admin/api/trae/:id/auth-keys：诊断每行凭据里有没有 Remote 传输会读取的字段。
  *
- * 背景：Remote 传输（`chat_sessions`）的 `common_params` 需要 `webId` / `bizUserId` /
- * `userUniqueId`，而这三个键不在 `parseAuth` 的读取白名单里 ⇒ 凭据 JSON 里**即便有**
- * 也读不出来，面板也看不到（`handleGetProviders` 只回掩码）。本端点为「要不要移植 Remote
- * 传输」提供事实依据：直接读原始 JSON 的键名，并顺带查 accessToken 的 JWT claims。
+ * ⚠️ **这三个字段不是 Remote 的前置条件**（2026-10-09 实测：本机 storage.json 里
+ * `webId`/`bizUserId`/`userUniqueId` 全缺，纯 OAuth token 直打 `/api/remote/v1`
+ * 仍返 200）。本端点是**可观测性**用途，不是立项门槛。
+ *
+ * 保留理由：源侧 `common_params` 确实会读这三个值（`web_id`/`biz_user_id`/`user_unique_id`），
+ * 为空时上游按空值处理。若日后出现「Remote 行为与 web 端不一致」，第一个要看的变量就是它们。
+ * 另外这三个键不在 `parseAuth` 的读取白名单里 ⇒ 凭据 JSON 里**即便有**也读不出来，
+ * 面板也看不到（`handleGetProviders` 只回掩码），只能靠本端点直接读原始 JSON 键名。
  *
  * 安全约束：只回**字段名与长度**，不回任何凭据值。`key` 一律以掩码形式出现在响应里。
  */

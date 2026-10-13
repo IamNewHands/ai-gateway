@@ -3425,13 +3425,15 @@ function traeAuthKeys(id) {
       box.innerHTML = '<p class="form-helper">暂无凭据行。</p>'
       return
     }
+    // ⚠️ 这三个字段**不是** Remote 的前置条件（2026-10-09 实测：本机 storage.json 里三个全缺，
+    // 纯 OAuth token 直打 /api/remote/v1 仍返 200）。三档结论都不拦移植，只区分信息量。
     const verdict = sum.withRequiredFields > 0
-      ? '<span style="color:var(--color-success,#16a34a)">凭据 JSON 里三个字段齐全（' + sum.withRequiredFields + '/' + sum.nonEmpty + ' 行）→ Remote 传输大概率可直接跑通</span>'
+      ? '<span style="color:var(--color-success,#16a34a)">三个字段齐全（' + sum.withRequiredFields + '/' + sum.nonEmpty + ' 行）→ Remote 移植可直接进行；日后排查上游行为差异时这三个值有参考</span>'
       : (sum.withRequiredInJwt > 0
-        ? '<span style="color:var(--color-warn,#d97706)">JSON 里没有，但 JWT claims 里齐全（' + sum.withRequiredInJwt + '/' + sum.nonEmpty + ' 行）→ 可从 token 补</span>'
-        : '<span style="color:var(--color-danger,#ef4444)">三个字段都没有（' + sum.nonEmpty + ' 行凭据）→ 需要先解决 webId 来源，才能移植 Remote</span>')
+        ? '<span style="color:var(--color-success,#16a34a)">JSON 里没有，但 JWT claims 里齐全（' + sum.withRequiredInJwt + '/' + sum.nonEmpty + ' 行）→ Remote 移植可直接进行</span>'
+        : '<span style="color:var(--color-success,#16a34a)">三个字段都没有（' + sum.nonEmpty + ' 行凭据）→ <b>这不阻塞 Remote 移植</b>。2026-10-09 实测：三个字段全缺时纯 OAuth token 直打 /api/remote/v1 仍返 200（models 34775 字节、chat_sessions 200），可直接开工。</span>')
     const cell = function (hit) {
-      if (!hit || !hit.found) return '<span class="bd bd-off" title="未找到">缺</span>'
+      if (!hit || !hit.found) return '<span class="bd bd-off" title="未找到（不阻塞 Remote）">缺</span>'
       return '<span class="bd bd-on" title="位置: ' + escapeHtml(hit.in) + '">' + escapeHtml(hit.in) + ' (' + hit.length + ')</span>'
     }
     const rowHtml = rows.map(function (r) {
