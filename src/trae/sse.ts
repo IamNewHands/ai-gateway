@@ -680,7 +680,7 @@ export class SoloToolCallMerger {
 // [DONE] 未发送，客户端报 "truncated: stream ended"（尤其工具调用场景）。
 // ReadableStream 的 start 回调在循环结束后总处理残留缓冲并主动 close，保证流正确结束。
 
-function encodeSse(data: string): Uint8Array {
+export function encodeSse(data: string): Uint8Array {
   return new TextEncoder().encode(`data: ${data}\n\n`)
 }
 

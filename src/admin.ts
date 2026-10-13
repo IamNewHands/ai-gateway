@@ -237,6 +237,33 @@ function normalizeReasoningEffortByModel(value: unknown): Record<string, string>
   return Object.keys(out).length > 0 ? out : undefined
 }
 
+/** TRAE 上游端点合法值。默认 `'solo'` —— 未显式选择 = 现有路径，行为零变化。 */
+const TRAE_UPSTREAM_ENDPOINTS = ['solo', 'remote']
+
+/** 归一 TRAE 上游端点：非法值 / 空值一律视为「未设置」（= 走默认 solo）。 */
+function normalizeTraeEndpoint(value: unknown): 'solo' | 'remote' | undefined {
+  return typeof value === 'string' && TRAE_UPSTREAM_ENDPOINTS.includes(value)
+    ? (value as 'solo' | 'remote')
+    : undefined
+}
+
+/** 归一 Remote executor 档位：非法值视为「未设置」（= 默认 agent）。 */
+function normalizeTraeRemoteAgentType(value: unknown): 'agent' | 'work' | undefined {
+  return value === 'agent' || value === 'work' ? value : undefined
+}
+
+/**
+ * 归一 Remote 思考强度默认档位。
+ *
+ * 只认上游真正存在的三档（`light`/`high`/`extra_high`），**不**接受 `low`/`max`
+ * 之类的客户端别名 —— 那些是请求侧别名，由 `reasoning-effort.ts` 在请求路径上归一。
+ * 配置面存上游口径，避免同一个值在不同层有不同含义。
+ */
+function normalizeTraeRemoteEffort(value: unknown): string | undefined {
+  const text = typeof value === 'string' ? value.trim().toLowerCase() : ''
+  return ['light', 'high', 'extra_high'].includes(text) ? text : undefined
+}
+
 /**
  * 归一 Cline 上游钉住表（移植 cline-pass-switcher）：丢弃非法 pinMode/sort 与空 key，
  * `upstreams` / `exclude` 只留非空字符串并去重；三项都空的配置不落库。
@@ -337,6 +364,10 @@ export async function handleCreateProvider(c: Context<AppEnv>) {
     traeMaxMessages: body.traeMaxMessages,
     traeMaxHistoryChars: body.traeMaxHistoryChars,
     traeMaxToolSchemaChars: body.traeMaxToolSchemaChars,
+    traeUpstreamEndpoint: normalizeTraeEndpoint(body.traeUpstreamEndpoint),
+    traeRemoteAgentType: normalizeTraeRemoteAgentType(body.traeRemoteAgentType),
+    traeRemoteReasoningEffort: normalizeTraeRemoteEffort(body.traeRemoteReasoningEffort),
+    traeRemoteMaxMode: body.traeRemoteMaxMode,
     accountSpread: body.accountSpread,
     apiKeys: normalizeArray(body.apiKeys, (k) => ({ key: k, enabled: true })),
     models: body.models
@@ -407,6 +438,10 @@ export async function handleUpdateProvider(c: Context<AppEnv>) {
   if (body.traeMaxMessages !== undefined) updates.traeMaxMessages = body.traeMaxMessages ?? undefined
   if (body.traeMaxHistoryChars !== undefined) updates.traeMaxHistoryChars = body.traeMaxHistoryChars ?? undefined
   if (body.traeMaxToolSchemaChars !== undefined) updates.traeMaxToolSchemaChars = body.traeMaxToolSchemaChars ?? undefined
+  if (body.traeUpstreamEndpoint !== undefined) updates.traeUpstreamEndpoint = normalizeTraeEndpoint(body.traeUpstreamEndpoint) ?? undefined
+  if (body.traeRemoteAgentType !== undefined) updates.traeRemoteAgentType = normalizeTraeRemoteAgentType(body.traeRemoteAgentType) ?? undefined
+  if (body.traeRemoteReasoningEffort !== undefined) updates.traeRemoteReasoningEffort = normalizeTraeRemoteEffort(body.traeRemoteReasoningEffort) ?? undefined
+  if (body.traeRemoteMaxMode !== undefined) updates.traeRemoteMaxMode = body.traeRemoteMaxMode ?? undefined
   if (body.accountSpread !== undefined) updates.accountSpread = body.accountSpread ?? undefined
   // 提示词模式三值（移植 ff64ecd 的 append）：非法值不落库，回落 undefined（=passthrough）
   if (body.promptMode !== undefined) {
@@ -506,6 +541,10 @@ export async function handleUpsertProvider(c: Context<AppEnv>) {
       traeMaxMessages: body.traeMaxMessages,
       traeMaxHistoryChars: body.traeMaxHistoryChars,
       traeMaxToolSchemaChars: body.traeMaxToolSchemaChars,
+      traeUpstreamEndpoint: normalizeTraeEndpoint(body.traeUpstreamEndpoint),
+      traeRemoteAgentType: normalizeTraeRemoteAgentType(body.traeRemoteAgentType),
+      traeRemoteReasoningEffort: normalizeTraeRemoteEffort(body.traeRemoteReasoningEffort),
+      traeRemoteMaxMode: body.traeRemoteMaxMode,
       accountSpread: body.accountSpread,
       createdAt: now,
       updatedAt: now,
@@ -552,6 +591,10 @@ export async function handleUpsertProvider(c: Context<AppEnv>) {
   if (body.traeMaxMessages !== undefined) updates.traeMaxMessages = body.traeMaxMessages ?? undefined
   if (body.traeMaxHistoryChars !== undefined) updates.traeMaxHistoryChars = body.traeMaxHistoryChars ?? undefined
   if (body.traeMaxToolSchemaChars !== undefined) updates.traeMaxToolSchemaChars = body.traeMaxToolSchemaChars ?? undefined
+  if (body.traeUpstreamEndpoint !== undefined) updates.traeUpstreamEndpoint = normalizeTraeEndpoint(body.traeUpstreamEndpoint) ?? undefined
+  if (body.traeRemoteAgentType !== undefined) updates.traeRemoteAgentType = normalizeTraeRemoteAgentType(body.traeRemoteAgentType) ?? undefined
+  if (body.traeRemoteReasoningEffort !== undefined) updates.traeRemoteReasoningEffort = normalizeTraeRemoteEffort(body.traeRemoteReasoningEffort) ?? undefined
+  if (body.traeRemoteMaxMode !== undefined) updates.traeRemoteMaxMode = body.traeRemoteMaxMode ?? undefined
   if (body.accountSpread !== undefined) updates.accountSpread = body.accountSpread ?? undefined
 
   // keys 合并：以现有为底，按 key 字符串去重追加，保留原 enabled

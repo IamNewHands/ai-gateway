@@ -960,6 +960,37 @@ if ($waitForHuman) {
                 <div id="trae-acc-${escapePageHtml(p.id)}" class="mt-1"></div>
                 <div class="fc mt-1 field-row" style="gap:8px"><input type="number" id="cd-plan-${escapePageHtml(p.id)}" value="${p.cooldown&&p.cooldown.planMs?Math.round(p.cooldown.planMs/60000):''}" style="width:88px" placeholder="plan冷却" title="余额/权益耗尽（402）的硬冷却时长（分钟）。到期到次日 04:00，签到恢复后自动解冻。"><input type="number" id="cd-soft-${escapePageHtml(p.id)}" value="${p.cooldown&&p.cooldown.softMs?Math.round(p.cooldown.softMs/1000):''}" style="width:88px" placeholder="429冷却" title="429 限流的默认软冷却时长（秒）。"><input type="number" id="cd-err-${escapePageHtml(p.id)}" value="${p.cooldown&&p.cooldown.errThreshold?p.cooldown.errThreshold:''}" style="width:76px" placeholder="错误阈值" title="连续错误次数阈值：达到后把该账号冷却「错误冷却」时长。"><input type="number" id="cd-errms-${escapePageHtml(p.id)}" value="${p.cooldown&&p.cooldown.errMs?Math.round(p.cooldown.errMs/60000):''}" style="width:88px" placeholder="错误冷却" title="达到错误阈值后的账号级冷却时长（分钟）。"><span class="mu" style="font-size:12px">冷却参数（留空 = 默认 plan 12h / 429 60s / 连续 3 次错误冷却 10m）</span></div>
                 <div class="collapse-section">
+                  <button class="collapse-btn" onclick="toggleVbCollapse('trae-endpoint-adv-${escapePageJsx(p.id)}', this)" type="button" aria-expanded="false">
+                    <i class="fas fa-chevron-right collapse-icon" aria-hidden="true"></i> 上游端点（Remote / SOLO，可选）
+                  </button>
+                  <div id="trae-endpoint-adv-${escapePageHtml(p.id)}" class="hd">
+                    <fieldset class="form-group"><legend>上游端点</legend>
+                      <span class="form-helper">默认 <b>SOLO</b>（现有路径，行为零变化）。切到 <b>Remote</b> 后走两步协议（建会话 → 读事件），<b>唯一实质收益是思考强度真正生效</b>：SOLO/IDE 端点不带承载档位的字段，客户端设的 <code>reasoning_effort</code> 必然被忽略。<br>注意 Remote <b>不是普遍更好</b>：上游记录过部分模型在 Remote/Work 上会撞 4028/502，遇到就切回 SOLO。带 tools 的请求按源侧口径路由到 Work 档位。</span>
+                      <div class="fg"><label>端点</label>
+                        <select id="trae-ep-${escapePageHtml(p.id)}">
+                          <option value="solo"${(p.traeUpstreamEndpoint||'solo')==='solo'?' selected':''}>SOLO（默认，llm_utils_chat）</option>
+                          <option value="remote"${p.traeUpstreamEndpoint==='remote'?' selected':''}>Remote（chat_sessions + events，支持思考强度）</option>
+                        </select>
+                      </div>
+                      <div class="fg"><label>Remote 档位</label>
+                        <select id="trae-ra-${escapePageHtml(p.id)}">
+                          <option value="agent"${(p.traeRemoteAgentType||'agent')==='agent'?' selected':''}>Agent（solo_agent_remote，1M 上下文）</option>
+                          <option value="work"${p.traeRemoteAgentType==='work'?' selected':''}>Work（solo_work_remote，200K 兜底）</option>
+                        </select>
+                      </div>
+                      <div class="fg"><label>思考强度默认档（客户端未指定时兜底）</label>
+                        <select id="trae-re-${escapePageHtml(p.id)}">
+                          <option value=""${!p.traeRemoteReasoningEffort?' selected':''}>不施加（完全听客户端）</option>
+                          <option value="light"${p.traeRemoteReasoningEffort==='light'?' selected':''}>light（最省）</option>
+                          <option value="high"${p.traeRemoteReasoningEffort==='high'?' selected':''}>high</option>
+                          <option value="extra_high"${p.traeRemoteReasoningEffort==='extra_high'?' selected':''}>extra_high（最强）</option>
+                        </select>
+                      </div>
+                      <label class="switch-label"><span>请求 max mode（1M 上下文档，需上游账号确实标记支持）</span><span class="tg"><input type="checkbox" id="trae-rmm-${escapePageHtml(p.id)}" ${p.traeRemoteMaxMode?'checked':''}><span class="sl"></span></span></label>
+                    </fieldset>
+                  </div>
+                </div>
+                <div class="collapse-section">
                   <button class="collapse-btn" onclick="toggleVbCollapse('trae-budget-adv-${escapePageJsx(p.id)}', this)" type="button" aria-expanded="false">
                     <i class="fas fa-chevron-right collapse-icon" aria-hidden="true"></i> 省钱预算（历史裁剪 / 工具压缩，可选）
                   </button>
@@ -4775,6 +4806,16 @@ async function save(id) {
   const traeMaxMessages = traeBudgetEl ? numOrUndef((document.getElementById('trae-mm-' + id)||{}).value) : undefined
   const traeMaxHistoryChars = traeBudgetEl ? numOrUndef((document.getElementById('trae-mhc-' + id)||{}).value) : undefined
   const traeMaxToolSchemaChars = traeBudgetEl ? numOrUndef((document.getElementById('trae-mtsc-' + id)||{}).value) : undefined
+  // TRAE 上游端点（Remote / SOLO）：区块未渲染（非 trae 提供商）时全部 undefined → 不改动既有配置。
+  // 档位用「或 null」（而非 undefined），以便「不施加」能真正清空此前存过的值。
+  const traeEpEl = document.getElementById('trae-ep-' + id)
+  const traeUpstreamEndpoint = traeEpEl ? (traeEpEl.value === 'remote' ? 'remote' : 'solo') : undefined
+  const traeRaEl = document.getElementById('trae-ra-' + id)
+  const traeRemoteAgentType = traeRaEl ? (traeRaEl.value === 'work' ? 'work' : 'agent') : undefined
+  const traeReEl = document.getElementById('trae-re-' + id)
+  const traeRemoteReasoningEffort = traeReEl ? (traeReEl.value || null) : undefined
+  const traeRmmEl = document.getElementById('trae-rmm-' + id)
+  const traeRemoteMaxMode = traeRmmEl ? traeRmmEl.checked === true : undefined
   // 系统提示词体系：模式 + 自有提示词（append 是合法取值，不能回落 passthrough）
   const pEl = document.getElementById('pmode-' + id)
   const promptMode = pEl ? (pEl.value === 'custom' ? 'custom' : pEl.value === 'append' ? 'append' : 'passthrough') : undefined
@@ -4811,7 +4852,7 @@ async function save(id) {
       return fetch('/admin/api/providers/' + encodeURIComponent(id), {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ name: nm, baseUrl: url, apiType, authType, oauth: authType === 'oauth-device' ? oauth : undefined, apiKeys: keys, models, enabled, toolBridge: (document.getElementById('atb-' + id)||{}).checked === true, allowUnlistedModels: (document.getElementById('aum-' + id)||{}).checked === true, reasoningEffort: ((document.getElementById('re-' + id)||{}).value || null), deepseekThinkingOff, thinkingInject, cachePrefixInject, cooldown: collectCooldown(id), type: providerType, kukuThinkMode, visionBridge: vb, geminiBaseUrl: ((document.getElementById('gbu-' + id)||{}).value || '').trim() || null, traeEnableRemoteBudget, traeRemoteOnlyModels, traeMaxMessages, traeMaxHistoryChars, traeMaxToolSchemaChars, accountSpread: (document.getElementById('m365-spread-' + id)||{}).checked === true, promptMode, promptText })
+        body: JSON.stringify({ name: nm, baseUrl: url, apiType, authType, oauth: authType === 'oauth-device' ? oauth : undefined, apiKeys: keys, models, enabled, toolBridge: (document.getElementById('atb-' + id)||{}).checked === true, allowUnlistedModels: (document.getElementById('aum-' + id)||{}).checked === true, reasoningEffort: ((document.getElementById('re-' + id)||{}).value || null), deepseekThinkingOff, thinkingInject, cachePrefixInject, cooldown: collectCooldown(id), type: providerType, kukuThinkMode, visionBridge: vb, geminiBaseUrl: ((document.getElementById('gbu-' + id)||{}).value || '').trim() || null, traeEnableRemoteBudget, traeRemoteOnlyModels, traeMaxMessages, traeMaxHistoryChars, traeMaxToolSchemaChars, traeUpstreamEndpoint, traeRemoteAgentType, traeRemoteReasoningEffort, traeRemoteMaxMode, accountSpread: (document.getElementById('m365-spread-' + id)||{}).checked === true, promptMode, promptText })
       })
     })
     const d = await r.json()

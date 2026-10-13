@@ -268,6 +268,28 @@ function sanitizeText(s: string): string {
 }
 
 /**
+ * TRAE Remote 思考强度**抢救**：在 `sanitizeUpstreamBody` 删除之前，把承载档位的字段
+ * 挪进私有字段 `__trae_effort`。
+ *
+ * 为什么必须抢：`sanitizeUpstreamBody` 删 `reasoning_effort` / `thinking` 对**通用**
+ * OpenAI 兼容上游是必要的（它们不认这两个字段会 400），但 **TRAE Remote 正是靠
+ * `reasoning_effort` 承载思考档位**——删了就等于「切到 Remote 也没法调强度」，
+ * 而那恰恰是切 Remote 的唯一实质理由。
+ *
+ * **只对 `traeUpstreamEndpoint === 'remote'` 生效**：非 Remote 提供商（含 TRAE 自己的
+ * SOLO/Work 路径）连载体都不会被创建，请求体与改动前逐字节一致——这是「保留原先的 SOLO、
+ * 不影响使用」的具体保证。
+ */
+function rescueTraeReasoningEffort(provider: Provider, body: Record<string, unknown>): void {
+  if (provider.traeUpstreamEndpoint !== 'remote') return
+  const carrier: Record<string, unknown> = {}
+  for (const key of ['reasoning_effort', 'reasoningEffort', 'thinking_effort', 'reasoning', 'thinking']) {
+    if (body[key] !== undefined) carrier[key] = body[key]
+  }
+  if (Object.keys(carrier).length > 0) body['__trae_effort'] = carrier
+}
+
+/**
  * 清理上游不支持的请求体字段：
  * - developer role → system（WorkBuddy 不支持 developer）
  * - 删除 reasoning_effort（上游 OpenAI 兼容 API 不支持）
@@ -1776,6 +1798,8 @@ export async function forwardProxy(
     // TRAE SOLO：免费模型多账号反代（移植自 traework2api）。账号池在 src/trae/ 内部管理
     // （积分最高者优先、1005/429/401 冷却或禁用、签到解冻），账号凭证存在 provider.apiKeys。
     if (isTraeProvider(provider)) {
+      // 抢救思考强度（Remote 传输靠它承载档位；sanitize 之前必须留一份）
+      rescueTraeReasoningEffort(provider, forwardBody as Record<string, unknown>)
       const response = await proxyTraeChatRequest(c.env, provider, forwardBody as Record<string, unknown>)
       const logLevel = response.ok ? 'request' : (response.status >= 500 ? 'error' : 'warn')
       try {
@@ -3690,6 +3714,9 @@ async function handleAnthropicMessagesInner(c: Context<AppEnv>) {
     if (isTraeProvider(provider)) {
       // 强制流式（TRAE 上游只支持流式 SSE），由本层决定是否转非流式 Anthropic
       const upstreamBody: Record<string, unknown> = { ...openaiBody, stream: true }
+      // 抢救思考强度：anthropicToOpenAI 已把 thinking.budget_tokens 折成 reasoning_effort，
+      // 而下面的 sanitize 会把它删掉——Remote 传输要靠它。
+      rescueTraeReasoningEffort(provider, upstreamBody)
       sanitizeUpstreamBody(upstreamBody)
       const response = await proxyTraeChatRequest(c.env, provider, upstreamBody)
       if (!response.ok) {
@@ -4822,7 +4849,11 @@ async function handleResponsesInner(c: Context<AppEnv>) {
 
     // TRAE SOLO：账号池 + SOLO 协议转发（proxyTraeChatRequest 返回 OpenAI SSE），再转回 Responses 格式。
     if (isTraeProvider(provider)) {
-      return handleResponsesSpecial(c, provider, model, openaiBody, originalStream, proxyTraeChatRequest, 'TRAE', g5Base, g5Save)
+      // 抢救思考强度：handleResponsesSpecial 内部会 sanitizeUpstreamBody 删掉
+      // reasoning_effort，而 Remote 传输要靠它承载档位。传副本，不动 openaiBody。
+      const traeBody = { ...openaiBody }
+      rescueTraeReasoningEffort(provider, traeBody)
+      return handleResponsesSpecial(c, provider, model, traeBody, originalStream, proxyTraeChatRequest, 'TRAE', g5Base, g5Save)
     }
 
     // DeepSeek App：注入 token 池 + 私有协议转发（proxyDeepseekChatRequest 返回 OpenAI SSE），

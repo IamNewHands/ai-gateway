@@ -17,6 +17,9 @@ import { TRAE_CONNECT_DEADLINES_MS, TRAE_DEFAULT_MODEL, TRAE_KEEPALIVE_MS, TRAE_
 import { chatStream, chatWorkStream, exchangeToken, extractLastUserPrompt, isTraeQuotaError, isTraeRequestSideError, needsTraeRefresh, parseAuth, probeTraeCredits, type TraeConnectTiming } from './upstream'
 import { isRemoteOnlyModel, type HistoryBudget } from './payload'
 import { aggregateSoloSse, aggregateWorkSse, soloStreamToOpenAIStream, workStreamToOpenAIStream } from './sse'
+import { aggregateWebSse, webStreamToOpenAIStream } from './web-sse'
+import { createRemoteSession, streamRemoteEvents, stopRemoteSession } from './remote'
+import { requestedEffortLevel, type TraeEffortLevel } from './reasoning-effort'
 import type { SOLOStreamError, TraeAccount } from './types'
 import { writeLog } from '../admin'
 import {
@@ -650,6 +653,235 @@ export async function executeWorkRequest(
 }
 
 /**
+ * TRAE **Remote** 端点转发（`provider.traeUpstreamEndpoint === 'remote'` 时启用）。
+ *
+ * 与 SOLO 路径的关系：**并行的第二条传输**，不是对 SOLO 的改写。账号池、冷却、
+ * 并发信号量、token 预刷新全部复用同一套（`pickTraeAccount` / `applyChatError` /
+ * `acquireTraeSession`），只有「怎么打上游、怎么翻译回来」不同：
+ *   SOLO：  1 次 POST → 响应体就是 SSE
+ *   Remote：POST 建会话 → GET 读事件 → `webStreamToOpenAIStream` 翻译
+ *
+ * 换 Remote 的**唯一实质收益**是思考强度：`reasoning_effort` 会被写进 `custom_model`
+ * 下发（SOLO/IDE 端点不带这个字段，客户端设的档位必然被忽略）。
+ *
+ * ## 与源侧的一处**有意偏离**
+ *
+ * 源侧 `TRAE_REMOTE_CALLER_TOOLS_USE_WORK=1`：带 tools 的 Remote 请求自动改走 Work 档位。
+ * 这里**不自动改**，只按面板 `traeRemoteAgentType` 的显式选择走。理由：
+ * 两个档位的模型目录**不通用**（Agent 带 1M 配置、Work 是 200K），自动切换会让
+ * 「模型在 Work 目录里不存在」变成一个**硬失败**——每个带 tools 的请求都报
+ * `model is not available`。默认走显式选择，失败模式温和得多（用户可在面板换档位）。
+ */
+async function proxyTraeRemoteRequest(
+  env: Env,
+  provider: Provider,
+  body: Record<string, unknown>,
+  configName: string,
+  stream: boolean
+): Promise<Response> {
+  const accounts = getTraeAccounts(provider)
+  const cd = resolveTraeCooldown(provider)
+  const tried = new Set<string>()
+  let lastErr: Error | null = null
+  const baseUrl = provider.baseUrl || null
+  const agentType = provider.traeRemoteAgentType === 'work' ? 'solo_work_remote' : 'solo_agent_remote'
+  const concurrency = typeof provider.traeConcurrency === 'number' ? provider.traeConcurrency : 0
+  const idleMs = typeof provider.traeSessionIdleMs === 'number' ? provider.traeSessionIdleMs : 0
+
+  // 思考强度：请求侧优先，面板默认档兜底（仅当客户端没带、或带了不可识别的值时）。
+  // `__trae_effort` 由 src/proxy.ts 在 sanitizeUpstreamBody 删除前抢救而来。
+  const rescued = (body['__trae_effort'] && typeof body['__trae_effort'] === 'object' && !Array.isArray(body['__trae_effort']))
+    ? body['__trae_effort'] as Record<string, unknown>
+    : {}
+  let requestBody: Record<string, unknown> = rescued
+  const configuredEffort = typeof provider.traeRemoteReasoningEffort === 'string' ? provider.traeRemoteReasoningEffort.trim() : ''
+  if (configuredEffort && !requestedEffortLevel(rescued)) {
+    requestBody = { ...rescued, reasoning_effort: configuredEffort }
+  }
+  const includeReasoning = requestedEffortLevel(requestBody) !== ''
+
+  for (let i = 0; i < MAX_ROTATE; i++) {
+    const account = await pickTraeAccount(env, provider.id, accounts, tried, provider.preferTraeUid, concurrency, idleMs)
+    if (!account) break
+    tried.add(account.uid)
+    await acquireTraeSession(env, provider.id, account.uid, concurrency > 0).catch(() => {})
+
+    // token 预刷新：与 SOLO 路径同一套判据与定责（transport 不罚号）。
+    try {
+      if (needsTraeRefresh(account)) {
+        const res = await exchangeToken(account)
+        account.accessToken = res.accessToken
+        account.refreshToken = res.refreshToken
+        account.expiresAt = res.expiresAt
+        await saveTraeAccount(env, provider.id, account).catch(() => {})
+      }
+    } catch (e) {
+      lastErr = e as Error
+      const kind = (e as any).kind
+      if (kind === 'transport') {
+        await releaseTraeSession(env, provider.id, account.uid).catch(() => {})
+        break
+      }
+      if (kind === 'session_dead') {
+        await disableTraeAccount(env, provider.id, account.uid, 'refresh session dead')
+      } else {
+        await cooldownTraeAccount(env, provider.id, account.uid, cd.errMs, 'refresh: ' + ((e as Error).message || '').substring(0, 120))
+      }
+      await releaseTraeSession(env, provider.id, account.uid).catch(() => {})
+      continue
+    }
+
+    // 第一步：建会话。失败按错误类别定责——401 是账号级，429 软冷却，其余累计。
+    const trace: { maxModeApplied?: boolean; reasoningEffortApplied?: TraeEffortLevel | '' } = {}
+    let session: Awaited<ReturnType<typeof createRemoteSession>>
+    try {
+      session = await createRemoteSession(account, configName, body['messages'], {
+        baseUrl,
+        agentType,
+        maxMode: provider.traeRemoteMaxMode === true,
+        requestBody,
+        trace,
+      })
+    } catch (e) {
+      lastErr = e as Error
+      const kind = (e as any).kind || 'client'
+      await applyChatError(env, provider.id, account.uid, kind, cd)
+      await releaseTraeSession(env, provider.id, account.uid).catch(() => {})
+      // 请求侧参数错是本请求的终态：换号也会撞同一校验，继续轮转只会白扔健康号。
+      if (kind === 'client_params') {
+        return traeClientParamsError((e as any).msg || (e as Error).message || '', (e as any).status || 400)
+      }
+      continue
+    }
+
+    const effortNote = trace.reasoningEffortApplied ? ` effort=${trace.reasoningEffortApplied}` : ''
+    const maxNote = trace.maxModeApplied ? ' max_mode=on' : ''
+
+    // 第二步：读事件流（流式直接翻译，非流式聚合）。
+    try {
+      const events = streamRemoteEvents(account, session.sessionId, session.messageId, { baseUrl, agentType })
+
+      if (stream) {
+        await noteTraeSuccess(env, provider.id, account.uid)
+        const perf = await getPerfSettings(env)
+        const keepAliveMs = perf.keepAliveMs > 0 ? perf.keepAliveMs : TRAE_KEEPALIVE_MS
+        const idleTimeoutMs = perf.idleTimeoutMs || TRAE_STREAM_IDLE_TIMEOUT_MS
+        const startedAt = Date.now()
+        const sseBody = withSSEKeepAlive(
+          webStreamToOpenAIStream(events, configName, {
+            includeReasoning,
+            allowedTools: body['tools'],
+            toolChoice: body['tool_choice'],
+            onErr: (se) => { void applyStreamError(env, provider.id, account.uid, se, cd) },
+            onTruncated: (info) => {
+              // 静默截断定责：Remote 在扁平 query 超限时会**不发 done 直接关连接**，
+              // 这条日志把「上游自然收尾」与「被截断」分开（同 SOLO 侧口径）。
+              const msg = `[trae-remote] provider=${provider.id} uid=${account.uid} model=${configName}`
+                + ` end=truncated kind=${info.kind} content=${info.contentChars} reasoning=${info.reasoningChars}`
+                + ` toolCalls=${info.sawToolCalls} usage=${info.sawUsage}${effortNote}${maxNote}`
+              console.log(msg) // codeql-disable: 纯诊断日志，不含密钥/敏感 token
+              writeLog(env, 'warn', msg).catch(() => { /* 日志失败不影响流 */ })
+            },
+            onRunaway: (info) => {
+              // 退化是模型采样行为，不是账号故障 —— 与 SOLO 侧同纪律，**不罚号**。
+              const msg = `[trae-remote] provider=${provider.id} uid=${account.uid} model=${configName}`
+                + ` end=runaway kind=${info.kind} reasoning=${info.reasoningChars} content=${info.contentChars}`
+              console.log(msg) // codeql-disable: 纯诊断日志，不含密钥/敏感 token
+              writeLog(env, 'warn', msg).catch(() => { /* 日志失败不影响流 */ })
+            },
+          }),
+          keepAliveMs,
+          idleTimeoutMs,
+          (reason) => {
+            const secs = Math.round((Date.now() - startedAt) / 1000)
+            const msg = `[trae-remote] provider=${provider.id} uid=${account.uid} model=${configName}`
+              + ` end=${reason} duration=${secs}s agent=${agentType}${effortNote}${maxNote}`
+            console.log(msg) // codeql-disable: 纯诊断日志，不含密钥/敏感 token
+            writeLog(env, 'info', msg).catch(() => { /* 日志失败不影响流 */ })
+            void releaseTraeSession(env, provider.id, account.uid).catch(() => {})
+            // 非正常收尾才主动停远端会话：正常结束时上游自己已收尾，再停一次没有必要。
+            if (reason === 'idle' || reason === 'cancel') {
+              void stopRemoteSession(account, session.sessionId, session.messageId, { baseUrl, agentType }).catch(() => {})
+            }
+          }
+        )
+        return new Response(sseBody, {
+          status: 200,
+          headers: {
+            'Content-Type': 'text/event-stream; charset=utf-8',
+            'Cache-Control': 'no-store',
+            'X-Accel-Buffering': 'no',
+            Connection: 'keep-alive',
+          },
+        })
+      }
+
+      // 非流式：聚合为单条 chat.completion。
+      const agg = await aggregateWebSse(events, configName, {
+        includeReasoning,
+        allowedTools: body['tools'],
+        toolChoice: body['tool_choice'],
+      })
+      if (agg.err) {
+        lastErr = new Error(`remote stream error code=${agg.err.code} msg=${agg.err.msg}`)
+        const requestSide = await applyStreamError(env, provider.id, account.uid, agg.err, cd)
+        await releaseTraeSession(env, provider.id, account.uid).catch(() => {})
+        if (requestSide) return traeClientParamsError(`remote error code=${agg.err.code} msg=${agg.err.msg}`)
+        continue
+      }
+      if (agg.truncated) {
+        const info = agg.truncated
+        const msg = `[trae-remote] provider=${provider.id} uid=${account.uid} model=${configName}`
+          + ` end=truncated kind=${info.kind} content=${info.contentChars} reasoning=${info.reasoningChars}`
+          + ` toolCalls=${info.sawToolCalls} usage=${info.sawUsage}${effortNote}${maxNote}`
+        console.log(msg) // codeql-disable: 纯诊断日志，不含密钥/敏感 token
+        writeLog(env, 'warn', msg).catch(() => { /* 日志失败不影响响应 */ })
+        // 与 SOLO 侧同构：不返回半句话、不罚号，交给循环/末尾按 transport 定责。
+        const e = new Error(`TRAE Remote 非流式聚合未收到 done（kind=${info.kind} content=${info.contentChars}）`) as Error & { kind?: string }
+        e.kind = 'transport'
+        lastErr = e
+        await releaseTraeSession(env, provider.id, account.uid).catch(() => {})
+        continue
+      }
+      await noteTraeSuccess(env, provider.id, account.uid)
+      await releaseTraeSession(env, provider.id, account.uid).catch(() => {})
+      const out = agg.resp!
+      out['model'] = configName
+      return new Response(JSON.stringify(out), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json; charset=utf-8' },
+      })
+    } catch (e) {
+      // 事件流阶段失败（首事件超时 / 首事件前报错 / 读流中断）：按 transport 定责不罚号，
+      // 由 applyChatError 的 transport 分支保证（见该函数注释）。
+      lastErr = e as Error
+      const kind = (e as any).kind || 'transport'
+      await applyChatError(env, provider.id, account.uid, kind, cd)
+      await releaseTraeSession(env, provider.id, account.uid).catch(() => {})
+      continue
+    }
+  }
+
+  // 定责出口与 SOLO 侧同构：连接层失败报 upstream_unreachable（可重试、不冤枉账号），
+  // 其余才是「账号池无可用账号」。
+  if ((lastErr as any)?.kind === 'transport') {
+    await logTraeTransport(env, `[trae-transport] provider=${provider.id} model=${configName}`
+      + ` end=503 upstream_unreachable transport=remote attempts=${tried.size}`
+      + ` err=${(lastErr?.message || '').slice(0, 160)}`)
+    return openaiError(
+      503,
+      'upstream_unreachable',
+      'TRAE Remote 上游连接超时/中断（账号未被惩罚，非账号池问题）：' + (lastErr?.message || '')
+    )
+  }
+  return openaiError(
+    503,
+    'no_healthy_account',
+    'all accounts unavailable (cooling/disabled)' + (lastErr ? ': ' + lastErr.message : '')
+  )
+}
+
+/**
  * TRAE 对话转发入口（在 src/proxy.ts 分发中调用）。
  * 返回 OpenAI 兼容 Response（流式 SSE / 非流式 JSON / 错误 JSON）。
  */
@@ -676,6 +908,13 @@ export async function proxyTraeChatRequest(
 
   const prompt = extractLastUserPrompt(body['messages'] as any[])
   const hasTools = Array.isArray(body['tools']) && (body['tools'] as unknown[]).length > 0
+
+  // 0. 上游端点选择：**默认 SOLO**（下方全部现有逻辑，行为零变化）。
+  //    只有面板显式把「上游端点」选成 Remote 才走新传输 —— 这就是「保留原先的 SOLO、
+  //    不影响使用」的落点：未配置该字段的提供商一个分支都不会进。
+  if (provider.traeUpstreamEndpoint === 'remote') {
+    return proxyTraeRemoteRequest(env, provider, body, configName, stream)
+  }
 
   // 1. 若显式请求 Work 专属通道模型（且未携带外部自定义 tools），直接走 Work 通道
   if (isWorkModel(model) && !hasTools) {

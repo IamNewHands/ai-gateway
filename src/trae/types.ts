@@ -147,6 +147,54 @@ export interface TraeModelInfo {
   maxTokens: number
 }
 
+/**
+ * Remote 模型的思考强度配置（源侧 `reasoning_effort_config`）。
+ *
+ * 只有 Remote 传输会下发这个字段：`support_thinking` 为真时 `options` 列出该模型支持的
+ * 档位（`light` / `high` / `extra_high`），请求侧据此把客户端的
+ * `reasoning_effort` 钳到合法值。SOLO/IDE 端点不带这个字段，故那边 effort 恒为「不生效」。
+ */
+export interface TraeReasoningEffortConfig {
+  support_thinking?: boolean
+  /** 上游声明的可选档位原文（如 ["light","high","extra_high"]，可能含未识别值） */
+  options?: unknown[]
+  [key: string]: unknown
+}
+
+/**
+ * Remote 模型目录条目（`GET {RemoteHost}/models?functions=…`）。
+ *
+ * 与 SOLO 的 `TraeModelInfo` 不同：Remote 目录返回的是**完整 custom_model 对象**，
+ * 建会话时必须原样回传，否则上游静默选用默认模型（源侧 `_bound_model_name` 专门防这个）。
+ * 因此这里保留 `raw` 以便逐字回传，不试图把它规约成几个字段。
+ */
+export interface TraeRemoteModelConfig {
+  /** config_name（建会话 `model_name` 用它） */
+  name: string
+  displayName?: string
+  configSource?: number
+  provider?: string
+  multimodal?: boolean
+  maxMode?: boolean
+  reasoningEffortConfig?: TraeReasoningEffortConfig
+  /** 上游下发的完整对象，建会话时作为 custom_model 原样回传 */
+  raw: Record<string, any>
+}
+
+/**
+ * 归一化后的 Remote 事件（`GET /chat_sessions/{id}/events`）。
+ *
+ * Remote 的事件名与 SOLO 不同：核心是 `plan_item`（累积快照，`thought` 是思考、
+ * `content` 是正文）与 `message`；另有 `heartbeat` 心跳帧——**必须保留**，
+ * 客户端靠它重置 idle 计时器，静默丢弃会被当成流结束。
+ */
+export interface TraeRemoteEvent {
+  /** 归一化事件名：heartbeat | plan_item | message | token_usage | done | error | … */
+  event: string
+  /** 原始 payload */
+  data: Record<string, any>
+}
+
 /** 登录流程中间状态（存在 KV trae:login:<providerId>） */
 export interface TraeLoginState {
   machineId: string

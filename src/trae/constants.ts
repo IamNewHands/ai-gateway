@@ -50,6 +50,76 @@ export const TRAE_WORK_CONSTANTS = {
 
 export const TRAE_WORK_UA = `Trae/${TRAE_WORK_CONSTANTS.WorkIdeVersion}`
 
+/**
+ * TRAE **Remote** 传输常量（移植自 Trae2api-cn `src/trae_remote_client.py`）。
+ *
+ * 与 SOLO/Work 的关系：Remote 是**第三条上游传输**，不是开关。协议是两步：
+ *   ① `POST {RemoteHost}/chat_sessions` → 拿 `chat_session_id` + `message_id`
+ *   ② `GET  {RemoteHost}/chat_sessions/{id}/events?reply_to_message_id={msgId}` → 读事件流
+ * 相比 SOLO（`llm_utils_chat` 单次 POST 直出 SSE），Remote 多一次建会话往返，换来的是
+ * **`reasoning_effort` 真正生效**（SOLO/IDE 端点忽略该字段，见 `reasoning_effort.py` 的
+ * 调用点只有 remote client）。
+ *
+ * 认证与 SOLO 完全兼容：两边都是 `Authorization: Cloud-IDE-JWT {accessToken}`
+ *（`upstream.ts` 的 `soloHeaders` 已是同款），故账号池与登录流程零改动。
+ */
+export const TRAE_REMOTE_CONSTANTS = {
+  /** Remote 基址。注意路径必须含 `/api/remote/v1`，缺了会 404（见 normalizeTraeRemoteBase） */
+  RemoteHost: 'https://trae-api-cn.mchost.guru/api/remote/v1',
+  /** 裸 host（`normalizeTraeRemoteBase` 据此判断要不要补路径） */
+  RemoteHostRoot: 'https://trae-api-cn.mchost.guru',
+  RemoteOrigin: 'https://solo.trae.cn',
+
+  /** 端点 */
+  EpRemoteSessions: '/chat_sessions',
+  EpRemoteModels: '/models',
+
+  /**
+   * Remote 模型目录的 functions 过滤器。
+   * `show_custom_model=true` 必须带上：账号自建的 custom 模型只在这个口径下返回，
+   * 漏了它会让「手工选模型」拿不到 custom_model，上游随即静默回退到默认模型。
+   */
+  RemoteModelFunctions: 'solo_agent_remote,solo_work_remote,solo_design_remote',
+
+  /**
+   * Remote 的浏览器 UA。源侧照抄 Chrome 149（web 前端就是浏览器发的），
+   * 与 SOLO 的 `Trae/0.1.52` 客户端 UA **不是同一个**——两边头不能混用。
+   */
+  RemoteUA:
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
+    + '(KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36',
+
+  /** max mode（1M 上下文档）默认值，源侧 `_max_mode_*` 用 */
+  MaxContextTokens: 1_000_000,
+  MaxPromptTokens: 936_000,
+  MaxOutputTokens: 64_000,
+  MaxModeType: 1,
+} as const
+
+/**
+ * Remote 建会话（`POST /chat_sessions`）的非流式建连上限。
+ *
+ * 比 SOLO 的 10s 阶梯宽松：这一步是普通 JSON 往返（不是 SSE 长流），源侧给 60s。
+ * 不给阶梯——建会话失败要换的是**账号/模式**，不是「同一条连接再撞一次」，
+ * 而 `TRAE_CONNECT_DEADLINES_MS` 的阶梯语义只对 SOLO/Work 的长流建连成立。
+ */
+export const TRAE_REMOTE_CONNECT_TIMEOUT_MS = 60_000
+
+/** Remote 事件流：首事件死线（源侧 `TRAE_REMOTE_FIRST_EVENT_TIMEOUT_SECONDS`，默认 120s）。 */
+export const TRAE_REMOTE_FIRST_EVENT_TIMEOUT_MS = 120_000
+
+/** Remote 事件流：读完整个流的总上限（源侧 `TRAE_WEB_STREAM_TIMEOUT`，默认 300s）。 */
+export const TRAE_REMOTE_STREAM_TIMEOUT_MS = 300_000
+
+/**
+ * Remote 模式下需要把请求改路由到 Work 层的模型判据。
+ *
+ * 源侧 `TRAE_REMOTE_CALLER_TOOLS_USE_WORK=1`：**带 tools 的 Remote 请求路由到 Work**
+ * ——Agent 会话自带远端 workspace，可能消耗内部工具（如 browser_use_subagent），
+ * 而调用方的 tools 语义属于 API 侧，两边混用会让上游把内部工具调用当成调用方的。
+ */
+export const TRAE_REMOTE_CALLER_TOOLS_USE_WORK = true
+
 /** 判断是否属于 Work 专属通道模型（包含 work 或以 -Official 结尾） */
 export function isWorkModel(model: string): boolean {
   const m = (model || '').trim().toLowerCase()

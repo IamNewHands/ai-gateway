@@ -206,6 +206,40 @@ export interface Provider {
    */
   traeMaxToolSchemaChars?: number
   /**
+   * TRAE **上游端点**（传输选择）。默认 `'solo'` = 现有 `llm_utils_chat` 路径，行为零变化。
+   *
+   * `'remote'` = 走 `POST /api/remote/v1/chat_sessions` → `GET …/events` 两步协议。
+   * 换它的**唯一实质理由**是思考强度：`reasoning_effort` 只在 Remote 上生效
+   *（SOLO/IDE 端点不带 `custom_model`，客户端设的档位必然被忽略）。
+   *
+   * 非破坏性：默认值不改，未显式选择的提供商走的仍是原路径。
+   * 注意 Remote 不是普遍更好——源侧记录过部分模型在 Remote/Work 上会撞上游 4028/502。
+   */
+  traeUpstreamEndpoint?: 'solo' | 'remote'
+  /**
+   * Remote 的 executor 档位：`'agent'`（`solo_agent_remote`，1M 上下文，默认）
+   * 或 `'work'`（`solo_work_remote`，200K 兜底）。
+   *
+   * 仅 `traeUpstreamEndpoint === 'remote'` 时生效。两个档位的模型目录**不通用**
+   *（Agent 带 1M 配置、Work 是 200K），所以选错档位会出现「模型列表里没有这个模型」。
+   */
+  traeRemoteAgentType?: 'agent' | 'work'
+  /**
+   * Remote 思考强度**默认档位**：`light` / `high` / `extra_high`。
+   *
+   * 仅当客户端请求里没带 `reasoning_effort`（或带了无法识别的值）时兜底；
+   * 客户端显式指定的档位优先。留空 = 不施加，完全听客户端的。
+   * 实际下发前会按模型声明的 `reasoning_effort_config` **向下钳制**。
+   */
+  traeRemoteReasoningEffort?: string
+  /**
+   * Remote 是否请求 max mode（1M 上下文档）。
+   *
+   * 三重前提：Agent 档位 + 此处开启 + **上游账号确实标记该模型支持 max**。
+   * 第三条是硬门槛——凭空造 1M 上限会让上游在会话中途拒绝。
+   */
+  traeRemoteMaxMode?: boolean
+  /**
    * WorkBuddy / Qoder 多账号池首选账号 UID（面板下拉框手工指定，两个池共用同一字段）。
    * 填写后转发时优先使用该账号（按 uid 精确匹配），
    * 被冷却/禁用/失败时才回退到池内其他账号。留空 = 自动挑选。
@@ -527,6 +561,11 @@ export interface CreateProviderRequest {
   traeMaxMessages?: number
   traeMaxHistoryChars?: number
   traeMaxToolSchemaChars?: number
+  /** TRAE 上游端点：'solo'（默认）| 'remote'（见 Provider.traeUpstreamEndpoint） */
+  traeUpstreamEndpoint?: 'solo' | 'remote'
+  traeRemoteAgentType?: 'agent' | 'work'
+  traeRemoteReasoningEffort?: string
+  traeRemoteMaxMode?: boolean
   /** M365 会话级多账号分摊（Account Spread）：开启后跨请求轮询不同健康账号分摊负载 */
   accountSpread?: boolean
 }
@@ -568,6 +607,11 @@ export interface UpdateProviderRequest {
   traeMaxMessages?: number | null
   traeMaxHistoryChars?: number | null
   traeMaxToolSchemaChars?: number | null
+  /** TRAE 上游端点（传 'solo'/null 恢复默认 SOLO 路径） */
+  traeUpstreamEndpoint?: 'solo' | 'remote' | null
+  traeRemoteAgentType?: 'agent' | 'work' | null
+  traeRemoteReasoningEffort?: string | null
+  traeRemoteMaxMode?: boolean | null
   /** M365 会话级多账号分摊（Account Spread，传 false/null 关闭） */
   accountSpread?: boolean | null
   /** 系统提示词体系：'passthrough'（传 null 恢复默认）| 'custom' | 'append' */
@@ -613,6 +657,11 @@ export interface UpsertProviderRequest {
   traeMaxMessages?: number
   traeMaxHistoryChars?: number
   traeMaxToolSchemaChars?: number
+  /** TRAE 上游端点：'solo'（默认）| 'remote' */
+  traeUpstreamEndpoint?: 'solo' | 'remote'
+  traeRemoteAgentType?: 'agent' | 'work'
+  traeRemoteReasoningEffort?: string
+  traeRemoteMaxMode?: boolean
   /** M365 会话级多账号分摊（Account Spread） */
   accountSpread?: boolean
   /** 系统提示词体系：'passthrough'（缺省）| 'custom'（替换）| 'append'（追加并用） */

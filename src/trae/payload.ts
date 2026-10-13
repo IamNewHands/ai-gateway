@@ -171,6 +171,137 @@ export function isRemoteOnlyModel(model: string, cfg: string): boolean {
   return list.includes(m)
 }
 
+// ===== Remote 传输的 query 扁平化（移植自 Trae2api-cn `flatten_query`） =====
+
+/**
+ * 把 content 归一化成纯文本（源侧 `_content_to_text`）。
+ *
+ * Remote 端点的 `query` 是**一个扁平字符串**（不是结构化消息数组），所以多模态 / 内容块
+ * 必须先降级成文本。推理类块（`reasoning`/`thinking`）刻意丢弃——那是上一轮模型的思考链，
+ * 回灌给上游既费 token 又会诱导它复述。
+ */
+function contentToText(content: unknown): string {
+  if (content === null || content === undefined) return ''
+  if (typeof content === 'string') return content
+  if (Array.isArray(content)) {
+    const parts: string[] = []
+    for (const c of content) {
+      if (typeof c === 'string') {
+        parts.push(c)
+        continue
+      }
+      if (c && typeof c === 'object' && !Array.isArray(c)) {
+        const block = c as Record<string, any>
+        const type = String(block['type'] || '').toLowerCase()
+        if (type === 'reasoning' || type === 'thinking' || type === 'reasoning_text') continue
+        const text = block['text'] ?? block['content'] ?? block['value']
+        if (typeof text === 'string') parts.push(text)
+        else if (text !== undefined && text !== null) parts.push(String(text))
+        continue
+      }
+      if (c !== null && c !== undefined) parts.push(String(c))
+    }
+    return parts.join('\n')
+  }
+  if (typeof content === 'object') {
+    const obj = content as Record<string, any>
+    for (const key of ['text', 'content', 'value', 'data']) {
+      const candidate = obj[key]
+      if (typeof candidate === 'string' && candidate !== '') return candidate
+    }
+  }
+  return String(content)
+}
+
+/**
+ * 序列化 assistant 的历史 tool_calls 为一段可读文本（源侧 `_serialize_tool_calls`）。
+ *
+ * Remote 的 `query` 没有结构化的 tool 历史位；工具调用只能作为文本回灌，
+ * 并显式标注「已经处理过，不要重复调用」——否则上游会看到自己（或调用方）上一轮
+ * 的调用记录，再执行一遍。
+ */
+function serializeToolCalls(toolCalls: unknown): string {
+  if (!Array.isArray(toolCalls) || toolCalls.length === 0) return ''
+  const calls: Array<Record<string, any>> = []
+  for (const call of toolCalls) {
+    if (!call || typeof call !== 'object' || Array.isArray(call)) continue
+    const c = call as Record<string, any>
+    const fn = c['function'] && typeof c['function'] === 'object' && !Array.isArray(c['function'])
+      ? (c['function'] as Record<string, any>)
+      : c
+    calls.push({
+      id: c['id'] ?? c['tool_call_id'] ?? null,
+      name: fn['name'] ?? null,
+      input: fn['arguments'] ?? fn['input'] ?? {},
+    })
+  }
+  if (calls.length === 0) return ''
+  return 'Client tool history (already handled; do not repeat):\n' + JSON.stringify(calls)
+}
+
+/**
+ * 把 OpenAI messages 扁平化为 Remote 端点的 `query` 字段。
+ *
+ * 形态：`JSON.stringify([{ type: 'text', data: { content: <整段文本> } }])`
+ * ——注意**整个对话压成一条 text block**，角色靠 `[System]` / `[Assistant]` /
+ * `[Client Tool Result: …]` 前缀在纯文本里表达。这是上游 web 端的原生格式，
+ * 改成结构化数组上游不认。
+ *
+ * 与 SOLO 的 `prepareBody` 是两套格式：SOLO 走结构化 `messages`（content 转
+ * `[{type:"text",text}]`），Remote 走这一条扁平 query。两者不可互换。
+ */
+export function flattenTraeQuery(messages: unknown): string {
+  const list = Array.isArray(messages) ? messages : []
+  const parts: string[] = []
+  for (const mi of list) {
+    if (!mi || typeof mi !== 'object' || Array.isArray(mi)) continue
+    const m = mi as Record<string, any>
+    const role = typeof m['role'] === 'string' ? m['role'] : 'user'
+
+    let contentValue = m['content']
+    const hasToolCalls = Array.isArray(m['tool_calls']) && (m['tool_calls'] as unknown[]).length > 0
+    if ((contentValue === null || contentValue === undefined || contentValue === '' || (Array.isArray(contentValue) && contentValue.length === 0)) && !hasToolCalls) {
+      // 部分客户端把文本放在 parts/text/prompt 等别名里（Anthropic 风格输入）。
+      for (const key of ['parts', 'text', 'prompt', 'message', 'input']) {
+        const candidate = m[key]
+        if (candidate === null || candidate === undefined || candidate === '' || candidate === '{}') continue
+        if (Array.isArray(candidate) && candidate.length === 0) continue
+        contentValue = candidate
+        break
+      }
+    }
+    const content = contentToText(contentValue)
+
+    if (role === 'system' || role === 'developer') {
+      // developer 归一化为 system：上游 Remote 的角色词表同样只认 system
+      //（与 payload.prepareBody 的 developer→system 保持同一口径）。
+      parts.push(`[System]\n${content}`)
+    } else if (role === 'assistant') {
+      const assistantParts: string[] = content ? [content] : []
+      const toolHistory = serializeToolCalls(m['tool_calls'])
+      if (toolHistory) assistantParts.push(toolHistory)
+      if (assistantParts.length > 0) parts.push('[Assistant]\n' + assistantParts.join('\n\n'))
+    } else if (role === 'tool' || role === 'function') {
+      const toolId = m['tool_call_id'] ?? m['toolCallId'] ?? 'unknown'
+      const toolName = m['name'] ?? 'tool'
+      // 失败态由内容里的错误标记推断（上游不单独下发 status 字段）。
+      const text = content.toLowerCase()
+      const status = text.includes('"error"') || text.includes('failed') || text.includes('exception')
+        ? 'failed'
+        : 'succeeded'
+      parts.push(`[Client Tool Result: ${toolId} ${toolName} status=${status}]\n${content}`)
+    } else {
+      parts.push(content)
+    }
+  }
+  const text = parts.join('\n\n')
+  try {
+    return JSON.stringify([{ type: 'text', data: { content: text } }])
+  } catch {
+    return JSON.stringify([{ type: 'text', data: { content: '' } }])
+  }
+}
+
 /** 单 pass 改写；无法解析时原样返回。 */
 export function prepareBody(src: string): string {
   if (!src) return src
@@ -235,6 +366,11 @@ export function prepareBody(src: string): string {
 
   normalizeToolChoice(obj)
   normalizeTools(obj)
+
+  // 兜底：`__trae_effort` 是网关内部载体（src/proxy.ts 为 Remote 端点抢救的思考档位），
+  // **绝不能**出现在 SOLO 上游的请求体里。正常路径上它只在 Remote 提供商被创建，
+  // 但这里再删一次，保证任何调用方都漏不出去（同 `__budget` 的处理方式）。
+  delete obj['__trae_effort']
 
   // 可选的历史/工具 schema 裁剪预算（raw/remote 模式省输入积分；默认关闭）。
   // 调用方通过 body.__budget 注入，避免改变现有 SOLO 热路径行为。
