@@ -295,6 +295,150 @@ export function parseAuth(jsonText: string): TraeAccount {
   return account
 }
 
+// ===== 凭据字段诊断（Remote 传输可行性探测） =====
+
+/**
+ * Remote 传输**必需但无默认值**的 provider_specific 字段（源侧 `common_params`）。
+ *
+ * 源侧 `common_params` 其余字段都有默认值（scope/tenant/region/appLanguage/appVersion/
+ * userRegion/userIdentity），缺了不阻塞建会话；只有这三个缺了上游无法绑定账号身份。
+ * 它们不在 `parseAuth` 的读取白名单里，所以凭据 JSON 里**即便有也读不到** —— 本诊断
+ * 直接看原始 JSON 的键名，绕过白名单。
+ */
+const TRAE_REMOTE_REQUIRED_FIELDS: ReadonlyArray<{ field: string; aliases: string[] }> = [
+  { field: 'webId', aliases: ['webId', 'web_id', 'WebId'] },
+  { field: 'bizUserId', aliases: ['bizUserId', 'biz_user_id', 'BizUserId'] },
+  { field: 'userUniqueId', aliases: ['userUniqueId', 'user_unique_id', 'UserUniqueId'] },
+]
+
+/** 有默认值、缺失不阻塞建会话的可选字段（仅供完整度参考）。 */
+const TRAE_REMOTE_OPTIONAL_FIELDS: ReadonlyArray<{ field: string; aliases: string[] }> = [
+  { field: 'scope', aliases: ['scope', 'Scope'] },
+  { field: 'tenant', aliases: ['tenant', 'Tenant'] },
+  { field: 'region', aliases: ['region', 'Region'] },
+  { field: 'aiRegion', aliases: ['aiRegion', 'ai_region', 'aiRegion'] },
+  { field: 'appLanguage', aliases: ['appLanguage', 'app_language'] },
+  { field: 'appVersion', aliases: ['appVersion', 'app_version'] },
+  { field: 'userRegion', aliases: ['userRegion', 'user_region'] },
+  { field: 'userIdentity', aliases: ['userIdentity', 'user_identity'] },
+]
+
+/** 供面板展示的必需字段名清单（与 TRAE_REMOTE_REQUIRED_FIELDS 同源，避免 UI 硬编码）。 */
+export const TRAE_REMOTE_REQUIRED_FIELD_NAMES: readonly string[] = TRAE_REMOTE_REQUIRED_FIELDS.map((s) => s.field)
+
+/** 单个目标字段的命中情况。**只带值长度，不带值本身。** */
+export interface TraeAuthFieldHit {
+  field: string
+  found: boolean
+  /** 命中位置：root / auth / account / jwt */
+  in: string
+  /** 值的字符长度（0 = 未命中）；不含任何内容 */
+  length: number
+}
+
+/** 一行凭据的诊断报告。**全程只回字段名与长度，绝不回传任何凭据值。** */
+export interface TraeAuthKeyReport {
+  topLevelKeys: string[]
+  authKeys: string[]
+  accountKeys: string[]
+  requiredFields: TraeAuthFieldHit[]
+  optionalFields: TraeAuthFieldHit[]
+  /** accessToken JWT claims 的键名（Remote 要的字段有时只在 claims 里） */
+  jwtClaimKeys: string[]
+  jwtRequiredFields: TraeAuthFieldHit[]
+  parseOk: boolean
+  parseError?: string
+  /** parseAuth 解析出的 uid（面板本就在显示，非敏感） */
+  uid?: string
+}
+
+/** 在若干来源对象里按别名查一个字段；命中即返回，只看长度不取值。 */
+function findAuthField(
+  sources: Array<{ name: string; obj: Record<string, any> | null }>,
+  spec: { field: string; aliases: string[] }
+): TraeAuthFieldHit {
+  for (const src of sources) {
+    if (!src.obj) continue
+    for (const alias of spec.aliases) {
+      const v = src.obj[alias]
+      if (v === undefined || v === null) continue
+      const text = typeof v === 'string' ? v : JSON.stringify(v)
+      if (text === '' || text === '""' || text === '{}') continue
+      return { field: spec.field, found: true, in: src.name, length: text.length }
+    }
+  }
+  return { field: spec.field, found: false, in: '', length: 0 }
+}
+
+/**
+ * 诊断一行凭据里有没有 Remote 传输所需的字段。
+ *
+ * 存在的意义：`parseAuth` 只读白名单里的键，`webId`/`bizUserId`/`userUniqueId` 不在其中
+ * ⇒ 凭据 JSON 里有没有这三个键，从面板和解析结果上都看不出来。本函数直接读原始 JSON 的
+ * 键名，并顺带查 accessToken 的 JWT claims（这三个值有时只存在于 token 里）。
+ *
+ * 安全约束：返回值只含**字段名与长度**，任何凭据值都不回传。
+ */
+export function inspectTraeAuthKeys(rawKey: string): TraeAuthKeyReport {
+  const report: TraeAuthKeyReport = {
+    topLevelKeys: [],
+    authKeys: [],
+    accountKeys: [],
+    requiredFields: [],
+    optionalFields: [],
+    jwtClaimKeys: [],
+    jwtRequiredFields: [],
+    parseOk: false,
+  }
+
+  let obj: Record<string, any> | null = null
+  try {
+    const parsed = JSON.parse(String(rawKey || '').trim())
+    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) obj = parsed as Record<string, any>
+  } catch (e) {
+    report.parseError = (e as Error).message
+  }
+  if (!obj) {
+    if (!report.parseError) report.parseError = 'JSON 结构不正确'
+    return report
+  }
+
+  report.topLevelKeys = Object.keys(obj).sort()
+  const auth = obj['auth'] && typeof obj['auth'] === 'object' && !Array.isArray(obj['auth'])
+    ? (obj['auth'] as Record<string, any>)
+    : null
+  const account = obj['account'] && typeof obj['account'] === 'object' && !Array.isArray(obj['account'])
+    ? (obj['account'] as Record<string, any>)
+    : null
+  report.authKeys = auth ? Object.keys(auth).sort() : []
+  report.accountKeys = account ? Object.keys(account).sort() : []
+
+  const sources = [
+    { name: 'auth', obj: auth },
+    { name: 'account', obj: account },
+    { name: 'root', obj },
+  ]
+  report.requiredFields = TRAE_REMOTE_REQUIRED_FIELDS.map((s) => findAuthField(sources, s))
+  report.optionalFields = TRAE_REMOTE_OPTIONAL_FIELDS.map((s) => findAuthField(sources, s))
+
+  // JWT claims：Remote 要的字段有时只在 token 里，不在 JSON 里。
+  const token = pickStr(auth, ['accessToken', 'access_token']) || pickStr(obj, ['accessToken', 'access_token', 'token'])
+  const claims = token ? decodeJwtClaims(token) : null
+  report.jwtClaimKeys = claims ? Object.keys(claims).sort() : []
+  report.jwtRequiredFields = claims
+    ? TRAE_REMOTE_REQUIRED_FIELDS.map((s) => findAuthField([{ name: 'jwt', obj: claims }], s))
+    : []
+
+  // 顺带确认这行能否被 parseAuth 正常解析（决定它是否参与转发挑号）
+  try {
+    report.uid = parseAuth(rawKey).uid
+    report.parseOk = true
+  } catch (e) {
+    report.parseError = (e as Error).message
+  }
+  return report
+}
+
 /** 序列化为存储用的规范化 JSON（扁平形，camelCase）。 */
 export function serializeAccount(a: TraeAccount): string {
   const obj: Record<string, any> = {

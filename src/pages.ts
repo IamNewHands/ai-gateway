@@ -952,9 +952,11 @@ if ($waitForHuman) {
                   <button class="btn btn-s" onclick="traeCheckin('${escapePageJsx(p.id)}')"><i class="fas fa-calendar-check" aria-hidden="true"></i>全部签到</button>
                   <button class="btn btn-s" onclick="traeRefreshCredits('${escapePageJsx(p.id)}')"><i class="fas fa-coins" aria-hidden="true"></i>刷新积分</button>
                   <button class="btn btn-s" onclick="traeModels('${escapePageJsx(p.id)}')"><i class="fas fa-cloud-download-alt" aria-hidden="true"></i>拉取模型</button>
+                  <button class="btn btn-gh" onclick="traeAuthKeys('${escapePageJsx(p.id)}')" title="诊断凭据 JSON 里有没有 Remote 传输所需的 webId / bizUserId / userUniqueId（只显示字段名与长度，不显示值）"><i class="fas fa-key" aria-hidden="true"></i>凭据字段</button>
                   <button class="btn btn-gh" onclick="traeStatus('${escapePageJsx(p.id)}')"><i class="fas fa-sync" aria-hidden="true"></i>刷新状态</button>
                 </div>
                 <div id="trae-st-${escapePageHtml(p.id)}" class="oauth-status" aria-live="polite"></div>
+                <div id="trae-ak-${escapePageHtml(p.id)}" class="mt-1"></div>
                 <div id="trae-acc-${escapePageHtml(p.id)}" class="mt-1"></div>
                 <div class="fc mt-1 field-row" style="gap:8px"><input type="number" id="cd-plan-${escapePageHtml(p.id)}" value="${p.cooldown&&p.cooldown.planMs?Math.round(p.cooldown.planMs/60000):''}" style="width:88px" placeholder="plan冷却" title="余额/权益耗尽（402）的硬冷却时长（分钟）。到期到次日 04:00，签到恢复后自动解冻。"><input type="number" id="cd-soft-${escapePageHtml(p.id)}" value="${p.cooldown&&p.cooldown.softMs?Math.round(p.cooldown.softMs/1000):''}" style="width:88px" placeholder="429冷却" title="429 限流的默认软冷却时长（秒）。"><input type="number" id="cd-err-${escapePageHtml(p.id)}" value="${p.cooldown&&p.cooldown.errThreshold?p.cooldown.errThreshold:''}" style="width:76px" placeholder="错误阈值" title="连续错误次数阈值：达到后把该账号冷却「错误冷却」时长。"><input type="number" id="cd-errms-${escapePageHtml(p.id)}" value="${p.cooldown&&p.cooldown.errMs?Math.round(p.cooldown.errMs/60000):''}" style="width:88px" placeholder="错误冷却" title="达到错误阈值后的账号级冷却时长（分钟）。"><span class="mu" style="font-size:12px">冷却参数（留空 = 默认 plan 12h / 429 60s / 连续 3 次错误冷却 10m）</span></div>
                 <div class="collapse-section">
@@ -3400,6 +3402,73 @@ function deepseekTokenUnpark(id, tokenId) {
     deepseekTokenList(id)
   }).catch(function () { if (st) showResult(st, false, '请求失败') })
 }
+/**
+ * 凭据字段诊断：检查每行 TRAE 凭据 JSON 里有没有 Remote 传输所需的
+ * webId / bizUserId / userUniqueId。只显示字段名与长度，绝不显示值。
+ */
+function traeAuthKeys(id) {
+  const box = document.getElementById('trae-ak-' + id)
+  const st = document.getElementById('trae-st-' + id)
+  if (!box) return
+  box.innerHTML = '<p class="form-helper">诊断中…</p>'
+  fetch('/admin/api/trae/' + encodeURIComponent(id) + '/auth-keys', { method: 'GET' }).then(r => r.json()).then(d => {
+    if (!d.success || !d.data) {
+      box.innerHTML = ''
+      if (st) showResult(st, false, d.message || '诊断失败')
+      return
+    }
+    if (st) st.textContent = ''
+    const rows = d.data.rows || []
+    const sum = d.data.summary || {}
+    const reqNames = d.data.requiredFields || []
+    if (rows.length === 0) {
+      box.innerHTML = '<p class="form-helper">暂无凭据行。</p>'
+      return
+    }
+    const verdict = sum.withRequiredFields > 0
+      ? '<span style="color:var(--color-success,#16a34a)">凭据 JSON 里三个字段齐全（' + sum.withRequiredFields + '/' + sum.nonEmpty + ' 行）→ Remote 传输大概率可直接跑通</span>'
+      : (sum.withRequiredInJwt > 0
+        ? '<span style="color:var(--color-warn,#d97706)">JSON 里没有，但 JWT claims 里齐全（' + sum.withRequiredInJwt + '/' + sum.nonEmpty + ' 行）→ 可从 token 补</span>'
+        : '<span style="color:var(--color-danger,#ef4444)">三个字段都没有（' + sum.nonEmpty + ' 行凭据）→ 需要先解决 webId 来源，才能移植 Remote</span>')
+    const cell = function (hit) {
+      if (!hit || !hit.found) return '<span class="bd bd-off" title="未找到">缺</span>'
+      return '<span class="bd bd-on" title="位置: ' + escapeHtml(hit.in) + '">' + escapeHtml(hit.in) + ' (' + hit.length + ')</span>'
+    }
+    const rowHtml = rows.map(function (r) {
+      const rep = r.report
+      const uidTxt = rep && rep.uid ? escapeHtml(rep.uid) : '<span class="bd bd-off">解析失败</span>'
+      const reqCells = rep ? reqNames.map(function (n) {
+        const hit = (rep.requiredFields || []).filter(function (f) { return f.field === n })[0]
+        return '<td>' + cell(hit) + '</td>'
+      }).join('') : reqNames.map(function () { return '<td>-</td>' }).join('')
+      const jwtCells = rep ? reqNames.map(function (n) {
+        const hit = (rep.jwtRequiredFields || []).filter(function (f) { return f.field === n })[0]
+        return '<td>' + cell(hit) + '</td>'
+      }).join('') : reqNames.map(function () { return '<td>-</td>' }).join('')
+      const optTxt = rep ? (rep.optionalFields || []).filter(function (f) { return f.found }).map(function (f) {
+        return escapeHtml(f.field)
+      }).join(', ') || '<span style="color:var(--color-muted,#6b7280)">无</span>' : '-'
+      return '<tr><td>' + r.index + '</td><td>' + escapeHtml(r.mask) + '</td><td>' + (r.enabled ? '启用' : '禁用') + '</td><td>' + uidTxt + '</td>' +
+        reqCells + jwtCells + '<td style="font-size:12px">' + optTxt + '</td></tr>'
+    }).join('')
+    const th = reqNames.map(function (n) { return '<th>' + escapeHtml(n) + '</th>' }).join('')
+    const thJwt = reqNames.map(function (n) { return '<th>JWT: ' + escapeHtml(n) + '</th>' }).join('')
+    box.innerHTML =
+      '<p class="form-helper">' + verdict + '</p>' +
+      '<p class="form-helper" style="font-size:12px">「位置」= 该字段在凭据 JSON 的哪一层（auth / account / root）；括号内是值的字符长度。' +
+      '<b>只显示字段名与长度，不显示任何凭据值。</b></p>' +
+      '<div style="max-height:220px;overflow:auto"><table class="usage-log-table" style="margin:0">' +
+      '<thead><tr><th>#</th><th>凭据</th><th>状态</th><th>UID</th>' + th + thJwt + '<th>可选字段命中</th></tr></thead>' +
+      '<tbody>' + rowHtml + '</tbody></table></div>' +
+      '<div class="fc mt-1 field-row"><button class="btn btn-gh btn-xs" onclick="document.getElementById(\\'trae-ak-' + escapeJsAttr(id) + '\\').innerHTML=\\'\\'"><i class="fas fa-times" aria-hidden="true"></i>关闭</button></div>' +
+      (rows[0] && rows[0].report && rows[0].report.topLevelKeys && rows[0].report.topLevelKeys.length
+        ? '<details class="mt-1"><summary class="form-helper" style="cursor:pointer">第 1 行凭据的完整键名（仅键名）</summary><p class="form-helper" style="font-size:12px;word-break:break-all">顶层: ' + escapeHtml(rows[0].report.topLevelKeys.join(', ')) + '<br>auth: ' + escapeHtml((rows[0].report.authKeys || []).join(', ') || '(无)') + '<br>account: ' + escapeHtml((rows[0].report.accountKeys || []).join(', ') || '(无)') + '<br>jwt claims: ' + escapeHtml((rows[0].report.jwtClaimKeys || []).join(', ') || '(无)') + '</p></details>'
+        : '')
+  }).catch(function () {
+    box.innerHTML = '<p class="form-helper">诊断请求失败。</p>'
+  })
+}
+
 function traeStatus(id) {
   const st = document.getElementById('trae-st-' + id)
   const box = document.getElementById('trae-acc-' + id)

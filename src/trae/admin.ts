@@ -22,10 +22,12 @@ import {
   fetchUserEntUsage,
   fetchUserEntUsageDetails,
   getUserInfo,
+  inspectTraeAuthKeys,
   isAlreadyTraeCheckin,
   needsTraeRefresh,
   performCheckinClaim,
   probeTraeCredits,
+  TRAE_REMOTE_REQUIRED_FIELD_NAMES,
 } from './upstream'
 import {
   disableTraeAccount,
@@ -625,6 +627,62 @@ export async function handleTraeCreditsRefresh(c: Context<AppEnv>) {
   })
 }
 
+/**
+ * GET /admin/api/trae/:id/auth-keys：诊断每行凭据里有没有 Remote 传输所需字段。
+ *
+ * 背景：Remote 传输（`chat_sessions`）的 `common_params` 需要 `webId` / `bizUserId` /
+ * `userUniqueId`，而这三个键不在 `parseAuth` 的读取白名单里 ⇒ 凭据 JSON 里**即便有**
+ * 也读不出来，面板也看不到（`handleGetProviders` 只回掩码）。本端点为「要不要移植 Remote
+ * 传输」提供事实依据：直接读原始 JSON 的键名，并顺带查 accessToken 的 JWT claims。
+ *
+ * 安全约束：只回**字段名与长度**，不回任何凭据值。`key` 一律以掩码形式出现在响应里。
+ */
+export async function handleTraeAuthKeys(c: Context<AppEnv>) {
+  const id = c.req.param('id') || ''
+  if (!id) return c.json<ApiResponse>({ success: false, message: '缺少 id 参数' }, 400)
+  const provider = await getProvider(c.env, id)
+  if (!provider) return c.json<ApiResponse>({ success: false, message: '提供商不存在' }, 404)
+  if (!isTraeProvider(provider)) return c.json<ApiResponse>({ success: false, message: '不是 TRAE 提供商' }, 400)
+
+  const rows = (provider.apiKeys || []).map((k, index) => {
+    const raw = (k.key || '').trim()
+    const mask = raw.length > 4 ? `****${raw.slice(-4)}` : '****'
+    if (!raw) {
+      return { index, enabled: k.enabled, label: k.label || '', mask, empty: true, report: null }
+    }
+    let report: ReturnType<typeof inspectTraeAuthKeys> | null = null
+    let error: string | undefined
+    try {
+      report = inspectTraeAuthKeys(raw)
+    } catch (e) {
+      error = (e as Error).message
+    }
+    return { index, enabled: k.enabled, label: k.label || '', mask, empty: false, report, error }
+  })
+
+  // 汇总：三个必需字段在多少行凭据里出现过（决定 Remote 是否有希望直接跑通）
+  const withRequired = rows.filter((r) => r.report && r.report.requiredFields.every((f) => f.found)).length
+  const withRequiredInJwt = rows.filter(
+    (r) => r.report && r.report.jwtRequiredFields.length > 0 && r.report.jwtRequiredFields.every((f) => f.found)
+  ).length
+  const nonEmpty = rows.filter((r) => !r.empty).length
+
+  return c.json<ApiResponse>({
+    success: true,
+    data: {
+      rows,
+      summary: {
+        total: rows.length,
+        nonEmpty,
+        /** 凭据 JSON 里三个字段齐全的行数 */
+        withRequiredFields: withRequired,
+        /** JSON 里没有、但 accessToken JWT claims 里齐全的行数 */
+        withRequiredInJwt,
+      },
+      requiredFields: TRAE_REMOTE_REQUIRED_FIELD_NAMES,
+    },
+  })
+}
+
 /** 静态模型 id 表（面板预设下拉用，避免 UI 硬编码）。 */
 export const TRAE_UI_MODEL_IDS = TRAE_STATIC_MODEL_IDS
-
