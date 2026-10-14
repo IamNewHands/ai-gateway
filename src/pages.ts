@@ -730,7 +730,7 @@ ${H('管理')}
             <div class="pd" id="dt-${escapePageHtml(p.id)}">
               <div class="detail-heading"><div><h3>编辑 ${escapePageHtml(p.name)}</h3><p>保存后，新配置会用于后续转发请求。</p></div><span class="protocol-chip">${(p.apiType||'openai')==='anthropic'?'ANTHROPIC':'OPENAI'}</span></div>
               <div class="fr"><div class="fg"><label>名称</label><input type="text" id="nm-${escapePageHtml(p.id)}" value="${escapePageHtml(p.name)}"></div><div class="fg"><label>ID</label><input type="text" value="${escapePageHtml(p.id)}" disabled></div></div>
-              <div class="fg"><label>API 地址</label><input type="url" id="url-${escapePageHtml(p.id)}" value="${escapePageHtml(p.baseUrl)}"></div>
+              <div class="fg"><label>API 地址</label><input type="url" id="url-${escapePageHtml(p.id)}" value="${escapePageHtml(p.baseUrl)}">${isTraeProviderUI(p)?`<span class="form-helper">TRAE 的聊天路径<b>不读这一格</b>：SOLO / Work 用的是内置主机（硬编码常量），改它从来没有影响过聊天。只有「上游端点 = Remote」时才会用到它，且会<b>自动补 <code>/api/remote/v1</code></b> —— 保持预设值 <code>https://trae-api-cn.mchost.guru</code> 即可，<b>留空</b>用内置默认。仅当改成自定义主机时才原样使用（那种情况可能 404）。</span>`:''}</div>
               ${(p.oauth&&p.oauth.flowType==='gemini')?`
               <div class="fg" id="gbu-row-${escapePageHtml(p.id)}"><label for="gbu-${escapePageHtml(p.id)}">Gemini 推理中转地址（可选）</label><input type="url" id="gbu-${escapePageHtml(p.id)}" value="${escapePageHtml(p.geminiBaseUrl||'')}" placeholder="https://your-us-relay.example.com"><span class="form-helper">配置美国中转地址后，网关把 generateContent / countTokens 推理请求经该节点中转以规避地区限制（HTTP 400 User location is not supported）。OAuth 认证仍直连 Google。留空 = 直连内置默认地址。</span></div>
               <div class="fg" id="gquota-row-${escapePageHtml(p.id)}"><label>账号额度（5 小时窗口 / 周窗口）</label><div class="fr" style="align-items:center;gap:8px;"><button class="btn btn-s" onclick="geminiQuota('${escapePageJsx(p.id)}')"><i class="fas fa-gauge-high" aria-hidden="true"></i>查询额度</button><span id="gquota-tier-${escapePageHtml(p.id)}" class="pu"></span></div><div id="gquota-out-${escapePageHtml(p.id)}" class="form-helper" style="white-space:pre-wrap;"></div></div>`:''}
@@ -965,7 +965,7 @@ if ($waitForHuman) {
                   </button>
                   <div id="trae-endpoint-adv-${escapePageHtml(p.id)}" class="hd">
                     <fieldset class="form-group"><legend>上游端点</legend>
-                      <span class="form-helper">默认 <b>SOLO</b>（现有路径，行为零变化）。切到 <b>Remote</b> 后走两步协议（建会话 → 读事件），<b>唯一实质收益是思考强度真正生效</b>：SOLO/IDE 端点不带承载档位的字段，客户端设的 <code>reasoning_effort</code> 必然被忽略。<br>注意 Remote <b>不是普遍更好</b>：上游记录过部分模型在 Remote/Work 上会撞 4028/502，遇到就切回 SOLO。带 tools 的请求按源侧口径路由到 Work 档位。</span>
+                      <span class="form-helper">默认 <b>SOLO</b>（现有路径，行为零变化）。切到 <b>Remote</b> 后走两步协议（建会话 → 读事件），<b>唯一实质收益是思考强度真正生效</b>：SOLO/IDE 端点不带承载档位的字段，客户端设的 <code>reasoning_effort</code> 必然被忽略。<br>注意 Remote <b>不是普遍更好</b>：上游记录过部分模型在 Remote/Work 上会撞 4028/502，遇到就切回 SOLO。<br>档位由下方「Remote 档位」<b>显式选择</b>：带 tools 的请求<b>不会</b>被自动改档 —— 两个档位的模型目录不通用，自动切换会让「模型在另一档不存在」变成每个带 tools 请求都硬失败。</span>
                       <div class="fg"><label>端点</label>
                         <select id="trae-ep-${escapePageHtml(p.id)}">
                           <option value="solo"${(p.traeUpstreamEndpoint||'solo')==='solo'?' selected':''}>SOLO（默认，llm_utils_chat）</option>

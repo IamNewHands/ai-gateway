@@ -120,6 +120,23 @@ describe('管理页内联脚本语法（pages.ts 模板转义铁律 #5）', () =
     expect(js).toContain('积分明细')
   })
 
+  it('TRAE 的「API 地址」带 Remote 补路径提示；档位说明与实现一致；其它提供商不带提示', async () => {
+    const traeHtml = await render([traeProvider()])
+    // API 地址提示三要素：聊天路径不读这一格 / Remote 会自动补路径 / 留空用默认
+    expect(traeHtml).toContain('不读这一格')
+    expect(traeHtml).toContain('/api/remote/v1')
+    expect(traeHtml).toContain('留空')
+    // 档位说明必须与**实现**一致：带 tools 的请求**不会**被自动改档。
+    // （源侧 TRAE_REMOTE_CALLER_TOOLS_USE_WORK 的自动路由刻意未移植——两档模型目录
+    //  不通用，自动切换会让「模型在另一档不存在」变成每个带 tools 请求都硬失败。）
+    expect(traeHtml).toContain('显式选择')
+    expect(traeHtml).not.toContain('带 tools 的请求按源侧口径路由到 Work 档位')
+
+    // 非 TRAE 提供商的 API 地址字段是**真在用**的，提示只会成噪声 → 不渲染
+    const clineHtml = await render([clineProvider()])
+    expect(clineHtml).not.toContain('不读这一格')
+  })
+
   it('无 TRAE 提供商时同样语法合法（新增代码不依赖 TRAE 存在）', async () => {
     const html = await render([{
       id: 'plain', name: 'plain', baseUrl: 'https://example.com/v1', apiType: 'openai',
