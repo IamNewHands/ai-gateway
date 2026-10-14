@@ -592,6 +592,12 @@ export interface CreateRemoteSessionOptions {
   models?: Record<string, TraeRemoteModelConfig>
   /** 稳定会话 id 覆盖 */
   sessionId?: string | null
+  /**
+   * 会话变体标记（进稳定会话 id 的哈希材料）。
+   * Work 兜底用 `'work-fallback'`，使兜底会话与正常 Work 会话不共用远端 workspace
+   *（源侧 `work_fallback_options` 同款）。
+   */
+  sessionVariant?: string
   /** 客户端请求体（供 reasoning_effort 读取） */
   requestBody?: unknown
   /** 诊断：把 effort/max 结果写回调用方 */
@@ -642,7 +648,8 @@ export async function createRemoteSession(
     enabled: opts.maxMode === true,
   })
   const strategy = useMaxMode ? 'max' : resolved.strategy
-  const sessionId = await remoteModelSessionId(accountId, resolved.modelName || model, useMaxMode ? 'max' : '', opts.sessionId)
+  const variant = useMaxMode ? 'max' : String(opts.sessionVariant ?? '')
+  const sessionId = await remoteModelSessionId(accountId, resolved.modelName || model, variant, opts.sessionId)
 
   const initialMessage: Record<string, any> = {
     chat_session_id: '',
@@ -1000,6 +1007,75 @@ export async function* streamRemoteEvents(
   if (!sawTerminal) {
     // 源侧同款定责：上游会静默关连接，半句话不得当正常收尾。
     throw new RemoteStreamIncomplete('Trae remote event stream ended without a done event')
+  }
+}
+
+/** 给一次异步生成器的 `next()` 套死线（预读用；语义同 readWithDeadline）。 */
+function nextWithDeadline<T>(gen: AsyncGenerator<T>, ms: number): Promise<IteratorResult<T>> {
+  if (!(ms > 0)) return gen.next()
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new RemoteReadTimeout(`no model event for ${ms}ms`)), ms)
+    gen.next().then(
+      (r) => { clearTimeout(timer); resolve(r) },
+      (e) => { clearTimeout(timer); reject(e) },
+    )
+  })
+}
+
+/**
+ * 预读**首个模型事件** —— 把「会话建起来了但 executor 不启动」在**建流之前**暴露出来。
+ *
+ * 为什么必须提前读、不能等翻译层报错：源侧正是在 `RemoteFirstEventTimeout` 时才决定回落到
+ * Work 档位（`work_fallback_options`）。而一旦我们已经把 `200` + SSE 响应头返回给客户端，
+ * **就再也没有机会换档位了**（响应头已发出，改不了）。所以必须在返回 Response 之前读到
+ * 首个模型事件，把「换档位」这个决定留在还来得及的时候。
+ *
+ * 返回 `[首个模型事件, 续流生成器]`；续流**先重放预读到的帧**，所以预读不丢帧、不重排。
+ *
+ * 失败一律归到 `RemoteFirstEventTimeout` / `RemoteFirstEventError`（都是可换号的
+ * transport 类失败），让调用方只需判这两类。
+ */
+export async function preflightFirstModelEvent(
+  events: AsyncGenerator<TraeRemoteEvent>,
+  firstEventTimeoutMs: number
+): Promise<{ head: TraeRemoteEvent; rest: AsyncGenerator<TraeRemoteEvent> }> {
+  const buffered: TraeRemoteEvent[] = []
+  const deadline = firstEventTimeoutMs > 0 ? Date.now() + firstEventTimeoutMs : null
+  for (;;) {
+    const budget = deadline !== null ? Math.max(1, deadline - Date.now()) : 0
+    let next: IteratorResult<TraeRemoteEvent>
+    try {
+      next = await nextWithDeadline(events, budget)
+    } catch (e) {
+      // 上游给了**明确判决**（带 HTTP 状态码：401 禁用 / 429 软冷却 / 5xx 累计）→ 原样上抛。
+      // 这属于**账号级**定责，不该被档位兜底盖掉
+      //（源侧同款：`_stream_events_unbounded` 的 status 错误直接冒泡，不触发 work fallback）。
+      if ((e as { status?: number }).status !== undefined) throw e
+      // 建会话后上游立刻报错（executor 起不来）→ 仍属「首事件前失败」，可换档位。
+      if (e instanceof RemoteFirstEventError) throw e
+      // 不在这里主动 `return()` 关流：底层生成器里还有一条**自己的**首事件死线，它会在
+      // 同一预算到达时 abort 连接 —— 连接不会漏，也就不用 fire-and-forget 一个可能挂住的清理。
+      if (e instanceof RemoteFirstEventTimeout || e instanceof RemoteReadTimeout) {
+        throw new RemoteFirstEventTimeout(
+          `Trae remote session emitted no model event before the first-event deadline: ${(e as Error).message}`
+        )
+      }
+      throw new RemoteFirstEventTimeout(
+        `Trae remote event stream failed before its first model event: ${(e as Error).message}`
+      )
+    }
+    if (next.done) {
+      throw new RemoteFirstEventTimeout('Trae remote session ended before its first model event')
+    }
+    buffered.push(next.value)
+    if (REMOTE_MODEL_EVENTS.has(next.value.event)) {
+      const head = next.value
+      const rest = (async function* replayPreflight() {
+        for (const ev of buffered) yield ev
+        for await (const ev of events) yield ev
+      })()
+      return { head, rest }
+    }
   }
 }
 

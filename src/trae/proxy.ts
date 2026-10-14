@@ -13,13 +13,14 @@
 import type { Env, Provider } from '../types'
 import { withSSEKeepAlive } from '../opencode'
 import { getPerfSettings } from '../perf'
-import { TRAE_CONNECT_DEADLINES_MS, TRAE_DEFAULT_MODEL, TRAE_KEEPALIVE_MS, TRAE_RAW_MAX_HISTORY_CHARS, TRAE_RAW_MAX_MESSAGES, TRAE_RAW_MAX_TOOL_SCHEMA_CHARS, TRAE_STATIC_MODEL_IDS, TRAE_STREAM_IDLE_TIMEOUT_MS, TRAE_WORK_CONSTANTS, isWorkModel, normalizeTraeModelName } from './constants'
+import { TRAE_CONNECT_DEADLINES_MS, TRAE_DEFAULT_MODEL, TRAE_KEEPALIVE_MS, TRAE_RAW_MAX_HISTORY_CHARS, TRAE_RAW_MAX_MESSAGES, TRAE_RAW_MAX_TOOL_SCHEMA_CHARS, TRAE_REMOTE_FIRST_EVENT_TIMEOUT_MS, TRAE_STATIC_MODEL_IDS, TRAE_STREAM_IDLE_TIMEOUT_MS, TRAE_WORK_CONSTANTS, isWorkModel, normalizeTraeModelName } from './constants'
 import { chatStream, chatWorkStream, exchangeToken, extractLastUserPrompt, isTraeQuotaError, isTraeRequestSideError, needsTraeRefresh, parseAuth, probeTraeCredits, type TraeConnectTiming } from './upstream'
 import { isRemoteOnlyModel, type HistoryBudget } from './payload'
 import { aggregateSoloSse, aggregateWorkSse, soloStreamToOpenAIStream, workStreamToOpenAIStream } from './sse'
 import { aggregateWebSse, webStreamToOpenAIStream } from './web-sse'
-import { createRemoteSession, streamRemoteEvents, stopRemoteSession } from './remote'
+import { createRemoteSession, preflightFirstModelEvent, streamRemoteEvents, stopRemoteSession } from './remote'
 import { requestedEffortLevel, type TraeEffortLevel } from './reasoning-effort'
+import type { TraeRemoteEvent } from './types'
 import type { SOLOStreamError, TraeAccount } from './types'
 import { writeLog } from '../admin'
 import {
@@ -731,73 +732,114 @@ async function proxyTraeRemoteRequest(
       continue
     }
 
-    // 第一步：建会话。失败按错误类别定责——401 是账号级，429 软冷却，其余累计。
-    const trace: { maxModeApplied?: boolean; reasoningEffortApplied?: TraeEffortLevel | '' } = {}
-    let session: Awaited<ReturnType<typeof createRemoteSession>>
-    try {
-      session = await createRemoteSession(account, configName, body['messages'], {
-        baseUrl,
-        agentType,
-        maxMode: provider.traeRemoteMaxMode === true,
-        requestBody,
-        trace,
-      })
-    } catch (e) {
-      lastErr = e as Error
-      const kind = (e as any).kind || 'client'
-      await applyChatError(env, provider.id, account.uid, kind, cd)
-      await releaseTraeSession(env, provider.id, account.uid).catch(() => {})
-      // 请求侧参数错是本请求的终态：换号也会撞同一校验，继续轮转只会白扔健康号。
-      if (kind === 'client_params') {
-        return traeClientParamsError((e as any).msg || (e as Error).message || '', (e as any).status || 400)
-      }
-      continue
-    }
-
-    const effortNote = trace.reasoningEffortApplied ? ` effort=${trace.reasoningEffortApplied}` : ''
-    const maxNote = trace.maxModeApplied ? ' max_mode=on' : ''
-
-    // 会话建起来了。这条日志是「Remote 路径到底有没有跑」的**唯一直接证据**：
-    // 流式路径返回的 200 只是「响应头已返回」，正文此刻还没开始发 ——
-    // 光看 → 200 分不出「Remote 在跑但上游静默」与「压根没走 Remote」。
-    const sessionMsg = `[trae-remote] provider=${provider.id} uid=${account.uid} model=${configName}`
-      + ` phase=session session=${session.sessionId} msg=${session.messageId} agent=${agentType}${effortNote}${maxNote}`
-    console.log(sessionMsg) // codeql-disable: 纯诊断日志，不含密钥/敏感 token
-    writeLog(env, 'info', sessionMsg).catch(() => { /* 日志失败不影响流 */ })
-
-    // 第二步：读事件流（流式直接翻译，非流式聚合）。
     try {
       const perf = await getPerfSettings(env)
       const keepAliveMs = perf.keepAliveMs > 0 ? perf.keepAliveMs : TRAE_KEEPALIVE_MS
       // 读空闲死线：与 SSE 心跳用同一个「性能设置」口径（默认 180s）。
       const idleTimeoutMs = perf.idleTimeoutMs || TRAE_STREAM_IDLE_TIMEOUT_MS
 
-      const events = streamRemoteEvents(account, session.sessionId, session.messageId, {
-        baseUrl,
-        agentType,
-        idleTimeoutMs,
-        // 「上游到底发没发、发的什么形态」的直接证据，只在首个非空片段触发一次。
-        // 没有它，「会话建起来了但一直没内容」只能靠猜（上游事件体只有模型输出，无凭据）。
-        onRawHead: (head) => {
-          const msg = `[trae-remote] provider=${provider.id} uid=${account.uid} model=${configName}`
-            + ` phase=raw-head head=${JSON.stringify(head.slice(0, 300))}`
-          console.log(msg) // codeql-disable: 诊断片段，不含密钥/敏感 token
-          writeLog(env, 'info', msg).catch(() => { /* 日志失败不影响流 */ })
-        },
-        // 「流是活的」的证据：首个模型事件（心跳不算，见 streamRemoteEvents 注释）。
-        onFirstModelEvent: (name) => {
-          const msg = `[trae-remote] provider=${provider.id} uid=${account.uid} model=${configName}`
-            + ` phase=first-event event=${name}`
-          console.log(msg) // codeql-disable: 纯诊断日志，不含密钥/敏感 token
-          writeLog(env, 'info', msg).catch(() => { /* 日志失败不影响流 */ })
-        },
-      })
+      // ===== 第一步：选档位 → 建会话 → **预读**首个模型事件 =====
+      //
+      // 档位兜底链（源侧 `can_work_fallback` + `work_fallback_options` 的同款语义）：
+      // 只在 **Agent 起步**时允许一次 Work 兜底，**同一账号、同一模型名**。
+      //
+      // 为什么必须有这条链（2026-10-14 实测）：Agent 档位会「会话建好了、executor 不启动」
+      // —— 上游只发心跳（`event: heartbeat data: {"status":2,...}`），一个模型事件都不出，
+      // 客户端只见连接活着、永远没内容。源侧正是在这种情况下回落到 Work 才拿到结果。
+      //
+      // 为什么必须**在返回 200 之前**预读：响应头一旦发出，就再也换不了档位了。
+      //
+      // **不违反「不许偷偷换模型」**：换的是 executor 档位，模型名一个字符都不变；
+      // Work 目录里若没有该模型，`createRemoteSession` 会显式抛错（而不是静默换一个）。
+      const tiers = agentType === 'solo_agent_remote' ? [agentType, 'solo_work_remote'] : [agentType]
+      let session: Awaited<ReturnType<typeof createRemoteSession>> | null = null
+      let events: AsyncGenerator<TraeRemoteEvent> | null = null
+      let effortNote = ''
+      let maxNote = ''
+      let usedTier = agentType
+      let terminalResponse: Response | null = null
+      let tierFallbackUsed = false
 
+      for (const tier of tiers) {
+        if (session) break
+        // 建会话失败按错误类别定责——401 是账号级，429 软冷却，其余累计。
+        const trace: { maxModeApplied?: boolean; reasoningEffortApplied?: TraeEffortLevel | '' } = {}
+        try {
+          const created = await createRemoteSession(account, configName, body['messages'], {
+            baseUrl,
+            agentType: tier,
+            maxMode: provider.traeRemoteMaxMode === true,
+            requestBody,
+            trace,
+            sessionVariant: tierFallbackUsed ? 'work-fallback' : '',
+          })
+          // 预读首个模型事件（心跳不算 —— 见 preflightFirstModelEvent 注释）。
+          const probe = streamRemoteEvents(account, created.sessionId, created.messageId, {
+            baseUrl,
+            agentType: tier,
+            idleTimeoutMs,
+            // 「上游到底发没发、发的什么形态」的直接证据，只在首个非空片段触发一次。
+            // 没有它，「会话建起来了但一直没内容」只能靠猜（上游事件体只有模型输出，无凭据）。
+            onRawHead: (head) => {
+              const msg = `[trae-remote] provider=${provider.id} uid=${account.uid} model=${configName}`
+                + ` phase=raw-head head=${JSON.stringify(head.slice(0, 300))}`
+              console.log(msg) // codeql-disable: 诊断片段，不含密钥/敏感 token
+              writeLog(env, 'info', msg).catch(() => { /* 日志失败不影响流 */ })
+            },
+          })
+          const pre = await preflightFirstModelEvent(probe, TRAE_REMOTE_FIRST_EVENT_TIMEOUT_MS)
+          session = created
+          events = pre.rest
+          usedTier = tier
+          effortNote = trace.reasoningEffortApplied ? ` effort=${trace.reasoningEffortApplied}` : ''
+          maxNote = trace.maxModeApplied ? ' max_mode=on' : ''
+          // 这条日志是「Remote 到底跑没跑、哪个档位、首事件到没到」的直接证据。
+          const sessionMsg = `[trae-remote] provider=${provider.id} uid=${account.uid} model=${configName}`
+            + ` phase=session session=${created.sessionId} msg=${created.messageId}`
+            + ` agent=${tier} first=${pre.head.event}${effortNote}${maxNote}`
+          console.log(sessionMsg) // codeql-disable: 纯诊断日志，不含密钥/敏感 token
+          writeLog(env, 'info', sessionMsg).catch(() => { /* 日志失败不影响流 */ })
+        } catch (e) {
+          lastErr = e as Error
+          // Agent 起步失败（**建会话**失败 或 **迟迟没有首个模型事件**）→ 换 Work 档位再试一次。
+          if (tier === 'solo_agent_remote' && !tierFallbackUsed) {
+            tierFallbackUsed = true
+            const msg = `[trae-remote] provider=${provider.id} uid=${account.uid} model=${configName}`
+              + ` phase=tier-fallback from=solo_agent_remote to=solo_work_remote`
+              + ` reason=${((e as Error).message || String(e)).slice(0, 160)}`
+            console.log(msg) // codeql-disable: 纯诊断日志，不含密钥/敏感 token
+            writeLog(env, 'warn', msg).catch(() => { /* 日志失败不影响流 */ })
+            continue
+          }
+          const kind = (e as any).kind || 'transport'
+          await applyChatError(env, provider.id, account.uid, kind, cd)
+          // 请求侧参数错是本请求的终态：换号也会撞同一校验，继续轮转只会白扔健康号。
+          if (kind === 'client_params') {
+            terminalResponse = traeClientParamsError((e as any).msg || (e as Error).message || '', (e as any).status || 400)
+          }
+          break
+        }
+      }
+
+      if (terminalResponse) {
+        await releaseTraeSession(env, provider.id, account.uid).catch(() => {})
+        return terminalResponse
+      }
+      if (!session || !events) {
+        // 所有档位都没起来 → 换号（错误已在上面定责；transport 类不罚号）。
+        await releaseTraeSession(env, provider.id, account.uid).catch(() => {})
+        continue
+      }
+      // 取成 const：闭包里引用 `let` 变量会丢掉 TS 的 null 收窄。
+      const activeSession = session
+      const activeEvents = events
+
+      // ===== 第二步：翻译已预读的流（activeEvents 已含首帧，不丢帧）=====
       if (stream) {
         await noteTraeSuccess(env, provider.id, account.uid)
         const startedAt = Date.now()
         const sseBody = withSSEKeepAlive(
-          webStreamToOpenAIStream(events, configName, {
+          webStreamToOpenAIStream(activeEvents, configName, {
             includeReasoning,
             allowedTools: body['tools'],
             toolChoice: body['tool_choice'],
@@ -824,13 +866,13 @@ async function proxyTraeRemoteRequest(
           (reason) => {
             const secs = Math.round((Date.now() - startedAt) / 1000)
             const msg = `[trae-remote] provider=${provider.id} uid=${account.uid} model=${configName}`
-              + ` end=${reason} duration=${secs}s agent=${agentType}${effortNote}${maxNote}`
+              + ` end=${reason} duration=${secs}s agent=${usedTier}${effortNote}${maxNote}`
             console.log(msg) // codeql-disable: 纯诊断日志，不含密钥/敏感 token
             writeLog(env, 'info', msg).catch(() => { /* 日志失败不影响流 */ })
             void releaseTraeSession(env, provider.id, account.uid).catch(() => {})
             // 非正常收尾才主动停远端会话：正常结束时上游自己已收尾，再停一次没有必要。
             if (reason === 'idle' || reason === 'cancel') {
-              void stopRemoteSession(account, session.sessionId, session.messageId, { baseUrl, agentType }).catch(() => {})
+              void stopRemoteSession(account, activeSession.sessionId, activeSession.messageId, { baseUrl, agentType: usedTier }).catch(() => {})
             }
           }
         )
@@ -846,7 +888,7 @@ async function proxyTraeRemoteRequest(
       }
 
       // 非流式：聚合为单条 chat.completion。
-      const agg = await aggregateWebSse(events, configName, {
+      const agg = await aggregateWebSse(activeEvents, configName, {
         includeReasoning,
         allowedTools: body['tools'],
         toolChoice: body['tool_choice'],
