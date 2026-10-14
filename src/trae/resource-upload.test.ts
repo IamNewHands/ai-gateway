@@ -16,11 +16,14 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 import {
   crc32Hex,
   douyinFallbackHost,
+  escapeResourceBytes,
   extractImageParts,
   fetchResourceUploadUrl,
   imageMimeFromBytes,
   redactCredentials,
   resourceUploadBase,
+  TRAE_RESOURCE_ESCAPE_HEAD_HEX,
+  TRAE_RESOURCE_ESCAPE_SALT_HEX,
   TRAE_RESOURCE_MAX_PUTS,
   uploadImageParts,
   uploadResourceToTrae,
@@ -102,6 +105,73 @@ describe('crc32Hex：标准 CRC32（IEEE 802.3，反射多项式 0xEDB88320）',
   it('二进制字节按原值参与计算（不是按字符串编码）', () => {
     expect(crc32Hex(new Uint8Array([0x89, 0x50, 0x4e, 0x47]))).toBe(crc32Hex(new Uint8Array([0x89, 0x50, 0x4e, 0x47])))
     expect(crc32Hex(new Uint8Array([1, 2, 3]))).not.toBe(crc32Hex(new Uint8Array([3, 2, 1])))
+  })
+})
+
+// ===== 上传体转义（`InvalidFileType` 的真因）=====
+
+/** hex ↔ 字节：本仓 tsconfig 只挂 workers-types，测试里刻意不引 Buffer。 */
+function hexToBytes(hex: string): Uint8Array {
+  const out = new Uint8Array(hex.length >> 1)
+  for (let i = 0; i < out.length; i++) out[i] = parseInt(hex.slice(i * 2, i * 2 + 2), 16)
+  return out
+}
+function toHex(b: Uint8Array): string {
+  return [...b].map((v) => v.toString(16).padStart(2, '0')).join('')
+}
+
+describe('escapeResourceBytes：8 字节头 + 原始字节 XOR 固定盐（官方抓包实录）', () => {
+  /**
+   * 官方 web 客户端那次**成功**的 PUT（`Status 200`、`x-tos-crc32: ec6588f3`）body 的前 64 字节。
+   * 来自浏览器 Console 对 `XMLHttpRequest.send` 的 body 捕获，逐字节实录。
+   */
+  const CAPTURE_HEAD64 =
+    '000000001bc6ae8663cff48198c39fe09d8920ecfcf386f520ea9ce4c695e3c5a426c39fe2e89adfd5ea9d89248cfbff85c7ed16099d6c8b832cbbc2a7299ad5'
+  /** 同一次上传的源图（21674 字节）前 56 字节 —— 即上一条 body 的明文。 */
+  const SRC_HEAD56 =
+    '89504e470d0a1a0a0000000d494844520000016d0000014708060000006a361d720000000566644543522493e300e5ab6299000000097048'
+
+  it('**金属向量**：源图前 56 字节 → 官方抓包 body 前 64 字节（逐字节一致）', () => {
+    const out = escapeResourceBytes(hexToBytes(SRC_HEAD56))
+    expect(out).toHaveLength(64)
+    expect(toHex(out)).toBe(CAPTURE_HEAD64)
+  })
+
+  it('长度恒为原始 + 8（头），空输入也只剩头', () => {
+    expect(escapeResourceBytes(new Uint8Array(0)).byteLength).toBe(8)
+    expect(toHex(escapeResourceBytes(new Uint8Array(0)))).toBe(TRAE_RESOURCE_ESCAPE_HEAD_HEX)
+    for (const n of [1, 37, 38, 21674]) {
+      expect(escapeResourceBytes(new Uint8Array(n)).byteLength).toBe(n + 8)
+    }
+  })
+
+  it('盐按**字节位置循环**（周期 37），第 37 字节回到盐的第 0 字节', () => {
+    const salt = hexToBytes(TRAE_RESOURCE_ESCAPE_SALT_HEX)
+    const raw = new Uint8Array(40).fill(0x5a)
+    const out = escapeResourceBytes(raw)
+    expect(out[8]).toBe(0x5a ^ salt[0])
+    expect(out[8 + 36]).toBe(0x5a ^ salt[36])
+    expect(out[8 + 37]).toBe(0x5a ^ salt[0])
+    expect(out[8 + 38]).toBe(0x5a ^ salt[1])
+    expect(out[8 + 39]).toBe(0x5a ^ salt[2])
+  })
+
+  it('盐是 37 字节且为**合法 UTF-8**（这正是「代码字面量、不是按文件算」的依据）', () => {
+    const salt = hexToBytes(TRAE_RESOURCE_ESCAPE_SALT_HEX)
+    expect(salt.byteLength).toBe(37)
+    expect(TRAE_RESOURCE_ESCAPE_HEAD_HEX).toHaveLength(16)
+    // 往返编码一致 ⇒ 这 37 个字节确实是一段 UTF-8 文本（随机 37 字节做到的概率约 2e-5）。
+    const text = new TextDecoder().decode(salt)
+    expect(toHex(new TextEncoder().encode(text))).toBe(TRAE_RESOURCE_ESCAPE_SALT_HEX)
+  })
+
+  it('转义可逆：对载荷再 XOR 一次即得原字节', () => {
+    const raw = new Uint8Array(100).map((_, i) => (i * 7 + 3) & 0xff)
+    const out = escapeResourceBytes(raw)
+    const salt = hexToBytes(TRAE_RESOURCE_ESCAPE_SALT_HEX)
+    const back = new Uint8Array(raw.length)
+    for (let i = 0; i < raw.length; i++) back[i] = out[8 + i] ^ salt[i % salt.length]
+    expect(toHex(back)).toBe(toHex(raw))
   })
 })
 
@@ -281,15 +351,19 @@ describe('uploadResourceToTrae：② 上传字节 + ③ 拼 URI', () => {
     // auth **原样**进 Authorization：没有 Bearer、没有别的前缀。
     expect(calls[0].init.headers['Authorization']).toBe(FAKE_AUTH)
     expect(calls[0].init.headers['Content-Type']).toBe('application/octet-stream')
-    expect(calls[0].init.headers['Content-Length']).toBe(String(BYTES.byteLength))
-    // Content-CRC32 = 标准 CRC32 的 8 位小写 hex。
-    expect(calls[0].init.headers['Content-CRC32']).toBe(crc32Hex(BYTES))
+    // Content-Length / Content-CRC32 都按**转义后的上传体**算（官方那次成功 PUT 就是这么来的）。
+    const escaped = escapeResourceBytes(BYTES)
+    expect(calls[0].init.headers['Content-Length']).toBe(String(escaped.byteLength))
+    // Content-CRC32 = 标准 CRC32 的 8 位小写 hex，算在**上传体**上（对应官方响应里的 payload.hash）。
+    expect(calls[0].init.headers['Content-CRC32']).toBe(crc32Hex(escaped))
     expect(calls[0].init.headers['Content-CRC32']).toMatch(/^[0-9a-f]{8}$/)
     // 照抄官方客户端那次成功 PUT 的三个头（跨站直传的来源校验）。
     expect(calls[0].init.headers['Accept']).toBe('*/*')
     expect(calls[0].init.headers['Origin']).toBe('https://work.trae.cn')
     expect(calls[0].init.headers['Referer']).toBe('https://work.trae.cn/')
-    expect(calls[0].init.body).toBe(BYTES)
+    // body 是**转义体**，不是图片原始字节 —— 裸传就是 `400 InvalidFileType/4028`。
+    expect(toHex(calls[0].init.body)).toBe(toHex(escaped))
+    expect(toHex(calls[0].init.body)).not.toBe(toHex(BYTES))
 
     expect(uri).toBe(`trae-res://remote_resource/${STORE_URI}`)
   })
@@ -395,7 +469,7 @@ describe('uploadResourceToTrae：上传主机候选顺序与逐个换主机（20
     // 字节诊断：证明「传上去的确实是图片」，而不是内容被拒。
     expect(err!.message).toContain(`bytes=${BYTES.length}`)
     expect(err!.message).toContain('first8=010203')
-    expect(err!.message).toContain(`crc=${crc32Hex(BYTES)}`)
+    expect(err!.message).toContain(`crc=${crc32Hex(escapeResourceBytes(BYTES))}`)
   })
 
   it('**HTTP 400 也要换下一个主机**（旧行为「HTTP 失败不回退」被真机推翻）', async () => {
@@ -678,7 +752,7 @@ describe('uploadResourceToTrae：变体阶梯（Content-Type / Content-CRC32 的
     // 变体 1 → 2：Content-Type 不变，**只**少了 Content-CRC32。
     expect(v1.contentType).toBe('application/octet-stream')
     expect(v2.contentType).toBe(v1.contentType)
-    expect(v1.crc).toBe(crc32Hex(PNG))
+    expect(v1.crc).toBe(crc32Hex(escapeResourceBytes(PNG)))
     expect(v2.crc).toBeUndefined()
     expect(changedHeaderKeys(v1.headers, v2.headers)).toEqual(['Content-CRC32'])
 
@@ -721,7 +795,7 @@ describe('uploadResourceToTrae：变体阶梯（Content-Type / Content-CRC32 的
     expect(uri).toBe(`trae-res://remote_resource/${STORE_URI}`)
     expect(puts).toHaveLength(5)
     expect(puts[4].contentType).toBe('image/png')
-    expect(puts[4].crc).toBe(crc32Hex(PNG))
+    expect(puts[4].crc).toBe(crc32Hex(escapeResourceBytes(PNG)))
     // 变体 4（mime-nocrc）一次都没发过：真实 mime 且**不带** CRC 的请求不存在。
     expect(puts.some((p) => p.contentType === 'image/png' && p.crc === undefined)).toBe(false)
     expect(trace.variant).toBe('mime+crc')

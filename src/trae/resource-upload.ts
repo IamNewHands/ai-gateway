@@ -346,7 +346,69 @@ function uploadVariants(mime: string): PutVariant[] {
 }
 
 /**
+ * 上传体「转义」的头与盐 —— **2026-10-14 从官方客户端那次成功的 PUT 完整反推，并用 CRC32 铁证**。
+ *
+ * ## 这是 `InvalidFileType` 的真因（不是 Content-Type、不是主机、不是后缀）
+ *
+ * 官方 web 客户端上传一张 PNG 时，PUT 的 body **不是图片字节本身**，而是：
+ *
+ *     body = <8 字节固定头 000000001bc6ae86> + (图片字节 XOR <37 字节固定盐，按字节位置循环>)
+ *
+ * 证据链（三段，全部可复算）：
+ *  1. 抓包：`content-length: 21682`，而同一张源图 21674 字节 → **恰好 +8**；
+ *     `x-tos-crc32: ec6588f3`，我们裸传同一张图的 CRC32 是 `dfdf7d80` → 上传体不是裸字节。
+ *  2. 用「头 8 字节 + 源图前 37 字节」反推出盐，发现它**有周期 37** 且尾部 16 字节按 `%37`
+ *     对齐后逐字节吻合（两个不同 object uuid 的上传体前 64 字节完全相同 → 变换是确定性的）。
+ *  3. **铁证**：`CRC32(000000001bc6ae86 + (源图 XOR 盐)) === ec6588f3`，与官方响应里的
+ *     `x-tos-crc32` / `payload.hash` 逐位一致，前 64 与后 16 字节也逐字节吻合。
+ *
+ * 另：盐的 37 字节是**合法 UTF-8**（`"ꟺƕɅꝉ ᵻ§ ꝉƕ€ ß€§Ꟊ!"`），37 个随机字节恰好合法 UTF-8 的
+ * 概率约 2e-5 —— 说明它是**代码里的字面量（固定盐）**，不是按文件算出来的。头 8 字节同理：
+ * 长度（21674/21682）、各校验（crc32/adler32/md5/sha 前缀）都撞不上它，且两个不同 object
+ * uuid 上传体的头完全相同 → 前者不像「按文件算」的字段。
+ *
+ * 这与 ① 下发 token 里的 `is_imagex: true` + `content_type_block.mime_list:
+ * ["application/octet-stream"]`（要求上传体嗅探为 opaque 字节）完全自洽：**裸 PNG 会被判成
+ * `InvalidFileType/4028`，转义后的字节才是服务端要的形态。**
+ *
+ * ⚠️ 未验证之处（据实记录）：盐与头是否对所有图片都恒定，只由「同一张图两次不同 uuid 上传
+ * 完全一致」+「盐是合法 UTF-8」支撑 —— **需要用另一张不同尺寸的图真机复核一次**。若那张图
+ * 失败，说明头/盐里有按文件算的字段（那就得去 `work.trae.cn` 的上传 SDK（`8938.*.js` 的
+ * `uploadSingleFile`）里读实现），而不是继续猜。
+ */
+export const TRAE_RESOURCE_ESCAPE_HEAD_HEX = '000000001bc6ae86'
+export const TRAE_RESOURCE_ESCAPE_SALT_HEX =
+  'ea9fbac695c985ea9d8920e1b5bbc2a720ea9d89c695e282ac20c39fe282acc2a7ea9d8921'
+
+function hexToBytes(hex: string): Uint8Array {
+  const out = new Uint8Array(hex.length >> 1)
+  for (let i = 0; i < out.length; i++) out[i] = parseInt(hex.slice(i * 2, i * 2 + 2), 16)
+  return out
+}
+
+const ESCAPE_HEAD = hexToBytes(TRAE_RESOURCE_ESCAPE_HEAD_HEX)
+const ESCAPE_SALT = hexToBytes(TRAE_RESOURCE_ESCAPE_SALT_HEX)
+
+/**
+ * 把要上传的图片字节转成**实际上传体**（官方客户端同款形态）。
+ *
+ * `Content-CRC32` 必须算在**返回值**上（不是入参）：官方响应里 `payload.hash` 就是这么来的。
+ * 长度 = 入参 + 8（头），所以 `Content-Length` 也要用返回值算。
+ */
+export function escapeResourceBytes(bytes: Uint8Array): Uint8Array {
+  const out = new Uint8Array(ESCAPE_HEAD.length + bytes.length)
+  out.set(ESCAPE_HEAD, 0)
+  for (let i = 0; i < bytes.length; i++) {
+    out[ESCAPE_HEAD.length + i] = bytes[i] ^ ESCAPE_SALT[i % ESCAPE_SALT.length]
+  }
+  return out
+}
+
+/**
  * 发一次 PUT。**网络层失败会抛出**，由调用方决定要不要换下一个 (变体, 主机) 组合。
+ *
+ * `bytes` 是**已经转义过的上传体**（`escapeResourceBytes` 的产物），不是图片原始字节 ——
+ * 传原始字节就是 2026-10-14 之前那几轮的 `InvalidFileType`。
  *
  * 变体之间只有 `Content-Type` / `Content-CRC32` 不同；`Authorization` / `Accept` /
  * `Origin` / `Referer` 四个头**恒定** —— 实验只允许一个变量在动，否则赢了也不知道赢在哪。
@@ -408,6 +470,13 @@ export interface ResourceUploadTrace {
  * 顺序（`uploadVariants`）与上限（`TRAE_RESOURCE_MAX_PUTS`）都是**契约**。撞到上限时
  * `trace.exhausted = true`、错误信息里也带 `exhausted=true`。
  *
+ * ## 上传体必须转义（2026-10-14 定案，`InvalidFileType` 的真因）
+ *
+ * `bytes` 是图片**原始**字节；本函数把它转成实际上传体（`escapeResourceBytes`：
+ * 8 字节固定头 + 原始字节 XOR 固定盐），`Content-Length` / `Content-CRC32` 都按转换后的体算。
+ * 传裸图片字节必然 `400 InvalidFileType/4028` —— 那几轮怀疑过的 Content-Type、主机、对象名
+ * 后缀**全部已被真机排除**，唯一差异就是上传体。
+ *
  * ## 为什么任一组合失败都要继续（而不是只回退网络错误）
  *
  * 2026-10-14 真机推翻的旧判断：广告主机 `tos-d-x-lf.snssdk.com` 回的是 **HTTP 400 业务
@@ -455,7 +524,11 @@ export async function uploadResourceToTrae(
   candidates.push(primary)
   for (const h of hosts.slice(1)) if (!candidates.includes(h)) candidates.push(h)
 
-  const crc = crc32Hex(bytes)
+  // **实际上传体**：头 8 字节 + 图片字节 XOR 固定盐（见 `escapeResourceBytes` 的长注释）。
+  // 长度、CRC 都必须按这个体算 —— 官方那次成功的 PUT 就是这么来的（`21674 → 21682`、
+  // `x-tos-crc32 = ec6588f3`）。mime 嗅探仍然用**原始字节**（要判断这是不是真图片）。
+  const escaped = escapeResourceBytes(bytes)
+  const crc = crc32Hex(escaped)
   const mime = imageMimeFromBytes(bytes)
   const ladder = uploadVariants(mime)
   // 先摊平成 (变体, 主机) 组合列表，再按上限截断：这样「未穷尽」是**算出来的**
@@ -473,6 +546,7 @@ export async function uploadResourceToTrae(
     `[trae-upload] plan file=${filename || '-'} target=${String(ticket?.target ?? '') || '-'}`
     + ` advertised=${hosts.join(',') || '-'} candidates=${candidates.join(',')}`
     + ` variants=${ladder.map((v) => v.name).join('+')} mime=${mime || 'unknown'}`
+    + ` body=${bytes.length}->${escaped.length}`
     + ` planned=${planned.length}/${combos.length}${exhausted ? ' exhausted=true' : ''}`
     + ` store=${storeUri}`
   ) // codeql-disable: 仅主机名/对象名/变体名/计数，凭据（auth/session_key）绝不在此
@@ -484,7 +558,7 @@ export async function uploadResourceToTrae(
     const url = uploadUrlFor(host, storeUri)
     let result: PutResult
     try {
-      result = await putObject(url, auth, bytes, crc, variant)
+      result = await putObject(url, auth, escaped, crc, variant)
     } catch (e) {
       failures.push(
         `variant=${variant.name} host=${host} transport: ${(e as Error).message || String(e)}`
@@ -523,7 +597,7 @@ export async function uploadResourceToTrae(
   // 每条失败只带一行短码（见 `renderUploadFailureDetail`），保证整条消息在调用方的上限内**不被截尾**。
   throw new Error(
     `Trae resource upload failed (${where} target=${String(ticket?.target ?? '') || '-'}`
-    + ` bytes=${bytes.length} first8=${hexPreview(bytes)} crc=${crc}`
+    + ` bytes=${bytes.length} first8=${hexPreview(bytes)} body=${escaped.length} crc=${crc}`
     + ` mime=${mime || 'unknown'} variants=${ladder.map((v) => v.name).join('+')}`
     + `${exhausted ? ' exhausted=true' : ''} store=${storeUri}): ${failures.join(' | ') || 'no upload host tried'}`
   )
