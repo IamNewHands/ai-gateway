@@ -619,16 +619,24 @@ describe('createRemoteSession：多模态图片（门禁 + 降级）', () => {
     }
 
     expect(sessionId).toBe('sess-1')
-    // 八次调用：① 申请上传位 → ②…⑦ 变体阶梯（3 变体 × 2 主机，每枪都 success=1 → 失败）
-    // → ⑧ 建会话。`success !== 0` 也算「这个组合不行」，阶梯要走完。
-    expect(calls).toHaveLength(8)
+    // 十次调用：① 申请上传位 → ②…⑨ 变体阶梯（4 变体 × 2 主机 = 8 枪，每枪都 success=1 → 失败）
+    // → ⑩ 建会话。`success !== 0` 也算「这个组合不行」，阶梯要走完。
+    expect(calls).toHaveLength(10)
     expect(calls[1].url).toBe(`https://tos-d-x-lf.douyin.com/${STORE_URI}`)
     expect(calls[2].url).toBe(`https://tos-d-x-lf.snssdk.com/${STORE_URI}`)
+    // 每个变体的**第一台主机**落在 calls[1]/[3]/[5]/[7]：变体 1/2（octet）是 octet-stream，
+    // 变体 3/4（mime）是真实 mime。
     expect(calls[1].init.headers['Content-Type']).toBe('application/octet-stream')
-    expect(calls[3].init.headers['Content-Type']).toBe('image/png')
-    expect(calls[5].init.headers['Content-CRC32']).toBeUndefined()
+    expect(calls[3].init.headers['Content-Type']).toBe('application/octet-stream')
+    expect(calls[5].init.headers['Content-Type']).toBe('image/png')
+    expect(calls[7].init.headers['Content-Type']).toBe('image/png')
+    // Content-CRC32 只在变体 1/3（`+crc`）上；变体 2/4（`-nocrc`）不带它。
+    expect(calls[1].init.headers['Content-CRC32']).toBeDefined()
+    expect(calls[3].init.headers['Content-CRC32']).toBeUndefined()
+    expect(calls[5].init.headers['Content-CRC32']).toBeDefined()
+    expect(calls[7].init.headers['Content-CRC32']).toBeUndefined()
     // 图片全丢，但会话照建（`calls` 的最后一条才是建会话）。
-    expect(queryBlocks(calls[7])).toHaveLength(1)
+    expect(queryBlocks(calls[9])).toHaveLength(1)
     expect(trace.imageUploadFailed).toBe(1)
     expect(trace.imageUploadError).toContain('success=1')
   })

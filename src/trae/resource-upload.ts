@@ -275,7 +275,7 @@ interface PutResult {
  * 与其再猜一轮，不如一次部署把候选跑完，让日志直接说哪个赢（命中变体见
  * `ResourceUploadTrace` / `ImageUploadOutcome.variantSummary`）。
  */
-export type ResourceUploadVariant = 'octet+crc' | 'mime+crc' | 'mime-nocrc'
+export type ResourceUploadVariant = 'octet+crc' | 'octet-nocrc' | 'mime+crc' | 'mime-nocrc'
 
 /** 一个候选变体：只有 `Content-Type` 与「带不带 Content-CRC32」在变。 */
 interface PutVariant {
@@ -287,11 +287,11 @@ interface PutVariant {
 /**
  * 硬上限：一次上传最多发几个 PUT。
  *
- * 3 变体 × 2 主机 = 6 正好够（真机就是 2 台主机）。有第三台时会被截断，那时
+ * 4 变体 × 2 主机 = 8 正好够（真机就是 2 台主机）。有第三台时会被截断，那时
  * `trace.exhausted = true` 且错误信息里带 `exhausted=true` —— **绝不把「没试完」说成
  * 「都试过了」**，否则实验结论会假阴性。
  */
-export const TRAE_RESOURCE_MAX_PUTS = 6
+export const TRAE_RESOURCE_MAX_PUTS = 8
 
 /**
  * 魔术字节 → 真实图片 mime；嗅不出返回 `''`。
@@ -311,19 +311,26 @@ export function imageMimeFromBytes(bytes: Uint8Array): string {
 }
 
 /**
- * 变体阶梯：**顺序是契约**。
+ * 变体阶梯：**顺序是契约**，且刻意排成「一步只动一个变量」的 2×2。
  *
- *  1. `octet+crc` —— 现状（抓包里官方发的形态）。放第一位是为了**不回归**：万一真机
- *     其实已经能过，就不该白打后面两枪；
- *  2. `mime+crc` —— 真实 mime + CRC（假设「被校验的是实际图片类型」）；
- *  3. `mime-nocrc` —— 真实 mime、**不带** CRC（TOS 可能对「未知 Content-Type + CRC」
- *     这个组合做了校验，去掉 CRC 是最后一个正交变量）。
+ * | # | 变体 | Content-Type | CRC | 相对基准动了什么 |
+ * |---|---|---|---|---|
+ * | 1 | `octet+crc` | `application/octet-stream` | 有 | —— 现状（抓包里官方发的形态），放第一位保证**不回归** |
+ * | 2 | `octet-nocrc` | `application/octet-stream` | 无 | **只去掉 CRC** |
+ * | 3 | `mime+crc` | 真实 mime | 有 | **只换成真实 mime**（相对第 1 档） |
+ * | 4 | `mime-nocrc` | 真实 mime | 无 | 两个都动（兜底） |
  *
- * 嗅不出 mime 时只留 1（见 `imageMimeFromBytes`）。
+ * 为什么把 `octet-nocrc` 排在第 2 位：这样「CRC 头本身是不是毒药」能被**单独**证伪。
+ * 早先的 3 档版本把「去 CRC」和「换 mime」揉在第 3 档里 —— 一旦它成功也分不清是哪个
+ * 变量起作用，那等于白做一次真机实验。
+ *
+ * 嗅不出 mime 时只留前两档（见 `imageMimeFromBytes`）：瞎填一个 `Content-Type` 只会把
+ * `InvalidFileType` 换成另一种失败，还会污染结论。
  */
 function uploadVariants(mime: string): PutVariant[] {
   const ladder: PutVariant[] = [
     { name: 'octet+crc', contentType: 'application/octet-stream', includeCrc: true },
+    { name: 'octet-nocrc', contentType: 'application/octet-stream', includeCrc: false },
   ]
   if (mime) {
     ladder.push({ name: 'mime+crc', contentType: mime, includeCrc: true })
