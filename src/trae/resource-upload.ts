@@ -152,21 +152,25 @@ export function resourceUploadBase(baseUrl?: string | null): string {
 /**
  * ①：申请上传位。
  *
- * `targets` 里的 uuid **由我们生成**（不是上游给的），文件名形如 `<uuid>.trae` —— 这是
- * 官方客户端的实际形态，也是 ③ 里 `store_uri` 末段与 `target` 必须一致的原因。
+ * `targets` 里的 uuid **由我们生成**（不是上游给的），扩展名跟随待传图片（如 `<uuid>.png`）
+ * —— 实测踩坑：TOS 图片桶（`tos-cn-i-*`）会从对象名后缀与内容做类型校验，若固定为 `.trae`
+ * 会被 TOS 拒绝并报 `400 InvalidFileType` (error_code 4028)；必须带真实图片扩展名。
  *
  * 失败一律抛错（图片少一张总比整轮对话挂掉强，由调用方降级）；错误信息**不含** `auth` /
  * `session_key`，含状态码与脱敏后的响应体前 200 字符。
  *
- * `opts.filename` **只用于排障文案**（哪个文件申请失败），不参与协议：对象名固定是
- * `<uuid>.trae`，人类文件名是在 ③ 的 `attachment.filename` 里带上去的。
+ * `opts.filename` 用于提供真实扩展名与排障文案，人类文件名是在 ③ 的 `attachment.filename` 里带上去的。
  */
 export async function fetchResourceUploadUrl(
   account: TraeAccount,
-  opts?: { baseUrl?: string | null; filename?: string }
+  opts?: { baseUrl?: string | null; filename?: string; ext?: string }
 ): Promise<ResourceUploadTicket> {
   const base = resourceUploadBase(opts?.baseUrl)
-  const target = `${crypto.randomUUID()}.trae`
+  const fnExt = opts?.filename && opts.filename.includes('.')
+    ? opts.filename.slice(opts.filename.lastIndexOf('.') + 1).toLowerCase()
+    : ''
+  const ext = fnExt || opts?.ext || 'png'
+  const target = `${crypto.randomUUID()}.${ext}`
   // 排障定位（哪张图、哪个账号）；`uid` 不是凭据，本仓其它日志也照打。
   const where = `uid=${account?.uid || '-'} file=${opts?.filename || '-'}`
   // ① 的头部是**推断**的（见文件头「唯一没有抓包确认的地方」）：端点在 IDE API 下，
@@ -356,6 +360,7 @@ async function putObject(
     // 实证：`auth` **原样**进 Authorization，没有 Bearer / 其他前缀。
     Authorization: auth,
     'Content-Type': variant.contentType,
+    'Content-Length': String(bytes.byteLength),
     // 以下三个照抄官方客户端那次成功的 PUT（**不是**发明）。TOS 侧可能对
     // 跨站直传做来源校验，缺了它们可能以 400/InvalidFileType 的形式被拒。
     Accept: '*/*',

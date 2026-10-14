@@ -171,14 +171,38 @@ describe('fetchResourceUploadUrl：① 申请上传位', () => {
     const body = JSON.parse(calls[0].init.body)
     expect(body.biz_type).toBe('remote_resource')
     expect(body.targets).toHaveLength(1)
-    // uuid 由**我们**生成，后缀固定 .trae。
-    expect(body.targets[0]).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.trae$/)
+    // uuid 由我们生成，后缀跟随待传文件的真实扩展名（PixPin.png → .png）。
+    expect(body.targets[0]).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.png$/)
 
     expect(t.storeUri).toBe(STORE_URI)
     expect(t.auth).toBe(FAKE_AUTH)
     expect(t.uploadHosts).toEqual([UPLOAD_HOST])
     // target 必须与请求里发的一致（③ 的 store_uri 末段就是它）。
     expect(t.target).toBe(body.targets[0])
+  })
+
+  it('target 后缀跟随 filename 或 ext 参数，缺省兜底 png', async () => {
+    let lastBody: any
+    vi.stubGlobal('fetch', vi.fn(async (_url: string, init: any) => {
+      lastBody = JSON.parse(init.body)
+      return uploadUrlResponse()
+    }))
+
+    // filename = photo.jpg → .jpg
+    await fetchResourceUploadUrl(ACCOUNT, { filename: 'photo.jpg' })
+    expect(lastBody.targets[0]).toMatch(/\.jpg$/)
+
+    // filename = anim.webp → .webp
+    await fetchResourceUploadUrl(ACCOUNT, { filename: 'anim.webp' })
+    expect(lastBody.targets[0]).toMatch(/\.webp$/)
+
+    // 显式 ext = gif
+    await fetchResourceUploadUrl(ACCOUNT, { ext: 'gif' })
+    expect(lastBody.targets[0]).toMatch(/\.gif$/)
+
+    // 无参数 → 兜底 .png
+    await fetchResourceUploadUrl(ACCOUNT)
+    expect(lastBody.targets[0]).toMatch(/\.png$/)
   })
 
   it('头部复用 IDE API 那一套（Authorization: Cloud-IDE-JWT）', async () => {
@@ -256,6 +280,7 @@ describe('uploadResourceToTrae：② 上传字节 + ③ 拼 URI', () => {
     // auth **原样**进 Authorization：没有 Bearer、没有别的前缀。
     expect(calls[0].init.headers['Authorization']).toBe(FAKE_AUTH)
     expect(calls[0].init.headers['Content-Type']).toBe('application/octet-stream')
+    expect(calls[0].init.headers['Content-Length']).toBe(String(BYTES.byteLength))
     // Content-CRC32 = 标准 CRC32 的 8 位小写 hex。
     expect(calls[0].init.headers['Content-CRC32']).toBe(crc32Hex(BYTES))
     expect(calls[0].init.headers['Content-CRC32']).toMatch(/^[0-9a-f]{8}$/)
