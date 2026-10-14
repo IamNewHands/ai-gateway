@@ -515,7 +515,9 @@ describe('createRemoteSession：多模态图片（门禁 + 降级）', () => {
     // 三次调用：① 申请上传位 → ② PUT 字节 → ③ 建会话。
     expect(calls).toHaveLength(3)
     expect(calls[0].url).toBe('https://trae-api-cn.mchost.guru/api/ide/v1/get_resource_upload_url')
-    expect(calls[1].url).toBe(`https://tos-d-x-lf.snssdk.com/${STORE_URI}`)
+    // PUT 打的是**观测到能用**的主机（douyin），不是 API 广告的 snssdk：
+    // 2026-10-14 真机实证，照广告打 snssdk 会被 `400 InvalidFileType` 拒（字节是合法 PNG）。
+    expect(calls[1].url).toBe(`https://tos-d-x-lf.douyin.com/${STORE_URI}`)
     expect(calls[1].init.headers['Authorization']).toBe(FAKE_AUTH)
 
     const blocks = queryBlocks(calls[2])
@@ -617,8 +619,13 @@ describe('createRemoteSession：多模态图片（门禁 + 降级）', () => {
     }
 
     expect(sessionId).toBe('sess-1')
-    expect(calls).toHaveLength(3)
-    expect(queryBlocks(calls[2])).toHaveLength(1)
+    // 四次调用：① 申请上传位 → ② PUT 到观测主机（success=1，失败）→ ③ PUT 到广告主机
+    //（同样 success=1）→ ④ 建会话。`success !== 0` 也算「这个主机不行」，候选链要走完。
+    expect(calls).toHaveLength(4)
+    expect(calls[1].url).toBe(`https://tos-d-x-lf.douyin.com/${STORE_URI}`)
+    expect(calls[2].url).toBe(`https://tos-d-x-lf.snssdk.com/${STORE_URI}`)
+    // 图片全丢，但会话照建（`calls` 的最后一条才是建会话）。
+    expect(queryBlocks(calls[3])).toHaveLength(1)
     expect(trace.imageUploadFailed).toBe(1)
     expect(trace.imageUploadError).toContain('success=1')
   })

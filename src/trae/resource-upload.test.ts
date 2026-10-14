@@ -38,7 +38,10 @@ const ACCOUNT: TraeAccount = {
 const FAKE_AUTH = 'AKIDFAKE:version:v2:JWT-SECRET'
 const FAKE_SESSION_KEY = 'sk-LEAK'
 const STORE_URI = 'tos-cn-i-aiagcest/cn/u1/remote_resource/abc.trae'
+/** `get_resource_upload_url` **广告**的主机（照它打会被 400 拒）。 */
 const UPLOAD_HOST = 'tos-d-x-lf.snssdk.com'
+/** 官方 web 客户端**实际发**的主机（子域相同、基域不同）——候选里排第一。 */
+const OBSERVED_HOST = 'tos-d-x-lf.douyin.com'
 
 function ticket(extra: Partial<ResourceUploadTicket> = {}): ResourceUploadTicket {
   return { storeUri: STORE_URI, auth: FAKE_AUTH, uploadHosts: [UPLOAD_HOST], target: 'abc.trae', ...extra }
@@ -242,8 +245,10 @@ describe('uploadResourceToTrae：② 上传字节 + ③ 拼 URI', () => {
 
     const uri = await uploadResourceToTrae(ACCOUNT, ticket(), BYTES, 'image-1.png')
 
+    // 第一枪打**观测到能用的**主机（douyin），不是 API 广告的那个（snssdk）：
+    // 2026-10-14 真机实证，照广告打 snssdk 会被 `400 InvalidFileType` 拒掉，而字节是合法 PNG。
     expect(calls).toHaveLength(1)
-    expect(calls[0].url).toBe(`https://${UPLOAD_HOST}/${STORE_URI}`)
+    expect(calls[0].url).toBe(`https://${OBSERVED_HOST}/${STORE_URI}`)
     expect(calls[0].init.method).toBe('PUT')
     // auth **原样**进 Authorization：没有 Bearer、没有别的前缀。
     expect(calls[0].init.headers['Authorization']).toBe(FAKE_AUTH)
@@ -251,6 +256,10 @@ describe('uploadResourceToTrae：② 上传字节 + ③ 拼 URI', () => {
     // Content-CRC32 = 标准 CRC32 的 8 位小写 hex。
     expect(calls[0].init.headers['Content-CRC32']).toBe(crc32Hex(BYTES))
     expect(calls[0].init.headers['Content-CRC32']).toMatch(/^[0-9a-f]{8}$/)
+    // 照抄官方客户端那次成功 PUT 的三个头（跨站直传的来源校验）。
+    expect(calls[0].init.headers['Accept']).toBe('*/*')
+    expect(calls[0].init.headers['Origin']).toBe('https://work.trae.cn')
+    expect(calls[0].init.headers['Referer']).toBe('https://work.trae.cn/')
     expect(calls[0].init.body).toBe(BYTES)
 
     expect(uri).toBe(`trae-res://remote_resource/${STORE_URI}`)
@@ -268,8 +277,14 @@ describe('uploadResourceToTrae：② 上传字节 + ③ 拼 URI', () => {
   })
 
   it('HTTP 2xx 但 success != 0 → 失败（不能把业务失败当成功）', async () => {
-    vi.stubGlobal('fetch', vi.fn(async () => putResponse(1)))
+    const urls: string[] = []
+    vi.stubGlobal('fetch', vi.fn(async (url: string) => {
+      urls.push(url)
+      return putResponse(1)
+    }))
     await expect(uploadResourceToTrae(ACCOUNT, ticket(), BYTES, 'a.png')).rejects.toThrow(/success=1/)
+    // `success !== 0` 也算「这个主机不行」→ 候选链继续走完。
+    expect(urls).toHaveLength(2)
   })
 
   it('HTTP 2xx 且响应体没有 success 字段 → 按 2xx 认成功（代理可能吃掉 body）', async () => {
@@ -278,10 +293,16 @@ describe('uploadResourceToTrae：② 上传字节 + ③ 拼 URI', () => {
       .resolves.toBe(`trae-res://remote_resource/${STORE_URI}`)
   })
 
-  it('HTTP 失败 → 抛错，信息含状态码与排障定位（uid/filename），不含 auth', async () => {
-    vi.stubGlobal('fetch', vi.fn(async () => new Response(`denied ${FAKE_AUTH}`, { status: 403 })))
+  it('HTTP 失败 → 抛聚合错误，含每个主机的状态码与排障定位（uid/filename），不含 auth', async () => {
+    const urls: string[] = []
+    vi.stubGlobal('fetch', vi.fn(async (url: string) => {
+      urls.push(url)
+      return new Response(`denied ${FAKE_AUTH}`, { status: 403 })
+    }))
     const err = await uploadResourceToTrae(ACCOUNT, ticket(), BYTES, 'image-1.png').then(() => null, (e: Error) => e)
-    expect(err!.message).toContain('[403]')
+    expect(urls).toHaveLength(2)
+    expect(err!.message).toContain(`host=${OBSERVED_HOST} [403]`)
+    expect(err!.message).toContain(`host=${UPLOAD_HOST} [403]`)
     expect(err!.message).toContain('uid=u1')
     expect(err!.message).toContain('file=image-1.png')
     expect(err!.message).not.toContain('JWT-SECRET')
@@ -296,10 +317,10 @@ describe('uploadResourceToTrae：② 上传字节 + ③ 拼 URI', () => {
   })
 })
 
-describe('uploadResourceToTrae：douyin.com 域名回退（实测坑）', () => {
+describe('uploadResourceToTrae：上传主机候选顺序与逐个换主机（2026-10-14 真机实证）', () => {
   const BYTES = new Uint8Array([1, 2, 3])
 
-  it('网络层失败 → 换「首个子域标签不变、基域 douyin.com」重试一次', async () => {
+  it('第一个主机（观测值 douyin）网络失败 → 换回广告主机 snssdk 再试一次', async () => {
     const urls: string[] = []
     vi.stubGlobal('fetch', vi.fn(async (url: string) => {
       urls.push(url)
@@ -310,32 +331,119 @@ describe('uploadResourceToTrae：douyin.com 域名回退（实测坑）', () => 
     const uri = await uploadResourceToTrae(ACCOUNT, ticket(), BYTES, 'a.png')
 
     expect(urls).toHaveLength(2)
-    expect(urls[0]).toBe(`https://tos-d-x-lf.snssdk.com/${STORE_URI}`)
-    expect(urls[1]).toBe(`https://tos-d-x-lf.douyin.com/${STORE_URI}`)
+    // 顺序是「观测值优先」：douyin 先，snssdk 后。
+    expect(urls[0]).toBe(`https://${OBSERVED_HOST}/${STORE_URI}`)
+    expect(urls[1]).toBe(`https://${UPLOAD_HOST}/${STORE_URI}`)
     expect(uri).toBe(`trae-res://remote_resource/${STORE_URI}`)
   })
 
-  it('两次都网络失败 → 抛 transport 错误', async () => {
+  it('所有主机都网络失败 → 抛聚合错误，**每个主机的原因都列出**', async () => {
     const urls: string[] = []
     vi.stubGlobal('fetch', vi.fn(async (url: string) => {
       urls.push(url)
       throw new TypeError('fetch failed')
     }))
-    await expect(uploadResourceToTrae(ACCOUNT, ticket(), BYTES, 'a.png')).rejects.toThrow(/transport error/)
+    const err = await uploadResourceToTrae(ACCOUNT, ticket(), BYTES, 'a.png').then(() => null, (e: Error) => e)
+
     expect(urls).toHaveLength(2)
+    expect(err!.message).toContain('Trae resource upload failed')
+    // 两个主机各一条原因，用 ` | ` 分隔（排障时一眼看出「都试过了、都挂了」）。
+    expect(err!.message).toContain(`host=${OBSERVED_HOST} transport:`)
+    expect(err!.message).toContain(`host=${UPLOAD_HOST} transport:`)
+    expect(err!.message).toContain(' | ')
+    // 字节诊断：证明「传上去的确实是图片」，而不是内容被拒。
+    expect(err!.message).toContain(`bytes=${BYTES.length}`)
+    expect(err!.message).toContain('first8=010203')
+    expect(err!.message).toContain(`crc=${crc32Hex(BYTES)}`)
   })
 
-  it('**HTTP 失败不回退**：那是协议/凭据问题，换域名只会把病因掩盖成另一种', async () => {
+  it('**HTTP 400 也要换下一个主机**（旧行为「HTTP 失败不回退」被真机推翻）', async () => {
+    // 真机依据（2026-10-14）：`get_resource_upload_url` 广告 `tos-d-x-lf.snssdk.com`，但官方
+    // 客户端实际发 `tos-d-x-lf.douyin.com`。照广告打时上游回的是 **HTTP 400 + success:-1 +
+    // InvalidFileType**，而字节已验证合法（`bytes=21674 first8=89504e470d0a1a0a` = PNG 魔术
+    // 字节）—— 被拒的是**主机**，不是内容。
+    //
+    // 所以「非 2xx 就放弃」是错的：它会把一个**主机级**的 400 当成**内容/凭据级**的终态，
+    // 整条图片链路就永远卡在广告主机上（真机上就是这么丢图的）。
+    //
+    // 这条用例用「第一个主机 400、第二个主机 200」钉住规则本身：任一主机失败都不得中止候选链。
+    //（线上因为 douyin 排第一，通常压根走不到第二个；规则的价值是在映射未知/反转时兜底。）
     const urls: string[] = []
     vi.stubGlobal('fetch', vi.fn(async (url: string) => {
       urls.push(url)
-      return new Response('nope', { status: 500 })
+      if (urls.length === 1) {
+        return new Response(
+          JSON.stringify({ Version: '', success: -1, error: { code: 400, error: 'InvalidFileType', error_code: 4028 } }),
+          { status: 400 }
+        )
+      }
+      return putResponse(0)
     }))
-    await expect(uploadResourceToTrae(ACCOUNT, ticket(), BYTES, 'a.png')).rejects.toThrow(/\[500\]/)
-    expect(urls).toHaveLength(1)
+
+    const uri = await uploadResourceToTrae(ACCOUNT, ticket(), BYTES, 'image-1.png')
+
+    expect(urls).toHaveLength(2)
+    expect(urls[0]).toBe(`https://${OBSERVED_HOST}/${STORE_URI}`)
+    expect(urls[1]).toBe(`https://${UPLOAD_HOST}/${STORE_URI}`)
+    expect(uri).toBe(`trae-res://remote_resource/${STORE_URI}`)
   })
 
-  it('douyinFallbackHost：只换基域，首个子域标签原样保留', () => {
+  it('所有主机都回 HTTP 400 → 聚合错误里带每个主机的状态码与脱敏响应体', async () => {
+    const urls: string[] = []
+    vi.stubGlobal('fetch', vi.fn(async (url: string) => {
+      urls.push(url)
+      return new Response(
+        JSON.stringify({ Version: '', success: -1, error: { code: 400, error: 'InvalidFileType', error_code: 4028 } }),
+        { status: 400 }
+      )
+    }))
+    const err = await uploadResourceToTrae(ACCOUNT, ticket(), BYTES, 'image-1.png').then(() => null, (e: Error) => e)
+
+    expect(urls).toHaveLength(2)
+    expect(err!.message).toContain(`host=${OBSERVED_HOST} [400]`)
+    expect(err!.message).toContain(`host=${UPLOAD_HOST} [400]`)
+    expect(err!.message).toContain('InvalidFileType')
+    // 失败细节进错误信息，但凭据不进。
+    expect(err!.message).not.toContain('JWT-SECRET')
+    expect(err!.message).not.toContain(FAKE_SESSION_KEY)
+  })
+
+  it('候选链 = [观测主机, 广告主机, 上游其余主机…]（顺序固定，去重）', async () => {
+    const urls: string[] = []
+    vi.stubGlobal('fetch', vi.fn(async (url: string) => {
+      urls.push(url)
+      // 前两台一律 400，逼候选链走到底 —— 这样才能把**完整顺序**钉住（而不是只看第一台）。
+      if (urls.length < 3) return new Response('nope', { status: 400 })
+      return putResponse(0)
+    }))
+
+    await uploadResourceToTrae(
+      ACCOUNT,
+      ticket({ uploadHosts: [UPLOAD_HOST, 'tos-extra.example.com'] }),
+      BYTES,
+      'a.png'
+    )
+
+    expect(urls).toEqual([
+      `https://${OBSERVED_HOST}/${STORE_URI}`,
+      `https://${UPLOAD_HOST}/${STORE_URI}`,
+      `https://tos-extra.example.com/${STORE_URI}`,
+    ])
+  })
+
+  it('候选链去重：上游广告的就是观测主机时只打一次，不重复同一个 URL', async () => {
+    const urls: string[] = []
+    vi.stubGlobal('fetch', vi.fn(async (url: string) => {
+      urls.push(url)
+      return new Response('nope', { status: 400 })
+    }))
+
+    await expect(uploadResourceToTrae(ACCOUNT, ticket({ uploadHosts: [OBSERVED_HOST] }), BYTES, 'a.png'))
+      .rejects.toThrow(/Trae resource upload failed/)
+    expect(urls).toEqual([`https://${OBSERVED_HOST}/${STORE_URI}`])
+  })
+
+  it('douyinFallbackHost：基域映射（观测值优先），只换基域、首个子域标签原样保留', () => {
     expect(douyinFallbackHost('tos-d-x-lf.snssdk.com')).toBe('tos-d-x-lf.douyin.com')
     expect(douyinFallbackHost('https://tos-d-x-lf.snssdk.com/path')).toBe('tos-d-x-lf.douyin.com')
     // 已经在 douyin.com 上 → 没有可换的（避免原地重试一次）

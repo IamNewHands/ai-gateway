@@ -224,11 +224,16 @@ export async function fetchResourceUploadUrl(
 // ===== ② 上传字节 =====
 
 /**
- * 真实上传域名的回退值。
+ * 上传主机的**基域映射**（观测值优先）。
  *
- * **这是实测踩到的坑**：API 广告的是 `tos-d-x-lf.snssdk.com`，浏览器实际发到
- * `tos-d-x-lf.douyin.com` —— 首个子域标签相同，基域不同。规则照抄实证：
- * 「首个子域标签不变，基域换成 `douyin.com`」。
+ * **这是实测踩到的坑**：① `get_resource_upload_url` 广告的是
+ * `tos-d-x-lf.snssdk.com`，而官方 web 客户端真正发的是 `tos-d-x-lf.douyin.com`
+ * —— 首个子域标签相同、基域不同。规则照抄实证：「首个子域标签不变，基域换成
+ * `douyin.com`」。
+ *
+ * ⚠️ 它产出的主机是**候选链的第一位**（不是「失败后才用的回退值」）：
+ * 照广告打 `snssdk.com` 会拿到 `400 InvalidFileType`，而同一份合法 PNG
+ *（`bytes=21674 first8=89504e470d0a1a0a`）打到 `douyin.com` 是 200。
  *
  * 返回 `null` = 没有可换的基域（已经是 `douyin.com`，或主机名没有点）。
  */
@@ -287,9 +292,16 @@ async function putObject(url: string, auth: string, bytes: Uint8Array, crc: stri
  *    （实测语义是 0 = 成功，非 0 = 失败）；响应体解析不出 `success` 时按 2xx 认成功
  *    （中转/代理可能吃掉 body，此时以 HTTP 状态为准）。
  *
- * 域名回退**只在网络层失败（fetch 抛出）时**触发，且只换一次。为什么不在 HTTP 4xx/5xx 上
- * 也回退：那类失败是协议或凭据问题，换域名既救不回来，还会把「凭据不对」伪装成「域名不对」，
- * 并让上游多收一次写请求。
+ * **任一主机失败都换下一台**：transport 失败、非 2xx、`success !== 0` 都继续。
+ *
+ * 为什么不能只回退「网络层失败」（2026-10-14 真机推翻的旧判断）：广告主机
+ * `tos-d-x-lf.snssdk.com` 回的是 **HTTP 400 业务错误**（`InvalidFileType`），
+ * 不是连接失败 —— 只认网络错误就会一直卡在第一个主机上，永远试不到真正可用的
+ * `tos-d-x-lf.douyin.com`。聚合错误会把每台主机的原因都列出来，所以「凭据错」
+ *（两台同状态码）与「主机不对」（一台 400 一台 200）仍然可区分。
+ *
+ * 多打一台不会产生孤儿对象：候选链上所有主机用的是**同一个 `store_uri`**，
+ * 后一枪是覆盖写。
  */
 export async function uploadResourceToTrae(
   account: TraeAccount,
@@ -312,38 +324,50 @@ export async function uploadResourceToTrae(
   const primary = hosts[0]
   if (!primary) throw new Error(`Trae resource upload: upstream returned no upload_hosts (${where})`)
 
-  const candidates = [primary]
-  const fallback = douyinFallbackHost(primary)
-  if (fallback && fallback !== primary) candidates.push(fallback)
+  /**
+   * 候选主机顺序：**观测到能用的放最前**。
+   *
+   * 实测（2026-10-14）：`get_resource_upload_url` 广告的是 `tos-d-x-lf.snssdk.com`，
+   * 而官方 web 客户端真正发的是 `tos-d-x-lf.douyin.com`（子域相同、基域不同）。
+   * 照广告打 `snssdk.com` 时上游回 `400 InvalidFileType`，而字节已验证是合法 PNG
+   *（`bytes=21674 first8=89504e470d0a1a0a`）—— 说明被拒的不是内容，是那个主机。
+   */
+  const candidates: string[] = []
+  const observed = douyinFallbackHost(primary)
+  if (observed && observed !== primary) candidates.push(observed)
+  candidates.push(primary)
+  for (const h of hosts.slice(1)) if (!candidates.includes(h)) candidates.push(h)
 
   const crc = crc32Hex(bytes)
-  let lastTransport = ''
+  const failures: string[] = []
   for (const host of candidates) {
     const url = uploadUrlFor(host, storeUri)
     let result: PutResult
     try {
       result = await putObject(url, auth, bytes, crc)
     } catch (e) {
-      lastTransport = `host=${host} ${(e as Error).message || String(e)}`
+      failures.push(`host=${host} transport: ${(e as Error).message || String(e)}`)
       continue
     }
+    // **任何非 2xx 都要换主机再试**，不能只认「网络层失败」：实测 `snssdk.com` 回的是
+    // 业务错误 400 而不是连接失败，只回退网络错误就会一直卡在第一个主机上。
     if (!result.ok) {
-      // 诊断字段刻意带上 `bytes` / `first8`：`InvalidFileType` 这类拒绝，唯一能区分
-      // 「字节根本不是图片」与「字节是图片但协议另有要求」的证据就是长度 + 魔术字节。
-      // 响应体放宽到 800 字符：实测 200 字符会在 `error_code` 处被切断，恰好切掉原因。
-      throw new Error(
-        `Trae resource upload [${result.status}] (${where} bytes=${bytes.length} first8=${hexPreview(bytes)} crc=${crc}): ${redactCredentials(result.body).slice(0, 800)}`
+      failures.push(
+        `host=${host} [${result.status}]: ${redactCredentials(result.body).slice(0, 800)}`
       )
+      continue
     }
     const success = readSuccessFlag(result.body)
     if (success !== null && success !== 0) {
-      throw new Error(
-        `Trae resource upload rejected (success=${success}) (${where} bytes=${bytes.length} first8=${hexPreview(bytes)} crc=${crc}): ${redactCredentials(result.body).slice(0, 800)}`
-      )
+      failures.push(`host=${host} rejected (success=${success}): ${redactCredentials(result.body).slice(0, 800)}`)
+      continue
     }
     return `trae-res://${bizType}/${storeUri}`
   }
-  throw new Error(`Trae resource upload transport error (${where}): ${lastTransport || 'no upload host tried'}`)
+  // 全部主机都失败：把字节诊断与每个主机的原因一起抛出，便于一眼定位。
+  throw new Error(
+    `Trae resource upload failed (${where} bytes=${bytes.length} first8=${hexPreview(bytes)} crc=${crc}): ${failures.join(' | ') || 'no upload host tried'}`
+  )
 }
 
 /** 前 8 字节的 hex（诊断「传上去的到底是不是图片」；不含任何凭据）。 */

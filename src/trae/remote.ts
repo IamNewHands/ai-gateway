@@ -733,7 +733,10 @@ export async function createRemoteSession(
       attachments = outcome.attachments
       if (outcome.failures.length > 0) {
         const first = outcome.failures[0]
-        const reason = String(first.reason ?? '').slice(0, 160)
+        // 600 而不是 160：上传失败现在是**聚合**错误（多主机候选链），前 ~100 字符是
+        // `... bytes= first8= crc=): ` 前缀，160 会把第二台主机的原因整段截掉，
+        // 让「两台都试过」在日志里看起来像「只打了一台」。
+        const reason = String(first.reason ?? '').slice(0, 600)
         // 只含张数与已脱敏的原因（`resource-upload.ts` 保证错误信息里没有 auth/session_key）。
         console.warn(
           `[trae-remote] image upload failed: requested=${opts.imageParts.length}`
@@ -746,7 +749,7 @@ export async function createRemoteSession(
         opts.trace.imageAttachments = attachments.length
         opts.trace.imageUploadFailed = outcome.failures.length
         opts.trace.imageUploadError = outcome.failures.length > 0
-          ? String(outcome.failures[0].reason ?? '').slice(0, 160)
+          ? String(outcome.failures[0].reason ?? '').slice(0, 600)
           : undefined
       }
     } else if (opts.trace) {
