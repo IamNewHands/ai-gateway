@@ -660,6 +660,14 @@ export interface RemoteSessionTrace {
   imageUploadFailed?: number
   /** 首条上传失败原因（**已脱敏、已截断**，可直接进日志） */
   imageUploadError?: string
+  /**
+   * **成功**上传时命中的变体摘要，如 `mime+crc=2`（没有成功图时是空串）。
+   *
+   * 为什么必须回填它：变体阶梯是一次性实验，而面板 durable 日志是唯一读数入口 ——
+   * 只知道「图传上去了」没用，**必须知道是哪一档赢的**，否则没法把阶梯收敛成只留那一档
+   *（命中信息原本只走 `console.log`，面板里看不到）。
+   */
+  imageVariantSummary?: string
   /** 图片没上传的原因：`model-not-multimodal` / `model-config-unresolved` */
   imageSkipReason?: string
 }
@@ -748,6 +756,9 @@ export async function createRemoteSession(
         opts.trace.imageParts = opts.imageParts.length
         opts.trace.imageAttachments = attachments.length
         opts.trace.imageUploadFailed = outcome.failures.length
+        // 成功命中的变体也要回填：失败时 `variantSummary` 是空串，原因由
+        // `imageUploadError`（走 warn 日志）承载；成功时它是唯一的读数。
+        opts.trace.imageVariantSummary = outcome.variantSummary
         opts.trace.imageUploadError = outcome.failures.length > 0
           ? String(outcome.failures[0].reason ?? '').slice(0, 600)
           : undefined

@@ -903,6 +903,10 @@ async function proxyTraeRemoteRequest(
             // query 长度：源侧 Remote 对超长 query 有静默上限（约 480k），超了上游直接丢
             // 会话且不发 done —— 症状与「executor 不启动」一样，只有这个数字能区分两者。
             + ` query=${trace.queryChars ?? -1}`
+            // 变体阶梯的实验读数：成功时是哪一档赢的（失败时空串，原因在下面的 warn 日志里）。
+            // 没有这个字段，命中信息只走 console.log，面板 durable 日志里看不到 ——
+            // 而「是哪一档赢的」正是把阶梯收敛成只留那一档的唯一依据。
+            + ` img_variant=${trace.imageVariantSummary || '-'}`
           console.log(sessionMsg) // codeql-disable: 纯诊断日志，不含密钥/敏感 token
           writeLog(env, 'info', sessionMsg).catch(() => { /* 日志失败不影响流 */ })
 
