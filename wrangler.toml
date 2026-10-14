@@ -59,8 +59,12 @@ dataset = "ai_gateway_usage"
 # 夜猫子 black_cat 只在 CST 23:00–08:00 窗口内计数（官方规则「每天 1 次 × 累计 3 天」），
 # 而签到的 10:05/22:05 都不在窗口内 —— 没有这条 cron，夜猫子永远不会被点亮。
 # 取 23:30 而非 23:00：避开窗口边界，且给当日的活跃上报留出时间。
+#
+# 每 5 分钟那条是 TRAE Remote 的**僵尸会话回收**（见 src/trae/session-registry.ts）：
+# 隔离进程在「建好会话」与「发出 stop」之间死掉时，会话 id 再无人知晓，只能靠 KV 登记
+# + 租约过期兜底。上游槽位积满后不报错、只让新会话排队（executor 不启动），故不能省。
 [triggers]
-crons = ["0 */2 * * *", "5 2,14 * * *", "0 * * * *", "0 20 * * *", "30 15 * * *"]
+crons = ["0 */2 * * *", "5 2,14 * * *", "0 * * * *", "0 20 * * *", "30 15 * * *", "*/5 * * * *"]
 
 # Admin credentials (set these in Cloudflare Dashboard > Workers > Variables)
 # [vars]

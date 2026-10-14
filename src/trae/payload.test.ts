@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest'
-import { prepareBody, applyHistoryBudget, applyToolSchemaBudget, isRemoteOnlyModel } from './payload'
+import { prepareBody, applyHistoryBudget, applyToolSchemaBudget, flattenTraeQuery, isRemoteOnlyModel } from './payload'
 
 function msg(role: string, content: string): Record<string, any> {
   return { role, content }
@@ -146,5 +146,105 @@ describe('prepareBody：上游角色白名单归一化（SOLO 只认 system/assi
     }
     const parsed = JSON.parse(prepareBody(JSON.stringify(body)))
     expect(parsed.messages.map((m: { role: string }) => m.role)).toEqual(['system', 'user', 'assistant', 'tool', 'system'])
+  })
+})
+
+// ===== Remote 扁平 query 的多模态（源侧 trae_client.flatten_query 口径） =====
+
+/** 取出扁平 query 里的整段文本（形态固定：单条 text block）。 */
+function queryText(messages: unknown): string {
+  return JSON.parse(flattenTraeQuery(messages))[0].data.content
+}
+
+describe('flattenTraeQuery：多模态图片（源侧不支持图片，结论已写进 contentToText 注释）', () => {
+  it('文本与图片混排 → 文本保留，图片位置只留一个空元素（源侧 "\n".join 的实际输出）', () => {
+    const text = queryText([
+      {
+        role: 'user',
+        content: [
+          { type: 'text', text: '看图' },
+          { type: 'image_url', image_url: { url: 'data:image/png;base64,AAAA' } },
+          { type: 'text', text: '然后改配置' },
+        ],
+      },
+    ])
+    // 源侧 `parts.append(text or "")` 会为空块占一个元素，join 出来就是两个连续换行。
+    expect(text).toBe('看图\n\n然后改配置')
+  })
+
+  it('纯图片消息 → 整段文本为空串（源侧就是丢掉，没有占位文案）', () => {
+    expect(queryText([{ role: 'user', content: [{ type: 'image_url', image_url: { url: 'https://x/y.png' } }] }])).toBe('')
+  })
+
+  it('不发明新格式：base64、远程 URL、任何 image/Unsupported 占位都不得出现', () => {
+    const text = queryText([
+      {
+        role: 'user',
+        content: [
+          { type: 'image_url', image_url: { url: 'data:image/png;base64,SECRETB64' } },
+          { type: 'image_url', image_url: { url: 'https://example.com/secret.png' } },
+        ],
+      },
+    ])
+    expect(text).not.toContain('SECRETB64')
+    expect(text).not.toContain('secret.png')
+    expect(text.toLowerCase()).not.toContain('image')
+    expect(text).not.toContain('Unsupported')
+  })
+
+  it('Anthropic 风格 image 块（source.base64）同样只留空元素', () => {
+    const text = queryText([
+      {
+        role: 'user',
+        content: [
+          { type: 'text', text: 'A' },
+          { type: 'image', source: { type: 'base64', media_type: 'image/png', data: 'SECRET' } },
+        ],
+      },
+    ])
+    expect(text).toBe('A\n')
+  })
+
+  it('图片消息不污染相邻消息的文本', () => {
+    const text = queryText([
+      { role: 'system', content: 'S' },
+      { role: 'user', content: [{ type: 'image_url', image_url: { url: 'x' } }] },
+      { role: 'user', content: 'U' },
+    ])
+    expect(text).toBe('[System]\nS\n\n\n\nU')
+  })
+
+  it('多模态消息不改变 query 形态：仍是单条 text block', () => {
+    const out = JSON.parse(flattenTraeQuery([
+      { role: 'user', content: [{ type: 'image_url', image_url: { url: 'x' } }, { type: 'text', text: 'T' }] },
+    ]))
+    expect(out).toHaveLength(1)
+    expect(out[0].type).toBe('text')
+    expect(out[0].data.content).toBe('\nT')
+  })
+
+  it('reasoning 块仍被丢弃（本仓库对源侧的有意分歧，与 remote.test.ts 同口径）', () => {
+    const text = queryText([
+      { role: 'user', content: [{ type: 'text', text: 'A' }, { type: 'reasoning', text: 'SECRET' }] },
+    ])
+    expect(text).toBe('A')
+  })
+
+  it('renderer 的 value 块仍能取到文本（多模态改动不误伤这条路径）', () => {
+    expect(queryText([{ role: 'user', content: [{ type: 'text', value: 'V' }] }])).toBe('V')
+    expect(
+      queryText([
+        {
+          role: 'user',
+          content: [
+            { type: 'tool_result', value: [{ type: 'text', value: 'R1' }, { type: 'text', value: 'R2' }] },
+          ],
+        },
+      ]),
+    ).toBe('R1\nR2')
+  })
+
+  it('非数组 messages → 仍是合法 JSON 且 content 为空（回归）', () => {
+    expect(queryText(null)).toBe('')
   })
 })

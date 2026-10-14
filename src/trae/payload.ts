@@ -174,11 +174,62 @@ export function isRemoteOnlyModel(model: string, cfg: string): boolean {
 // ===== Remote 传输的 query 扁平化（移植自 Trae2api-cn `flatten_query`） =====
 
 /**
- * 把 content 归一化成纯文本（源侧 `_content_to_text`）。
+ * 源侧 `cli_client.renderer_block_text`：Trae 桌面渲染器把文本放在 `value` 而不是
+ * `text`/`content`（`{type:"text",value:…}`、`{type:"tool_result",value:[…]}`），
+ * 不取 `value` 这些块会被读成空串。
+ *
+ * 与 `remote-messages.ts` 里同名的那份**故意各留一份**：那边跟的是源侧
+ * `raw_client._content_to_text`（图片块会产出 `[Unsupported image_url input omitted]`），
+ * 这边跟的是源侧 `trae_client._content_to_text`（图片块塌成空串）。共用一个 helper
+ * 会把源侧本来就分叉的两套语义重新绑死。
+ */
+function rendererBlockText(block: Record<string, any>): string {
+  const value = block['value']
+  if (typeof value === 'string') return value
+  if (Array.isArray(value)) {
+    const parts: string[] = []
+    for (const item of value) {
+      if (typeof item === 'string') {
+        parts.push(item)
+        continue
+      }
+      if (item && typeof item === 'object' && !Array.isArray(item)) {
+        const nested = item as Record<string, any>
+        // 源侧 `item.get("text") or item.get("content") or item.get("value")`：取第一个真值。
+        const text = nested['text'] || nested['content'] || nested['value']
+        if (typeof text === 'string') parts.push(text)
+      }
+    }
+    // 源侧 `"\n".join(part for part in parts if part)`：空串不参与拼接。
+    return parts.filter(Boolean).join('\n')
+  }
+  return ''
+}
+
+/**
+ * 把 content 归一化成纯文本（源侧 `trae_client._content_to_text` + `cli_client.renderer_block_text`）。
  *
  * Remote 端点的 `query` 是**一个扁平字符串**（不是结构化消息数组），所以多模态 / 内容块
  * 必须先降级成文本。推理类块（`reasoning`/`thinking`）刻意丢弃——那是上一轮模型的思考链，
- * 回灌给上游既费 token 又会诱导它复述。
+ * 回灌给上游既费 token 又会诱导它复述。**这条是本仓库对源侧的有意分歧**：源侧那份
+ * `_content_to_text` 没有 reasoning 概念，会把思考文本一起拼进去（回归用例见
+ * `remote.test.ts` 的「数组 content 里的 reasoning 块被丢弃」）。
+ *
+ * ## 图片：源侧不支持，也不做占位（2026-10-15 读源确认，结论就是这一句）
+ *
+ * 源侧 Remote 通路对图片**没有结构化字段、没有 data URI 透传、也没有占位文案**：
+ * `flatten_query` 调的是 `trae_client._content_to_text`，它只读 `text` / `content`，
+ * 两者都空才回落到 `renderer_block_text` 读 `value`；`image_url` / `image` 块三样都没有，
+ * 于是产出**空串**、被 `"\n".join` 原样拼进去（净效果：图片位置多一个换行）。
+ *
+ * 源侧另有一份同名的 `raw_client._content_to_text` 会产出
+ * `[Unsupported image_url input omitted]`，但**那条路径不经过 Remote 的 flatten**
+ * （它只被 `_remote_client_tool_task_anchor` 用，见 `remote-messages.ts`）——
+ * 两份同名函数在源侧就是分叉的，别拿另一份的结论套这一份。
+ *
+ * 所以这里照抄源侧行为：图片块贡献空串，**不发明**任何新格式（不加 `[image]` 占位、
+ * 不透传 base64、不改结构化字段）。真要让上游看图，走 `vision/bridge.ts` 在进提供商
+ * 之前把图片换成转写文本——那条桥是网关自己的机制，与源侧无关。
  */
 function contentToText(content: unknown): string {
   if (content === null || content === undefined) return ''
@@ -194,12 +245,20 @@ function contentToText(content: unknown): string {
         const block = c as Record<string, any>
         const type = String(block['type'] || '').toLowerCase()
         if (type === 'reasoning' || type === 'thinking' || type === 'reasoning_text') continue
-        const text = block['text'] ?? block['content'] ?? block['value']
-        if (typeof text === 'string') parts.push(text)
-        else if (text !== undefined && text !== null) parts.push(String(text))
+        // 源侧 `c.get("text") or c.get("content")`；两者都空才回落到 renderer 的 `value`。
+        const direct = block['text'] || block['content']
+        const text =
+          direct === null || direct === undefined || direct === ''
+            ? rendererBlockText(block)
+            : direct
+        // 源侧 `parts.append(text or "")`：取不到文本的块（图片就是这一类）也占一个空元素，
+        // 因此 join 出来会多一个换行 —— 这是源侧的实际输出，不是漏写。
+        // 源侧对「非空但非字符串」的 text 会直接 append 原值（Python join 会抛），
+        // 这里退化成空串，是全文件唯一一处有意比源侧更保守的地方。
+        parts.push(typeof text === 'string' ? text : '')
         continue
       }
-      if (c !== null && c !== undefined) parts.push(String(c))
+      // 源侧对既不是 dict 也不是 str 的元素**直接跳过**（不 append），照抄。
     }
     return parts.join('\n')
   }
@@ -249,6 +308,9 @@ function serializeToolCalls(toolCalls: unknown): string {
  *
  * 与 SOLO 的 `prepareBody` 是两套格式：SOLO 走结构化 `messages`（content 转
  * `[{type:"text",text}]`），Remote 走这一条扁平 query。两者不可互换。
+ *
+ * 多模态见 `contentToText`：源侧 Remote 通路不支持图片，图片块只贡献一个空元素
+ * （结论与依据都写在那个函数的注释里，别在这里另立一套说法）。
  */
 export function flattenTraeQuery(messages: unknown): string {
   const list = Array.isArray(messages) ? messages : []

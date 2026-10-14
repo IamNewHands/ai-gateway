@@ -600,6 +600,28 @@ export interface WebStreamOptions {
    * 附带收益：模型一说完就释放槽位，不必等客户端把流慢慢读完。
    */
   onDone?: () => void
+  /**
+   * 流**正常收尾**时回传一次可比指标（诊断 / 验收用）。
+   *
+   * 为什么不能复用 `onDone`：它触发时思考摘要还没算出来（`reasoningChars` 恒为 0），
+   * 而「思考强度到底有没有生效」唯一可比的量就是思考字符数 —— 同一道题在 `light` 与
+   * `extra_high` 下的 `reasoningChars` 若没有量级差，说明档位根本没被上游采纳。
+   */
+  onFinish?: (info: WebStreamDoneInfo) => void
+}
+
+/**
+ * 流收尾指标。
+ *
+ * `reasoningChars` 是核对思考强度的**可比量**：同一 prompt 下它应随档位单调增长
+ *（`light` < `high` < `extra_high`）。若三档的字符数几乎相同，则档位未生效 ——
+ * 要么上游忽略了字段，要么我们在下发前就被钳制掉了。
+ */
+export interface WebStreamDoneInfo {
+  contentChars: number
+  reasoningChars: number
+  sawToolCalls: boolean
+  finishReason: string
 }
 
 /** 从 OpenAI `tools` 字段抽出工具名集合（`undefined` = 未声明，`Set()` = 显式禁用）。 */
@@ -920,6 +942,17 @@ export function webStreamToOpenAIStream(
 
       if (!hasToolCalls && !streamedText && !sawReasoningOutput) {
         writeChunk({ content: '(trae upstream returned an empty response)' }, '')
+      }
+      // 收尾指标（见 WebStreamDoneInfo）：思考字符数是「档位有没有生效」的唯一可比量。
+      if (opts.onFinish) {
+        try {
+          opts.onFinish({
+            contentChars,
+            reasoningChars,
+            sawToolCalls: hasToolCalls,
+            finishReason: remoteFinishReason(finalReason, hasToolCalls),
+          })
+        } catch { /* 诊断不得影响流 */ }
       }
       writeChunk({}, remoteFinishReason(finalReason, hasToolCalls))
       writeDone()

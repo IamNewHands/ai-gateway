@@ -22,12 +22,27 @@ import {
   TRAE_REMOTE_CONNECT_TIMEOUT_MS,
   TRAE_REMOTE_CONSTANTS,
   TRAE_REMOTE_FIRST_EVENT_TIMEOUT_MS,
+  TRAE_REMOTE_PARALLEL_LIMIT,
   TRAE_REMOTE_STREAM_TIMEOUT_MS,
   normalizeTraeModelName,
 } from './constants'
 import { flattenTraeQuery } from './payload'
 import { applyReasoningEffort, type TraeEffortLevel } from './reasoning-effort'
 import type { TraeAccount, TraeErrKind, TraeReasoningEffortConfig, TraeRemoteEvent, TraeRemoteModelConfig } from './types'
+
+/**
+ * Remote 的**实际**每账号并发上限。
+ *
+ * 面板配置为 0（= 不限）时也必须收敛到 `TRAE_REMOTE_PARALLEL_LIMIT`，这是 Remote 与
+ * SOLO 的关键差别：SOLO 一条 POST 打完就结束，上游不按「运行中的会话」计并发；Remote
+ * 的会话在整条事件流期间都占着槽位，而槽位满了上游**不报错**、只让新会话排队
+ *（executor 永不启动，客户端只见心跳）。
+ *
+ * 面板配得比上游上限更大同样没有意义（上游照样排队），所以取 `min`。
+ */
+export function effectiveRemoteConcurrency(configured: number): number {
+  return configured > 0 ? Math.min(configured, TRAE_REMOTE_PARALLEL_LIMIT) : TRAE_REMOTE_PARALLEL_LIMIT
+}
 
 // ===== 基址 =====
 
@@ -600,8 +615,27 @@ export interface CreateRemoteSessionOptions {
   sessionVariant?: string
   /** 客户端请求体（供 reasoning_effort 读取） */
   requestBody?: unknown
-  /** 诊断：把 effort/max 结果写回调用方 */
-  trace?: { maxModeApplied?: boolean; reasoningEffortApplied?: TraeEffortLevel | '' }
+  /** 诊断：把 effort / max / query 长度等结果写回调用方（见 RemoteSessionTrace） */
+  trace?: RemoteSessionTrace
+}
+
+/**
+ * `createRemoteSession` 回填的诊断信息（建会话阶段**实际**发生了什么）。
+ *
+ * 这些字段存在的唯一理由是：Remote 的失败常常是**静默**的 —— 档位被忽略、会话被丢弃
+ * 都不报错。没有回填，日志只能证明「我们发了什么」，证明不了「上游收下了什么」。
+ */
+export interface RemoteSessionTrace {
+  maxModeApplied?: boolean
+  reasoningEffortApplied?: TraeEffortLevel | ''
+  /**
+   * 扁平化后的 `query` 字符数。
+   *
+   * 源侧 Remote 对超长 query 有**静默上限**（`_bounded_remote_query`，约 480k 字符），
+   * 超了上游不发 `done`、直接丢会话 —— 客户端看到的就是「没有内容」，与 executor
+   * 不启动的症状**完全一样**。没有这个数字，那种失败只能靠猜。
+   */
+  queryChars?: number
 }
 
 export interface CreateRemoteSessionResult {
@@ -651,10 +685,14 @@ export async function createRemoteSession(
   const variant = useMaxMode ? 'max' : String(opts.sessionVariant ?? '')
   const sessionId = await remoteModelSessionId(accountId, resolved.modelName || model, variant, opts.sessionId)
 
+  // 扁平化一次并留住长度：`query` 是 Remote 唯一的对话载体，而源侧对超长 query 有
+  // **静默上限**（约 480k 字符）—— 超了上游不发 done、直接丢会话，症状与「executor
+  // 不启动」完全一样。长度是区分这两种失败的唯一线索。
+  const query = flattenTraeQuery(messages)
   const initialMessage: Record<string, any> = {
     chat_session_id: '',
     content: [],
-    query: flattenTraeQuery(messages),
+    query,
     model_name: resolved.modelName,
     agent_type: agentType,
     agent_id: agentType,
@@ -700,6 +738,7 @@ export async function createRemoteSession(
   if (opts.trace) {
     opts.trace.maxModeApplied = useMaxMode
     opts.trace.reasoningEffortApplied = appliedEffort
+    opts.trace.queryChars = query.length
   }
 
   let resp: Response
@@ -875,8 +914,14 @@ export async function* streamRemoteEvents(
     idleTimeoutMs?: number
     /** 诊断：首个原始字节片段（判定「上游发没发、什么形态」） */
     onRawHead?: (head: string) => void
-    /** 诊断：首个模型事件名（判定「流是活的」） */
-    onFirstModelEvent?: (name: string) => void
+    /**
+     * 诊断：首个模型事件（判定「流是活的」）。
+     *
+     * 带上 `data` 是为了核对上游**有没有回显我们下发的思考档位**：`model_config` 是
+     * 首个模型事件，它若回显了档位字段，那就是「档位真的被采纳」的直接证据 ——
+     * 只看我们自己的日志只能证明「我们发了」，证明不了「上游收了」。
+     */
+    onFirstModelEvent?: (name: string, data: Record<string, any>) => void
   }
 ): AsyncGenerator<TraeRemoteEvent> {
   const base = remoteBaseUrl(opts?.baseUrl)
@@ -993,7 +1038,7 @@ export async function* streamRemoteEvents(
         }
         if (REMOTE_MODEL_EVENTS.has(ev.event)) {
           if (!sawModelEvent && opts?.onFirstModelEvent) {
-            try { opts.onFirstModelEvent(ev.event) } catch { /* 诊断不影响流 */ }
+            try { opts.onFirstModelEvent(ev.event, ev.data) } catch { /* 诊断不影响流 */ }
           }
           sawModelEvent = true
         }

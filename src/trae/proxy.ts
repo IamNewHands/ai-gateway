@@ -18,8 +18,15 @@ import { chatStream, chatWorkStream, exchangeToken, extractLastUserPrompt, isTra
 import { isRemoteOnlyModel, type HistoryBudget } from './payload'
 import { aggregateSoloSse, aggregateWorkSse, soloStreamToOpenAIStream, workStreamToOpenAIStream } from './sse'
 import { aggregateWebSse, webStreamToOpenAIStream } from './web-sse'
-import { createRemoteSession, preflightFirstModelEvent, streamRemoteEvents, stopRemoteSession } from './remote'
-import { requestedEffortLevel, type TraeEffortLevel } from './reasoning-effort'
+import { createRemoteSession, effectiveRemoteConcurrency, preflightFirstModelEvent, streamRemoteEvents, stopRemoteSession, type RemoteSessionTrace } from './remote'
+import { countImageBlocks, historyHasToolProtocol, prepareRemoteMessages } from './remote-messages'
+import {
+  TRAE_REMOTE_LEASE_TOUCH_MS,
+  registerRemoteSession,
+  touchRemoteSession,
+  unregisterRemoteSession,
+} from './session-registry'
+import { rawRequestedEffort, reasoningDisabledByRequest, requestedEffortLevel, type TraeEffortLevel } from './reasoning-effort'
 import type { TraeRemoteEvent } from './types'
 import type { SOLOStreamError, TraeAccount } from './types'
 import { writeLog } from '../admin'
@@ -696,10 +703,46 @@ async function proxyTraeRemoteRequest(
   const cd = resolveTraeCooldown(provider)
   const tried = new Set<string>()
   let lastErr: Error | null = null
+  /**
+   * 已建立会话的收尾钩子。刻意放在 `try` **外面**：非流式路径的聚合/记账若抛错，
+   * 会走外层 catch，而那时 `try` 内声明的局部变量不可见 —— 会话就会停在
+   * 「已建、未停」状态并占住上游槽位。这里提前挂一个引用，异常出口也能回收。
+   */
+  let stopActiveSession: (() => void) | null = null
   const baseUrl = provider.baseUrl || null
   const agentType = provider.traeRemoteAgentType === 'work' ? 'solo_work_remote' : 'solo_agent_remote'
-  const concurrency = typeof provider.traeConcurrency === 'number' ? provider.traeConcurrency : 0
+  // 并发上限必须**默认生效**：Remote 的会话在整条事件流期间都占住上游槽位，而槽位满了
+  // 上游**不报错**、只让新会话排队（executor 永不启动，客户端只见心跳）。
+  // 详见 TRAE_REMOTE_PARALLEL_LIMIT 的注释。
+  const configuredConcurrency = typeof provider.traeConcurrency === 'number' ? provider.traeConcurrency : 0
+  const concurrency = effectiveRemoteConcurrency(configuredConcurrency)
   const idleMs = typeof provider.traeSessionIdleMs === 'number' ? provider.traeSessionIdleMs : 0
+
+  // 消息预处理（工具任务锚点 + 工具目录提示）在**建会话之前**做一次：档位兜底会建两次
+  // 会话，复用同一份结果，避免两次请求的消息形态不一致。
+  //
+  // 为什么必须有「工具目录提示」：Remote 的 `query` **不携带 tools 字段**，上游因此
+  // 完全不知道调用方声明了哪些工具，也就调不出来。源侧靠 `_messages_with_client_runtime`
+  // 把工具目录序列化进 system 提示补上这一环。
+  //
+  // 两个 gate 刻意**分开**（源侧口径）：锚点看「有没有工具能力」（含扫历史），
+  // 目录提示只看请求体的 tools。
+  const remoteMessages = prepareRemoteMessages(body['messages'], {
+    hasTools: (Array.isArray(body['tools']) && (body['tools'] as unknown[]).length > 0)
+      || historyHasToolProtocol(body['messages']),
+    tools: body['tools'],
+  })
+
+  // 诊断：Remote 照源侧**丢弃**图片且不报错（`flatten_query` 只读 text/content），
+  // 而 DSH 给 trae 模型声明了 `input: [text, image]` —— 不写这行，用户附图被吃掉是
+  // 完全无声的，只会表现为「模型答非所问」。
+  const droppedImages = countImageBlocks(body['messages'])
+  if (droppedImages > 0) {
+    const imgMsg = `[trae-remote] provider=${provider.id} model=${configName}`
+      + ` dropped_images=${droppedImages} reason=remote-query-carries-no-images`
+    console.log(imgMsg) // codeql-disable: 纯诊断日志，不含密钥/敏感 token
+    void writeLog(env, 'warn', imgMsg).catch(() => { /* 日志失败不影响请求 */ })
+  }
 
   // 收尾动作绑到请求生命周期上（见 TraeRunCtx 注释）：响应结束后未登记的异步任务
   // 会被 Workers 直接丢弃，回收静默失败就退化成会话泄漏。
@@ -718,7 +761,10 @@ async function proxyTraeRemoteRequest(
   if (configuredEffort && !requestedEffortLevel(rescued)) {
     requestBody = { ...rescued, reasoning_effort: configuredEffort }
   }
-  const includeReasoning = requestedEffortLevel(requestBody) !== ''
+  // 下发思考内容的前提：客户端要了档位，**且**没有明确说「不要思考」。
+  // 后者必须单独判：`none` 会被归一化成最低档 `light`，光看归一化结果会把
+  // 「不要思考」误读成「要一点点思考」，进而把 reasoning_content 发出去。
+  const includeReasoning = requestedEffortLevel(requestBody) !== '' && !reasoningDisabledByRequest(requestBody)
 
   for (let i = 0; i < MAX_ROTATE; i++) {
     const account = await pickTraeAccount(env, provider.id, accounts, tried, provider.preferTraeUid, concurrency, idleMs)
@@ -780,6 +826,7 @@ async function proxyTraeRemoteRequest(
       let session: Awaited<ReturnType<typeof createRemoteSession>> | null = null
       let events: AsyncGenerator<TraeRemoteEvent> | null = null
       let effortNote = ''
+      let appliedEffort: TraeEffortLevel | '' = ''
       let maxNote = ''
       let usedTier = agentType
       let terminalResponse: Response | null = null
@@ -788,18 +835,28 @@ async function proxyTraeRemoteRequest(
       for (const tier of tiers) {
         if (session) break
         // 建会话失败按错误类别定责——401 是账号级，429 软冷却，其余累计。
-        const trace: { maxModeApplied?: boolean; reasoningEffortApplied?: TraeEffortLevel | '' } = {}
+        const trace: RemoteSessionTrace = {}
         // 在 try 外声明：兜底/失败路径要能**回收**这个会话。漏回收会占住上游并发槽位
         //（实测上限 2），积满后新会话只排队、executor 不启动 —— 那正是本轮现场。
         let created: Awaited<ReturnType<typeof createRemoteSession>> | null = null
         try {
-          created = await createRemoteSession(account, configName, body['messages'], {
+          created = await createRemoteSession(account, configName, remoteMessages, {
             baseUrl,
             agentType: tier,
             maxMode: provider.traeRemoteMaxMode === true,
             requestBody,
             trace,
             sessionVariant: tierFallbackUsed ? 'work-fallback' : '',
+          })
+          // 登记存活会话（见 session-registry 注释）：隔离进程若在「建会话」与「回收」
+          // 之间直接死掉，就再没人知道这个 id —— 只能靠 KV 登记 + cron 的 reaper 兜底。
+          void registerRemoteSession(env, provider.id, {
+            uid: account.uid,
+            sessionId: created.sessionId,
+            messageId: created.messageId,
+            agentType: tier,
+            startedAt: Date.now(),
+            lastSeenAt: Date.now(),
           })
           // 预读首个模型事件（心跳不算 —— 见 preflightFirstModelEvent 注释）。
           const probe = streamRemoteEvents(account, created.sessionId, created.messageId, {
@@ -809,6 +866,15 @@ async function proxyTraeRemoteRequest(
             // 与外层预读用**同一个**窗口：两处不一致会让内外死线乱响，
             // 报出来的 ms 也对不上（实测踩过：报 4760ms，其实是外层 120s 预算的剩余量）。
             firstEventTimeoutMs: probeMs,
+            // 上游是否**回显**了我们下发的档位：`model_config` 是首个模型事件，它若带档位
+            // 字段，就是「档位被采纳」的直接证据 —— 只看我们自己的日志只能证明「我们发了」。
+            onFirstModelEvent: (name, data) => {
+              if (name !== 'model_config') return
+              const mcMsg = `[trae-remote] provider=${provider.id} uid=${account.uid} model=${configName}`
+                + ` phase=model-config data=${JSON.stringify(data).slice(0, 800)}`
+              console.log(mcMsg) // codeql-disable: 上游模型配置回显，不含密钥
+              writeLog(env, 'info', mcMsg).catch(() => { /* 日志失败不影响流 */ })
+            },
             // 「上游到底发没发、发的什么形态」的直接证据，只在首个非空片段触发一次。
             // 没有它，「会话建起来了但一直没内容」只能靠猜（上游事件体只有模型输出，无凭据）。
             onRawHead: (head) => {
@@ -822,12 +888,17 @@ async function proxyTraeRemoteRequest(
           session = created
           events = pre.rest
           usedTier = tier
+          appliedEffort = trace.reasoningEffortApplied || ''
           effortNote = trace.reasoningEffortApplied ? ` effort=${trace.reasoningEffortApplied}` : ''
           maxNote = trace.maxModeApplied ? ' max_mode=on' : ''
           // 这条日志是「Remote 到底跑没跑、哪个档位、首事件到没到」的直接证据。
           const sessionMsg = `[trae-remote] provider=${provider.id} uid=${account.uid} model=${configName}`
             + ` phase=session session=${created.sessionId} msg=${created.messageId}`
             + ` agent=${tier} first=${pre.head.event}${effortNote}${maxNote}`
+            + ` req=${rawRequestedEffort(requestBody) || '(none)'}`
+            // query 长度：源侧 Remote 对超长 query 有静默上限（约 480k），超了上游直接丢
+            // 会话且不发 done —— 症状与「executor 不启动」一样，只有这个数字能区分两者。
+            + ` query=${trace.queryChars ?? -1}`
           console.log(sessionMsg) // codeql-disable: 纯诊断日志，不含密钥/敏感 token
           writeLog(env, 'info', sessionMsg).catch(() => { /* 日志失败不影响流 */ })
         } catch (e) {
@@ -836,7 +907,16 @@ async function proxyTraeRemoteRequest(
           // 这是本轮事故的核心：漏回收 → 槽位积满 → 之后每个新会话只排队、executor 不启动
           //（表现为「只发心跳、永远没有首个模型事件」），还会叠加上游 429。
           if (created) {
-            defer(stopRemoteSession(account, created.sessionId, created.messageId, { baseUrl, agentType: tier }))
+            const failedSessionId = created.sessionId
+            const failedMessageId = created.messageId
+            defer((async () => {
+              try {
+                await stopRemoteSession(account, failedSessionId, failedMessageId, { baseUrl, agentType: tier })
+              } finally {
+                // 无论停成功与否都摘登记：停不掉的记录留着只会让 reaper 每轮重试一次。
+                await unregisterRemoteSession(env, provider.id, failedSessionId)
+              }
+            })())
           }
           // 并发上限是「账号资源被占满」，换 executor 换不掉占用 → 直接换号
           //（源侧 `main.py:7159` 同款：solo_agent_parallel_limit → rotating account）。
@@ -878,11 +958,46 @@ async function proxyTraeRemoteRequest(
       //  2. `onClose`：客户端断连 / idle 兜底 / 读错误 —— 唯一能盖到这些路径的地方；
       //  3. 非流式成功路径：没有流，前两者都不存在。
       let stopInitiated = false
+      // 租约续期（见 session-registry 注释）：会话活着就每 TRAE_REMOTE_LEASE_TOUCH_MS
+      // 刷新一次 lastSeenAt；隔离进程一死续期就停，reaper 据此判僵尸。
+      //
+      // 用「自续期 timeout」而不是 setInterval：`stopOnce` 一置位就不再排下一次，
+      // 不会留下一个在**后续请求**里继续乱跑的定时器（Workers 的 isolate 会被复用）。
+      let leaseStopped = false
+      let leaseTimer: ReturnType<typeof setTimeout> | null = null
+      const scheduleLease = (): void => {
+        if (leaseStopped) return
+        leaseTimer = setTimeout(() => {
+          leaseTimer = null
+          if (leaseStopped) return
+          void touchRemoteSession(env, provider.id, {
+            uid: account.uid,
+            sessionId: activeSession.sessionId,
+            messageId: activeSession.messageId,
+            agentType: usedTier,
+            startedAt: Date.now(),
+            lastSeenAt: Date.now(),
+          })
+          scheduleLease()
+        }, TRAE_REMOTE_LEASE_TOUCH_MS)
+      }
       const stopOnce = (): void => {
         if (stopInitiated) return
         stopInitiated = true
-        defer(stopRemoteSession(account, activeSession.sessionId, activeSession.messageId, { baseUrl, agentType: usedTier }))
+        leaseStopped = true
+        if (leaseTimer !== null) { clearTimeout(leaseTimer); leaseTimer = null }
+        const sid = activeSession.sessionId
+        const mid = activeSession.messageId
+        defer((async () => {
+          try {
+            await stopRemoteSession(account, sid, mid, { baseUrl, agentType: usedTier })
+          } finally {
+            await unregisterRemoteSession(env, provider.id, sid)
+          }
+        })())
       }
+      scheduleLease()
+      stopActiveSession = stopOnce
 
       // ===== 第二步：翻译已预读的流（activeEvents 已含首帧，不丢帧）=====
       if (stream) {
@@ -894,6 +1009,16 @@ async function proxyTraeRemoteRequest(
             // 模型说完立刻回收上游会话（见 WebStreamOptions.onDone 注释：这是唯一
             // 「请求还在飞」因而回收一定落地的时机）。
             onDone: stopOnce,
+            // 收尾指标：`reasoning=<chars>` 是核对思考强度的**可比量**（见 WebStreamDoneInfo）。
+            // 同一道题在 light / high / extra_high 下若没有量级差，说明档位没被上游采纳。
+            onFinish: (info) => {
+              const finMsg = `[trae-remote] provider=${provider.id} uid=${account.uid} model=${configName}`
+                + ` phase=finish content=${info.contentChars} reasoning=${info.reasoningChars}`
+                + ` toolCalls=${info.sawToolCalls} finish=${info.finishReason}`
+                + ` effort=${appliedEffort || '(none)'} req=${rawRequestedEffort(requestBody) || '(none)'}`
+              console.log(finMsg) // codeql-disable: 纯诊断日志，不含密钥/敏感 token
+              writeLog(env, 'info', finMsg).catch(() => { /* 日志失败不影响响应 */ })
+            },
             allowedTools: body['tools'],
             toolChoice: body['tool_choice'],
             onErr: (se) => { void applyStreamError(env, provider.id, account.uid, se, cd) },
@@ -989,6 +1114,9 @@ async function proxyTraeRemoteRequest(
       // 事件流阶段失败（首事件超时 / 首事件前报错 / 读流中断）：按 transport 定责不罚号，
       // 由 applyChatError 的 transport 分支保证（见该函数注释）。
       lastErr = e as Error
+      // 异常出口也要回收（钩子在 try 外声明，见其注释）：否则会话停在「已建、未停」，
+      // 占住上游并发槽位。
+      stopActiveSession?.()
       const kind = (e as any).kind || 'transport'
       await applyChatError(env, provider.id, account.uid, kind, cd)
       await releaseTraeSession(env, provider.id, account.uid).catch(() => {})

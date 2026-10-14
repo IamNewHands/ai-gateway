@@ -19,6 +19,7 @@
  */
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { proxyTraeChatRequest } from './proxy'
+import { effectiveRemoteConcurrency } from './remote'
 import { webStreamToOpenAIStream } from './web-sse'
 import type { TraeRemoteEvent } from './types'
 
@@ -184,5 +185,30 @@ describe('onDone 的触发条件', () => {
       { onDone: () => seen.push('done') }
     ))
     expect(seen).toEqual([])
+  })
+})
+
+describe('每账号并发上限：默认生效（槽位防线的另一半）', () => {
+  /**
+   * 回归点（2026-10-14）：`provider.traeConcurrency` 默认是 0（不限），而 Remote 的会话
+   * 在整条事件流期间都占住上游槽位 —— 槽位满了上游不报错、只让新会话排队（executor
+   * 不启动）。所以面板没配时也必须收敛到上游实测上限，否则「不配 = 不设防」。
+   */
+  it('面板未配置（0）→ 收敛到上游实测上限 2，而不是「不限」', () => {
+    expect(effectiveRemoteConcurrency(0)).toBe(2)
+  })
+
+  it('面板配得比上游上限大 → 取上游上限（配更大没有意义，上游照样排队）', () => {
+    expect(effectiveRemoteConcurrency(5)).toBe(2)
+    expect(effectiveRemoteConcurrency(2)).toBe(2)
+  })
+
+  it('面板配得更小 → 尊重面板（更保守是安全的）', () => {
+    expect(effectiveRemoteConcurrency(1)).toBe(1)
+  })
+
+  it('负数 / NaN 按「未配置」处理，不会算出 0 个槽位把自己锁死', () => {
+    expect(effectiveRemoteConcurrency(-1)).toBe(2)
+    expect(effectiveRemoteConcurrency(Number.NaN)).toBe(2)
   })
 })

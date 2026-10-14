@@ -120,6 +120,7 @@ import {
   runTraeCheckins,
   refreshTraeTokens,
 } from './trae/admin'
+import { reapRemoteSessions } from './trae/session-registry'
 import {
   handleDeepseekTokenAdd,
   handleDeepseekTokenRemove,
@@ -606,6 +607,31 @@ async function scheduled(event: ScheduledEvent, env: Env, ctx: ExecutionContext)
       console.log(`[m365-health] cron done: providers=${result.providers} accounts=${result.accounts} ok=${result.ok} recovered=${result.recovered} failed=${result.failed} errors=${result.errors}`)
     } catch (err) {
       console.error(`[m365-health] cron error: ${(err as Error).message}`)
+    }
+    return
+  }
+  if (event.cron === '*/5 * * * *') {
+    // TRAE Remote 僵尸会话回收（见 src/trae/session-registry.ts）。
+    // 隔离进程在「建好会话」与「发出 stop」之间死掉时，会话 id 再无人知晓；而槽位积满后
+    // 上游不报错、只让新会话排队（executor 不启动），所以这条兜底是必需的。
+    try {
+      const providers = (await getProviders(env)) as Provider[]
+      let scanned = 0
+      let reaped = 0
+      let orphaned = 0
+      let errors = 0
+      for (const p of providers) {
+        if (p.traeUpstreamEndpoint !== 'remote') continue
+        try {
+          const r = await reapRemoteSessions(env, p)
+          scanned += r.scanned
+          reaped += r.reaped
+          orphaned += r.failed
+        } catch { errors++ }
+      }
+      console.log(`[trae-remote-reap] cron done: scanned=${scanned} reaped=${reaped} orphaned=${orphaned} errors=${errors}`)
+    } catch (err) {
+      console.error(`[trae-remote-reap] cron error: ${(err as Error).message}`)
     }
     return
   }

@@ -133,6 +133,19 @@ export const TRAE_REMOTE_STREAM_TIMEOUT_MS = 300_000
  */
 export const TRAE_REMOTE_CALLER_TOOLS_USE_WORK = true
 
+/**
+ * 上游**每账号**并发会话上限（实测 `991502 solo_agent_parallel_limit`，`limit:2`）。
+ *
+ * 为什么 Remote 要默认套用它，而 SOLO 不用：SOLO 是一条 POST 打完就结束，上游不按
+ * 「运行中的会话」计并发；Remote 是「建会话 → 读事件流」，会话活着的整段时间都占一个槽位。
+ * 槽位满了之后上游**不报错**，而是让新会话排队 —— executor 永不启动，客户端只见心跳
+ *（2026-10-14 现场）。所以这条上限不是性能调优，而是**关掉那个静默失败模式**。
+ *
+ * 取 `min(面板配置, 2)`：面板配得比 2 大没有意义（上游照样排队），配得更小则尊重面板；
+ * 面板没配（0 = 不限）时用 2。
+ */
+export const TRAE_REMOTE_PARALLEL_LIMIT = 2
+
 /** 判断是否属于 Work 专属通道模型（包含 work 或以 -Official 结尾） */
 export function isWorkModel(model: string): boolean {
   const m = (model || '').trim().toLowerCase()
