@@ -41,9 +41,16 @@ const ACCOUNT: TraeAccount = {
 const FAKE_AUTH = 'AKIDFAKE:version:v2:JWT-SECRET'
 const FAKE_SESSION_KEY = 'sk-LEAK'
 const STORE_URI = 'tos-cn-i-aiagcest/cn/u1/remote_resource/abc.trae'
-/** `get_resource_upload_url` **广告**的主机（照它打会被 400 拒）。 */
+/** ① `get_resource_upload_url` **广告**的主机（真机实测：照它打回 `400 InvalidFileType`）。 */
 const UPLOAD_HOST = 'tos-d-x-lf.snssdk.com'
-/** 官方 web 客户端**实际发**的主机（子域相同、基域不同）——候选里排第一。 */
+/**
+ * `douyinFallbackHost` **推导**出的候选（首个子域标签不变、基域换成 `douyin.com`），排第一。
+ *
+ * ⚠️ 2026-10-14 16:11 真机：新一代主机名（`tos-lq-x.*`）经同一映射后得到
+ * `tos-lq-x.douyin.com`，回的是 **Cloudflare 530 / `error code: 1016`（源站 DNS 不解析）**
+ * —— 也就是**推导出来的那台是死的**，白占候选链第一枪。它是否真被官方用过尚无直证，
+ * 所以这里只改注释、**不动顺序**（本轮只做插桩，不叠第二个变量）。
+ */
 const OBSERVED_HOST = 'tos-d-x-lf.douyin.com'
 
 function ticket(extra: Partial<ResourceUploadTicket> = {}): ResourceUploadTicket {
@@ -171,8 +178,10 @@ describe('fetchResourceUploadUrl：① 申请上传位', () => {
     const body = JSON.parse(calls[0].init.body)
     expect(body.biz_type).toBe('remote_resource')
     expect(body.targets).toHaveLength(1)
-    // uuid 由我们生成，后缀跟随待传文件的真实扩展名（PixPin.png → .png）。
-    expect(body.targets[0]).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.png$/)
+    // uuid 由我们生成，后缀是**实测值** `.trae`：抓包里官方 `attachment.data.uri` 末段就是
+    // `…/remote_resource/<uuid>.trae`，而同一个 attachment 的 `filename` 是 `PixPin….png`
+    // —— 官方就是把 PNG 字节写进 `.trae` 对象并成功的。别按「服务端校验后缀」去改这一行。
+    expect(body.targets[0]).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.trae$/)
 
     expect(t.storeUri).toBe(STORE_URI)
     expect(t.auth).toBe(FAKE_AUTH)
@@ -181,28 +190,20 @@ describe('fetchResourceUploadUrl：① 申请上传位', () => {
     expect(t.target).toBe(body.targets[0])
   })
 
-  it('target 后缀跟随 filename 或 ext 参数，缺省兜底 png', async () => {
-    let lastBody: any
+  it('filename 不参与协议：换任何人类文件名，target 后缀都是 .trae', async () => {
+    const targets: string[] = []
     vi.stubGlobal('fetch', vi.fn(async (_url: string, init: any) => {
-      lastBody = JSON.parse(init.body)
+      targets.push(JSON.parse(init.body).targets[0])
       return uploadUrlResponse()
     }))
 
-    // filename = photo.jpg → .jpg
     await fetchResourceUploadUrl(ACCOUNT, { filename: 'photo.jpg' })
-    expect(lastBody.targets[0]).toMatch(/\.jpg$/)
-
-    // filename = anim.webp → .webp
     await fetchResourceUploadUrl(ACCOUNT, { filename: 'anim.webp' })
-    expect(lastBody.targets[0]).toMatch(/\.webp$/)
-
-    // 显式 ext = gif
-    await fetchResourceUploadUrl(ACCOUNT, { ext: 'gif' })
-    expect(lastBody.targets[0]).toMatch(/\.gif$/)
-
-    // 无参数 → 兜底 .png
     await fetchResourceUploadUrl(ACCOUNT)
-    expect(lastBody.targets[0]).toMatch(/\.png$/)
+
+    // 人类文件名只在 ③ 的 `attachment.filename` 里带上去，不改对象名。
+    expect(targets).toHaveLength(3)
+    for (const t of targets) expect(t).toMatch(/\.trae$/)
   })
 
   it('头部复用 IDE API 那一套（Authorization: Cloud-IDE-JWT）', async () => {
@@ -446,9 +447,38 @@ describe('uploadResourceToTrae：上传主机候选顺序与逐个换主机（20
     expect(err!.message).toContain(`variant=octet-nocrc host=${OBSERVED_HOST} [400]`)
     expect(err!.message).toContain(`variant=octet-nocrc host=${UPLOAD_HOST} [400]`)
     expect(err!.message).toContain('InvalidFileType')
+    // 响应体被压成**一行短码**（而不是 800 字符原文）：8 枪也放得下调用方的上限。
+    expect(err!.message).toContain('InvalidFileType/4028')
+    // `store=` 是 ① 实际下发的对象名 —— 后缀到底是谁说了算，看这一项（不再是猜）。
+    expect(err!.message).toContain(`store=${STORE_URI}`)
     // 失败细节进错误信息，但凭据不进。
     expect(err!.message).not.toContain('JWT-SECRET')
     expect(err!.message).not.toContain(FAKE_SESSION_KEY)
+  })
+
+  it('**8 枪全失败时整条消息不超 1200 字符**（上一轮就是被截尾丢了结论）', async () => {
+    // PNG 魔术字节 → 阶梯满 4 档；2 主机 → 4 × 2 = 8 枪，正好撞上限。
+    const PNG = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a])
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(
+      JSON.stringify({ Version: '', success: -1, error: { code: 400, error: 'InvalidFileType', error_code: 4028 } }),
+      { status: 400 }
+    )))
+    const err = await uploadResourceToTrae(
+      ACCOUNT,
+      ticket({ uploadHosts: [UPLOAD_HOST, 'tos-extra.example.com'] }),
+      PNG,
+      'image-1.png'
+    ).then(() => null, (e: Error) => e)
+
+    // `remote.ts` 的上限是 1200：超了就会截尾，把后面几枪和 `store=` 一起丢掉。
+    expect(err!.message.length).toBeLessThanOrEqual(1200)
+    // 8 枪的**最后一枪**必须还在（截尾的判据就是「最后一枪不见了」）。
+    // 外层变体、内层主机 → 4 变体 × 3 主机 = 12 个组合，截到 8 时的末枪是
+    // `mime+crc` 的第 2 台主机（`mime-nocrc` 一枪都轮不到，由 `exhausted=true` 如实报出）。
+    expect(err!.message).toContain(`variant=mime+crc host=${UPLOAD_HOST} [400]`)
+    expect(err!.message).not.toContain('variant=mime-nocrc')
+    expect(err!.message).toContain('exhausted=true')
+    expect(err!.message).toContain(`store=${STORE_URI}`)
   })
 
   it('候选链 = [观测主机, 广告主机, 上游其余主机…]（顺序固定，去重）', async () => {
@@ -595,6 +625,43 @@ describe('uploadResourceToTrae：变体阶梯（Content-Type / Content-CRC32 的
     expect(trace.variant).toBeUndefined()
   })
 
+  it('[trae-upload] plan：开打前一次性打全「广告主机/候选顺序/对象名/计划枪数」，独立于会被截断的聚合错误', async () => {
+    // 上一轮真机日志的教训：结论只能从**聚合错误**里读，而它有字符上限 —— 尾巴一截，
+    //「到底广告了几台主机」「对象名是什么后缀」「有没有 exhausted」就全丢了。
+    // 这条钉住「计划」是一条独立的、开打前就发出的读数。
+    const logs: string[] = []
+    const spy = vi.spyOn(console, 'log').mockImplementation((...args: unknown[]) => {
+      logs.push(args.map((a) => String(a)).join(' '))
+    })
+    try {
+      ladderSpy(() => new Response('nope', { status: 400 }))
+      await expect(
+        uploadResourceToTrae(
+          ACCOUNT,
+          ticket({ uploadHosts: [UPLOAD_HOST, 'tos-extra.example.com'] }),
+          PNG,
+          'PixPin_2026-10-14_14-16-32.png'
+        )
+      ).rejects.toThrow(/Trae resource upload failed/)
+    } finally {
+      spy.mockRestore()
+    }
+
+    const plan = logs.find((l) => l.includes('[trae-upload] plan'))
+    expect(plan).toBeDefined()
+    // ① 原样广告的主机 —— 与候选顺序一比，就知道「推导主机」是不是我们自造的。
+    expect(plan).toContain(`advertised=${UPLOAD_HOST},tos-extra.example.com`)
+    expect(plan).toContain(`candidates=${OBSERVED_HOST},${UPLOAD_HOST},tos-extra.example.com`)
+    // `store=` 是 ① 下发的对象名（后缀的唯一读数），`target=` 是我们申请的名字。
+    expect(plan).toContain(`store=${STORE_URI}`)
+    expect(plan).toContain('target=abc.trae')
+    // 4 变体 × 3 主机 = 12 个组合，硬上限只允许 8 枪 → 必须如实标 exhausted。
+    expect(plan).toContain('planned=8/12 exhausted=true')
+    // 凭据绝不进日志（plan 行里有主机名与对象名，但不能有 auth/session_key）。
+    expect(plan).not.toContain('JWT-SECRET')
+    expect(plan).not.toContain(FAKE_SESSION_KEY)
+  })
+
   it('单变量隔离：变体 2 相对变体 1**只**差 Content-CRC32，变体 3 相对变体 1**只**差 Content-Type', async () => {
     // 这条把「CRC 头是不是毒药」变成可**单独**证伪的命题：取每个变体的第一台主机
     //（同一主机 → 主机维度被排除），直接 diff 头部键集合 —— 多一个键就说明实验被污染。
@@ -637,10 +704,10 @@ describe('uploadResourceToTrae：变体阶梯（Content-Type / Content-CRC32 的
     expect(trace.attempts).toBe(4)
     expect(trace.variant).toBeUndefined()
     // 错误信息要如实说「阶梯只有这两档」，别让读日志的人以为 mime 变体也试过了
-    //（收尾的 `)` 钉住列表就此结束：后面没有别的变体名）。
+    //（后面紧跟的 ` store=` 钉住列表就此结束：没有第三个变体名被塞进来）。
     await expect(
       uploadResourceToTrae(ACCOUNT, ticket(), UNKNOWN, 'image-1.bin')
-    ).rejects.toThrow(/variants=octet\+crc\+octet-nocrc\)/)
+    ).rejects.toThrow(/variants=octet\+crc\+octet-nocrc store=/)
   })
 
   it('变体 3（mime+crc）成功即停：不再试变体 4（mime-nocrc），也不再多打主机', async () => {

@@ -741,10 +741,11 @@ export async function createRemoteSession(
       attachments = outcome.attachments
       if (outcome.failures.length > 0) {
         const first = outcome.failures[0]
-        // 600 而不是 160：上传失败现在是**聚合**错误（多主机候选链），前 ~100 字符是
-        // `... bytes= first8= crc=): ` 前缀，160 会把第二台主机的原因整段截掉，
-        // 让「两台都试过」在日志里看起来像「只打了一台」。
-        const reason = String(first.reason ?? '').slice(0, 600)
+        // 1200 而不是 600：上传失败是**聚合**错误（候选主机 × 变体阶梯），而
+        // `resource-upload.ts` 现在把每条失败压成一行短码（`host [400]: InvalidFileType/4028`）。
+        // 8 枪 ≈ 790 字符 —— 600 会把最后两枪与 `store=`（对象名后缀的唯一读数）截掉，
+        // 2026-10-14 16:11 的真机日志就是这么丢掉结论的。留 1200 是为了**整条不截尾**。
+        const reason = String(first.reason ?? '').slice(0, 1200)
         // 只含张数与已脱敏的原因（`resource-upload.ts` 保证错误信息里没有 auth/session_key）。
         console.warn(
           `[trae-remote] image upload failed: requested=${opts.imageParts.length}`
@@ -760,7 +761,7 @@ export async function createRemoteSession(
         // `imageUploadError`（走 warn 日志）承载；成功时它是唯一的读数。
         opts.trace.imageVariantSummary = outcome.variantSummary
         opts.trace.imageUploadError = outcome.failures.length > 0
-          ? String(outcome.failures[0].reason ?? '').slice(0, 600)
+          ? String(outcome.failures[0].reason ?? '').slice(0, 1200)
           : undefined
       }
     } else if (opts.trace) {

@@ -117,7 +117,7 @@ export interface ResourceUploadTicket {
   storeUri: string
   /** 短期写凭据。**绝不进日志/错误信息/快照。** */
   auth: string
-  /** 上游广告的上传主机（实测与浏览器真正发的主机基域不同，见 `uploadResourceToTrae`） */
+  /** ① 广告的上传主机（`upload_hosts` 原样，**不**做映射；候选顺序见 `uploadResourceToTrae`） */
   uploadHosts: string[]
   /** 我们生成的 `<uuid>.trae`（只用于排障，不是凭据） */
   target: string
@@ -152,25 +152,27 @@ export function resourceUploadBase(baseUrl?: string | null): string {
 /**
  * ①：申请上传位。
  *
- * `targets` 里的 uuid **由我们生成**（不是上游给的），扩展名跟随待传图片（如 `<uuid>.png`）
- * —— 实测踩坑：TOS 图片桶（`tos-cn-i-*`）会从对象名后缀与内容做类型校验，若固定为 `.trae`
- * 会被 TOS 拒绝并报 `400 InvalidFileType` (error_code 4028)；必须带真实图片扩展名。
+ * `targets` 里的 uuid **由我们生成**（不是上游给的），对象名形如 `<uuid>.trae`。
+ *
+ * ⚠️ 2026-10-14 这里曾被改成「跟随真实图片后缀（`<uuid>.png`）」，**现已回退**：
+ * 抓包里官方 web 客户端 `chat_sessions` 的 `attachment.data.uri` 末段是
+ * `…/remote_resource/<uuid>.trae`，而同一个 attachment 的 `filename` 是
+ * `PixPin_2026-10-14_14-16-32.png` —— 也就是**官方就是把 PNG 字节写进 `.trae` 对象并且成功**。
+ * 后缀是**实测值**；再按「服务端会校验后缀」去改，等于把实测换成猜测，而且会掩盖真因
+ *（真因在 PUT 的形态上：候选主机与请求头，见 `uploadResourceToTrae` 与 `[trae-upload] plan`）。
  *
  * 失败一律抛错（图片少一张总比整轮对话挂掉强，由调用方降级）；错误信息**不含** `auth` /
  * `session_key`，含状态码与脱敏后的响应体前 200 字符。
  *
- * `opts.filename` 用于提供真实扩展名与排障文案，人类文件名是在 ③ 的 `attachment.filename` 里带上去的。
+ * `opts.filename` **只用于排障文案**（哪个文件申请失败），不参与协议：对象名固定是
+ * `<uuid>.trae`，人类文件名是在 ③ 的 `attachment.filename` 里带上去的。
  */
 export async function fetchResourceUploadUrl(
   account: TraeAccount,
-  opts?: { baseUrl?: string | null; filename?: string; ext?: string }
+  opts?: { baseUrl?: string | null; filename?: string }
 ): Promise<ResourceUploadTicket> {
   const base = resourceUploadBase(opts?.baseUrl)
-  const fnExt = opts?.filename && opts.filename.includes('.')
-    ? opts.filename.slice(opts.filename.lastIndexOf('.') + 1).toLowerCase()
-    : ''
-  const ext = fnExt || opts?.ext || 'png'
-  const target = `${crypto.randomUUID()}.${ext}`
+  const target = `${crypto.randomUUID()}.trae`
   // 排障定位（哪张图、哪个账号）；`uid` 不是凭据，本仓其它日志也照打。
   const where = `uid=${account?.uid || '-'} file=${opts?.filename || '-'}`
   // ① 的头部是**推断**的（见文件头「唯一没有抓包确认的地方」）：端点在 IDE API 下，
@@ -463,6 +465,18 @@ export async function uploadResourceToTrae(
   const planned = combos.slice(0, TRAE_RESOURCE_MAX_PUTS)
   const exhausted = combos.length > planned.length
 
+  // 计划**一次性打全**，且不依赖聚合错误（那条会被调用方截断）：
+  // `advertised` 是 ① 原样广告的主机、`candidates` 是实际会打的顺序、`store` 是 ① 下发
+  // 的对象名（**后缀是实测还是我们自造，看这一项就知道**）。上一轮真机日志里这些全被截掉，
+  // 导致无法判断「怎么只打了两台」「对象名到底是什么后缀」。
+  console.log(
+    `[trae-upload] plan file=${filename || '-'} target=${String(ticket?.target ?? '') || '-'}`
+    + ` advertised=${hosts.join(',') || '-'} candidates=${candidates.join(',')}`
+    + ` variants=${ladder.map((v) => v.name).join('+')} mime=${mime || 'unknown'}`
+    + ` planned=${planned.length}/${combos.length}${exhausted ? ' exhausted=true' : ''}`
+    + ` store=${storeUri}`
+  ) // codeql-disable: 仅主机名/对象名/变体名/计数，凭据（auth/session_key）绝不在此
+
   const failures: string[] = []
   let attempts = 0
   for (const { variant, host } of planned) {
@@ -479,16 +493,16 @@ export async function uploadResourceToTrae(
     }
     // **任何非 2xx 都要换下一个组合**（理由见函数头注释）。
     if (!result.ok) {
-      failures.push(
-        `variant=${variant.name} host=${host} [${result.status}]: ${redactCredentials(result.body).slice(0, 800)}`
-      )
+      const detail = renderUploadFailureDetail(result.body)
+      const head = `variant=${variant.name} host=${host} [${result.status}]`
+      failures.push(detail ? `${head}: ${detail}` : head)
       continue
     }
     const success = readSuccessFlag(result.body)
     if (success !== null && success !== 0) {
-      failures.push(
-        `variant=${variant.name} host=${host} rejected (success=${success}): ${redactCredentials(result.body).slice(0, 800)}`
-      )
+      const detail = renderUploadFailureDetail(result.body)
+      const head = `variant=${variant.name} host=${host} rejected (success=${success})`
+      failures.push(detail ? `${head}: ${detail}` : head)
       continue
     }
     if (opts?.trace) {
@@ -504,10 +518,14 @@ export async function uploadResourceToTrae(
     opts.trace.exhausted = exhausted
   }
   // 全部组合都失败：把字节诊断、mime 嗅探结果与每个组合的原因一起抛出，便于一眼定位。
+  // `store=` / `target=` 是**这轮新增的关键读数**：前者是 ① 实际下发的对象名（后缀由它说了算），
+  // 后者是我们申请的名字 —— 两者一比就知道「后缀是我们自造还是服务端给的」。
+  // 每条失败只带一行短码（见 `renderUploadFailureDetail`），保证整条消息在调用方的上限内**不被截尾**。
   throw new Error(
-    `Trae resource upload failed (${where} bytes=${bytes.length} first8=${hexPreview(bytes)} crc=${crc}`
+    `Trae resource upload failed (${where} target=${String(ticket?.target ?? '') || '-'}`
+    + ` bytes=${bytes.length} first8=${hexPreview(bytes)} crc=${crc}`
     + ` mime=${mime || 'unknown'} variants=${ladder.map((v) => v.name).join('+')}`
-    + `${exhausted ? ' exhausted=true' : ''}): ${failures.join(' | ') || 'no upload host tried'}`
+    + `${exhausted ? ' exhausted=true' : ''} store=${storeUri}): ${failures.join(' | ') || 'no upload host tried'}`
   )
 }
 
@@ -529,6 +547,37 @@ function readSuccessFlag(body: string): number | null {
   } catch {
     return null
   }
+}
+
+/**
+ * 把一次失败响应的 body 压成**一行短码**（供聚合错误使用）。
+ *
+ * 为什么不再直接塞 800 字符原文：一次上传最多 `TRAE_RESOURCE_MAX_PUTS` 枪，8 × 800 = 6400
+ * 字符，而调用方（`remote.ts` 的 `imageUploadError`）有字符上限 —— 结果就是**尾巴被截掉**。
+ * 2026-10-14 16:11 的真机日志正是这样：后面的主机、`exhausted`、对象名全被截没，
+ * 读到的人无法判断「到底试了几台、试完没有」，等于白跑一轮实验。
+ *
+ * 这里提炼「是哪个业务错误」（如 `InvalidFileType/4028`），每枪约 70 字符，8 枪也放得下；
+ * 非 JSON 响应（如 Cloudflare 的 `error code: 1016`）退回前 80 字符。
+ * **照常过 `redactCredentials`** —— 压缩不能成为泄露通道。
+ */
+function renderUploadFailureDetail(body: string): string {
+  const text = redactCredentials(String(body ?? '')).trim()
+  if (!text) return ''
+  try {
+    const obj = JSON.parse(text)
+    const err = obj && typeof obj === 'object' && !Array.isArray(obj)
+      ? (obj as Record<string, any>)['error']
+      : null
+    if (err && typeof err === 'object' && !Array.isArray(err)) {
+      const name = String((err as Record<string, any>)['error'] ?? '').trim()
+      const code = (err as Record<string, any>)['error_code']
+      if (name) return code === undefined || code === null ? name : `${name}/${String(code)}`
+    }
+  } catch {
+    // 非 JSON：继续走下面的截断分支。
+  }
+  return text.replace(/\s+/g, ' ').slice(0, 80)
 }
 
 // ===== 批量上传（建会话前的门禁调用点） =====
