@@ -757,15 +757,44 @@ async function proxyTraeRemoteRequest(
     const effortNote = trace.reasoningEffortApplied ? ` effort=${trace.reasoningEffortApplied}` : ''
     const maxNote = trace.maxModeApplied ? ' max_mode=on' : ''
 
+    // 会话建起来了。这条日志是「Remote 路径到底有没有跑」的**唯一直接证据**：
+    // 流式路径返回的 200 只是「响应头已返回」，正文此刻还没开始发 ——
+    // 光看 → 200 分不出「Remote 在跑但上游静默」与「压根没走 Remote」。
+    const sessionMsg = `[trae-remote] provider=${provider.id} uid=${account.uid} model=${configName}`
+      + ` phase=session session=${session.sessionId} msg=${session.messageId} agent=${agentType}${effortNote}${maxNote}`
+    console.log(sessionMsg) // codeql-disable: 纯诊断日志，不含密钥/敏感 token
+    writeLog(env, 'info', sessionMsg).catch(() => { /* 日志失败不影响流 */ })
+
     // 第二步：读事件流（流式直接翻译，非流式聚合）。
     try {
-      const events = streamRemoteEvents(account, session.sessionId, session.messageId, { baseUrl, agentType })
+      const perf = await getPerfSettings(env)
+      const keepAliveMs = perf.keepAliveMs > 0 ? perf.keepAliveMs : TRAE_KEEPALIVE_MS
+      // 读空闲死线：与 SSE 心跳用同一个「性能设置」口径（默认 180s）。
+      const idleTimeoutMs = perf.idleTimeoutMs || TRAE_STREAM_IDLE_TIMEOUT_MS
+
+      const events = streamRemoteEvents(account, session.sessionId, session.messageId, {
+        baseUrl,
+        agentType,
+        idleTimeoutMs,
+        // 「上游到底发没发、发的什么形态」的直接证据，只在首个非空片段触发一次。
+        // 没有它，「会话建起来了但一直没内容」只能靠猜（上游事件体只有模型输出，无凭据）。
+        onRawHead: (head) => {
+          const msg = `[trae-remote] provider=${provider.id} uid=${account.uid} model=${configName}`
+            + ` phase=raw-head head=${JSON.stringify(head.slice(0, 300))}`
+          console.log(msg) // codeql-disable: 诊断片段，不含密钥/敏感 token
+          writeLog(env, 'info', msg).catch(() => { /* 日志失败不影响流 */ })
+        },
+        // 「流是活的」的证据：首个模型事件（心跳不算，见 streamRemoteEvents 注释）。
+        onFirstModelEvent: (name) => {
+          const msg = `[trae-remote] provider=${provider.id} uid=${account.uid} model=${configName}`
+            + ` phase=first-event event=${name}`
+          console.log(msg) // codeql-disable: 纯诊断日志，不含密钥/敏感 token
+          writeLog(env, 'info', msg).catch(() => { /* 日志失败不影响流 */ })
+        },
+      })
 
       if (stream) {
         await noteTraeSuccess(env, provider.id, account.uid)
-        const perf = await getPerfSettings(env)
-        const keepAliveMs = perf.keepAliveMs > 0 ? perf.keepAliveMs : TRAE_KEEPALIVE_MS
-        const idleTimeoutMs = perf.idleTimeoutMs || TRAE_STREAM_IDLE_TIMEOUT_MS
         const startedAt = Date.now()
         const sseBody = withSSEKeepAlive(
           webStreamToOpenAIStream(events, configName, {

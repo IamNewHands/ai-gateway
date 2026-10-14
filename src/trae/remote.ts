@@ -198,10 +198,10 @@ export interface RemoteCommonParamsInput {
 /**
  * 构造 `initial_message.common_params`（源侧 `common_params`，返回 JSON 字符串）。
  *
- * 三个「已实测非阻塞」的字段（`web_id` / `biz_user_id` / `user_unique_id`）在这里**不发**
- * ——2026-10-09 实测：本机 `storage.json` 里这三个全缺，纯 OAuth token 直打 Remote
- * 依然 200（models 34775 字节、chat_sessions 200）。所以它们是可观测性变量，不是门槛；
- * 上游对空值按空处理。若日后出现「Remote 行为与 web 端不一致」，再回来看这三个。
+ * 三个「已实测非阻塞」的字段（`web_id` / `biz_user_id` / `user_unique_id`）在这里**按源侧
+ * 原样下发为空串** ——2026-10-09 实测：本机 `storage.json` 里这三个全缺，纯 OAuth token
+ * 直打 Remote 依然 200（models 34775 字节、chat_sessions 200）。所以它们是可观测性变量，
+ * 不是门槛。仍下发空串是为了与源侧**逐字段一致**（空串 ≠ 缺键），减少真机排障的变量。
  *
  * Work 档位会额外下发一整套桌面客户端元数据（os/cpu/build_version 等）——
  * 这些是源侧实测值，**不要按本机真实环境改**：上游校验的是「TraeCode Linux 客户端」身份。
@@ -216,7 +216,12 @@ export async function buildRemoteCommonParams(input: RemoteCommonParamsInput): P
     app_language: intl ? 'en' : 'zh-CN',
     quality: 'stable',
     app_version: '1.0.0.1229',
-    // 以下三个是「实测非阻塞」字段，刻意不下发（见函数注释）。
+    // 这三个字段照源侧**原样下发为空串**（不是省略）。2026-10-09 实测它们为空时
+    // Remote 照常 200，所以它们**不是**门槛；但「空串」与「缺键」在协议上是两种形态，
+    // 与源侧保持一致可以少一个变量——真机排障时不必再怀疑是不是少了这三个键。
+    web_id: '',
+    biz_user_id: '',
+    user_unique_id: '',
     user_identity: 'Free',
     is_freshman: '0',
     scope: intl ? 'marscode-us' : 'marscode-cn',
@@ -788,13 +793,51 @@ export class RemoteStreamIncomplete extends Error {
   }
 }
 
+/** 一次 `reader.read()` 超时（首事件死线 / 空闲死线共用）。 */
+class RemoteReadTimeout extends Error {
+  constructor(message: string) {
+    super(message)
+    this.name = 'RemoteReadTimeout'
+  }
+}
+
+/**
+ * 给**一次** `reader.read()` 套死线。
+ *
+ * ⚠️ 为什么不能用 `AbortSignal.timeout` 代替：那是**整个请求的总时长**上限，而源侧
+ * 的 300s 是 httpx 的 **read（每次读取之间）** 超时。两者语义完全不同——
+ * 用总时长会把「思考了 6 分钟但一直在出数据」的正常长会话掐死。
+ *
+ * 而「只在循环里检查 deadline」也不行：`reader.read()` 会在上游完全静默时**永久阻塞**，
+ * 循环根本没有机会再检查一次（实测：会话建起来了、一个字节都不发，客户端拿到
+ * 8s 一次的心跳却永远等不到内容）。必须把死线压进 read 本身。
+ */
+function readWithDeadline<T>(
+  reader: ReadableStreamDefaultReader<T>,
+  ms: number
+): Promise<ReadableStreamReadResult<T>> {
+  if (!(ms > 0)) return reader.read()
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new RemoteReadTimeout(`no data for ${ms}ms`)), ms)
+    reader.read().then(
+      (r) => { clearTimeout(timer); resolve(r) },
+      (e) => { clearTimeout(timer); reject(e) },
+    )
+  })
+}
+
 /**
  * 第二步：`GET /chat_sessions/{id}/events?reply_to_message_id={msgId}`，逐事件产出。
  *
- * 首事件死线（默认 120s）：Remote 在 executor 真正起来之前会先发 queue/heartbeat 帧。
- * 若把心跳算作「已产出」，一次卡死的会话就会耗掉整个流超时；故**只有模型事件**才
- * 解除首事件死线。首事件前收到 `error` 则抛 `RemoteFirstEventError`（可重试），
- * 让调用方走它自己的显式兜底。
+ * 三道死线（源侧 `httpx.Timeout(read, connect)` 的等价物）：
+ *  1. **建连**：`TRAE_REMOTE_CONNECT_TIMEOUT_MS`（拿到响应头即解除）；
+ *  2. **首事件**（默认 120s）：Remote 在 executor 起来前会先发 queue/heartbeat 帧。
+ *     若把心跳算作「已产出」，一次卡死的会话就会耗掉整个流超时；故**只有模型事件**
+ *     才解除首事件死线。首事件前收到 `error` 则抛 `RemoteFirstEventError`（可重试）；
+ *  3. **读空闲**（默认 300s，**每次读取之间**而非总时长）：拿到首个模型事件后改用
+ *     这条，保证「思考很久但持续有输出」的长会话不被总时长误杀。
+ *
+ * 任一死线触发都会 **abort 底层连接** —— 否则上游会继续跑完、继续烧额度。
  *
  * 无 `done` 就结束 → 抛 `RemoteStreamIncomplete`：上游会在扁平 query 超过静默上限时
  * 直接关连接而不报错，此时若当正常 EOF，半句话会被伪装成完整回答。
@@ -803,25 +846,46 @@ export async function* streamRemoteEvents(
   account: TraeAccount,
   sessionId: string,
   messageId: string,
-  opts?: { baseUrl?: string | null; agentType?: string; firstEventTimeoutMs?: number }
+  opts?: {
+    baseUrl?: string | null
+    agentType?: string
+    firstEventTimeoutMs?: number
+    /** 每次读取之间的空闲上限（默认 TRAE_REMOTE_STREAM_TIMEOUT_MS） */
+    idleTimeoutMs?: number
+    /** 诊断：首个原始字节片段（判定「上游发没发、什么形态」） */
+    onRawHead?: (head: string) => void
+    /** 诊断：首个模型事件名（判定「流是活的」） */
+    onFirstModelEvent?: (name: string) => void
+  }
 ): AsyncGenerator<TraeRemoteEvent> {
   const base = remoteBaseUrl(opts?.baseUrl)
   const url = `${base}${TRAE_REMOTE_CONSTANTS.EpRemoteSessions}/${sessionId}/events`
     + `?reply_to_message_id=${encodeURIComponent(messageId)}`
   const firstEventTimeoutMs = opts?.firstEventTimeoutMs ?? TRAE_REMOTE_FIRST_EVENT_TIMEOUT_MS
+  const idleTimeoutMs = opts?.idleTimeoutMs ?? TRAE_REMOTE_STREAM_TIMEOUT_MS
 
+  // 建连死线：只覆盖「到响应头」。响应头一到就解除，剩下的交给每次读取的空闲死线。
+  // 用 AbortController 而不是 AbortSignal.timeout：后者无法在中途解除，会把整条流
+  // 按总时长掐死（见 readWithDeadline 注释）。
+  const controller = new AbortController()
+  const connectTimer = setTimeout(
+    () => controller.abort(new Error(`connect timeout ${TRAE_REMOTE_CONNECT_TIMEOUT_MS}ms`)),
+    TRAE_REMOTE_CONNECT_TIMEOUT_MS
+  )
   let resp: Response
   try {
     resp = await fetch(url, {
       method: 'GET',
       headers: remoteHeaders(account, true, { baseUrl: opts?.baseUrl, agentType: opts?.agentType }),
-      signal: AbortSignal.timeout(TRAE_REMOTE_STREAM_TIMEOUT_MS),
+      signal: controller.signal,
     })
   } catch (e) {
+    clearTimeout(connectTimer)
     const err = new Error(`remote events transport error: ${(e as Error).message || String(e)}`) as Error & { kind?: TraeErrKind }
     ;(err as any).kind = 'transport'
     throw err
   }
+  clearTimeout(connectTimer)
   if (resp.status >= 400 || !resp.body) {
     const raw = await resp.text().catch(() => '')
     const err = new Error(`Trae remote events [${resp.status}]: ${raw.slice(0, 500)}`) as Error & { kind?: TraeErrKind; status?: number; msg?: string }
@@ -832,11 +896,12 @@ export async function* streamRemoteEvents(
   }
 
   const reader = resp.body.pipeThrough(new TextDecoderStream()).getReader()
-  const deadline = firstEventTimeoutMs > 0 ? Date.now() + firstEventTimeoutMs : null
+  const firstDeadline = firstEventTimeoutMs > 0 ? Date.now() + firstEventTimeoutMs : null
   let sawModelEvent = false
   let sawTerminal = false
   let lineBuffer = ''
   let eventName: string | null = null
+  let rawHeadSeen = false
 
   /** 解析一条 SSE 行；返回事件或 null。 */
   const parseLine = (line: string): TraeRemoteEvent | null => {
@@ -869,24 +934,32 @@ export async function* streamRemoteEvents(
 
   try {
     while (true) {
-      // 首事件死线：只有模型事件才算「已产出」，心跳不解除。
-      if (deadline !== null && !sawModelEvent) {
-        const remaining = deadline - Date.now()
-        if (remaining <= 0) {
-          throw new RemoteFirstEventTimeout('Trae remote session emitted no model event before the first-event timeout')
-        }
-      }
+      // 死线：首事件前用「首事件剩余预算」，之后用「每次读取之间的空闲上限」。
+      // 这是**每次 read 各自的**上限，不是总时长（见 readWithDeadline 注释）。
+      const budget = sawModelEvent
+        ? idleTimeoutMs
+        : (firstDeadline !== null ? Math.max(1, firstDeadline - Date.now()) : 0)
       let read: ReadableStreamReadResult<string>
       try {
-        read = await reader.read()
+        read = await readWithDeadline(reader, budget)
       } catch (e) {
+        // 死线触发或读失败：先掐断底层连接（否则上游会跑完并继续烧额度），再定责。
+        try { controller.abort(e) } catch { /* 已 abort */ }
+        const reason = (e as Error).message || String(e)
         if (!sawModelEvent) {
-          throw new RemoteFirstEventTimeout(`Trae remote event stream read failed before first model event: ${(e as Error).message}`)
+          throw new RemoteFirstEventTimeout(`Trae remote session emitted no model event before the first-event deadline: ${reason}`)
         }
-        throw new RemoteStreamIncomplete(`Trae remote event stream read failed after upstream activity began: ${(e as Error).message}`)
+        throw new RemoteStreamIncomplete(`Trae remote event stream stalled after upstream activity began: ${reason}`)
       }
       if (read.done) break
-      lineBuffer += read.value ?? ''
+      const chunk = read.value ?? ''
+      lineBuffer += chunk
+      // 诊断：首个**非空**字节片段原样上报 —— 用来判定上游到底发没发、发的什么形态。
+      // 这是「会话建起来了但一直没内容」这类问题的唯一直接证据。
+      if (!rawHeadSeen && chunk.trim() !== '') {
+        rawHeadSeen = true
+        if (opts?.onRawHead) { try { opts.onRawHead(lineBuffer.slice(0, 400)) } catch { /* 诊断不影响流 */ } }
+      }
       const lines = lineBuffer.split('\n')
       lineBuffer = lines.pop() ?? ''
       for (const line of lines) {
@@ -897,7 +970,12 @@ export async function* streamRemoteEvents(
           const message = String(ev.data['message'] ?? ev.data['error'] ?? ev.data['detail'] ?? 'remote session setup failed').trim()
           throw new RemoteFirstEventError(`Trae remote upstream error${code ? ' ' + code : ''}: ${message}`)
         }
-        if (REMOTE_MODEL_EVENTS.has(ev.event)) sawModelEvent = true
+        if (REMOTE_MODEL_EVENTS.has(ev.event)) {
+          if (!sawModelEvent && opts?.onFirstModelEvent) {
+            try { opts.onFirstModelEvent(ev.event) } catch { /* 诊断不影响流 */ }
+          }
+          sawModelEvent = true
+        }
         if (ev.event === 'done') sawTerminal = true
         yield ev
       }

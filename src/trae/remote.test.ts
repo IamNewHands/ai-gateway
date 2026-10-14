@@ -293,11 +293,14 @@ describe('buildRemoteCommonParams：设备指纹确定性', () => {
     expect(p1['device_id']).toBe(p2['device_id'])
   })
 
-  it('**不下发** webId / bizUserId / userUniqueId（2026-10-09 实测非阻塞）', async () => {
+  it('webId / bizUserId / userUniqueId 按源侧**原样下发为空串**（实测非阻塞，但形态与源侧一致）', async () => {
     const params = JSON.parse(await buildRemoteCommonParams({ account: ACCOUNT, mode: 'code' }))
-    expect('web_id' in params).toBe(false)
-    expect('biz_user_id' in params).toBe(false)
-    expect('user_unique_id' in params).toBe(false)
+    // 2026-10-09 实测：这三个为空时 Remote 照常 200 ⇒ 不是门槛。
+    // 但仍按源侧下发**空串**（而非省略键）：「空串」与「缺键」在协议上是两种形态，
+    // 保持一致可以少一个真机排障时要怀疑的变量。
+    expect(params['web_id']).toBe('')
+    expect(params['biz_user_id']).toBe('')
+    expect(params['user_unique_id']).toBe('')
   })
 
   it('Work 模式带上桌面客户端元数据 + biz_session_id', async () => {
@@ -538,5 +541,106 @@ describe('streamRemoteEvents：事件流', () => {
   it('HTTP 401 → kind=session_dead', async () => {
     vi.stubGlobal('fetch', vi.fn(async () => new Response('nope', { status: 401 })))
     await expect(collect(streamRemoteEvents(ACCOUNT, 's', 'm'))).rejects.toMatchObject({ kind: 'session_dead' })
+  })
+})
+
+// ===== 死线语义（这三条钉住的是「静默挂起」这个真实事故） =====
+
+/** 一个**永远不发数据、也永不关闭**的响应体：模拟「会话建起来了但上游完全静默」。 */
+function hangingResponse(): Response {
+  const body = new ReadableStream<Uint8Array>({
+    start() { /* 刻意不 enqueue、不 close */ },
+  })
+  return new Response(body, { status: 200 })
+}
+
+/** 先发一段，然后静默且不关闭：模拟「出了内容之后上游卡住」。 */
+function emitThenHang(initial: string): Response {
+  const body = new ReadableStream<Uint8Array>({
+    start(controller) {
+      controller.enqueue(new TextEncoder().encode(initial))
+    },
+  })
+  return new Response(body, { status: 200 })
+}
+
+describe('streamRemoteEvents：死线必须在**读取本身**上生效', () => {
+  it('上游完全静默 → 首事件死线触发 RemoteFirstEventTimeout（不得永久挂起）', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => hangingResponse()))
+    const started = Date.now()
+    await expect(
+      collect(streamRemoteEvents(ACCOUNT, 's', 'm', { firstEventTimeoutMs: 40 }))
+    ).rejects.toBeInstanceOf(RemoteFirstEventTimeout)
+    // 死线是 40ms；旧实现会挂到 300s 的总超时甚至更久
+    expect(Date.now() - started).toBeLessThan(2000)
+  })
+
+  it('只发心跳、不发模型事件 → 心跳不解除首事件死线', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => emitThenHang(
+      'event: heartbeat\ndata: {}\n\nevent: heartbeat\ndata: {}\n\n'
+    )))
+    await expect(
+      collect(streamRemoteEvents(ACCOUNT, 's', 'm', { firstEventTimeoutMs: 40 }))
+    ).rejects.toBeInstanceOf(RemoteFirstEventTimeout)
+  })
+
+  it('已有模型事件后静默 → 空闲死线触发 RemoteStreamIncomplete（不可重试，已有产出）', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => emitThenHang(
+      'event: plan_item\ndata: {"id":"p1","content":"x"}\n\n'
+    )))
+    const seen: string[] = []
+    let thrown: unknown = null
+    try {
+      for await (const ev of streamRemoteEvents(ACCOUNT, 's', 'm', { firstEventTimeoutMs: 500, idleTimeoutMs: 40 })) {
+        seen.push(ev.event)
+      }
+    } catch (e) {
+      thrown = e
+    }
+    expect(seen).toContain('plan_item')
+    expect(thrown).toBeInstanceOf(RemoteStreamIncomplete)
+  })
+
+  it('**持续有数据的长会话不被总时长误杀**（死线是每次读取之间，不是总时长）', async () => {
+    // 8 帧 × 40ms ≈ 320ms 总时长 > 150ms 空闲死线；但每帧间隔 40ms < 150ms。
+    // 若实现用的是「总时长上限」，这条会失败 —— 而那正是源侧 300s 的语义差别所在。
+    const body = new ReadableStream<Uint8Array>({
+      start(controller) {
+        let i = 0
+        const timer = setInterval(() => {
+          i++
+          if (i <= 8) {
+            controller.enqueue(new TextEncoder().encode(
+              `event: plan_item\ndata: {"id":"p1","content":"x${i}"}\n\n`
+            ))
+            return
+          }
+          clearInterval(timer)
+          controller.enqueue(new TextEncoder().encode('event: done\ndata: {}\n\n'))
+          controller.close()
+        }, 40)
+      },
+    })
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(body, { status: 200 })))
+    const events = await collect(streamRemoteEvents(ACCOUNT, 's', 'm', { idleTimeoutMs: 150 }))
+    expect(events.filter((e) => e.event === 'plan_item')).toHaveLength(8)
+    expect(events[events.length - 1].event).toBe('done')
+  })
+
+  it('诊断回调：raw-head 只报首个非空片段；first-event 报首个**模型**事件（心跳不算）', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => sseResponse([
+      ['heartbeat', {}],
+      ['plan_item', { id: 'p1', content: 'hi' }],
+      ['done', {}],
+    ])))
+    const heads: string[] = []
+    const firsts: string[] = []
+    await collect(streamRemoteEvents(ACCOUNT, 's', 'm', {
+      onRawHead: (h) => heads.push(h),
+      onFirstModelEvent: (n) => firsts.push(n),
+    }))
+    expect(heads).toHaveLength(1)
+    expect(heads[0]).toContain('plan_item')
+    expect(firsts).toEqual(['plan_item'])
   })
 })
