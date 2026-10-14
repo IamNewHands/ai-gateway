@@ -265,6 +265,11 @@ async function putObject(url: string, auth: string, bytes: Uint8Array, crc: stri
       Authorization: auth,
       'Content-CRC32': crc,
       'Content-Type': 'application/octet-stream',
+      // 以下三个照抄官方客户端那次成功的 PUT（**不是**发明）。TOS 侧可能对
+      // 跨站直传做来源校验，缺了它们可能以 400/InvalidFileType 的形式被拒。
+      Accept: '*/*',
+      Origin: 'https://work.trae.cn',
+      Referer: 'https://work.trae.cn/',
     },
     body: bytes,
     signal: AbortSignal.timeout(TRAE_RESOURCE_TIMEOUT_MS),
@@ -323,19 +328,30 @@ export async function uploadResourceToTrae(
       continue
     }
     if (!result.ok) {
+      // 诊断字段刻意带上 `bytes` / `first8`：`InvalidFileType` 这类拒绝，唯一能区分
+      // 「字节根本不是图片」与「字节是图片但协议另有要求」的证据就是长度 + 魔术字节。
+      // 响应体放宽到 800 字符：实测 200 字符会在 `error_code` 处被切断，恰好切掉原因。
       throw new Error(
-        `Trae resource upload [${result.status}] (${where}): ${redactCredentials(result.body).slice(0, 200)}`
+        `Trae resource upload [${result.status}] (${where} bytes=${bytes.length} first8=${hexPreview(bytes)} crc=${crc}): ${redactCredentials(result.body).slice(0, 800)}`
       )
     }
     const success = readSuccessFlag(result.body)
     if (success !== null && success !== 0) {
       throw new Error(
-        `Trae resource upload rejected (success=${success}) (${where}): ${redactCredentials(result.body).slice(0, 200)}`
+        `Trae resource upload rejected (success=${success}) (${where} bytes=${bytes.length} first8=${hexPreview(bytes)} crc=${crc}): ${redactCredentials(result.body).slice(0, 800)}`
       )
     }
     return `trae-res://${bizType}/${storeUri}`
   }
   throw new Error(`Trae resource upload transport error (${where}): ${lastTransport || 'no upload host tried'}`)
+}
+
+/** 前 8 字节的 hex（诊断「传上去的到底是不是图片」；不含任何凭据）。 */
+function hexPreview(b: Uint8Array): string {
+  const n = Math.min(8, b.length)
+  const parts: string[] = []
+  for (let i = 0; i < n; i++) parts.push(b[i].toString(16).padStart(2, '0'))
+  return parts.join('') || '(empty)'
 }
 
 /** 读响应体里的数字 `success`；没有/不是数字 → `null`（此时以 HTTP 状态为准）。 */
