@@ -132,6 +132,12 @@ describe('Remote 档位兜底：Agent 起不来 → 同账号 Work 档位', () =
         calls.push('models')
         return modelsResponse()
       }
+      // ⚠️ 必须排在 /chat_sessions 之前判定：stop 端点是 `POST /chat_sessions/{id}/stop`，
+      // 也含 `/chat_sessions`，顺序写反会把「回收」误记成「建会话」。
+      if (u.includes('/stop')) {
+        calls.push('stop')
+        return new Response('{}', { status: 200 })
+      }
       if (u.includes('/chat_sessions') && String(init?.method || '') === 'POST') {
         calls.push('create')
         return new Response(JSON.stringify({ code: 0, data: { chat_session_id: 's1', message_id: 'm1' } }), { status: 200 })
@@ -169,6 +175,9 @@ describe('Remote 档位兜底：Agent 起不来 → 同账号 Work 档位', () =
     expect(calls.filter((c) => c === 'create')).toHaveLength(2)
     expect(calls).toContain('events-agent')
     expect(calls).toContain('events-work')
+    // **回收断言（本轮事故的核心）**：Agent 失败那次 + Work 正常结束那次都必须主动停会话。
+    // 漏回收会占住上游并发槽位（实测 limit=2），积满后新会话只排队、executor 不启动。
+    expect(calls.filter((c) => c === 'stop').length).toBeGreaterThanOrEqual(2)
   })
 
   it('两次都起不来 → 不谎报成功（503，且不是「账号池无可用账号」的误判）', async () => {

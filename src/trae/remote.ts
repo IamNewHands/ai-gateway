@@ -718,10 +718,24 @@ export async function createRemoteSession(
 
   const text = await resp.text().catch(() => '')
   if (resp.status >= 400) {
-    const err = new Error(`Trae remote create_session [${resp.status}]: ${text.slice(0, 500)}`) as Error & { kind?: TraeErrKind; status?: number; msg?: string }
+    const err = new Error(`Trae remote create_session [${resp.status}]: ${text.slice(0, 500)}`) as Error & { kind?: TraeErrKind; status?: number; msg?: string; parallelLimit?: boolean }
     ;(err as any).kind = resp.status === 401 ? 'session_dead' : resp.status === 429 ? 'soft_rate' : 'server'
     ;(err as any).status = resp.status
     ;(err as any).msg = text.slice(0, 500)
+    /**
+     * 上游**并发会话上限**（`solo_agent_parallel_limit`，实测 `limit:2 / running:2`）。
+     *
+     * 这是**账号资源被占满**，不是账号坏了，也不是请求有问题，因此三件事都要区分开：
+     *  - 不该长冷却（账号是好的，槽位很快会释放）；
+     *  - 不该换档位（换 executor 换不掉「该账号还有 2 个会话在跑」这个事实）；
+     *  - 只该**换号**（源侧 `main.py:7159` 同款：`solo_agent_parallel_limit` → rotating account）。
+     *
+     * 更要命的是它常常是**我们自己的漏**造成的：每次放弃会话而不 stop，就会占住一个槽位，
+     * 积满 2 个之后新建的会话只会排队、executor 永远不启动（表现为「只发心跳」）。
+     */
+    if (text.includes('solo_agent_parallel_limit') || text.includes('991502')) {
+      ;(err as any).parallelLimit = true
+    }
     throw err
   }
   let payload: Record<string, any> | null = null

@@ -764,8 +764,11 @@ async function proxyTraeRemoteRequest(
         if (session) break
         // 建会话失败按错误类别定责——401 是账号级，429 软冷却，其余累计。
         const trace: { maxModeApplied?: boolean; reasoningEffortApplied?: TraeEffortLevel | '' } = {}
+        // 在 try 外声明：兜底/失败路径要能**回收**这个会话。漏回收会占住上游并发槽位
+        //（实测上限 2），积满后新会话只排队、executor 不启动 —— 那正是本轮现场。
+        let created: Awaited<ReturnType<typeof createRemoteSession>> | null = null
         try {
-          const created = await createRemoteSession(account, configName, body['messages'], {
+          created = await createRemoteSession(account, configName, body['messages'], {
             baseUrl,
             agentType: tier,
             maxMode: provider.traeRemoteMaxMode === true,
@@ -801,8 +804,17 @@ async function proxyTraeRemoteRequest(
           writeLog(env, 'info', sessionMsg).catch(() => { /* 日志失败不影响流 */ })
         } catch (e) {
           lastErr = e as Error
+          // **失败即回收**：把上游会话停掉，别让它占着账号的并发槽位。
+          // 这是本轮事故的核心：漏回收 → 槽位积满 → 之后每个新会话只排队、executor 不启动
+          //（表现为「只发心跳、永远没有首个模型事件」），还会叠加上游 429。
+          if (created) {
+            void stopRemoteSession(account, created.sessionId, created.messageId, { baseUrl, agentType: tier })
+          }
+          // 并发上限是「账号资源被占满」，换 executor 换不掉占用 → 直接换号
+          //（源侧 `main.py:7159` 同款：solo_agent_parallel_limit → rotating account）。
+          const parallelLimit = (e as { parallelLimit?: boolean }).parallelLimit === true
           // Agent 起步失败（**建会话**失败 或 **迟迟没有首个模型事件**）→ 换 Work 档位再试一次。
-          if (tier === 'solo_agent_remote' && !tierFallbackUsed) {
+          if (tier === 'solo_agent_remote' && !tierFallbackUsed && !parallelLimit) {
             tierFallbackUsed = true
             const msg = `[trae-remote] provider=${provider.id} uid=${account.uid} model=${configName}`
               + ` phase=tier-fallback from=solo_agent_remote to=solo_work_remote`
@@ -870,10 +882,12 @@ async function proxyTraeRemoteRequest(
             console.log(msg) // codeql-disable: 纯诊断日志，不含密钥/敏感 token
             writeLog(env, 'info', msg).catch(() => { /* 日志失败不影响流 */ })
             void releaseTraeSession(env, provider.id, account.uid).catch(() => {})
-            // 非正常收尾才主动停远端会话：正常结束时上游自己已收尾，再停一次没有必要。
-            if (reason === 'idle' || reason === 'cancel') {
-              void stopRemoteSession(account, activeSession.sessionId, activeSession.messageId, { baseUrl, agentType: usedTier }).catch(() => {})
-            }
+            // **会话生命周期 = 本次请求**：无论怎么收尾都主动停掉。
+            // 为什么不能只在 idle/cancel 时停：上游并发槽位（实测 `limit:2`）是按「运行中的
+            // 会话」计的，正常收尾后的会话仍可能占着槽位；积满 2 个就 `solo_agent_parallel_limit`，
+            // 之后**新会话只会排队、executor 不启动**（本轮现场）。
+            // 源侧同款：请求结束时 `close_remote_session()` → `stop_session`。
+            void stopRemoteSession(account, activeSession.sessionId, activeSession.messageId, { baseUrl, agentType: usedTier })
           }
         )
         return new Response(sseBody, {
@@ -896,6 +910,7 @@ async function proxyTraeRemoteRequest(
       if (agg.err) {
         lastErr = new Error(`remote stream error code=${agg.err.code} msg=${agg.err.msg}`)
         const requestSide = await applyStreamError(env, provider.id, account.uid, agg.err, cd)
+        void stopRemoteSession(account, activeSession.sessionId, activeSession.messageId, { baseUrl, agentType: usedTier })
         await releaseTraeSession(env, provider.id, account.uid).catch(() => {})
         if (requestSide) return traeClientParamsError(`remote error code=${agg.err.code} msg=${agg.err.msg}`)
         continue
@@ -911,6 +926,7 @@ async function proxyTraeRemoteRequest(
         const e = new Error(`TRAE Remote 非流式聚合未收到 done（kind=${info.kind} content=${info.contentChars}）`) as Error & { kind?: string }
         e.kind = 'transport'
         lastErr = e
+        void stopRemoteSession(account, activeSession.sessionId, activeSession.messageId, { baseUrl, agentType: usedTier })
         await releaseTraeSession(env, provider.id, account.uid).catch(() => {})
         continue
       }
