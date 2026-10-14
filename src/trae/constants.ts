@@ -108,6 +108,19 @@ export const TRAE_REMOTE_CONNECT_TIMEOUT_MS = 60_000
 /** Remote 事件流：首事件死线（源侧 `TRAE_REMOTE_FIRST_EVENT_TIMEOUT_SECONDS`，默认 120s）。 */
 export const TRAE_REMOTE_FIRST_EVENT_TIMEOUT_MS = 120_000
 
+/**
+ * **Agent 档位的探测窗口**：仅当后面还跟着 Work 兜底时使用。
+ *
+ * 为什么单独给一个更短的窗口：Agent 档位在真机上会「会话建好了、executor 不启动」——
+ * 只发心跳、永不出模型事件。若为它死等完整 120s，再乘以账号轮转（实测 `attempts=3`），
+ * 一次请求要拖到 **6 分钟以上**，用户完全无法使用，也做不了任何对照实验。
+ *
+ * Agent 档位本质是「优先尝试」（源侧 `TRAE_REMOTE_AGENT_FIRST` 的语义就是先试 Agent、
+ * 不行再用 Work），所以它有资格被更快放弃：**只在有兜底时缩短**；没有兜底
+ *（用户显式只选一档）时仍用完整 120s，不误杀真正慢启动的合法会话。
+ */
+export const TRAE_REMOTE_AGENT_PROBE_MS = 25_000
+
 /** Remote 事件流：读完整个流的总上限（源侧 `TRAE_WEB_STREAM_TIMEOUT`，默认 300s）。 */
 export const TRAE_REMOTE_STREAM_TIMEOUT_MS = 300_000
 

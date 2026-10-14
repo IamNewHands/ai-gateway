@@ -1070,8 +1070,10 @@ export async function preflightFirstModelEvent(
       // 不在这里主动 `return()` 关流：底层生成器里还有一条**自己的**首事件死线，它会在
       // 同一预算到达时 abort 连接 —— 连接不会漏，也就不用 fire-and-forget 一个可能挂住的清理。
       if (e instanceof RemoteFirstEventTimeout || e instanceof RemoteReadTimeout) {
+        // 报**总预算**而不是最后一个窗口的剩余量：后者会让人误以为死线只有几秒
+        //（实测踩过：日志写 `no model event for 4760ms`，实际已经等满 120s）。
         throw new RemoteFirstEventTimeout(
-          `Trae remote session emitted no model event before the first-event deadline: ${(e as Error).message}`
+          `Trae remote session emitted no model event within ${firstEventTimeoutMs}ms (last window: ${(e as Error).message})`
         )
       }
       throw new RemoteFirstEventTimeout(

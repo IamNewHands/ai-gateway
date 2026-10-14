@@ -13,7 +13,7 @@
 import type { Env, Provider } from '../types'
 import { withSSEKeepAlive } from '../opencode'
 import { getPerfSettings } from '../perf'
-import { TRAE_CONNECT_DEADLINES_MS, TRAE_DEFAULT_MODEL, TRAE_KEEPALIVE_MS, TRAE_RAW_MAX_HISTORY_CHARS, TRAE_RAW_MAX_MESSAGES, TRAE_RAW_MAX_TOOL_SCHEMA_CHARS, TRAE_REMOTE_FIRST_EVENT_TIMEOUT_MS, TRAE_STATIC_MODEL_IDS, TRAE_STREAM_IDLE_TIMEOUT_MS, TRAE_WORK_CONSTANTS, isWorkModel, normalizeTraeModelName } from './constants'
+import { TRAE_CONNECT_DEADLINES_MS, TRAE_DEFAULT_MODEL, TRAE_KEEPALIVE_MS, TRAE_RAW_MAX_HISTORY_CHARS, TRAE_RAW_MAX_MESSAGES, TRAE_RAW_MAX_TOOL_SCHEMA_CHARS, TRAE_REMOTE_AGENT_PROBE_MS, TRAE_REMOTE_FIRST_EVENT_TIMEOUT_MS, TRAE_STATIC_MODEL_IDS, TRAE_STREAM_IDLE_TIMEOUT_MS, TRAE_WORK_CONSTANTS, isWorkModel, normalizeTraeModelName } from './constants'
 import { chatStream, chatWorkStream, exchangeToken, extractLastUserPrompt, isTraeQuotaError, isTraeRequestSideError, needsTraeRefresh, parseAuth, probeTraeCredits, type TraeConnectTiming } from './upstream'
 import { isRemoteOnlyModel, type HistoryBudget } from './payload'
 import { aggregateSoloSse, aggregateWorkSse, soloStreamToOpenAIStream, workStreamToOpenAIStream } from './sse'
@@ -752,6 +752,12 @@ async function proxyTraeRemoteRequest(
       // **不违反「不许偷偷换模型」**：换的是 executor 档位，模型名一个字符都不变；
       // Work 目录里若没有该模型，`createRemoteSession` 会显式抛错（而不是静默换一个）。
       const tiers = agentType === 'solo_agent_remote' ? [agentType, 'solo_work_remote'] : [agentType]
+      // Agent 档位只是「优先尝试」，后面有 Work 兜底 → 不必为它死等完整 120s。
+      // 实测每个账号都只发心跳，3 个账号轮下来一次请求要 6 分钟以上，根本没法做对照实验。
+      // 没有兜底时（用户显式只选一档）仍用完整窗口，不误杀真正慢启动的合法会话。
+      const probeMs = tiers.length > 1
+        ? Math.min(TRAE_REMOTE_FIRST_EVENT_TIMEOUT_MS, TRAE_REMOTE_AGENT_PROBE_MS)
+        : TRAE_REMOTE_FIRST_EVENT_TIMEOUT_MS
       let session: Awaited<ReturnType<typeof createRemoteSession>> | null = null
       let events: AsyncGenerator<TraeRemoteEvent> | null = null
       let effortNote = ''
@@ -781,6 +787,9 @@ async function proxyTraeRemoteRequest(
             baseUrl,
             agentType: tier,
             idleTimeoutMs,
+            // 与外层预读用**同一个**窗口：两处不一致会让内外死线乱响，
+            // 报出来的 ms 也对不上（实测踩过：报 4760ms，其实是外层 120s 预算的剩余量）。
+            firstEventTimeoutMs: probeMs,
             // 「上游到底发没发、发的什么形态」的直接证据，只在首个非空片段触发一次。
             // 没有它，「会话建起来了但一直没内容」只能靠猜（上游事件体只有模型输出，无凭据）。
             onRawHead: (head) => {
@@ -790,7 +799,7 @@ async function proxyTraeRemoteRequest(
               writeLog(env, 'info', msg).catch(() => { /* 日志失败不影响流 */ })
             },
           })
-          const pre = await preflightFirstModelEvent(probe, TRAE_REMOTE_FIRST_EVENT_TIMEOUT_MS)
+          const pre = await preflightFirstModelEvent(probe, probeMs)
           session = created
           events = pre.rest
           usedTier = tier
