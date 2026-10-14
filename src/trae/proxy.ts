@@ -673,12 +673,24 @@ export async function executeWorkRequest(
  * 「模型在 Work 目录里不存在」变成一个**硬失败**——每个带 tools 的请求都报
  * `model is not available`。默认走显式选择，失败模式温和得多（用户可在面板换档位）。
  */
+/**
+ * 请求生命周期钩子（结构上兼容 `ExecutionContext`）。
+ *
+ * 只需要 `waitUntil`：回收上游会话是**响应之后**才可能完成的工作，而 Workers 在响应
+ * 结束后会回收 isolate，未登记的异步任务会被直接丢弃（回收静默失败 = 会话泄漏）。
+ * 可选是为了单测与其他宿主：缺席时退回 fire-and-forget。
+ */
+export interface TraeRunCtx {
+  waitUntil?: (promise: Promise<unknown>) => void
+}
+
 async function proxyTraeRemoteRequest(
   env: Env,
   provider: Provider,
   body: Record<string, unknown>,
   configName: string,
-  stream: boolean
+  stream: boolean,
+  ctx?: TraeRunCtx
 ): Promise<Response> {
   const accounts = getTraeAccounts(provider)
   const cd = resolveTraeCooldown(provider)
@@ -688,6 +700,13 @@ async function proxyTraeRemoteRequest(
   const agentType = provider.traeRemoteAgentType === 'work' ? 'solo_work_remote' : 'solo_agent_remote'
   const concurrency = typeof provider.traeConcurrency === 'number' ? provider.traeConcurrency : 0
   const idleMs = typeof provider.traeSessionIdleMs === 'number' ? provider.traeSessionIdleMs : 0
+
+  // 收尾动作绑到请求生命周期上（见 TraeRunCtx 注释）：响应结束后未登记的异步任务
+  // 会被 Workers 直接丢弃，回收静默失败就退化成会话泄漏。
+  const defer = (p: Promise<unknown>): void => {
+    if (ctx?.waitUntil) { try { ctx.waitUntil(p); return } catch { /* 退回 fire-and-forget */ } }
+    void p
+  }
 
   // 思考强度：请求侧优先，面板默认档兜底（仅当客户端没带、或带了不可识别的值时）。
   // `__trae_effort` 由 src/proxy.ts 在 sanitizeUpstreamBody 删除前抢救而来。
@@ -817,7 +836,7 @@ async function proxyTraeRemoteRequest(
           // 这是本轮事故的核心：漏回收 → 槽位积满 → 之后每个新会话只排队、executor 不启动
           //（表现为「只发心跳、永远没有首个模型事件」），还会叠加上游 429。
           if (created) {
-            void stopRemoteSession(account, created.sessionId, created.messageId, { baseUrl, agentType: tier })
+            defer(stopRemoteSession(account, created.sessionId, created.messageId, { baseUrl, agentType: tier }))
           }
           // 并发上限是「账号资源被占满」，换 executor 换不掉占用 → 直接换号
           //（源侧 `main.py:7159` 同款：solo_agent_parallel_limit → rotating account）。
@@ -854,6 +873,16 @@ async function proxyTraeRemoteRequest(
       // 取成 const：闭包里引用 `let` 变量会丢掉 TS 的 null 收窄。
       const activeSession = session
       const activeEvents = events
+      // **会话生命周期 = 本次请求**，且**只回收一次**。三个时机互为补位：
+      //  1. `onDone`：模型刚说完 —— 请求还在飞，子请求一定落地，槽位也释放得最早（首选）；
+      //  2. `onClose`：客户端断连 / idle 兜底 / 读错误 —— 唯一能盖到这些路径的地方；
+      //  3. 非流式成功路径：没有流，前两者都不存在。
+      let stopInitiated = false
+      const stopOnce = (): void => {
+        if (stopInitiated) return
+        stopInitiated = true
+        defer(stopRemoteSession(account, activeSession.sessionId, activeSession.messageId, { baseUrl, agentType: usedTier }))
+      }
 
       // ===== 第二步：翻译已预读的流（activeEvents 已含首帧，不丢帧）=====
       if (stream) {
@@ -862,6 +891,9 @@ async function proxyTraeRemoteRequest(
         const sseBody = withSSEKeepAlive(
           webStreamToOpenAIStream(activeEvents, configName, {
             includeReasoning,
+            // 模型说完立刻回收上游会话（见 WebStreamOptions.onDone 注释：这是唯一
+            // 「请求还在飞」因而回收一定落地的时机）。
+            onDone: stopOnce,
             allowedTools: body['tools'],
             toolChoice: body['tool_choice'],
             onErr: (se) => { void applyStreamError(env, provider.id, account.uid, se, cd) },
@@ -896,7 +928,8 @@ async function proxyTraeRemoteRequest(
             // 会话」计的，正常收尾后的会话仍可能占着槽位；积满 2 个就 `solo_agent_parallel_limit`，
             // 之后**新会话只会排队、executor 不启动**（本轮现场）。
             // 源侧同款：请求结束时 `close_remote_session()` → `stop_session`。
-            void stopRemoteSession(account, activeSession.sessionId, activeSession.messageId, { baseUrl, agentType: usedTier })
+            // 若 `onDone` 已经回收过，这里是 no-op（`stopOnce` 去重）。
+            stopOnce()
           }
         )
         return new Response(sseBody, {
@@ -915,11 +948,12 @@ async function proxyTraeRemoteRequest(
         includeReasoning,
         allowedTools: body['tools'],
         toolChoice: body['tool_choice'],
+        onDone: stopOnce,
       })
       if (agg.err) {
         lastErr = new Error(`remote stream error code=${agg.err.code} msg=${agg.err.msg}`)
         const requestSide = await applyStreamError(env, provider.id, account.uid, agg.err, cd)
-        void stopRemoteSession(account, activeSession.sessionId, activeSession.messageId, { baseUrl, agentType: usedTier })
+        stopOnce()
         await releaseTraeSession(env, provider.id, account.uid).catch(() => {})
         if (requestSide) return traeClientParamsError(`remote error code=${agg.err.code} msg=${agg.err.msg}`)
         continue
@@ -935,11 +969,15 @@ async function proxyTraeRemoteRequest(
         const e = new Error(`TRAE Remote 非流式聚合未收到 done（kind=${info.kind} content=${info.contentChars}）`) as Error & { kind?: string }
         e.kind = 'transport'
         lastErr = e
-        void stopRemoteSession(account, activeSession.sessionId, activeSession.messageId, { baseUrl, agentType: usedTier })
+        stopOnce()
         await releaseTraeSession(env, provider.id, account.uid).catch(() => {})
         continue
       }
       await noteTraeSuccess(env, provider.id, account.uid)
+      // 非流式成功路径：没有流，就没有 `onDone` / `onClose` 可挂 —— 这里必须显式回收。
+      // 曾经漏了这一处：每个非流式 Remote 请求都泄漏一个上游会话，积满 2 个之后
+      // 新会话只排队、executor 不再启动（正是 2026-10-14 那个「只有心跳」的现场）。
+      stopOnce()
       await releaseTraeSession(env, provider.id, account.uid).catch(() => {})
       const out = agg.resp!
       out['model'] = configName
@@ -984,7 +1022,8 @@ async function proxyTraeRemoteRequest(
 export async function proxyTraeChatRequest(
   env: Env,
   provider: Provider,
-  body: Record<string, unknown>
+  body: Record<string, unknown>,
+  ctx?: TraeRunCtx
 ): Promise<Response> {
   const stream = body['stream'] === true
   const model = String(body['model'] || '')
@@ -1009,7 +1048,7 @@ export async function proxyTraeChatRequest(
   //    只有面板显式把「上游端点」选成 Remote 才走新传输 —— 这就是「保留原先的 SOLO、
   //    不影响使用」的落点：未配置该字段的提供商一个分支都不会进。
   if (provider.traeUpstreamEndpoint === 'remote') {
-    return proxyTraeRemoteRequest(env, provider, body, configName, stream)
+    return proxyTraeRemoteRequest(env, provider, body, configName, stream, ctx)
   }
 
   // 1. 若显式请求 Work 专属通道模型（且未携带外部自定义 tools），直接走 Work 通道

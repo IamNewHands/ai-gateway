@@ -587,6 +587,19 @@ export interface WebStreamOptions {
   onErr?: (se: SOLOStreamError) => void
   onTruncated?: (info: SoloStreamEndInfo) => void
   onRunaway?: (info: TraeRunawayInfo) => void
+  /**
+   * 收到上游 `done` 时**立刻**回调 —— 用来回收上游会话（`stopRemoteSession`）。
+   *
+   * 为什么不只在流收尾（`withSSEKeepAlive` 的 `onClose`）时回收：
+   *  - `done` 到达时**请求还在飞**（我们正往响应里写帧），此刻发起的子请求属于本次请求，
+   *    一定跑得完；
+   *  - `onClose` 是在 `controller.close()` **之后**才跑的，响应已经结束，此刻发起的子请求
+   *    可能被运行时直接丢弃 —— 回收静默失败 = 会话泄漏 = 上游并发槽位（实测上限 2）积满，
+   *    之后新会话只排队、executor 不启动（2026-10-14 现场就是这个形态）。
+   *
+   * 附带收益：模型一说完就释放槽位，不必等客户端把流慢慢读完。
+   */
+  onDone?: () => void
 }
 
 /** 从 OpenAI `tools` 字段抽出工具名集合（`undefined` = 未声明，`Set()` = 显式禁用）。 */
@@ -777,6 +790,7 @@ export function webStreamToOpenAIStream(
           if (event === 'done') {
             finalReason = String(data['finish_reason'] ?? data['finishReason'] ?? finalReason)
             sawDone = true
+            if (opts.onDone) { try { opts.onDone() } catch { /* 回收回调不得影响流 */ } }
             break
           }
         }
@@ -1042,6 +1056,7 @@ export async function aggregateWebSse(
       if (event === 'done') {
         finalReason = String(data['finish_reason'] ?? data['finishReason'] ?? finalReason)
         sawDone = true
+        if (opts.onDone) { try { opts.onDone() } catch { /* 回收回调不得影响聚合 */ } }
         break
       }
     }

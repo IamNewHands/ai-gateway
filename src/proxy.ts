@@ -1800,7 +1800,7 @@ export async function forwardProxy(
     if (isTraeProvider(provider)) {
       // 抢救思考强度（Remote 传输靠它承载档位；sanitize 之前必须留一份）
       rescueTraeReasoningEffort(provider, forwardBody as Record<string, unknown>)
-      const response = await proxyTraeChatRequest(c.env, provider, forwardBody as Record<string, unknown>)
+      const response = await proxyTraeChatRequest(c.env, provider, forwardBody as Record<string, unknown>, c.executionCtx)
       const logLevel = response.ok ? 'request' : (response.status >= 500 ? 'error' : 'warn')
       try {
         const bodySummary = summarizeRequestBody(forwardBody)
@@ -3718,7 +3718,7 @@ async function handleAnthropicMessagesInner(c: Context<AppEnv>) {
       // 而下面的 sanitize 会把它删掉——Remote 传输要靠它。
       rescueTraeReasoningEffort(provider, upstreamBody)
       sanitizeUpstreamBody(upstreamBody)
-      const response = await proxyTraeChatRequest(c.env, provider, upstreamBody)
+      const response = await proxyTraeChatRequest(c.env, provider, upstreamBody, c.executionCtx)
       if (!response.ok) {
         const errText = await response.text()
         try {
@@ -4441,7 +4441,15 @@ async function handleAnthropicCline(
   return handleAnthropicSpecial(c, provider, model, openaiBody, originalStream, clineProxy, 'Cline')
 }
 
-/** 特殊提供商（Cline/Gemini/CNB）的 Anthropic 格式转发共用实现。 */
+/**
+ * 特殊提供商（Cline / Gemini / CNB / M365）的 Anthropic 格式转发共用实现，也是它们
+ * 统一的三参回调签名。
+ *
+ * ⚠️ 第 4 个参数**不是空闲的**：Gemini（`GeminiProxyOptions`）、M365（`M365ProxyContext`）、
+ * CNB（`CnbStreamDiag` 回调）各自把它当成自己的 options。所以「请求生命周期钩子」不能塞进
+ * 这个签名 —— TRAE Remote 要在响应**之后**回收上游会话（只有登记到 `waitUntil` 才跑得完，
+ * 详见 `src/trae/proxy.ts` 的 `TraeRunCtx`），是在**它自己的调用点**用闭包绑进去的。
+ */
 type SpecialChatProxy = (env: Env, provider: import('./types').Provider, body: Record<string, unknown>) => Promise<Response>
 
 async function handleAnthropicSpecial(
@@ -4853,7 +4861,11 @@ async function handleResponsesInner(c: Context<AppEnv>) {
       // reasoning_effort，而 Remote 传输要靠它承载档位。传副本，不动 openaiBody。
       const traeBody = { ...openaiBody }
       rescueTraeReasoningEffort(provider, traeBody)
-      return handleResponsesSpecial(c, provider, model, traeBody, originalStream, proxyTraeChatRequest, 'TRAE', g5Base, g5Save)
+      // 用闭包把请求生命周期钩子绑进去（同下方 deepseek/cline 的薄包装写法）：
+      // `SpecialChatProxy` 的第 4 个参数已被别的通道占用，见该类型注释。
+      const traeResponsesProxy: SpecialChatProxy = (env, p, b) =>
+        proxyTraeChatRequest(env, p, b, c.executionCtx)
+      return handleResponsesSpecial(c, provider, model, traeBody, originalStream, traeResponsesProxy, 'TRAE', g5Base, g5Save)
     }
 
     // DeepSeek App：注入 token 池 + 私有协议转发（proxyDeepseekChatRequest 返回 OpenAI SSE），
