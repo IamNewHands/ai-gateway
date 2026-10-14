@@ -215,21 +215,38 @@ function rendererBlockText(block: Record<string, any>): string {
  * `_content_to_text` 没有 reasoning 概念，会把思考文本一起拼进去（回归用例见
  * `remote.test.ts` 的「数组 content 里的 reasoning 块被丢弃」）。
  *
- * ## 图片：源侧不支持，也不做占位（2026-10-15 读源确认，结论就是这一句）
+ * ## 图片：源侧不发，但**协议支持**（2026-10-15 抓到官方 web 客户端请求体后更正）
  *
- * 源侧 Remote 通路对图片**没有结构化字段、没有 data URI 透传、也没有占位文案**：
- * `flatten_query` 调的是 `trae_client._content_to_text`，它只读 `text` / `content`，
- * 两者都空才回落到 `renderer_block_text` 读 `value`；`image_url` / `image` 块三样都没有，
- * 于是产出**空串**、被 `"\n".join` 原样拼进去（净效果：图片位置多一个换行）。
+ * 上一版这里写的是「源侧不支持图片」——那是**推论错误**。源侧客户端不发图片 ≠ 协议不能带图。
+ *
+ * 官方 web 客户端（`work.trae.cn` 的 `POST /api/remote/v1/chat_sessions`）真实下发的
+ * `query` 是**一个 JSON 块数组的字符串**，图片走独立的 `attachment` 块：
+ *
+ * ```json
+ * [{"type":"text","data":{"content":"描述下图片"}},
+ *  {"type":"attachment","data":{"uri":"trae-res://remote_resource/tos-cn-i-aiagcest/cn/<uid>/remote_resource/<uuid>.trae",
+ *                               "filename":"PixPin_2026-10-14_14-16-32.png"}}]
+ * ```
+ *
+ * 由此确定三件事：
+ *  1. **格式家族与我们一致**（都是 `[{type,data}]` 的 JSON 字符串），差别只在官方按消息
+ *     分多个 `text` 块，而我们（照源侧 `flatten_query`）把整段对话压成**一个** `text` 块；
+ *  2. 附件是独立的 `attachment` 块，`uri` 指向 Trae 自己的资源存储（火山 TOS），
+ *     **不是** data URI —— 说明本地文件必须先经一个**上传 / 预签名**步骤换成 `trae-res://`；
+ *  3. `custom_model.multimodal: true` 确认该模型声明支持图片（该字段我们已解析但未使用，
+ *     见 `remote.ts` 的 `buildRemoteModelConfig`）。
+ *
+ * 那个上传端点**源侧与本仓库都还没有**（源侧 `flatten_query` 只产 `text` 块）。
+ * 拿到「附图时官方客户端发出的那个上传请求」后即可补上 `attachment` 块，
+ * 并以 `custom_model.multimodal` 作为门禁。
+ *
+ * 在那之前：图片块贡献空串（`_content_to_text` 只读 text/content），只能靠面板的识图桥
+ *（`vision/bridge.ts`）转写成文本 —— 那是**有损的权宜之计**，不是终态。
  *
  * 源侧另有一份同名的 `raw_client._content_to_text` 会产出
  * `[Unsupported image_url input omitted]`，但**那条路径不经过 Remote 的 flatten**
- * （它只被 `_remote_client_tool_task_anchor` 用，见 `remote-messages.ts`）——
+ *（它只被 `_remote_client_tool_task_anchor` 用，见 `remote-messages.ts`）——
  * 两份同名函数在源侧就是分叉的，别拿另一份的结论套这一份。
- *
- * 所以这里照抄源侧行为：图片块贡献空串，**不发明**任何新格式（不加 `[image]` 占位、
- * 不透传 base64、不改结构化字段）。真要让上游看图，走 `vision/bridge.ts` 在进提供商
- * 之前把图片换成转写文本——那条桥是网关自己的机制，与源侧无关。
  */
 function contentToText(content: unknown): string {
   if (content === null || content === undefined) return ''
@@ -309,8 +326,9 @@ function serializeToolCalls(toolCalls: unknown): string {
  * 与 SOLO 的 `prepareBody` 是两套格式：SOLO 走结构化 `messages`（content 转
  * `[{type:"text",text}]`），Remote 走这一条扁平 query。两者不可互换。
  *
- * 多模态见 `contentToText`：源侧 Remote 通路不支持图片，图片块只贡献一个空元素
- * （结论与依据都写在那个函数的注释里，别在这里另立一套说法）。
+ * 多模态：图片要走独立的 `attachment` 块（官方 web 端就是这么发的），而 `uri` 需要先经
+ * 上传换成 `trae-res://` —— 该上传端点尚未拿到，所以图片暂由 `contentToText` 丢掉。
+ * 依据与后续步骤都写在 `contentToText` 的注释里，别在这里另立一套说法。
  */
 export function flattenTraeQuery(messages: unknown): string {
   const list = Array.isArray(messages) ? messages : []
