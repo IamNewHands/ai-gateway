@@ -248,3 +248,61 @@ describe('flattenTraeQuery：多模态图片（源侧不支持图片，结论已
     expect(queryText(null)).toBe('')
   })
 })
+
+// ===== Remote 扁平 query 的附件块（官方 web 端形态：text 块 + attachment 块） =====
+
+describe('flattenTraeQuery：attachment 块（**追加**，不改 text 块）', () => {
+  const MESSAGES = [
+    { role: 'system', content: 'S' },
+    { role: 'user', content: '看图' },
+  ]
+  const ATTACHMENT = {
+    uri: 'trae-res://remote_resource/tos-cn-i-aiagcest/cn/u1/remote_resource/abc.trae',
+    filename: 'PixPin_2026-10-14_14-16-32.png',
+  }
+
+  it('无附件 → 输出与加这个参数之前**逐字节相同**（省略参数 / 空对象 / 空数组三种写法）', () => {
+    const before = flattenTraeQuery(MESSAGES)
+    expect(flattenTraeQuery(MESSAGES, {})).toBe(before)
+    expect(flattenTraeQuery(MESSAGES, { attachments: [] })).toBe(before)
+    // 形态也不能变：仍是**单条** text 块。
+    expect(JSON.parse(before)).toHaveLength(1)
+  })
+
+  it('有附件 → text 块一字不动，**追加** attachment 块（键序与官方一致）', () => {
+    const out = JSON.parse(flattenTraeQuery(MESSAGES, { attachments: [ATTACHMENT] }))
+    expect(out).toHaveLength(2)
+    expect(out[0].type).toBe('text')
+    expect(out[0].data.content).toBe('[System]\nS\n\n看图')
+    expect(out[1]).toEqual({ type: 'attachment', data: ATTACHMENT })
+    // 序列化后的键序也要对（上游按原文字节读，重排键序是没必要的风险）。
+    expect(flattenTraeQuery(MESSAGES, { attachments: [ATTACHMENT] }))
+      .toContain('{"type":"attachment","data":{"uri":"trae-res://')
+  })
+
+  it('多个附件按顺序追加', () => {
+    const out = JSON.parse(flattenTraeQuery(MESSAGES, {
+      attachments: [ATTACHMENT, { uri: 'trae-res://remote_resource/b.trae', filename: 'b.png' }],
+    }))
+    expect(out.map((b: { type: string }) => b.type)).toEqual(['text', 'attachment', 'attachment'])
+    expect(out[2].data.filename).toBe('b.png')
+  })
+
+  it('空 uri 的附件被跳过（不发上游必然拒绝的空引用）', () => {
+    const out = JSON.parse(flattenTraeQuery(MESSAGES, {
+      attachments: [
+        { uri: '', filename: 'x.png' },
+        { uri: '   ', filename: 'y.png' },
+        { uri: 'trae-res://remote_resource/ok.trae', filename: 'ok.png' },
+      ],
+    }))
+    expect(out).toHaveLength(2)
+    expect(out[1].data.uri).toBe('trae-res://remote_resource/ok.trae')
+  })
+
+  it('无文本 + 有附件 → 仍是合法的两块（text 块 content 为空串，不省略）', () => {
+    const out = JSON.parse(flattenTraeQuery(null, { attachments: [ATTACHMENT] }))
+    expect(out).toHaveLength(2)
+    expect(out[0]).toEqual({ type: 'text', data: { content: '' } })
+  })
+})

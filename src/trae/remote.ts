@@ -26,8 +26,9 @@ import {
   TRAE_REMOTE_STREAM_TIMEOUT_MS,
   normalizeTraeModelName,
 } from './constants'
-import { flattenTraeQuery } from './payload'
+import { flattenTraeQuery, type TraeQueryAttachment } from './payload'
 import { applyReasoningEffort, type TraeEffortLevel } from './reasoning-effort'
+import { uploadImageParts } from './resource-upload'
 import type { TraeAccount, TraeErrKind, TraeReasoningEffortConfig, TraeRemoteEvent, TraeRemoteModelConfig } from './types'
 
 /**
@@ -615,6 +616,15 @@ export interface CreateRemoteSessionOptions {
   sessionVariant?: string
   /** 客户端请求体（供 reasoning_effort 读取） */
   requestBody?: unknown
+  /**
+   * 待上传的图片（字节 + 文件名，由调用方从 messages 里抽出，见
+   * `resource-upload.ts` 的 `extractImageParts`）。
+   *
+   * **只有** `cfg.multimodal === true` 才会真的上传；其余情况（模型不声明多模态、
+   * `strategy === 'auto'` 拿不到模型目录）一律不上传 —— 与「面板识图桥只在配了识图模型时
+   * 才转写图片」是同一个门禁语义。上传失败也不让整轮会话失败（见 `createRemoteSession`）。
+   */
+  imageParts?: Array<{ bytes: Uint8Array; filename: string }>
   /** 诊断：把 effort / max / query 长度等结果写回调用方（见 RemoteSessionTrace） */
   trace?: RemoteSessionTrace
 }
@@ -636,6 +646,22 @@ export interface RemoteSessionTrace {
    * 不启动的症状**完全一样**。没有这个数字，那种失败只能靠猜。
    */
   queryChars?: number
+  /**
+   * 请求里带的图片张数（调用方从 messages 抽出的，不是原始块数）。
+   *
+   * 图片链路是 Remote 里**最容易静默失败**的一环：模型不识图、上传被拒、抽取阶段就丢了
+   * 远端 URL —— 三种情况上游都不会报错，只会「答非所问」。这三个数字 + `imageSkipReason`
+   * 是唯一能把它们区分开的东西（`proxy.ts` 的 `dropped_images=` 日志就靠它们）。
+   */
+  imageParts?: number
+  /** 真正以 `attachment` 块下发的张数 */
+  imageAttachments?: number
+  /** 上传失败的张数 */
+  imageUploadFailed?: number
+  /** 首条上传失败原因（**已脱敏、已截断**，可直接进日志） */
+  imageUploadError?: string
+  /** 图片没上传的原因：`model-not-multimodal` / `model-config-unresolved` */
+  imageSkipReason?: string
 }
 
 export interface CreateRemoteSessionResult {
@@ -685,10 +711,56 @@ export async function createRemoteSession(
   const variant = useMaxMode ? 'max' : String(opts.sessionVariant ?? '')
   const sessionId = await remoteModelSessionId(accountId, resolved.modelName || model, variant, opts.sessionId)
 
+  // ===== 图片：只有「模型声明多模态」才上传 =====
+  //
+  // 门禁是 `cfg.multimodal`（`buildRemoteModelConfig` 从上游模型目录解析出来的字段）。
+  // 为什么必须门禁，而不是「有图就传」：
+  //  - `strategy === 'auto'` 时压根没有 `cfg`（上游自己挑模型），此时传附件等于给一个
+  //    可能不识图的模型塞图 —— 与面板「识图桥只在配了识图模型时才转写」的语义一致；
+  //  - 上传是**两步外部写请求**（还会在 Trae 存储里落一个对象），不该在模型不识图时白花。
+  //
+  // 失败**不让整轮会话失败**：图片丢了总比整轮对话挂掉强 —— 用户至少还能拿到回答，
+  // 而下面留的 warn 日志（含张数与脱敏原因，**不含 auth**）能让人查到图为什么没上去。
+  // 降级后的行为 == 加这个功能之前的行为（图片降级成纯文本，`contentToText` 吃掉）。
+  //
+  // 已知代价：档位兜底（Agent → Work）会**再建一次会话**，那时图片会重新上传一遍
+  //（新的 uuid、新的对象）。只在上传成功但会话失败时发生，频率低；不做跨调用缓存是因为
+  // Workers 的 isolate 生命周期不可依赖，缓存反而会引入「拿到过期凭据」这种更难查的故障。
+  let attachments: TraeQueryAttachment[] = []
+  if (opts.imageParts && opts.imageParts.length > 0) {
+    if (cfg?.multimodal === true) {
+      const outcome = await uploadImageParts(account, opts.imageParts, { baseUrl: opts.baseUrl })
+      attachments = outcome.attachments
+      if (outcome.failures.length > 0) {
+        const first = outcome.failures[0]
+        const reason = String(first.reason ?? '').slice(0, 160)
+        // 只含张数与已脱敏的原因（`resource-upload.ts` 保证错误信息里没有 auth/session_key）。
+        console.warn(
+          `[trae-remote] image upload failed: requested=${opts.imageParts.length}`
+          + ` attached=${attachments.length} failed=${outcome.failures.length}`
+          + ` first=${first.filename}: ${reason}`
+        ) // codeql-disable: 纯诊断日志，不含凭据
+      }
+      if (opts.trace) {
+        opts.trace.imageParts = opts.imageParts.length
+        opts.trace.imageAttachments = attachments.length
+        opts.trace.imageUploadFailed = outcome.failures.length
+        opts.trace.imageUploadError = outcome.failures.length > 0
+          ? String(outcome.failures[0].reason ?? '').slice(0, 160)
+          : undefined
+      }
+    } else if (opts.trace) {
+      opts.trace.imageParts = opts.imageParts.length
+      opts.trace.imageAttachments = 0
+      opts.trace.imageUploadFailed = 0
+      opts.trace.imageSkipReason = cfg ? 'model-not-multimodal' : 'model-config-unresolved'
+    }
+  }
+
   // 扁平化一次并留住长度：`query` 是 Remote 唯一的对话载体，而源侧对超长 query 有
   // **静默上限**（约 480k 字符）—— 超了上游不发 done、直接丢会话，症状与「executor
   // 不启动」完全一样。长度是区分这两种失败的唯一线索。
-  const query = flattenTraeQuery(messages)
+  const query = flattenTraeQuery(messages, { attachments })
   const initialMessage: Record<string, any> = {
     chat_session_id: '',
     content: [],

@@ -48,7 +48,8 @@ function model(name: string, extra: Record<string, any> = {}): TraeRemoteModelCo
     name,
     displayName: String(extra['display_name'] ?? extra['display_model_name'] ?? '').trim() || undefined,
     configSource: 1,
-    multimodal: false,
+    // 多模态门禁是本次新增：helper 必须能造出 `multimodal: true`，否则「有图才上传」测不了。
+    multimodal: Boolean(extra['multimodal']),
     maxMode: Boolean(extra['max_mode']),
     reasoningEffortConfig: extra['reasoning_effort_config'],
     raw,
@@ -450,6 +451,188 @@ describe('createRemoteSession：建会话', () => {
   it('网络异常 → kind=transport（不罚号）', async () => {
     vi.stubGlobal('fetch', vi.fn(async () => { throw new Error('boom') }))
     await expect(createRemoteSession(ACCOUNT, 'auto', [], {})).rejects.toMatchObject({ kind: 'transport' })
+  })
+})
+
+// ===== 多模态图片：门禁 + 降级 =====
+
+/**
+ * 图片链路的三种失败都是**静默**的（模型不识图 / 上传被拒 / 抽取阶段就丢了），上游一律不报错。
+ * 这组用例守两件事：
+ *  1. **门禁**：只有 `custom_model.multimodal === true` 才真的上传（`auto` 策略没有 cfg → 不上传）；
+ *  2. **降级**：上传失败**不让整轮会话失败**，但要留下可查的证据（`trace` + warn 日志），
+ *     且日志里**没有** `auth` / `session_key`。
+ */
+describe('createRemoteSession：多模态图片（门禁 + 降级）', () => {
+  /** 1×1 PNG 的字节头（够魔术字节判后缀即可）。 */
+  const PNG = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a])
+  const STORE_URI = 'tos-cn-i-aiagcest/cn/u1/remote_resource/abc.trae'
+  const FAKE_AUTH = 'AKIDFAKE:version:v2:JWT-SECRET'
+  const FAKE_SESSION_KEY = 'sk-LEAK'
+  const IMAGE_PART = { bytes: PNG, filename: 'image-1.png' }
+
+  /** 按 URL 分派的 fetch：上传位 → PUT → 建会话。返回调用流水供断言。 */
+  function imageFetch(opts: { uploadUrlStatus?: number; putStatus?: number; putSuccess?: number } = {}) {
+    const calls: Array<{ url: string; init: any }> = []
+    const spy = vi.fn(async (url: string, init: any) => {
+      calls.push({ url, init })
+      if (String(url).includes('/get_resource_upload_url')) {
+        const status = opts.uploadUrlStatus ?? 200
+        if (status >= 400) return new Response('upload url denied', { status })
+        return new Response(JSON.stringify({
+          session_key: FAKE_SESSION_KEY,
+          store_infos: [{ auth: FAKE_AUTH, store_uri: STORE_URI }],
+          upload_hosts: ['tos-d-x-lf.snssdk.com'],
+        }), { status: 200 })
+      }
+      if (init?.method === 'PUT') {
+        const status = opts.putStatus ?? 200
+        if (status >= 400) return new Response('put denied', { status })
+        return new Response(JSON.stringify({ Version: '', success: opts.putSuccess ?? 0 }), { status: 200 })
+      }
+      return sessionResponse()
+    })
+    vi.stubGlobal('fetch', spy)
+    return calls
+  }
+
+  function queryBlocks(call: { init: any }): Array<{ type: string; data: any }> {
+    return JSON.parse(JSON.parse(call.init.body).initial_message.query)
+  }
+
+  it('multimodal=true → 上传并**追加** attachment 块（text 块不变）', async () => {
+    const models = { 'DeepSeek-V4-Pro': model('DeepSeek-V4-Pro', { multimodal: true }) }
+    const calls = imageFetch()
+    const trace: NonNullable<CreateRemoteSessionOptions['trace']> = {}
+
+    const result = await createRemoteSession(ACCOUNT, 'DeepSeek-V4-Pro', [{ role: 'user', content: '看图' }], {
+      models,
+      trace,
+      imageParts: [IMAGE_PART],
+    })
+
+    expect(result.sessionId).toBe('sess-1')
+    // 三次调用：① 申请上传位 → ② PUT 字节 → ③ 建会话。
+    expect(calls).toHaveLength(3)
+    expect(calls[0].url).toBe('https://trae-api-cn.mchost.guru/api/ide/v1/get_resource_upload_url')
+    expect(calls[1].url).toBe(`https://tos-d-x-lf.snssdk.com/${STORE_URI}`)
+    expect(calls[1].init.headers['Authorization']).toBe(FAKE_AUTH)
+
+    const blocks = queryBlocks(calls[2])
+    expect(blocks).toHaveLength(2)
+    expect(blocks[0]).toEqual({ type: 'text', data: { content: '看图' } })
+    expect(blocks[1]).toEqual({
+      type: 'attachment',
+      data: { uri: `trae-res://remote_resource/${STORE_URI}`, filename: 'image-1.png' },
+    })
+
+    expect(trace.imageParts).toBe(1)
+    expect(trace.imageAttachments).toBe(1)
+    expect(trace.imageUploadFailed).toBe(0)
+    expect(trace.imageSkipReason).toBeUndefined()
+  })
+
+  it('multimodal=false → **不上传**（只打一次建会话），trace 记下原因', async () => {
+    const models = { 'DeepSeek-V4-Pro': model('DeepSeek-V4-Pro') }
+    const calls = imageFetch()
+    const trace: NonNullable<CreateRemoteSessionOptions['trace']> = {}
+
+    await createRemoteSession(ACCOUNT, 'DeepSeek-V4-Pro', [{ role: 'user', content: '看图' }], {
+      models,
+      trace,
+      imageParts: [IMAGE_PART],
+    })
+
+    expect(calls).toHaveLength(1)
+    expect(queryBlocks(calls[0])).toHaveLength(1)
+    expect(trace.imageParts).toBe(1)
+    expect(trace.imageAttachments).toBe(0)
+    expect(trace.imageSkipReason).toBe('model-not-multimodal')
+  })
+
+  it('strategy=auto（拿不到 cfg）→ 不上传（与面板识图桥的降级语义一致）', async () => {
+    const calls = imageFetch()
+    const trace: NonNullable<CreateRemoteSessionOptions['trace']> = {}
+
+    await createRemoteSession(ACCOUNT, 'auto', [{ role: 'user', content: '看图' }], {
+      trace,
+      imageParts: [IMAGE_PART],
+    })
+
+    expect(calls).toHaveLength(1)
+    expect(queryBlocks(calls[0])).toHaveLength(1)
+    expect(trace.imageSkipReason).toBe('model-config-unresolved')
+  })
+
+  it('上传位申请失败 → **会话照建**（降级），无 attachment 块，warn 日志不含凭据', async () => {
+    const models = { 'DeepSeek-V4-Pro': model('DeepSeek-V4-Pro', { multimodal: true }) }
+    const calls = imageFetch({ uploadUrlStatus: 500 })
+    const trace: NonNullable<CreateRemoteSessionOptions['trace']> = {}
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => { /* 静音 */ })
+    let sessionId = ''
+    let warnText = ''
+    try {
+      const result = await createRemoteSession(ACCOUNT, 'DeepSeek-V4-Pro', [{ role: 'user', content: '看图' }], {
+        models,
+        trace,
+        imageParts: [IMAGE_PART],
+      })
+      sessionId = result.sessionId
+      // 在 mockRestore **之前**取走调用记录：restore 会连带清空历史。
+      warnText = warn.mock.calls.map((c) => c.join(' ')).join('\n')
+    } finally {
+      warn.mockRestore()
+    }
+
+    // 图片丢了，但整轮对话**没有**失败 —— 这是本条的硬要求。
+    expect(sessionId).toBe('sess-1')
+    expect(calls).toHaveLength(2) // 上传位（失败）+ 建会话
+    expect(queryBlocks(calls[1])).toHaveLength(1)
+    expect(trace.imageParts).toBe(1)
+    expect(trace.imageAttachments).toBe(0)
+    expect(trace.imageUploadFailed).toBe(1)
+    expect(trace.imageUploadError).toContain('[500]')
+
+    expect(warnText).toContain('requested=1')
+    expect(warnText).toContain('attached=0')
+    expect(warnText).not.toContain('JWT-SECRET')
+    expect(warnText).not.toContain(FAKE_SESSION_KEY)
+  })
+
+  it('PUT 返回 success=1（业务失败）→ 同样降级，不炸会话', async () => {
+    const models = { 'DeepSeek-V4-Pro': model('DeepSeek-V4-Pro', { multimodal: true }) }
+    const calls = imageFetch({ putSuccess: 1 })
+    const trace: NonNullable<CreateRemoteSessionOptions['trace']> = {}
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => { /* 静音 */ })
+    let sessionId = ''
+    try {
+      const result = await createRemoteSession(ACCOUNT, 'DeepSeek-V4-Pro', [{ role: 'user', content: '看图' }], {
+        models,
+        trace,
+        imageParts: [IMAGE_PART],
+      })
+      sessionId = result.sessionId
+    } finally {
+      warn.mockRestore()
+    }
+
+    expect(sessionId).toBe('sess-1')
+    expect(calls).toHaveLength(3)
+    expect(queryBlocks(calls[2])).toHaveLength(1)
+    expect(trace.imageUploadFailed).toBe(1)
+    expect(trace.imageUploadError).toContain('success=1')
+  })
+
+  it('没有 imageParts → 一次多余请求都不发（零回归）', async () => {
+    const models = { 'DeepSeek-V4-Pro': model('DeepSeek-V4-Pro', { multimodal: true }) }
+    const calls = imageFetch()
+    const trace: NonNullable<CreateRemoteSessionOptions['trace']> = {}
+
+    await createRemoteSession(ACCOUNT, 'DeepSeek-V4-Pro', [{ role: 'user', content: 'hi' }], { models, trace })
+
+    expect(calls).toHaveLength(1)
+    expect(trace.imageParts).toBeUndefined()
+    expect(trace.imageAttachments).toBeUndefined()
   })
 })
 

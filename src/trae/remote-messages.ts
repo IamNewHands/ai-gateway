@@ -202,18 +202,23 @@ export function historyHasToolProtocol(messages: unknown): boolean {
 /**
  * 统计请求里的图片块数量（**诊断用**）。
  *
- * 为什么需要它：源侧 Remote 的 flatten 会把图片块静默吃掉且不报错（见
- * `payload.ts` 的 `contentToText` 注释），而本地 profile 给 trae 模型声明了
- * `input: [text, image]` —— 也就是用户真的会附图，然后被无声丢弃。这条链路
- * 没有任何异常可抓，只能靠调用方打一行日志暴露「本轮有几张图被丢了」。
+ * 为什么需要它：Remote 的 flatten 只读 `text`/`content`，图片块本身不会变成 query 里的
+ * 文本。图片现在走独立的上传 + `attachment` 块（`resource-upload.ts`），但那条路有**三道
+ * 静默失败**——模型不声明多模态、上传被拒、抽取阶段就丢了（远端 URL / 解码失败）——
+ * 上游一律不报错，用户只看到「模型答非所问」。这个计数就是分母：`proxy.ts` 用
+ * `countImageBlocks() - extractImageParts().length` 与 `trace.imageAttachments` 的差额
+ * 打 `dropped_images=` 日志。
  *
  * 只数两种形态（本仓库到 trae 之前已由 `formats.ts` 统一成第一种）：
  *  - OpenAI：`{ type: 'image_url', image_url: { url } }`
  *  - Anthropic：`{ type: 'image', source: { type: 'base64' | 'url', … } }`
  *
  * 只看 `content` 数组里的块，不看顶层字段，也不校验 url 是否为空 —— 计数器的用途是
- * 「有没有图被丢掉」，不是「图能不能用」。`input_image`（Responses 形态）与 `file`
+ * 「有没有图没进上游」，不是「图能不能用」。`input_image`（Responses 形态）与 `file`
  * 块不计入：它们到 trae 之前会被归一成 `image_url`，真要覆盖再各加一个分支。
+ *
+ * ⚠️ 口径必须与 `resource-upload.ts` 的 `extractImageParts` **成对演进**：两者数的不是
+ * 同一批块时，日志里的差额就会说谎（多报或漏报丢图）。
  */
 export function countImageBlocks(messages: unknown): number {
   if (!Array.isArray(messages)) return 0

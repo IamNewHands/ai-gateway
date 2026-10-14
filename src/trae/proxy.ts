@@ -20,6 +20,7 @@ import { aggregateSoloSse, aggregateWorkSse, soloStreamToOpenAIStream, workStrea
 import { aggregateWebSse, webStreamToOpenAIStream } from './web-sse'
 import { createRemoteSession, effectiveRemoteConcurrency, preflightFirstModelEvent, streamRemoteEvents, stopRemoteSession, type RemoteSessionTrace } from './remote'
 import { countImageBlocks, historyHasToolProtocol, prepareRemoteMessages } from './remote-messages'
+import { extractImageParts } from './resource-upload'
 import {
   TRAE_REMOTE_LEASE_TOUCH_MS,
   registerRemoteSession,
@@ -733,23 +734,18 @@ async function proxyTraeRemoteRequest(
     tools: body['tools'],
   })
 
-  // 诊断：图片走到了 Remote 传输还没被转写 —— 这**不是**传输缺陷，而是**开关没开**。
+  // 图片：Remote 的 `query` 是纯文本，图片必须走独立的 `attachment` 块，而那个 `uri`
+  //（`trae-res://…`）**要求字节已经躺在 Trae 的资源存储里** —— 所以要先上传
+  //（`resource-upload.ts`）。这里只负责把 messages 里的图片字节抽出来交给
+  // `createRemoteSession`；**传不传由它按 `custom_model.multimodal` 门禁决定**，
+  // 因为模型目录只有它拉得到。
   //
-  // Remote 的 `query` 是纯文本（`flatten_query` 只读 text/content），所以图片必须先在
-  // 网关侧转写。这个机制**早就有**：面板给该提供商勾选任一「识图模型」后，
-  // `src/proxy.ts:1626` 会对**所有普通提供商**（含 trae）先跑一遍 VisionBridge，把图片
-  // 转写成文本再进本函数。没勾 → 图片在这里被静默丢弃。
-  //
-  // 之所以要专门记一条：不记的话，用户附图后只会看到「模型答非所问」，而完全无从知道
-  // 图片根本没到上游（2026-10-14 实测踩过）。
-  const droppedImages = countImageBlocks(body['messages'])
-  if (droppedImages > 0) {
-    const imgMsg = `[trae-remote] provider=${provider.id} model=${configName}`
-      + ` dropped_images=${droppedImages} reason=visionBridge-not-configured`
-      + ` fix=面板-识图模型配置-勾选任一识图模型(主文本模型留空)`
-    console.log(imgMsg) // codeql-disable: 纯诊断日志，不含密钥/敏感 token
-    void writeLog(env, 'warn', imgMsg).catch(() => { /* 日志失败不影响请求 */ })
-  }
+  // 抽不出来的（`image_url.url` 是 http(s) 远端地址、Anthropic `source.type=url`、
+  // base64 解码失败）**不进** `imageParts` —— 本层刻意不做「服务端替调用方去抓任意第三方
+  // 图床」这件事（SSRF 面 + 不在本轮范围）。这类差额靠
+  // `imageBlocks - imageParts.length` 在下面的 `dropped_images=` 日志里暴露，不静默。
+  const imageBlocks = countImageBlocks(body['messages'])
+  const imageParts = imageBlocks > 0 ? extractImageParts(body['messages']) : []
 
   // 收尾动作绑到请求生命周期上（见 TraeRunCtx 注释）：响应结束后未登记的异步任务
   // 会被 Workers 直接丢弃，回收静默失败就退化成会话泄漏。
@@ -853,6 +849,7 @@ async function proxyTraeRemoteRequest(
             maxMode: provider.traeRemoteMaxMode === true,
             requestBody,
             trace,
+            imageParts,
             sessionVariant: tierFallbackUsed ? 'work-fallback' : '',
           })
           // 登记存活会话（见 session-registry 注释）：隔离进程若在「建会话」与「回收」
@@ -908,6 +905,29 @@ async function proxyTraeRemoteRequest(
             + ` query=${trace.queryChars ?? -1}`
           console.log(sessionMsg) // codeql-disable: 纯诊断日志，不含密钥/敏感 token
           writeLog(env, 'info', sessionMsg).catch(() => { /* 日志失败不影响流 */ })
+
+          // 「客户端带了图、上游没收到」的告警。**只在真的丢图时打**（这正是本条的改动：
+          // 以前无论上传是否可用都打，现在只有降级才打），三种情形合并成一条：
+          //   - 模型不声明多模态 / auto 策略拿不到模型目录 → 压根没上传（`imageSkipReason`）；
+          //   - 上传被拒或网络失败（`imageUploadError`，已脱敏）；
+          //   - 抽取阶段就丢了（远端 URL / 解码失败），由 imageBlocks 与 imageParts 的差额暴露。
+          //
+          // 为什么必须留这条：图丢了上游**不报错**，用户只会看到「模型答非所问」，完全无从
+          // 知道图根本没到（2026-10-14 实测踩过）。`fix=` 保留「面板勾选识图模型」这条降级建议
+          // —— 那是模型不识图时唯一能让图片信息进上游的路（VisionBridge 转写成文本）。
+          const attachedImages = trace.imageAttachments ?? 0
+          const droppedImages = Math.max(0, imageBlocks - attachedImages)
+          if (droppedImages > 0) {
+            const reason = trace.imageUploadError
+              || trace.imageSkipReason
+              || (imageBlocks > imageParts.length ? 'unsupported-image-source' : 'unknown')
+            const imgMsg = `[trae-remote] provider=${provider.id} uid=${account.uid} model=${configName}`
+              + ` dropped_images=${droppedImages} requested=${imageBlocks} attached=${attachedImages}`
+              + ` reason=${reason}`
+              + ` fix=面板-识图模型配置-勾选任一识图模型(主文本模型留空)`
+            console.log(imgMsg) // codeql-disable: 纯诊断日志，不含密钥/敏感 token
+            writeLog(env, 'warn', imgMsg).catch(() => { /* 日志失败不影响流 */ })
+          }
         } catch (e) {
           lastErr = e as Error
           // **失败即回收**：把上游会话停掉，别让它占着账号的并发槽位。

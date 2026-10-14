@@ -236,12 +236,14 @@ function rendererBlockText(block: Record<string, any>): string {
  *  3. `custom_model.multimodal: true` 确认该模型声明支持图片（该字段我们已解析但未使用，
  *     见 `remote.ts` 的 `buildRemoteModelConfig`）。
  *
- * 那个上传端点**源侧与本仓库都还没有**（源侧 `flatten_query` 只产 `text` 块）。
- * 拿到「附图时官方客户端发出的那个上传请求」后即可补上 `attachment` 块，
- * 并以 `custom_model.multimodal` 作为门禁。
+ * 那个上传端点曾经「源侧与本仓库都还没有」（源侧 `flatten_query` 只产 `text` 块）。
+ * 2026-10-15 已补齐，落在 `resource-upload.ts`：① `POST {IDE}/get_resource_upload_url`
+ * 拿上传位 → ② `PUT https://{upload_host}/{store_uri}` 传字节 → ③ 拼出 `trae-res://…`。
+ * 本文件只负责**引用**它（`flattenTraeQuery` 的 `attachments` 选项），不做上传。
  *
- * 在那之前：图片块贡献空串（`_content_to_text` 只读 text/content），只能靠面板的识图桥
- *（`vision/bridge.ts`）转写成文本 —— 那是**有损的权宜之计**，不是终态。
+ * 门禁是 `custom_model.multimodal`（`remote.ts` 的 `buildRemoteModelConfig` 解析）。
+ * 模型不识图时图片仍然只能走面板的识图桥（`vision/bridge.ts`）转写成文本 —— 那是**有损的
+ * 权宜之计**，不是终态；`multimodal: true` 时走真正的 `attachment` 块。
  *
  * 源侧另有一份同名的 `raw_client._content_to_text` 会产出
  * `[Unsupported image_url input omitted]`，但**那条路径不经过 Remote 的 flatten**
@@ -316,6 +318,17 @@ function serializeToolCalls(toolCalls: unknown): string {
 }
 
 /**
+ * 一个已经上传好的附件（`uri` 必须是 `trae-res://…`，由 `resource-upload.ts` 产出）。
+ *
+ * 单独成类型而不是内联对象：`remote.ts`（上传）与 `proxy.ts`（抽取字节）都要引用同一形态，
+ * 各写一份字面量迟早会漂移。
+ */
+export interface TraeQueryAttachment {
+  uri: string
+  filename: string
+}
+
+/**
  * 把 OpenAI messages 扁平化为 Remote 端点的 `query` 字段。
  *
  * 形态：`JSON.stringify([{ type: 'text', data: { content: <整段文本> } }])`
@@ -326,11 +339,20 @@ function serializeToolCalls(toolCalls: unknown): string {
  * 与 SOLO 的 `prepareBody` 是两套格式：SOLO 走结构化 `messages`（content 转
  * `[{type:"text",text}]`），Remote 走这一条扁平 query。两者不可互换。
  *
- * 多模态：图片要走独立的 `attachment` 块（官方 web 端就是这么发的），而 `uri` 需要先经
- * 上传换成 `trae-res://` —— 该上传端点尚未拿到，所以图片暂由 `contentToText` 丢掉。
- * 依据与后续步骤都写在 `contentToText` 的注释里，别在这里另立一套说法。
+ * ## 多模态：**追加** `attachment` 块，不动 `text` 块
+ *
+ * 官方 web 端把图片发成独立的 `attachment` 块（`uri` 指向 Trae 自己的资源存储，见
+ * `contentToText` 的注释）。我们照发，但**刻意不**模仿官方「按消息分多个 text 块」的形态：
+ * 本仓库对源侧 `flatten_query` 的「整段对话压成一个 text 块」是既有行为，动它会改掉所有
+ * 历史请求的字节形态（缓存、回归用例全受影响）。所以这里的规则是：
+ *
+ *  - `opts.attachments` 为空 → 输出与加这个参数之前**逐字节相同**；
+ *  - 非空 → 在 text 块**之后**追加 `{type:'attachment',data:{uri,filename}}`，text 块一字不动。
+ *
+ * 空 `uri` 的附件被跳过（而不是发一个上游必然拒绝的空引用）—— 上传失败时调用方就不该
+ * 把半成品塞进来，这里再兜一层。
  */
-export function flattenTraeQuery(messages: unknown): string {
+export function flattenTraeQuery(messages: unknown, opts?: { attachments?: TraeQueryAttachment[] }): string {
   const list = Array.isArray(messages) ? messages : []
   const parts: string[] = []
   for (const mi of list) {
@@ -375,8 +397,22 @@ export function flattenTraeQuery(messages: unknown): string {
     }
   }
   const text = parts.join('\n\n')
+  // 键序固定（type 在前、data 在后；data 里 content 唯一）：无附件时这里必须与改动前
+  // **逐字节相同**，回归用例 `payload.test.ts` 的「无附件输出逐字节不变」在守这条。
+  const blocks: Array<{ type: string; data: Record<string, string> }> = [
+    { type: 'text', data: { content: text } },
+  ]
+  for (const attachment of opts?.attachments ?? []) {
+    if (!attachment) continue
+    const uri = typeof attachment.uri === 'string' ? attachment.uri.trim() : ''
+    if (!uri) continue
+    blocks.push({
+      type: 'attachment',
+      data: { uri, filename: String(attachment.filename ?? '') },
+    })
+  }
   try {
-    return JSON.stringify([{ type: 'text', data: { content: text } }])
+    return JSON.stringify(blocks)
   } catch {
     return JSON.stringify([{ type: 'text', data: { content: '' } }])
   }
