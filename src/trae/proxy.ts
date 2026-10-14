@@ -733,13 +733,20 @@ async function proxyTraeRemoteRequest(
     tools: body['tools'],
   })
 
-  // 诊断：Remote 照源侧**丢弃**图片且不报错（`flatten_query` 只读 text/content），
-  // 而 DSH 给 trae 模型声明了 `input: [text, image]` —— 不写这行，用户附图被吃掉是
-  // 完全无声的，只会表现为「模型答非所问」。
+  // 诊断：图片走到了 Remote 传输还没被转写 —— 这**不是**传输缺陷，而是**开关没开**。
+  //
+  // Remote 的 `query` 是纯文本（`flatten_query` 只读 text/content），所以图片必须先在
+  // 网关侧转写。这个机制**早就有**：面板给该提供商勾选任一「识图模型」后，
+  // `src/proxy.ts:1626` 会对**所有普通提供商**（含 trae）先跑一遍 VisionBridge，把图片
+  // 转写成文本再进本函数。没勾 → 图片在这里被静默丢弃。
+  //
+  // 之所以要专门记一条：不记的话，用户附图后只会看到「模型答非所问」，而完全无从知道
+  // 图片根本没到上游（2026-10-14 实测踩过）。
   const droppedImages = countImageBlocks(body['messages'])
   if (droppedImages > 0) {
     const imgMsg = `[trae-remote] provider=${provider.id} model=${configName}`
-      + ` dropped_images=${droppedImages} reason=remote-query-carries-no-images`
+      + ` dropped_images=${droppedImages} reason=visionBridge-not-configured`
+      + ` fix=面板-识图模型配置-勾选任一识图模型(主文本模型留空)`
     console.log(imgMsg) // codeql-disable: 纯诊断日志，不含密钥/敏感 token
     void writeLog(env, 'warn', imgMsg).catch(() => { /* 日志失败不影响请求 */ })
   }
