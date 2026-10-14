@@ -18,11 +18,14 @@ import {
   douyinFallbackHost,
   extractImageParts,
   fetchResourceUploadUrl,
+  imageMimeFromBytes,
   redactCredentials,
   resourceUploadBase,
+  TRAE_RESOURCE_MAX_PUTS,
   uploadImageParts,
   uploadResourceToTrae,
   type ResourceUploadTicket,
+  type ResourceUploadTrace,
 } from './resource-upload'
 import type { TraeAccount } from './types'
 
@@ -282,9 +285,13 @@ describe('uploadResourceToTrae：② 上传字节 + ③ 拼 URI', () => {
       urls.push(url)
       return putResponse(1)
     }))
-    await expect(uploadResourceToTrae(ACCOUNT, ticket(), BYTES, 'a.png')).rejects.toThrow(/success=1/)
-    // `success !== 0` 也算「这个主机不行」→ 候选链继续走完。
-    expect(urls).toHaveLength(2)
+    const err = await uploadResourceToTrae(ACCOUNT, ticket(), BYTES, 'a.png').then(() => null, (e: Error) => e)
+    expect(err!.message).toContain('success=1')
+    // `success !== 0` 也算「这个组合不行」→ 阶梯走完：3 变体 × 2 主机 = 6 枪。
+    expect(urls).toHaveLength(6)
+    expect(err!.message).toContain('variant=octet+crc host=')
+    expect(err!.message).toContain('variant=mime+crc host=')
+    expect(err!.message).toContain('variant=mime-nocrc host=')
   })
 
   it('HTTP 2xx 且响应体没有 success 字段 → 按 2xx 认成功（代理可能吃掉 body）', async () => {
@@ -293,16 +300,16 @@ describe('uploadResourceToTrae：② 上传字节 + ③ 拼 URI', () => {
       .resolves.toBe(`trae-res://remote_resource/${STORE_URI}`)
   })
 
-  it('HTTP 失败 → 抛聚合错误，含每个主机的状态码与排障定位（uid/filename），不含 auth', async () => {
+  it('HTTP 失败 → 抛聚合错误，含每个组合的变体名/状态码与排障定位（uid/filename），不含 auth', async () => {
     const urls: string[] = []
     vi.stubGlobal('fetch', vi.fn(async (url: string) => {
       urls.push(url)
       return new Response(`denied ${FAKE_AUTH}`, { status: 403 })
     }))
     const err = await uploadResourceToTrae(ACCOUNT, ticket(), BYTES, 'image-1.png').then(() => null, (e: Error) => e)
-    expect(urls).toHaveLength(2)
-    expect(err!.message).toContain(`host=${OBSERVED_HOST} [403]`)
-    expect(err!.message).toContain(`host=${UPLOAD_HOST} [403]`)
+    expect(urls).toHaveLength(6)
+    expect(err!.message).toContain(`variant=octet+crc host=${OBSERVED_HOST} [403]`)
+    expect(err!.message).toContain(`variant=mime+crc host=${UPLOAD_HOST} [403]`)
     expect(err!.message).toContain('uid=u1')
     expect(err!.message).toContain('file=image-1.png')
     expect(err!.message).not.toContain('JWT-SECRET')
@@ -400,8 +407,8 @@ describe('uploadResourceToTrae：上传主机候选顺序与逐个换主机（20
     const err = await uploadResourceToTrae(ACCOUNT, ticket(), BYTES, 'image-1.png').then(() => null, (e: Error) => e)
 
     expect(urls).toHaveLength(2)
-    expect(err!.message).toContain(`host=${OBSERVED_HOST} [400]`)
-    expect(err!.message).toContain(`host=${UPLOAD_HOST} [400]`)
+    expect(err!.message).toContain(`variant=octet+crc host=${OBSERVED_HOST} [400]`)
+    expect(err!.message).toContain(`variant=octet+crc host=${UPLOAD_HOST} [400]`)
     expect(err!.message).toContain('InvalidFileType')
     // 失败细节进错误信息，但凭据不进。
     expect(err!.message).not.toContain('JWT-SECRET')
@@ -453,12 +460,188 @@ describe('uploadResourceToTrae：上传主机候选顺序与逐个换主机（20
   })
 })
 
+// ===== 上传变体阶梯（2026-10-15：主机维度已排除，只剩「类型」这一个变量） =====
+
+describe('uploadResourceToTrae：变体阶梯（Content-Type / Content-CRC32 的候选）', () => {
+  /** PNG 魔术字节开头 → `imageMimeFromBytes` 认得出，阶梯有 3 档。 */
+  const PNG = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a])
+  /** 没有魔术字节 → mime 嗅不出，阶梯只有 1 档。 */
+  const UNKNOWN = new Uint8Array([1, 2, 3])
+
+  /** 记录每次 PUT 的 (host, contentType, crc 头有没有, 四个恒定头)。 */
+  function ladderSpy(responder: (n: number) => Response) {
+    const puts: Array<{
+      host: string
+      contentType: string | undefined
+      crc: string | undefined
+      authorization: string | undefined
+      accept: string | undefined
+      origin: string | undefined
+      referer: string | undefined
+    }> = []
+    let n = 0
+    vi.stubGlobal('fetch', vi.fn(async (url: string, init: any) => {
+      n++
+      puts.push({
+        host: new URL(url).host,
+        contentType: init.headers['Content-Type'],
+        crc: init.headers['Content-CRC32'],
+        authorization: init.headers['Authorization'],
+        accept: init.headers['Accept'],
+        origin: init.headers['Origin'],
+        referer: init.headers['Referer'],
+      })
+      return responder(n)
+    }))
+    return puts
+  }
+
+  it('imageMimeFromBytes：魔术字节 → 真实 mime；嗅不出返回空串（不瞎填）', () => {
+    expect(imageMimeFromBytes(new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]))).toBe('image/png')
+    expect(imageMimeFromBytes(new Uint8Array([0xff, 0xd8, 0xff, 0xe0]))).toBe('image/jpeg')
+    expect(imageMimeFromBytes(new Uint8Array([0x47, 0x49, 0x46, 0x38, 0x39, 0x61]))).toBe('image/gif')
+    expect(imageMimeFromBytes(
+      new Uint8Array([0x52, 0x49, 0x46, 0x46, 0, 0, 0, 0, 0x57, 0x45, 0x42, 0x50])
+    )).toBe('image/webp')
+    expect(imageMimeFromBytes(UNKNOWN)).toBe('')
+    expect(imageMimeFromBytes(new Uint8Array(0))).toBe('')
+  })
+
+  it('顺序是契约：外层变体、内层主机，3 变体 × 2 主机 = 6 枪', async () => {
+    const puts = ladderSpy(() => new Response('nope', { status: 400 }))
+    const trace: ResourceUploadTrace = {}
+
+    await expect(
+      uploadResourceToTrae(ACCOUNT, ticket(), PNG, 'image-1.png', { trace })
+    ).rejects.toThrow(/Trae resource upload failed/)
+
+    expect(puts.map((p) => `${p.host}|${p.contentType}|${p.crc === undefined ? 'nocrc' : 'crc'}`)).toEqual([
+      `${OBSERVED_HOST}|application/octet-stream|crc`,
+      `${UPLOAD_HOST}|application/octet-stream|crc`,
+      `${OBSERVED_HOST}|image/png|crc`,
+      `${UPLOAD_HOST}|image/png|crc`,
+      `${OBSERVED_HOST}|image/png|nocrc`,
+      `${UPLOAD_HOST}|image/png|nocrc`,
+    ])
+    // 4 个恒定头在所有变体上都不变 —— 实验只允许一个变量（Content-Type / CRC）在动。
+    for (const p of puts) {
+      expect(p.authorization).toBe(FAKE_AUTH)
+      expect(p.accept).toBe('*/*')
+      expect(p.origin).toBe('https://work.trae.cn')
+      expect(p.referer).toBe('https://work.trae.cn/')
+    }
+    expect(trace.attempts).toBe(6)
+    expect(trace.exhausted).toBe(false)
+    expect(trace.variant).toBeUndefined()
+  })
+
+  it('嗅不出 mime → **跳过**变体 2/3，只留 octet+crc（不瞎填 Content-Type）', async () => {
+    const puts = ladderSpy(() => new Response('nope', { status: 400 }))
+    const trace: ResourceUploadTrace = {}
+
+    await expect(
+      uploadResourceToTrae(ACCOUNT, ticket(), UNKNOWN, 'image-1.bin', { trace })
+    ).rejects.toThrow(/mime=unknown/)
+
+    expect(puts).toHaveLength(2)
+    expect(puts.every((p) => p.contentType === 'application/octet-stream' && p.crc !== undefined)).toBe(true)
+    // 错误信息要如实说「阶梯只有一档」，别让读日志的人以为 mime 变体也试过了。
+    await expect(
+      uploadResourceToTrae(ACCOUNT, ticket(), UNKNOWN, 'image-1.bin')
+    ).rejects.toThrow(/variants=octet\+crc/)
+  })
+
+  it('变体 2 成功即停：不再试变体 3，也不再多打主机', async () => {
+    // 前 2 枪（变体 1 的两台主机）400，第 3 枪（变体 2 的第一台主机）成功。
+    const puts = ladderSpy((n) => (n < 3 ? new Response('nope', { status: 400 }) : putResponse(0)))
+    const trace: ResourceUploadTrace = {}
+
+    const uri = await uploadResourceToTrae(ACCOUNT, ticket(), PNG, 'image-1.png', { trace })
+
+    expect(uri).toBe(`trae-res://remote_resource/${STORE_URI}`)
+    expect(puts).toHaveLength(3)
+    expect(puts[2].contentType).toBe('image/png')
+    expect(puts[2].crc).toBe(crc32Hex(PNG))
+    // 变体 3（nocrc）一次都没发过。
+    expect(puts.some((p) => p.crc === undefined)).toBe(false)
+    expect(trace.variant).toBe('mime+crc')
+    expect(trace.attempts).toBe(3)
+    expect(trace.exhausted).toBe(false)
+  })
+
+  it('变体 1 成功 → trace 记 octet+crc、只打 1 枪（不回归）', async () => {
+    const puts = ladderSpy(() => putResponse(0))
+    const trace: ResourceUploadTrace = {}
+
+    await uploadResourceToTrae(ACCOUNT, ticket(), PNG, 'image-1.png', { trace })
+
+    expect(puts).toHaveLength(1)
+    expect(puts[0].contentType).toBe('application/octet-stream')
+    expect(trace.variant).toBe('octet+crc')
+    expect(trace.attempts).toBe(1)
+  })
+
+  it('PUT 次数有硬上限：候选多于上限时截断，并**如实报告未穷尽**', async () => {
+    const urls: string[] = []
+    vi.stubGlobal('fetch', vi.fn(async (url: string) => {
+      urls.push(url)
+      return new Response('nope', { status: 400 })
+    }))
+    // 4 台主机 × 3 变体 = 12 组合 > 上限 6。
+    const trace: ResourceUploadTrace = {}
+    const err = await uploadResourceToTrae(
+      ACCOUNT,
+      ticket({ uploadHosts: [UPLOAD_HOST, 'tos-a.example.com', 'tos-b.example.com'] }),
+      PNG,
+      'image-1.png',
+      { trace }
+    ).then(() => null, (e: Error) => e)
+
+    expect(urls).toHaveLength(TRAE_RESOURCE_MAX_PUTS)
+    expect(err!.message).toContain('exhausted=true')
+    expect(trace.exhausted).toBe(true)
+    expect(trace.attempts).toBe(TRAE_RESOURCE_MAX_PUTS)
+    // 没穷尽时**不能**留下「命中了某个变体」的假结论。
+    expect(trace.variant).toBeUndefined()
+  })
+
+  it('未到上限时错误信息里**不带** exhausted（别把「试完了」说成「没试完」）', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => new Response('nope', { status: 400 })))
+    const err = await uploadResourceToTrae(ACCOUNT, ticket(), PNG, 'image-1.png').then(() => null, (e: Error) => e)
+    expect(err!.message).not.toContain('exhausted')
+    expect(err!.message).toContain('mime=image/png')
+    expect(err!.message).toContain('variants=octet+crc+mime+crc+mime-nocrc')
+  })
+
+  it('失败信息里每条都带变体名（否则分不清是哪一档挂的）', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => new Response('nope', { status: 400 })))
+    const err = await uploadResourceToTrae(ACCOUNT, ticket(), PNG, 'image-1.png').then(() => null, (e: Error) => e)
+    for (const variant of ['octet+crc', 'mime+crc', 'mime-nocrc']) {
+      expect(err!.message).toContain(`variant=${variant} host=${OBSERVED_HOST} [400]`)
+      expect(err!.message).toContain(`variant=${variant} host=${UPLOAD_HOST} [400]`)
+    }
+  })
+
+  it('凭据安全：6 条失败原因堆在一起也不含 auth / session_key', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(
+      JSON.stringify({ success: -1, auth: FAKE_AUTH, session_key: FAKE_SESSION_KEY }),
+      { status: 400 }
+    )))
+    const err = await uploadResourceToTrae(ACCOUNT, ticket(), PNG, 'image-1.png').then(() => null, (e: Error) => e)
+    expect(err!.message).not.toContain('JWT-SECRET')
+    expect(err!.message).not.toContain(FAKE_SESSION_KEY)
+    expect(err!.message).toContain('[redacted]')
+  })
+})
+
 // ===== 批量上传 =====
 
 describe('uploadImageParts：逐张独立，一张坏不拖累其余', () => {
   const BYTES = new Uint8Array([1, 2, 3])
+  /** PNG 魔术字节：mime 嗅得出，阶梯 3 档（用来验证变体命中摘要）。 */
+  const PNG = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a])
 
-  it('全成功 → attachments 齐全，failures 为空', async () => {
+  it('全成功 → attachments 齐全，failures 为空，并暴露命中的变体', async () => {
     vi.stubGlobal('fetch', vi.fn(async (url: string, init: any) => {
       if (url.includes('get_resource_upload_url')) return uploadUrlResponse()
       if (init?.method === 'PUT') return putResponse(0)
@@ -472,6 +655,26 @@ describe('uploadImageParts：逐张独立，一张坏不拖累其余', () => {
     expect(out.failures).toHaveLength(0)
     expect(out.attachments[0].uri).toBe(`trae-res://remote_resource/${STORE_URI}`)
     expect(out.attachments[0].filename).toBe('image-1.png')
+    // 命中的变体必须能带出去 —— 这是「下次收敛到只用那一个」的唯一依据。
+    expect(out.variants).toEqual({ 'image-1.png': 'octet+crc', 'image-2.png': 'octet+crc' })
+    expect(out.variantSummary).toBe('octet+crc=2')
+  })
+
+  it('变体 2 才成功时，命中的是 mime+crc（不是 octet+crc）', async () => {
+    let puts = 0
+    vi.stubGlobal('fetch', vi.fn(async (url: string, init: any) => {
+      if (url.includes('get_resource_upload_url')) return uploadUrlResponse()
+      if (init?.method === 'PUT') {
+        puts++
+        // 变体 1 的两台主机都 400，变体 2 的第一台成功。
+        return puts < 3 ? new Response('nope', { status: 400 }) : putResponse(0)
+      }
+      return new Response('{}', { status: 200 })
+    }))
+    const out = await uploadImageParts(ACCOUNT, [{ bytes: PNG, filename: 'image-1.png' }])
+    expect(out.attachments).toHaveLength(1)
+    expect(out.variants).toEqual({ 'image-1.png': 'mime+crc' })
+    expect(out.variantSummary).toBe('mime+crc=1')
   })
 
   it('第一张申请上传位就失败 → 第二张照常成功，失败原因可读且不含凭据', async () => {
@@ -504,7 +707,7 @@ describe('uploadImageParts：逐张独立，一张坏不拖累其余', () => {
     const spy = vi.fn()
     vi.stubGlobal('fetch', spy)
     const out = await uploadImageParts(ACCOUNT, [])
-    expect(out).toEqual({ attachments: [], failures: [] })
+    expect(out).toEqual({ attachments: [], failures: [], variants: {}, variantSummary: '' })
     expect(spy).not.toHaveBeenCalled()
   })
 })

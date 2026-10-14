@@ -261,21 +261,104 @@ interface PutResult {
   body: string
 }
 
-/** 发一次 PUT。**网络层失败会抛出**，由调用方决定要不要换域名（见 uploadResourceToTrae）。 */
-async function putObject(url: string, auth: string, bytes: Uint8Array, crc: string): Promise<PutResult> {
+/**
+ * 上传**变体**名（同一次部署内按顺序全试，成功即停）。
+ *
+ * 为什么会有「变体」这一维：2026-10-15 真机把除「类型」以外的维度全排除了 ——
+ * ① 鉴权 OK、`Authorization` OK、字节是真 PNG（`bytes=21674 first8=89504e470d0a1a0a`）、
+ * URL 形态与抓包一致、两台主机（`douyin` / `snssdk`）回**同一个**
+ * `400 InvalidFileType`、CRC32 算法已用标准向量 `cbf43926` 验过。
+ * 而上游报错原文就是 `invalid file type` —— 我们唯一在声明的「类型」就是 `Content-Type`。
+ *
+ * 抓包里官方发的是 `application/octet-stream`，但那可能只是 JWT 里
+ * `mime_list: ["application/octet-stream"]` 的默认占位；真正被校验的可能是**实际图片 mime**。
+ * 与其再猜一轮，不如一次部署把候选跑完，让日志直接说哪个赢（命中变体见
+ * `ResourceUploadTrace` / `ImageUploadOutcome.variantSummary`）。
+ */
+export type ResourceUploadVariant = 'octet+crc' | 'mime+crc' | 'mime-nocrc'
+
+/** 一个候选变体：只有 `Content-Type` 与「带不带 Content-CRC32」在变。 */
+interface PutVariant {
+  name: ResourceUploadVariant
+  contentType: string
+  includeCrc: boolean
+}
+
+/**
+ * 硬上限：一次上传最多发几个 PUT。
+ *
+ * 3 变体 × 2 主机 = 6 正好够（真机就是 2 台主机）。有第三台时会被截断，那时
+ * `trace.exhausted = true` 且错误信息里带 `exhausted=true` —— **绝不把「没试完」说成
+ * 「都试过了」**，否则实验结论会假阴性。
+ */
+export const TRAE_RESOURCE_MAX_PUTS = 6
+
+/**
+ * 魔术字节 → 真实图片 mime；嗅不出返回 `''`。
+ *
+ * 返回空串时调用方**必须跳过** mime 变体：瞎填一个 `Content-Type` 只会把
+ * `InvalidFileType` 换成另一种失败，还会污染实验结论（分不清是「mime 猜错了」还是
+ * 「mime 这条路本来就不通」）。
+ */
+export function imageMimeFromBytes(bytes: Uint8Array): string {
+  switch (sniffImageExt(bytes)) {
+    case 'png': return 'image/png'
+    case 'jpg': return 'image/jpeg'
+    case 'gif': return 'image/gif'
+    case 'webp': return 'image/webp'
+    default: return ''
+  }
+}
+
+/**
+ * 变体阶梯：**顺序是契约**。
+ *
+ *  1. `octet+crc` —— 现状（抓包里官方发的形态）。放第一位是为了**不回归**：万一真机
+ *     其实已经能过，就不该白打后面两枪；
+ *  2. `mime+crc` —— 真实 mime + CRC（假设「被校验的是实际图片类型」）；
+ *  3. `mime-nocrc` —— 真实 mime、**不带** CRC（TOS 可能对「未知 Content-Type + CRC」
+ *     这个组合做了校验，去掉 CRC 是最后一个正交变量）。
+ *
+ * 嗅不出 mime 时只留 1（见 `imageMimeFromBytes`）。
+ */
+function uploadVariants(mime: string): PutVariant[] {
+  const ladder: PutVariant[] = [
+    { name: 'octet+crc', contentType: 'application/octet-stream', includeCrc: true },
+  ]
+  if (mime) {
+    ladder.push({ name: 'mime+crc', contentType: mime, includeCrc: true })
+    ladder.push({ name: 'mime-nocrc', contentType: mime, includeCrc: false })
+  }
+  return ladder
+}
+
+/**
+ * 发一次 PUT。**网络层失败会抛出**，由调用方决定要不要换下一个 (变体, 主机) 组合。
+ *
+ * 变体之间只有 `Content-Type` / `Content-CRC32` 不同；`Authorization` / `Accept` /
+ * `Origin` / `Referer` 四个头**恒定** —— 实验只允许一个变量在动，否则赢了也不知道赢在哪。
+ */
+async function putObject(
+  url: string,
+  auth: string,
+  bytes: Uint8Array,
+  crc: string,
+  variant: PutVariant
+): Promise<PutResult> {
+  const headers: Record<string, string> = {
+    // 实证：`auth` **原样**进 Authorization，没有 Bearer / 其他前缀。
+    Authorization: auth,
+    'Content-Type': variant.contentType,
+    // 以下三个照抄官方客户端那次成功的 PUT（**不是**发明）。TOS 侧可能对
+    // 跨站直传做来源校验，缺了它们可能以 400/InvalidFileType 的形式被拒。
+    Accept: '*/*',
+    Origin: 'https://work.trae.cn',
+    Referer: 'https://work.trae.cn/',
+  }
+  if (variant.includeCrc) headers['Content-CRC32'] = crc
   const resp = await fetch(url, {
     method: 'PUT',
-    headers: {
-      // 实证：`auth` **原样**进 Authorization，没有 Bearer / 其他前缀。
-      Authorization: auth,
-      'Content-CRC32': crc,
-      'Content-Type': 'application/octet-stream',
-      // 以下三个照抄官方客户端那次成功的 PUT（**不是**发明）。TOS 侧可能对
-      // 跨站直传做来源校验，缺了它们可能以 400/InvalidFileType 的形式被拒。
-      Accept: '*/*',
-      Origin: 'https://work.trae.cn',
-      Referer: 'https://work.trae.cn/',
-    },
+    headers,
     body: bytes,
     signal: AbortSignal.timeout(TRAE_RESOURCE_TIMEOUT_MS),
   })
@@ -283,32 +366,49 @@ async function putObject(url: string, auth: string, bytes: Uint8Array, crc: stri
   return { status: resp.status, ok: resp.ok, body }
 }
 
+/** `uploadResourceToTrae` 回填的诊断（**命中的是哪个变体** —— 下次收敛到只用它的唯一依据）。 */
+export interface ResourceUploadTrace {
+  /** 命中的变体名（**只有成功时才有值**） */
+  variant?: ResourceUploadVariant
+  /** 实际发出的 PUT 次数（含失败的那些） */
+  attempts?: number
+  /** `true` = 撞到硬上限提前停：候选**没穷尽**，别据此下「都不行」的结论 */
+  exhausted?: boolean
+}
+
 /**
  * ②：上传字节，返回 ③ 的 `trae-res://…` URI。
  *
- * 成功判据（两条都要，顺序固定）：
+ * ## 成功判据（两条都要，顺序固定）
  *  - HTTP 非 2xx → 失败（响应体脱敏后进错误信息）；
  *  - 2xx 且响应体里有数字 `success` → **只有 `success === 0` 才算成功**
  *    （实测语义是 0 = 成功，非 0 = 失败）；响应体解析不出 `success` 时按 2xx 认成功
  *    （中转/代理可能吃掉 body，此时以 HTTP 状态为准）。
  *
- * **任一主机失败都换下一台**：transport 失败、非 2xx、`success !== 0` 都继续。
+ * ## 候选阶梯：**外层变体、内层主机**，成功即停
  *
- * 为什么不能只回退「网络层失败」（2026-10-14 真机推翻的旧判断）：广告主机
- * `tos-d-x-lf.snssdk.com` 回的是 **HTTP 400 业务错误**（`InvalidFileType`），
- * 不是连接失败 —— 只认网络错误就会一直卡在第一个主机上，永远试不到真正可用的
- * `tos-d-x-lf.douyin.com`。聚合错误会把每台主机的原因都列出来，所以「凭据错」
- *（两台同状态码）与「主机不对」（一台 400 一台 200）仍然可区分。
+ * 主机维度已被真机证明无关（两台回同一个 400），所以放**内层**：同一个变体先把两台主机
+ * 走完，再换下一个变体 —— 这样「哪个变体赢」在日志里是单调可读的。反过来（外层主机）会让
+ * 同一变体的两条结果被别的变体隔开，实验结论读不出来。
  *
- * 多打一台不会产生孤儿对象：候选链上所有主机用的是**同一个 `store_uri`**，
- * 后一枪是覆盖写。
+ * 顺序（`uploadVariants`）与上限（`TRAE_RESOURCE_MAX_PUTS`）都是**契约**。撞到上限时
+ * `trace.exhausted = true`、错误信息里也带 `exhausted=true`。
+ *
+ * ## 为什么任一组合失败都要继续（而不是只回退网络错误）
+ *
+ * 2026-10-14 真机推翻的旧判断：广告主机 `tos-d-x-lf.snssdk.com` 回的是 **HTTP 400 业务
+ * 错误**（`InvalidFileType`），不是连接失败 —— 只认网络错误就会一直卡在第一个组合上，
+ * 永远试不到后面真正能用的那个。聚合错误会把每个组合的原因都列出来，所以「凭据错」
+ *（所有组合同状态码）与「组合不对」（有 200）仍然可区分。
+ *
+ * 多打几枪不会产生孤儿对象：所有组合用的是**同一个 `store_uri`**，后一枪是覆盖写。
  */
 export async function uploadResourceToTrae(
   account: TraeAccount,
   ticket: ResourceUploadTicket,
   bytes: Uint8Array,
   filename: string,
-  opts?: { baseUrl?: string | null; bizType?: string }
+  opts?: { baseUrl?: string | null; bizType?: string; trace?: ResourceUploadTrace }
 ): Promise<string> {
   // 说明：上传的凭据是 ① 下发的短期写凭据 `auth`，**不是** Cloud-IDE-JWT。
   // `account` / `filename` 在这里只用于**排障定位**（哪张图、哪个账号），不参与协议。
@@ -330,7 +430,10 @@ export async function uploadResourceToTrae(
    * 实测（2026-10-14）：`get_resource_upload_url` 广告的是 `tos-d-x-lf.snssdk.com`，
    * 而官方 web 客户端真正发的是 `tos-d-x-lf.douyin.com`（子域相同、基域不同）。
    * 照广告打 `snssdk.com` 时上游回 `400 InvalidFileType`，而字节已验证是合法 PNG
-   *（`bytes=21674 first8=89504e470d0a1a0a`）—— 说明被拒的不是内容，是那个主机。
+   *（`bytes=21674 first8=89504e470d0a1a0a`）—— 当时据此判定「被拒的是主机」。
+   *
+   * ⚠️ 2026-10-15 更正：两台主机回的是**同一个** 400，主机维度已被排除。这里保留候选链
+   * 只是为了「万一某天只有一台通」时还能自愈，不再是本轮的重点（重点在变体阶梯）。
    */
   const candidates: string[] = []
   const observed = douyinFallbackHost(primary)
@@ -339,34 +442,60 @@ export async function uploadResourceToTrae(
   for (const h of hosts.slice(1)) if (!candidates.includes(h)) candidates.push(h)
 
   const crc = crc32Hex(bytes)
+  const mime = imageMimeFromBytes(bytes)
+  const ladder = uploadVariants(mime)
+  // 先摊平成 (变体, 主机) 组合列表，再按上限截断：这样「未穷尽」是**算出来的**
+  //（combos.length > 实际试过的数量），而不是靠循环里数数猜的。
+  const combos: Array<{ variant: PutVariant; host: string }> = []
+  for (const variant of ladder) for (const host of candidates) combos.push({ variant, host })
+  const planned = combos.slice(0, TRAE_RESOURCE_MAX_PUTS)
+  const exhausted = combos.length > planned.length
+
   const failures: string[] = []
-  for (const host of candidates) {
+  let attempts = 0
+  for (const { variant, host } of planned) {
+    attempts++
     const url = uploadUrlFor(host, storeUri)
     let result: PutResult
     try {
-      result = await putObject(url, auth, bytes, crc)
+      result = await putObject(url, auth, bytes, crc, variant)
     } catch (e) {
-      failures.push(`host=${host} transport: ${(e as Error).message || String(e)}`)
+      failures.push(
+        `variant=${variant.name} host=${host} transport: ${(e as Error).message || String(e)}`
+      )
       continue
     }
-    // **任何非 2xx 都要换主机再试**，不能只认「网络层失败」：实测 `snssdk.com` 回的是
-    // 业务错误 400 而不是连接失败，只回退网络错误就会一直卡在第一个主机上。
+    // **任何非 2xx 都要换下一个组合**（理由见函数头注释）。
     if (!result.ok) {
       failures.push(
-        `host=${host} [${result.status}]: ${redactCredentials(result.body).slice(0, 800)}`
+        `variant=${variant.name} host=${host} [${result.status}]: ${redactCredentials(result.body).slice(0, 800)}`
       )
       continue
     }
     const success = readSuccessFlag(result.body)
     if (success !== null && success !== 0) {
-      failures.push(`host=${host} rejected (success=${success}): ${redactCredentials(result.body).slice(0, 800)}`)
+      failures.push(
+        `variant=${variant.name} host=${host} rejected (success=${success}): ${redactCredentials(result.body).slice(0, 800)}`
+      )
       continue
+    }
+    if (opts?.trace) {
+      opts.trace.variant = variant.name
+      opts.trace.attempts = attempts
+      opts.trace.exhausted = false
     }
     return `trae-res://${bizType}/${storeUri}`
   }
-  // 全部主机都失败：把字节诊断与每个主机的原因一起抛出，便于一眼定位。
+
+  if (opts?.trace) {
+    opts.trace.attempts = attempts
+    opts.trace.exhausted = exhausted
+  }
+  // 全部组合都失败：把字节诊断、mime 嗅探结果与每个组合的原因一起抛出，便于一眼定位。
   throw new Error(
-    `Trae resource upload failed (${where} bytes=${bytes.length} first8=${hexPreview(bytes)} crc=${crc}): ${failures.join(' | ') || 'no upload host tried'}`
+    `Trae resource upload failed (${where} bytes=${bytes.length} first8=${hexPreview(bytes)} crc=${crc}`
+    + ` mime=${mime || 'unknown'} variants=${ladder.map((v) => v.name).join('+')}`
+    + `${exhausted ? ' exhausted=true' : ''}): ${failures.join(' | ') || 'no upload host tried'}`
   )
 }
 
@@ -408,6 +537,15 @@ export interface ImageUploadFailure {
 export interface ImageUploadOutcome {
   attachments: TraeQueryAttachment[]
   failures: ImageUploadFailure[]
+  /**
+   * 每张**成功**的图命中的上传变体（`filename` → 变体名）。
+   *
+   * 为什么必须暴露：变体阶梯存在的意义就是「一次部署收敛到只用那一个」。没有这个映射，
+   * 下次就只能继续把三个都跑一遍（每次上传 3 倍写请求），或者靠人肉读日志。
+   */
+  variants: Record<string, ResourceUploadVariant>
+  /** 命中变体的计数摘要（如 `octet+crc=2`）；没有成功图时是空串 */
+  variantSummary: string
 }
 
 /**
@@ -423,20 +561,35 @@ export async function uploadImageParts(
 ): Promise<ImageUploadOutcome> {
   const attachments: TraeQueryAttachment[] = []
   const failures: ImageUploadFailure[] = []
+  const variants: Record<string, ResourceUploadVariant> = {}
   for (const part of parts) {
     try {
       const ticket = await fetchResourceUploadUrl(account, { baseUrl: opts?.baseUrl, filename: part.filename })
+      const trace: ResourceUploadTrace = {}
       const uri = await uploadResourceToTrae(account, ticket, part.bytes, part.filename, {
         baseUrl: opts?.baseUrl,
         bizType: opts?.bizType,
+        trace,
       })
       attachments.push({ uri, filename: part.filename })
+      if (trace.variant) {
+        variants[part.filename] = trace.variant
+        // 这一行就是「一次部署直接告诉我们哪个变体赢」的落点。变体阶梯是**实验**：
+        // 没有它，跑完三个变体也只剩一个「成功了」的结论，收敛不到「以后只用哪一个」。
+        console.log(
+          `[trae-upload] variant-hit file=${part.filename} variant=${trace.variant}`
+          + ` puts=${trace.attempts ?? -1}${trace.exhausted ? ' exhausted=true' : ''}`
+        ) // codeql-disable: 只含文件名/变体名/次数，不含凭据
+      }
     } catch (e) {
       // 本模块抛出的错误已保证不含凭据（见文件头「凭据边界」），可以直接落日志。
       failures.push({ filename: part.filename, reason: (e as Error).message || String(e) })
     }
   }
-  return { attachments, failures }
+  const hits: Record<string, number> = {}
+  for (const name of Object.values(variants)) hits[name] = (hits[name] ?? 0) + 1
+  const variantSummary = Object.entries(hits).map(([name, n]) => `${name}=${n}`).join(',')
+  return { attachments, failures, variants, variantSummary }
 }
 
 // ===== 请求体 → 待上传字节 =====

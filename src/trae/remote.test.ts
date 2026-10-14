@@ -619,13 +619,16 @@ describe('createRemoteSession：多模态图片（门禁 + 降级）', () => {
     }
 
     expect(sessionId).toBe('sess-1')
-    // 四次调用：① 申请上传位 → ② PUT 到观测主机（success=1，失败）→ ③ PUT 到广告主机
-    //（同样 success=1）→ ④ 建会话。`success !== 0` 也算「这个主机不行」，候选链要走完。
-    expect(calls).toHaveLength(4)
+    // 八次调用：① 申请上传位 → ②…⑦ 变体阶梯（3 变体 × 2 主机，每枪都 success=1 → 失败）
+    // → ⑧ 建会话。`success !== 0` 也算「这个组合不行」，阶梯要走完。
+    expect(calls).toHaveLength(8)
     expect(calls[1].url).toBe(`https://tos-d-x-lf.douyin.com/${STORE_URI}`)
     expect(calls[2].url).toBe(`https://tos-d-x-lf.snssdk.com/${STORE_URI}`)
+    expect(calls[1].init.headers['Content-Type']).toBe('application/octet-stream')
+    expect(calls[3].init.headers['Content-Type']).toBe('image/png')
+    expect(calls[5].init.headers['Content-CRC32']).toBeUndefined()
     // 图片全丢，但会话照建（`calls` 的最后一条才是建会话）。
-    expect(queryBlocks(calls[3])).toHaveLength(1)
+    expect(queryBlocks(calls[7])).toHaveLength(1)
     expect(trace.imageUploadFailed).toBe(1)
     expect(trace.imageUploadError).toContain('success=1')
   })
