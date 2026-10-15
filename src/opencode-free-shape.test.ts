@@ -4,6 +4,7 @@ import {
   isOpenCodeFreeModel,
   proxyOpenCodeRequest,
   shapeOpenCodeFreeBody,
+  testOpenCodeModel,
 } from './opencode'
 
 /**
@@ -55,7 +56,7 @@ describe('isOpenCodeFreeModel', () => {
 })
 
 describe('shapeOpenCodeFreeBody', () => {
-  it('免费模型 + 无 tools + 非流式：强制流式并补齐 bash/read', () => {
+  it('免费模型 + 无 tools + 非流式：强制流式并补齐 shell/read', () => {
     const shape = shapeOpenCodeFreeBody(
       JSON.stringify({ model: 'big-pickle', messages: [{ role: 'user', content: 'hi' }] }),
       'chat/completions',
@@ -65,17 +66,18 @@ describe('shapeOpenCodeFreeBody', () => {
     const names = (body['tools'] as Array<Record<string, unknown>>).map(
       (t) => ((t['function'] as Record<string, unknown>)['name']),
     )
-    expect(names).toEqual(['bash', 'read'])
+    expect(names).toEqual(['shell', 'read'])
     expect(shape.collapseStream).toBe(true)
-    expect(shape.syntheticTools).toEqual(['bash', 'read'])
+    expect(shape.syntheticTools).toEqual(['shell', 'read'])
   })
 
-  it('免费模型 + 已含 bash/read + 已流式：原样返回，不做任何改动', () => {
+  it('免费模型 + 已含 shell/read + 已流式且含 usage：原样返回，不做任何改动', () => {
     const raw = JSON.stringify({
       model: 'big-pickle',
       stream: true,
+      stream_options: { include_usage: true },
       tools: [
-        { type: 'function', function: { name: 'bash', description: 'x', parameters: {} } },
+        { type: 'function', function: { name: 'shell', description: 'x', parameters: {} } },
         { type: 'function', function: { name: 'read', description: 'x', parameters: {} } },
       ],
     })
@@ -85,13 +87,13 @@ describe('shapeOpenCodeFreeBody', () => {
     expect(shape.collapseStream).toBe(false)
   })
 
-  it('免费模型 + tools[bash,write]：只补 read（write 不能替代 read）', () => {
+  it('免费模型 + tools[shell,write]：只补 read（write 不能替代 read）', () => {
     const shape = shapeOpenCodeFreeBody(
       JSON.stringify({
         model: 'mimo-v2.6-flash-free',
         stream: true,
         tools: [
-          { type: 'function', function: { name: 'bash', parameters: {} } },
+          { type: 'function', function: { name: 'shell', parameters: {} } },
           { type: 'function', function: { name: 'write', parameters: {} } },
         ],
       }),
@@ -121,7 +123,7 @@ describe('shapeOpenCodeFreeBody', () => {
     )
     const body = JSON.parse(shape.body as string) as Record<string, unknown>
     const tools = body['tools'] as Array<Record<string, unknown>>
-    expect(tools.map((t) => t['name'])).toEqual(['bash', 'read'])
+    expect(tools.map((t) => t['name'])).toEqual(['shell', 'read'])
     expect(tools[0]['function']).toBeUndefined()
   })
 })
@@ -214,14 +216,15 @@ describe('proxyOpenCodeRequest 免费档整形端到端', () => {
     const toolNames = (sent!['tools'] as Array<Record<string, unknown>>).map(
       (t) => ((t['function'] as Record<string, unknown>)['name']),
     )
-    expect(toolNames).toContain('bash')
+    expect(toolNames).toContain('shell')
     expect(toolNames).toContain('read')
     expect(sentHeaders!.get('Accept')).toContain('text/event-stream')
     expect(sentHeaders!.get('x-opencode-client')).toBe('cli')
-    // 上游免费档校验的两条出站指纹：UA 版本 ≥ 1.18.0、ID 为 opencode 规范格式
-    expect(sentHeaders!.get('User-Agent')).toContain('opencode/1.18.')
-    expect(sentHeaders!.get('x-opencode-request')).toMatch(/^msg_[0-9a-f]{12}[0-9A-Za-z]{14}$/)
+    // 上游免费档校验指纹：UA 2.x 规范、移除了探针头 x-opencode-request、保留 canonical 降序 session
+    expect(sentHeaders!.get('User-Agent')).toContain('opencode/latest/2.0.')
+    expect(sentHeaders!.get('x-opencode-request')).toBeNull()
     expect(sentHeaders!.get('x-opencode-session')).toMatch(/^ses_[0-9a-f]{12}[0-9A-Za-z]{14}$/)
+    expect(sentHeaders!.get('x-opencode-session-id')).toMatch(/^ses_[0-9a-f]{12}[0-9A-Za-z]{14}$/)
 
     expect(res.status).toBe(200)
     expect(res.headers.get('Content-Type')).toContain('application/json')
@@ -235,7 +238,7 @@ describe('proxyOpenCodeRequest 免费档整形端到端', () => {
     const fetcher = (async () => new Response(
       sseStream([
         'data: {"id":"c1","model":"big-pickle","choices":[{"index":0,"delta":{"content":"ok"}}]}\n\n',
-        'data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"bash","arguments":"{}"}}]}}]}\n\n',
+        'data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"shell","arguments":"{}"}}]}}]}\n\n',
         'data: {"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}\n\n',
         'data: [DONE]\n',
       ]),
@@ -278,5 +281,43 @@ describe('proxyOpenCodeRequest 免费档整形端到端', () => {
 
     expect(sentBody).toBe(original)
     expect(await res.text()).toBe('{"ok":true}')
+  })
+
+  it('testOpenCodeModel：测试 deepseek-v4.1-flash-free 规约至 /inference 且满足 2.x 指纹', async () => {
+    let capturedUrl = ''
+    let capturedHeaders: Headers | null = null
+    let capturedBody: Record<string, unknown> | null = null
+    const fetcher = (async (url: string | URL | Request, init?: RequestInit) => {
+      capturedUrl = String(url)
+      capturedHeaders = new Headers(init?.headers)
+      capturedBody = JSON.parse(String(init?.body)) as Record<string, unknown>
+      return new Response(
+        sseStream([
+          'data: {"id":"c1","choices":[{"index":0,"delta":{"content":"pong"}}]}\n\n',
+          'data: [DONE]\n',
+        ]),
+        { status: 200, headers: { 'Content-Type': 'text/event-stream' } },
+      )
+    }) as unknown as typeof fetch
+
+    const result = await testOpenCodeModel(
+      'https://opencode.ai/zen/v1',
+      KEYS,
+      'deepseek-v4.1-flash-free',
+      [],
+      fetcher,
+    )
+
+    expect(result.success).toBe(true)
+    expect(capturedUrl).toBe('https://opencode.ai/inference/v1/chat/completions')
+    expect(capturedHeaders!.get('x-opencode-request')).toBeNull()
+    expect(capturedHeaders!.get('x-opencode-session-id')).toMatch(/^ses_[0-9a-f]{12}[0-9A-Za-z]{14}$/)
+    expect(capturedHeaders!.get('User-Agent')).toContain('opencode/latest/2.0.')
+    expect(capturedBody!['stream']).toBe(true)
+    const toolNames = (capturedBody!['tools'] as Array<Record<string, unknown>>).map(
+      (t) => ((t['function'] as Record<string, unknown>)['name']),
+    )
+    expect(toolNames).toContain('shell')
+    expect(toolNames).toContain('read')
   })
 })

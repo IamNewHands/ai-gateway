@@ -710,11 +710,15 @@ export async function handleTestModel(c: Context<AppEnv>) {
       : tokenRealm === 'cn'
         ? ['cn']
         : ['cn', ...(cfg.globalBaseUrl ? ['global' as const] : [])]
-    const testBody = JSON.stringify({ model: modelId, messages: [{ role: 'user', content: 'hi' }], max_tokens: 1, stream: true })
     // WorkBuddy（browser 流）连通性测试必须补全官方协议头（X-CodeBuddy-Request / WorkBuddy UA /
     // X-Domain / X-Machine-ID 等）——否则全球域 WAF/限流把请求判为"非官方客户端形态"而返 429/403，
     // 与真实转发（proxy 侧注入同一套头）不一致，测出来的 429 是**假阴性**（实际 chat 可用）。
     const isWorkbuddyPool = provider.oauth?.flowType === 'browser' || (typeof provider.id === 'string' && provider.id.startsWith('workbuddy'))
+    // WorkBuddy global 域 GPT/推理模型（如 gpt-5.4、gpt-6-sol）上游模型提供商要求 max_tokens ≥ 100
+    // （否则上游报 400 11133 integer_below_min_value；对齐 workbuddy2api c6e849f / global_e2e_test.go:308），
+    // 统一设为 100 保证全部模型均可通过
+    const testMaxTokens = isWorkbuddyPool ? 100 : 1
+    const testBody = JSON.stringify({ model: modelId, messages: [{ role: 'user', content: 'hi' }], max_tokens: testMaxTokens, stream: true })
     for (const realm of realms) {
       const realmBase = (realm === 'global' && cfg.globalBaseUrl ? cfg.globalBaseUrl : provider.baseUrl).replace(/\/$/, '')
       const origin = realm === 'global' && cfg.globalOrigin ? cfg.globalOrigin : (cfg.extraHeaders?.Origin)

@@ -70,8 +70,8 @@ beforeEach(() => {
 })
 
 describe('canonicalOpenCodeSessionId', () => {
-  it('已是 canonical 形状的会话 ID 原样保留（保住上游 prompt cache 亲和）', async () => {
-    const real = 'ses_0d40c74ca001DRbKK0WJdc6KfN'
+  it('已是 canonical 降序形状的会话 ID 原样保留（保住上游 prompt cache 亲和）', async () => {
+    const real = 'ses_f525e4699ffe5hmrr6t1FiPVca'
     expect(await canonicalOpenCodeSessionId(real)).toBe(real)
   })
 
@@ -290,7 +290,7 @@ describe('P1-2a 403 FreeTierError 懒整形兜底', () => {
     expect(retryBody['stream']).toBe(true)
     const names = (retryBody['tools'] as Array<Record<string, unknown>>).map(
       (t) => ((t['function'] as Record<string, unknown>)['name']))
-    expect(names).toEqual(['bash', 'read'])
+    expect(names).toEqual(['shell', 'read'])
   })
 
   it('非 FreeTierError 的 403 不触发重试', async () => {
@@ -370,7 +370,7 @@ describe('openCodeTestIntent：/admin/api/test-key 的意图路由', () => {
 
 describe('diagnoseOpenCodeKey：先拉实时列表再探测', () => {
   const MODELS_URL = BASE + '/models'
-  const CHAT_URL = BASE + '/chat/completions'
+  const CHAT_URL = 'https://opencode.ai/inference/v1/chat/completions'
   const modelList = (ids: string[]) => jsonResponse(200, { object: 'list', data: ids.map((id) => ({ id })) })
   const UNAVAILABLE = { error: { type: 'server_error', message: 'Upstream request failed: Model is unavailable.' } }
 

@@ -2,12 +2,9 @@ import type { ApiKeyEntry, Env } from './types'
 
 export const OPENCODE_PROVIDER_ID = 'opencode'
 
-const OPENCODE_VERSION = '1.18.31'
-// 上游免费档要求 UA 里的 opencode 版本 ≥ 1.18.0（2026-09-26 实测：1.17.8 → 426
-// UpgradeRequired "OpenCode 1.18.0 or newer is required to use the free tier"）。
-// provider-utils / runtime 段不参与判定，仅为保持与真实 CLI 出站指纹一致。
-const OPENCODE_AI_SDK_VERSION = '4.0.40'
-const OPENCODE_RUNTIME = 'bun/1.3.14'
+const OPENCODE_VERSION = '2.0.29'
+// 上游 2026-10-14 起免费档指纹强制要求 opencode/<channel>/<version>/<name> 格式（如 opencode/latest/2.0.29/cli），
+// 旧版 1.18.31 或自造格式会直接触发 403 FreeTierError。
 // POST 连接/首字节超时：思考模型首字节前可能长时间无输出，放宽到 90s。
 // 连接建立后（流式）不再受整体超时限制，改由 withSSEKeepAlive 的 idle 兜底，
 // 避免长思考中途被 5 分钟整体超时掐断（"思考到一半停住"）。
@@ -200,7 +197,13 @@ function getMirrorOrder(urls: string[], random: () => number): string[] {
 }
 
 function buildUrl(baseUrl: string, subPath: string, search = ''): string {
-  return `${baseUrl.replace(/\/+$/, '')}/${subPath.replace(/^\/+/, '')}${search}`
+  let base = baseUrl.replace(/\/+$/, '')
+  // OpenCode 官方已将免费推理流量切到 /inference 节点（旧 /zen 会被 403 FreeTierError 拦截）；
+  // 规约 /zen/v1 -> /inference/v1，/zen -> /inference；GET models 等不在此列
+  if (subPath.startsWith('chat/completions') || subPath.startsWith('responses')) {
+    base = base.replace(/\/zen(\/v1)?$/, '/inference$1')
+  }
+  return `${base}/${subPath.replace(/^\/+/, '')}${search}`
 }
 
 /**
@@ -234,20 +237,46 @@ function createOpenCodeId(prefix: 'msg' | 'ses'): string {
 const CANONICAL_SESSION_PATTERN = /^ses_[0-9a-f]{12}[0-9A-Za-z]{14}$/
 
 /**
+ * 官方客户端 Identifier.descending() 时间戳特征：48位 ~(ts<<12|counter)。
+ * 按位取反使低12位为 0xFFF - counter，官方计数器 1-63 对应 0xFC0-0xFFF。
+ * 校验失败直接 403 FreeTierError。
+ */
+const DESCENDING_TIME_PART_PATTERN = /^[0-9a-f]{9}f[c-f][0-9a-f]$/
+
+function descendingTimePart(hash: Uint8Array): string {
+  let current = (
+    BigInt(hash[0]) << 28n |
+    BigInt(hash[1]) << 20n |
+    BigInt(hash[2]) << 12n |
+    BigInt(hash[3]) << 4n |
+    BigInt(hash[4]) >> 4n
+  ) << 12n
+  current |= 1n
+  const inverted = ~current & 0xFFFFFFFFFFFFn
+  let hex = ''
+  for (let i = 5; i >= 0; i--) {
+    hex += Number((inverted >> BigInt(8 * i)) & 0xffn).toString(16).padStart(2, '0')
+  }
+  return hex
+}
+
+/**
  * 把任意会话信号确定性映射成 canonical `ses_` 形状（移植 opencode2api
  * internal/identity/request.go:90-107）。
  *
- * 已是 canonical 形状的信号**原样保留**——那是真实 opencode 客户端的会话 ID，
- * 保留它才能命中上游 prompt cache 亲和；其余信号（UUID、第三方客户端会话、
- * 网关自造 ID、内容种子）用 sha256 确定性哈希成同一形状，使同一会话每次请求
- * 都拿到同一个 session ID。
+ * 已是规范降序形状的信号**原样保留**——那是真实 opencode 客户端的会话 ID，
+ * 保留它才能命中上游 prompt cache 亲和；其余信号用 sha256 降序哈希成同一形状，
+ * 使同一会话每次请求都拿到合规的 session ID。
  */
 export async function canonicalOpenCodeSessionId(signal: string): Promise<string> {
-  if (CANONICAL_SESSION_PATTERN.test(signal)) return signal
+  if (CANONICAL_SESSION_PATTERN.test(signal)) {
+    if (DESCENDING_TIME_PART_PATTERN.test(signal.slice(4, 16))) {
+      return signal
+    }
+  }
   const bytes = new TextEncoder().encode('ses\u0000' + signal)
   const digest = new Uint8Array(await crypto.subtle.digest('SHA-256', bytes))
-  let time = ''
-  for (let i = 0; i < 6; i++) time += digest[i].toString(16).padStart(2, '0')
+  const time = descendingTimePart(digest.subarray(0, 6))
   let random = ''
   for (let i = 6; i < 20; i++) random += OPENCODE_ID_CHARS[digest[i] % 62]
   return `ses_${time}${random}`
@@ -311,20 +340,21 @@ export function applyOpenCodeReasoningEffort(body: string | undefined, effort: s
   return JSON.stringify(payload)
 }
 
-function createRequestHeaders(apiKey: string, requestId: string, sessionId: string, streamAccept: boolean): Headers {
+function createRequestHeaders(apiKey: string, sessionId: string, streamAccept: boolean): Headers {
   const headers = new Headers({
     'Content-Type': 'application/json',
     'Authorization': `Bearer ${apiKey}`,
-    'User-Agent': `opencode/${OPENCODE_VERSION} ai-sdk/provider-utils/${OPENCODE_AI_SDK_VERSION} runtime/${OPENCODE_RUNTIME}`,
+    'User-Agent': `opencode/latest/${OPENCODE_VERSION}/cli`,
     'x-opencode-client': 'cli',
     'x-opencode-project': 'global',
-    'x-opencode-request': requestId,
     'x-opencode-session': sessionId,
+    'x-opencode-session-id': sessionId,
+    'x-session-affinity': sessionId,
+    'X-Session-Id': sessionId,
   })
   // 推理请求声明可接受 event-stream，与真实 opencode CLI 的出站指纹一致。
-  // 实测（2026-09-26）该头本身不参与免费档判定，但缺它会让出站请求与 CLI 有明显差异，
-  // 保留以降低后续追加风控规则命中的概率。GET（/models 等）保持 application/json，
-  // 避免上游按 Accept 协商成 SSE。
+  // 注意：自 2026-10-14 起上游免费层严查 x-opencode-request 探针头，携带即报 403 FreeTierError，
+  // 必须将其剔除；Session 则需双头 x-opencode-session 与 x-opencode-session-id 齐备。
   if (streamAccept) headers.set('Accept', 'application/json, text/event-stream')
   return headers
 }
@@ -512,7 +542,7 @@ async function requestUpstream(
   try {
     const response = await fetcher(url, {
       method,
-      headers: createRequestHeaders(apiKey, requestId, sessionId, isStreamRequest),
+      headers: createRequestHeaders(apiKey, sessionId, isStreamRequest),
       body: isStreamRequest ? body : undefined,
       signal: controller.signal,
     })
@@ -534,21 +564,90 @@ async function requestUpstream(
   }
 }
 
-// ===== 免费档 agent 形状整形（2026-09-26 实测锁定） =====
-// 上游对免费档模型强制校验请求体是否为「agent 形状」，不满足即
-// 403 {"type":"error","error":{"type":"FreeTierError", ...}}。
-// 实测矩阵（真 key，big-pickle / mimo-v2.6-flash-free 双模型一致）：
-//   stream:true + tools[bash,read]        → 200
-//   stream:true + tools[bash,write]       → 403（read 不可被其他工具名替代）
-//   stream:true + tools[bash]             → 403（数量不足）
-//   stream:true + tools[read,edit]        → 403（缺 bash）
-//   stream:true + tools[bash,read,zzz]    → 200（多余工具名不影响）
-//   stream:false + tools[bash,read]       → 403（必须流式）
-//   stream:true + tools[bash,read] 无 Accept 头 → 200（Accept 不参与判定）
-// 即：stream:true + tools 里同时存在 name=bash 与 name=read，二者缺一不可。
+// ===== 免费档 agent 形状整形（2026-10-14 上游风控升级实测） =====
+// 上游对免费档模型强制校验请求体是否为「agent 形状」：
+// 1. stream: true，且 Chat 协议需补齐 stream_options.include_usage: true。
+// 2. 自 2026-10-14 起，上游全面升级为 OpenCode 2.x CLI 标准：工具名由 bash 更名为 shell，
+//    且上游对识别到的工具进行 schema 字节级校验（简易空 schema 视为伪造而直接报 403 FreeTierError），
+//    因此必须注入官方客户端完整的工具描述与 JSON Schema。
+// 实测证明：必须同时包含 name=shell 与 name=read，二者缺一不可。
 
-/** 上游免费档校验强制要求的工具名（缺一即 403 FreeTierError） */
-export const OPENCODE_REQUIRED_TOOLS = ['bash', 'read'] as const
+export const OPENCODE_REQUIRED_TOOLS = ['shell', 'read'] as const
+
+/** 官方 OpenCode 2.x CLI 内置核心工具定义（description + parameters 严格与官方 CLI 保持一致） */
+export const OPENCODE_GENUINE_TOOLS: Record<string, { description: string; parameters: Record<string, unknown> }> = {
+  shell: {
+    description: 'Execute a shell command and return its output. Commands run on Windows using powershell. Quote file paths containing spaces or special characters. Prefer dedicated tools over shell commands when possible. When output is large, the full result is saved to a file and a truncated preview is returned. Rely on automatic truncation unless filtering the output is more useful. Commands accept an optional timeout, background commands have no timeout by default. Background commands return immediately, and you will be notified when they complete.',
+    parameters: {
+      type: 'object',
+      properties: {
+        background: { type: 'boolean', description: "Run the command in the background and return immediately (useful for dev servers and long-running builds). You do not need to use '&' at the end of the command when using this parameter. You will be notified when it completes. DO NOT poll for completion." },
+        command: { type: 'string', description: 'Shell command string to execute' },
+        timeout: { type: 'integer', minimum: 0, description: 'Timeout in milliseconds. Set to 0 to disable the timeout. Defaults to 120000 for foreground commands. Background commands have no timeout by default.' },
+        workdir: { type: 'string', description: 'Working directory to execute the command in. Defaults to the current working directory. When possible, avoid changing directories in the command and set the working directory here instead.' },
+      },
+      required: ['command'],
+      additionalProperties: false,
+    },
+  },
+  read: {
+    description: 'Read the contents of a file or directory. Supports text files, images, and PDFs. Images and PDFs are presented directly to the model. Each text line is prefixed by its 1-based line number as <line>: <content>. The prefix is for reference and is not part of the file content. Directory entries are returned one per line. Use offset and limit to read large files or directories in sections. Prefer one larger read over many small slices, and use grep to find specific content in large files.',
+    parameters: {
+      type: 'object',
+      properties: {
+        limit: { type: 'integer', minimum: 0, description: 'The maximum number of lines or directory entries to read (defaults to and capped at 2000)' },
+        offset: { type: 'integer', minimum: 0, description: 'The line or directory entry to start reading from (1-based)' },
+        path: { type: 'string', description: 'File or directory to read' },
+      },
+      required: ['path'],
+      additionalProperties: false,
+    },
+  },
+  edit: {
+    description: 'Edit the contents of a file by finding and replacing exact text. When editing text from Read output, preserve the exact indentation (tabs or spaces) and omit the line-number prefix, such as `1: `. Never include the prefix in oldString or newString. Write line breaks as \\n; the file\'s existing CRLF or LF line endings are matched and preserved. To change line endings themselves, make oldString and newString differ only in \\r; that edit applies to the exact bytes. If there is no exact match, the edit retries while ignoring typographic quote, dash, and space variants, then trailing whitespace on each line. The edit fails if oldString is not found. By default, oldString must identify a UNIQUE location. Multiple matches FAIL unless replaceAll is true. Add more surrounding context to disambiguate, or set replaceAll to true to replace every occurrence. Use replaceAll when the change should apply to every occurrence, such as renaming a variable.',
+    parameters: {
+      type: 'object',
+      properties: {
+        newString: { type: 'string', description: 'Text to replace oldString with (must differ from oldString)' },
+        oldString: { type: 'string', description: 'Exact text to find and replace' },
+        path: { type: 'string', description: 'File to edit' },
+        replaceAll: { type: 'boolean', description: 'Whether to replace every occurrence of oldString. When false, oldString must match exactly once. Defaults to false.' },
+      },
+      required: ['path', 'oldString', 'newString'],
+      additionalProperties: false,
+    },
+  },
+  glob: {
+    description: 'Search file paths using a glob pattern (examples: "**/*.ts", "src/**/*.tsx").',
+    parameters: {
+      type: 'object',
+      properties: {
+        hidden: { type: 'boolean', description: 'Include hidden files and directories (default: false).' },
+        limit: { type: 'integer', exclusiveMinimum: 0, description: 'Maximum number of matching files to return (default: 100)' },
+        path: { type: 'string', description: 'Directory to search. Defaults to the current working directory.' },
+        pattern: { type: 'string', description: 'Glob pattern to match files against' },
+      },
+      required: ['pattern'],
+      additionalProperties: false,
+    },
+  },
+  grep: {
+    description: "Search file contents using ripgrep's regular expression syntax or literal text matching. Use it to locate specific code, symbols, or text patterns, and narrow searches with `path` or `include`. Returns matching file paths, line numbers, and line previews.",
+    parameters: {
+      type: 'object',
+      properties: {
+        caseSensitive: { type: 'boolean', description: 'Use case-sensitive matching (default: true).' },
+        include: { type: 'string', description: 'Glob pattern to filter files (for example, "*.js" or "*.{ts,tsx}")' },
+        limit: { type: 'integer', exclusiveMinimum: 0, description: 'Maximum number of matching lines to return (default: 100)' },
+        literal: { type: 'boolean', description: 'Treat `pattern` as exact text instead of a regular expression (default: false).' },
+        path: { type: 'string', description: 'File or directory to search. Defaults to the current working directory.' },
+        pattern: { type: 'string', minLength: 1, description: 'Regular expression or literal text to match in file contents.' },
+      },
+      required: ['pattern'],
+      additionalProperties: false,
+    },
+  },
+}
 
 /** 免费档模型 id 口径，与 filterOpenCodeModels 保持一致 */
 export function isOpenCodeFreeModel(modelId: string): boolean {
@@ -577,17 +676,19 @@ function openCodeToolName(item: unknown): string {
   return typeof name === 'string' ? name : ''
 }
 
-/** 合成最小工具定义：上游只校验名字，schema 内容不校验 */
-function minimalToolDef(name: string, protocol: 'chat' | 'responses'): Record<string, unknown> {
-  const parameters = { type: 'object', properties: {}, required: [] }
+/** 合成真实工具定义：上游 2026-10-14 起强校验工具 schema，空 stub 会被直接 403 拒收 */
+function genuineToolDef(name: string, protocol: 'chat' | 'responses'): Record<string, unknown> {
+  const genuine = OPENCODE_GENUINE_TOOLS[name]
+  const description = genuine?.description ?? `Agent tool ${name}`
+  const parameters = genuine?.parameters ?? { type: 'object', properties: {}, required: [] }
   if (protocol === 'responses') {
-    return { type: 'function', name, description: 'x', parameters, strict: false }
+    return { type: 'function', name, description, parameters, strict: false }
   }
-  return { type: 'function', function: { name, description: 'x', parameters } }
+  return { type: 'function', function: { name, description, parameters } }
 }
 
 /**
- * 把免费档模型的请求体整形成 agent 形状：强制 stream:true，并补齐 bash / read。
+ * 把免费档模型的请求体整形成 agent 形状：强制 stream:true、补齐 include_usage 并补齐 shell / read。
  * 付费模型、非 JSON 体、GET 路径一律原样返回（对齐 opencode2api 的 shapeKeyBody）。
  */
 export function shapeOpenCodeFreeBody(rawBody: string | undefined, subPath: string): OpenCodeShape {
@@ -627,6 +728,18 @@ function shapeOpenCodeBody(rawBody: string | undefined, subPath: string, force: 
     changed = true
   }
 
+  // 对 Chat 协议流式强制补齐 stream_options.include_usage: true（对齐 opencode2api ensureAnonymousChatUsage）
+  if (protocol === 'chat') {
+    const streamOptions = payload['stream_options']
+    if (!streamOptions || typeof streamOptions !== 'object') {
+      payload['stream_options'] = { include_usage: true }
+      changed = true
+    } else if ((streamOptions as Record<string, unknown>)['include_usage'] !== true) {
+      (streamOptions as Record<string, unknown>)['include_usage'] = true
+      changed = true
+    }
+  }
+
   const rawTools = payload['tools']
   const items = Array.isArray(rawTools) ? rawTools : null
   const present = new Set<string>()
@@ -637,7 +750,7 @@ function shapeOpenCodeBody(rawBody: string | undefined, subPath: string, force: 
   const missing = OPENCODE_REQUIRED_TOOLS.filter((name) => !present.has(name))
   if (missing.length > 0) {
     const next = items ? [...items] : []
-    for (const name of missing) next.push(minimalToolDef(name, protocol))
+    for (const name of missing) next.push(genuineToolDef(name, protocol))
     payload['tools'] = next
     changed = true
   }
