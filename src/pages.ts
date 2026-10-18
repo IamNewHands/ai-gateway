@@ -2734,7 +2734,7 @@ function renderOauthPoolAccounts(id, accs, ciByUid, ciByNick, ciAccounts, prefer
     if (a.tokenMask) {
       line += ' · <code class="mu" style="font-size:11px" title="已存储于网关 KV">Token: ' + escapeHtml(a.tokenMask) + '</code>'
     }
-    return '<div class="fc mb-2 field-row" style="align-items:flex-start"><div class="fx1" style="font-size:12px;min-width:0"><div>' + line + ' ' + ciBadge + '</div>' + creditLine + pkgHtml + '</div><div class="fc" style="gap:4px"><button class="btn btn-gh btn-xs" onclick="oauthPoolCopyToken(\\'' + escapeJsAttr(id) + '\\',\\'' + escapeJsAttr(a.uid) + '\\')" title="复制 Access Token"><i class="fas fa-copy" aria-hidden="true"></i>复制Token</button>' + poolToggleBtn('oauthPool', id, a, isOff) + '<button class="btn btn-gh btn-xs" onclick="oauthPoolRemove(\\'' + escapeJsAttr(id) + '\\',\\'' + escapeJsAttr(a.uid) + '\\')"><i class="fas fa-trash" aria-hidden="true"></i>移除</button></div></div>'
+    return '<div class="fc mb-2 field-row" style="align-items:flex-start"><div class="fx1" style="font-size:12px;min-width:0"><div>' + line + ' ' + ciBadge + '</div>' + creditLine + pkgHtml + '</div><div class="fc" style="gap:4px"><button class="btn btn-gh btn-xs" onclick="oauthPoolCopyToken(\\'' + escapeJsAttr(id) + '\\',\\'' + escapeJsAttr(a.uid) + '\\')" title="复制 Access Token"><i class="fas fa-copy" aria-hidden="true"></i>复制Token</button>' + poolToggleBtn('oauthPoolToggle', id, a, isOff) + '<button class="btn btn-gh btn-xs" onclick="oauthPoolRemove(\\'' + escapeJsAttr(id) + '\\',\\'' + escapeJsAttr(a.uid) + '\\')"><i class="fas fa-trash" aria-hidden="true"></i>移除</button></div></div>'
   }).join('')
   // 绑定权益包折叠按钮（与签到区相同的 toggleCollapse 交互）
   box.querySelectorAll('[data-pkg]').forEach(function(btn) {

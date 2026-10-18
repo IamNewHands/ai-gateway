@@ -1136,6 +1136,22 @@ describe('DeepSeek App token 注入面板', () => {
     expect(js).toContain('已停用')
   })
 
+  /**
+   * 按钮画出来 ≠ 能点：onclick 里的函数名必须与已定义的函数逐字相同。
+   *
+   * 2026-10-18 事故：WorkBuddy 行调用 poolToggleBtn('oauthPool', ...) 少写了 Toggle 后缀，
+   * 按钮渲染正常，点击才在浏览器里抛 `oauthPool is not defined` —— 上面的字符串断言
+   * 只查「函数存在」和「端点存在」，恰好漏掉这种调用点写错。这里直接校验每个调用点的实参。
+   */
+  it('禁用/启用按钮的 onclick 指向真实存在的函数（写错只会点击时炸）', async () => {
+    const js = inlineScripts(await render([deepseekProvider()])).join('\n')
+    const targets = Array.from(js.matchAll(/poolToggleBtn\('([^']+)'/g)).map(function (m) { return m[1] })
+    expect(targets.length).toBeGreaterThan(0)
+    for (const fn of targets) {
+      expect(js, 'poolToggleBtn 传入的函数名必须已定义：' + fn).toContain('function ' + fn + '(')
+    }
+  })
+
   it('池摘要里显示「已停用」计数与 park 提示', async () => {
     const js = inlineScripts(await render([deepseekProvider()])).join('\n')
     expect(js).toContain('已停用')
