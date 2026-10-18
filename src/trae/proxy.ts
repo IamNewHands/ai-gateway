@@ -345,7 +345,7 @@ function traeClientParamsError(detail: string, httpStatus = 400): Response {
  * 的合法请求（对照成功路径 `[trae-stream] ... connect=` 的分布），还是上游确实整段不通。
  */
 function logTraeTransport(env: Env, msg: string): Promise<void> {
-  console.log(msg) // codeql-disable: 纯诊断日志，不含密钥/敏感 token
+  console.log(msg) // CodeQL 误报（CODING_NOTES.md §493）： 纯诊断日志，不含密钥/敏感 token
   // 有意 await（与 cline `[cline-attempt]` 同口径）：响应返回时日志已落盘，
   // 避免 isolate 收尾时丢掉这条唯一的定性线索。失败路径本来就是 30s 级，KV 往返可忽略。
   return writeLog(env, 'warn', msg).catch(() => { /* 日志失败不影响响应 */ })
@@ -589,7 +589,7 @@ export async function executeWorkRequest(
           // 推理退化（plan_item 思考文本重复）熔断：同样不冷却账号（模型行为非账号故障）
           const msg = `[trae-work-stream] provider=${provider.id} uid=${account.uid} model=${workModel}`
             + ` end=runaway kind=${info.kind} reasoning=${info.reasoningChars} content=${info.contentChars}`
-          console.log(msg) // codeql-disable: 纯诊断日志，不含密钥/敏感 token
+          console.log(msg) // CodeQL 误报（CODING_NOTES.md §493）： 纯诊断日志，不含密钥/敏感 token
           writeLog(env, 'warn', msg).catch(() => { /* 日志失败不影响流 */ })
         }),
         keepAliveMs,
@@ -598,7 +598,7 @@ export async function executeWorkRequest(
           const secs = Math.round((Date.now() - startedAt) / 1000)
           const errInfo = lastWorkErr ? ` errCode=${lastWorkErr.code} errMsg=${lastWorkErr.msg}` : ''
           const msg = `[trae-work-stream] provider=${provider.id} uid=${account.uid} model=${workModel} end=${reason} duration=${secs}s${errInfo}`
-          console.log(msg) // codeql-disable: 纯诊断日志，不含密钥/敏感 token
+          console.log(msg) // CodeQL 误报（CODING_NOTES.md §493）： 纯诊断日志，不含密钥/敏感 token
           writeLog(env, 'info', msg).catch(() => {})
         }
       )
@@ -635,7 +635,7 @@ export async function executeWorkRequest(
       const msg = `[trae-work-agg] provider=${provider.id} uid=${account.uid} model=${workModel}`
         + ` end=truncated kind=${info.kind} content=${info.contentChars} reasoning=${info.reasoningChars}`
         + ` usage=${info.sawUsage}`
-      console.log(msg) // codeql-disable: 纯诊断日志，不含密钥/敏感 token
+      console.log(msg) // CodeQL 误报（CODING_NOTES.md §493）： 纯诊断日志，不含密钥/敏感 token
       writeLog(env, 'warn', msg).catch(() => { /* 日志失败不影响响应 */ })
       continue
     }
@@ -876,7 +876,7 @@ async function proxyTraeRemoteRequest(
               if (name !== 'model_config') return
               const mcMsg = `[trae-remote] provider=${provider.id} uid=${account.uid} model=${configName}`
                 + ` phase=model-config data=${JSON.stringify(data).slice(0, 800)}`
-              console.log(mcMsg) // codeql-disable: 上游模型配置回显，不含密钥
+              console.log(mcMsg) // CodeQL 误报（CODING_NOTES.md §493）： 上游模型配置回显，不含密钥
               writeLog(env, 'info', mcMsg).catch(() => { /* 日志失败不影响流 */ })
             },
             // 「上游到底发没发、发的什么形态」的直接证据，只在首个非空片段触发一次。
@@ -884,7 +884,7 @@ async function proxyTraeRemoteRequest(
             onRawHead: (head) => {
               const msg = `[trae-remote] provider=${provider.id} uid=${account.uid} model=${configName}`
                 + ` phase=raw-head head=${JSON.stringify(head.slice(0, 300))}`
-              console.log(msg) // codeql-disable: 诊断片段，不含密钥/敏感 token
+              console.log(msg) // CodeQL 误报（CODING_NOTES.md §493）： 诊断片段，不含密钥/敏感 token
               writeLog(env, 'info', msg).catch(() => { /* 日志失败不影响流 */ })
             },
           })
@@ -907,7 +907,7 @@ async function proxyTraeRemoteRequest(
             // 没有这个字段，命中信息只走 console.log，面板 durable 日志里看不到 ——
             // 而「是哪一档赢的」正是把阶梯收敛成只留那一档的唯一依据。
             + ` img_variant=${trace.imageVariantSummary || '-'}`
-          console.log(sessionMsg) // codeql-disable: 纯诊断日志，不含密钥/敏感 token
+          console.log(sessionMsg) // CodeQL 误报（CODING_NOTES.md §493）： 纯诊断日志，不含密钥/敏感 token
           writeLog(env, 'info', sessionMsg).catch(() => { /* 日志失败不影响流 */ })
 
           // 「客户端带了图、上游没收到」的告警。**只在真的丢图时打**（这正是本条的改动：
@@ -929,7 +929,7 @@ async function proxyTraeRemoteRequest(
               + ` dropped_images=${droppedImages} requested=${imageBlocks} attached=${attachedImages}`
               + ` reason=${reason}`
               + ` fix=面板-识图模型配置-勾选任一识图模型(主文本模型留空)`
-            console.log(imgMsg) // codeql-disable: 纯诊断日志，不含密钥/敏感 token
+            console.log(imgMsg) // CodeQL 误报（CODING_NOTES.md §493）： 纯诊断日志，不含密钥/敏感 token
             writeLog(env, 'warn', imgMsg).catch(() => { /* 日志失败不影响流 */ })
           }
         } catch (e) {
@@ -958,7 +958,7 @@ async function proxyTraeRemoteRequest(
             const msg = `[trae-remote] provider=${provider.id} uid=${account.uid} model=${configName}`
               + ` phase=tier-fallback from=solo_agent_remote to=solo_work_remote`
               + ` reason=${((e as Error).message || String(e)).slice(0, 160)}`
-            console.log(msg) // codeql-disable: 纯诊断日志，不含密钥/敏感 token
+            console.log(msg) // CodeQL 误报（CODING_NOTES.md §493）： 纯诊断日志，不含密钥/敏感 token
             writeLog(env, 'warn', msg).catch(() => { /* 日志失败不影响流 */ })
             continue
           }
@@ -1047,7 +1047,7 @@ async function proxyTraeRemoteRequest(
                 + ` phase=finish content=${info.contentChars} reasoning=${info.reasoningChars}`
                 + ` toolCalls=${info.sawToolCalls} finish=${info.finishReason}`
                 + ` effort=${appliedEffort || '(none)'} req=${rawRequestedEffort(requestBody) || '(none)'}`
-              console.log(finMsg) // codeql-disable: 纯诊断日志，不含密钥/敏感 token
+              console.log(finMsg) // CodeQL 误报（CODING_NOTES.md §493）： 纯诊断日志，不含密钥/敏感 token
               writeLog(env, 'info', finMsg).catch(() => { /* 日志失败不影响响应 */ })
             },
             allowedTools: body['tools'],
@@ -1059,14 +1059,14 @@ async function proxyTraeRemoteRequest(
               const msg = `[trae-remote] provider=${provider.id} uid=${account.uid} model=${configName}`
                 + ` end=truncated kind=${info.kind} content=${info.contentChars} reasoning=${info.reasoningChars}`
                 + ` toolCalls=${info.sawToolCalls} usage=${info.sawUsage}${effortNote}${maxNote}`
-              console.log(msg) // codeql-disable: 纯诊断日志，不含密钥/敏感 token
+              console.log(msg) // CodeQL 误报（CODING_NOTES.md §493）： 纯诊断日志，不含密钥/敏感 token
               writeLog(env, 'warn', msg).catch(() => { /* 日志失败不影响流 */ })
             },
             onRunaway: (info) => {
               // 退化是模型采样行为，不是账号故障 —— 与 SOLO 侧同纪律，**不罚号**。
               const msg = `[trae-remote] provider=${provider.id} uid=${account.uid} model=${configName}`
                 + ` end=runaway kind=${info.kind} reasoning=${info.reasoningChars} content=${info.contentChars}`
-              console.log(msg) // codeql-disable: 纯诊断日志，不含密钥/敏感 token
+              console.log(msg) // CodeQL 误报（CODING_NOTES.md §493）： 纯诊断日志，不含密钥/敏感 token
               writeLog(env, 'warn', msg).catch(() => { /* 日志失败不影响流 */ })
             },
           }),
@@ -1076,7 +1076,7 @@ async function proxyTraeRemoteRequest(
             const secs = Math.round((Date.now() - startedAt) / 1000)
             const msg = `[trae-remote] provider=${provider.id} uid=${account.uid} model=${configName}`
               + ` end=${reason} duration=${secs}s agent=${usedTier}${effortNote}${maxNote}`
-            console.log(msg) // codeql-disable: 纯诊断日志，不含密钥/敏感 token
+            console.log(msg) // CodeQL 误报（CODING_NOTES.md §493）： 纯诊断日志，不含密钥/敏感 token
             writeLog(env, 'info', msg).catch(() => { /* 日志失败不影响流 */ })
             void releaseTraeSession(env, provider.id, account.uid).catch(() => {})
             // **会话生命周期 = 本次请求**：无论怎么收尾都主动停掉。
@@ -1119,7 +1119,7 @@ async function proxyTraeRemoteRequest(
         const msg = `[trae-remote] provider=${provider.id} uid=${account.uid} model=${configName}`
           + ` end=truncated kind=${info.kind} content=${info.contentChars} reasoning=${info.reasoningChars}`
           + ` toolCalls=${info.sawToolCalls} usage=${info.sawUsage}${effortNote}${maxNote}`
-        console.log(msg) // codeql-disable: 纯诊断日志，不含密钥/敏感 token
+        console.log(msg) // CodeQL 误报（CODING_NOTES.md §493）： 纯诊断日志，不含密钥/敏感 token
         writeLog(env, 'warn', msg).catch(() => { /* 日志失败不影响响应 */ })
         // 与 SOLO 侧同构：不返回半句话、不罚号，交给循环/末尾按 transport 定责。
         const e = new Error(`TRAE Remote 非流式聚合未收到 done（kind=${info.kind} content=${info.contentChars}）`) as Error & { kind?: string }
@@ -1375,7 +1375,7 @@ export async function proxyTraeChatRequest(
           const msg = `[trae-stream] provider=${provider.id} uid=${account.uid} model=${configName}`
             + ` end=truncated kind=${info.kind} content=${info.contentChars} reasoning=${info.reasoningChars}`
             + ` toolCalls=${info.sawToolCalls} usage=${info.sawUsage}`
-          console.log(msg) // codeql-disable: 纯诊断日志，不含密钥/敏感 token
+          console.log(msg) // CodeQL 误报（CODING_NOTES.md §493）： 纯诊断日志，不含密钥/敏感 token
           writeLog(env, 'warn', msg).catch(() => { /* 日志失败不影响流 */ })
         }, (info) => {
           // 推理退化（思考死循环）熔断标记：与「上游截断」分开记，事后按 end=runaway 直接定位。
@@ -1384,7 +1384,7 @@ export async function proxyTraeChatRequest(
           const msg = `[trae-stream] provider=${provider.id} uid=${account.uid} model=${configName}`
             + ` end=runaway kind=${info.kind} reasoning=${info.reasoningChars} content=${info.contentChars}`
             + ` toolCalls=${info.sawToolCalls}`
-          console.log(msg) // codeql-disable: 纯诊断日志，不含密钥/敏感 token
+          console.log(msg) // CodeQL 误报（CODING_NOTES.md §493）： 纯诊断日志，不含密钥/敏感 token
           writeLog(env, 'warn', msg).catch(() => { /* 日志失败不影响流 */ })
         }, (info) => {
           // 收尾审计（SoloDoneAudit）：把「上游发了 done、正文却停在半句」与「上游没发 done」
@@ -1398,7 +1398,7 @@ export async function proxyTraeChatRequest(
             + ` end=done-audit dones=${info.dones} postDoneContent=${info.postDoneContentChars}`
             + ` postDoneReasoning=${info.postDoneReasoningChars} postDoneToolCalls=${info.postDoneToolCalls}`
             + ` content=${info.contentChars} reasoning=${info.reasoningChars} toolCalls=${info.sawToolCalls}`
-          console.log(audit) // codeql-disable: 纯诊断日志，不含密钥/敏感 token
+          console.log(audit) // CodeQL 误报（CODING_NOTES.md §493）： 纯诊断日志，不含密钥/敏感 token
           writeLog(env, 'info', audit).catch(() => { /* 日志失败不影响流 */ })
         }),
         keepAliveMs,
@@ -1412,7 +1412,7 @@ export async function proxyTraeChatRequest(
           // connect= 是「建连+响应头」耗时：成功样本的分布是判断 30s 常量是否过紧的唯一依据
           // （若成功样本长期贴着 20-29s，说明临界；若普遍 <10s，则 30s 不是瓶颈）。
           const msg = `[trae-stream] provider=${provider.id} uid=${account.uid} model=${configName} end=${reason} duration=${secs}s connect=${timing.connectMs ?? -1}ms${errInfo}`
-          console.log(msg) // codeql-disable: 纯诊断日志，不含密钥/敏感 token
+          console.log(msg) // CodeQL 误报（CODING_NOTES.md §493）： 纯诊断日志，不含密钥/敏感 token
           writeLog(env, 'info', msg).catch(() => { /* 日志失败不影响流 */ })
           // 流真正结束后释放会话占用（只在 acquire 过时实际减计数；release 幂等）
           void releaseTraeSession(env, provider.id, account.uid).catch(() => {})
@@ -1464,7 +1464,7 @@ export async function proxyTraeChatRequest(
       const msg = `[trae-agg] provider=${provider.id} uid=${account.uid} model=${configName}`
         + ` end=truncated kind=${info.kind} content=${info.contentChars} reasoning=${info.reasoningChars}`
         + ` toolCalls=${info.sawToolCalls} usage=${info.sawUsage}`
-      console.log(msg) // codeql-disable: 纯诊断日志，不含密钥/敏感 token
+      console.log(msg) // CodeQL 误报（CODING_NOTES.md §493）： 纯诊断日志，不含密钥/敏感 token
       writeLog(env, 'warn', msg).catch(() => { /* 日志失败不影响响应 */ })
       const e = new Error(
         `TRAE SOLO 非流式聚合未收到 done（kind=${info.kind} content=${info.contentChars}）`

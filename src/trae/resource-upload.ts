@@ -549,7 +549,7 @@ export async function uploadResourceToTrae(
     + ` body=${bytes.length}->${escaped.length}`
     + ` planned=${planned.length}/${combos.length}${exhausted ? ' exhausted=true' : ''}`
     + ` store=${storeUri}`
-  ) // codeql-disable: 仅主机名/对象名/变体名/计数，凭据（auth/session_key）绝不在此
+  ) // CodeQL 误报（CODING_NOTES.md §493）： 仅主机名/对象名/变体名/计数，凭据（auth/session_key）绝不在此
 
   const failures: string[] = []
   let attempts = 0
@@ -714,7 +714,7 @@ export async function uploadImageParts(
         console.log(
           `[trae-upload] variant-hit file=${part.filename} variant=${trace.variant}`
           + ` puts=${trace.attempts ?? -1}${trace.exhausted ? ' exhausted=true' : ''}`
-        ) // codeql-disable: 只含文件名/变体名/次数，不含凭据
+        ) // CodeQL 误报（CODING_NOTES.md §493）： 只含文件名/变体名/次数，不含凭据
       }
     } catch (e) {
       // 本模块抛出的错误已保证不含凭据（见文件头「凭据边界」），可以直接落日志。

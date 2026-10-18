@@ -498,7 +498,17 @@ TRAE 思考模型在推理阶段可能 15~20s 不发数据，客户端（AI SDK 
   ——污点顺着 Provider 对象流动，**改日志字段/脱敏打印都消不掉这一族告警**（2026-09-16 已 dismiss 30 条同类）。
 - 处理：**逐条 dismiss（reason = false positive）**。
 - **不要再写 `// codeql-disable`**：CodeQL / GitHub code scanning **不支持**内联抑制注释，那是无效写法，
-  只会让下一个人以为已经抑制了（7e7dc49 又加了 7 处）。
+  只会让下一个人以为已经抑制了（7e7dc49 又加了 7 处；2026-10-18 已把全仓 25 处改写成
+  `// CodeQL 误报（CODING_NOTES.md §493）：<理由>` —— 保留「为什么不是泄露」的理由，删掉无效伪指令）。
+- **2026-10-18 轮**：新出 24 条同类告警（`trae/proxy.ts` 15、`index.ts` 2、`cline/proxy.ts` 2、
+  `m365/oauth.ts` 2、`checkin.ts` 1、`qoder/identity.ts` 1、`oauth.ts` 1），逐条 dismiss
+  （reason = false positive），open 归零。**dismiss 备注上限 280 字符**，写不下就指向本节。
+- 备注模板（231 字符，可直接复用）：「False positive: name-heuristic source (provider.apiKeys / oauth*).
+  Sink logs provider id, account uid, model, session/message ids, durations, upstream
+  model-config/raw-head slices and error text - no token. See CODING_NOTES.md 493.」
+- 遗留观察（不是本次要改的）：qoder 池 `uid` 在缺 `user_id` 时用 `access_token.slice(0,16)` 兜底
+  （`src/qoder/pool.ts:177`），而 `src/oauth.ts:1649` 会打它的前 8 字符。它是账号身份键（KV 键、
+  面板行 id），换成哈希等于改身份、要迁移存量池，故保留；只是「半截 token 进日志」这层风险要知道。
 - 想一劳永逸只有两条路，都属人的决定、不默认做：advanced setup 的 `codeql-config.yml` 里
   `query-filters: - exclude: id: js/clear-text-logging`（等于整仓放弃该查询），或自维护一份改过 source 的查询副本。
 - 真修的例子（本轮）：`src/pages-inline-script.test.ts` 内联脚本抽取正则改 `<\/script\s*\/?>`，

@@ -751,7 +751,7 @@ export async function createRemoteSession(
           `[trae-remote] image upload failed: requested=${opts.imageParts.length}`
           + ` attached=${attachments.length} failed=${outcome.failures.length}`
           + ` first=${first.filename}: ${reason}`
-        ) // codeql-disable: 纯诊断日志，不含凭据
+        ) // CodeQL 误报（CODING_NOTES.md §493）： 纯诊断日志，不含凭据
       }
       if (opts.trace) {
         opts.trace.imageParts = opts.imageParts.length
