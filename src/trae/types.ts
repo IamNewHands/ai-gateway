@@ -114,6 +114,8 @@ export interface TraeAccountStatus {
   workUntil?: number
   workReason?: string
   disabled: boolean
+  /** 人工启停（provider.apiKeys 行的 enabled；false = 用户手动禁用，非上游判死） */
+  enabled?: boolean
   errCount: number
   /** 权益包明细（含到期时间），来自最近一次探测；从未探测过则缺省 */
   packs?: TraeEntPackInfo[]

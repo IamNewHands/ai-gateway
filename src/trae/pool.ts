@@ -509,29 +509,100 @@ export async function noteTraeSuccess(env: Env, providerId: string, uid: string)
   }
 }
 
-/** 签到后解冻：仅当 remain > 0 且账号处于冷却（非禁用）时恢复。支持同时传入 workRemain。 */
+/**
+ * 签到 / 额度探测成功后的解冻。`unfreeze` 决定是否顺带清冷却与**自动禁用**，两个调用方语义不同，
+ * 必须显式声明（对齐 qoder writeQoderQuota 的 unfreeze 形参）：
+ *   - 单账号签到（true）：签到通过上游鉴权 = 凭据有效的直接证据，冷却与「需重新登录」都不再成立；
+ *     并且必须连 `disabled` 一起清——401/403 判死只是推断（WAF、瞬时抖动、域错配都会给 401/403），
+ *     旧实现用 `!st.disabled` 守卫后误判一旦落盘就永无清除路径：积分在涨、token 能用，账号却
+ *     永远不参与挑号（2026-10-18 修）。
+ *   - 面板批量刷新积分（false）：只读一次额度不该解冻——把限流冷却中的号放出来等于绕过限流保护。
+ * 人工禁用写在 provider.apiKeys 行的 enabled=false（getTraeAccounts 直接跳过），本函数只动池状态，
+ * 不会把用户手动停掉的账号放回来。
+ */
 export async function reenableTraeIfCredits(
   env: Env,
   providerId: string,
   uid: string,
   remain: number,
-  workRemain?: number
+  workRemain: number | undefined,
+  unfreeze: boolean
 ): Promise<void> {
   const pool = await readTraePool(env, providerId)
   const st = pool[uid] || {}
   pool[uid] = { ...st, credits: remain }
   if (typeof workRemain === 'number') {
     pool[uid].workCredits = workRemain
-    if (workRemain > 0 && !st.disabled) {
+    if (unfreeze && workRemain > 0) {
       pool[uid].workUntil = 0
       pool[uid].workReason = ''
       pool[uid].workErrCount = 0
     }
   }
-  if (remain > 0 && !st.disabled) {
-    pool[uid] = { ...pool[uid], until: 0, reason: '', errCount: 0 }
+  if (unfreeze && remain > 0) {
+    pool[uid] = { ...pool[uid], disabled: false, until: 0, reason: '', errCount: 0 }
   }
   await writeTraePool(env, providerId, pool)
+}
+
+/**
+ * 列出 provider.apiKeys 中**全部**账号行（含 enabled=false 的）。
+ *
+ * 与 getTraeAccounts 的区别只在「是否包含人工禁用的行」：挑号/签到必须排除禁用号，
+ * 但面板与人工启停必须看得见它们，否则禁用后昵称变空、也认不出「已禁用」→ 无法再启用。
+ */
+export function getTraeAccountEntries(provider: Provider): Array<{ uid: string; nickname: string; enabled: boolean }> {
+  const out: Array<{ uid: string; nickname: string; enabled: boolean }> = []
+  for (const k of provider.apiKeys || []) {
+    const raw = (k.key || '').trim()
+    if (!raw) continue
+    try {
+      const a = parseAuth(raw)
+      out.push({ uid: a.uid, nickname: a.nickname || '', enabled: k.enabled !== false })
+    } catch {
+      /* 跳过损坏的账号行 */
+    }
+  }
+  return out
+}
+
+/**
+ * 人工启用/禁用 TRAE 账号（面板「禁用/启用」按钮）。
+ *
+ * 「人工禁用」落在 provider.apiKeys 行的 `enabled=false`：TraeAccountState 没有这个字段，
+ * 且 getTraeAccounts 第一行就 `if (!k.enabled) continue`，所以改成 false 立刻退出挑号、
+ * 签到轮询与积分刷新；saveTraeAccount 又显式保留原 enabled（:174-177），
+ * 因此 token 刷新不会把用户的停用决定洗掉。
+ * 与「自动禁用」`pool[uid].disabled`（上游 401/403 判死、签到可解冻）正交。
+ *
+ * 「启用」顺带清自动禁用与两条通道的冷却（对齐 deepseek unpark 的语义）：用户点启用就是在断言
+ * 该号现在可用，只翻 enabled 而留着 disabled/until，面板仍显示「已禁用/冷却中」，按钮像没生效。
+ */
+export async function setTraeAccountEnabled(env: Env, providerId: string, uid: string, enabled: boolean): Promise<boolean> {
+  const provider = await updateProvider(env, providerId, {})
+  if (!provider) return false
+  const apiKeys = [...(provider.apiKeys || [])]
+  let hit = false
+  for (let i = 0; i < apiKeys.length; i++) {
+    try {
+      if (parseAuth((apiKeys[i].key || '').trim()).uid !== uid) continue
+    } catch {
+      continue
+    }
+    apiKeys[i] = { ...apiKeys[i], enabled }
+    hit = true
+  }
+  if (!hit) return false
+  await updateProvider(env, providerId, { apiKeys })
+  if (enabled) {
+    const pool = await readTraePool(env, providerId)
+    const st = pool[uid]
+    if (st) {
+      pool[uid] = { ...st, disabled: false, until: 0, reason: '', errCount: 0, workUntil: 0, workReason: '', workErrCount: 0 }
+      await writeTraePool(env, providerId, pool)
+    }
+  }
+  return true
 }
 
 /**
@@ -547,10 +618,13 @@ export function compareTraePacks(a: TraeEntPackInfo, b: TraeEntPackInfo): number
 
 /** 对外状态列表（脱敏，不含 token），按 uid 排序稳定输出。 */
 export async function listTraeStatus(env: Env, provider: Provider): Promise<TraeAccountStatus[]> {
-  const accounts = getTraeAccounts(provider)
+  // 必须连 enabled=false 的行一起看：getTraeAccounts 会跳过人工禁用的账号，
+  // 只用它会让被禁用的号在面板上丢昵称、也认不出「已禁用」→ 无法再点启用。
+  const entries = getTraeAccountEntries(provider)
+  const byUid = new Map(entries.map((e) => [e.uid, e]))
   const pool = await readTraePool(env, provider.id)
   const now = Date.now()
-  const uids = accounts.map((a) => a.uid)
+  const uids = entries.map((e) => e.uid)
   // 池中有状态但账号已被移除的 uid 也展示（便于排查冷却/禁用残留）
   for (const uid of Object.keys(pool)) {
     if (!uids.includes(uid)) uids.push(uid)
@@ -558,11 +632,12 @@ export async function listTraeStatus(env: Env, provider: Provider): Promise<Trae
   uids.sort()
   const out: TraeAccountStatus[] = []
   for (const uid of uids) {
-    const a = accounts.find((x) => x.uid === uid)
+    const a = byUid.get(uid)
     const st = pool[uid]
     out.push({
       uid,
       nickname: a?.nickname || '',
+      enabled: a ? a.enabled : true,
       credits: st?.credits ?? 0,
       workCredits: st?.workCredits,
       cooling: st ? st.until > now : false,

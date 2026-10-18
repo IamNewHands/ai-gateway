@@ -37,6 +37,7 @@ import {
   readTraePool,
   reenableTraeIfCredits,
   removeTraeAccount,
+  setTraeAccountEnabled,
   saveTraeAccount,
   setTraeCredits,
   setTraePacks,
@@ -342,7 +343,7 @@ export async function checkinTraeAccount(env: Env, provider: Provider, account: 
     if (typeof prevWorkCredits === 'number' && prevWorkCredits > 0 && workRemain === 0) {
       workRemain = prevWorkCredits
     }
-    await reenableTraeIfCredits(env, provider.id, account.uid, ideRemain, workRemain)
+    await reenableTraeIfCredits(env, provider.id, account.uid, ideRemain, workRemain, true)
     base.credits = ideRemain
     base.workCredits = workRemain
     await setTraePacks(env, provider.id, account.uid, details.packs)
@@ -563,6 +564,31 @@ export async function handleTraeAccountRemove(c: Context<AppEnv>) {
   return c.json<ApiResponse>({ success: true, message: '已删除账号 ' + uid })
 }
 
+/**
+ * POST /admin/api/trae/:id/account/toggle：人工启用/禁用单个 TRAE 账号。
+ *
+ * 禁用写 provider.apiKeys 行的 enabled=false（getTraeAccounts 立刻跳过 → 不再挑号、不再签到），
+ * 但保留凭证行，因此是可逆暂停、不是删除；「启用」顺带清自动禁用与两通道冷却（见
+ * setTraeAccountEnabled）。这也是唯一能让「上游判死的号」重新参与挑号的人工入口——
+ * 除了它只有「重新登录」一条路。
+ */
+export async function handleTraeAccountToggle(c: Context<AppEnv>) {
+  const id = c.req.param('id') || ''
+  if (!id) return c.json<ApiResponse>({ success: false, message: '缺少 id 参数' }, 400)
+  const provider = await getProvider(c.env, id)
+  if (!provider) return c.json<ApiResponse>({ success: false, message: '提供商不存在' }, 404)
+  const body = await readOptionalJSONLimited<{ uid?: string; enabled?: boolean }>(c.req.raw, MAX_ADMIN_REQUEST_BYTES)
+  const uid = (body.uid || '').trim()
+  if (!uid) return c.json<ApiResponse>({ success: false, message: '缺少 uid' }, 400)
+  // 同 WorkBuddy/Qoder 端点：enabled 必须显式给，缺失不允许被当成「启用」
+  if (typeof body.enabled !== 'boolean') {
+    return c.json<ApiResponse>({ success: false, message: '缺少 enabled 参数（true=启用 / false=禁用）' }, 400)
+  }
+  const ok = await setTraeAccountEnabled(c.env, id, uid, body.enabled)
+  if (!ok) return c.json<ApiResponse>({ success: false, message: '账号不存在' }, 404)
+  return c.json<ApiResponse>({ success: true, message: (body.enabled ? '已启用 ' : '已禁用 ') + uid })
+}
+
 /** POST /admin/api/trae/:id/credits/refresh：主动探测并刷新所有账号的双通道积分（通用与 Work 积分）。 */
 export async function handleTraeCreditsRefresh(c: Context<AppEnv>) {
   const id = c.req.param('id') || ''
@@ -602,7 +628,8 @@ export async function handleTraeCreditsRefresh(c: Context<AppEnv>) {
         }
       }
 
-      await reenableTraeIfCredits(c.env, id, a.uid, ideRemain, workRemain)
+      // 面板批量刷新：只读额度，不解冻（unfreeze=false）——把限流冷却中的号放出来等于绕过限流保护
+      await reenableTraeIfCredits(c.env, id, a.uid, ideRemain, workRemain, false)
       // 权益包明细（含到期时间）落盘，面板「积分明细」折叠表据此展示
       await setTraePacks(c.env, id, a.uid, details.packs)
       results.push({

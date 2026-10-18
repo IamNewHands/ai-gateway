@@ -644,6 +644,31 @@ export async function removeQoderAccount(env: Env, providerId: string, uid: stri
   return true
 }
 
+/**
+ * 人工启用/禁用 Qoder 池账号（面板「禁用/启用」按钮，与 WorkBuddy 共用 /pool/toggle 端点）。
+ *
+ * 与 WorkBuddy 池同一口径：人工禁用写顶层 `enabled=false`（isQoderAccountHealthy 与挑号
+ * :295-297 直接排除它），自动判死写 `state.disabled`（签到成功可解冻）。两者正交，
+ * 因此面板刷新、签到解冻、token 刷新这些自动路径都不会覆盖用户的手动决定。
+ * 「启用」顺带清自动禁用与冷却（对齐 deepseek unpark 语义，理由见
+ * oauth-pool.setOauthAccountEnabled）：否则按钮点了面板仍显示「已禁用」，看起来没生效。
+ *
+ * @returns 账号是否存在（false → 端点回 404）
+ */
+export async function setQoderAccountEnabled(env: Env, providerId: string, uid: string, enabled: boolean): Promise<boolean> {
+  const pool = await readQoderPool(env, providerId)
+  const acc = pool.find((a) => a.uid === uid)
+  if (!acc) return false
+  acc.enabled = enabled
+  if (enabled) {
+    const st = acc.state || { credits: 0, disabled: false, until: 0, errCount: 0 }
+    acc.state = { ...st, disabled: false, until: 0, reason: '', errCount: 0 }
+  }
+  acc.updatedAt = Date.now()
+  await writeQoderPool(env, providerId, pool)
+  return true
+}
+
 /** 对外状态列表（脱敏，不含 token）。 */
 export async function listQoderPoolStatus(env: Env, providerId: string): Promise<Array<Record<string, unknown>>> {
   const pool = await readQoderPool(env, providerId)

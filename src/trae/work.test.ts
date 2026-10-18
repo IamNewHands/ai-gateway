@@ -376,8 +376,8 @@ describe('Trae Work: 账号池与状态机调度 (pool.ts)', () => {
     picked = await pickTraeWorkAccount(fakeEnv, 'p1', [accountA])
     expect(picked).toBeNull() // 已冷却，无法选取
 
-    // 重新通过 reenable 恢复
-    await reenableTraeIfCredits(fakeEnv, 'p1', 'user_a', 0, 50)
+    // 重新通过 reenable 恢复（unfreeze=true = 签到语义）
+    await reenableTraeIfCredits(fakeEnv, 'p1', 'user_a', 0, 50, true)
     picked = await pickTraeWorkAccount(fakeEnv, 'p1', [accountA])
     expect(picked?.uid).toBe('user_a')
   })
@@ -388,8 +388,8 @@ describe('Trae Work: 账号池与状态机调度 (pool.ts)', () => {
     let picked = await pickTraeWorkAccount(fakeEnv, 'p1', [accountA])
     expect(picked).toBeNull()
 
-    // 充值或探测发现有余额，唤醒
-    await reenableTraeIfCredits(fakeEnv, 'p1', 'user_a', 10, 50)
+    // 充值或探测发现有余额，唤醒（unfreeze=true = 签到语义）
+    await reenableTraeIfCredits(fakeEnv, 'p1', 'user_a', 10, 50, true)
     picked = await pickTraeWorkAccount(fakeEnv, 'p1', [accountA])
     expect(picked?.uid).toBe('user_a')
   })

@@ -28,6 +28,7 @@ import {
   handleKukuQrConnect,
   handleKukuQrPoll,
   handleOAuthPoolRemove,
+  handleOAuthPoolToggle,
   handleOAuthPoolSetPrefer,
   handleOAuthPoolExport,
   handleOAuthModels,
@@ -114,6 +115,7 @@ import {
   handleTraeModels,
   handleTraeStatus,
   handleTraeAccountRemove,
+  handleTraeAccountToggle,
   handleTraeSetPrefer,
   handleTraeCreditsRefresh,
   handleTraeAuthKeys,
@@ -243,6 +245,8 @@ app.post('/admin/api/kuku/:id/qr/poll', handleKukuQrPoll)
 app.post('/admin/api/oauth/:id/pool/remove', handleOAuthPoolRemove)
 // WorkBuddy 多账号池：设置首选账号（面板手工指定，留空恢复自动挑选）
 app.post('/admin/api/oauth/:id/pool/prefer', handleOAuthPoolSetPrefer)
+// WorkBuddy / Qoder 账号池：人工启用/禁用单个账号（可逆暂停，与 remove 的删除语义分开）
+app.post('/admin/api/oauth/:id/pool/toggle', handleOAuthPoolToggle)
 // 账号池凭证导出（Token / JSON）
 app.get('/admin/api/oauth/:id/pool/export', handleOAuthPoolExport)
 // WorkBuddy 生态任务：活跃上报、猫猫旅行巡检、一键日常（签到+活跃+旅行）
@@ -288,6 +292,7 @@ app.post('/admin/api/trae/:id/checkin', handleTraeCheckin)
 app.post('/admin/api/trae/:id/models', handleTraeModels)
 app.get('/admin/api/trae/:id/status', handleTraeStatus)
 app.post('/admin/api/trae/:id/account/remove', handleTraeAccountRemove)
+app.post('/admin/api/trae/:id/account/toggle', handleTraeAccountToggle)
 app.post('/admin/api/trae/:id/account/prefer', handleTraeSetPrefer)
 app.post('/admin/api/trae/:id/credits/refresh', handleTraeCreditsRefresh)
 // 凭据字段诊断（Remote 传输可行性）：只回字段名与长度，不回凭据值

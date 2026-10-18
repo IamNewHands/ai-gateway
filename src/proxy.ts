@@ -2502,7 +2502,18 @@ async function proxyOAuthRequestPooledCore(
       }
     }
 
-    // 401/403：先刷新一次（仍 401 则尝试备用域；再失败禁用换号）
+    // 401/403 分流（2026-10-18，用户批准的「仅会话吊销才停用」口径，与 Qoder 对齐）：
+    // **先分清「会话真的死了」还是「上游临时拒绝」，再决定停用还是轮换**。
+    // 旧实现只要「刷新 + 备用域」后仍是 401/403 就 disableOauthAccount('session dead (401/403)')，
+    // 于是 APISIX 边缘 401（网关/指纹拦截、凭证尚未生效）、瞬时抖动、token 域错配都会把一个
+    // **完全有效**的账号永久踢出选号——用户实测面板「已禁用」而积分照涨、签到成功，只有本地标记，
+    // 且没有任何自愈路径（签到解冻旧实现带 `!st.disabled` 守卫，见 reenableOauthIfCredits）。
+    // 三条判据（响应体只能读一次，故先取文本再分流）：
+    //   - 会话吊销（12153 / Offline user session not found）→ 连续 3 次防抖后停用；
+    //   - 11140 request illegal（账号级授权封禁，需重新 OAuth 登录，软冷却不会自愈）→ 立即停用；
+    //   - 其余 401/403（边缘拦截页、空体、未知信封）→ 软冷却 + 粘性解绑 + 本轮换号，**不停用**。
+    // 停止用不等于放行：该号仍被 until 冷却挡在挑号之外，只是 60s 后有机会自证清白，
+    // 而不是一次未识别的 401 就永久报废（真正的死会话由 12153 判据在 3 次内收敛）。
     if (response.status === 401 || response.status === 403) {
       let refreshedToken: string | null = null
       if (account.token.refresh_token) {
@@ -2528,13 +2539,20 @@ async function proxyOAuthRequestPooledCore(
         }
       }
       if (response.status === 401 || response.status === 403) {
-        await disableOauthAccount(c.env, provider.id, account.uid, 'session dead (401/403)')
+        const text = await response.text().catch(() => '')
+        if (classifyWorkbuddyUpstreamError(response.status, text) === 'session_dead') {
+          await noteOauthSessionDead(c.env, provider.id, account.uid, cd)
+        } else if (isAccountBanned(text)) {
+          await disableOauthAccount(c.env, provider.id, account.uid, 'account banned by upstream (11140 request illegal), re-login required')
+        } else {
+          await cooldownOauthAccount(c.env, provider.id, account.uid, cd.softMs, `upstream ${response.status} (rotate, no disable)`)
+        }
         // 粘性解绑：失败号若是本会话的绑定号，下次请求重新分配（对齐 session.go Unbind）
         if (stickyKey && account.uid === stickyUid) {
           await unbindSticky(c.env, provider.id, stickyKey)
           stickyUid = ''
         }
-        lastErr = new Error(`account ${account.uid} session dead`)
+        lastErr = new Error(`account ${account.uid} upstream ${response.status}`)
         await backoffAt(i)
         continue
       }

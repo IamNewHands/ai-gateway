@@ -19,6 +19,7 @@ import {
   __resetOauthPoolRuntimeForTests,
   __resetOauthModelCostsForTests,
   reenableOauthIfCredits,
+  setOauthAccountEnabled,
   soonestOauthExpiryAt,
   type OAuthPool,
   type OAuthPoolState,
@@ -753,5 +754,89 @@ describe('7 天内到期积分优先挑号（2026-09-28 需求）', () => {
     await reenableOauthIfCredits(kv.env, pid, 'u1', 40, [])
     pool = await readOauthPool(kv.env, pid)
     expect(pool[0].state.packages).toEqual([])
+  })
+})
+
+/**
+ * 池账号的两个「停用」通道必须正交（2026-10-18 修）：
+ *   - state.disabled = 自动判死（401/403 误判、12153 三次）→ 签到/额度探测成功即可解冻；
+ *   - 顶层 enabled=false = 人工决定 → 任何自动路径都不写它，只能人工放回。
+ * 线上症状正是前者没有解冻路径：签到成功、积分在涨，账号却永远不参与挑号。
+ */
+describe('池账号签到解冻与人工禁用/启用', () => {
+  // 每个用例独立 providerId：readOauthPool 有 1s 内存缓存，共用 pid 会读到上一个用例的池。
+  const pidOf = (s: string) => PROVIDER + '-toggle-' + s
+
+  it('reenableOauthIfCredits：签到成功必须清掉自动禁用（误判 session dead 的账号要能自己回来）', async () => {
+    __resetOauthPoolRuntimeForTests()
+    const pid = pidOf('unfreeze')
+    const kv = makeRealKV(pid, [
+      makeAccount('dead', {
+        state: { credits: 0, disabled: true, reason: 'session dead (401/403)', until: 0, errCount: 3, sessionDeadFails: 3 },
+      }),
+    ])
+
+    await reenableOauthIfCredits(kv.env, pid, 'dead', 120)
+    const pool = await readOauthPool(kv.env, pid)
+    expect(pool[0].state.disabled).toBe(false)
+    expect(pool[0].state.reason).toBe('')
+    expect(pool[0].state.errCount).toBe(0)
+    expect(pool[0].state.sessionDeadFails).toBe(0)
+    expect(isOauthAccountHealthy(pool[0], Date.now())).toBe(true)
+    // 解冻后真的会重新被挑中（而不是只在状态里好看）
+    const picked = await pickOauthAccount(kv.env, pid, new Set(), undefined, { rng: RNG_ZERO })
+    expect(picked?.uid).toBe('dead')
+  })
+
+  it('reenableOauthIfCredits：无积分（remain <= 0）不解冻，避免放出来立刻再撞额度', async () => {
+    __resetOauthPoolRuntimeForTests()
+    const pid = pidOf('unfreeze-zero')
+    const kv = makeRealKV(pid, [
+      makeAccount('dead', { state: { credits: 0, disabled: true, reason: 'session dead (401/403)', until: 0, errCount: 3 } }),
+    ])
+
+    await reenableOauthIfCredits(kv.env, pid, 'dead', 0)
+    const pool = await readOauthPool(kv.env, pid)
+    expect(pool[0].state.disabled).toBe(true)
+    expect(pool[0].state.reason).toBe('session dead (401/403)')
+  })
+
+  it('setOauthAccountEnabled(false)：保留凭证但立刻退出挑号', async () => {
+    __resetOauthPoolRuntimeForTests()
+    const pid = pidOf('disable')
+    const kv = makeRealKV(pid, [makeAccount('a', { state: { credits: 100, disabled: false, until: 0, errCount: 0 } })])
+
+    expect(await setOauthAccountEnabled(kv.env, pid, 'a', false)).toBe(true)
+    const pool = await readOauthPool(kv.env, pid)
+    expect(pool[0].enabled).toBe(false)
+    expect(isOauthAccountHealthy(pool[0], Date.now())).toBe(false)
+    expect(await pickOauthAccount(kv.env, pid, new Set(), undefined, { rng: RNG_ZERO })).toBeFalsy()
+  })
+
+  it('setOauthAccountEnabled(true)：人工启用时把自动判死与冷却一并清掉（否则面板仍显示已禁用）', async () => {
+    __resetOauthPoolRuntimeForTests()
+    const pid = pidOf('enable')
+    const kv = makeRealKV(pid, [
+      makeAccount('a', {
+        enabled: false,
+        state: { credits: 100, disabled: true, reason: 'session dead (401/403)', until: Date.now() + 60000, errCount: 2 },
+      }),
+    ])
+
+    expect(await setOauthAccountEnabled(kv.env, pid, 'a', true)).toBe(true)
+    const pool = await readOauthPool(kv.env, pid)
+    expect(pool[0].enabled).toBe(true)
+    expect(pool[0].state.disabled).toBe(false)
+    expect(pool[0].state.reason).toBe('')
+    expect(pool[0].state.until).toBe(0)
+    expect(pool[0].state.errCount).toBe(0)
+    expect((await pickOauthAccount(kv.env, pid, new Set(), undefined, { rng: RNG_ZERO }))?.uid).toBe('a')
+  })
+
+  it('setOauthAccountEnabled：账号不存在返回 false（端点据此回 404）', async () => {
+    __resetOauthPoolRuntimeForTests()
+    const pid = pidOf('missing')
+    const kv = makeRealKV(pid, [makeAccount('a')])
+    expect(await setOauthAccountEnabled(kv.env, pid, 'ghost', false)).toBe(false)
   })
 })

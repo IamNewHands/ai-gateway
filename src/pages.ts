@@ -2734,7 +2734,7 @@ function renderOauthPoolAccounts(id, accs, ciByUid, ciByNick, ciAccounts, prefer
     if (a.tokenMask) {
       line += ' · <code class="mu" style="font-size:11px" title="已存储于网关 KV">Token: ' + escapeHtml(a.tokenMask) + '</code>'
     }
-    return '<div class="fc mb-2 field-row" style="align-items:flex-start"><div class="fx1" style="font-size:12px;min-width:0"><div>' + line + ' ' + ciBadge + '</div>' + creditLine + pkgHtml + '</div><div class="fc" style="gap:4px"><button class="btn btn-gh btn-xs" onclick="oauthPoolCopyToken(\\'' + escapeJsAttr(id) + '\\',\\'' + escapeJsAttr(a.uid) + '\\')" title="复制 Access Token"><i class="fas fa-copy" aria-hidden="true"></i>复制Token</button><button class="btn btn-gh btn-xs" onclick="oauthPoolRemove(\\'' + escapeJsAttr(id) + '\\',\\'' + escapeJsAttr(a.uid) + '\\')"><i class="fas fa-trash" aria-hidden="true"></i>移除</button></div></div>'
+    return '<div class="fc mb-2 field-row" style="align-items:flex-start"><div class="fx1" style="font-size:12px;min-width:0"><div>' + line + ' ' + ciBadge + '</div>' + creditLine + pkgHtml + '</div><div class="fc" style="gap:4px"><button class="btn btn-gh btn-xs" onclick="oauthPoolCopyToken(\\'' + escapeJsAttr(id) + '\\',\\'' + escapeJsAttr(a.uid) + '\\')" title="复制 Access Token"><i class="fas fa-copy" aria-hidden="true"></i>复制Token</button>' + poolToggleBtn('oauthPool', id, a, isOff) + '<button class="btn btn-gh btn-xs" onclick="oauthPoolRemove(\\'' + escapeJsAttr(id) + '\\',\\'' + escapeJsAttr(a.uid) + '\\')"><i class="fas fa-trash" aria-hidden="true"></i>移除</button></div></div>'
   }).join('')
   // 绑定权益包折叠按钮（与签到区相同的 toggleCollapse 交互）
   box.querySelectorAll('[data-pkg]').forEach(function(btn) {
@@ -2754,6 +2754,36 @@ function oauthPoolRemove(id, uid) {
         else oauthPoolStatus(id)
       }
     }).catch(function() { toast('移除失败', 'error') })
+  })
+}
+/* 账号池「禁用/启用」按钮（WorkBuddy 国内/国际 + Qoder 共用）。
+   与「移除」的区别：禁用是**可逆暂停**——凭证、额度、签到记录全保留，只是不再被挑号；
+   移除是删除。禁用写顶层 enabled（人工决定），签到解冻/面板刷新都不会把它放回来，
+   想恢复必须再点一次「启用」；点「启用」同时清除自动判死的禁用标记与冷却。
+   off 为当前是否处于不可用态（已禁用/自动判死），据此决定按钮是「启用」还是「禁用」。 */
+function poolToggleBtn(fn, id, a, off) {
+  const enable = !!off
+  const label = enable ? '启用' : '禁用'
+  const title = enable ? '启用该账号：恢复参与轮换，并清除自动判死的禁用/冷却标记' : '禁用该账号：保留凭证，暂停参与轮换（可随时重新启用）'
+  return '<button class="btn btn-gh btn-xs" onclick="' + fn + '(' + '\\'' + escapeJsAttr(id) + '\\',\\'' + escapeJsAttr(a.uid) + '\\',' + (enable ? 'true' : 'false') + ')" title="' + title + '"><i class="fas fa-' + (enable ? 'play' : 'ban') + '" aria-hidden="true"></i>' + label + '</button>'
+}
+function oauthPoolToggle(id, uid, enable) {
+  const act = enable ? '启用' : '禁用'
+  const ask = enable
+    ? '启用 ' + uid + ' ？该账号将重新参与轮换，并清除自动判死的禁用/冷却标记。'
+    : '禁用 ' + uid + ' ？保留凭证与额度，但不再被轮换使用（可随时重新启用）。'
+  cM(ask).then(function(ok) {
+    if (!ok) return
+    fetch('/admin/api/oauth/' + encodeURIComponent(id) + '/pool/toggle', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ uid: uid, enabled: !!enable })
+    }).then(r => r.json()).then(function(d) {
+      toast(d.message || (d.success ? '已' + act : act + '失败'), d.success ? 'success' : 'error')
+      if (d.success) {
+        // 同 oauthPoolRemove：两池共用端点，按容器存在性刷新对应池
+        if (document.getElementById('qdp-acc-' + id)) qoderPoolStatus(id)
+        else oauthPoolStatus(id)
+      }
+    }).catch(function() { toast(act + '失败', 'error') })
   })
 }
 // WorkBuddy 多账号池：设置首选账号（对齐 TRAE 面板交互；forcedUid 传入 '' 恢复自动挑选）
@@ -3038,7 +3068,7 @@ function renderQoderPoolAccounts(id, accs, ciByUid, ciAccounts, preferUid) {
     } else if (pkgDisp.total > 0) {
       pkgHtml = '<div class="mu" style="margin-top:2px">额度包明细：' + pkgDisp.total + ' 个包已全部用完</div>'
     }
-    return '<div class="fc mb-2 field-row" style="align-items:flex-start"><div class="fx1" style="font-size:12px;min-width:0"><div>' + line + ' ' + ciBadge + '</div>' + creditLine + codeHtml + pkgHtml + '</div><div class="fc" style="gap:4px"><button class="btn btn-gh btn-xs" onclick="oauthPoolCopyToken(\\'' + escapeJsAttr(id) + '\\',\\'' + escapeJsAttr(a.uid) + '\\')" title="复制 Access Token"><i class="fas fa-copy" aria-hidden="true"></i>复制Token</button><button class="btn btn-gh btn-xs" onclick="oauthPoolRemove(\\'' + escapeJsAttr(id) + '\\',\\'' + escapeJsAttr(a.uid) + '\\')"><i class="fas fa-trash" aria-hidden="true"></i>移除</button></div></div>'
+    return '<div class="fc mb-2 field-row" style="align-items:flex-start"><div class="fx1" style="font-size:12px;min-width:0"><div>' + line + ' ' + ciBadge + '</div>' + creditLine + codeHtml + pkgHtml + '</div><div class="fc" style="gap:4px"><button class="btn btn-gh btn-xs" onclick="oauthPoolCopyToken(\\'' + escapeJsAttr(id) + '\\',\\'' + escapeJsAttr(a.uid) + '\\')" title="复制 Access Token"><i class="fas fa-copy" aria-hidden="true"></i>复制Token</button>' + poolToggleBtn('oauthPoolToggle', id, a, isOff) + '<button class="btn btn-gh btn-xs" onclick="oauthPoolRemove(\\'' + escapeJsAttr(id) + '\\',\\'' + escapeJsAttr(a.uid) + '\\')"><i class="fas fa-trash" aria-hidden="true"></i>移除</button></div></div>'
   }).join('')
   // 绑定额度包折叠按钮（与 WorkBuddy 池相同的 toggleCollapse 交互）
   box.querySelectorAll('[data-pkg]').forEach(function(btn) {
@@ -3530,10 +3560,16 @@ function traeStatus(id) {
         '<thead><tr><th>UID</th><th>昵称</th><th>通用积分 (SOLO)</th><th>Work 积分</th><th>今日签到</th><th>通道状态</th><th>冷却至</th><th>操作</th></tr></thead><tbody>' +
         accs.map(function (a, ai) {
           const isDis = a.disabled
+          // 人工停用（apiKeys 行 enabled=false）与自动判死（state.disabled）分开显示：
+          // 前者只有用户点「启用」才会恢复，后者点「启用」会顺带清掉自动标记（等价 unpark）。
+          // 混成一句「已禁用」就看不出这个号是被我停的、还是被上游 401/403 误判的。
+          const offManual = a.enabled === false
           const soloCool = a.cooling
           const workCool = a.workCooling
           let stTxt = '<span style="color:var(--color-success,#16a34a)">正常</span>'
-          if (isDis) {
+          if (offManual) {
+            stTxt = '<span style="color:var(--color-danger,#ef4444)" title="人工停用：不再参与挑号与签到，点「启用」恢复">已停用</span>'
+          } else if (isDis) {
             stTxt = '<span style="color:var(--color-danger,#ef4444)">已禁用</span>'
           } else if (soloCool && workCool) {
             stTxt = '<span style="color:var(--color-warn,#d97706)">双通道冷却</span>'
@@ -3571,7 +3607,8 @@ function traeStatus(id) {
 
           return '<tr><td><code>' + escapeHtml(a.uid) + '</code></td><td>' + escapeHtml(a.nickname || '-') + '</td>' +
             '<td>' + soloBadge + '</td><td>' + workBadge + '</td><td' + ciTip + '>' + ciTxt + '</td><td>' + stTxt + reasonHtml + '</td><td>' + until + '</td>' +
-            '<td><button class="btn btn-d btn-xs" onclick="traeRemoveAccount(\\'' + escapeJsAttr(id) + '\\',\\'' + escapeJsAttr(a.uid) + '\\')">删除</button></td></tr>' +
+            '<td><button class="btn btn-gh btn-xs" onclick="traeToggleAccount(\\'' + escapeJsAttr(id) + '\\',\\'' + escapeJsAttr(a.uid) + '\\',' + (offManual || isDis ? 'true' : 'false') + ')" title="' + (offManual ? '启用该账号：恢复参与挑号与签到' : (isDis ? '启用该账号：清除自动判死的禁用标记与两通道冷却' : '禁用该账号：保留凭证，暂停参与挑号与签到（可随时重新启用）')) + '">' + (offManual || isDis ? '启用' : '禁用') + '</button>' +
+            '<button class="btn btn-d btn-xs" onclick="traeRemoveAccount(\\'' + escapeJsAttr(id) + '\\',\\'' + escapeJsAttr(a.uid) + '\\')">删除</button></td></tr>' +
             '<tr><td colspan="8" style="border-top:none;padding-top:0">' + packDetail + '</td></tr>'
         }).join('') + '</tbody></table></div>' +
         '<p class="form-helper">共 ' + accs.length + ' 个账号；今日已签 ' + ciOk + ' / ' + accs.length + '。「积分明细」展开可见每个权益包的到期时间与用量（<b>已用完的包自动隐藏</b>，其余按到期升序，快过期的在最上面），点「刷新积分」更新。</p>'
@@ -3601,6 +3638,29 @@ function traeRemoveAccount(id, uid) {
       if (!d.success) { if (st) showResult(st, false, d.message || '删除失败'); return }
       if (st) showResult(st, true, d.message || '已删除')
       traeStatus(id)
+      setTimeout(function () { reloadAdmin() }, 1200)
+    }).catch(() => { if (st) showResult(st, false, '网络错误，请重试') })
+  })
+}
+// 人工禁用/启用单个 TRAE 账号：禁用 = 可逆暂停（保留 apiKeys 凭证行，只是不再挑号/签到），
+// 与「删除」不同；「启用」顺带清自动判死的禁用标记与两通道冷却（见 setTraeAccountEnabled）。
+function traeToggleAccount(id, uid, enable) {
+  const act = enable ? '启用' : '禁用'
+  const ask = enable
+    ? '启用 ' + uid + ' ？该账号将重新参与挑号与签到，并清除自动判死的禁用标记与冷却。'
+    : '禁用 ' + uid + ' ？保留凭证，但不再参与挑号与签到（可随时重新启用）。'
+  cM(ask).then(function (ok) {
+    if (!ok) return
+    const st = document.getElementById('trae-st-' + id)
+    fetch('/admin/api/trae/' + encodeURIComponent(id) + '/account/toggle', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ uid: uid, enabled: !!enable }),
+    }).then(r => r.json()).then(d => {
+      if (!d.success) { if (st) showResult(st, false, d.message || act + '失败'); return }
+      if (st) showResult(st, true, d.message || '已' + act)
+      traeStatus(id)
+      // 表格里的账号数据来自 provider.apiKeys（禁用会改它），故与删除同样重载面板保证一致
       setTimeout(function () { reloadAdmin() }, 1200)
     }).catch(() => { if (st) showResult(st, false, '网络错误，请重试') })
   })

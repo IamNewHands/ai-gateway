@@ -41,8 +41,8 @@ import { fetchGeminiQuota } from './gemini/quota'
 import { isCnbProvider, testCnbConnection, CNB_MODELS } from './cnb/proxy'
 import { PROXY_KEY_PREFIX, EXPIRY_OPTIONS, OPENCODE_DEFAULT_URL } from './config'
 import { startOauthDeviceFlow, pollOauthDeviceFlow, readOauthToken, deleteOauthToken, getOauthAccessToken, buildOauthHeaders, detectTokenRealm, submitOauthGeminiCallback, submitOauthM365Callback, submitOauthM365ROPC, OAUTH_POOL_KV_PREFIX } from './oauth'
-import { isOAuthPoolProvider, seedOauthPoolFromSingle, listOauthPoolStatus, removeOauthAccount, readOauthPool } from './oauth-pool'
-import { seedQoderPoolFromSingle, listQoderPoolStatus, removeQoderAccount, readQoderPool } from './qoder/pool'
+import { isOAuthPoolProvider, seedOauthPoolFromSingle, listOauthPoolStatus, removeOauthAccount, readOauthPool, setOauthAccountEnabled } from './oauth-pool'
+import { seedQoderPoolFromSingle, listQoderPoolStatus, removeQoderAccount, readQoderPool, setQoderAccountEnabled } from './qoder/pool'
 import { isM365Provider, M365_MODELS, testM365Model } from './m365/proxy'
 import { isZcodeProvider, testZcodeModel, buildZcodeHeaders, ZCODE_MODELS, fetchZcodeModels } from './zcode/proxy'
 import { injectWorkbuddyChatHeaders, ensureGlobalFallbackSystem } from './workbuddy-upstream'
@@ -1649,6 +1649,40 @@ export async function handleOAuthPoolRemove(c: Context<AppEnv>) {
     : await removeOauthAccount(c.env, id, uid)
   if (!removed) return c.json<ApiResponse>({ success: false, message: '账号不存在' }, 404)
   return c.json<ApiResponse>({ success: true, message: '已从账号池删除 ' + uid })
+}
+
+/**
+ * POST /admin/api/oauth/:id/pool/toggle：人工启用/禁用池内账号。
+ *
+ * WorkBuddy（国内 `codebuddy.cn` / 国际 `workbuddy.ai`）与 Qoder 共用本端点：两者都是
+ * 「一个 provider 一个账号池」的同一形态（见 handleOAuthPoolRemove 的 isQoderFlow 分流）。
+ *
+ * 与「移除」的分工：禁用是**可逆暂停**（保留凭证、额度与昵称，只是不再被挑号），移除才是删除。
+ * 写的是顶层 `enabled`（人工决定），面板刷新、签到解冻、token 刷新都不会覆盖它；
+ * 恢复只能再点一次「启用」——这正是「我自己停掉的号不会被自动流程偷偷放回来」的保证。
+ */
+export async function handleOAuthPoolToggle(c: Context<AppEnv>) {
+  const id = c.req.param('id')
+  if (!id) return c.json<ApiResponse>({ success: false, message: '缺少 id 参数' }, 400)
+  const provider = await getProvider(c.env, id)
+  if (!provider) return c.json<ApiResponse>({ success: false, message: '提供商不存在' }, 404)
+  const isQoder = isQoderFlow(provider)
+  if (!isOAuthPoolProvider(provider) && !isQoder) {
+    return c.json<ApiResponse>({ success: false, message: '该提供商不是多账号池模式' }, 400)
+  }
+  const body = await readOptionalJSONLimited<{ uid?: string; enabled?: boolean }>(c.req.raw, MAX_ADMIN_REQUEST_BYTES)
+  const uid = String(body?.uid || '').trim()
+  if (!uid) return c.json<ApiResponse>({ success: false, message: '缺少 uid 参数' }, 400)
+  // enabled 必须显式给 boolean：缺省按 true 处理的话，一个手滑的空 body 就会把账号「启用」，
+  // 与禁用/启用对称、且失败安全的语义不符（停用是保守方向，恢复必须是有意为之）。
+  if (typeof body?.enabled !== 'boolean') {
+    return c.json<ApiResponse>({ success: false, message: '缺少 enabled 参数（true=启用 / false=禁用）' }, 400)
+  }
+  const ok = isQoder
+    ? await setQoderAccountEnabled(c.env, id, uid, body.enabled)
+    : await setOauthAccountEnabled(c.env, id, uid, body.enabled)
+  if (!ok) return c.json<ApiResponse>({ success: false, message: '账号不存在' }, 404)
+  return c.json<ApiResponse>({ success: true, message: (body.enabled ? '已启用 ' : '已禁用 ') + uid })
 }
 
 /** POST /admin/api/oauth/:id/pool/prefer：设置首选账号（面板下拉框指定，留空则恢复自动挑选）。 */

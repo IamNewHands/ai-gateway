@@ -1119,6 +1119,23 @@ describe('DeepSeek App token 注入面板', () => {
     expect(js).toContain('t.parked ?')
   })
 
+  /**
+   * 池账号的人工禁用/启用（2026-10-18 新增：WorkBuddy 国内/国际 + Qoder + TRAE）。
+   *
+   * 为什么必须渲染：账号被自动判死后原本只能「移除 + 重新登录」，用户没有单账号止损/放回
+   * 的手段。这里断言到端点字符串，避免按钮画出来却没接线（点下去永远没反应）。
+   */
+  it('池列表渲染人工「禁用/启用」按钮并接上 toggle 端点', async () => {
+    const js = inlineScripts(await render([deepseekProvider()])).join('\n')
+    expect(js).toContain('function poolToggleBtn')
+    expect(js).toContain('function oauthPoolToggle')
+    expect(js).toContain("'/pool/toggle'")
+    expect(js).toContain('function traeToggleAccount')
+    expect(js).toContain("'/account/toggle'")
+    // 人工停用的显示态与自动判死分开，否则用户分不清「我停的」和「被判死的」
+    expect(js).toContain('已停用')
+  })
+
   it('池摘要里显示「已停用」计数与 park 提示', async () => {
     const js = inlineScripts(await render([deepseekProvider()])).join('\n')
     expect(js).toContain('已停用')

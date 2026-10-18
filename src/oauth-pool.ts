@@ -1042,7 +1042,16 @@ export async function noteOauthSuccess(env: Env, providerId: string, uid: string
 }
 
 /**
- * 签到后解冻：仅当 remain > 0 且账号处于冷却（非禁用）时恢复。
+ * 签到/额度探测成功后的解冻（对齐 qoder writeQoderQuota 的 unfreeze 语义）。
+ *
+ * 为什么必须**连自动禁用一起清**（2026-10-18 修）：401/403 判死是不可靠推断——WAF 拦截、
+ * 网关瞬时抖动、token 域错配都会给出 401/403，而原实现只有「非禁用」才解冻，于是误判一旦
+ * 落进 state.disabled 就再无清除路径：签到明明成功、积分还在涨、同一 token 转发也能用，
+ * 账号却永远不参与挑号（面板「已禁用」+ 积分正常，用户看到的正是这个自相矛盾的状态）。
+ * 判据从「当前 not disabled」改为「上游真的回过额度」——探测成功 = 凭据有效的最强证据。
+ *
+ * 与**人工禁用**互不干扰：人工禁用写顶层 enabled=false（面板 isOff 同样认它），本函数不碰
+ * enabled —— 被用户手动停掉的账号不会被一次签到偷偷放回来。
  *
  * packages（可选）：本次额度探测拿到的权益包明细（含到期时间）。
  * 传数组即视为**权威快照**并落盘（空数组 = 探测成功但无包，会清掉旧明细）；
@@ -1064,8 +1073,9 @@ export async function reenableOauthIfCredits(
   if (Array.isArray(packages)) {
     acc.state = { ...acc.state, packages, packagesAt: Date.now() }
   }
-  if (remain > 0 && !st.disabled) {
-    acc.state = { ...acc.state, until: 0, reason: '', errCount: 0 }
+  if (remain > 0) {
+    // 连自动禁用一起清：探测成功即证明凭据有效（见上方注释），误判的 session dead 不该继续挡号。
+    acc.state = { ...acc.state, disabled: false, until: 0, reason: '', errCount: 0, sessionDeadFails: 0 }
   }
   await writeOauthPool(env, providerId, pool)
 }
@@ -1085,6 +1095,36 @@ export async function removeOauthAccount(env: Env, providerId: string, uid: stri
   const next = pool.filter((a) => a.uid !== uid)
   if (next.length === pool.length) return false
   await writeOauthPool(env, providerId, next)
+  return true
+}
+
+/**
+ * 人工启用/禁用池账号（面板「禁用/启用」按钮，WorkBuddy 与 Qoder 共用端点）。
+ *
+ * 为什么用顶层 `enabled`，而不是复用 `state.disabled`：
+ *  - `enabled=false` 是**人工决定**：任何自动路径（签到解冻、noteOauthSuccess、登录 upsert、token
+ *    刷新）都不写它，所以「我自己停掉的号」不会因为上游偶然一次成功被偷偷放回来；
+ *  - `state.disabled` 是**自动判死**（401/403 误判、12153 三次），可被签到成功解冻。
+ * 两者正交，挑号与全冷却兜底都按 `enabled === false` 排除（isOauthAccountHealthy /
+ * pickEarliestCoolingFallback），因此禁用后立刻不再被选中，无需另加过滤条件。
+ *
+ * 「启用」时顺带清自动禁用与冷却（对齐 deepseek unpark / trae「解除停用」语义）：用户点启用
+ * 就是在断言该号现在可用，只翻 enabled 而留着 disabled/reason 会让按钮看起来没生效
+ * （面板 isOff = disabled || enabled===false，仍显示「已禁用」）。
+ *
+ * @returns 账号是否存在（不存在 → false，端点据此回 404）
+ */
+export async function setOauthAccountEnabled(env: Env, providerId: string, uid: string, enabled: boolean): Promise<boolean> {
+  const pool = await readOauthPool(env, providerId)
+  const acc = pool.find((a) => a.uid === uid)
+  if (!acc) return false
+  acc.enabled = enabled
+  if (enabled) {
+    const st = acc.state || { credits: 0, disabled: false, until: 0, errCount: 0 }
+    acc.state = { ...st, disabled: false, until: 0, reason: '', errCount: 0, sessionDeadFails: 0 }
+  }
+  acc.updatedAt = Date.now()
+  await writeOauthPool(env, providerId, pool)
   return true
 }
 
