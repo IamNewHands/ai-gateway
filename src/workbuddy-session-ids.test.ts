@@ -496,15 +496,18 @@ describe('injectConversationHeaders（9 个头）', () => {
     expect(headers['X-Request-ID']).toBe(headers['X-Conversation-Message-ID'])
     expect(headers['X-Root-Request-ID']).toBe('a'.repeat(32))
     expect(headers['X-Trace-ID']).toBe('trace-1')
-    expect(headers['X-B3-TraceId']).toBe('a'.repeat(32))
-    expect(headers['X-B3-SpanId']).toBe(headers['X-Conversation-Message-ID'].slice(0, 16))
+    // trace-1 不是合法 B3 hex → X-B3-TraceId 回落 messageId
+    expect(headers['X-B3-TraceId']).toBe(headers['X-Conversation-Message-ID'])
+    expect(headers['X-B3-SpanId']).toMatch(/^[0-9a-f]{16}$/)
     expect(headers['X-B3-Sampled']).toBe('1')
+    expect(headers['traceparent']).toBe(`00-trace-1-${headers['X-B3-SpanId']}-01`)
+    expect(headers['b3']).toBe(`trace-1-${headers['X-B3-SpanId']}-1`)
   })
 
-  it('conversationId 为空 → 不发 X-Conversation-ID（透传优先，不伪造）', () => {
+  it('conversationId 为空 → 现生成 dashed UUID（渠道校验要求该头必存在）', () => {
     const headers: Record<string, string> = {}
     injectConversationHeaders(headers, { conversationId: '', conversationRequestId: 'b'.repeat(32) })
-    expect(headers['X-Conversation-ID']).toBeUndefined()
+    expect(headers['X-Conversation-ID']).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/)
   })
 
   it('conversationRequestId 为空 → 本级补 32 hex（聚合主键必发）', () => {
@@ -513,16 +516,22 @@ describe('injectConversationHeaders（9 个头）', () => {
     expect(headers['X-Conversation-Request-ID']).toMatch(/^[0-9a-f]{32}$/)
   })
 
-  it('traceId 为空 → X-Trace-ID 回落 conversationRequestId', () => {
+  it('traceId 为空 → X-Trace-ID 独立随机（不绑定聚合主键）', () => {
     const headers: Record<string, string> = {}
     injectConversationHeaders(headers, { conversationId: '', conversationRequestId: 'c'.repeat(32) })
-    expect(headers['X-Trace-ID']).toBe('c'.repeat(32))
+    expect(headers['X-Trace-ID']).toMatch(/^[0-9a-f]{32}$/)
+    expect(headers['X-Trace-ID']).not.toBe('c'.repeat(32))
+    expect(headers['X-B3-TraceId']).toBe(headers['X-Trace-ID'])
   })
 
-  it('非法 B3 TraceId（如带横线 UUID）→ X-B3-TraceId 回落 messageId', () => {
+  it('traceId 为非法 B3 形态 → X-B3-TraceId 回落 messageId', () => {
     const headers: Record<string, string> = {}
     const badConvReq = '550e8400-e29b-41d4-a716-446655440000'
-    injectConversationHeaders(headers, { conversationId: '', conversationRequestId: badConvReq })
+    injectConversationHeaders(headers, {
+      conversationId: '',
+      conversationRequestId: badConvReq,
+      traceId: badConvReq,
+    })
     // 聚合主键仍用原值（不是 B3 头，不受 B3 规范约束）
     expect(headers['X-Conversation-Request-ID']).toBe(badConvReq)
     // B3 TraceId 必须是合法 hex → 回落 messageId

@@ -10,15 +10,16 @@
  * 网关此前**一个都不发**，上游按 HTTP 请求逐条记账 → 同一对话几十上百条独立记录，
  * 既无法统计单轮真实成本，也无法与成本账本（recordOauthModelCost）对齐。
  *
- * 头族分四层（对齐 headers.go:236-275 的注释）：
- *  - `X-Conversation-ID`：会话级，多轮稳定（body 的 conversationId）。**空则不发**——
- *    透传客户端原值优先，客户端没给就不伪造，避免误导后台建错会话；
+ * 头族分四层（对齐 headers.go:236-275 的注释，形态按 hub 5.8.4 桌面端抓包校正）：
+ *  - `X-Conversation-ID`：会话级，带连字符 UUID。**必发**——body 有 conversationId
+ *    则透传，没有则现生成一个（官方桌面端每请求都带；缺该头会被渠道校验判 11-128
+ *    `conversation id missing`）；
  *  - `X-Conversation-Request-ID`：**对话轮级聚合主键，必发**。一次 user send 内的所有
  *    tool call / 重试 / 换号 / 降级复用同一个 → 后台按它聚合成一条；
  *  - `X-Conversation-Message-ID` = `X-Request-ID`：消息级，每条独立（32 位 hex）；
- *  - `X-Root-Request-ID` = conversationRequestID；`X-Trace-ID`：入站透传或回落聚合主键；
- *  - `X-B3-TraceId` / `X-B3-SpanId` / `X-B3-Sampled`：链路族。B3 规范只认 16/32 hex，
- *    入站 conversationRequestID 非法时 TraceId 回落 messageID（恒 32 hex）。
+ *  - `X-Root-Request-ID` = conversationRequestID；`X-Trace-ID` / `traceparent` / `b3` /
+ *    `X-B3-*`：**独立随机**链路族（入站 X-Trace-ID 优先透传）。B3 规范只认 16/32 hex，
+ *    非法入站值回落恒 32 hex 的 messageID。
  */
 
 /** 生成 32 位小写 hex 的消息级 ID（对齐 workbuddy2api NewMessageID：UUID v4 去横线形态）。 */
@@ -28,6 +29,27 @@ export function newMessageId(): string {
   let out = ''
   for (const b of bytes) out += b.toString(16).padStart(2, '0')
   return out
+}
+
+/**
+ * 生成**带连字符**的 UUID（v4 形态，36 字符）——桌面端 `X-Conversation-ID` 的实测形态
+ * （hub wb_identity.new_conversation_id / tests/_test_product_persistence.py：36 字符、4 个连字符）。
+ *
+ * 为什么必须发这个头：上游渠道校验在请求**完全没有会话 id** 时回 400 / code 11-128
+ * （`conversation id missing`，displayTips「这次调用没通过渠道校验」）。此前网关只在
+ * 客户端 body 自带 conversationId 时才透传该头，OpenAI 兼容客户端与后台「测试联通性」
+ * 的 body 都没有这个字段 → 该头恒缺失 → 稳定撞 11-128。官方桌面端每个请求都带一个
+ * 新生成的 UUID，故这里缺失时按同形态补一个。
+ */
+export function newConversationId(): string {
+  const bytes = new Uint8Array(16)
+  crypto.getRandomValues(bytes)
+  // RFC 4122：版本位 4、变体位 10xx（与 randomUUID 输出同形态）
+  bytes[6] = (bytes[6] & 0x0f) | 0x40
+  bytes[8] = (bytes[8] & 0x3f) | 0x80
+  let hex = ''
+  for (const b of bytes) hex += b.toString(16).padStart(2, '0')
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`
 }
 
 /** B3 规范合法性：TraceId 必须是 16 或 32 位 hex（对齐 workbuddy2api validTraceID）。 */
@@ -369,11 +391,14 @@ function hasUserID(body: Record<string, unknown> | null | undefined): boolean {
 
 /** 会话头族元数据（对齐 workbuddy2api upstream.ChatMeta）。 */
 export interface ChatMeta {
-  /** X-Conversation-ID：body 提取的入站值，空则不发（透传优先，不伪造） */
+  /**
+   * X-Conversation-ID：入站 body 的值优先；缺失时由 buildChatMeta 补一个
+   * 带连字符的 UUID（官方桌面端每请求都带，缺失会被渠道校验判 11-128）。
+   */
   conversationId: string
   /** X-Conversation-Request-ID / X-Root-Request-ID：聚合主键，必发 */
   conversationRequestId: string
-  /** X-Trace-ID：入站透传值，空则回落 conversationRequestId */
+  /** X-Trace-ID：入站透传值，空则用独立随机 trace id */
   traceId?: string
 }
 
@@ -407,7 +432,7 @@ export async function buildChatMeta(opts: {
   /** 入站 X-Trace-ID 头值 */
   inboundTraceId?: string
 }): Promise<ChatMeta> {
-  const conversationId = resolveConversationId(opts.body)
+  const conversationId = resolveConversationId(opts.body) || newConversationId()
   // turnKey 不再限「无会话键」才计算——带会话键客户端同样需要轮级粒度（#170）。
   const turn = turnKey(opts.body)
   const sessKey = opts.sessionKey ?? ''
@@ -435,40 +460,52 @@ export async function buildChatMeta(opts: {
 }
 
 /**
- * 注入会话头族（对齐 workbuddy2api headers.go:248-275 injectConversationHeaders）。
+ * 注入会话头族（对齐 workbuddy2api headers.go:248-275 injectConversationHeaders，
+ * 并按 hub wb_identity 5.8.4 桌面端抓包校正形态）。
  *
  * 头名与取值：
  *  | 头 | 值 | 说明 |
  *  |---|---|---|
- *  | X-Conversation-ID | meta.conversationId | 仅非空才发 |
+ *  | X-Conversation-ID | meta.conversationId（缺失则现生成 dashed UUID） | **必发** |
  *  | X-Conversation-Request-ID | conversationRequestId | 必发（空则本级补 32 hex） |
  *  | X-Conversation-Message-ID | messageId | 每次调用新生成 |
  *  | X-Request-ID | messageId | 同上 |
  *  | X-Root-Request-ID | conversationRequestId | 根请求追踪 |
- *  | X-Trace-ID | meta.traceId ?? conversationRequestId | 入站透传优先 |
- *  | X-B3-TraceId | conversationRequestId（非法则回落 messageId） | 16/32 hex |
- *  | X-B3-SpanId | messageId 前 16 位 | 恒 16 hex |
+ *  | X-Trace-ID | meta.traceId ?? 独立随机 trace | 入站透传优先 |
+ *  | traceparent | `00-<trace>-<span>-01` | W3C 链路族 |
+ *  | b3 | `<trace>-<span>-1` | B3 单头形态 |
+ *  | X-B3-TraceId | trace | 16/32 hex |
+ *  | X-B3-SpanId | span | 恒 16 hex，每次调用新生成 |
  *  | X-B3-Sampled | "1" | 常量 |
  *
- * 注意：messageID / X-Request-ID / X-B3-SpanId **每次出站都新生成**
+ * **关键契约（11-128 根因）**：`X-Conversation-ID` 必须**恒存在**。上游渠道校验在
+ * 请求完全没有会话 id 时回 400 / code 11-128（`conversation id missing`）。官方桌面端
+ * 每个请求都带一个带连字符的 UUID，故 meta 里缺失时就地补一个，绝不省略。
+ *
+ * 注意：messageID / X-Request-ID / X-B3-SpanId / trace **每次出站都新生成**
  * （与调用次数绑定），而 conversationRequestId 在整个轮转 + 重试周期内恒定。
+ * 桌面端 `X-Trace-ID` 与 `X-B3-TraceId` 是**独立随机**链路 id（不是聚合主键）——
+ * 抓包如此；把 trace 绑到 conversationRequestId 会形成一处网关特征。
  */
 export function injectConversationHeaders(headers: Record<string, string>, meta: ChatMeta): void {
   const convReqId = meta.conversationRequestId || newMessageId()
   const messageId = newMessageId()
 
-  if (meta.conversationId) headers['X-Conversation-ID'] = meta.conversationId
+  headers['X-Conversation-ID'] = meta.conversationId || newConversationId()
   headers['X-Conversation-Request-ID'] = convReqId
   headers['X-Conversation-Message-ID'] = messageId
   headers['X-Request-ID'] = messageId
   headers['X-Root-Request-ID'] = convReqId
 
-  const traceId = meta.traceId || convReqId
+  const traceId = meta.traceId || newMessageId()
+  const spanId = newMessageId().slice(0, 16)
   headers['X-Trace-ID'] = traceId
+  headers['traceparent'] = `00-${traceId}-${spanId}-01`
+  headers['b3'] = `${traceId}-${spanId}-1`
 
   // B3 规范只认 16/32 hex TraceId：非法入站值回落恒 32 hex 的 messageId
-  const b3Trace = isValidB3TraceId(convReqId) ? convReqId : messageId
+  const b3Trace = isValidB3TraceId(traceId) ? traceId : messageId
   headers['X-B3-TraceId'] = b3Trace
-  headers['X-B3-SpanId'] = messageId.slice(0, 16)
+  headers['X-B3-SpanId'] = spanId
   headers['X-B3-Sampled'] = '1'
 }

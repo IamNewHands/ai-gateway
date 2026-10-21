@@ -19,6 +19,7 @@ import {
   CST_OFFSET_MS,
   isAccountBanned,
   WORKBUDDY_CLIENT_VERSION,
+  WORKBUDDY_CLIENT_VERSION_CN,
   WORKBUDDY_CLI_VERSION,
   buildWorkbuddyUserAgent,
   workbuddyAcceptLanguage,
@@ -783,8 +784,8 @@ describe('WorkBuddy 归属头与身份头注入 injectWorkbuddyChatHeaders', () 
     expect(headers['X-Agent-Purpose']).toBe('conversation')
     expect(headers['X-IDE-Name']).toBe('WorkBuddy')
     expect(headers['X-IDE-Type']).toBe('WorkBuddy')
-    expect(headers['X-IDE-Version']).toBe(WORKBUDDY_CLIENT_VERSION)
-    expect(headers['X-Product']).toBe('WorkBuddy')
+    expect(headers['X-IDE-Version']).toBe(WORKBUDDY_CLIENT_VERSION_CN)
+    expect(headers['X-Product']).toBe('SaaS')
     expect(headers['X-User-Id']).toBe('u123')
     expect(headers['X-Enterprise-Id']).toBe('e123')
     expect(headers['X-Domain']).toBe('example.com')
@@ -818,24 +819,24 @@ describe('WorkBuddy 归属头与身份头注入 injectWorkbuddyChatHeaders', () 
     const cn: Record<string, string> = {}
     injectWorkbuddyChatHeaders(cn, dummyToken, 'cn')
     expect(cn['User-Agent']).toBe(
-      `WorkBuddy/${WORKBUDDY_CLIENT_VERSION} WorkBuddy/${WORKBUDDY_CLIENT_VERSION} CLI/${WORKBUDDY_CLI_VERSION}`
+      `WorkBuddy/${WORKBUDDY_CLIENT_VERSION_CN} WorkBuddy/${WORKBUDDY_CLIENT_VERSION_CN} CLI/${WORKBUDDY_CLI_VERSION}`
     )
 
     const gl: Record<string, string> = {}
     injectWorkbuddyChatHeaders(gl, dummyToken, 'global')
     expect(gl['User-Agent']).toBe(
-      `WorkBuddy/${WORKBUDDY_CLIENT_VERSION} WorkBuddy AI/${WORKBUDDY_CLIENT_VERSION} CLI/${WORKBUDDY_CLI_VERSION}`
+      `WorkBuddy/${WORKBUDDY_CLIENT_VERSION} workbuddy-ai/${WORKBUDDY_CLIENT_VERSION} CLI/${WORKBUDDY_CLI_VERSION}`
     )
-    // 关键：global 平台段必须是 WorkBuddy AI，不是 WorkBuddy
-    expect(gl['User-Agent']).toContain('WorkBuddy AI/')
+    // 关键：global 平台段必须是 workbuddy-ai（小写连字符），送错会触发 403/11140
+    expect(gl['User-Agent']).toContain('workbuddy-ai/')
   })
 
-  it('Accept 分流（D6）：chat 路径声明 event-stream，非 chat 路径保持 application/json', () => {
+  it('Accept 分流（D6）：chat 路径用桌面端 Accept，非 chat 路径保持 application/json', () => {
     const chat: Record<string, string> = { Accept: 'application/json' }
     injectWorkbuddyChatHeaders(chat, dummyToken, 'cn', undefined, undefined, { chatPath: true })
-    expect(chat['Accept']).toBe('application/json, text/event-stream')
+    expect(chat['Accept']).toBe('application/json, text/plain, */*')
 
-    // 非 chat 路径（如 models）不得被改成 event-stream
+    // 非 chat 路径（如 models）不得被改写
     const models: Record<string, string> = { Accept: 'application/json' }
     injectWorkbuddyChatHeaders(models, dummyToken, 'cn', undefined, undefined, { chatPath: false })
     expect(models['Accept']).toBe('application/json')
@@ -844,7 +845,7 @@ describe('WorkBuddy 归属头与身份头注入 injectWorkbuddyChatHeaders', () 
   it('Accept 缺省按 chat 路径处理（绝大多数调用是 chat）', () => {
     const headers: Record<string, string> = {}
     injectWorkbuddyChatHeaders(headers, dummyToken, 'cn')
-    expect(headers['Accept']).toBe('application/json, text/event-stream')
+    expect(headers['Accept']).toBe('application/json, text/plain, */*')
   })
 
   it('缺失信息时正确降级为 X-No-* 头并清除敏感 refresh token', () => {
@@ -858,11 +859,11 @@ describe('WorkBuddy 归属头与身份头注入 injectWorkbuddyChatHeaders', () 
     expect(headers['X-Refresh-Token']).toBeUndefined()
   })
 
-  it('Global 域默认回落 X-Domain: workbuddy.ai', () => {
+  it('Global 域默认回落 X-Domain: www.workbuddy.ai', () => {
     const headers: Record<string, string> = {}
     injectWorkbuddyChatHeaders(headers, 'invalid-token', 'global')
 
-    expect(headers['X-Domain']).toBe('workbuddy.ai')
+    expect(headers['X-Domain']).toBe('www.workbuddy.ai')
     expect(headers['X-No-Department-Info']).toBeUndefined()
   })
 
@@ -876,18 +877,25 @@ describe('WorkBuddy 归属头与身份头注入 injectWorkbuddyChatHeaders', () 
     expect(headers['X-Tenant-Id']).toBeUndefined()
   })
 
-  it('Global 域 X-Domain 固定 workbuddy.ai（不回退登录会话原值）', () => {
+  it('Global 域 X-Domain 固定 www.workbuddy.ai（不回退登录会话原值）', () => {
     const headers: Record<string, string> = {}
-    // dummyToken 的 domain claim 是 example.com，global 下应被覆盖为 workbuddy.ai
+    // dummyToken 的 domain claim 是 example.com，global 下应被覆盖为 www.workbuddy.ai
     injectWorkbuddyChatHeaders(headers, dummyToken, 'global')
-    expect(headers['X-Domain']).toBe('workbuddy.ai')
+    expect(headers['X-Domain']).toBe('www.workbuddy.ai')
   })
 
-  it('注入账号稳定的 X-Machine-ID / X-Session-ID（对齐 workbuddy2api 3b87c14e）', () => {
+  it('chat 路径不发 X-Machine-ID / X-Session-ID（hub 桌面端契约）', () => {
+    const headers: Record<string, string> = {}
+    injectWorkbuddyChatHeaders(headers, dummyToken, 'cn', undefined, undefined, { chatPath: true })
+    expect(headers['X-Machine-ID']).toBeUndefined()
+    expect(headers['X-Session-ID']).toBeUndefined()
+  })
+
+  it('非 chat 路径注入账号稳定的 X-Machine-ID / X-Session-ID', () => {
     const a: Record<string, string> = {}
-    injectWorkbuddyChatHeaders(a, dummyToken, 'cn')
+    injectWorkbuddyChatHeaders(a, dummyToken, 'cn', undefined, undefined, { chatPath: false })
     const b: Record<string, string> = {}
-    injectWorkbuddyChatHeaders(b, dummyToken, 'cn')
+    injectWorkbuddyChatHeaders(b, dummyToken, 'cn', undefined, undefined, { chatPath: false })
     // 同 uid 跨请求恒同值
     expect(a['X-Machine-ID']).toEqual(b['X-Machine-ID'])
     expect(a['X-Machine-ID']).toMatch(/^[0-9a-f]{36}$/)
@@ -898,14 +906,14 @@ describe('WorkBuddy 归属头与身份头注入 injectWorkbuddyChatHeaders', () 
 
   it('不同 uid 派生不同稳定 ID；uid 缺失不注入', () => {
     const h1: Record<string, string> = {}
-    injectWorkbuddyChatHeaders(h1, uidToken('u123'), 'cn')
+    injectWorkbuddyChatHeaders(h1, uidToken('u123'), 'cn', undefined, undefined, { chatPath: false })
     const h2: Record<string, string> = {}
-    injectWorkbuddyChatHeaders(h2, uidToken('u999'), 'cn')
+    injectWorkbuddyChatHeaders(h2, uidToken('u999'), 'cn', undefined, undefined, { chatPath: false })
     expect(h1['X-Machine-ID']).not.toBe(h2['X-Machine-ID'])
     expect(h1['X-Session-ID']).not.toBe(h2['X-Session-ID'])
     // uid 缺失（invalid token）→ 不注入、不 panic
     const noUid: Record<string, string> = {}
-    injectWorkbuddyChatHeaders(noUid, 'invalid-token', 'cn')
+    injectWorkbuddyChatHeaders(noUid, 'invalid-token', 'cn', undefined, undefined, { chatPath: false })
     expect(noUid['X-Machine-ID']).toBeUndefined()
     expect(noUid['X-Session-ID']).toBeUndefined()
   })
@@ -1262,8 +1270,8 @@ describe('内容拦截防火墙文案（移植 workbuddy2api contentBlockedClien
 
 describe('buildWorkbuddyUserAgent / workbuddyAcceptLanguage / workbuddyChatAccept 纯函数', () => {
   it('buildWorkbuddyUserAgent 三段式形态与 realm 平台段', () => {
-    expect(buildWorkbuddyUserAgent('cn')).toBe('WorkBuddy/5.5.6 WorkBuddy/5.5.6 CLI/2.137.1')
-    expect(buildWorkbuddyUserAgent('global')).toBe('WorkBuddy/5.5.6 WorkBuddy AI/5.5.6 CLI/2.137.1')
+    expect(buildWorkbuddyUserAgent('cn')).toBe('WorkBuddy/5.8.3 WorkBuddy/5.8.3 CLI/2.161.0')
+    expect(buildWorkbuddyUserAgent('global')).toBe('WorkBuddy/5.8.4 workbuddy-ai/5.8.4 CLI/2.161.0')
   })
 
   it('workbuddyAcceptLanguage 按 realm 切', () => {
@@ -1271,8 +1279,8 @@ describe('buildWorkbuddyUserAgent / workbuddyAcceptLanguage / workbuddyChatAccep
     expect(workbuddyAcceptLanguage('global')).toBe('en-US')
   })
 
-  it('workbuddyChatAccept 恒为 event-stream 形式（上游被强制流式）', () => {
-    expect(workbuddyChatAccept()).toBe('application/json, text/event-stream')
+  it('workbuddyChatAccept 恒为桌面端 Accept 形式', () => {
+    expect(workbuddyChatAccept()).toBe('application/json, text/plain, */*')
   })
 })
 

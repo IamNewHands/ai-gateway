@@ -1646,33 +1646,51 @@ export function parseWorkbuddyGlobalModels(
 
 /**
  * WorkBuddy 客户端版本段（出站 UA 的 `WorkBuddy/<ver>` 与 X-IDE-Version）。
- * 取 ai-gateway 自身**实测点亮成功**的脚本常量（scripts/workbuddy/school_open_day_2026.py:134
- * 与 task_runner.py:233 的 `DESKTOP_UA`），而非 workbuddy2api 的 5.5.4——
- * 前者是本仓已验证可用的形态。
+ *
+ * 取值对齐 hub wb_identity.py 的 5.8.4 桌面端抓包（国际版）与 2026-10-18 两区
+ * 桌面端实跑（国内版 5.8.3）：
+ *  - 国际版 `5.8.4`（`DESKTOP_VERSION_INTL`）
+ *  - 国内版 `5.8.3`（`DESKTOP_VERSION_CN`）
+ *
+ * 旧值 5.5.6 已明显落后：上游风控会按客户端版本形态判「非官方客户端」，
+ * 送旧版本号是 403 / code 11140 的已知诱因之一。
  */
-export const WORKBUDDY_CLIENT_VERSION = '5.5.6'
+export const WORKBUDDY_CLIENT_VERSION = '5.8.4'
 
-/** 出站 UA 中 `CLI/<ver>` 段的版本（对齐官方内置 CLI 与实测脚本）。 */
-export const WORKBUDDY_CLI_VERSION = '2.137.1'
+/** 国内版桌面端版本（X-IDE-Version / UA 首段与平台段）。 */
+export const WORKBUDDY_CLIENT_VERSION_CN = '5.8.3'
+
+/** 出站 UA 中 `CLI/<ver>` 段的版本（客户端内置 CLI，两区同为 2.161.0）。 */
+export const WORKBUDDY_CLI_VERSION = '2.161.0'
+
+/** 按 realm 返回桌面端客户端版本（global 5.8.4 / cn 5.8.3）。 */
+export function workbuddyClientVersion(realm: 'cn' | 'global'): string {
+  return realm === 'global' ? WORKBUDDY_CLIENT_VERSION : WORKBUDDY_CLIENT_VERSION_CN
+}
 
 /**
  * 组装官方桌面端形态的出站 UA（三段式）：
  *   `WorkBuddy/<clientVersion> <platform>/<clientVersion> CLI/<cliVersion>`
  *
- * 平台段（第二段）品牌**按 realm 切换**（对齐 workbuddy2api headers.go:65-71）：
+ * 平台段（第二段）品牌**按 realm 切**（对齐 hub wb_identity.py 5.8.4 抓包）：
  *  - CN → `WorkBuddy`（与第一段同值）
- *  - global → `WorkBuddy AI`（官方国际版 productName）
+ *  - global → `workbuddy-ai`（**小写连字符**，来自国际版 product.json 的
+ *    applicationName；不是 `WorkBuddy AI`）
  *
- * 为什么必须按 realm 切：workbuddy2api 注释明确记载「global 账号送错平台段
- * （`WorkBuddy` 非 `WorkBuddy AI`）可能触发上游 403 code 11140 "request illegal" 风控」
- * （headers.go:62-63）。而 403/11140 已被本仓分类为 account_fault → 硬禁用，
- * 即送错 UA 的代价是**账号被永久禁用**，故这不是可选优化。
+ * 为什么必须按 realm 切且大小写精确：hub 注释明确记载「国际版 Electron 主进程
+ * 自己发的旁路请求 UA 是 workbuddy-ai/... workbuddy-ai/...，而对话请求由内置 CLI
+ * 子进程发出，platform 段取 CLIENT_INFO_IDE_TYPE=WorkBuddy、application 段取
+ * product.json 的 applicationName=workbuddy-ai，所以首段大写、次段小写」；
+ * 送错平台段（`WorkBuddy AI` 含空格大写）会触发上游 403 code 11140
+ * "request illegal" 风控。而 403/11140 已被本仓分类为 account_fault → 硬禁用，
+ * 即送错 UA 的代价是**账号被禁用**，故这不是可选优化。
  *
  * 官方客户端无任何 UA 随机化，故这里保持确定性（同账号同版本恒同值）。
  */
 export function buildWorkbuddyUserAgent(realm: 'cn' | 'global'): string {
-  const platform = realm === 'global' ? 'WorkBuddy AI' : 'WorkBuddy'
-  return `WorkBuddy/${WORKBUDDY_CLIENT_VERSION} ${platform}/${WORKBUDDY_CLIENT_VERSION} CLI/${WORKBUDDY_CLI_VERSION}`
+  const version = workbuddyClientVersion(realm)
+  const platform = realm === 'global' ? 'workbuddy-ai' : 'WorkBuddy'
+  return `WorkBuddy/${version} ${platform}/${version} CLI/${WORKBUDDY_CLI_VERSION}`
 }
 
 /**
@@ -1686,22 +1704,19 @@ export function workbuddyAcceptLanguage(realm: 'cn' | 'global'): string {
 }
 
 /**
- * WorkBuddy **chat 路径**的 Accept 头（对齐 workbuddy2api headers.go:191-192 的 D6 分流）。
+ * WorkBuddy **chat 路径**的 Accept 头（对齐 hub wb_accounts.py headers() 桌面端实测）。
  *
- * 源实现的 Accept 分流按**路径**而非按客户端意图：
- *  - CommonHeaders（refresh / models / billing 等非 chat 路径）→ `application/json`
- *  - ChatHeaders（所有 chat/completions 调用）→ `application/json, text/event-stream`
+ * 桌面端 5.8.4 抓包的 chat Accept 是浏览器形态的
+ * `application/json, text/plain, 通配`（**不是** `text/event-stream`）：
+ * 客户端始终以 `stream:true` 发请求、由自己的 SSE 解析器消费响应，但 Accept 声明
+ * 仍是通配浏览器形态。此前网关发 `application/json, text/event-stream` 与官方
+ * 桌面端不符，是一处可被上游识别的「非官方客户端」特征。
  *
- * 为什么 chat 恒发 event-stream 形式：WorkBuddy 上游被强制 `stream:true`
- * （网关侧再按客户端意图聚合或透传），因此**上游必然以 SSE 应答**，
- * Accept 必须声明能接受 event-stream，否则与实际上游行为不符。
- * 注意这与「客户端是否要流式」无关——那是网关侧聚合决策，不影响出站 Accept。
- *
- * 本仓现状缺陷：`buildOauthHeaders` 对 chat 路径也发 `application/json`（非 chat 形态），
- * 与"上游必回 SSE"的事实不符，故在 chat 专用的头注入函数里覆盖。
+ * 非 chat 路径（models / billing 等）不覆盖，保持 buildOauthHeaders 的
+ * `application/json`。
  */
 export function workbuddyChatAccept(): string {
-  return 'application/json, text/event-stream'
+  return 'application/json, text/plain, */*'
 }
 
 /**
@@ -1760,22 +1775,31 @@ export function parseJwtClaims(token: string): { uid: string; enterpriseId: stri
 }
 
 /**
- * 注入 WorkBuddy/CodeBuddy 官方出站协议头（对齐 workbuddy2api internal/upstream/headers.go）：
- * 1. 归属头（白名单头组）：X-Agent-Purpose="conversation", X-IDE-Name="WorkBuddy", X-IDE-Type="WorkBuddy",
- *    X-IDE-Version=<clientVersion>, X-Product="WorkBuddy"
- * 2. 身份标识头：X-User-Id（空则 X-No-User-Id: 1）, X-Enterprise-Id（空则 X-No-Enterprise-Id: 1）
- * 3. 动态领域头：X-Domain（Global 默认为 workbuddy.ai，CN 有则填，无则 X-No-Department-Info: 1）
- * 4. 设备风控头：X-Device-Token（accountTokenState.device_token || cfg.deviceToken）
- * 5. 风控闸门头：X-CodeBuddy-Request: 1（官方客户端所有 API 必带，对齐 D1）
- * 6. 出站 UA 三段式（平台段按 realm 切，global 送错会触发 403/11140）
- * 7. Accept-Language 按 realm 切（cn zh-CN / global en-US，对齐 D5）
- * 8. Accept 分流：仅 chat 路径（opts.chatPath 非 false）覆盖为 event-stream 形式（对齐 D6）
- * 9. 会话头族（opts.chatMeta 提供时注入，对齐 workbuddy2api injectConversationHeaders）
- * 10. 安全红线：绝不在 chat 请求携带 X-Refresh-Token
+ * 注入 WorkBuddy/CodeBuddy 官方**桌面端**出站协议头（对齐 hub wb_identity.py
+ * build_identity_headers 的 PRODUCT_DESKTOP 分支，5.8.4 抓包实测）。
  *
- * opts.chatPath：本函数虽名 ChatHeaders，但在本仓也被带任意 subPath 的转发路径调用；
- * 仅当确为 chat/completions 时才覆盖 Accept（非 chat 路径保持 buildOauthHeaders 的
- * application/json），避免给 models 等路径发错误的 Accept。缺省 true（绝大多数调用是 chat）。
+ * 桌面端头集合（逐项对齐，缺一项都是可识别的「非官方客户端」特征）：
+ *  - 归属头：X-Agent-Intent="craft"、X-Agent-Purpose="conversation"、
+ *    X-Agent-Type="main"、X-IDE-Name="WorkBuddy"、X-IDE-Type="WorkBuddy"、
+ *    X-IDE-Version=<realm 版本>、X-Private-Data="true"、X-Product="SaaS"
+ *  - 领域头：X-Domain（global 固定 `www.workbuddy.ai`；CN 优先账号登录域）
+ *  - 身份头：X-User-Id（缺失则 X-No-User-Id: 1）、X-Enterprise-Id / X-No-Enterprise-Id
+ *  - 风控闸门：X-CodeBuddy-Request: 1（官方所有 API 必带）
+ *  - 出站 UA：三段式，平台段按 realm 切（global `workbuddy-ai` / cn `WorkBuddy`）
+ *  - Accept-Language：cn zh-CN / global en-US
+ *  - Accept：chat 路径覆盖为 `application/json, text/plain, 通配`
+ *  - 会话头族：X-Conversation-ID（**必发**）+ Request/Root/Message ID + trace 族
+ *
+ * 两条「不发」红线（对齐 hub 注释，均为跨账号关联键 / 网关特征）：
+ *  - **chat 路径不发 X-Machine-ID / X-Session-ID**：官方对话请求不带这两个头
+ *    （只用于反馈上报）。此前网关给每个账号发恒定派生值，反而是一处网关特征。
+ *    非 chat 路径（billing / models）仍按账号派生——那条链路官方确实带。
+ *  - **国际版不发 X-Device-Token**：国际版客户端没有该头（三轮抓包 + 5.7.6 /
+ *    5.8.4 二进制构造器均不含），发给国际版账号既是伪造头，也是把多个账号串到
+ *    同一台设备的关联键。仅国内版保留真实设备 token 语义。
+ *
+ * opts.chatPath：仅当确为 chat/completions 时才覆盖 Accept 并抑制机器/会话头；
+ * 非 chat 路径保持 buildOauthHeaders 的 `application/json` 与账号派生指纹。
  * opts.chatMeta：会话头族元数据（轮转循环外生成一次，循环内复用）。
  */
 export function injectWorkbuddyChatHeaders(
@@ -1786,22 +1810,27 @@ export function injectWorkbuddyChatHeaders(
   cfg?: { deviceToken?: string; extraHeaders?: Record<string, string> },
   opts?: { chatPath?: boolean; chatMeta?: ChatMeta }
 ): void {
+  const isChat = opts?.chatPath !== false
+
+  headers['X-Agent-Intent'] = 'craft'
   headers['X-Agent-Purpose'] = 'conversation'
+  headers['X-Agent-Type'] = 'main'
   headers['X-IDE-Name'] = 'WorkBuddy'
   headers['X-IDE-Type'] = 'WorkBuddy'
-  headers['X-IDE-Version'] = WORKBUDDY_CLIENT_VERSION
-  headers['X-Product'] = 'WorkBuddy'
+  headers['X-IDE-Version'] = workbuddyClientVersion(realm)
+  headers['X-Private-Data'] = 'true'
+  headers['X-Product'] = 'SaaS'
 
   // 风控闸门头（D1）：官方客户端所有 API 请求必带，缺失可能被上游误判为非官方客户端。
   headers['X-CodeBuddy-Request'] = '1'
-  // 出站 UA：三段式 + 平台段按 realm 切（global 送错平台段可触发 403 code 11140）
+  // 出站 UA：三段式 + 平台段按 realm 切（global 平台段必须是 workbuddy-ai）
   headers['User-Agent'] = buildWorkbuddyUserAgent(realm)
   // Accept-Language 按 realm 切（D5）
   headers['Accept-Language'] = workbuddyAcceptLanguage(realm)
-  // XMLHttpRequest 标识：官方桌面端所有 API 请求均带（对齐 workbuddy2api CommonHeaders）
+  // XMLHttpRequest 标识：官方桌面端所有 API 请求均带
   headers['X-Requested-With'] = 'XMLHttpRequest'
-  // Accept 分流（D6）：chat 路径声明可接受 event-stream（上游被强制流式，必回 SSE）
-  if (opts?.chatPath !== false) {
+  // Accept：chat 路径为官方桌面端形态；非 chat 路径保持调用方值
+  if (isChat) {
     headers['Accept'] = workbuddyChatAccept()
   }
 
@@ -1810,12 +1839,14 @@ export function injectWorkbuddyChatHeaders(
   if (uid) {
     headers['X-User-Id'] = uid
     delete headers['X-No-User-Id']
-    // 账号稳定的机器/会话 ID 头（对齐 workbuddy2api 3b87c14e / X-Machine-ID / X-Session-ID）：
-    // 同账号跨重启/跨请求恒同值，供上游把全部出站请求归一为同一"机器指纹"。
-    // 缺失或每次漂移（随机/空）会被全球域风控判定为可疑客户端形态，放大限流（见 429 排查）。
-    // 仅在 uid 存在时注入；uid 缺失无稳定指纹源头，不注入也不 panic。
-    headers['X-Machine-ID'] = deriveAccountStableID('machine', uid)
-    headers['X-Session-ID'] = deriveAccountStableID('session', uid)
+    if (isChat) {
+      // 官方对话请求不带这两个头（仅反馈上报用），发了就是网关特征
+      delete headers['X-Machine-ID']
+      delete headers['X-Session-ID']
+    } else {
+      headers['X-Machine-ID'] = deriveAccountStableID('machine', uid)
+      headers['X-Session-ID'] = deriveAccountStableID('session', uid)
+    }
   } else {
     headers['X-No-User-Id'] = '1'
     delete headers['X-Machine-ID']
@@ -1823,8 +1854,8 @@ export function injectWorkbuddyChatHeaders(
   }
 
   const entId = accountTokenState?.enterprise_id || claims.enterpriseId
-  // global 账号统一声明无企业（对齐 workbuddy2api injectGlobalChatHeaders）：
-  // 官方国际版客户端发 X-No-Enterprise-Id=1，且不回退到登录会话的 X-Enterprise-Id。
+  // global 账号统一声明无企业（对齐官方国际版客户端）：
+  // 固定 X-No-Enterprise-Id=1，且不回退到登录会话的 X-Enterprise-Id。
   if (realm === 'global') {
     headers['X-No-Enterprise-Id'] = '1'
     delete headers['X-Enterprise-Id']
@@ -1836,8 +1867,9 @@ export function injectWorkbuddyChatHeaders(
     headers['X-No-Enterprise-Id'] = '1'
   }
 
-  // X-Domain：global 固定 workbuddy.ai（不回退登录会话原值）；CN 有则透传，无则声明缺失。
-  const domain = realm === 'global' ? 'workbuddy.ai' : (accountTokenState?.domain || claims.domain)
+  // X-Domain：global 固定 www.workbuddy.ai（hub _ENDPOINTS 的 intl 值，带 www）；
+  // CN 优先账号登录域，无则声明缺失。
+  const domain = realm === 'global' ? 'www.workbuddy.ai' : (accountTokenState?.domain || claims.domain)
   if (domain) {
     headers['X-Domain'] = domain
     delete headers['X-No-Department-Info']
@@ -1845,14 +1877,19 @@ export function injectWorkbuddyChatHeaders(
     headers['X-No-Department-Info'] = '1'
   }
 
-  const devToken = accountTokenState?.device_token || cfg?.deviceToken
-  if (devToken) {
-    headers['X-Device-Token'] = devToken
+  // 设备 token：仅国内版发（国际版官方客户端无此头，且会成跨账号关联键）
+  if (realm === 'cn') {
+    const devToken = accountTokenState?.device_token || cfg?.deviceToken
+    if (devToken) {
+      headers['X-Device-Token'] = devToken
+    }
+  } else {
+    delete headers['X-Device-Token']
   }
 
-  // 会话头族（issue #35）：聚合主键 + 消息级 ID + B3 链路族。
+  // 会话头族（issue #35）：X-Conversation-ID（必发）+ 聚合主键 + 消息级 ID + trace 族。
   // 仅在 chat 路径注入（非 chat 请求无"对话轮"语义）。
-  if (opts?.chatMeta && opts.chatPath !== false) {
+  if (opts?.chatMeta && isChat) {
     injectConversationHeaders(headers, opts.chatMeta)
   }
 

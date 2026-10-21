@@ -180,9 +180,9 @@ describe('WorkBuddy 池化代理端到端（粘性 + 会话头族 + 协议头）
     expect(h['accept-language']).toBe('zh-CN')
     expect(h['x-requested-with']).toBe('XMLHttpRequest')
     expect(h['user-agent']).toMatch(/^WorkBuddy\/.+ WorkBuddy\/.+ CLI\/.+$/)
-    expect(h['accept']).toBe('application/json, text/event-stream')
+    expect(h['accept']).toBe('application/json, text/plain, */*')
     expect(h['x-ide-name']).toBe('WorkBuddy')
-    expect(h['x-product']).toBe('WorkBuddy')
+    expect(h['x-product']).toBe('SaaS')
   })
 
   it('出站携带会话头族（P0-6）：聚合主键 + 消息级 ID + B3', async () => {
@@ -202,9 +202,14 @@ describe('WorkBuddy 池化代理端到端（粘性 + 会话头族 + 协议头）
     expect(h['x-root-request-id']).toBe(h['x-conversation-request-id'])
     expect(h['x-conversation-message-id']).toMatch(/^[0-9a-f]{32}$/)
     expect(h['x-request-id']).toBe(h['x-conversation-message-id'])
-    expect(h['x-b3-traceid']).toBe(h['x-conversation-request-id'])
-    expect(h['x-b3-spanid']).toBe(h['x-conversation-message-id'].slice(0, 16))
+    // trace 族独立随机：不等于会话主键，但形态合法
+    expect(h['x-trace-id']).toMatch(/^[0-9a-f]{32}$/)
+    expect(h['x-trace-id']).not.toBe(h['x-conversation-request-id'])
+    expect(h['x-b3-traceid']).toBe(h['x-trace-id'])
+    expect(h['x-b3-spanid']).toMatch(/^[0-9a-f]{16}$/)
     expect(h['x-b3-sampled']).toBe('1')
+    expect(h['traceparent']).toBe(`00-${h['x-trace-id']}-${h['x-b3-spanid']}-01`)
+    expect(h['b3']).toBe(`${h['x-trace-id']}-${h['x-b3-spanid']}-1`)
   })
 
   it('同一会话多轮 → 聚合主键按对话轮换新（b9ac0d3 统一轮级，对齐官方 CLI）', async () => {
