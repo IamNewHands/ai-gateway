@@ -91,6 +91,18 @@ export interface Provider {
   promptMode?: 'passthrough' | 'custom' | 'append'
   /** custom/append 模式下注入的自有系统提示词文本（两模式均生效）。 */
   promptText?: string
+  /**
+   * 出站 User-Agent 覆写（通用 api-key 转发路径生效）。
+   *
+   * 用于按**客户端指纹**鉴权的上游：UA 不在其白名单时，上游会在校验密钥之前
+   * 直接拒绝（如 agentrouter 的 `unauthorized_client_error`），此时换 key 无效、
+   * 只能改 UA。客户端侧常无法改（DSH 的 `attributionHeaders()` 会强制写回自己的
+   * UA），因此由网关统一覆写。
+   *
+   * 值必须是单行可打印 ASCII；设置后覆盖透传来的客户端 UA（含 `user-agent`
+   * 前缀透传）。不配 = 保持既有行为（透传客户端 UA）。
+   */
+  upstreamUserAgent?: string
   /** OAuth 设备码认证配置（authType === 'oauth-device' 时生效） */
   oauth?: OAuthDeviceConfig
   apiKeys: ApiKeyEntry[]
@@ -618,6 +630,8 @@ export interface UpdateProviderRequest {
   promptMode?: 'passthrough' | 'custom' | 'append' | null
   /** custom/append 模式下注入的自有系统提示词（传 ''/null 清空） */
   promptText?: string | null
+  /** 出站 User-Agent 覆写（传 ''/null 清除；见 Provider.upstreamUserAgent） */
+  upstreamUserAgent?: string | null
 }
 
 /**

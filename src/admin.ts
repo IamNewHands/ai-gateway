@@ -27,6 +27,7 @@ import {
 import { testModelConnection } from './proxy'
 import { probeMcpServers } from './mcp-gateway'
 import { MAX_ADMIN_REQUEST_BYTES, readOptionalJSONLimited, readStrictJSONLimited } from './request-body'
+import { normalizeUpstreamUserAgent } from './upstream-user-agent'
 import { isTraeProvider, testTraeCredential, testTraeModel } from './trae/proxy'
 import { diagnoseOpenCodeKey, fetchOpenCodeModels, isOpenCodeProvider, resolveOpenCodeUrls, testOpenCodeModel } from './opencode'
 import { isQoderFlow, fetchQoderModels, testQoderModel } from './qoder/proxy'
@@ -46,7 +47,6 @@ import { seedQoderPoolFromSingle, listQoderPoolStatus, removeQoderAccount, readQ
 import { isM365Provider, M365_MODELS, testM365Model } from './m365/proxy'
 import { isZcodeProvider, testZcodeModel, buildZcodeHeaders, ZCODE_MODELS, fetchZcodeModels } from './zcode/proxy'
 import { injectWorkbuddyChatHeaders, ensureGlobalFallbackSystem } from './workbuddy-upstream'
-import { buildChatMeta } from './workbuddy-session-ids'
 import { probeWorkbuddyModelCatalogForProvider, __resetWorkbuddyCatalogCacheForTests } from './workbuddy-models'
 import { isKukuProvider, isKukuRequest, testKukuModel } from './kuku/proxy'
 import { probeKukuNetwork } from './kuku/probe'
@@ -449,6 +449,17 @@ export async function handleUpdateProvider(c: Context<AppEnv>) {
     updates.promptMode = body.promptMode === 'custom' || body.promptMode === 'append' ? body.promptMode : undefined
   }
   if (body.promptText !== undefined) updates.promptText = body.promptText ?? undefined
+  if (body.upstreamUserAgent !== undefined) {
+    // 传 '' / null 清除；非法（含换行、不可打印字符、超长）不落库
+    const ua = normalizeUpstreamUserAgent(body.upstreamUserAgent ?? '')
+    if (ua === null) {
+      return c.json<ApiResponse>({
+        success: false,
+        message: '出站 User-Agent 必须是单行可打印 ASCII（不含换行/控制字符），且不超过 512 字节',
+      }, 400)
+    }
+    updates.upstreamUserAgent = ua === '' ? undefined : ua
+  }
   if (body.apiKeys !== undefined) {
     updates.apiKeys = normalizeArray(body.apiKeys, (k) => ({ key: k, enabled: true }))
   }
@@ -719,19 +730,14 @@ export async function handleTestModel(c: Context<AppEnv>) {
     // （否则上游报 400 11133 integer_below_min_value；对齐 workbuddy2api c6e849f / global_e2e_test.go:308），
     // 统一设为 100 保证全部模型均可通过
     const testMaxTokens = isWorkbuddyPool ? 100 : 1
-    const testRequestBody = { model: modelId, messages: [{ role: 'user', content: 'hi' }], max_tokens: testMaxTokens, stream: true }
-    const testBody = JSON.stringify(testRequestBody)
-    // 会话头族（X-Conversation-* / X-Request-ID）：真实 chat 路径必带，缺了会被
-    // 上游渠道校验判为非法请求，回 400 / code 11128（conversation id missing）。
-    // 在域轮转循环外生成一次，CN/Global 重试复用同一个对话轮 ID。
-    const testChatMeta = isWorkbuddyPool ? await buildChatMeta({ body: testRequestBody }) : undefined
+    const testBody = JSON.stringify({ model: modelId, messages: [{ role: 'user', content: 'hi' }], max_tokens: testMaxTokens, stream: true })
     for (const realm of realms) {
       const realmBase = (realm === 'global' && cfg.globalBaseUrl ? cfg.globalBaseUrl : provider.baseUrl).replace(/\/$/, '')
       const origin = realm === 'global' && cfg.globalOrigin ? cfg.globalOrigin : (cfg.extraHeaders?.Origin)
       const url = `${realmBase}/${endpoint}`
       const headers = buildOauthHeaders(cfg, token, { origin, apiType: provider.apiType, cookies })
       if (isWorkbuddyPool) {
-        injectWorkbuddyChatHeaders(headers, token, realm, tokenState ? { uid: tokenState.uid, enterprise_id: tokenState.enterprise_id, domain: tokenState.domain, device_token: tokenState.device_token } : undefined, cfg, { chatPath: true, chatMeta: testChatMeta })
+        injectWorkbuddyChatHeaders(headers, token, realm, tokenState ? { uid: tokenState.uid, enterprise_id: tokenState.enterprise_id, domain: tokenState.domain, device_token: tokenState.device_token } : undefined, cfg, { chatPath: true })
       }
       // 此处**直连上游**，不走 forwardProxy，故缺失真实转发管线里的
       // ensureGlobalFallbackSystem。global 域要求首条为 system，缺省会
@@ -826,7 +832,7 @@ export async function handleTestModel(c: Context<AppEnv>) {
   }
   const result = isOpenCodeProvider(provider.id)
     ? await testOpenCodeModel(resolvedBase, enabledKeys, modelId, resolveOpenCodeUrls(c.env))
-    : await testModelConnection(resolvedBase, enabledKeys[0].key, modelId, provider.apiType)
+    : await testModelConnection(resolvedBase, enabledKeys[0].key, modelId, provider.apiType, provider.upstreamUserAgent)
 
   return c.json<ApiResponse>({
     success: true,

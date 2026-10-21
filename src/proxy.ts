@@ -31,6 +31,7 @@ import {
 } from './m365/responses-guardrails'
 import { isTraeProvider, proxyTraeChatRequest } from './trae/proxy'
 import { isZcodeProvider, buildZcodeHeaders } from './zcode/proxy'
+import { setHeaderCaseInsensitive } from './upstream-user-agent'
 import { isKukuProvider, proxyKukuChatRequest } from './kuku/proxy'
 import { isDeepseekAppProvider, proxyDeepseekChatRequest } from './deepseek/proxy'
 import { isDeepseekReasoningOff } from './deepseek/request'
@@ -1319,7 +1320,8 @@ export async function testModelConnection(
   baseUrl: string,
   apiKey: string,
   modelId: string,
-  apiType?: 'openai' | 'anthropic'
+  apiType?: 'openai' | 'anthropic',
+  upstreamUserAgent?: string,
 ): Promise<{ success: boolean; message: string; statusCode?: number }> {
   try {
     const cleanBase = baseUrl.replace(/\/$/, '')
@@ -1332,6 +1334,11 @@ export async function testModelConnection(
     }
     // 始终用 Bearer Authorization 发 OpenAI 格式请求到上游
     headers['Authorization'] = `Bearer ${apiKey}`
+    // 与真实转发一致：按客户端指纹鉴权的上游，测试连接也必须带同一 UA，
+    // 否则后台会显示 401 而真实请求其实是通的。
+    if (upstreamUserAgent) {
+      setHeaderCaseInsensitive(headers, 'User-Agent', upstreamUserAgent)
+    }
 
     const response = await fetch(url, {
       method: 'POST',
@@ -2079,6 +2086,13 @@ export async function forwardProxy(
       // 注入 ZCode 身份头，使上游识别为 ZCode 客户端
       if (isZcodeProvider(providerId)) {
         Object.assign(forwardHeaders, buildZcodeHeaders())
+      }
+      // 提供商级 User-Agent 覆写：按客户端指纹鉴权的上游（如 agentrouter）在 UA
+      // 不在白名单时先于密钥校验拒绝，只能改 UA；客户端侧无法自改
+      // （DSH 的 attributionHeaders() 会强制写回自己的 UA）。
+      // 大小写无关替换，覆盖 buildPassthroughHeaders 透传来的客户端 UA。
+      if (provider.upstreamUserAgent) {
+        setHeaderCaseInsensitive(forwardHeaders, 'User-Agent', provider.upstreamUserAgent)
       }
       const requestBody = JSON.stringify(forwardBody)
       const isStream = isStreamRequest(forwardBody as ProxyRequestBody)

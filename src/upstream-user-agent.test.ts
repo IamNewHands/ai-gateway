@@ -1,0 +1,212 @@
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
+import { Hono } from 'hono'
+import { handleProxy, testModelConnection } from './proxy'
+import { clearCache } from './storage'
+import { normalizeUpstreamUserAgent, setHeaderCaseInsensitive, UPSTREAM_USER_AGENT_MAX_BYTES } from './upstream-user-agent'
+import type { AppEnv, Env, Provider } from './types'
+
+/**
+ * 提供商级出站 User-Agent 覆写（`Provider.upstreamUserAgent`）。
+ *
+ * 存在的理由：部分上游按客户端指纹鉴权——UA 不在白名单时**先于密钥校验**拒绝，
+ * 换 key 无效。实测 agentrouter（`https://ps.air-outer.com/v1`）：不带 key 与带正确
+ * key 的 401 响应逐字相同（`unauthorized_client_error`），而 `claude-cli/2.0.1
+ * (external, cli)` 等 UA 直接 200。客户端侧改不动（DSH 会强制写回自己的 UA），
+ * 所以覆写必须发生在网关。
+ */
+
+const PID = 'agentrouter'
+
+function makeProvider(overrides: Partial<Provider> = {}): Provider {
+  return {
+    id: PID,
+    name: 'agentrouter',
+    baseUrl: 'https://ps.air-outer.com/v1',
+    apiType: 'openai',
+    apiKeys: [{ key: 'sk-test-key', enabled: true }],
+    models: [{ id: 'deepseek-v4-flash', enabled: true }],
+    enabled: true,
+    createdAt: 'a',
+    updatedAt: 'a',
+    ...overrides,
+  } as Provider
+}
+
+function makeEnv(providers: Provider[]) {
+  const store = new Map<string, string>()
+  store.set('providers', JSON.stringify(providers))
+  const kv = {
+    get: async (k: string) => store.get(k) ?? null,
+    put: async (k: string, v: string) => { store.set(k, v) },
+    delete: async (k: string) => { store.delete(k) },
+    list: async () => ({ keys: [], list_complete: true, cursor: '' }),
+  }
+  return { KV: kv, GATEWAY_KV: kv, RATE_LIMIT_KV: kv, SESSION_KV: kv } as unknown as Env
+}
+
+interface Call { url: string; headers: Record<string, string>; body: string }
+
+function installFetchMock(calls: Call[]) {
+  return vi.fn(async (url: string | URL | Request, init?: RequestInit) => {
+    const u = typeof url === 'string' ? url : url instanceof URL ? url.toString() : url.url
+    const raw = (init?.headers ?? {}) as Record<string, string>
+    const headers: Record<string, string> = {}
+    for (const k of Object.keys(raw)) headers[k.toLowerCase()] = String(raw[k])
+    calls.push({ url: u, headers, body: typeof init?.body === 'string' ? init.body : '' })
+    return new Response(JSON.stringify({
+      id: 'c1',
+      object: 'chat.completion',
+      model: 'deepseek-v4-flash',
+      choices: [{ index: 0, message: { role: 'assistant', content: 'hi' }, finish_reason: 'stop' }],
+    }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+  })
+}
+
+async function postChat(env: Env, clientHeaders: Record<string, string> = {}) {
+  const app = new Hono<AppEnv>()
+  app.post('/v1/chat/completions', (c) => handleProxy(c))
+  const req = new Request('https://gw.test/v1/chat/completions', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...clientHeaders },
+    body: JSON.stringify({ model: `${PID}/deepseek-v4-flash`, messages: [{ role: 'user', content: 'hi' }] }),
+  })
+  return app.fetch(req, env, { waitUntil: () => {}, passThroughOnException: () => {} } as unknown as ExecutionContext)
+}
+
+describe('upstream-user-agent：值校验', () => {
+  it('常规 UA 原样通过（含空格与括号的注释形式）', () => {
+    expect(normalizeUpstreamUserAgent('claude-cli/2.0.1 (external, cli)'))
+      .toBe('claude-cli/2.0.1 (external, cli)')
+  })
+
+  it('首尾空白被裁掉', () => {
+    expect(normalizeUpstreamUserAgent('  opencode/0.5.11  ')).toBe('opencode/0.5.11')
+  })
+
+  it('空串/纯空白返回空串（调用方据此清除配置）', () => {
+    expect(normalizeUpstreamUserAgent('')).toBe('')
+    expect(normalizeUpstreamUserAgent('   ')).toBe('')
+  })
+
+  it('含换行或控制字符 → 拒绝（防头注入）', () => {
+    expect(normalizeUpstreamUserAgent('a\r\nX-Injected: 1')).toBeNull()
+    expect(normalizeUpstreamUserAgent('a\nb')).toBeNull()
+    expect(normalizeUpstreamUserAgent('a\u0000b')).toBeNull()
+    expect(normalizeUpstreamUserAgent('a\u007fb')).toBeNull()
+  })
+
+  it('非 ASCII（中文/全角）→ 拒绝', () => {
+    expect(normalizeUpstreamUserAgent('客户端/1.0')).toBeNull()
+  })
+
+  it('超过 512 字节 → 拒绝，等于上限 → 通过', () => {
+    expect(normalizeUpstreamUserAgent('a'.repeat(UPSTREAM_USER_AGENT_MAX_BYTES))).toBe('a'.repeat(UPSTREAM_USER_AGENT_MAX_BYTES))
+    expect(normalizeUpstreamUserAgent('a'.repeat(UPSTREAM_USER_AGENT_MAX_BYTES + 1))).toBeNull()
+  })
+})
+
+describe('upstream-user-agent：大小写无关替换', () => {
+  it('删除小写同名键后写入新值，其他头不动', () => {
+    const headers: Record<string, string> = { 'user-agent': 'node', 'x-keep': 'v' }
+    setHeaderCaseInsensitive(headers, 'User-Agent', 'claude-cli/2.0.1 (external, cli)')
+    expect(headers['user-agent']).toBeUndefined()
+    expect(headers['User-Agent']).toBe('claude-cli/2.0.1 (external, cli)')
+    expect(headers['x-keep']).toBe('v')
+  })
+
+  it('多个大小写变体同时清除，最终只有一个键', () => {
+    const headers: Record<string, string> = { 'user-agent': 'a', 'USER-AGENT': 'b' }
+    setHeaderCaseInsensitive(headers, 'User-Agent', 'final')
+    const uaKeys = Object.keys(headers).filter((k) => k.toLowerCase() === 'user-agent')
+    expect(uaKeys).toEqual(['User-Agent'])
+    expect(headers['User-Agent']).toBe('final')
+  })
+})
+
+describe('upstream-user-agent：接入出站请求路径', () => {
+  let calls: Call[]
+
+  beforeEach(() => {
+    calls = []
+    clearCache()
+  })
+
+  afterEach(() => {
+    vi.unstubAllGlobals()
+    vi.restoreAllMocks()
+  })
+
+  it('配置了 upstreamUserAgent → 出站 UA 被覆写，即使客户端透传了自己的 UA', async () => {
+    vi.stubGlobal('fetch', installFetchMock(calls))
+    const env = makeEnv([makeProvider({ upstreamUserAgent: 'claude-cli/2.0.1 (external, cli)' })])
+
+    const res = await postChat(env, { 'user-agent': 'deepseek-harness/0.2.0-rc.2 (+https://github.com/deepseek-ai/deepseek-harness)' })
+    expect(res.status).toBe(200)
+
+    expect(calls).toHaveLength(1)
+    expect(calls[0].url).toBe('https://ps.air-outer.com/v1/chat/completions')
+    expect(calls[0].headers['user-agent']).toBe('claude-cli/2.0.1 (external, cli)')
+  })
+
+  it('未配置 → 保持既有行为：客户端 user-agent 按白名单前缀透传', async () => {
+    vi.stubGlobal('fetch', installFetchMock(calls))
+    const env = makeEnv([makeProvider()])
+
+    const res = await postChat(env, { 'user-agent': 'my-client/1.0' })
+    expect(res.status).toBe(200)
+
+    expect(calls[0].headers['user-agent']).toBe('my-client/1.0')
+  })
+
+  it('覆写只作用于该提供商：另一个 provider 的出站 UA 不受影响', async () => {
+    vi.stubGlobal('fetch', installFetchMock(calls))
+    const env = makeEnv([
+      makeProvider({ upstreamUserAgent: 'claude-cli/2.0.1 (external, cli)' }),
+      makeProvider({ id: 'plain', name: 'plain', baseUrl: 'https://plain.example/v1' }),
+    ])
+
+    const app = new Hono<AppEnv>()
+    app.post('/v1/chat/completions', (c) => handleProxy(c))
+    const req = new Request('https://gw.test/v1/chat/completions', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'user-agent': 'my-client/1.0' },
+      body: JSON.stringify({ model: 'plain/deepseek-v4-flash', messages: [{ role: 'user', content: 'hi' }] }),
+    })
+    await app.fetch(req, env, { waitUntil: () => {}, passThroughOnException: () => {} } as unknown as ExecutionContext)
+
+    expect(calls[0].url).toBe('https://plain.example/v1/chat/completions')
+    expect(calls[0].headers['user-agent']).toBe('my-client/1.0')
+  })
+})
+
+describe('upstream-user-agent：后台「测试模型」与真实转发同口径', () => {
+  let calls: Call[]
+
+  beforeEach(() => {
+    calls = []
+  })
+
+  afterEach(() => {
+    vi.unstubAllGlobals()
+    vi.restoreAllMocks()
+  })
+
+  it('传入 upstreamUserAgent → 测试请求带该 UA（否则后台会误报 401）', async () => {
+    vi.stubGlobal('fetch', installFetchMock(calls))
+    const result = await testModelConnection(
+      'https://ps.air-outer.com/v1',
+      'sk-test-key',
+      'deepseek-v4-flash',
+      'openai',
+      'claude-cli/2.0.1 (external, cli)',
+    )
+    expect(result.success).toBe(true)
+    expect(calls[0].headers['user-agent']).toBe('claude-cli/2.0.1 (external, cli)')
+  })
+
+  it('未传 → 不带自定义 UA（保持既有行为）', async () => {
+    vi.stubGlobal('fetch', installFetchMock(calls))
+    await testModelConnection('https://plain.example/v1', 'sk-test-key', 'deepseek-v4-flash', 'openai')
+    expect(calls[0].headers['user-agent']).toBeUndefined()
+  })
+})
