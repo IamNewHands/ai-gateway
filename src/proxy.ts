@@ -3983,7 +3983,10 @@ async function handleAnthropicMessagesInner(c: Context<AppEnv>) {
 
     // 非 OAuth 提供商：用 apiKey 标准转发，始终发 OpenAI 格式到上游
     const enabledKeys = provider.apiKeys.filter(k => k.enabled)
-    if (enabledKeys.length === 0) {
+    // opencode 支持「无 Key」模式（走 public 镜像），因此不对它强制要求 Key；
+    // 其余提供商仍按原口径报配置错误。
+    const openCodeRoute = isOpenCodeProvider(providerId)
+    if (enabledKeys.length === 0 && !openCodeRoute) {
       return c.json({
         type: 'error',
         error: { type: 'configuration_error', message: `Provider "${provider.name}" has no enabled API keys` },
@@ -4016,40 +4019,82 @@ async function handleAnthropicMessagesInner(c: Context<AppEnv>) {
     let response: Response | undefined
     let lastErrText = ''
     let lastStatus = 502
-    for (const key of enabledKeys) {
-      try {
-        const headers: Record<string, string> = {
-          'Content-Type': 'application/json',
-          'Authorization': `Bearer ${key.key}`,
-          // P7：白名单前缀头（x- / anthropic- / user-）透传，供上游识别客户端
-          ...buildPassthroughHeaders(c),
-        }
-        // 注入 ZCode 身份头，使上游识别为 ZCode 客户端
-        if (isZcodeProvider(provider.id)) {
-          Object.assign(headers, buildZcodeHeaders())
-        }
-        const r = await fetchUpstream(c.env, forwardUrl, {
-          method: 'POST',
-          headers,
-          body: JSON.stringify(upstreamBody),
-        }, originalStream === true)
-        if (r.ok) {
-          response = r
-          break
-        }
+
+    if (openCodeRoute) {
+      // 与 /v1/chat/completions 同源：opencode 自带 key 轮换、429 熔断、免费档形状
+      // 整形与 public 镜像回退，通用 apiKey 转发不具备这些能力。缺这条分派时，无 Key
+      // 的 opencode 会在上面误报 500（2026-10-21 实测：同一模型 chat 入口 200，
+      // messages 入口 `Provider "OpenCode" has no enabled API keys`）。
+      const r = await proxyOpenCodeRequest({
+        baseUrl: provider.baseUrl,
+        apiKeys: enabledKeys,
+        method: 'POST',
+        subPath: 'chat/completions',
+        body: JSON.stringify(upstreamBody),
+        mirrorUrls: resolveOpenCodeUrls(c.env),
+        providerName: provider.name,
+        affinityKey: resolveOpenCodeAffinityKey(c, upstreamBody),
+        reasoningEffort: provider.reasoningEffortByModel?.[modelId] ?? provider.reasoningEffort,
+        logger: (level, message, details) => {
+          const logType = level === 'info' ? 'request' : level
+          try { c.executionCtx.waitUntil(writeLog(c.env, logType, `${message} [${model}]`, details)) } catch { /* log failure must not break */ }
+        },
+      })
+      if (r.ok) {
+        response = r
+      } else {
         lastStatus = r.status
         lastErrText = await r.text()
-      } catch (err) {
-        lastStatus = 502
-        lastErrText = (err as Error).message || '网络错误'
+      }
+    } else {
+      for (const key of enabledKeys) {
+        try {
+          const headers: Record<string, string> = {
+            'Content-Type': 'application/json',
+            'Authorization': `Bearer ${key.key}`,
+            // P7：白名单前缀头（x- / anthropic- / user-）透传，供上游识别客户端
+            ...buildPassthroughHeaders(c),
+          }
+          // 注入 ZCode 身份头，使上游识别为 ZCode 客户端
+          if (isZcodeProvider(provider.id)) {
+            Object.assign(headers, buildZcodeHeaders())
+          }
+          // 与 /v1/chat/completions 同口径的提供商级 UA 覆写（按客户端指纹鉴权的上游）
+          if (provider.upstreamUserAgent) {
+            setHeaderCaseInsensitive(headers, 'User-Agent', provider.upstreamUserAgent)
+          }
+          const r = await fetchUpstream(c.env, forwardUrl, {
+            method: 'POST',
+            headers,
+            body: JSON.stringify(upstreamBody),
+          }, originalStream === true)
+          if (r.ok) {
+            response = r
+            break
+          }
+          lastStatus = r.status
+          lastErrText = await r.text()
+        } catch (err) {
+          lastStatus = 502
+          lastErrText = (err as Error).message || '网络错误'
+        }
       }
     }
 
     if (!response) {
       try { c.executionCtx.waitUntil(writeLog(c.env, 'error', `[anthropic] ${model} → failover 全部失败 ${forwardUrl}`, JSON.stringify({ error: lastErrText, body: summarizeRequestBody(upstreamBody), url: forwardUrl }).substring(0, 4000))) } catch {}
+      // 上游空体时不给出「Upstream error: 」这种无信息文案（DSH 只会显示
+      // 「404 status code (no body)」，无法判断归属）。
+      const detail = lastErrText.trim() === ''
+        ? `上游返回 ${lastStatus} 但响应体为空，无法从上游取得诊断信息（模型可能已下架、免费档形状被拦或上游抖动）`
+        : sanitizeUpstreamError(lastErrText)
       return c.json({
         type: 'error',
-        error: { type: 'upstream_error', message: `Upstream error: ${sanitizeUpstreamError(lastErrText)}` },
+        error: {
+          type: lastErrText.trim() === '' ? 'upstream_empty_error' : 'upstream_error',
+          message: `Upstream error: ${detail}`,
+          ...(lastErrText.trim() === '' ? { upstream_status: lastStatus } : {}),
+        },
       }, lastStatus as Parameters<typeof c.json>[1])
     }
 

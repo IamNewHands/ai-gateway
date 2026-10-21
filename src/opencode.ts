@@ -1,4 +1,5 @@
 import type { ApiKeyEntry, Env } from './types'
+import { withEmptyBodyDiagnosis } from './upstream-failure'
 
 export const OPENCODE_PROVIDER_ID = 'opencode'
 
@@ -1274,8 +1275,45 @@ async function proxyOpenCodeRequestRaw(
     }
   }
 
-  if (officialFailure) return { response: restoreFailure(officialFailure), shape }
-  if (mirrorFailure) return { response: restoreFailure(mirrorFailure), shape }
+  // 上游失败且响应体为空时补可诊断 JSON 体：2026-10-21 DSH 报
+  // `404 status code (no body)` 即由此而来——上游 404 空体被原样透传，
+  // 客户端无法判断是模型下架、形状被拦还是上游抖动。状态码保持原值。
+  const modelOf = (): string => {
+    try {
+      const parsed = JSON.parse(body ?? '') as { model?: unknown }
+      return typeof parsed.model === 'string' ? parsed.model : ''
+    } catch {
+      return ''
+    }
+  }
+  const diagnose = async (response: Response, lane: 'official' | 'mirror'): Promise<Response> => {
+    if (response.ok) return response
+    const diagnosed = await withEmptyBodyDiagnosis(response, {
+      status: response.status,
+      model: modelOf(),
+      keysTried: enabledKeys.length,
+      mirrors: mirrors.length,
+      lane,
+    })
+    if (diagnosed !== response) {
+      log('warn', `${tag} 上游 ${response.status} 响应体为空，已补可诊断 JSON 体`)
+    }
+    return diagnosed
+  }
+
+  if (officialFailure) return { response: await diagnose(restoreFailure(officialFailure), 'official'), shape }
+  if (mirrorFailure) return { response: await diagnose(restoreFailure(mirrorFailure), 'mirror'), shape }
+  // 明确「根本没有可用通道」而不是泛化的 502「OpenCode 上游请求失败」：
+  // 无 key 又无镜像时一次上游请求都没发出去，客户端需要知道该配哪个开关。
+  if (lastTransportError === null && enabledKeys.length === 0 && mirrors.length === 0) {
+    log('error', `${tag} 未配置启用的 API key，且没有可用的 public 镜像（OPENCODE_MIRRORS_URL），未发起任何上游请求`)
+    return {
+      response: transportErrorResponse(new Error(
+        'OpenCode 提供商未配置启用的 API Key，且未配置 OPENCODE_MIRRORS_URL 镜像——没有任何可用通道，请求未发出',
+      )),
+      shape,
+    }
+  }
   return { response: transportErrorResponse(lastTransportError), shape }
 }
 
