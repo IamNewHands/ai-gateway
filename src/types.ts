@@ -561,6 +561,8 @@ export interface CreateProviderRequest {
   reasoningEffortByModel?: Record<string, string>
   /** Cline 上游渠道钉住（见 Provider.clinePinByModel） */
   clinePinByModel?: Record<string, ClinePinConfig>
+  /** 出站 User-Agent 覆写（见 Provider.upstreamUserAgent） */
+  upstreamUserAgent?: string | null
   /** DeepSeek App 提供商级默认关闭深度思考（见 Provider.deepseekThinkingOff） */
   deepseekThinkingOff?: boolean
   thinkingInject?: string[]

@@ -274,7 +274,7 @@ function opencodeEffortSelectHtml(selectId: string, selected: string | undefined
 // UX8：厂商预设与 OAuth 预置模板——单一数据源。
 // SSR 下拉 option 与客户端 applyProviderPreset / applyOauthPreset* 共用，
 // 注入为页面 script 常量，消除服务端/客户端两套重复预设表。
-const PROVIDER_PRESETS: Record<string, { name: string; id: string; baseUrl: string; apiType: string; authType?: string; oauthPreset?: string; models?: string[]; toolBridge?: boolean; type?: 'kuku'; kukuThinkMode?: number }> = {
+const PROVIDER_PRESETS: Record<string, { name: string; id: string; baseUrl: string; apiType: string; authType?: string; oauthPreset?: string; models?: string[]; toolBridge?: boolean; type?: 'kuku'; kukuThinkMode?: number; upstreamUserAgent?: string }> = {
   deepseek:     { name: 'DeepSeek',           id: 'deepseek',     baseUrl: 'https://api.deepseek.com',                          apiType: 'openai' },
   // DeepSeek App：凭据不是 API Key，而是浏览器里取的 userToken（token 注入型，见 DEEPSEEK-APP-PORT.md）。
   // 上游只有一个模型，预置填好避免用户手填错 ID / 地址（两处判定见 isDeepseekAppProviderUI）。
@@ -296,6 +296,13 @@ const PROVIDER_PRESETS: Record<string, { name: string; id: string; baseUrl: stri
     models: ['auto', 'glm-5.3'],
   },
   openrouter:   { name: 'OpenRouter',         id: 'openrouter',   baseUrl: 'https://openrouter.ai/api/v1',                      apiType: 'openai' },
+  // AgentRouter：按**客户端指纹**鉴权的聚合上游——UA 不在其白名单时会在校验密钥之前
+  // 直接返回 401 unauthorized_client_error（换 Key 无效，实测 claude-cli 等 UA 才放行）。
+  // 故预设直接把出站 UA 一起填好；备用域名 ps.air-outer.com 与原域 agentrouter.org 等价。
+  agentrouter:  { name: 'AgentRouter（按 UA 白名单鉴权）', id: 'agentrouter', baseUrl: 'https://ps.air-outer.com/v1', apiType: 'openai',
+    models: ['deepseek-v4-flash', 'gpt-6-astra', 'gpt-6.1-sol'],
+    upstreamUserAgent: 'claude-cli/2.0.1 (external, cli)',
+  },
   sensenova:    { name: '商汤日日新 (SenseNova)', id: 'sensenova', baseUrl: 'https://token.sensenova.cn/v1',                    apiType: 'openai',
     models: ['sensenova-6.8-flash-lite', 'deepseek-v4-flash', 'deepseek-v4-pro', 'glm-5.2', 'kimi-k3'],
   },
@@ -654,6 +661,7 @@ ${H('管理')}
             <div class="fg"><label for="apreset">厂商预设</label><select id="apreset" class="select-sm" onchange="applyProviderPreset(this.value)"><option value="">— 自定义 —</option>${Object.entries(PROVIDER_PRESETS).map(([name, pre]) => `<option value="${name}">${escapePageHtml(pre.name)}</option>`).join('')}</select><span class="form-helper">选择后自动填充名称/地址/格式，只需填 API Key 即可测试。</span></div>
             <div class="fg"><label for="aurl">API 地址</label><input type="url" id="aurl" placeholder="https://api.deepseek.com"></div>
             <div class="fg"><label for="afmt">API 格式</label><select id="afmt" class="select-sm"><option value="openai">OpenAI 兼容</option><option value="anthropic">Anthropic 兼容</option></select></div>
+            <div class="fg"><label for="aua">出站 User-Agent（可选）</label><input type="text" id="aua" placeholder="留空 = 透传客户端 UA"><span class="form-helper">部分上游按客户端指纹鉴权（UA 不在白名单时先于密钥校验直接 401，如 agentrouter），填这里用该值覆盖转发给上游的 User-Agent；值须单行可打印 ASCII，≤512 字节。创建后也可在提供商详情里修改。</span></div>
             <div class="fg"><label for="aat">认证方式</label><select id="aat" class="select-sm" onchange="toggleAuthType()"><option value="api-key">API Key</option><option value="oauth-device">OAuth 设备码登录</option></select></div>
             <div id="oauth-new" class="hd form-group">
               <fieldset class="form-group"><legend>OAuth 配置</legend>
@@ -1912,7 +1920,7 @@ async function createProv(opts) {
     const r = await fetch('/admin/api/providers', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ id, name: nm, baseUrl: url, apiType, authType, oauth: authType === 'oauth-device' ? oauth : undefined, apiKeys: keys, models, enabled, toolBridge: (document.getElementById('atb')||{}).checked === true, allowUnlistedModels: (document.getElementById('aum')||{}).checked === true, reasoningEffort: ((document.getElementById('re')||{}).value || undefined), thinkingInject, cachePrefixInject, type: providerType || (vb && vb.primary ? 'vision-bridge' : undefined), kukuThinkMode, visionBridge: vb, geminiBaseUrl: ((document.getElementById('agbu')||{}).value || '').trim() || undefined })
+      body: JSON.stringify({ id, name: nm, baseUrl: url, apiType, authType, oauth: authType === 'oauth-device' ? oauth : undefined, apiKeys: keys, models, enabled, toolBridge: (document.getElementById('atb')||{}).checked === true, allowUnlistedModels: (document.getElementById('aum')||{}).checked === true, reasoningEffort: ((document.getElementById('re')||{}).value || undefined), thinkingInject, cachePrefixInject, type: providerType || (vb && vb.primary ? 'vision-bridge' : undefined), kukuThinkMode, visionBridge: vb, geminiBaseUrl: ((document.getElementById('agbu')||{}).value || '').trim() || undefined, upstreamUserAgent: ((document.getElementById('aua')||{}).value || '').trim() || undefined })
     })
     const d = await r.json()
     if (d.success) {
@@ -2190,6 +2198,9 @@ function applyProviderPreset(name) {
   document.getElementById('aid').value = p.id
   document.getElementById('aurl').value = p.baseUrl
   document.getElementById('afmt').value = p.apiType
+  // 出站 UA 覆写：预设带了就一并填好（按指纹鉴权的上游缺了它必然 401）
+  const uaPresetEl = document.getElementById('aua')
+  if (uaPresetEl) uaPresetEl.value = p.upstreamUserAgent || ''
   if (p.authType === 'oauth-device') {
     document.getElementById('aat').value = 'oauth-device'
     toggleAuthType()

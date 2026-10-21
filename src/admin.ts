@@ -333,6 +333,17 @@ export async function handleCreateProvider(c: Context<AppEnv>) {
     return c.json<ApiResponse>({ success: false, message: oauthErr }, 400)
   }
 
+  // 出站 User-Agent 覆写：非法值直接拒绝，避免落库后每次请求都被上游按指纹拒绝
+  const upstreamUserAgent = body.upstreamUserAgent === undefined || body.upstreamUserAgent === null
+    ? undefined
+    : normalizeUpstreamUserAgent(body.upstreamUserAgent)
+  if (upstreamUserAgent === null) {
+    return c.json<ApiResponse>({
+      success: false,
+      message: '出站 User-Agent 必须是单行可打印 ASCII（不含换行/控制字符），且不超过 512 字节',
+    }, 400)
+  }
+
   const providers = await getProviders(c.env)
   if (providers.some((p) => p.id === body.id)) {
     return c.json<ApiResponse>({ success: false, message: `提供商 id "${body.id}" 已存在` }, 409)
@@ -370,6 +381,7 @@ export async function handleCreateProvider(c: Context<AppEnv>) {
     traeRemoteReasoningEffort: normalizeTraeRemoteEffort(body.traeRemoteReasoningEffort),
     traeRemoteMaxMode: body.traeRemoteMaxMode,
     accountSpread: body.accountSpread,
+    upstreamUserAgent: upstreamUserAgent || undefined,
     apiKeys: normalizeArray(body.apiKeys, (k) => ({ key: k, enabled: true })),
     models: body.models
       ? normalizeArray(body.models, (m) => ({ id: m, enabled: true }))

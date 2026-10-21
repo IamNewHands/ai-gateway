@@ -106,3 +106,29 @@ describe('提供商详情面板：仅相关提供商显示专属配置', () => {
     expect(p).toContain('value="high" checked')
   })
 })
+
+describe('厂商预设：按客户端指纹鉴权的上游必须有创建入口', () => {
+  it('agentrouter 出现在「厂商预设」下拉里（否则界面上根本创建不出来）', async () => {
+    const html = await render([])
+    expect(html).toContain('value="agentrouter"')
+  })
+
+  it('预设自带出站 UA 覆写与上游真实模型，选中后无需手填', async () => {
+    const html = await render([])
+    expect(html).toContain('claude-cli/2.0.1 (external, cli)')
+    expect(html).toContain('deepseek-v4-flash')
+    expect(html).toContain('gpt-6.1-sol')
+  })
+
+  it('新建表单带「出站 User-Agent」输入框', async () => {
+    const html = await render([])
+    expect(html).toContain('id="aua"')
+  })
+
+  it('提供商详情仍带可编辑的出站 UA 输入框（创建后改得动）', async () => {
+    const html = await render([baseProvider('agentrouter', { upstreamUserAgent: 'claude-cli/2.0.1 (external, cli)' })])
+    const p = panel(html, 'agentrouter')
+    expect(p).toContain('id="ua-agentrouter"')
+    expect(p).toContain('claude-cli/2.0.1 (external, cli)')
+  })
+})
