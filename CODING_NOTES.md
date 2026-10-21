@@ -168,7 +168,7 @@ TRAE 相关问题前先读本节。**
 6. **流式响应头**：`Content-Type: text/event-stream`、`Cache-Control: no-store`、`X-Accel-Buffering: no`（防中间层缓冲）。
 7. **Anthropic 路径对 TRAE 强制 `stream: true`**：TRAE 上游只支持流式，非流式由本层聚合后再转 Anthropic JSON。
 
-### 建连死线阶梯与 503 `upstream_unreachable`（2026-10-09 落地、2026-10-10 收紧，改超时前必读）
+### 建连死线阶梯与 503 `upstream_unreachable`（2026-10-09 落地、10-10 收紧、10-13 加到 5 段，改超时前必读）
 
 **症状**：DSH 报 `503 upstream_unreachable`，文案「TRAE SOLO 上游连接超时/中断（账号未被惩罚，非账号池问题）：
 chat transport error: connect timeout <ms>」；客户端等待 20–45s 后自己 0.5s 重试即恢复（那 0.5s 是 DSH 本地
@@ -183,7 +183,7 @@ chat transport error: connect timeout <ms>」；客户端等待 20–45s 后自�
 - 死连接成因（CF 出站连接池半关连接 / 上游接了不答）在 Workers 里既观测不到也控制不了 ⇒ **网关侧无法根治**，
   能做的只有「早点换连接、少白等」。
 
-**当前值**：`TRAE_CONNECT_DEADLINES_MS = [10_000, 10_000, 10_000]`；`TRAE_CHAT_CONNECT_TIMEOUT_MS` 恒等于最后一段
+**当前值**：`TRAE_CONNECT_DEADLINES_MS = [10_000, 10_000, 10_000, 10_000, 10_000]`；`TRAE_CHAT_CONNECT_TIMEOUT_MS` 恒等于最后一段
 （单一 owner：未传死线的调用点，如后台「测试连接」，与主路径共用同一判据）。
 
 **加段依据（2026-10-10 当晚由 2 段加到 3 段）**：坏窗口实测 q ≈ 0.5（session-070d26b6 在 22:02–22:25 约 25 个
@@ -191,6 +191,15 @@ chat transport error: connect timeout <ms>」；客户端等待 20–45s 后自�
 需要打开的连接数期望值恒为 1/q，**与段数无关** ⇒ 加段不增加上游负载，只是把一次客户端重试（0.5–10s 退避 +
 一次 HTTP 往返）搬进网关，从而保护客户端那 5 次重试预算（预算耗尽才会让 turn 真正失败：session-3c542aab
 turn4/step5 连续 5 次 503 后 `Connection error`）。代价只有最坏死等 21s → 32s（仍优于阶梯上线前的 42s）。
+
+**再加两段（2026-10-13，3 → 5）**：长会话（DSH agent，带 tools）里 503 仍「非常频繁」。带 tools 时**没有 Work
+兜底**（`proxy.ts` 的 `hasTools` 分支：Work 协议带不了调用方 tools，降级会静默丢语义），所以阶梯段数就是这类请求
+唯一的容灾层 ⇒ 段数直接折算成功率。按已测 q ≈ 0.5：3 段失败率 12.5%，5 段 3%。
+**代价**：最坏死等 32s → 52s，且全在响应头之前（客户端这段时间收不到任何字节）。
+⚠ 这个代价只在客户端愿意等 ≥52s 时成立——2026-10-10 的 32s 级 503 客户端都拿到了响应体，说明至少能等 32s。
+**若症状变成「客户端先超时」**（DSH 报 timeout / connection error 而不是收到 503 响应体），说明段数已越过客户端耐心，
+该退回 3–4 段，而不是继续加段。加段前先按下面的「救援日志」判读：`attempt=5/5` 的失败占比若是常态，说明 q 已经
+高到「加段也救不回来」，此时该动的是候选①（对冲）或候选②（查 q），不是继续堆段数。
 
 **被证伪的两个旧假设（不要再拿它们当依据）**：
 1. 「存在 10–30s 才出响应头的合法慢请求，所以最后一段必须 ≥ 30s」——2026-10-10 分布证伪，该区间零样本。

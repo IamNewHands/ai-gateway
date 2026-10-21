@@ -200,8 +200,18 @@ export const TRAE_STREAM_IDLE_TIMEOUT_MS = 180000
  *
  * 触发条件：**只有网关自己的定时器掐断（`timing.connectTimeout === true`）才走阶梯**；
  * 上游自己断的（`timeout=false`）不重发——那不是死连接，语义保留给原有兜底链。
+ *
+ * 2026-10-13 由 3 段加到 5 段：
+ *  用户在长会话（DSH agent，**带 tools**）里报「非常频繁」的 503，文案与本阶梯的撞满分支一致
+ *  （`attempts=3` / `connect timeout 10000ms`）。带 tools 时**没有 Work 兜底**（见 proxy.ts
+ *  的 `hasTools` 分支：Work 协议带不了调用方 tools，降级会静默丢语义），所以阶梯段数就是这条
+ *  请求唯一的容灾层 ⇒ 段数直接折算成功率。按已测 q≈0.5：3 段失败率 12.5%，5 段 3%。
+ *  代价：最坏死等 32s → 52s，且全部发生在响应头之前（客户端在这期间收不到任何字节）。
+ *  ⚠ 这个代价只在「客户端愿意等 ≥52s」时成立。2026-10-10 的 32s 级 503 客户端都收到了响应体，
+ *  说明它至少能等 32s；**若哪天变成客户端先超时**（症状是 DSH 报 timeout 而不是收到 503），
+ *  该回到 3–4 段，而不是继续加段。
  */
-export const TRAE_CONNECT_DEADLINES_MS: readonly number[] = [10_000, 10_000, 10_000]
+export const TRAE_CONNECT_DEADLINES_MS: readonly number[] = [10_000, 10_000, 10_000, 10_000, 10_000]
 
 /**
  * 单段建连上限：**未传死线的调用点**（直接调 `chatStream` / `chatWorkStream` 的默认值，
