@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest'
-import { openAIChunkToResponsesSSE, responsesToOpenAI, buildResponsesFallbackCompleted, createAnthropicSSEAccumulator, openAIChunkToAnthropicSSE, aggregateOpenAIToAnthropic } from './formats'
+import { openAIChunkToResponsesSSE, responsesToOpenAI, buildResponsesFallbackCompleted, createAnthropicSSEAccumulator, openAIChunkToAnthropicSSE, aggregateOpenAIToAnthropic, finalizeAnthropicStream, anthropicToOpenAI } from './formats'
 
 // 构造一个响应转换器的累加器（与 proxy.ts handleResponsesSpecial 的用法一致）
 function acc(): Parameters<typeof openAIChunkToResponsesSSE>[1] {
@@ -355,5 +355,116 @@ describe('aggregateOpenAIToAnthropic：畸形 tool_call 清洗', () => {
     expect(resp['stop_reason']).toBe('tool_use')
     const content = resp['content'] as Array<Record<string, unknown>>
     expect(content.filter((b) => b['type'] === 'tool_use')).toHaveLength(1)
+  })
+})
+
+// ============================================================================
+// Anthropic 工具块 JSON 校验（移植 Trae2api-cn a01d77c / e5eb6d1）
+//
+// 旧行为：`closeCurrentBlock` 解析失败**静默保留原串**，照常发 content_block_stop 且
+// stop_reason 报 tool_use ⇒ 客户端拿半截 JSON 当成功去执行工具；非流式更糟，解析失败直接
+// `input = {}`，等于「没有参数」也执行。现在：能修就补发后缀增量，修不好发 `event: error`
+// 且不补 message_stop；非流式修不好则丢弃该块（不下发坏 input）。
+// ============================================================================
+
+describe('Anthropic 工具块：截断参数的修复与显式失败', () => {
+  it('流式：截断在字符串中 → 收尾补发后缀，拼接后是合法 JSON，stop_reason 仍 tool_use', () => {
+    const a = createAnthropicSSEAccumulator()
+    let sse = openAIChunkToAnthropicSSE(
+      toolDeltaChunk([{ index: 0, id: 'c1', type: 'function', function: { name: 'Bash', arguments: '{"cmd": "ls' } }]),
+      a,
+    )
+    sse += openAIChunkToAnthropicSSE(finishChunk('tool_calls'), a)
+    const joined = anthropicToolArgDeltas(sse).join('')
+    expect(() => JSON.parse(joined)).not.toThrow()
+    expect(JSON.parse(joined)).toEqual({ cmd: 'ls' })
+    expect(sse).toContain('"stop_reason":"tool_use"')
+    expect(sse).not.toContain('event: error')
+  })
+
+  it('流式：修不好 → 发 event: error，且不补 message_stop（不得在失败后报正常结束）', () => {
+    const a = createAnthropicSSEAccumulator()
+    let sse = openAIChunkToAnthropicSSE(
+      toolDeltaChunk([{ index: 0, id: 'c1', type: 'function', function: { name: 'Bash', arguments: '{"a": tru' } }]),
+      a,
+    )
+    sse += openAIChunkToAnthropicSSE(finishChunk('tool_calls'), a)
+    expect(sse).toContain('event: error')
+    expect(sse).toContain('"type":"api_error"')
+    expect(sse).not.toContain('message_stop')
+    // 后续 chunk 一律不再产出事件（客户端已按失败处理）
+    expect(openAIChunkToAnthropicSSE(finishChunk('stop'), a)).toBe('')
+    expect(finalizeAnthropicStream(a)).toBe('')
+  })
+
+  it('流式：上游直接结束（无 finish_reason）→ 兜底 finalize 也走同一套修复', () => {
+    const a = createAnthropicSSEAccumulator()
+    openAIChunkToAnthropicSSE(
+      toolDeltaChunk([{ index: 0, id: 'c1', type: 'function', function: { name: 'Bash', arguments: '{"cmd": "ls' } }]),
+      a,
+    )
+    const tail = finalizeAnthropicStream(a)
+    expect(tail).toContain('content_block_stop')
+    // 已发出的增量 + 兜底补发 = 合法 JSON
+    const deltas = anthropicToolArgDeltas(tail)
+    expect(deltas.length).toBeGreaterThan(0)
+    expect(() => JSON.parse('{"cmd": "ls' + deltas.join(''))).not.toThrow()
+  })
+
+  it('流式：累计快照（重发整段）只补后缀，不拼成 {...}{...}', () => {
+    const a = createAnthropicSSEAccumulator()
+    let sse = openAIChunkToAnthropicSSE(
+      toolDeltaChunk([{ index: 0, id: 'c1', type: 'function', function: { name: 'Bash', arguments: '{"a":' } }]),
+      a,
+    )
+    sse += openAIChunkToAnthropicSSE(
+      toolDeltaChunk([{ index: 0, id: 'c1', type: 'function', function: { name: 'Bash', arguments: '{"a":1}' } }]),
+      a,
+    )
+    sse += openAIChunkToAnthropicSSE(finishChunk('tool_calls'), a)
+    expect(anthropicToolArgDeltas(sse).join('')).toBe('{"a":1}')
+  })
+
+  it('非流式：截断参数被修复后下发，而不是 input: {}', () => {
+    const resp = aggregateOpenAIToAnthropic([
+      toolDeltaChunk([{ index: 0, id: 'c1', type: 'function', function: { name: 'exec', arguments: '{"cmd": "ls' } }]),
+      finishChunk('tool_calls'),
+    ])
+    const content = resp['content'] as Array<Record<string, unknown>>
+    const tu = content.find((b) => b['type'] === 'tool_use') as Record<string, unknown>
+    expect(tu['input']).toEqual({ cmd: 'ls' })
+    expect(resp['stop_reason']).toBe('tool_use')
+  })
+
+  it('非流式：修不好 → 丢弃该 tool_use 块（不下发空参数），stop_reason 降为 end_turn', () => {
+    const resp = aggregateOpenAIToAnthropic([
+      toolDeltaChunk([{ index: 0, id: 'c1', type: 'function', function: { name: 'exec', arguments: '{"a": tru' } }]),
+      finishChunk('tool_calls'),
+    ])
+    const content = resp['content'] as Array<Record<string, unknown>>
+    expect(content.some((b) => b['type'] === 'tool_use')).toBe(false)
+    expect(resp['stop_reason']).toBe('end_turn')
+  })
+})
+
+describe('anthropicToOpenAI：并行工具调用策略', () => {
+  const base = { model: 'm', messages: [] }
+
+  it('顶层 parallel_tool_calls 原样透传（含显式 false）', () => {
+    expect(anthropicToOpenAI({ ...base, parallel_tool_calls: false } as never)['parallel_tool_calls']).toBe(false)
+    expect(anthropicToOpenAI({ ...base, parallel_tool_calls: true } as never)['parallel_tool_calls']).toBe(true)
+  })
+
+  it('disable_parallel_tool_use=true → false；显式 false → true（不丢显式取值）', () => {
+    expect(
+      anthropicToOpenAI({ ...base, tool_choice: { type: 'auto', disable_parallel_tool_use: true } } as never)['parallel_tool_calls'],
+    ).toBe(false)
+    expect(
+      anthropicToOpenAI({ ...base, tool_choice: { type: 'auto', disable_parallel_tool_use: false } } as never)['parallel_tool_calls'],
+    ).toBe(true)
+  })
+
+  it('两者都不带 → 不下发该字段（保持上游默认）', () => {
+    expect(anthropicToOpenAI({ ...base } as never)['parallel_tool_calls']).toBeUndefined()
   })
 })

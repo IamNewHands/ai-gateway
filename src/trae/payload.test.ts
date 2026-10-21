@@ -1,5 +1,15 @@
 import { describe, it, expect } from 'vitest'
-import { prepareBody, applyHistoryBudget, applyToolSchemaBudget, flattenTraeQuery, isRemoteOnlyModel } from './payload'
+import {
+  boundRemoteQuery,
+  flattenTraeQuery,
+  isRemoteOnlyModel,
+  prepareBody,
+  RemoteQueryTooLargeError,
+  applyHistoryBudget,
+  applyToolSchemaBudget,
+  TRAE_REMOTE_QUERY_MAX_CHARS,
+  TRAE_REMOTE_QUERY_TRUNCATION_MARKER,
+} from './payload'
 
 function msg(role: string, content: string): Record<string, any> {
   return { role, content }
@@ -304,5 +314,79 @@ describe('flattenTraeQuery：attachment 块（**追加**，不改 text 块）', 
     const out = JSON.parse(flattenTraeQuery(null, { attachments: [ATTACHMENT] }))
     expect(out).toHaveLength(2)
     expect(out[0]).toEqual({ type: 'text', data: { content: '' } })
+  })
+})
+
+// ===== boundRemoteQuery：Remote 输入上限与压缩（移植 Trae2api-cn 2f2dc1a / e077061）=====
+//
+// 上游对超长 `query` 是静默失败（不发 done、直接关连接，约 480k）。目标侧此前完全没有上限，
+// 面板的「历史总字符数上限」也因 `__budget` 只在 SOLO 路径注入而对 remote 提供商失效。
+// 现在的口径：丢最旧回合 → 单条头尾截断 → 仍超限抛 413（不换号重放）。
+describe('boundRemoteQuery：Remote query 上限与压缩', () => {
+  const measure = (messages: unknown[], attachments?: Array<{ uri: string; filename: string }>): number =>
+    flattenTraeQuery(messages, { attachments }).length
+
+  it('未超限 → 内容不变，dropped/truncated 均为 0', () => {
+    const messages = [msg('system', 'S'), msg('user', 'hello')]
+    const r = boundRemoteQuery(messages, { maxChars: 100_000 })
+    expect(r.droppedMessages).toBe(0)
+    expect(r.truncatedMessages).toBe(0)
+    expect(r.messages).toEqual(messages)
+    expect(r.chars).toBe(measure(messages))
+  })
+
+  it('maxChars<=0 = 不设限（面板留空的显式语义），原样返回同一个数组', () => {
+    const messages = [msg('user', 'x'.repeat(5000))]
+    const r = boundRemoteQuery(messages, { maxChars: 0 })
+    expect(r.messages).toBe(messages)
+    expect(r.droppedMessages).toBe(0)
+  })
+
+  it('超限 → 先丢最旧的完整回合，system 与最后一条恒保留', () => {
+    const messages = [msg('system', 'S'), msg('user', 'a'.repeat(400)), msg('user', 'newest')]
+    const r = boundRemoteQuery(messages, { maxChars: 200 })
+    expect(r.droppedMessages).toBe(1)
+    expect(r.messages).toHaveLength(2)
+    expect(asMsgs(r.messages).map((m) => m.role)).toEqual(['system', 'user'])
+    expect(asMsgs(r.messages)[1].content).toBe('newest')
+    expect(r.chars).toBeLessThanOrEqual(200)
+  })
+
+  it('单条超长消息 → 保留头尾并插入截断标记，总长压到上限内', () => {
+    const messages = [msg('system', 'S'), msg('user', 'A'.repeat(3000))]
+    const r = boundRemoteQuery(messages, { maxChars: 600 })
+    expect(r.truncatedMessages).toBeGreaterThan(0)
+    expect(r.chars).toBeLessThanOrEqual(600)
+    const content = String(asMsgs(r.messages)[1].content)
+    expect(content).toContain(TRAE_REMOTE_QUERY_TRUNCATION_MARKER)
+    expect(content.startsWith('A')).toBe(true)
+    expect(content.endsWith('A')).toBe(true)
+  })
+
+  it('压到上限内之后仍超限 → 抛 RemoteQueryTooLargeError（调用方据此返回 413 且不换号）', () => {
+    const messages = [msg('user', 'A'.repeat(3000))]
+    expect(() => boundRemoteQuery(messages, { maxChars: 60 })).toThrow(RemoteQueryTooLargeError)
+  })
+
+  it('图片 attachment 计入同一长度上限（仅图片就超限 → 直接抛，不让上游静默关流）', () => {
+    const attachments = [{ uri: 'trae-res://remote_resource/' + 'x'.repeat(300) + '.trae', filename: 'a.png' }]
+    expect(() => boundRemoteQuery([], { maxChars: 100, attachments })).toThrow(RemoteQueryTooLargeError)
+  })
+
+  it('默认上限常量对齐源侧约 480k', () => {
+    expect(TRAE_REMOTE_QUERY_MAX_CHARS).toBe(480_000)
+  })
+
+  it('工具配对不被拆散：丢弃历史时保留 tool 消息与结构字段', () => {
+    const messages = [
+      msg('system', 'S'),
+      { role: 'assistant', content: '', tool_calls: [{ id: 't1', function: { name: 'Bash', arguments: '{"a":1}' } }] },
+      { role: 'tool', tool_call_id: 't1', name: 'Bash', content: 'ok' },
+      msg('user', 'next'),
+    ]
+    const r = boundRemoteQuery(messages, { maxChars: 400 })
+    // 压缩只动 content，不删 tool_calls / tool_call_id 等结构字段
+    const kept = asMsgs(r.messages).filter((m) => m.role === 'assistant')
+    for (const m of kept) expect(Array.isArray(m.tool_calls)).toBe(true)
   })
 })

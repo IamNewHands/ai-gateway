@@ -9,6 +9,8 @@
  *   3. Anthropic Messages       /v1/messages           （新增）
  */
 
+import { isJsonText, repairJsonArguments } from './json-repair'
+
 // ============================================================
 //  Anthropic Messages → OpenAI Chat Completions  请求转换
 // ============================================================
@@ -147,6 +149,15 @@ export function anthropicToOpenAI(anthropicReq: AnthropicRequest): Record<string
     if (anthropicReq.tool_choice.disable_parallel_tool_use) {
       body['parallel_tool_calls'] = false
     }
+  }
+  // 并行工具调用策略：Anthropic 原生只有 `tool_choice.disable_parallel_tool_use`，
+  // 但不少客户端（以及源侧 `/v1/messages` 的实测流量）会直接带 OpenAI 拼写的顶层
+  // `parallel_tool_calls`。按类型判断（而不是真值判断）以保留显式 `false` ——
+  // 移植自 Trae2api-cn `anthropic_api.py:267-279`（`a01d77c`）。
+  if (typeof anthropicReq.parallel_tool_calls === 'boolean') {
+    body['parallel_tool_calls'] = anthropicReq.parallel_tool_calls
+  } else if (anthropicReq.tool_choice?.disable_parallel_tool_use === false) {
+    body['parallel_tool_calls'] = true
   }
 
   // thinking → reasoning_effort
@@ -392,6 +403,15 @@ interface AnthropicSSEAccumulator {
   outputTokens: number
   /** message_stop 是否已发送（流结束兜底用，避免重复/遗漏） */
   messageStopSent: boolean
+  /**
+   * 已发过 `event: error`（工具参数修不好）。置位后：
+   *  - 后续 chunk 一律不再产出事件（客户端已按失败处理）；
+   *  - `finalizeAnthropicStream` 不再补 `message_stop`，避免在错误之后又报一次「正常结束」。
+   *
+   * 移植自 Trae2api-cn `anthropic_api.py` 的 `tool_input_error()`（`a01d77c`/`e5eb6d1`）：
+   * 收尾校验每个 tool_use 块的累积 JSON，修不好就发明确 error，**不把半截参数当成功**。
+   */
+  fatalError?: string
   /** 当前 content block 的 content_block_stop 是否已发送 */
   currentBlockClosed: boolean
 }
@@ -428,6 +448,20 @@ function formatAnthropicSSE(events: string[]): string {
 }
 
 /**
+ * Anthropic SSE 的错误事件（`event: error` + `{"type":"error","error":{...}}`）。
+ *
+ * 为什么必须发它：工具参数修不好时，客户端已经收到半截 `input_json_delta`。此时若照常
+ * `content_block_stop` + `stop_reason: tool_use`，客户端会把残缺 JSON 当成功去执行工具
+ * （源侧 `anthropic_api.py` 的 `error_event()` 同一定责：宁可显式失败，也不给坏 input）。
+ */
+function anthropicErrorEvents(message: string): string[] {
+  return [
+    'event: error',
+    `data: ${JSON.stringify({ type: 'error', error: { type: 'api_error', message } })}`,
+  ]
+}
+
+/**
  * 将一个 OpenAI SSE chunk 转换为零个或多个 Anthropic SSE 事件行。
  * 返回 Anthropic SSE 格式的字符串（多行）。
  * 第一个 chunk 会触发 message_start + content_block_start。
@@ -437,6 +471,9 @@ export function openAIChunkToAnthropicSSE(
   acc: AnthropicSSEAccumulator
 ): string {
   const events: string[] = []
+  // 已发过 error（工具参数修不好）：后续 chunk 一律不再产出事件 —— 客户端已按失败处理，
+  // 再补 message_delta/message_stop 会让它把这一轮读成「正常结束」（源侧同口径）。
+  if (acc.fatalError) return ''
 
   // 首次：发送 message_start
   if (!acc.messageId) {
@@ -475,6 +512,7 @@ export function openAIChunkToAnthropicSSE(
       if (!acc.currentBlockClosed) {
         closeCurrentBlock(acc, events)
       }
+      if (acc.fatalError) return formatAnthropicSSE(events)
       acc.stopReason = mapFinishReason(choice.finish_reason)
       if (acc.stopReason === 'tool_use' && !hasStartedToolUseBlock(acc)) acc.stopReason = 'end_turn'
       events.push(`event: message_delta`)
@@ -585,7 +623,17 @@ export function openAIChunkToAnthropicSSE(
       // 累积 arguments，并在 name 到齐后增量发出
       // （含首片：旧实现在「创建分支」里把首片塞进 input 却从不发 delta，导致 input 残缺）
       if (block && tc.function?.arguments) {
-        block.input += tc.function.arguments
+        const incoming = tc.function.arguments
+        const previous = block.input
+        if (previous !== '' && incoming.startsWith(previous) && incoming.length > previous.length) {
+          // 累计快照：整体替换，只发新增后缀（源侧 `append_tool_arguments` 同款）。
+          // 不做这一步，快照会被当增量拼成 `{...}{...}` —— 客户端拿到必然解析失败的 input。
+          block.input = incoming
+        } else if (previous !== '' && previous.startsWith(incoming) && isJsonText(incoming)) {
+          // 重放前缀（同一段已发过的完整值）：忽略，避免重复下发
+        } else {
+          block.input += incoming
+        }
         emitToolArgsDelta(acc, block, events)
       }
     }
@@ -602,6 +650,8 @@ export function openAIChunkToAnthropicSSE(
     if (!acc.currentBlockClosed) {
       closeCurrentBlock(acc, events)
     }
+    // 工具参数修不好 → 本轮已发 `event: error`，不再补 message_delta/message_stop
+    if (acc.fatalError) return formatAnthropicSSE(events)
     acc.stopReason = mapFinishReason(choice.finish_reason)
     if (acc.stopReason === 'tool_use' && !hasStartedToolUseBlock(acc)) acc.stopReason = 'end_turn'
 
@@ -717,13 +767,31 @@ function closeCurrentBlock(acc: AnthropicSSEAccumulator, events: string[]): void
       acc.currentBlockClosed = true
       return
     }
-    // 收尾补发尚未发出的 arguments（name 晚到的形态）
+    // 1) 收尾修复：把半截 JSON 补成合法值。repair 只做纯追加（补引号/补括号），
+    //    因此结果可以当作**同一块的最后一段增量**下发，客户端拼接后正是完整 JSON。
+    if (block.input !== '' && !isJsonText(block.input)) {
+      const repaired = repairJsonArguments(block.input)
+      if (repaired !== block.input && repaired.startsWith(block.input) && isJsonText(repaired)) {
+        block.input = repaired
+      }
+    }
+    // 2) 补发尚未发出的 arguments（name 晚到的形态 + 上一步的修复后缀）
     emitToolArgsDelta(acc, block, events)
+    // 3) 修不好 → 发 error 且**不关块**：与源侧 `tool_input_error()` 同口径。
+    //    不关块是为了让「错误」成为这一轮的唯一终态，而不是「错误之后又正常结束」。
+    if (block.input !== '' && !isJsonText(block.input)) {
+      const message = `Tool input for ${block.name || 'tool'} is invalid JSON: `
+        + 'upstream tool arguments ended before a complete object'
+      acc.fatalError = message
+      events.push(...anthropicErrorEvents(message))
+      acc.currentBlockClosed = true
+      return
+    }
     // 解析累积的 input JSON 为规范字符串（便于非流式聚合/调试）
     try {
       const parsed = JSON.parse(block.input)
       block.input = JSON.stringify(parsed)
-    } catch { /* 保留原始字符串 */ }
+    } catch { /* 空参数保持空串：零参数调用不编造 {} */ }
   }
   events.push(`event: content_block_stop`)
   events.push(`data: ${JSON.stringify({ type: 'content_block_stop', index: acc.currentBlockIndex })}`)
@@ -757,6 +825,9 @@ export function finalizeAnthropicStream(acc: AnthropicSSEAccumulator): string {
   if (!acc.currentBlockClosed && acc.currentBlockIndex >= 0) {
     closeCurrentBlock(acc, events)
   }
+  // 已发 error（工具参数修不好）：这一轮的终态就是错误，不得再补 message_stop —— 否则
+  // 客户端会在「失败」之后又收到「正常结束」，把半截参数当成功（源侧同口径）。
+  if (acc.fatalError) return events.length > 0 ? formatAnthropicSSE(events) : ''
   // 2. 发送未发送的 message_stop
   if (!acc.messageStopSent) {
     acc.stopReason = acc.stopReason || 'end_turn'
@@ -783,6 +854,8 @@ export function diagnoseAnthropicAccumulator(acc: AnthropicSSEAccumulator): Reco
     messageStopSent: acc.messageStopSent,
     currentBlockClosed: acc.currentBlockClosed,
     currentBlockIndex: acc.currentBlockIndex,
+    // 工具参数修不好时的终态标记：日志里出现它 = 这一轮是被 error 帧收掉的，不是正常结束
+    fatalError: acc.fatalError ?? null,
     contentBlocks: acc.contentBlocks.map(b => ({
       type: b.type,
       index: b.index,
@@ -851,7 +924,23 @@ export function aggregateOpenAIToAnthropic(chunks: OpenAIChunk[]): Record<string
     if (!entry.name) continue
     if (!entry.id) entry.id = genToolUseId()
     let input: Record<string, unknown> = {}
-    try { input = JSON.parse(entry.args) } catch { /* keep empty */ }
+    // 参数必须是合法 JSON 对象：先尝试修复，修不好就**丢弃该调用**，绝不下发 `input: {}`。
+    // 空对象会让客户端拿「没有参数」去执行工具（例如无 path 的写文件），而它在协议上看起来
+    // 是一次成功的 tool_use —— 与源侧 `_tool_use_block` 改 `raise AnthropicRequestError`
+    // 同一动机（`a01d77c`）。空参数（`''`）保持零参数语义，不编造。
+    if (entry.args.trim() !== '') {
+      const repaired = repairJsonArguments(entry.args)
+      if (!isJsonText(repaired)) {
+        console.warn(`[formats] 丢弃参数不可用的 tool_use: ${entry.name}`)
+        continue
+      }
+      const parsed = JSON.parse(repaired) as unknown
+      if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+        console.warn(`[formats] 丢弃参数不是 JSON 对象的 tool_use: ${entry.name}`)
+        continue
+      }
+      input = parsed as Record<string, unknown>
+    }
     contentBlocks.push({ type: 'tool_use', id: entry.id, name: entry.name, input })
     toolCalls.push({ id: entry.id, name: entry.name, input })
   }

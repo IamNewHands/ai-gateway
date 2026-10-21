@@ -418,6 +418,142 @@ export function flattenTraeQuery(messages: unknown, opts?: { attachments?: TraeQ
   }
 }
 
+/**
+ * Remote `query` 的默认硬上限（字符）。
+ *
+ * 为什么必须有：上游对超长 `query` 是**静默失败** —— 不发 `done`、直接关连接（源侧实测约
+ * 480k~500k 字符）。客户端看到的是「连接断了/没有内容」，与 executor 不启动的症状完全一样，
+ * 事后只能靠猜。源侧 `_bounded_remote_query`（Trae2api-cn `2f2dc1a` / `e077061`）把这个数字
+ * 落成常量并按它压缩历史；本仓库此前只在 trace 里记 `queryChars`（`remote.ts`），没有任何
+ * 上限，长会话（Codex 类上千条消息）必然撞上。
+ *
+ * 取值对齐源侧「约 480k」：留出与上游真实阈值之间的余量，避免贴边抖动。
+ */
+export const TRAE_REMOTE_QUERY_MAX_CHARS = 480_000
+
+/**
+ * 单条超长消息被截断时插入的标记（源侧 `_REMOTE_QUERY_TRUNCATION_MARKER` 同文案）。
+ *
+ * 必须显式标记：静默截断会让模型以为上下文完整，从而在「看起来缺了前文」的地方自信编造。
+ * 保留开头（任务/约束常在最前面）与结尾（最新进展），中间替换成这条标记。
+ */
+export const TRAE_REMOTE_QUERY_TRUNCATION_MARKER =
+  '\n\n[relay: older context omitted to fit the Trae remote query limit]\n\n'
+
+/** `boundRemoteQuery` 无法把 query 压到上限内时抛出（调用方映射 413，且**不得换号重放**）。 */
+export class RemoteQueryTooLargeError extends Error {
+  readonly queryChars: number
+  readonly limit: number
+  constructor(queryChars: number, limit: number) {
+    super(
+      `Trae remote query exceeds the configured input limit (${queryChars} > ${limit} characters after compaction). `
+      + 'Attached images count toward this limit; reduce the input size or use the IDE/Solo endpoint for larger payloads.'
+    )
+    this.name = 'RemoteQueryTooLargeError'
+    this.queryChars = queryChars
+    this.limit = limit
+  }
+}
+
+export interface RemoteQueryBoundResult {
+  messages: unknown[]
+  /** 压缩后的扁平 `query` 字符数（就是上游真正看到的长度） */
+  chars: number
+  /** 被整条丢弃的历史消息数 */
+  droppedMessages: number
+  /** 被头尾截断的单条消息数 */
+  truncatedMessages: number
+}
+
+/**
+ * 把 messages 压到 Remote `query` 的上限内（源侧 `_bounded_remote_query` 的等价物）。
+ *
+ * 三档降级，顺序与源侧一致：
+ *  1. **丢最旧的完整回合**（system/developer 恒保留，最后一条消息恒保留 —— 丢掉它就没有
+ *     问题可答了）；
+ *  2. 仍超限 → 对**贡献最大**的单条消息做头 + 尾保留、中间插入截断标记（`truncatedMessages`）；
+ *  3. 仍超限 → 抛 `RemoteQueryTooLargeError`，由调用方返回 413 终态。
+ *
+ * 为什么第 3 档必须是终态而不是「换号重试」：输入长度是**确定性**属性，同一 body 换任何账号
+ * 都撞同一个上限，轮转只会白烧健康号并把真因伪装成「账号池无可用账号」（源侧 release-v1.0.6
+ * 明确写了「不再把同一请求重复提交到其他账号」）。
+ *
+ * 度量口径是**扁平化后的 wire query**（含 `[System]` / `[Assistant]` 前缀与 attachment 块），
+ * 不是 `JSON.stringify(message).length` —— 上游限制的是前者，用后者会系统性低估。
+ */
+export function boundRemoteQuery(
+  messages: unknown,
+  opts: {
+    maxChars: number
+    attachments?: TraeQueryAttachment[]
+    marker?: string
+  }
+): RemoteQueryBoundResult {
+  const limit = Number.isFinite(opts.maxChars) ? Math.floor(opts.maxChars) : 0
+  const marker = opts.marker ?? TRAE_REMOTE_QUERY_TRUNCATION_MARKER
+  const source = Array.isArray(messages) ? messages : []
+  // limit <= 0 = 不设限（面板留空时的显式语义），原样返回
+  if (limit <= 0) {
+    return { messages: source, chars: flattenTraeQuery(source, { attachments: opts.attachments }).length, droppedMessages: 0, truncatedMessages: 0 }
+  }
+
+  const out = source.slice()
+  const measure = (): number => flattenTraeQuery(out, { attachments: opts.attachments }).length
+
+  // ---- 第 1 档：从最旧的完整回合起整条丢弃 ----
+  let droppedMessages = 0
+  while (measure() > limit) {
+    let dropAt = -1
+    for (let i = 0; i < out.length; i++) {
+      const role = roleOf(out[i])
+      if (role === 'system' || role === 'developer') continue
+      // 最后一条恒保留：它是本轮真正要回答的问题
+      if (i === out.length - 1) continue
+      dropAt = i
+      break
+    }
+    if (dropAt < 0) break
+    out.splice(dropAt, 1)
+    droppedMessages += 1
+  }
+
+  // ---- 第 2 档：单条超长消息头尾保留 + 截断标记 ----
+  let truncatedMessages = 0
+  // 每轮至少缩掉一点，用迭代上界兜住「缩不动」的死循环（正常 2~3 轮就收敛）
+  for (let guard = 0; guard < 64 && measure() > limit; guard++) {
+    let target = -1
+    let targetSize = 0
+    for (let i = 0; i < out.length; i++) {
+      const m = out[i]
+      if (!m || typeof m !== 'object' || Array.isArray(m)) continue
+      const text = contentToText((m as Record<string, any>)['content'])
+      // 已经缩到只剩标记的消息不再参与（否则会无限缩同一条）
+      if (text.length <= marker.length + 8) continue
+      const size = sizeOf(m)
+      if (size > targetSize) {
+        targetSize = size
+        target = i
+      }
+    }
+    if (target < 0) break
+    const message = out[target] as Record<string, any>
+    const text = contentToText(message['content'])
+    const excess = measure() - limit
+    const keep = Math.max(2, text.length - excess - marker.length)
+    const head = Math.max(1, Math.floor(keep / 2))
+    const tail = Math.max(0, keep - head)
+    const truncated = text.slice(0, head) + marker + (tail > 0 ? text.slice(text.length - tail) : '')
+    // 只替换 content：tool_calls / name / tool_call_id 等结构字段原样保留，
+    // 否则会拆散工具调用配对（`flattenTraeQuery` 靠它们产出 `[Client Tool Result: …]`）
+    out[target] = { ...message, content: truncated }
+    truncatedMessages += 1
+  }
+
+  const chars = measure()
+  if (chars > limit) throw new RemoteQueryTooLargeError(chars, limit)
+  return { messages: out, chars, droppedMessages, truncatedMessages }
+}
+
 /** 单 pass 改写；无法解析时原样返回。 */
 export function prepareBody(src: string): string {
   if (!src) return src

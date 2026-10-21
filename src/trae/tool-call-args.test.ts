@@ -327,3 +327,114 @@ describe('soloStreamToOpenAIStream：SOLO 工具调用坏形态（issue #8）', 
     expect(finish).not.toContain('tool_calls')
   })
 })
+
+// ===== 流式收尾修复（移植 Trae2api-cn a01d77c / e5eb6d1）=====
+//
+// 目标侧旧行为：流式逐片原样下发，上游把 JSON 截断在半路时客户端拿到半截 `arguments`，
+// 而 `finish_reason` 仍是 `tool_calls` ⇒ 客户端把一次**已计费**的回合当成功（执行带错参数
+// 的工具，或解析失败后重试同一请求）。现在收尾时补发一条纯追加的修复增量；修不好则发
+// 具名 error 帧并把 `finish_reason` 降为 `length`。
+
+/** 取流里所有非增量帧（finish_reason / error 帧）。 */
+function streamFrames(sse: string): Array<Record<string, any>> {
+  return sse
+    .split('\n')
+    .filter((l) => l.startsWith('data:'))
+    .map((l) => l.slice(5).trim())
+    .filter((b) => b !== '' && b !== '[DONE]')
+    .map((b) => JSON.parse(b))
+}
+
+function finishReasons(sse: string): string[] {
+  return streamFrames(sse)
+    .map((c) => c?.choices?.[0]?.finish_reason)
+    .filter((f): f is string => typeof f === 'string' && f !== '')
+}
+
+describe('流式工具参数收尾修复', () => {
+  it('截断在字符串中 → 收尾补发后缀，客户端拼出合法 JSON，finish_reason 仍是 tool_calls', async () => {
+    const sse = await drain(
+      soloStreamToOpenAIStream(
+        upstreamOf([
+          output({ tool_calls: [{ index: 0, id: 'c1', function: { name: 'Bash', arguments: '{"command": "git sta' } }] }),
+          done(),
+        ]),
+        'DeepSeek-V4.1-Flash',
+      ),
+    )
+    const calls = collectStreamToolCalls(sse)
+    expect(calls).toHaveLength(1)
+    // 关键断言：客户端按增量拼接后必须拿到**合法 JSON**，而不是半截字符串
+    expect(isJsonText(calls[0].args)).toBe(true)
+    expect(JSON.parse(calls[0].args)).toEqual({ command: 'git sta' })
+    expect(finishReasons(sse)).toContain('tool_calls')
+    expect(streamFrames(sse).some((f) => f?.error)).toBe(false)
+  })
+
+  it('截断在嵌套括号中 → 按栈补齐后仍是合法 JSON', async () => {
+    const sse = await drain(
+      soloStreamToOpenAIStream(
+        upstreamOf([
+          output({ tool_calls: [{ index: 0, id: 'c1', function: { name: 'Write', arguments: '{"a": {"b": [1, 2' } }] }),
+          done(),
+        ]),
+        'DeepSeek-V4.1-Flash',
+      ),
+    )
+    const calls = collectStreamToolCalls(sse)
+    expect(calls).toHaveLength(1)
+    expect(isJsonText(calls[0].args)).toBe(true)
+    expect(JSON.parse(calls[0].args)).toEqual({ a: { b: [1, 2] } })
+  })
+
+  it('修不好（字面量截断）→ 发 error 帧且 finish_reason 降为 length，不得谎报 tool_calls', async () => {
+    const sse = await drain(
+      soloStreamToOpenAIStream(
+        upstreamOf([
+          // `tru` 补上引号/括号也成不了合法 JSON → repair 放弃
+          output({ tool_calls: [{ index: 0, id: 'c1', function: { name: 'Bash', arguments: '{"a": tru' } }] }),
+          done(),
+        ]),
+        'DeepSeek-V4.1-Flash',
+      ),
+    )
+    const frames = streamFrames(sse)
+    const errFrame = frames.find((f) => f?.error)
+    expect(errFrame).toBeTruthy()
+    expect(String(errFrame?.error?.code)).toBe('upstream_tool_args_invalid')
+    const finish = finishReasons(sse)
+    expect(finish).toContain('length')
+    expect(finish).not.toContain('tool_calls')
+  })
+
+  it('无 done 兜底路径同样补发修复后缀', async () => {
+    const sse = await drain(
+      soloStreamToOpenAIStream(
+        upstreamOf([
+          output({ tool_calls: [{ index: 0, id: 'c1', function: { name: 'Bash', arguments: '{"command": "ls' } }] }),
+          // 故意不发 done：模拟上游截断
+        ]),
+        'DeepSeek-V4.1-Flash',
+      ),
+    )
+    const calls = collectStreamToolCalls(sse)
+    expect(calls).toHaveLength(1)
+    expect(isJsonText(calls[0].args)).toBe(true)
+    expect(JSON.parse(calls[0].args)).toEqual({ command: 'ls' })
+  })
+
+  it('已合法的参数不重复下发任何增量（幂等）', async () => {
+    const sse = await drain(
+      soloStreamToOpenAIStream(
+        upstreamOf([
+          output({ tool_calls: [{ index: 0, id: 'c1', function: { name: 'Bash', arguments: '{"a":1}' } }] }),
+          done(),
+        ]),
+        'DeepSeek-V4.1-Flash',
+      ),
+    )
+    const calls = collectStreamToolCalls(sse)
+    expect(calls).toHaveLength(1)
+    expect(calls[0].args).toBe('{"a":1}')
+  })
+})

@@ -15,7 +15,7 @@ import { withSSEKeepAlive } from '../opencode'
 import { getPerfSettings } from '../perf'
 import { TRAE_CONNECT_DEADLINES_MS, TRAE_DEFAULT_MODEL, TRAE_KEEPALIVE_MS, TRAE_RAW_MAX_HISTORY_CHARS, TRAE_RAW_MAX_MESSAGES, TRAE_RAW_MAX_TOOL_SCHEMA_CHARS, TRAE_REMOTE_AGENT_PROBE_MS, TRAE_REMOTE_FIRST_EVENT_TIMEOUT_MS, TRAE_STATIC_MODEL_IDS, TRAE_STREAM_IDLE_TIMEOUT_MS, TRAE_WORK_CONSTANTS, isWorkModel, normalizeTraeModelName } from './constants'
 import { chatStream, chatWorkStream, exchangeToken, extractLastUserPrompt, isTraeQuotaError, isTraeRequestSideError, needsTraeRefresh, parseAuth, probeTraeCredits, type TraeConnectTiming } from './upstream'
-import { isRemoteOnlyModel, type HistoryBudget } from './payload'
+import { isRemoteOnlyModel, RemoteQueryTooLargeError, TRAE_REMOTE_QUERY_MAX_CHARS, type HistoryBudget } from './payload'
 import { aggregateSoloSse, aggregateWorkSse, soloStreamToOpenAIStream, workStreamToOpenAIStream } from './sse'
 import { aggregateWebSse, webStreamToOpenAIStream } from './web-sse'
 import { createRemoteSession, effectiveRemoteConcurrency, preflightFirstModelEvent, streamRemoteEvents, stopRemoteSession, type RemoteSessionTrace } from './remote'
@@ -850,6 +850,11 @@ async function proxyTraeRemoteRequest(
             requestBody,
             trace,
             imageParts,
+            // 面板「历史总字符数上限」在这里第一次真正作用于 Remote 通道
+            //（此前 `__budget` 只在 SOLO 路径注入，remote 提供商的面板设置是静默失效的）。
+            maxQueryChars: typeof provider.traeMaxHistoryChars === 'number' && provider.traeMaxHistoryChars > 0
+              ? provider.traeMaxHistoryChars
+              : TRAE_REMOTE_QUERY_MAX_CHARS,
             sessionVariant: tierFallbackUsed ? 'work-fallback' : '',
           })
           // 登记存活会话（见 session-registry 注释）：隔离进程若在「建会话」与「回收」
@@ -903,6 +908,9 @@ async function proxyTraeRemoteRequest(
             // query 长度：源侧 Remote 对超长 query 有静默上限（约 480k），超了上游直接丢
             // 会话且不发 done —— 症状与「executor 不启动」一样，只有这个数字能区分两者。
             + ` query=${trace.queryChars ?? -1}`
+            // 压缩读数：非 0 说明这一轮上游看到的历史被砍过（模型「忘了前文」的真因在这里，
+            // 不是模型退化）。与 query 一起看，才能判断是不是贴到 480k 上限了。
+            + ` dropped=${trace.queryDroppedMessages ?? 0} truncated=${trace.queryTruncatedMessages ?? 0}`
             // 变体阶梯的实验读数：成功时是哪一档赢的（失败时空串，原因在下面的 warn 日志里）。
             // 没有这个字段，命中信息只走 console.log，面板 durable 日志里看不到 ——
             // 而「是哪一档赢的」正是把阶梯收敛成只留那一档的唯一依据。
@@ -934,6 +942,21 @@ async function proxyTraeRemoteRequest(
           }
         } catch (e) {
           lastErr = e as Error
+          // 输入超限是**确定性**终态：同一 body 换任何账号都会撞同一个上限，轮转只会白烧
+          // 健康号并把真因伪装成「账号池无可用账号」（源侧 release-v1.0.6 同口径：直接 413，
+          // 不再把同一请求重复提交到其他账号）。不罚号，也不进 Work 档位兜底。
+          if (e instanceof RemoteQueryTooLargeError) {
+            const msg = `[trae-remote] provider=${provider.id} uid=${account.uid} model=${configName}`
+              + ` end=context_length_exceeded query=${e.queryChars} limit=${e.limit}`
+            console.log(msg) // CodeQL 误报（CODING_NOTES.md §493）： 纯诊断日志，不含凭据/敏感 token
+            writeLog(env, 'warn', msg).catch(() => { /* 日志失败不影响响应 */ })
+            terminalResponse = openaiError(
+              413,
+              'context_length_exceeded',
+              `TRAE Remote 输入超出上限（压缩后 ${e.queryChars} > ${e.limit} 字符）：请缩短历史或改用 SOLO/IDE 端点`
+            )
+            break
+          }
           // **失败即回收**：把上游会话停掉，别让它占着账号的并发槽位。
           // 这是本轮事故的核心：漏回收 → 槽位积满 → 之后每个新会话只排队、executor 不启动
           //（表现为「只发心跳、永远没有首个模型事件」），还会叠加上游 429。

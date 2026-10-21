@@ -29,7 +29,7 @@ import {
   RemoteFirstEventTimeout,
   RemoteStreamIncomplete,
 } from './remote'
-import { flattenTraeQuery } from './payload'
+import { flattenTraeQuery, RemoteQueryTooLargeError } from './payload'
 import type { CreateRemoteSessionOptions } from './remote'
 import type { TraeAccount, TraeRemoteEvent, TraeRemoteModelConfig } from './types'
 
@@ -843,5 +843,61 @@ describe('streamRemoteEvents：死线必须在**读取本身**上生效', () => 
     expect(heads).toHaveLength(1)
     expect(heads[0]).toContain('plan_item')
     expect(firsts).toEqual(['plan_item'])
+  })
+})
+
+// ============================================================================
+// Remote query 上限（移植 Trae2api-cn 2f2dc1a / e077061）
+//
+// 上游对超长 query 静默失败（不发 done、直接关流）。目标侧此前没有任何上限，长会话必然撞上，
+// 且症状与「连接超时」同形。这里钉两件事：① 建会话前就把 query 压到上限内（并回填压缩读数）；
+// ② 压不下去时**一个请求都不发**（确定性终态，不许换号重放）。
+// ============================================================================
+
+describe('createRemoteSession：query 上限', () => {
+  it('maxQueryChars 生效：超长历史被压缩，回填 dropped/truncated 与真实 queryChars', async () => {
+    let captured: any = null
+    vi.stubGlobal('fetch', vi.fn(async (_url: string, init: any) => {
+      captured = JSON.parse(init.body)
+      return sessionResponse()
+    }))
+    const trace: NonNullable<CreateRemoteSessionOptions['trace']> = {}
+    const long = 'A'.repeat(3000)
+    await createRemoteSession(ACCOUNT, 'auto', [
+      { role: 'system', content: 'S' },
+      { role: 'user', content: long },
+      { role: 'assistant', content: long },
+      { role: 'user', content: 'newest' },
+    ], { maxQueryChars: 800, trace })
+
+    const query = String(captured.initial_message.query)
+    expect(query.length).toBeLessThanOrEqual(800)
+    expect(trace.queryChars).toBe(query.length)
+    // system 恒保留、最后一条恒保留
+    expect(query).toContain('[System]')
+    expect(query).toContain('newest')
+    expect((trace.queryDroppedMessages ?? 0) + (trace.queryTruncatedMessages ?? 0)).toBeGreaterThan(0)
+  })
+
+  it('压不到上限内 → 抛 RemoteQueryTooLargeError，且**一个请求都不发**', async () => {
+    const fetchSpy = vi.fn(async () => sessionResponse())
+    vi.stubGlobal('fetch', fetchSpy)
+    await expect(
+      createRemoteSession(ACCOUNT, 'auto', [{ role: 'user', content: 'A'.repeat(3000) }], { maxQueryChars: 60 })
+    ).rejects.toBeInstanceOf(RemoteQueryTooLargeError)
+    expect(fetchSpy).not.toHaveBeenCalled()
+  })
+
+  it('未配置 maxQueryChars → 走 480k 默认值，普通长会话不被压缩', async () => {
+    let captured: any = null
+    vi.stubGlobal('fetch', vi.fn(async (_url: string, init: any) => {
+      captured = JSON.parse(init.body)
+      return sessionResponse()
+    }))
+    const trace: NonNullable<CreateRemoteSessionOptions['trace']> = {}
+    await createRemoteSession(ACCOUNT, 'auto', [{ role: 'user', content: 'A'.repeat(5000) }], { trace })
+    expect(trace.queryDroppedMessages).toBe(0)
+    expect(trace.queryTruncatedMessages).toBe(0)
+    expect(String(captured.initial_message.query).length).toBeGreaterThan(5000)
   })
 })

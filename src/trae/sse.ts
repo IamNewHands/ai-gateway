@@ -10,8 +10,13 @@
  *   event:token_usage data:{"prompt_tokens":21,...}
  *   event:done data:{"finish_reason":"stop"}
  */
+import { isJsonText, isUsableToolArgs, repairJsonArguments } from '../json-repair'
 import { buildTraeRunawayInfo, isDegenerateReasoningText, TraeReasoningGuard, TRAE_RUNAWAY_GRACE_CHARS, traeRunawayErrorFrame, type TraeRunawayInfo } from './runaway'
 import type { SOLOEvent, SOLOStreamError } from './types'
+
+// JSON 判定/修复的**唯一实现**在 `src/json-repair.ts`（Anthropic 出口 `formats.ts` 共用同一份，
+// 避免同一段坏参数在两条出口修法不一致）。此处保留同名导出，既有调用方与测试的 import 路径不变。
+export { isJsonText, isUsableToolArgs, repairJsonArguments }
 
 /** 解析一条事件（eventName 为 event 行值，dataLine 为 data 行值）。 */
 export function parseSoloLine(eventName: string, dataLine: string): SOLOEvent | null {
@@ -299,17 +304,6 @@ export function aggregateSoloSse(text: string, opts?: { readError?: boolean }): 
 // 对外 index 由合并器**按创建顺序**分配（0,1,2…），不透传上游 index：上游 index 会被
 // 并发调用复用，透传就会让两个逻辑调用撞同一 index，而客户端对同一 index 是拼接语义。
 
-/** 合法 JSON 文本（含标量）→ true；空串与解析失败 → false。 */
-export function isJsonText(text: string): boolean {
-  if (text === '') return false
-  try {
-    JSON.parse(text)
-    return true
-  } catch {
-    return false
-  }
-}
-
 /** 片段是否像一个新 JSON 值的起点（`{` 或 `[`，允许前导空白）。 */
 function startsNewJsonValue(text: string): boolean {
   const c = text.replace(/^\s+/, '').slice(0, 1)
@@ -323,33 +317,10 @@ function isOrphanClosingFragment(text: string): boolean {
 }
 
 /**
- * 尽力补全被截断的 JSON 参数（补未闭合字符串与括号栈）。
+ * 尽力补全被截断的 JSON 参数（补未闭合字符串与括号栈）—— 实现见 `src/json-repair.ts`。
  * 对齐源侧 `_repair_json_arguments`：只在结果能通过 `JSON.parse` 时才返回新值，否则原样返回
  * —— 宁可不修，也不编造一个能过 schema 的错误参数。
  */
-export function repairJsonArguments(argumentsText: string): string {
-  if (!argumentsText || isJsonText(argumentsText)) return argumentsText
-  let repaired = argumentsText.replace(/\s+$/, '')
-  const stack: string[] = []
-  let inStr = false
-  let esc = false
-  for (const ch of repaired) {
-    if (inStr) {
-      if (esc) esc = false
-      else if (ch === '\\') esc = true
-      else if (ch === '"') inStr = false
-      continue
-    }
-    if (ch === '"') inStr = true
-    else if (ch === '{' || ch === '[') stack.push(ch)
-    else if (ch === '}' || ch === ']') {
-      if (stack.length > 0) stack.pop()
-    }
-  }
-  if (inStr) repaired += '"'
-  for (let i = stack.length - 1; i >= 0; i--) repaired += stack[i] === '{' ? '}' : ']'
-  return isJsonText(repaired) ? repaired : argumentsText
-}
 
 /** 返回从 start 起的完整 JSON 值的结束下标（不含）；失败返回 -1。 */
 function jsonValueEnd(text: string, start: number): number {
@@ -499,6 +470,46 @@ export class SoloToolCallMerger {
   /** 诊断计数（供调用方记日志/告警）。 */
   stats(): { dropped: number; repaired: number; splits: number } {
     return { dropped: this.dropped, repaired: this.repaired, splits: this.splits }
+  }
+
+  /**
+   * 流式收尾：为「已下发半截参数」的调用补一条**纯追加**的修复增量。
+   *
+   * 为什么需要：流式路径边生成边下发（见 mergeOne），上游把 JSON 截断在半路时客户端已经
+   * 收到半截 `arguments`，而 `results()` 里的 repair 只服务非流式聚合 —— 于是客户端拿到
+   * `finish_reason=tool_calls` + 残缺 JSON，把一次**已计费**的回合当成功。
+   * 源侧（Trae2api-cn `a01d77c`）改用「全程累计、流末校验后一次性下发」消灭这个形态；
+   * 本仓库保留渐进下发（客户端早看到调用、长参数不憋到流末），改为收尾补发，语义等价：
+   * 修复只做纯追加（补未闭合字符串的引号 / 按括号栈补闭合符），后缀可以安全地追加到
+   * 同一个 index 上，客户端按增量拼接后得到的正是完整 JSON。
+   *
+   * @returns `deltas`：应补发的增量（可能为空）；`broken`：修不好、必须让本轮失败的数量
+   *          （调用方据此把 `finish_reason` 从 `tool_calls` 降级，见 `soloStreamToOpenAIStream`）
+   */
+  finalizeDeltas(): { deltas: Record<string, any>[]; broken: number } {
+    const deltas: Record<string, any>[] = []
+    let broken = 0
+    for (const outIndex of this.order) {
+      const merged = this.calls.get(outIndex)
+      if (!merged) continue
+      // 空参数视同零参数（不编造），已合法的原样保留
+      if (isUsableToolArgs(merged.args)) continue
+      const repaired = repairJsonArguments(merged.args)
+      // 纯追加才可下发：repair 的返回值必以入参为前缀，这里再断言一次，
+      // 防将来改动 repair 语义后「补发后缀」悄悄变成「下发一份不连续的参数」。
+      if (isJsonText(repaired) && repaired.startsWith(merged.args) && repaired.length > merged.args.length) {
+        const suffix = repaired.slice(merged.args.length)
+        merged.args = repaired
+        this.repaired += 1
+        deltas.push({ index: outIndex, function: { arguments: suffix } })
+      } else {
+        broken += 1
+      }
+    }
+    if (deltas.length > 0 || broken > 0) {
+      console.warn(`[trae-tool-calls] finalize repaired=${deltas.length} broken=${broken}`)
+    }
+    return { deltas, broken }
   }
 
   private mergeOne(call: Record<string, any>): Record<string, any> | null {
@@ -812,6 +823,34 @@ export function soloStreamToOpenAIStream(
         controller.enqueue(encodeSse('[DONE]'))
       }
 
+      /**
+       * 工具参数收尾：补发纯追加的修复增量，返回 true = 存在修不好的调用。
+       *
+       * 修不好时客户端已收到的半截参数**无法撤回**，只能靠具名 error 帧 + `finish_reason`
+       * 降级（`tool_calls` → `length`）让本轮按失败处理。否则就是「截断参数当成功」——
+       * 客户端执行一次带错参数的工具，而这一轮上游已经计费（源侧 `a01d77c` 的 strict 分支
+       * 同一定责：`InvalidNativeToolArguments(retryable=False)`）。
+       */
+      const flushToolRepair = (): boolean => {
+        const { deltas, broken } = toolMerger.finalizeDeltas()
+        for (const d of deltas) {
+          sawToolCalls = true
+          writeChunk({ tool_calls: [d] }, '')
+        }
+        if (broken > 0) {
+          try {
+            controller.enqueue(encodeSse(JSON.stringify({
+              error: {
+                message: `Trae 上游工具参数无法修复（broken=${broken}）：本轮按截断失败处理，请重试`,
+                type: 'upstream_tool_args_invalid',
+                code: 'upstream_tool_args_invalid',
+              },
+            })))
+          } catch { /* 流已被取消 */ }
+        }
+        return broken > 0
+      }
+
       /** 「本轮尚未产出任何可用结果」：退化熔断与 runaway 报错都只在这种形态下触发。 */
       const noProgress = (): boolean => contentChars === 0 && !sawToolCalls
 
@@ -896,6 +935,11 @@ export function soloStreamToOpenAIStream(
               let finish = ev.finishReason
               if (sawToolCalls && (finish === '' || finish === 'stop')) finish = 'tool_calls'
               if (!finish) finish = sawToolCalls ? 'tool_calls' : 'stop'
+              // 收尾前先补发工具参数的修复后缀（见 flushToolRepair）：上游把 JSON 截断在
+              // 半路时，客户端已收到的半截参数只能靠这条纯追加增量补完。
+              // 修不好则必须以失败收尾 —— `length` 语义诚实（模型被掐了），不得报 tool_calls
+              // 让客户端拿半截参数执行工具（源侧 a01d77c 的 strict 分支同一定责）。
+              if (flushToolRepair()) finish = 'length'
               writeChunk({}, finish)
               writeDone()
               sawDone = true
@@ -995,10 +1039,12 @@ export function soloStreamToOpenAIStream(
             onTruncated({ kind: readErrored ? 'read_error' : 'no_done', contentChars, reasoningChars, sawToolCalls, sawUsage })
           } catch { /* 诊断回调不得影响流 */ }
         }
+        // 先补发可修复的工具参数后缀，再报截断：顺序反了客户端会先收到失败帧而丢掉后续增量。
+        const argsBroken = flushToolRepair()
         try {
           controller.enqueue(encodeSse(JSON.stringify({ error: { message: text, type: kind, code: kind } })))
         } catch { /* 流已被取消 */ }
-        writeChunk({}, sawToolCalls ? 'tool_calls' : 'stop')
+        writeChunk({}, argsBroken ? 'length' : sawToolCalls ? 'tool_calls' : 'stop')
         writeDone()
       }
       // 收尾审计：流正常读完时上报一次（退化熔断路径由 onRunaway 记，两路口径不混）。

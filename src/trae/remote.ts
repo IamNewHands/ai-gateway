@@ -26,7 +26,7 @@ import {
   TRAE_REMOTE_STREAM_TIMEOUT_MS,
   normalizeTraeModelName,
 } from './constants'
-import { flattenTraeQuery, type TraeQueryAttachment } from './payload'
+import { boundRemoteQuery, flattenTraeQuery, TRAE_REMOTE_QUERY_MAX_CHARS, type TraeQueryAttachment } from './payload'
 import { applyReasoningEffort, type TraeEffortLevel } from './reasoning-effort'
 import { uploadImageParts } from './resource-upload'
 import type { TraeAccount, TraeErrKind, TraeReasoningEffortConfig, TraeRemoteEvent, TraeRemoteModelConfig } from './types'
@@ -625,6 +625,14 @@ export interface CreateRemoteSessionOptions {
    * 才转写图片」是同一个门禁语义。上传失败也不让整轮会话失败（见 `createRemoteSession`）。
    */
   imageParts?: Array<{ bytes: Uint8Array; filename: string }>
+  /**
+   * 扁平 `query` 的硬上限（字符）。不传用 `TRAE_REMOTE_QUERY_MAX_CHARS`（约 480k）。
+   *
+   * 面板 `traeMaxHistoryChars` 会经此生效 —— 此前 Remote 通道**完全没有**历史预算
+   *（`__budget` 只在 SOLO 路径注入，`proxy.ts` 在 Remote 分支早退），面板里那个「历史总字符数
+   * 上限」对 remote 提供商是静默失效的。
+   */
+  maxQueryChars?: number
   /** 诊断：把 effort / max / query 长度等结果写回调用方（见 RemoteSessionTrace） */
   trace?: RemoteSessionTrace
 }
@@ -646,6 +654,16 @@ export interface RemoteSessionTrace {
    * 不启动的症状**完全一样**。没有这个数字，那种失败只能靠猜。
    */
   queryChars?: number
+  /**
+   * 为压到 `queryChars` 上限内被**整条丢弃**的历史消息数（源侧 `_bounded_remote_query`
+   * 的 `removed`）。
+   *
+   * 与 `queryChars` 配对读：`queryChars` 贴边 + `queryDroppedMessages > 0` 说明这一轮上游
+   * 看到的历史已经被砍过，模型「忘了前文」不是它的问题，而是压缩在起作用。
+   */
+  queryDroppedMessages?: number
+  /** 为压到上限内被**头尾截断**的单条消息数（中间替换成截断标记）。 */
+  queryTruncatedMessages?: number
   /**
    * 请求里带的图片张数（调用方从 messages 抽出的，不是原始块数）。
    *
@@ -775,7 +793,15 @@ export async function createRemoteSession(
   // 扁平化一次并留住长度：`query` 是 Remote 唯一的对话载体，而源侧对超长 query 有
   // **静默上限**（约 480k 字符）—— 超了上游不发 done、直接丢会话，症状与「executor
   // 不启动」完全一样。长度是区分这两种失败的唯一线索。
-  const query = flattenTraeQuery(messages, { attachments })
+  //
+  // 压缩（源侧 `_bounded_remote_query` 的等价物）：先丢最旧回合、再对单条超长消息头尾截断，
+  // 仍超限则抛 `RemoteQueryTooLargeError` 由调用方返回 413 —— **不换号重放**，因为输入长度是
+  // 确定性属性（源侧 release-v1.0.6 同口径）。图片以 attachment 块参与同一长度度量。
+  const bounded = boundRemoteQuery(messages, {
+    maxChars: opts.maxQueryChars ?? TRAE_REMOTE_QUERY_MAX_CHARS,
+    attachments,
+  })
+  const query = flattenTraeQuery(bounded.messages, { attachments })
   const initialMessage: Record<string, any> = {
     chat_session_id: '',
     content: [],
@@ -826,6 +852,10 @@ export async function createRemoteSession(
     opts.trace.maxModeApplied = useMaxMode
     opts.trace.reasoningEffortApplied = appliedEffort
     opts.trace.queryChars = query.length
+    // 压缩读数：`dropped`/`truncated` 为 0 说明这次没触发压缩；非 0 时这两个数字是
+    // 「上游看到的历史被删了多少」的唯一证据（面板按 queryChars 贴边时优先看它们）。
+    opts.trace.queryDroppedMessages = bounded.droppedMessages
+    opts.trace.queryTruncatedMessages = bounded.truncatedMessages
   }
 
   let resp: Response
