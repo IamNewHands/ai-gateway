@@ -1134,6 +1134,32 @@ describe('sanitizeWorkbuddyMessages 请求体脱敏', () => {
     expect(parts[1].image_url.url).toBe('http://x/11128.png')
   })
 
+  it('system 里的「自我介绍句式 + 品牌」改写为中性句（hub v1.7.18）', () => {
+    const body = {
+      messages: [{
+        role: 'system',
+        content: 'You are a coding agent powered by the deepseek-v4.1-flash model.',
+      }],
+    }
+    sanitizeWorkbuddyMessages(body)
+    expect((body.messages[0] as any).content).toBe('You are a helpful AI assistant.')
+  })
+
+  it('user / assistant 里的自我介绍句式不改写（用户数据）', () => {
+    const text = 'You are an AI assistant built on DeepSeek.'
+    const body = { messages: [{ role: 'user', content: text }, { role: 'assistant', content: text }] }
+    sanitizeWorkbuddyMessages(body)
+    expect((body.messages[0] as any).content).toBe(text)
+    expect((body.messages[1] as any).content).toBe(text)
+  })
+
+  it('不误伤分词修饰宾语的普通句子', () => {
+    const text = 'You are free to use tools built by Acme.'
+    const body = { messages: [{ role: 'system', content: text }] }
+    sanitizeWorkbuddyMessages(body)
+    expect((body.messages[0] as any).content).toBe(text)
+  })
+
   it('**关键**：content 为 null 时仍净化 tool_calls.arguments（旧实现盲区）', () => {
     const body = {
       messages: [

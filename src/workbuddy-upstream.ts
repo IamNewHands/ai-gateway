@@ -1021,12 +1021,47 @@ export function sanitizeFingerprintText(text: string): string {
 }
 
 /**
+ * 「自我介绍句式 + 品牌」指纹（workbuddy2api-hub v1.7.18 起）：
+ *   You are an AI agent powered by DeepSeek Harness.
+ *   You are a coding agent powered by the deepseek-v4.1-flash model.
+ *   You are an AI assistant built on DeepSeek.
+ * 上游对这类整句做大小写不敏感的连续子串匹配，命中即 400 / code 11128；
+ * 单独品牌词、改词或去掉句式都放行。只改写 system / developer，user/tool 是用户数据。
+ * 动词表覆盖 built by / created by / developed by / made by / trained by 等变体；
+ * 名词可省略，冠词后允许 0~3 个修饰词；窗口有界，避免误伤
+ * "You are free to use tools built by ..." 这类分词修饰宾语的句子。
+ */
+const SANITIZE_IDENTITY_VERBS = [
+  'powered by', 'built on', 'built by', 'created by',
+  'developed by', 'made by', 'trained by',
+]
+const SANITIZE_IDENTITY_RE =
+  /You are\s+(?:an?\s+|the\s+)?(?:[\w.-]+\s+){0,3}?(?:agent|assistant|model|AI|LLM)?[\s,]*(?:powered by|built on|built by|created by|developed by|made by|trained by)[^\n]*?(?:\.(?=\s|$)|(?=\n|$))/gi
+const SANITIZE_IDENTITY_REPLACEMENT = 'You are a helpful AI assistant.'
+
+/** 是否命中「自我介绍句式 + 品牌」（先做廉价动词前置筛，再走正则）。 */
+function hasSanitizeIdentitySentence(text: string): boolean {
+  const lower = text.toLowerCase()
+  if (!SANITIZE_IDENTITY_VERBS.some((verb) => lower.includes(verb))) return false
+  SANITIZE_IDENTITY_RE.lastIndex = 0
+  return SANITIZE_IDENTITY_RE.test(text)
+}
+
+/** 把命中品牌的自我介绍整句换成中性句（不依赖具体品牌）。 */
+function sanitizeIdentitySentence(text: string): string {
+  if (!text || !hasSanitizeIdentitySentence(text)) return text
+  SANITIZE_IDENTITY_RE.lastIndex = 0
+  return text.replace(SANITIZE_IDENTITY_RE, SANITIZE_IDENTITY_REPLACEMENT).trim()
+}
+
+/**
  * 净化 content（兼容字符串与多模态数组）：只动 text part，image 等 part 不动。
+ * identity=true（system/developer）时额外做「自我介绍句式 + 品牌」改写。
  * 返回是否发生变化。
  */
-function sanitizeContentValue(v: unknown): { value: unknown; changed: boolean } {
+function sanitizeContentValue(v: unknown, identity: boolean = false): { value: unknown; changed: boolean } {
   if (typeof v === 'string') {
-    const s = sanitizeFingerprintText(v)
+    const s = identity ? sanitizeIdentitySentence(sanitizeFingerprintText(v)) : sanitizeFingerprintText(v)
     return { value: s, changed: s !== v }
   }
   if (Array.isArray(v)) {
@@ -1036,7 +1071,7 @@ function sanitizeContentValue(v: unknown): { value: unknown; changed: boolean } 
       const part = p as Record<string, unknown>
       const text = part['text']
       if (typeof text !== 'string') continue
-      const s = sanitizeFingerprintText(text)
+      const s = identity ? sanitizeIdentitySentence(sanitizeFingerprintText(text)) : sanitizeFingerprintText(text)
       if (s !== text) {
         part['text'] = s
         changed = true
@@ -1260,9 +1295,18 @@ export function sanitizeWorkbuddyMessages(body: Record<string, unknown>): void {
   for (const m of messages) {
     if (!m || typeof m !== 'object' || Array.isArray(m)) continue
     const msg = m as Record<string, unknown>
+    // 「自我介绍句式 + 品牌」只在 system / developer 里改写；user/assistant/tool
+    // 属用户数据，改写会让模型看到与磁盘不一致的内容（workbuddy2api-hub #537）。
+    const role = typeof msg['role'] === 'string' ? (msg['role'] as string).trim().toLowerCase() : ''
+    const identity = role === 'system' || role === 'developer'
     if ('content' in msg) {
-      const { value, changed } = sanitizeContentValue(msg['content'])
+      const { value, changed } = sanitizeContentValue(msg['content'], identity)
       if (changed) msg['content'] = value
+    }
+    if (typeof msg['reasoning_content'] === 'string') {
+      const rc = msg['reasoning_content'] as string
+      const s = sanitizeFingerprintText(rc)
+      if (s !== rc) msg['reasoning_content'] = s
     }
     if ('tool_calls' in msg) {
       sanitizeToolCallsValue(msg['tool_calls'])
@@ -1792,8 +1836,8 @@ export function injectWorkbuddyChatHeaders(
     headers['X-No-Enterprise-Id'] = '1'
   }
 
-  // X-Domain：global 固定 www.workbuddy.ai（不回退登录会话原值）；CN 有则透传，无则声明缺失。
-  let domain = realm === 'global' ? 'workbuddy.ai' : (accountTokenState?.domain || claims.domain)
+  // X-Domain：global 固定 workbuddy.ai（不回退登录会话原值）；CN 有则透传，无则声明缺失。
+  const domain = realm === 'global' ? 'workbuddy.ai' : (accountTokenState?.domain || claims.domain)
   if (domain) {
     headers['X-Domain'] = domain
     delete headers['X-No-Department-Info']

@@ -78,7 +78,9 @@ describe('handleTestModel: WorkBuddy 连通性测试 max_tokens 参数保护', (
     const { env } = makeEnv([wbProvider])
 
     let interceptedBody: Record<string, unknown> | null = null
+    let interceptedHeaders: Record<string, string> = {}
     vi.stubGlobal('fetch', vi.fn(async (_url: string, init?: RequestInit) => {
+      interceptedHeaders = (init?.headers || {}) as Record<string, string>
       if (init?.body && typeof init.body === 'string') {
         try {
           interceptedBody = JSON.parse(init.body) as Record<string, unknown>
@@ -109,6 +111,11 @@ describe('handleTestModel: WorkBuddy 连通性测试 max_tokens 参数保护', (
     expect(interceptedBody!['max_tokens']).toBe(100)
     expect(interceptedBody!['model']).toBe('gpt-6-sol')
     expect(interceptedBody!['stream']).toBe(true)
+
+    // 会话头族：真实 chat 路径必带，缺失会被上游判 400 / code 11128（conversation id missing）
+    expect(interceptedHeaders['X-Conversation-Request-ID']).toMatch(/^[0-9a-f]{32}$/)
+    expect(interceptedHeaders['X-Conversation-Message-ID']).toMatch(/^[0-9a-f]{32}$/)
+    expect(interceptedHeaders['X-Request-ID']).toMatch(/^[0-9a-f]{32}$/)
   })
 
   it('非 WorkBuddy 的普通 oauth-device 提供商仍保持最小 max_tokens: 1', async () => {
