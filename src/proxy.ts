@@ -3,6 +3,7 @@ import { getProvider, getProviders, getModelsListCache, setModelsListCache, getU
 import { KV_KEYS, KEY_HEALTH_COOLDOWN_MS, KEY_HEALTH_MAX_FAILURES, OAUTH_TOKEN_REFRESH_MARGIN_MS, UNIMODEL_PROVIDER_ID } from './config'
 import type { AppEnv, Env, Provider, ProxyRequestBody } from './types'
 import { RequestBodyError, readJSONLimited, MAX_AI_REQUEST_BYTES, MAX_RESPONSES_REQUEST_BYTES } from './request-body'
+import { normalizeToolSchemas } from './tool-schema'
 import { createAnalyticsContext, normalizeAnthropicUsage, normalizeChatUsage, normalizeResponsesUsage, summarizeError } from './analytics/types'
 import type { AnalyticsContext, UsageMetrics } from './analytics/types'
 import { createStreamUsageProbe, writeAnalyticsEvent } from './analytics/usage-logger'
@@ -305,6 +306,9 @@ function sanitizeUpstreamBody(body: Record<string, unknown>): void {
   if (body['thinking'] !== undefined) {
     delete body['thinking']
   }
+  // 工具 schema 归一：严格上游把缺省 `required` 重建成 `null` 后整次 400
+  // （见 tool-schema.ts）。放在下面的 messages 早退之前，Responses 形状也要覆盖。
+  normalizeToolSchemas(body)
 
   const messages = body['messages'] as any[]
   if (!Array.isArray(messages)) return
@@ -1815,6 +1819,9 @@ export async function forwardProxy(
 
     const enabledKeys = provider.apiKeys.filter(k => k.enabled)
     const forwardBody = { ...body, model: modelId }
+    // 出站工具 schema 归一：严格上游（如 agentrouter）会把缺省的 `required` 当 null 拒，
+    // 这里统一补 `required: []`；无工具的请求逐字节不变（见 tool-schema.ts）。
+    normalizeToolSchemas(forwardBody as Record<string, unknown>)
     // 缓存前缀注入：提供商勾选了该 modelId 时，在 messages 头部注入固定缓存前缀（提升前缀缓存命中率）
     await applyCachePrefixInjection(c.env, provider, modelId, forwardBody as Record<string, unknown>)
     // 思维模式引导注入：提供商勾选了该 modelId 时，在 messages 头部注入思维引导 system 提示词
