@@ -1,19 +1,21 @@
 /**
  * reasoning-echo.test.ts — agentrouter 思考模式的 thinking 回传补齐。
  *
- * 回归对象：2026-10-22 实测会话里 30 条 assistant 有 29 条带思考，唯独中间一条模型没吐
- * 思考文本，下一次请求被上游整轮拒：
+ * 回归对象：2026-10-22 实测会话里 assistant 的思考回传缺失/为空，下一次请求被上游整轮拒：
  *
  *   The `content[].thinking` in the thinking mode must be passed back to the API.
  *
- * 修法：对该上游的 assistant 消息缺 `reasoning_content` 时补空串，且**只**对 agentrouter
- * 的 deepseek 模型生效——其他上游的请求体必须逐字节不变。
+ * 两次线上实证决定了最终形状：
+ * 1. 缺字段 → 400（`66a6fe8` 之前）；
+ * 2. 补空串 `""` → 仍 400（`66a6fe8` 线上版，因为客户端 compat 本来就补空串）。
+ * 所以本层补**非空占位串**，且只对 agentrouter 的 deepseek 模型生效——其他上游的请求体
+ * 必须逐字节不变。
  */
 
 import { describe, it, expect } from 'vitest'
 import { ensureAssistantReasoningEcho, needsReasoningEcho } from './reasoning-echo'
 
-const clone = <T>(value: T): T => JSON.parse(JSON.stringify(value)) as T
+const PLACEHOLDER = ' '
 
 describe('needsReasoningEcho', () => {
   it('agentrouter 的 deepseek 模型才生效', () => {
@@ -58,12 +60,12 @@ describe('ensureAssistantReasoningEcho', () => {
     ],
   })
 
-  it('缺口轮次补空串，其余消息一字不动', () => {
+  it('缺口轮次补非空占位串，其余消息一字不动', () => {
     const body = conversation()
     ensureAssistantReasoningEcho(body)
 
     const messages = body.messages as Array<Record<string, unknown>>
-    expect(messages[3]['reasoning_content']).toBe('')
+    expect(messages[3]['reasoning_content']).toBe(PLACEHOLDER)
     expect(messages[1]['reasoning_content']).toBe('想一下 A')
     expect(messages[5]['reasoning_content']).toBe('想一下 C')
     // 非 assistant 消息不新增字段
@@ -73,17 +75,39 @@ describe('ensureAssistantReasoningEcho', () => {
     expect(messages[0]['content']).toBe('看看仓库')
   })
 
-  it('已有 reasoning_content（含空串）原样保留，不覆盖', () => {
+  it('空串/纯空白的 reasoning_content 升级为非空占位串，正文保留', () => {
     const body = {
       messages: [
         { role: 'assistant', content: 'x', reasoning_content: '原文' },
         { role: 'assistant', content: 'y', reasoning_content: '' },
+        { role: 'assistant', content: 'z', reasoning_content: '   ' },
       ],
     }
     ensureAssistantReasoningEcho(body)
     const messages = body.messages as Array<Record<string, unknown>>
     expect(messages[0]['reasoning_content']).toBe('原文')
-    expect(messages[1]['reasoning_content']).toBe('')
+    expect(messages[1]['reasoning_content']).toBe(PLACEHOLDER)
+    expect(messages[2]['reasoning_content']).toBe(PLACEHOLDER)
+  })
+
+  it('OpenAI 兼容客户端的思考形态（字段在、内容空串）：整体升级为占位串', () => {
+    // pi-ai 的 requiresReasoningContentOnAssistantMessages 补的就是空串——
+    // 只看「非空痕迹」的门控会在这里整层失效（第一版线上没生效的原因）。
+    const body = {
+      model: 'deepseek-v4-flash',
+      messages: [
+        { role: 'user', content: 'q' },
+        { role: 'assistant', content: 'a1', reasoning_content: '' },
+        { role: 'tool', tool_call_id: 't', content: 'r' },
+        { role: 'assistant', content: null, reasoning_content: '', tool_calls: [{ id: 't2' }] },
+      ],
+    }
+    ensureAssistantReasoningEcho(body)
+    const messages = body.messages as Array<Record<string, unknown>>
+    expect(messages[1]['reasoning_content']).toBe(PLACEHOLDER)
+    expect(messages[3]['reasoning_content']).toBe(PLACEHOLDER)
+    expect('reasoning_content' in messages[0]).toBe(false)
+    expect('reasoning_content' in messages[2]).toBe(false)
   })
 
   it('只有 reasoning 字段的客户端：用同源文本回填 reasoning_content', () => {
@@ -96,10 +120,10 @@ describe('ensureAssistantReasoningEcho', () => {
     ensureAssistantReasoningEcho(body)
     const messages = body.messages as Array<Record<string, unknown>>
     expect(messages[0]['reasoning_content']).toBe('思考正文')
-    expect(messages[1]['reasoning_content']).toBe('')
+    expect(messages[1]['reasoning_content']).toBe(PLACEHOLDER)
   })
 
-  it('纯非思考会话（无痕迹且未显式启用）：逐字节不变', () => {
+  it('纯非思考会话（无 reasoning 字段且未显式启用）：逐字节不变', () => {
     const body = {
       model: 'deepseek-v4-flash',
       messages: [
@@ -118,20 +142,15 @@ describe('ensureAssistantReasoningEcho', () => {
       messages: [{ role: 'assistant', content: 'hello' }],
     }
     ensureAssistantReasoningEcho(body)
-    expect((body.messages as Array<Record<string, unknown>>)[0]['reasoning_content']).toBe('')
+    expect((body.messages as Array<Record<string, unknown>>)[0]['reasoning_content']).toBe(PLACEHOLDER)
   })
 
-  it('空白 reasoning 不算痕迹（避免把空白当已回传）', () => {
-    const body = {
-      messages: [
-        { role: 'assistant', content: 'x', reasoning_content: '   ' },
-        { role: 'assistant', content: 'y' },
-      ],
-    }
-    // 无有效痕迹 → 门控不亮，请求体不变（上游对空白串的行为不在本层推断）
-    const before = JSON.stringify(body)
+  it('幂等：重复调用结果一致', () => {
+    const body = conversation()
     ensureAssistantReasoningEcho(body)
-    expect(JSON.stringify(body)).toBe(before)
+    const once = JSON.stringify(body)
+    ensureAssistantReasoningEcho(body)
+    expect(JSON.stringify(body)).toBe(once)
   })
 
   it('畸形输入不抛错', () => {
@@ -139,6 +158,5 @@ describe('ensureAssistantReasoningEcho', () => {
       expect(() => ensureAssistantReasoningEcho(body as Record<string, unknown>)).not.toThrow()
     }
     expect(() => ensureAssistantReasoningEcho({ messages: [], thinking: 'enabled' })).not.toThrow()
-    expect(clone({ ok: 1 })).toEqual({ ok: 1 })
   })
 })
