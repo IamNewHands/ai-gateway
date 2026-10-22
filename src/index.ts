@@ -131,6 +131,13 @@ import {
   handleDeepseekTokensList,
 } from './deepseek/admin'
 import { runSessionCleanup, runSessionPurge } from './deepseek/sessions'
+import {
+  handleAgentRouterAccounts,
+  handleAgentRouterAccountSave,
+  handleAgentRouterAccountDelete,
+  handleAgentRouterCheckin,
+  runAgentRouterCheckins,
+} from './agentrouter'
 import { M365Session } from './m365/durable'
 import { AccountFlux } from './m365/account-flux'
 import type { AppEnv, Env, Provider } from './types'
@@ -305,6 +312,15 @@ app.post('/admin/api/deepseek/:id/tokens/verify', handleDeepseekTokenVerify)
 app.post('/admin/api/deepseek/:id/tokens/remove', handleDeepseekTokenRemove)
 app.post('/admin/api/deepseek/:id/tokens/unpark', handleDeepseekTokenUnpark)
 
+// AgentRouter site credentials are separate from API keys and shared across
+// the chat/Responses provider cards. Read endpoints never return passwords.
+app.get('/admin/api/agentrouter/accounts', handleAgentRouterAccounts)
+app.post('/admin/api/agentrouter/accounts', handleAgentRouterAccountSave)
+app.put('/admin/api/agentrouter/accounts/:id', handleAgentRouterAccountSave)
+app.delete('/admin/api/agentrouter/accounts/:id', handleAgentRouterAccountDelete)
+app.post('/admin/api/agentrouter/checkin', handleAgentRouterCheckin)
+app.post('/admin/api/agentrouter/checkin/:id', handleAgentRouterCheckin)
+
 // Analytics Engine 总览与详细日志
 app.get('/admin/api/analytics/overview', handleAnalyticsOverview)
 app.get('/admin/api/analytics/trend', handleAnalyticsTrend)
@@ -370,6 +386,9 @@ app.post('/api/manage/trae/checkin', async (c) => {
   return c.json({ success: true, data: summary })
 })
 app.post('/api/manage/trae/checkin/:id', handleTraeCheckin)
+app.get('/api/manage/agentrouter/accounts', handleAgentRouterAccounts)
+app.post('/api/manage/agentrouter/checkin', handleAgentRouterCheckin)
+app.post('/api/manage/agentrouter/checkin/:id', handleAgentRouterCheckin)
 
 // ===== API 转发路由（需转发 Key 验证） =====
 app.use('/v1/*', proxyKeyAuthMiddleware)
@@ -553,7 +572,7 @@ app.onError((err, c) => {
 // ===== Cron：定时任务（按 event.cron 分发） =====
 // crons（见 wrangler.toml）：
 //   "0 */2 * * *"   —— 每 2 小时刷新 OAuth token
-//   "5 2,14 * * *"  —— 每日 10:05/22:05（北京时间）WorkBuddy/Qoder 签到（避开 Qoder 每日 10:00 刷新放量节点）
+//   "5 2,14 * * *"  —— 每日 10:05/22:05（北京时间）WorkBuddy/Qoder/TRAE/AgentRouter 签到
 //   "0 * * * *"     —— 每小时 M365 对话自动清理
 //   "0 20 * * *"    —— 每日 04:00（北京时间）M365 账号健康检查（临期刷新 + 复活误判不可用账号）
 // ⚠️ Cloudflare ES Module Workers 只认 default export 上的 handler：
@@ -561,11 +580,23 @@ app.onError((err, c) => {
 //    default.scheduled，cron 触发后会被静默丢弃 → 定时签到/token 刷新均不执行。
 async function scheduled(event: ScheduledEvent, env: Env, ctx: ExecutionContext) {
   if (event.cron === '5 2,14 * * *' || event.cron === '0 1,13 * * *') {
-    // 签到（WorkBuddy/QoderWork + TRAE SOLO）
-    const summary = await runAllCheckins(env)
-    console.log(`[checkin] cron done: total=${summary.total} ok=${summary.success} already=${summary.already} fail=${summary.fail} skipped=${summary.skipped}`)
-    const trae = await runTraeCheckins(env, true)
-    console.log(`[trae-checkin] cron done: total=${trae.total} ok=${trae.ok} already=${trae.already} fail=${trae.fail}`)
+    // Product families are isolated so one upstream/storage failure cannot
+    // prevent the remaining daily jobs from running.
+    try {
+      const summary = await runAllCheckins(env)
+      console.log(`[checkin] cron done: total=${summary.total} ok=${summary.success} already=${summary.already} fail=${summary.fail} skipped=${summary.skipped}`)
+    } catch { console.error('[checkin] daily job failed') }
+    try {
+      const trae = await runTraeCheckins(env, true)
+      console.log(`[trae-checkin] cron done: total=${trae.total} ok=${trae.ok} already=${trae.already} fail=${trae.fail}`)
+    } catch { console.error('[trae-checkin] daily job failed') }
+    try {
+      const agentrouter = await runAgentRouterCheckins(env)
+      console.log(JSON.stringify({ job: 'agentrouter-checkin', total: agentrouter.total, ok: agentrouter.ok, already: agentrouter.already, fail: agentrouter.fail, skipped: agentrouter.skipped }))
+      if (agentrouter.total) {
+        await writeLog(env, agentrouter.fail ? 'warn' : 'info', '[agentrouter-checkin] cron', JSON.stringify(agentrouter))
+      }
+    } catch { console.error('[agentrouter-checkin] daily job failed') }
     return
   }
   if (event.cron === '30 15 * * *') {

@@ -35,6 +35,9 @@ export const KV_KEYS = {
   /** Kuku 百度扫码登录的临时二维码会话状态 */
   KUKU_QR_PREFIX: 'kuku:qr:',
   CHECKIN_RESULT_PREFIX: 'checkin:result:',
+  AGENTROUTER_ACCOUNT_PREFIX: 'agentrouter:account:',
+  AGENTROUTER_RESULT_PREFIX: 'agentrouter:result:',
+  AGENTROUTER_DAY_PREFIX: 'agentrouter:day:',
   LOGIN_RATE: 'login:rate:',
   MCPS: 'mcps',
   UNIMODELS: 'unimodels',

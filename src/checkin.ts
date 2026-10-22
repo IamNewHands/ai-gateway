@@ -37,6 +37,7 @@ import {
 } from './qoder/pool'
 import { isTraeProvider } from './trae/proxy'
 import { runTraeCheckins, readTraeCheckinResults } from './trae/admin'
+import { readAgentRouterAccounts, runAgentRouterCheckins } from './agentrouter'
 import { listTraeStatus, packExpireAtMs } from './trae/pool'
 import type { TraeCheckinResult } from './trae/types'
 import {
@@ -1260,7 +1261,11 @@ export async function handleCheckinTrigger(c: Context<{ Bindings: Env }>) {
   try {
     traeSummary = await runTraeCheckins(c.env, !!body.silent)
   } catch { /* trae 签到失败不影响 workbuddy 结果 */ }
-  return c.json<ApiResponse>({ success: true, data: { summary, trae: traeSummary } })
+  let agentrouter: Awaited<ReturnType<typeof runAgentRouterCheckins>> | null = null
+  try {
+    agentrouter = await runAgentRouterCheckins(c.env, { force: true })
+  } catch { /* The independent site check-in must not erase other results. */ }
+  return c.json<ApiResponse>({ success: true, data: { summary, trae: traeSummary, agentrouter } })
 }
 
 /** GET /admin/api/checkin/status：返回所有 provider 的签到结果（面板展示）。
@@ -1296,7 +1301,9 @@ export async function handleCheckinStatus(c: Context<{ Bindings: Env }>) {
     })
   )
 
-  return c.json<ApiResponse>({ success: true, data: { workbuddy, trae } })
+  let agentrouter: Awaited<ReturnType<typeof readAgentRouterAccounts>> | null = null
+  try { agentrouter = await readAgentRouterAccounts(c.env) } catch { /* Report unavailable, not a fabricated empty pool. */ }
+  return c.json<ApiResponse>({ success: true, data: { workbuddy, trae, agentrouter } })
 }
 
 /**
@@ -1427,6 +1434,17 @@ export async function handleAdminOverview(c: Context<{ Bindings: Env }>) {
   const checkinProviders = providers.filter(participatesInCheckin)
   const workbuddy = await aggregateCheckinFamily(c.env, checkinProviders.filter((p) => !isQoderFlow(p)), now)
   const qoder = await aggregateCheckinFamily(c.env, checkinProviders.filter((p) => isQoderFlow(p)), now)
+  let agentRouterAccounts = 0, agentRouterCheckedIn = 0
+  let agentRouterRemain: number | null = null
+  let agentRouterAvailable = true
+  try {
+    const accounts = await readAgentRouterAccounts(c.env, now)
+    for (const account of accounts.filter((a) => a.enabled)) {
+      agentRouterAccounts++
+      if (account.checkedInToday) agentRouterCheckedIn++
+      if (typeof account.result?.quota === 'number') agentRouterRemain = (agentRouterRemain ?? 0) + account.result.quota
+    }
+  } catch { agentRouterAvailable = false }
 
   // TRAE SOLO：账号级签到结果与面板「今日签到」列同源；额度取账号池双通道合计
   // （SOLO 通用 + Work 专属）。只看 Work 会在没有 Work 权益包的账号上恒显 0——
@@ -1484,16 +1502,20 @@ export async function handleAdminOverview(c: Context<{ Bindings: Env }>) {
   return c.json<ApiResponse>({
     success: true,
     data: {
-      // 今日签到进度是跨产品族的总口径（三族相加），额度则各归各族
+      // 今日签到进度跨产品族累计，额度各归各族；AgentRouter 使用 USD 而非积分
       checkin: {
-        checkedIn: workbuddy.checkedIn + qoder.checkedIn + traeCheckedIn,
-        totalAccounts: workbuddy.checkinAccounts + qoder.checkinAccounts + traeAccounts,
+        checkedIn: workbuddy.checkedIn + qoder.checkedIn + traeCheckedIn + agentRouterCheckedIn,
+        totalAccounts: workbuddy.checkinAccounts + qoder.checkinAccounts + traeAccounts + agentRouterAccounts,
       },
       workbuddy: { remain: workbuddy.remain, size: workbuddy.size, accounts: workbuddy.accounts },
       qoder: { remain: qoder.remain, size: qoder.size, accounts: qoder.accounts },
       trae: {
         remain: traeRemain, size: traeSize, accounts: traeAccounts,
         soloRemain: traeSoloRemain, workRemain: traeWorkRemain,
+      },
+      agentrouter: {
+        accounts: agentRouterAccounts, checkedIn: agentRouterCheckedIn,
+        remain: agentRouterRemain, currency: 'USD', available: agentRouterAvailable,
       },
       // 7 天内到期积分明细：total/soonestAt 为跨渠道合计，channels 为逐渠道行
       expiring: {

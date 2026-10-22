@@ -575,6 +575,28 @@ button.bd { border: 0; font-family: inherit; cursor: pointer; }
 button.bd:hover { filter: brightness(.96); }
 button.bd.is-allowed { box-shadow: inset 0 0 0 .125rem currentColor; font-weight: 700; }
 button.bd.is-excluded { opacity: .45; text-decoration: line-through; }
+.agentrouter-toolbar { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: var(--space-xs); }
+.agentrouter-toolbar > .mu, .agentrouter-state { font-size: var(--text-xs); }
+.agentrouter-state:empty { display: none; }
+.agentrouter-state { margin-block: var(--space-xs); overflow-wrap: anywhere; }
+.agentrouter-form { display: grid; grid-template-columns: minmax(0, 1fr); gap: var(--space-xs); margin-block: var(--space-sm); }
+.agentrouter-form .fg { margin-block-end: 0; }
+.agentrouter-form-actions { display: flex; flex-wrap: wrap; align-items: center; gap: var(--space-xs); }
+.agentrouter-form-actions .switch-label { margin: 0; gap: var(--space-xs); }
+.agentrouter-row { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: var(--space-xs); padding-block: var(--space-sm); border-block-end: .0625rem solid var(--color-rule); }
+.agentrouter-account, .agentrouter-outcome, .agentrouter-quota { min-width: 0; display: flex; flex-direction: column; align-items: flex-start; gap: var(--space-3xs); font-size: var(--text-xs); }
+.agentrouter-account { grid-column: 1 / -1; overflow-wrap: anywhere; }
+.agentrouter-account strong { font-size: var(--text-sm); letter-spacing: 0; }
+.agentrouter-account span, .agentrouter-row small { color: var(--color-muted); }
+.agentrouter-outcome small { max-width: 25rem; overflow-wrap: anywhere; }
+.agentrouter-actions { grid-column: 1 / -1; display: flex; align-items: center; justify-content: flex-end; gap: var(--space-2xs); }
+.agentrouter-empty { padding-block: var(--space-sm); font-size: var(--text-xs); }
+@media (min-width: 56rem) {
+  .agentrouter-form { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+  .agentrouter-form-actions { grid-column: 1 / -1; }
+  .agentrouter-row { grid-template-columns: minmax(0, 1.2fr) minmax(0, 1fr) minmax(6rem, .7fr) auto; align-items: center; }
+  .agentrouter-account, .agentrouter-actions { grid-column: auto; }
+}
 .usage-log-table code { font-size: var(--text-xs); }
 .usage-log-cards { display: none; }
 .analytics-log-filters, .syslog-filters { display: grid; grid-template-columns: minmax(0, 1fr); gap: var(--space-2xs); margin-block: var(--space-sm); padding: var(--space-sm); border: .0625rem solid var(--color-rule); border-radius: var(--radius-control); background: var(--color-paper-2); }

@@ -21,6 +21,7 @@
 
 - **WorkBuddy / CodeBuddy / TraeWork 接入** — OAuth 设备码登录、CN / Global 双域路由、Token 自动刷新、模型自动入库
 - **WorkBuddy / TraeWork 每日签到** — Cron 定时自动签到，多账号支持，后台签到面板
+- **AgentRouter 每日签到** — 绑定邮箱与站内密码登录，Chat / Responses 共用签到账号，凭据加密存储、当天日志核验；见 [配置说明](AGENTROUTER_CHECKIN.md)
 - **对外管理 API** — Bearer Token 认证（`MANAGEMENT_TOKEN`），支持手机脚本远程管理提供商、触发签到
 - **协议格式双向转换** — Anthropic Messages / OpenAI Responses / Chat Completions 双向转换，含流式 SSE 实时转换
 - **Cline 接入** — 内置白嫖模型反代，多账号池轮询、一键授权获取 Token

@@ -227,6 +227,34 @@ curl -X POST -H "Authorization: Bearer <TOKEN>" -H "Content-Type: application/js
 
 ---
 
+### 6.5 AgentRouter 签到
+
+账号凭据在 Web 管理后台的 AgentRouter 提供商详情中配置；管理 Token 接口只查询脱敏账号或触发签到，
+不提供密码新增、编辑与导出。完整配置和状态口径见 [AgentRouter 签到说明](AGENTROUTER_CHECKIN.md)。
+
+| 方法 | 路径 | 用途 |
+| --- | --- | --- |
+| GET | `/api/manage/agentrouter/accounts` | 绑定邮箱、启用状态、密码可用状态、签到与余额快照，不含密码或 Cookie |
+| POST | `/api/manage/agentrouter/checkin` | 手动签到所有已启用账号 |
+| POST | `/api/manage/agentrouter/checkin/:id` | 按账号列表返回的 `id` 手动签到 |
+
+```json
+{
+  "success": true,
+  "data": {
+    "total": 1, "ok": 0, "already": 1, "fail": 0, "skipped": 0,
+    "results": []
+  }
+}
+```
+
+示例省略了逐账号 `results` 明细。`success=true` 仅表示任务摘要可用，不表示每个账号签到成功；
+只有 `ok` 或 `already` 是核验成功，`unverified` 与 `fail` 计入失败数。
+余额字段 `quota` / `usedQuota` / `totalQuota` 为 USD 快照；`null` 表示未知，不是零。
+现有 `POST /api/manage/checkin` 的全量响应也增加可选 `data.agentrouter`，其他产品结果不变。
+
+---
+
 ## 7. 完整对接流程 / End-to-end flow
 
 ```

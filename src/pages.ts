@@ -7,6 +7,7 @@ import { baseUrlHostIs } from './url-host'
 import { SHARED_JS, renderSiteFooter } from './shared.js'
 import { ANALYTICS_JS } from './analytics-ui.js'
 import { QODER_DEVICE_FIELDS } from './qoder/device'
+import { AGENTROUTER_UI_JS } from './agentrouter-ui'
 
 // ============================================================================
 // ⚠️ SSR 内联 JS 转义铁律（多次踩坑，改本文件前必读）
@@ -88,6 +89,28 @@ const providerProtocolLabel = (apiType?: string): string =>
  * `https://chat.deepseek.com.evil.com` 也认成自家上游。 */
 const isDeepseekAppProviderUI = (p: { id?: string; baseUrl?: string }) =>
   p.id === 'deepseek-app' || baseUrlHostIs(p.baseUrl, 'chat.deepseek.com')
+
+const isAgentRouterProviderUI = (p: { id?: string; baseUrl?: string }) =>
+  p.id === 'agentrouter' || p.id === 'agentrouter-responses' ||
+  baseUrlHostIs(p.baseUrl, 'agentrouter.org') || baseUrlHostIs(p.baseUrl, 'ps.air-outer.com')
+
+const agentRouterSectionHtml = (p: { id?: string }) => {
+  const pid = escapePageHtml(p.id)
+  return `<fieldset class="form-group agentrouter-block" data-agentrouter="${pid}"><legend>AgentRouter 每日签到</legend>` +
+    `<div class="agentrouter-toolbar"><span class="mu">北京时间 10:05 / 22:05</span>` +
+    `<div class="fc"><button type="button" class="btn btn-s btn-xs" data-ar-action="add"><i class="fas fa-plus" aria-hidden="true"></i>添加账号</button>` +
+    `<button type="button" class="icon-btn" data-ar-action="checkin-all" aria-label="全部签到" title="全部签到" disabled><i class="fas fa-calendar-check" aria-hidden="true"></i></button>` +
+    `<button type="button" class="icon-btn" data-ar-action="refresh" aria-label="刷新签到状态" title="刷新签到状态"><i class="fas fa-sync" aria-hidden="true"></i></button></div></div>` +
+    `<div class="agentrouter-editor hd"><form class="agentrouter-form" autocomplete="off">` +
+    `<div class="fg"><label for="ar-email-${pid}">绑定邮箱</label><input type="email" id="ar-email-${pid}" name="email" required maxlength="254" autocomplete="off"></div>` +
+    `<div class="fg"><label for="ar-password-${pid}">AgentRouter 站内密码</label><input type="password" id="ar-password-${pid}" name="password" required maxlength="1024" autocomplete="new-password"></div>` +
+    `<div class="fg"><label for="ar-name-${pid}">备注</label><input type="text" id="ar-name-${pid}" name="name" maxlength="254" autocomplete="off"></div>` +
+    `<div class="agentrouter-form-actions"><label class="switch-label"><span>每日自动签到</span><span class="tg"><input type="checkbox" name="enabled" checked><span class="sl"></span></span></label>` +
+    `<button type="submit" class="btn btn-p btn-xs"><i class="fas fa-save" aria-hidden="true"></i>保存</button>` +
+    `<button type="button" class="icon-btn" data-ar-action="cancel" title="取消" aria-label="取消编辑"><i class="fas fa-times" aria-hidden="true"></i></button></div></form></div>` +
+    `<div class="agentrouter-state mu" role="status" aria-live="polite"></div>` +
+    `<div class="agentrouter-list"></div></fieldset>`
+}
 
 /** 是否商汤日日新（SenseNova）提供商（id 固定或用 token.sensenova.cn 域，与 src/admin.ts 对齐） */
 const isSensenovaProviderUI = (p: { id?: string; baseUrl?: string }) =>
@@ -1125,6 +1148,7 @@ if ($waitForHuman) {
                 </button>
                 <fieldset class="form-group hd" id="ua-fs-${escapePageHtml(p.id)}"><legend>出站身份（UA / 请求头）</legend><div class="fc mt-1 field-row" style="align-items:flex-start"><label style="width:110px;font-size:13px;padding-top:6px">User-Agent</label><input type="text" id="ua-${escapePageHtml(p.id)}" value="${escapePageHtml(p.upstreamUserAgent||'')}" placeholder="留空 = 透传客户端 UA；例：claude-cli/2.0.1 (external, cli)" style="flex:1"></div><div class="fc mt-1 field-row" style="align-items:flex-start"><label style="width:110px;font-size:13px;padding-top:6px">请求头</label><textarea id="uh-${escapePageHtml(p.id)}" rows="4" style="flex:1" placeholder="每行一个：头名: 值&#10;例：x-app: cli">${escapePageHtml(upstreamHeadersToText(p.upstreamHeaders))}</textarea></div><span class="form-helper">部分中转上游按客户端指纹鉴权：UA 或特征头不在其白名单时会在校验 Key 之前直接拒绝（如 agentrouter 的 unauthorized_client_error，换 Key 无效）。这里填的值按名字大小写无关地覆盖转发给上游的同名头（含客户端透传值），后台「测试 / 获取模型」也走同一套头。仅作用于通用 API Key 转发；<code>host</code>、<code>content-length</code>、<code>authorization</code>、<code>accept-encoding</code> 等不允许覆写。</span></fieldset>
               </div>
+              ${isAgentRouterProviderUI(p) ? agentRouterSectionHtml(p) : ''}
               ${p.id === 'cline' ? clineUpstreamSectionHtml(p) : ''}
               <div class="detail-actions"><div id="tr-${escapePageHtml(p.id)}" aria-live="polite"></div><div>${((p.id === 'cnb' || (p.baseUrl && p.baseUrl.indexOf('cnb.cool') !== -1)) || ((p.oauth && (p.oauth.flowType === 'm365-pkce' || p.oauth.flowType === 'm365-ropc')))) ? '<button class="btn btn-s" onclick="fetchOauthModels(\'' + escapePageJsx(p.id) + '\')"><i class="fas fa-download" aria-hidden="true"></i>获取模型</button>' : ((isSensenovaProviderUI(p) || p.apiType === 'openai' || p.id === 'cline' || p.id === 'opencode') && !isTraeProviderUI(p) && !(p.authType === 'oauth-device' && p.oauth)) ? '<button class="btn btn-s" onclick="fetchEditModels(\'' + escapePageJsx(p.id) + '\')"><i class="fas fa-download" aria-hidden="true"></i>获取模型</button>' : ''}${p.id === 'cline' ? '<button class="btn btn-s" onclick="clineOAuthConnect(\'' + escapePageJsx(p.id) + '\')"><i class="fas fa-sign-in-alt" aria-hidden="true"></i>一键授权获取 Token</button>' : ''}<button class="btn btn-d" onclick="del('${escapePageJsx(p.id)}')"><i class="fas fa-trash" aria-hidden="true"></i>删除</button><button class="btn btn-p" onclick="save('${escapePageJsx(p.id)}')"><i class="fas fa-save" aria-hidden="true"></i>保存更改</button></div></div>
             </div>
@@ -1507,6 +1531,7 @@ function tog(id) {
   // Cline：展开时**先读一次只读留档**（不打上游），让"额度耗尽被冷却"一眼可见；
   // 保存/一键授权后标记过「待检测」的账号再多跑一次真实检测（那时需要拿新 token 关联账号）。
   if (d.classList.contains('open')) clineOnCardOpen(id)
+  if (d.classList.contains('open')) agentRouterOnCardOpen(d)
 }
 
 // P3：M365 账号池渲染 —— 独立页并入提供商详情后按 providerId 定位容器
@@ -1758,6 +1783,7 @@ function restoreAdminState() {
         // Cline：恢复展开态同样要读冷却/额度留档——否则「刷新后面板本来就是开的」这条最常见路径
         // 什么都不加载，用户看不到任何状态（2026-10-02 实测报障）。与手动 tog 共用同一入口。
         clineOnCardOpen(pid)
+        agentRouterOnCardOpen(d)
       })
       if (s.add) { const af = document.getElementById('af'); if (af) af.classList.remove('hd') }
       if (typeof s.y === 'number') uiScroll = s.y
@@ -5675,11 +5701,13 @@ async function triggerCheckin(id) {
         msg = '签到完成'
         results = [d.data]
       } else {
-        // 全量：d.data = { summary, trae }
+        // 全量：d.data = { summary, trae, agentrouter }
         var s = (d.data && d.data.summary) || d.data || {}
         var t = (d.data && d.data.trae) ? d.data.trae : { ok: 0, already: 0, fail: 0 }
+        var ar = (d.data && d.data.agentrouter) ? d.data.agentrouter : { ok: 0, already: 0, fail: 0 }
         msg = '签到完成：WorkBuddy 成功 ' + (s.success||0) + ' / 已签 ' + (s.already||0) + ' / 失败 ' + (s.fail||0) + ' / 跳过 ' + (s.skipped||0) +
-          '；TRAE 成功 ' + (t.ok||0) + ' / 已签 ' + (t.already||0) + ' / 失败 ' + (t.fail||0)
+          '；TRAE 成功 ' + (t.ok||0) + ' / 已签 ' + (t.already||0) + ' / 失败 ' + (t.fail||0) +
+          '；AgentRouter 成功 ' + (ar.ok||0) + ' / 已签 ' + (ar.already||0) + ' / 失败 ' + (ar.fail||0)
         results = s.results || []
       }
       toast(msg, 'success')
@@ -5698,6 +5726,7 @@ async function triggerCheckin(id) {
       document.querySelectorAll('.pd.open [id^="trae-acc-"]').forEach(function (el) {
         traeStatus(String(el.id).replace(/^trae-acc-/, ''))
       })
+      agentRouterRefreshVisible()
     } else {
       toast(d.message || '签到失败', 'error')
     }
@@ -5762,6 +5791,7 @@ async function triggerCatTravel(id) {
 // 页面加载后初始化识图模型顺序序号（处理编辑表单预勾选的模型）
 renumberVisionOrders();
 // UX2：上次 reload 前保存的滚动位置/展开面板在此恢复
+${AGENTROUTER_UI_JS}
 restoreAdminState();
 
 // ===== MCP 网关管理 =====
