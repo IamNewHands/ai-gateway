@@ -2,6 +2,11 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { Hono } from 'hono'
 import { handleProxy, testModelConnection } from './proxy'
 import { handleTestKeyNew, handleTestModelNew } from './admin'
+import {
+  applyUpstreamHeaders,
+  FORBIDDEN_UPSTREAM_HEADERS,
+  normalizeUpstreamHeaders,
+} from './upstream-user-agent'
 import { clearCache } from './storage'
 import { normalizeUpstreamUserAgent, setHeaderCaseInsensitive, UPSTREAM_USER_AGENT_MAX_BYTES } from './upstream-user-agent'
 import type { AppEnv, Env, Provider } from './types'
@@ -380,5 +385,167 @@ describe('upstream-user-agent：后台「获取模型 / 测试 Key」也走同�
 
     expect(calls[0].url).toBe('https://ps.air-outer.com/v1/chat/completions')
     expect(calls[0].headers['user-agent']).toBe('claude-cli/2.0.1 (external, cli)')
+  })
+})
+
+describe('upstream-headers：请求头表校验', () => {
+  it('常规表原样通过，保留书写大小写', () => {
+    const r = normalizeUpstreamHeaders({ 'x-app': 'cli', 'X-Stainless-Lang': 'js' })
+    expect(r).toEqual({ ok: true, value: { 'x-app': 'cli', 'X-Stainless-Lang': 'js' } })
+  })
+
+  it('undefined/null → 空表（= 不覆写）', () => {
+    expect(normalizeUpstreamHeaders(undefined)).toEqual({ ok: true, value: {} })
+    expect(normalizeUpstreamHeaders(null)).toEqual({ ok: true, value: {} })
+  })
+
+  it('空值跳过（界面上留空即「不覆写这个头」）', () => {
+    const r = normalizeUpstreamHeaders({ 'x-app': '', 'x-keep': 'v' })
+    expect(r.ok && r.value).toEqual({ 'x-keep': 'v' })
+  })
+
+  it('同名（大小写不同）只留最后一个，避免出站重复头', () => {
+    const r = normalizeUpstreamHeaders({ 'x-app': 'a', 'X-App': 'b' })
+    expect(r.ok && r.value).toEqual({ 'X-App': 'b' })
+  })
+
+  it('非对象 → 拒绝', () => {
+    expect(normalizeUpstreamHeaders('x-app: cli').ok).toBe(false)
+    expect(normalizeUpstreamHeaders(['x-app']).ok).toBe(false)
+  })
+
+  it('非法头名 → 拒绝（含空格、冒号、中文、空名）', () => {
+    for (const name of ['x app', 'x:app', '客户端', '']) {
+      expect(normalizeUpstreamHeaders({ [name]: 'v' }).ok).toBe(false)
+    }
+  })
+
+  it('由运行时/凭据池管理的头 → 拒绝覆写', () => {
+    for (const name of ['host', 'content-length', 'authorization', 'x-api-key', 'cookie', 'accept-encoding', 'connection']) {
+      expect(normalizeUpstreamHeaders({ [name]: 'v' }).ok).toBe(false)
+    }
+    // accept-encoding 必须留在禁止表里：显式设置会关闭 Workers 的自动解压
+    expect(FORBIDDEN_UPSTREAM_HEADERS.has('accept-encoding')).toBe(true)
+  })
+
+  it('值含换行 / 非 ASCII / 超长 → 拒绝', () => {
+    expect(normalizeUpstreamHeaders({ 'x-a': 'a\r\nX-Injected: 1' }).ok).toBe(false)
+    expect(normalizeUpstreamHeaders({ 'x-a': '客户端' }).ok).toBe(false)
+    expect(normalizeUpstreamHeaders({ 'x-a': 'a'.repeat(UPSTREAM_USER_AGENT_MAX_BYTES + 1) }).ok).toBe(false)
+  })
+})
+
+describe('upstream-headers：应用顺序', () => {
+  it('先 UA 后表：表里也写了 user-agent 时以表为准', () => {
+    const headers: Record<string, string> = {}
+    applyUpstreamHeaders(headers, {
+      upstreamUserAgent: 'claude-cli/2.0.1 (external, cli)',
+      upstreamHeaders: { 'user-agent': 'from-table/1.0' },
+    })
+    const uaKeys = Object.keys(headers).filter((k) => k.toLowerCase() === 'user-agent')
+    expect(uaKeys).toEqual(['user-agent'])
+    expect(headers['user-agent']).toBe('from-table/1.0')
+  })
+
+  it('大小写无关替换掉透传来的同名头，其他头不动', () => {
+    const headers: Record<string, string> = { 'x-app': 'old', 'x-keep': 'v' }
+    applyUpstreamHeaders(headers, { upstreamHeaders: { 'X-App': 'cli' } })
+    expect(headers['x-app']).toBeUndefined()
+    expect(headers['X-App']).toBe('cli')
+    expect(headers['x-keep']).toBe('v')
+  })
+})
+
+describe('upstream-headers：转发与后台探测同口径', () => {
+  let calls: Call[]
+
+  const HEADERS = { 'x-app': 'cli', 'x-stainless-lang': 'js' }
+
+  beforeEach(() => {
+    calls = []
+    clearCache()
+  })
+
+  afterEach(() => {
+    vi.unstubAllGlobals()
+    vi.restoreAllMocks()
+  })
+
+  it('真实转发带上 provider.upstreamHeaders', async () => {
+    vi.stubGlobal('fetch', installFetchMock(calls))
+    const env = makeEnv([makeProvider({ upstreamHeaders: HEADERS })])
+
+    const res = await postChat(env, { 'x-app': 'client-value' })
+    expect(res.status).toBe(200)
+    expect(calls[0].headers['x-app']).toBe('cli')
+    expect(calls[0].headers['x-stainless-lang']).toBe('js')
+  })
+
+  it('「获取模型」探测带上落库的 upstreamHeaders', async () => {
+    vi.stubGlobal('fetch', installFetchMock(calls))
+    const env = makeEnv([makeProvider({ upstreamHeaders: HEADERS })])
+
+    const app = new Hono<AppEnv>()
+    app.post('/admin/api/test-key', (c) => handleTestKeyNew(c))
+    const req = new Request('https://gw.test/admin/api/test-key', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        url: 'https://ps.air-outer.com/v1',
+        apiKey: 'sk-test-key',
+        apiType: 'openai',
+        providerId: PID,
+        intent: 'fetchModels',
+      }),
+    })
+    await app.fetch(req, env, { waitUntil: () => {}, passThroughOnException: () => {} } as unknown as ExecutionContext)
+
+    expect(calls[0].url).toBe('https://ps.air-outer.com/v1/models')
+    expect(calls[0].headers['x-app']).toBe('cli')
+    expect(calls[0].headers['x-stainless-lang']).toBe('js')
+  })
+
+  it('新建表单未保存：请求体里的 upstreamHeaders 生效', async () => {
+    vi.stubGlobal('fetch', installFetchMock(calls))
+    const env = makeEnv([])
+
+    const app = new Hono<AppEnv>()
+    app.post('/admin/api/test-key', (c) => handleTestKeyNew(c))
+    const req = new Request('https://gw.test/admin/api/test-key', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        url: 'https://ps.air-outer.com/v1',
+        apiKey: 'sk-test-key',
+        apiType: 'openai',
+        upstreamHeaders: HEADERS,
+      }),
+    })
+    await app.fetch(req, env, { waitUntil: () => {}, passThroughOnException: () => {} } as unknown as ExecutionContext)
+
+    expect(calls[0].headers['x-app']).toBe('cli')
+  })
+
+  it('非法头（host）→ 400 且不发出任何上游请求', async () => {
+    vi.stubGlobal('fetch', installFetchMock(calls))
+    const env = makeEnv([makeProvider()])
+
+    const app = new Hono<AppEnv>()
+    app.post('/admin/api/test-key', (c) => handleTestKeyNew(c))
+    const req = new Request('https://gw.test/admin/api/test-key', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        url: 'https://ps.air-outer.com/v1',
+        apiKey: 'sk-test-key',
+        apiType: 'openai',
+        providerId: PID,
+        upstreamHeaders: { host: 'evil.example' },
+      }),
+    })
+    const res = await app.fetch(req, env, { waitUntil: () => {}, passThroughOnException: () => {} } as unknown as ExecutionContext)
+
+    expect(res.status).toBe(400)
+    expect(calls).toHaveLength(0)
   })
 })

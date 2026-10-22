@@ -52,12 +52,34 @@ function showResult(el, success, msg) {
 }
 
 // ── API 请求函数 ──
-// 探测请求要带上的出站 UA：编辑态读详情面板的 #ua-<id>，新建态读 #aua。
-// 与保存时读的是同一个输入框，保证「测试/获取模型」用当前输入而非旧落库值。
+// 出站请求头文本域 <-> 对象。格式：每行「头名: 值」，# 开头为注释，空行忽略。
+function parseUpstreamHeaders(text) {
+  var out = {}
+  ;(text || '').split('\\n').forEach(function (line) {
+    var s = line.trim()
+    if (!s || s.charAt(0) === '#') return
+    var i = s.indexOf(':')
+    if (i <= 0) return
+    var name = s.slice(0, i).trim()
+    var value = s.slice(i + 1).trim()
+    if (name && value) out[name] = value
+  })
+  return Object.keys(out).length ? out : undefined
+}
+function formatUpstreamHeaders(obj) {
+  if (!obj) return ''
+  return Object.keys(obj).map(function (k) { return k + ': ' + obj[k] }).join('\\n')
+}
+// 探测请求要带上的出站身份：编辑态读详情面板的 #ua-<id> / #uh-<id>，新建态读 #aua / #auh。
+// 与保存时读的是同一组输入框，保证「测试/获取模型」用当前输入而非旧落库值。
 function probeUserAgent(id) {
   var el = document.getElementById(id ? 'ua-' + id : 'aua')
   var v = el && el.value ? el.value.trim() : ''
   return v || undefined
+}
+function probeUpstreamHeaders(id) {
+  var el = document.getElementById(id ? 'uh-' + id : 'auh')
+  return el ? parseUpstreamHeaders(el.value) : undefined
 }
 // intent: 'fetchModels'（要模型列表，缺省）| 'diagnose'（要单 key 推理诊断，opencode 专属）
 async function testKeyConnection(url, apiType, key, providerId, intent) {
@@ -65,7 +87,7 @@ async function testKeyConnection(url, apiType, key, providerId, intent) {
     var r = await fetch('/admin/api/test-key', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ url: url, apiKey: key, apiType: apiType, providerId: providerId, intent: intent, upstreamUserAgent: probeUserAgent(providerId) })
+      body: JSON.stringify({ url: url, apiKey: key, apiType: apiType, providerId: providerId, intent: intent, upstreamUserAgent: probeUserAgent(providerId), upstreamHeaders: probeUpstreamHeaders(providerId) })
     })
     var d = await r.json()
     if (d.success && d.data) {
@@ -82,7 +104,7 @@ async function testModelConnection(url, apiType, key, modelId, providerId) {
     var r = await fetch('/admin/api/test-model', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ url: url, apiKey: key, apiType: apiType, model: modelId, providerId: providerId, upstreamUserAgent: probeUserAgent(providerId) })
+      body: JSON.stringify({ url: url, apiKey: key, apiType: apiType, model: modelId, providerId: providerId, upstreamUserAgent: probeUserAgent(providerId), upstreamHeaders: probeUpstreamHeaders(providerId) })
     })
     var d = await r.json()
     if (d.success && d.data) {

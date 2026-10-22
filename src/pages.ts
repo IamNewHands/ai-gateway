@@ -272,9 +272,20 @@ function opencodeEffortSelectHtml(selectId: string, selected: string | undefined
 }
 
 // UX8：厂商预设与 OAuth 预置模板——单一数据源。
+/**
+ * 出站请求头表 → 文本域内容（每行 `头名: 值`）。
+ *
+ * 与 SHARED_JS 里的 `formatUpstreamHeaders` 同一格式：服务端渲染详情面板时用它，
+ * 客户端切换厂商预设时用 SHARED_JS 那份（同一份文本域，两个填充入口）。
+ */
+function upstreamHeadersToText(headers?: Record<string, string>): string {
+  if (!headers) return ''
+  return Object.entries(headers).map(([k, v]) => `${k}: ${v}`).join('\n')
+}
+
 // SSR 下拉 option 与客户端 applyProviderPreset / applyOauthPreset* 共用，
 // 注入为页面 script 常量，消除服务端/客户端两套重复预设表。
-const PROVIDER_PRESETS: Record<string, { name: string; id: string; baseUrl: string; apiType: string; authType?: string; oauthPreset?: string; models?: string[]; toolBridge?: boolean; type?: 'kuku'; kukuThinkMode?: number; upstreamUserAgent?: string }> = {
+const PROVIDER_PRESETS: Record<string, { name: string; id: string; baseUrl: string; apiType: string; authType?: string; oauthPreset?: string; models?: string[]; toolBridge?: boolean; type?: 'kuku'; kukuThinkMode?: number; upstreamUserAgent?: string; upstreamHeaders?: Record<string, string> }> = {
   deepseek:     { name: 'DeepSeek',           id: 'deepseek',     baseUrl: 'https://api.deepseek.com',                          apiType: 'openai' },
   // DeepSeek App：凭据不是 API Key，而是浏览器里取的 userToken（token 注入型，见 DEEPSEEK-APP-PORT.md）。
   // 上游只有一个模型，预置填好避免用户手填错 ID / 地址（两处判定见 isDeepseekAppProviderUI）。
@@ -298,10 +309,20 @@ const PROVIDER_PRESETS: Record<string, { name: string; id: string; baseUrl: stri
   openrouter:   { name: 'OpenRouter',         id: 'openrouter',   baseUrl: 'https://openrouter.ai/api/v1',                      apiType: 'openai' },
   // AgentRouter：按**客户端指纹**鉴权的聚合上游——UA 不在其白名单时会在校验密钥之前
   // 直接返回 401 unauthorized_client_error（换 Key 无效，实测 claude-cli 等 UA 才放行）。
-  // 故预设直接把出站 UA 一起填好；备用域名 ps.air-outer.com 与原域 agentrouter.org 等价。
+  // 故预设直接把出站 UA 与一组 CLI 特征头一起填好；备用域名 ps.air-outer.com 与原域
+  // agentrouter.org 等价。头集合刻意不含 accept-encoding（显式设置会关闭 Workers 自动解压）。
   agentrouter:  { name: 'AgentRouter（按 UA 白名单鉴权）', id: 'agentrouter', baseUrl: 'https://ps.air-outer.com/v1', apiType: 'openai',
     models: ['deepseek-v4-flash', 'gpt-6-astra', 'gpt-6.1-sol'],
     upstreamUserAgent: 'claude-cli/2.0.1 (external, cli)',
+    upstreamHeaders: {
+      'accept': 'application/json',
+      'x-app': 'cli',
+      'x-stainless-lang': 'js',
+      'x-stainless-os': 'Windows',
+      'x-stainless-arch': 'x64',
+      'x-stainless-runtime': 'node',
+      'x-stainless-runtime-version': 'v22.11.0',
+    },
   },
   sensenova:    { name: '商汤日日新 (SenseNova)', id: 'sensenova', baseUrl: 'https://token.sensenova.cn/v1',                    apiType: 'openai',
     models: ['sensenova-6.8-flash-lite', 'deepseek-v4-flash', 'deepseek-v4-pro', 'glm-5.2', 'kimi-k3'],
@@ -662,6 +683,7 @@ ${H('管理')}
             <div class="fg"><label for="aurl">API 地址</label><input type="url" id="aurl" placeholder="https://api.deepseek.com"></div>
             <div class="fg"><label for="afmt">API 格式</label><select id="afmt" class="select-sm"><option value="openai">OpenAI 兼容</option><option value="anthropic">Anthropic 兼容</option></select></div>
             <div class="fg"><label for="aua">出站 User-Agent（可选）</label><input type="text" id="aua" placeholder="留空 = 透传客户端 UA"><span class="form-helper">部分上游按客户端指纹鉴权（UA 不在白名单时先于密钥校验直接 401，如 agentrouter），填这里用该值覆盖转发给上游的 User-Agent；值须单行可打印 ASCII，≤512 字节。创建后也可在提供商详情里修改。</span></div>
+            <div class="fg"><label for="auh">出站请求头（可选）</label><textarea id="auh" rows="4" placeholder="每行一个，格式 头名: 值&#10;例：x-app: cli&#10;留空 = 不改"></textarea><span class="form-helper">与上面同类的指纹头，一次可配多个：按名字大小写无关地覆盖同名头（未列出的头保持原样）。<code>host</code>、<code>content-length</code>、<code>authorization</code>、<code>accept-encoding</code> 等由运行时或凭据池管理的头不允许覆写。以 <code>#</code> 开头的行是注释。</span></div>
             <div class="fg"><label for="aat">认证方式</label><select id="aat" class="select-sm" onchange="toggleAuthType()"><option value="api-key">API Key</option><option value="oauth-device">OAuth 设备码登录</option></select></div>
             <div id="oauth-new" class="hd form-group">
               <fieldset class="form-group"><legend>OAuth 配置</legend>
@@ -1065,7 +1087,7 @@ if ($waitForHuman) {
                 <button class="collapse-btn" onclick="toggleAdvOauth('ua-fs-${escapePageJsx(p.id)}', this)" type="button" aria-expanded="false">
                   <i class="fas fa-chevron-right collapse-icon" aria-hidden="true"></i> 出站 User-Agent 覆写（按客户端指纹鉴权的上游，可选）${p.upstreamUserAgent?'<span class="bd bd-on" style="margin-left:6px">已覆写</span>':''}
                 </button>
-                <fieldset class="form-group hd" id="ua-fs-${escapePageHtml(p.id)}"><legend>出站 User-Agent</legend><div class="fc mt-1 field-row" style="align-items:flex-start"><label style="width:110px;font-size:13px;padding-top:6px">User-Agent</label><input type="text" id="ua-${escapePageHtml(p.id)}" value="${escapePageHtml(p.upstreamUserAgent||'')}" placeholder="留空 = 透传客户端 UA；例：claude-cli/2.0.1 (external, cli)" style="flex:1"></div><span class="form-helper">部分中转上游按客户端指纹鉴权：UA 不在其白名单时会在校验 Key 之前直接拒绝（如 agentrouter 的 unauthorized_client_error，换 Key 无效）。填这里后用该值覆盖转发给上游的 User-Agent（含客户端透传值），后台「测试模型」也走同一 UA。仅作用于通用 API Key 转发；值须单行可打印 ASCII，≤512 字节。</span></fieldset>
+                <fieldset class="form-group hd" id="ua-fs-${escapePageHtml(p.id)}"><legend>出站身份（UA / 请求头）</legend><div class="fc mt-1 field-row" style="align-items:flex-start"><label style="width:110px;font-size:13px;padding-top:6px">User-Agent</label><input type="text" id="ua-${escapePageHtml(p.id)}" value="${escapePageHtml(p.upstreamUserAgent||'')}" placeholder="留空 = 透传客户端 UA；例：claude-cli/2.0.1 (external, cli)" style="flex:1"></div><div class="fc mt-1 field-row" style="align-items:flex-start"><label style="width:110px;font-size:13px;padding-top:6px">请求头</label><textarea id="uh-${escapePageHtml(p.id)}" rows="4" style="flex:1" placeholder="每行一个：头名: 值&#10;例：x-app: cli">${escapePageHtml(upstreamHeadersToText(p.upstreamHeaders))}</textarea></div><span class="form-helper">部分中转上游按客户端指纹鉴权：UA 或特征头不在其白名单时会在校验 Key 之前直接拒绝（如 agentrouter 的 unauthorized_client_error，换 Key 无效）。这里填的值按名字大小写无关地覆盖转发给上游的同名头（含客户端透传值），后台「测试 / 获取模型」也走同一套头。仅作用于通用 API Key 转发；<code>host</code>、<code>content-length</code>、<code>authorization</code>、<code>accept-encoding</code> 等不允许覆写。</span></fieldset>
               </div>
               ${p.id === 'cline' ? clineUpstreamSectionHtml(p) : ''}
               <div class="detail-actions"><div id="tr-${escapePageHtml(p.id)}" aria-live="polite"></div><div>${((p.id === 'cnb' || (p.baseUrl && p.baseUrl.indexOf('cnb.cool') !== -1)) || ((p.oauth && (p.oauth.flowType === 'm365-pkce' || p.oauth.flowType === 'm365-ropc')))) ? '<button class="btn btn-s" onclick="fetchOauthModels(\'' + escapePageJsx(p.id) + '\')"><i class="fas fa-download" aria-hidden="true"></i>获取模型</button>' : ((isSensenovaProviderUI(p) || p.apiType === 'openai' || p.id === 'cline' || p.id === 'opencode') && !isTraeProviderUI(p) && !(p.authType === 'oauth-device' && p.oauth)) ? '<button class="btn btn-s" onclick="fetchEditModels(\'' + escapePageJsx(p.id) + '\')"><i class="fas fa-download" aria-hidden="true"></i>获取模型</button>' : ''}${p.id === 'cline' ? '<button class="btn btn-s" onclick="clineOAuthConnect(\'' + escapePageJsx(p.id) + '\')"><i class="fas fa-sign-in-alt" aria-hidden="true"></i>一键授权获取 Token</button>' : ''}<button class="btn btn-d" onclick="del('${escapePageJsx(p.id)}')"><i class="fas fa-trash" aria-hidden="true"></i>删除</button><button class="btn btn-p" onclick="save('${escapePageJsx(p.id)}')"><i class="fas fa-save" aria-hidden="true"></i>保存更改</button></div></div>
@@ -1920,7 +1942,7 @@ async function createProv(opts) {
     const r = await fetch('/admin/api/providers', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ id, name: nm, baseUrl: url, apiType, authType, oauth: authType === 'oauth-device' ? oauth : undefined, apiKeys: keys, models, enabled, toolBridge: (document.getElementById('atb')||{}).checked === true, allowUnlistedModels: (document.getElementById('aum')||{}).checked === true, reasoningEffort: ((document.getElementById('re')||{}).value || undefined), thinkingInject, cachePrefixInject, type: providerType || (vb && vb.primary ? 'vision-bridge' : undefined), kukuThinkMode, visionBridge: vb, geminiBaseUrl: ((document.getElementById('agbu')||{}).value || '').trim() || undefined, upstreamUserAgent: ((document.getElementById('aua')||{}).value || '').trim() || undefined })
+      body: JSON.stringify({ id, name: nm, baseUrl: url, apiType, authType, oauth: authType === 'oauth-device' ? oauth : undefined, apiKeys: keys, models, enabled, toolBridge: (document.getElementById('atb')||{}).checked === true, allowUnlistedModels: (document.getElementById('aum')||{}).checked === true, reasoningEffort: ((document.getElementById('re')||{}).value || undefined), thinkingInject, cachePrefixInject, type: providerType || (vb && vb.primary ? 'vision-bridge' : undefined), kukuThinkMode, visionBridge: vb, geminiBaseUrl: ((document.getElementById('agbu')||{}).value || '').trim() || undefined, upstreamUserAgent: ((document.getElementById('aua')||{}).value || '').trim() || undefined, upstreamHeaders: parseUpstreamHeaders(((document.getElementById('auh')||{}).value || '')) })
     })
     const d = await r.json()
     if (d.success) {
@@ -2201,6 +2223,9 @@ function applyProviderPreset(name) {
   // 出站 UA 覆写：预设带了就一并填好（按指纹鉴权的上游缺了它必然 401）
   const uaPresetEl = document.getElementById('aua')
   if (uaPresetEl) uaPresetEl.value = p.upstreamUserAgent || ''
+  // 出站请求头：同一动机的一组指纹头，预设带了就按「头名: 值」逐行铺开
+  const uhPresetEl = document.getElementById('auh')
+  if (uhPresetEl) uhPresetEl.value = formatUpstreamHeaders(p.upstreamHeaders)
   if (p.authType === 'oauth-device') {
     document.getElementById('aat').value = 'oauth-device'
     toggleAuthType()
@@ -4901,6 +4926,9 @@ async function save(id) {
   // 出站 User-Agent 覆写：留空 → 视为清除（后端把 '' 归一为空配置）
   const uaEl = document.getElementById('ua-' + id)
   const upstreamUserAgent = uaEl ? (uaEl.value.trim() || null) : undefined
+  // 出站请求头覆写：空文本域 → null（清除）；否则按「头名: 值」逐行解析
+  const uhEl = document.getElementById('uh-' + id)
+  const upstreamHeaders = uhEl ? (parseUpstreamHeaders(uhEl.value) || null) : undefined
   // DeepSeek App 深度思考开关：仅该提供商有此复选框，其余提供商读到 null → 不改动
   const dsThinkEl = document.getElementById('ds-thinkoff-' + id)
   const deepseekThinkingOff = dsThinkEl ? dsThinkEl.checked === true : undefined
@@ -4932,7 +4960,7 @@ async function save(id) {
       return fetch('/admin/api/providers/' + encodeURIComponent(id), {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ name: nm, baseUrl: url, apiType, authType, oauth: authType === 'oauth-device' ? oauth : undefined, apiKeys: keys, models, enabled, toolBridge: (document.getElementById('atb-' + id)||{}).checked === true, allowUnlistedModels: (document.getElementById('aum-' + id)||{}).checked === true, reasoningEffort: ((document.getElementById('re-' + id)||{}).value || null), deepseekThinkingOff, thinkingInject, cachePrefixInject, cooldown: collectCooldown(id), type: providerType, kukuThinkMode, visionBridge: vb, geminiBaseUrl: ((document.getElementById('gbu-' + id)||{}).value || '').trim() || null, traeEnableRemoteBudget, traeRemoteOnlyModels, traeMaxMessages, traeMaxHistoryChars, traeMaxToolSchemaChars, traeUpstreamEndpoint, traeRemoteAgentType, traeRemoteReasoningEffort, traeRemoteMaxMode, accountSpread: (document.getElementById('m365-spread-' + id)||{}).checked === true, promptMode, promptText, upstreamUserAgent })
+        body: JSON.stringify({ name: nm, baseUrl: url, apiType, authType, oauth: authType === 'oauth-device' ? oauth : undefined, apiKeys: keys, models, enabled, toolBridge: (document.getElementById('atb-' + id)||{}).checked === true, allowUnlistedModels: (document.getElementById('aum-' + id)||{}).checked === true, reasoningEffort: ((document.getElementById('re-' + id)||{}).value || null), deepseekThinkingOff, thinkingInject, cachePrefixInject, cooldown: collectCooldown(id), type: providerType, kukuThinkMode, visionBridge: vb, geminiBaseUrl: ((document.getElementById('gbu-' + id)||{}).value || '').trim() || null, traeEnableRemoteBudget, traeRemoteOnlyModels, traeMaxMessages, traeMaxHistoryChars, traeMaxToolSchemaChars, traeUpstreamEndpoint, traeRemoteAgentType, traeRemoteReasoningEffort, traeRemoteMaxMode, accountSpread: (document.getElementById('m365-spread-' + id)||{}).checked === true, promptMode, promptText, upstreamUserAgent, upstreamHeaders })
       })
     })
     const d = await r.json()

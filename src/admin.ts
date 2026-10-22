@@ -27,7 +27,7 @@ import {
 import { testModelConnection } from './proxy'
 import { probeMcpServers } from './mcp-gateway'
 import { MAX_ADMIN_REQUEST_BYTES, readOptionalJSONLimited, readStrictJSONLimited } from './request-body'
-import { normalizeUpstreamUserAgent, setHeaderCaseInsensitive } from './upstream-user-agent'
+import { applyUpstreamHeaders, normalizeUpstreamHeaders, normalizeUpstreamUserAgent } from './upstream-user-agent'
 import { isTraeProvider, testTraeCredential, testTraeModel } from './trae/proxy'
 import { diagnoseOpenCodeKey, fetchOpenCodeModels, isOpenCodeProvider, resolveOpenCodeUrls, testOpenCodeModel } from './opencode'
 import { isQoderFlow, fetchQoderModels, testQoderModel } from './qoder/proxy'
@@ -344,6 +344,12 @@ export async function handleCreateProvider(c: Context<AppEnv>) {
     }, 400)
   }
 
+  // 出站请求头覆写表：同上，非法头名/值（含 host、content-length、accept-encoding 等）直接拒绝
+  const upstreamHeaders = normalizeUpstreamHeaders(body.upstreamHeaders)
+  if (!upstreamHeaders.ok) {
+    return c.json<ApiResponse>({ success: false, message: upstreamHeaders.message }, 400)
+  }
+
   const providers = await getProviders(c.env)
   if (providers.some((p) => p.id === body.id)) {
     return c.json<ApiResponse>({ success: false, message: `提供商 id "${body.id}" 已存在` }, 409)
@@ -382,6 +388,7 @@ export async function handleCreateProvider(c: Context<AppEnv>) {
     traeRemoteMaxMode: body.traeRemoteMaxMode,
     accountSpread: body.accountSpread,
     upstreamUserAgent: upstreamUserAgent || undefined,
+    upstreamHeaders: Object.keys(upstreamHeaders.value).length > 0 ? upstreamHeaders.value : undefined,
     apiKeys: normalizeArray(body.apiKeys, (k) => ({ key: k, enabled: true })),
     models: body.models
       ? normalizeArray(body.models, (m) => ({ id: m, enabled: true }))
@@ -471,6 +478,14 @@ export async function handleUpdateProvider(c: Context<AppEnv>) {
       }, 400)
     }
     updates.upstreamUserAgent = ua === '' ? undefined : ua
+  }
+  if (body.upstreamHeaders !== undefined) {
+    // 传 null / {} 清除；非法头名或值不落库
+    const normalized = normalizeUpstreamHeaders(body.upstreamHeaders)
+    if (!normalized.ok) {
+      return c.json<ApiResponse>({ success: false, message: normalized.message }, 400)
+    }
+    updates.upstreamHeaders = Object.keys(normalized.value).length > 0 ? normalized.value : undefined
   }
   if (body.apiKeys !== undefined) {
     updates.apiKeys = normalizeArray(body.apiKeys, (k) => ({ key: k, enabled: true }))
@@ -844,7 +859,10 @@ export async function handleTestModel(c: Context<AppEnv>) {
   }
   const result = isOpenCodeProvider(provider.id)
     ? await testOpenCodeModel(resolvedBase, enabledKeys, modelId, resolveOpenCodeUrls(c.env))
-    : await testModelConnection(resolvedBase, enabledKeys[0].key, modelId, provider.apiType, provider.upstreamUserAgent)
+    : await testModelConnection(resolvedBase, enabledKeys[0].key, modelId, provider.apiType, {
+      upstreamUserAgent: provider.upstreamUserAgent,
+      upstreamHeaders: provider.upstreamHeaders,
+    })
 
   return c.json<ApiResponse>({
     success: true,
@@ -855,37 +873,45 @@ export async function handleTestModel(c: Context<AppEnv>) {
 // ===== Key / 模型连通性测试（通过服务端代理，避免 CORS） =====
 
 /**
- * 管理面探测（「测试 Key」/「获取模型」/「测试模型」）的上游 UA 解析。
+ * 管理面探测（「测试 Key」/「获取模型」/「测试模型」）的出站头解析。
  *
  * 这几个按钮走的是**直连探测**路径（`GET /models`、`POST /chat/completions`），与正式
  * 转发是两套代码。按客户端指纹鉴权的上游（如 agentrouter 的 `unauthorized_client_error`）
- * 在探测阶段同样只认 UA——不覆写的话后台永远显示 401，而实际转发其实是通的。
+ * 在探测阶段同样只认 UA/特征头——不覆写的话后台永远显示 401，而实际转发其实是通的。
  *
  * 优先级：请求体显式值（新建/编辑表单尚未保存时的当前输入）> 已落库的 provider 值。
- * `value: undefined` 表示不覆写，保持 fetch 默认 UA。
  */
-function probeUserAgent(
+function probeOutbound(
   stored: Provider | null,
-  rawBodyValue: unknown,
-): { ok: true; value: string | undefined } | { ok: false; message: string } {
-  if (typeof rawBodyValue === 'string' && rawBodyValue.trim() !== '') {
-    const normalized = normalizeUpstreamUserAgent(rawBodyValue)
+  rawUserAgent: unknown,
+  rawHeaders: unknown,
+): { ok: true; value: { upstreamUserAgent?: string; upstreamHeaders?: Record<string, string> } }
+  | { ok: false; message: string } {
+  let upstreamUserAgent: string | undefined
+  if (typeof rawUserAgent === 'string' && rawUserAgent.trim() !== '') {
+    const normalized = normalizeUpstreamUserAgent(rawUserAgent)
     if (normalized === null) {
       return { ok: false, message: '出站 User-Agent 必须是单行可打印 ASCII（不含换行/控制字符），且不超过 512 字节' }
     }
-    return { ok: true, value: normalized }
+    upstreamUserAgent = normalized
+  } else {
+    upstreamUserAgent = stored?.upstreamUserAgent
   }
-  return { ok: true, value: stored?.upstreamUserAgent }
-}
 
-/** 把 provider 级 UA 覆写写进探测请求头（无配置时原样返回）。 */
-function withProbeUserAgent(headers: Record<string, string>, userAgent: string | undefined): Record<string, string> {
-  if (userAgent) setHeaderCaseInsensitive(headers, 'User-Agent', userAgent)
-  return headers
+  let upstreamHeaders: Record<string, string> | undefined
+  if (rawHeaders !== undefined && rawHeaders !== null) {
+    const normalized = normalizeUpstreamHeaders(rawHeaders)
+    if (!normalized.ok) return { ok: false, message: normalized.message }
+    upstreamHeaders = Object.keys(normalized.value).length > 0 ? normalized.value : undefined
+  } else {
+    upstreamHeaders = stored?.upstreamHeaders
+  }
+
+  return { ok: true, value: { upstreamUserAgent, upstreamHeaders } }
 }
 
 export async function handleTestKeyNew(c: Context<AppEnv>) {
-  const { url, apiKey, apiType, providerId, model, intent, upstreamUserAgent: rawUserAgent } = await readStrictJSONLimited<{
+  const { url, apiKey, apiType, providerId, model, intent, upstreamUserAgent: rawUserAgent, upstreamHeaders: rawHeaders } = await readStrictJSONLimited<{
     url: string
     apiKey: string
     apiType?: string
@@ -896,15 +922,16 @@ export async function handleTestKeyNew(c: Context<AppEnv>) {
     intent?: string
     /** 出站 UA 覆写；新建表单尚未保存时由前端带上，缺省回落到落库值 */
     upstreamUserAgent?: string
+    /** 出站请求头覆写表；同上，未保存时以表单当前值为准 */
+    upstreamHeaders?: Record<string, string>
   }>(c.req.raw, MAX_ADMIN_REQUEST_BYTES)
-  // 落库 provider 读一次：CNB 免 Key 判定与出站 UA 解析共用
+  // 落库 provider 读一次：CNB 免 Key 判定与出站头解析共用
   const storedProvider = providerId ? await getProvider(c.env, providerId) : null
   const cnbProvider = storedProvider && isCnbProvider(storedProvider) ? storedProvider : null
-  const ua = probeUserAgent(storedProvider, rawUserAgent)
-  if (!ua.ok) {
-    return c.json<ApiResponse>({ success: false, message: ua.message }, 400)
+  const outbound = probeOutbound(storedProvider, rawUserAgent, rawHeaders)
+  if (!outbound.ok) {
+    return c.json<ApiResponse>({ success: false, message: outbound.message }, 400)
   }
-  const userAgent = ua.value
   if (!url || (!apiKey && !(providerId && (isOpenCodeProvider(providerId) || cnbProvider)))) {
     return c.json<ApiResponse>({ success: false, message: 'url 和 apiKey 为必填项' }, 400)
   }
@@ -1080,7 +1107,7 @@ export async function handleTestKeyNew(c: Context<AppEnv>) {
     try {
       const response = await fetch(modelsUrl, {
         method: 'GET',
-        headers: withProbeUserAgent({ 'Authorization': `Bearer ${apiKey}` }, userAgent),
+        headers: applyUpstreamHeaders({ 'Authorization': `Bearer ${apiKey}` }, outbound.value),
         signal: AbortSignal.timeout(15000),
       })
       let errBody = ''
@@ -1117,7 +1144,7 @@ export async function handleTestKeyNew(c: Context<AppEnv>) {
   try {
     const response = await fetch(`${cleanBase}/models`, {
       method: 'GET',
-      headers: withProbeUserAgent({ 'Authorization': `Bearer ${apiKey}` }, userAgent),
+      headers: applyUpstreamHeaders({ 'Authorization': `Bearer ${apiKey}` }, outbound.value),
       signal: AbortSignal.timeout(15000),
     })
 
@@ -1152,7 +1179,7 @@ export async function handleTestKeyNew(c: Context<AppEnv>) {
 }
 
 export async function handleTestModelNew(c: Context<AppEnv>) {
-  const { url, apiKey, apiType, model, providerId, upstreamUserAgent: rawUserAgent } = await readStrictJSONLimited<{
+  const { url, apiKey, apiType, model, providerId, upstreamUserAgent: rawUserAgent, upstreamHeaders: rawHeaders } = await readStrictJSONLimited<{
     url: string
     apiKey: string
     apiType?: string
@@ -1160,14 +1187,15 @@ export async function handleTestModelNew(c: Context<AppEnv>) {
     providerId?: string
     /** 出站 UA 覆写；新建表单尚未保存时由前端带上，缺省回落到落库值 */
     upstreamUserAgent?: string
+    /** 出站请求头覆写表；同上，未保存时以表单当前值为准 */
+    upstreamHeaders?: Record<string, string>
   }>(c.req.raw, MAX_ADMIN_REQUEST_BYTES)
-  // 落库 provider 读一次：CNB 适配器判定与出站 UA 解析共用
+  // 落库 provider 读一次：CNB 适配器判定与出站头解析共用
   const storedProvider = providerId ? await getProvider(c.env, providerId) : null
-  const ua = probeUserAgent(storedProvider, rawUserAgent)
-  if (!ua.ok) {
-    return c.json<ApiResponse>({ success: false, message: ua.message }, 400)
+  const outbound = probeOutbound(storedProvider, rawUserAgent, rawHeaders)
+  if (!outbound.ok) {
+    return c.json<ApiResponse>({ success: false, message: outbound.message }, 400)
   }
-  const userAgent = ua.value
   if (!url || !model || (!apiKey && !(isOpenCodeProvider(providerId || '') || (providerId && isCnbProvider({ id: providerId } as Provider))))) {
     return c.json<ApiResponse>({ success: false, message: 'url、apiKey、model 为必填项' }, 400)
   }
@@ -1226,7 +1254,7 @@ export async function handleTestModelNew(c: Context<AppEnv>) {
   try {
     const response = await fetch(`${cleanBase}/${endpoint}`, {
       method: 'POST',
-      headers: withProbeUserAgent({ 'Content-Type': 'application/json', 'Authorization': `Bearer ${apiKey}` }, userAgent),
+      headers: applyUpstreamHeaders({ 'Content-Type': 'application/json', 'Authorization': `Bearer ${apiKey}` }, outbound.value),
       body: JSON.stringify({ model, messages: [{ role: 'user', content: 'hi' }], max_tokens: 1 }),
       signal: AbortSignal.timeout(15000),
     })

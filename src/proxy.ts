@@ -31,7 +31,7 @@ import {
 } from './m365/responses-guardrails'
 import { isTraeProvider, proxyTraeChatRequest } from './trae/proxy'
 import { isZcodeProvider, buildZcodeHeaders } from './zcode/proxy'
-import { setHeaderCaseInsensitive } from './upstream-user-agent'
+import { applyUpstreamHeaders } from './upstream-user-agent'
 import { isKukuProvider, proxyKukuChatRequest } from './kuku/proxy'
 import { isDeepseekAppProvider, proxyDeepseekChatRequest } from './deepseek/proxy'
 import { isDeepseekReasoningOff } from './deepseek/request'
@@ -1315,13 +1315,18 @@ const finalizeProxyResponse = async (
   return new Response(response.body, { status: response.status, statusText: response.statusText, headers })
 }
 
-/** 测试模型连接，发送最小请求验证 */
+/**
+ * 测试模型连接，发送最小请求验证。
+ *
+ * `outbound` 与真实转发同口径：可传单个 UA（旧签名）或完整出站头配置，
+ * 保证后台「测试模型」不会因为缺少指纹头而误报 401。
+ */
 export async function testModelConnection(
   baseUrl: string,
   apiKey: string,
   modelId: string,
   apiType?: 'openai' | 'anthropic',
-  upstreamUserAgent?: string,
+  outbound?: string | { upstreamUserAgent?: string; upstreamHeaders?: Record<string, string> },
 ): Promise<{ success: boolean; message: string; statusCode?: number }> {
   try {
     const cleanBase = baseUrl.replace(/\/$/, '')
@@ -1334,11 +1339,9 @@ export async function testModelConnection(
     }
     // 始终用 Bearer Authorization 发 OpenAI 格式请求到上游
     headers['Authorization'] = `Bearer ${apiKey}`
-    // 与真实转发一致：按客户端指纹鉴权的上游，测试连接也必须带同一 UA，
+    // 与真实转发一致：按客户端指纹鉴权的上游，测试连接也必须带同一组出站头，
     // 否则后台会显示 401 而真实请求其实是通的。
-    if (upstreamUserAgent) {
-      setHeaderCaseInsensitive(headers, 'User-Agent', upstreamUserAgent)
-    }
+    applyUpstreamHeaders(headers, typeof outbound === 'string' ? { upstreamUserAgent: outbound } : (outbound || {}))
 
     const response = await fetch(url, {
       method: 'POST',
@@ -2090,10 +2093,9 @@ export async function forwardProxy(
       // 提供商级 User-Agent 覆写：按客户端指纹鉴权的上游（如 agentrouter）在 UA
       // 不在白名单时先于密钥校验拒绝，只能改 UA；客户端侧无法自改
       // （DSH 的 attributionHeaders() 会强制写回自己的 UA）。
-      // 大小写无关替换，覆盖 buildPassthroughHeaders 透传来的客户端 UA。
-      if (provider.upstreamUserAgent) {
-        setHeaderCaseInsensitive(forwardHeaders, 'User-Agent', provider.upstreamUserAgent)
-      }
+      // 大小写无关替换，覆盖 buildPassthroughHeaders 透传来的客户端 UA；
+      // 同一张表里还能带 anthropic-version / x-app / x-stainless-* 这类特征头。
+      applyUpstreamHeaders(forwardHeaders, provider)
       const requestBody = JSON.stringify(forwardBody)
       const isStream = isStreamRequest(forwardBody as ProxyRequestBody)
       try {
@@ -4059,10 +4061,8 @@ async function handleAnthropicMessagesInner(c: Context<AppEnv>) {
           if (isZcodeProvider(provider.id)) {
             Object.assign(headers, buildZcodeHeaders())
           }
-          // 与 /v1/chat/completions 同口径的提供商级 UA 覆写（按客户端指纹鉴权的上游）
-          if (provider.upstreamUserAgent) {
-            setHeaderCaseInsensitive(headers, 'User-Agent', provider.upstreamUserAgent)
-          }
+          // 与 /v1/chat/completions 同口径的提供商级出站头覆写（按客户端指纹鉴权的上游）
+          applyUpstreamHeaders(headers, provider)
           const r = await fetchUpstream(c.env, forwardUrl, {
             method: 'POST',
             headers,

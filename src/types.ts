@@ -103,6 +103,19 @@ export interface Provider {
    * 前缀透传）。不配 = 保持既有行为（透传客户端 UA）。
    */
   upstreamUserAgent?: string
+  /**
+   * 出站请求头覆写表（通用 api-key 转发路径 + 后台探测路径生效）。
+   *
+   * 与 {@link upstreamUserAgent} 同一动机，但覆盖整组头：按客户端指纹鉴权/风控的
+   * 上游除了看 UA，还看 `anthropic-version`、`x-app`、`x-stainless-*` 这类客户端
+   * 特征头。这里按**名字大小写无关**地覆盖同名头（先删后写），未列出的头保持原样
+   * （含客户端透传值）。
+   *
+   * 禁止列表见 `upstream-user-agent.ts` 的 `FORBIDDEN_UPSTREAM_HEADERS`
+   * （host / content-length / 逐跳头 / 鉴权头等，改它们只会把请求弄坏或泄露凭据）。
+   * `user-agent` 可以放这里，也可以继续用 {@link upstreamUserAgent}；两者都配时以本表为准。
+   */
+  upstreamHeaders?: Record<string, string>
   /** OAuth 设备码认证配置（authType === 'oauth-device' 时生效） */
   oauth?: OAuthDeviceConfig
   apiKeys: ApiKeyEntry[]
@@ -563,6 +576,8 @@ export interface CreateProviderRequest {
   clinePinByModel?: Record<string, ClinePinConfig>
   /** 出站 User-Agent 覆写（见 Provider.upstreamUserAgent） */
   upstreamUserAgent?: string | null
+  /** 出站请求头覆写表（传 null 清除；见 Provider.upstreamHeaders） */
+  upstreamHeaders?: Record<string, string> | null
   /** DeepSeek App 提供商级默认关闭深度思考（见 Provider.deepseekThinkingOff） */
   deepseekThinkingOff?: boolean
   thinkingInject?: string[]
@@ -634,6 +649,8 @@ export interface UpdateProviderRequest {
   promptText?: string | null
   /** 出站 User-Agent 覆写（传 ''/null 清除；见 Provider.upstreamUserAgent） */
   upstreamUserAgent?: string | null
+  /** 出站请求头覆写表（传 null 清除；见 Provider.upstreamHeaders） */
+  upstreamHeaders?: Record<string, string> | null
 }
 
 /**

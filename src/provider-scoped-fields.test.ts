@@ -140,4 +140,26 @@ describe('厂商预设：按客户端指纹鉴权的上游必须有创建入口'
     // 两个探测请求都要带上
     expect(html).toContain('upstreamUserAgent: probeUserAgent(providerId)')
   })
+
+  it('预设还带一组客户端特征头（不止 UA），并可逐行编辑', async () => {
+    const html = await render([])
+    // 预设里的头集合：页面常量 + 新建表单文本域
+    expect(html).toContain('x-stainless-lang')
+    expect(html).toContain('id="auh"')
+    expect(html).toContain('function parseUpstreamHeaders(text)')
+    expect(html).toContain('upstreamHeaders: probeUpstreamHeaders(providerId)')
+  })
+
+  it('提供商详情带可编辑的请求头文本域，按「头名: 值」逐行渲染', async () => {
+    const html = await render([
+      baseProvider('agentrouter', {
+        upstreamUserAgent: 'claude-cli/2.0.1 (external, cli)',
+        upstreamHeaders: { 'x-app': 'cli', 'x-stainless-os': 'Windows' },
+      }),
+    ])
+    const p = panel(html, 'agentrouter')
+    expect(p).toContain('id="uh-agentrouter"')
+    expect(p).toContain('x-app: cli')
+    expect(p).toContain('x-stainless-os: Windows')
+  })
 })
