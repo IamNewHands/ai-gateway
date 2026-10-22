@@ -13,6 +13,11 @@
  * `error/message/type/code` 字段——看不出是哪个通道（官方地址 / public 镜像）、
  * 试过几个 key、上游到底说了什么，也看不出该重试还是该改配置。
  *
+ * 背景 3：2026-10-22 20:00 同一组 4 个镜像全失败（429/429/404/400），客户端两次分别
+ * 报 429 与裸 400——差别只来自镜像轮转的随机起点，因为旧逻辑让「最后一个镜像的报文」
+ * 覆盖前一个。因此诊断体除通道/次数外还带上 `mirror_attempts` 逐镜像状态，
+ * 调用方也要保证「可诊断的失败不被后面的畸形报文盖掉」。
+ *
  * 本模块只做一件事：**状态码保持上游原值**（不谎报成功、不把 4xx 改写成 2xx/5xx），
  * 但把「不可诊断」的失败体（空体，或非空但没有错误信封的 JSON）替换成含上游状态、
  * 模型、通道、尝试次数、镜像数与上游原始报文片段的 JSON 诊断体，并加
@@ -22,6 +27,18 @@
  * 「可诊断」的判定口径集中在本文件（`isDiagnosticUpstreamBody`）：调用方不得各自
  * 复制一份关键字表，否则「是否重试」与「报文如何改写」会跑偏。
  */
+
+/** 单个镜像通道的尝试结果（逐通道诊断用，见 mirror_attempts）。 */
+export interface MirrorAttemptSummary {
+  /** 镜像基址：已剥掉 userinfo / query / fragment，不含凭据。 */
+  url: string
+  /** 上游返回的状态码；网络异常时缺省。 */
+  status?: number
+  /** 该通道的报文是否可诊断（有错误信封即为 true）。 */
+  diagnostic?: boolean
+  /** 网络异常摘要；有 status 时缺省。 */
+  error?: string
+}
 
 /** 不可诊断失败所需的上下文，由调用方在失败出口处提供。 */
 export interface EmptyBodyContext {
@@ -35,6 +52,8 @@ export interface EmptyBodyContext {
   mirrors?: number
   /** 失败发生在官方地址还是镜像。 */
   lane?: 'official' | 'mirror' | 'transport'
+  /** 逐镜像尝试结果：多个镜像都失败时，只有一条报文能回给客户端。 */
+  mirrorAttempts?: MirrorAttemptSummary[]
 }
 
 /** 空体诊断体的稳定类型标签，客户端/日志可据此匹配。 */
@@ -89,6 +108,9 @@ function hintFor(context: EmptyBodyContext, empty: boolean): string {
   if (context.lane === 'mirror') parts.push('已回退到 public 镜像仍失败')
   if (context.keysTried === 0) parts.push('该提供商没有启用任何 Key（走镜像模式）')
   if (context.mirrors === 0) parts.push('未配置 OPENCODE_MIRRORS_URL 等镜像回退')
+  if (context.mirrorAttempts && context.mirrorAttempts.length > 0) {
+    parts.push('逐镜像状态见 mirror_attempts（每项含 url / status / diagnostic）')
+  }
   if (empty) {
     parts.push('上游静默失败常见于：模型已下架、镜像未代理该路径（如只转发 /zen 不转发 /inference）、或上游网关抖动；稍后重试或换模型/换账号')
   } else {
@@ -125,6 +147,9 @@ export async function withUpstreamFailureDiagnosis(
       ...(context.keysTried === undefined ? {} : { keys_tried: context.keysTried }),
       ...(context.mirrors === undefined ? {} : { mirrors: context.mirrors }),
       ...(context.lane === undefined ? {} : { lane: context.lane }),
+      ...(context.mirrorAttempts && context.mirrorAttempts.length > 0
+        ? { mirror_attempts: context.mirrorAttempts }
+        : {}),
       hint: hintFor(context, empty),
     },
   }

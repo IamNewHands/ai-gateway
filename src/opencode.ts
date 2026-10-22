@@ -1,5 +1,6 @@
 import type { ApiKeyEntry, Env } from './types'
 import { isDiagnosticUpstreamBody, withUpstreamFailureDiagnosis } from './upstream-failure'
+import type { MirrorAttemptSummary } from './upstream-failure'
 
 export const OPENCODE_PROVIDER_ID = 'opencode'
 
@@ -205,6 +206,20 @@ function buildUrl(baseUrl: string, subPath: string, search = ''): string {
     base = base.replace(/\/zen(\/v1)?$/, '/inference$1')
   }
   return `${base}/${subPath.replace(/^\/+/, '')}${search}`
+}
+
+/** 诊断展示用的镜像地址：剥掉 userinfo / query / fragment，避免把凭据带进错误体 */
+function redactMirrorUrl(raw: string): string {
+  try {
+    const parsed = new URL(raw)
+    parsed.username = ''
+    parsed.password = ''
+    parsed.search = ''
+    parsed.hash = ''
+    return parsed.toString()
+  } catch {
+    return raw.split('?')[0].split('#')[0]
+  }
 }
 
 /**
@@ -1056,6 +1071,8 @@ async function proxyOpenCodeRequestRaw(
   let reshaped = false
   let officialFailure: StoredFailure | null = null
   let mirrorFailure: StoredFailure | null = null
+  /** 逐镜像尝试结果：镜像多通道全失败时留给诊断体，避免只看到最后一条 */
+  const mirrorAttempts: MirrorAttemptSummary[] = []
   let lastTransportError: unknown = null
 
   const enabledKeys = options.apiKeys.filter((entry) => entry.enabled && entry.key)
@@ -1301,7 +1318,10 @@ async function proxyOpenCodeRequestRaw(
   // 所有 key 都失败，回退到镜像 public 模式
   const mirrors = getMirrorOrder(options.mirrorUrls, random)
   if (mirrors.length > 0) {
-    log('warn', `${tag} 所有 key 均失败，回退到 public 镜像（共 ${mirrors.length} 个）`)
+    // 0 个 key 时说「所有 key 均失败」是误导：本来就没有 key，一次都没试
+    log('warn', enabledKeys.length === 0
+      ? `${tag} 没有启用的 key，回退到 public 镜像（共 ${mirrors.length} 个）`
+      : `${tag} 所有 key 均失败，回退到 public 镜像（共 ${mirrors.length} 个）`)
   }
   for (const mirror of mirrors) {
     try {
@@ -1312,10 +1332,22 @@ async function proxyOpenCodeRequestRaw(
         return { response, shape }
       }
       log('warn', `${tag} public 镜像 ${mirror} → ${response.status}`)
-      mirrorFailure = await storeFailure(response)
+      const failure = await storeFailure(response)
+      const diagnostic = isDiagnosticFailure(failure)
+      mirrorAttempts.push({
+        url: redactMirrorUrl(mirror),
+        status: failure.status,
+        diagnostic,
+      })
+      // 可诊断的失败粘住：4 个镜像全挂时，客户端的错误码不能由镜像轮转的随机起点决定。
+      // 2026-10-22 20:00 现场：同一组镜像（429/429/404/400），一次报 429
+      // FreeUsageLimitError、一次报只有 {"model":...} 的裸 400——后者把真实原因盖掉了。
+      if (!mirrorFailure || !isDiagnosticFailure(mirrorFailure)) mirrorFailure = failure
     } catch (error) {
       lastTransportError = error
-      log('warn', `${tag} public 镜像 ${mirror} 网络异常：${(error instanceof Error && error.message) ? error.message.substring(0, 200) : String(error).substring(0, 200)}`)
+      const detail = (error instanceof Error && error.message ? error.message : String(error)).substring(0, 200)
+      mirrorAttempts.push({ url: redactMirrorUrl(mirror), error: detail })
+      log('warn', `${tag} public 镜像 ${mirror} 网络异常：${detail}`)
     }
   }
 
@@ -1337,6 +1369,7 @@ async function proxyOpenCodeRequestRaw(
       keysTried: enabledKeys.length,
       mirrors: mirrors.length,
       lane,
+      mirrorAttempts: lane === 'mirror' && mirrorAttempts.length > 0 ? mirrorAttempts : undefined,
     })
     if (diagnosed !== response) {
       log('warn', `${tag} 上游 ${response.status} 失败报文不可诊断（空体或缺少错误字段），已补诊断 JSON 体`)

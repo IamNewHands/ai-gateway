@@ -233,6 +233,77 @@ describe('opencode 出口：上游空体被补成可诊断体', () => {
     expect(res.headers.get(UPSTREAM_NONDIAGNOSTIC_HEADER)).toBeNull()
     expect(await res.text()).toBe(freeTier)
   })
+
+  it('镜像多通道全失败 → 可诊断的 429 不被后面镜像的畸形 400 盖掉', async () => {
+    // 2026-10-22 20:00 现场：4 个镜像分别回 429/429/404/400，客户端两次分别收到
+    // 429 与裸 400——差别只来自镜像轮转的随机起点。可诊断失败必须粘住。
+    const quota = '{"type":"FreeUsageLimitError","message":"Free usage limit reached. Subscribe to OpenCode Go to keep going"}'
+    const calls: string[] = []
+    const fetcher = vi.fn(async (url: string | URL | Request) => {
+      const href = String(url)
+      calls.push(href)
+      if (href.includes('mirror-a')) return new Response(quota, { status: 429, headers: { 'Content-Type': 'application/json' } })
+      if (href.includes('mirror-b')) return new Response('', { status: 404 })
+      return new Response('{"model":"deepseek-v4.1-flash-free"}', { status: 400, headers: { 'Content-Type': 'application/json' } })
+    }) as unknown as typeof fetch
+
+    const res = await proxyOpenCodeRequest({
+      baseUrl: 'https://opencode.ai/zen/v1',
+      apiKeys: [],
+      mirrorUrls: [
+        'https://mirror-a.example/zen/v1',
+        'https://mirror-b.example/zen/v1',
+        'https://mirror-c.example/zen/v1',
+      ],
+      method: 'POST',
+      subPath: 'chat/completions',
+      body: JSON.stringify({ model: 'deepseek-v4.1-flash-free', stream: true, messages: [{ role: 'user', content: 'hi' }] }),
+      fetcher,
+      random: () => 0,
+    })
+
+    expect(calls).toHaveLength(3)
+    expect(res.status).toBe(429)
+    expect(res.headers.get(UPSTREAM_NONDIAGNOSTIC_HEADER)).toBeNull()
+    expect(await res.text()).toBe(quota)
+  })
+
+  it('镜像全部不可诊断 → 诊断体带 mirror_attempts 逐镜像状态，且 0 key 时日志不再说「所有 key 均失败」', async () => {
+    const logs: string[] = []
+    const fetcher = vi.fn(async (url: string | URL | Request) => {
+      const href = String(url)
+      if (href.includes('mirror-a')) return new Response('', { status: 404 })
+      if (href.includes('mirror-b')) return new Response('{}', { status: 502 })
+      return new Response('{"model":"deepseek-v4.1-flash-free"}', { status: 400, headers: { 'Content-Type': 'application/json' } })
+    }) as unknown as typeof fetch
+
+    const res = await proxyOpenCodeRequest({
+      baseUrl: 'https://opencode.ai/zen/v1',
+      apiKeys: [],
+      mirrorUrls: [
+        'https://mirror-a.example/zen/v1?token=secret',
+        'https://mirror-b.example/zen/v1',
+        'https://mirror-c.example/zen/v1',
+      ],
+      method: 'POST',
+      subPath: 'chat/completions',
+      body: JSON.stringify({ model: 'deepseek-v4.1-flash-free', stream: true, messages: [{ role: 'user', content: 'hi' }] }),
+      fetcher,
+      random: () => 0,
+      logger: (_level, message) => { logs.push(message) },
+    })
+
+    // 全部不可诊断时保留旧口径：最后一个镜像的报文/状态码胜出
+    expect(res.status).toBe(400)
+    const payload = await res.json() as { error: Record<string, unknown> }
+    const attempts = payload.error['mirror_attempts'] as Array<{ url: string, status?: number, diagnostic?: boolean }>
+    expect(attempts.map((a) => a.status)).toEqual([404, 502, 400])
+    expect(attempts.every((a) => a.diagnostic === false)).toBe(true)
+    // 镜像地址剥掉 query，凭据不进错误体
+    expect(attempts[0].url).toBe('https://mirror-a.example/zen/v1')
+    expect(JSON.stringify(payload)).not.toContain('secret')
+    expect(logs.some((line) => line.includes('没有启用的 key，回退到 public 镜像'))).toBe(true)
+  })
 })
 
 describe('/v1/messages：opencode 无 Key 不再误报 configuration_error', () => {
