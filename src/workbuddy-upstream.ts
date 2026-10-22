@@ -1054,14 +1054,78 @@ function sanitizeIdentitySentence(text: string): string {
   return text.replace(SANITIZE_IDENTITY_RE, SANITIZE_IDENTITY_REPLACEMENT).trim()
 }
 
+// ===== DSH（DeepSeek Harness）渠道指纹：GUI 描述段 + 品牌词（hub #570 / #579 / #574） =====
+
+/**
+ * DSH 系统提示里的 **GUI 描述段**（hub #570 → #579 → #574）。
+ *
+ * 上游对「A 句 + B 句」的连续短语做大小写不敏感的渠道校验，命中即 400 / code 11-128：
+ *   A: You are interacting with the user through the DeepSeek Harness Web GUI
+ *      whose URL the runtime context names.
+ *   B: When the user refers to "this page", "this GUI", or "this app" without naming
+ *      another target, they mean this GUI.
+ *
+ * hub 逐句二分实测结论：改 A 句、改 B 句、或在两句之间插东西都会失配（B 句本身不是
+ * 指纹，A 句才是锚点）；但**只调整 A 句句尾语序（#579）实测仍 400**——最终靠
+ * 「A 句定形改写 + 散文里 `DeepSeek Harness` → `DeepSeek`」（#574）才通过真实 129KB 请求。
+ *
+ * 为什么不能靠 SANITIZE_IDENTITY_RE 兜住：该正则要求 `powered by / built on / …` 动词，
+ * GUI 段没有动词；而且本段不含 SANITIZE_FEATURES 任何一项 —— sanitizeFingerprintText
+ * 会在快速路径直接 early-return，整段原样出站 → 稳定 400。
+ */
+const SANITIZE_DSH_GUI_RE =
+  /You are interacting with the user through the (?:DeepSeek Harness|DeepSeek) Web GUI whose URL the runtime context names\./gi
+const SANITIZE_DSH_GUI_REPLACEMENT =
+  'You are interacting with the user through the DeepSeek Web GUI whose URL is named in the runtime context.'
+
+/**
+ * **品牌词缩减**：散文里的 `DeepSeek Harness` → `DeepSeek`（hub #574 确认的必要条件）。
+ *
+ * 只吃「空格分隔的两个词」，因此连字符 / 下划线形态字节不变：
+ *   - `github.com/deepseek-ai/deepseek-harness/tree/main`   ← 仓库地址
+ *   - `import deepseek_harness as dsh`                      ← 包名
+ *   - `/opt/deepseek-harness/app`                           ← 安装路径
+ * 末尾 `\b` 保证 `Harnesses` 之类的更长词不被截断。不锚定句子形状 —— 比按句特判稳，
+ * 且语义不变（品牌名少一个限定词）；替换串恒为 `DeepSeek`，大小写归一对齐 hub。
+ */
+const SANITIZE_DSH_BRAND_RE = /\bDeepSeek[ \t]+Harness\b/gi
+const SANITIZE_DSH_BRAND_REPLACEMENT = 'DeepSeek'
+
+/** 廉价前置筛：不含 `deepseek` 的文本直接跳过两条正则。 */
+function hasDshChannelFingerprint(text: string): boolean {
+  return /deepseek/i.test(text)
+}
+
+/**
+ * DSH 渠道指纹清洗。**顺序不可换**：
+ *   1. 先做 A 句定形改写 —— 它要求匹配句尾 `whose URL the runtime context names`，
+ *      先缩品牌词会留下一个仍带旧句尾的半改句子（上游照样命中）；
+ *   2. 再全局缩品牌词 —— 覆盖 GUI 段之外的自述散文（hub #574 实测品牌词是必要条件）。
+ */
+function sanitizeDshChannelFingerprint(text: string): string {
+  if (!text || !hasDshChannelFingerprint(text)) return text
+  return text
+    .replace(SANITIZE_DSH_GUI_RE, SANITIZE_DSH_GUI_REPLACEMENT)
+    .replace(SANITIZE_DSH_BRAND_RE, SANITIZE_DSH_BRAND_REPLACEMENT)
+}
+
+/**
+ * identity 通道的完整净化链（system / developer / assistant 共用）：
+ * 通用指纹 → 自我介绍句式 → DSH 渠道指纹。
+ */
+function sanitizeIdentityText(text: string): string {
+  return sanitizeDshChannelFingerprint(sanitizeIdentitySentence(sanitizeFingerprintText(text)))
+}
+
 /**
  * 净化 content（兼容字符串与多模态数组）：只动 text part，image 等 part 不动。
- * identity=true（system/developer）时额外做「自我介绍句式 + 品牌」改写。
+ * identity=true（system / developer / assistant）时额外做「自我介绍句式 + 品牌」与
+ * DSH 渠道指纹（GUI 段 + 品牌词）改写。
  * 返回是否发生变化。
  */
 function sanitizeContentValue(v: unknown, identity: boolean = false): { value: unknown; changed: boolean } {
   if (typeof v === 'string') {
-    const s = identity ? sanitizeIdentitySentence(sanitizeFingerprintText(v)) : sanitizeFingerprintText(v)
+    const s = identity ? sanitizeIdentityText(v) : sanitizeFingerprintText(v)
     return { value: s, changed: s !== v }
   }
   if (Array.isArray(v)) {
@@ -1071,7 +1135,7 @@ function sanitizeContentValue(v: unknown, identity: boolean = false): { value: u
       const part = p as Record<string, unknown>
       const text = part['text']
       if (typeof text !== 'string') continue
-      const s = identity ? sanitizeIdentitySentence(sanitizeFingerprintText(text)) : sanitizeFingerprintText(text)
+      const s = identity ? sanitizeIdentityText(text) : sanitizeFingerprintText(text)
       if (s !== text) {
         part['text'] = s
         changed = true
@@ -1295,10 +1359,13 @@ export function sanitizeWorkbuddyMessages(body: Record<string, unknown>): void {
   for (const m of messages) {
     if (!m || typeof m !== 'object' || Array.isArray(m)) continue
     const msg = m as Record<string, unknown>
-    // 「自我介绍句式 + 品牌」只在 system / developer 里改写；user/assistant/tool
-    // 属用户数据，改写会让模型看到与磁盘不一致的内容（workbuddy2api-hub #537）。
+    // 「自我介绍句式 + 品牌」/ DSH 渠道指纹只在 system / developer / assistant 里改写。
+    // user / tool 属用户数据，改写会让模型看到与磁盘不一致的内容（workbuddy2api-hub #537）。
+    // **assistant 为什么必须算进来**：hub #574 实测同一句放 user 里 200/200/200、
+    // 放 assistant 里 400/400/400 —— 历史里的自述句同样过上游渠道校验，只清洗
+    // system 会让多轮会话在第二轮就被拦。
     const role = typeof msg['role'] === 'string' ? (msg['role'] as string).trim().toLowerCase() : ''
-    const identity = role === 'system' || role === 'developer'
+    const identity = role === 'system' || role === 'developer' || role === 'assistant'
     if ('content' in msg) {
       const { value, changed } = sanitizeContentValue(msg['content'], identity)
       if (changed) msg['content'] = value

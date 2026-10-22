@@ -796,7 +796,17 @@ export async function handleTestModel(c: Context<AppEnv>) {
       const url = `${realmBase}/${endpoint}`
       const headers = buildOauthHeaders(cfg, token, { origin, apiType: provider.apiType, cookies })
       if (isWorkbuddyPool) {
-        injectWorkbuddyChatHeaders(headers, token, realm, tokenState ? { uid: tokenState.uid, enterprise_id: tokenState.enterprise_id, domain: tokenState.domain, device_token: tokenState.device_token } : undefined, cfg, { chatPath: true })
+        // 会话头族必须一并注入：injectWorkbuddyChatHeaders 只在收了 chatMeta 时才调
+        // injectConversationHeaders（workbuddy-upstream.ts 的 `if (opts?.chatMeta && isChat)`），
+        // 而 `X-Conversation-ID` 缺失会被上游渠道校验直接判 400 / code 11-128
+        // （`conversation id missing`，见 workbuddy-session-ids.ts 的关键契约）。
+        // 这里是**直连上游**的最小探测请求、不走 forwardProxy，所以真实转发路径的
+        // chatMeta 不会自动带过来 —— 漏传就会稳定假阴性（chat 实际可用却测出 400）。
+        // 传空串即可：injectConversationHeaders 会就地补带连字符的 UUID 与 32 hex 请求 id。
+        injectWorkbuddyChatHeaders(headers, token, realm, tokenState ? { uid: tokenState.uid, enterprise_id: tokenState.enterprise_id, domain: tokenState.domain, device_token: tokenState.device_token } : undefined, cfg, {
+          chatPath: true,
+          chatMeta: { conversationId: '', conversationRequestId: '' },
+        })
       }
       // 此处**直连上游**，不走 forwardProxy，故缺失真实转发管线里的
       // ensureGlobalFallbackSystem。global 域要求首条为 system，缺省会

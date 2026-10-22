@@ -115,6 +115,12 @@ describe('handleTestModel: WorkBuddy 连通性测试 max_tokens 参数保护', (
     // 会话头族：真实 chat 路径必带，缺失会被上游判 400 / code 11128（conversation id missing）
     expect(interceptedHeaders['X-Conversation-Request-ID']).toMatch(/^[0-9a-f]{32}$/)
     expect(interceptedHeaders['X-Conversation-Message-ID']).toMatch(/^[0-9a-f]{32}$/)
+    // X-Conversation-ID 是 11-128 那条判定的**唯一依据**，必须是带连字符的 UUID（非 32 hex）
+    expect(interceptedHeaders['X-Conversation-ID']).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/)
+    expect(interceptedHeaders['X-Root-Request-ID']).toBe(interceptedHeaders['X-Conversation-Request-ID'])
+    // trace 族随会话头族一起注入（W3C traceparent + B3 单头）
+    expect(interceptedHeaders['traceparent']).toMatch(/^00-[0-9a-f]{32}-[0-9a-f]{16}-01$/)
+    expect(interceptedHeaders['b3']).toMatch(/^[0-9a-f]{32}-[0-9a-f]{16}-1$/)
     expect(interceptedHeaders['X-Request-ID']).toMatch(/^[0-9a-f]{32}$/)
   })
 

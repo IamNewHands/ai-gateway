@@ -1153,12 +1153,21 @@ describe('sanitizeWorkbuddyMessages 请求体脱敏', () => {
     expect((body.messages[0] as any).content).toBe('You are a helpful AI assistant.')
   })
 
-  it('user / assistant 里的自我介绍句式不改写（用户数据）', () => {
+  it('user / tool 里的自我介绍句式不改写（用户数据）', () => {
     const text = 'You are an AI assistant built on DeepSeek.'
-    const body = { messages: [{ role: 'user', content: text }, { role: 'assistant', content: text }] }
+    const body = { messages: [{ role: 'user', content: text }, { role: 'tool', content: text }] }
     sanitizeWorkbuddyMessages(body)
     expect((body.messages[0] as any).content).toBe(text)
     expect((body.messages[1] as any).content).toBe(text)
+  })
+
+  it('**assistant 历史里的自我介绍句式同样改写**（hub #574：user 200 / assistant 400）', () => {
+    // 同一句放 user 里 200/200/200、放 assistant 里 400/400/400（hub 实测）。
+    // 只清洗 system 会让多轮会话在第二轮就被上游拦掉。
+    const text = 'You are an AI agent powered by DeepSeek Harness.'
+    const body = { messages: [{ role: 'assistant', content: text }] }
+    sanitizeWorkbuddyMessages(body)
+    expect((body.messages[0] as any).content).toBe('You are a helpful AI assistant.')
   })
 
   it('不误伤分词修饰宾语的普通句子', () => {
@@ -1211,6 +1220,86 @@ describe('sanitizeWorkbuddyMessages 请求体脱敏', () => {
     expect(() => sanitizeWorkbuddyMessages({})).not.toThrow()
     expect(() => sanitizeWorkbuddyMessages({ messages: 'bad' })).not.toThrow()
     expect(() => sanitizeWorkbuddyMessages({ messages: [null, 1, 'x'] })).not.toThrow()
+  })
+})
+
+describe('DSH 渠道指纹：GUI 描述段 + 品牌词（移植 hub #570 / #579 / #574）', () => {
+  // 与 hub tests/_test_sanitize_fingerprint.py 的 DshGuiParagraphTests 同源。
+  const A = 'You are interacting with the user through the DeepSeek Harness Web GUI whose URL the runtime context names.'
+  const A_REWORDED = 'You are interacting with the user through the DeepSeek Web GUI whose URL is named in the runtime context.'
+  const B = 'When the user refers to "this page", "this GUI", or "this app" without naming another target, they mean this GUI.'
+  const GUI = `${A} ${B}`
+
+  const run = (role: string, content: string) => {
+    const body = { messages: [{ role, content }] }
+    sanitizeWorkbuddyMessages(body)
+    return (body.messages[0] as any).content as string
+  }
+
+  it('system 里的 GUI 段被「A 句定形改写」，B 句原样保留', () => {
+    // 逐句二分结论：B 句本身不是指纹，A 句才是锚点；但 A 句必须连句尾一起重写
+    // （hub #579 只改语序、实测仍 400，故这里钉住的是 #574 的定形形态）。
+    expect(run('system', GUI)).toBe(`${A_REWORDED} ${B}`)
+  })
+
+  it('**关键**：散文里的品牌词被缩成 DeepSeek（#579 只改语序实测仍 400）', () => {
+    const out = run('system', GUI)
+    expect(out).toContain('DeepSeek Web GUI')
+    expect(out).not.toContain('DeepSeek Harness')
+    expect(out).not.toContain('whose URL the runtime context names')
+  })
+
+  it('developer 角色同样改写', () => {
+    expect(run('developer', GUI)).toBe(`${A_REWORDED} ${B}`)
+  })
+
+  it('**assistant 历史同样改写**（hub #574：同一句 user 200 / assistant 400）', () => {
+    const out = run('assistant', GUI)
+    expect(out).not.toContain('DeepSeek Harness')
+    expect(out).toContain('DeepSeek Web GUI')
+  })
+
+  it('user / tool 不改写（用户数据，hub #537）', () => {
+    expect(run('user', GUI)).toBe(GUI)
+    expect(run('tool', GUI)).toBe(GUI)
+  })
+
+  it('连字符 / 下划线形态的标识符原样保留', () => {
+    // 品牌缩词只吃「空格分隔的两个词」，路径 / 包名 / 仓库地址不得被破坏。
+    for (const text of [
+      'github.com/deepseek-ai/deepseek-harness/tree/main',
+      'import deepseek_harness as dsh',
+      '/opt/deepseek-harness/app',
+    ]) {
+      expect(run('system', text)).toBe(text)
+    }
+  })
+
+  it('大小写不敏感，且幂等', () => {
+    const once = run('system', GUI.toLowerCase())
+    expect(once).toBe(`${A_REWORDED} ${B.toLowerCase()}`)
+    expect(run('system', once)).toBe(once)
+  })
+
+  it('生产入口真的把改写带上出站 body（规则接上了还不够，得确认接线）', () => {
+    // 对应 hub 的 test_wire_body_carries_the_rewrite：漏接线时单测全绿、线上照旧 400。
+    const body: Record<string, unknown> = {
+      model: 'deepseek-v4.1-flash',
+      messages: [
+        { role: 'system', content: GUI },
+        { role: 'user', content: 'hi' },
+      ],
+    }
+    sanitizeWorkbuddyMessages(body)
+    const system = (body.messages as any[])[0].content as string
+    expect(system).toContain('DeepSeek Web GUI')
+    expect(system).not.toContain('DeepSeek Harness')
+    expect(system).toContain('whose URL is named in the runtime context')
+  })
+
+  it('不含 deepseek 的普通文本零改动（前置筛）', () => {
+    const text = 'You are interacting with the user through the Web GUI. Nothing to see.'
+    expect(run('system', text)).toBe(text)
   })
 })
 
