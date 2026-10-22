@@ -3,13 +3,23 @@ import { Hono } from 'hono'
 import { handleAnthropicMessages, handleProxy } from './proxy'
 import { proxyOpenCodeRequest } from './opencode'
 import { clearCache } from './storage'
-import { withEmptyBodyDiagnosis, UPSTREAM_EMPTY_ERROR_TYPE, UPSTREAM_EMPTY_HEADER } from './upstream-failure'
+import {
+  isDiagnosticUpstreamBody,
+  withUpstreamFailureDiagnosis,
+  UPSTREAM_EMPTY_ERROR_TYPE,
+  UPSTREAM_EMPTY_HEADER,
+  UPSTREAM_NONDIAGNOSTIC_ERROR_TYPE,
+  UPSTREAM_NONDIAGNOSTIC_HEADER,
+} from './upstream-failure'
 import type { AppEnv, Env, Provider } from './types'
 
 /**
- * 上游「静默失败」的两处修复：
+ * 上游「不可诊断失败」的修复：
  *  1. opencode 上游返回非 2xx 且响应体为空时，补可诊断 JSON（2026-10-21 DSH 报
  *     `404 status code (no body)` 就是空体原样透传）；
+ *  1b. 2026-10-22 DSH 报 `400 {"model":"deepseek-v4.1-flash-free"}`：非空但没有任何
+ *     错误字段的畸形报文同样不可诊断，需要补成诊断体，且不能被当成「请求本身的问题」
+ *     直接放弃其它通道；
  *  2. `/v1/messages`（Anthropic 入口）缺少 opencode 分派，无 Key 的 opencode 会
  *     误报 500 `Provider "OpenCode" has no enabled API keys`——同一模型走
  *     `/v1/chat/completions` 却是 200。
@@ -33,10 +43,10 @@ function openAiSse(model: string, content = 'hello'): Response {
   ]), { status: 200, headers: { 'Content-Type': 'text/event-stream' } })
 }
 
-describe('withEmptyBodyDiagnosis：空体才有诊断体，非空原样返回', () => {
+describe('withUpstreamFailureDiagnosis：空体/畸形体才有诊断体，可诊断报文原样返回', () => {
   it('空体失败 → 换成 JSON 诊断体，状态码保持上游原值', async () => {
     const upstream = new Response('', { status: 404 })
-    const out = await withEmptyBodyDiagnosis(upstream, {
+    const out = await withUpstreamFailureDiagnosis(upstream, {
       status: 404, model: 'deepseek-v4.1-flash-free', keysTried: 0, mirrors: 0, lane: 'mirror',
     })
     expect(out.status).toBe(404)
@@ -51,25 +61,62 @@ describe('withEmptyBodyDiagnosis：空体才有诊断体，非空原样返回', 
     expect(String(payload.error['hint'])).toContain('镜像')
   })
 
-  it('非空失败 → 原样返回，且原响应体未被消费', async () => {
+  it('可诊断失败（带 error/message）→ 原样返回，且原响应体未被消费', async () => {
     const upstream = new Response('{"error":{"message":"model is unavailable"}}', {
       status: 403, headers: { 'Content-Type': 'application/json' },
     })
-    const out = await withEmptyBodyDiagnosis(upstream, { status: 403, model: 'm' })
+    const out = await withUpstreamFailureDiagnosis(upstream, { status: 403, model: 'm' })
     expect(out).toBe(upstream)
     expect(await out.text()).toBe('{"error":{"message":"model is unavailable"}}')
   })
 
   it('成功响应 → 直接返回（不触碰 body）', async () => {
     const upstream = new Response('{"ok":true}', { status: 200 })
-    const out = await withEmptyBodyDiagnosis(upstream, { status: 200, model: 'm' })
+    const out = await withUpstreamFailureDiagnosis(upstream, { status: 200, model: 'm' })
     expect(out).toBe(upstream)
   })
 
   it('上游给了 Retry-After → 保留（限流信息不丢）', async () => {
     const upstream = new Response('', { status: 429, headers: { 'Retry-After': '7' } })
-    const out = await withEmptyBodyDiagnosis(upstream, { status: 429, model: 'm' })
+    const out = await withUpstreamFailureDiagnosis(upstream, { status: 429, model: 'm' })
     expect(out.headers.get('Retry-After')).toBe('7')
+  })
+
+  it('畸形体 `{"model":"x"}`（无 error/message）→ 换诊断体并附上游原文', async () => {
+    const upstream = new Response('{"model":"deepseek-v4.1-flash-free"}', {
+      status: 400, headers: { 'Content-Type': 'application/json' },
+    })
+    const out = await withUpstreamFailureDiagnosis(upstream, {
+      status: 400, model: 'deepseek-v4.1-flash-free', keysTried: 0, mirrors: 2, lane: 'mirror',
+    })
+    expect(out).not.toBe(upstream)
+    expect(out.status).toBe(400)
+    expect(out.headers.get(UPSTREAM_NONDIAGNOSTIC_HEADER)).toBe('400')
+    expect(out.headers.get(UPSTREAM_EMPTY_HEADER)).toBeNull()
+    const payload = await out.json() as { error: Record<string, unknown> }
+    expect(payload.error['type']).toBe(UPSTREAM_NONDIAGNOSTIC_ERROR_TYPE)
+    expect(payload.error['upstream_status']).toBe(400)
+    expect(payload.error['lane']).toBe('mirror')
+    expect(payload.error['mirrors']).toBe(2)
+    expect(String(payload.error['upstream_body'])).toContain('deepseek-v4.1-flash-free')
+    expect(String(payload.error['hint'])).toContain('upstream_body')
+  })
+})
+
+describe('isDiagnosticUpstreamBody：口径统一，调用方不再各抄一份关键字表', () => {
+  it('空体 / 畸形 JSON 对象 → 不可诊断', () => {
+    expect(isDiagnosticUpstreamBody('')).toBe(false)
+    expect(isDiagnosticUpstreamBody('   ')).toBe(false)
+    expect(isDiagnosticUpstreamBody('{"model":"x"}')).toBe(false)
+    expect(isDiagnosticUpstreamBody('{"usage":{"total_tokens":0}}')).toBe(false)
+  })
+
+  it('带错误信封或纯文本 → 可诊断', () => {
+    expect(isDiagnosticUpstreamBody('{"error":{"message":"x"}}')).toBe(true)
+    expect(isDiagnosticUpstreamBody('{"type":"error","error":{"type":"FreeTierError"}}')).toBe(true)
+    expect(isDiagnosticUpstreamBody('{"message":"x"}')).toBe(true)
+    expect(isDiagnosticUpstreamBody('{"code":400,"msg":"already claimed"}')).toBe(true)
+    expect(isDiagnosticUpstreamBody('upstream connect timeout')).toBe(true)
   })
 })
 
@@ -106,6 +153,85 @@ describe('opencode 出口：上游空体被补成可诊断体', () => {
     })
     expect(res.headers.get(UPSTREAM_EMPTY_HEADER)).toBeNull()
     expect(await res.text()).toBe(body)
+  })
+
+  it('某个 key 回畸形 400（`{"model":...}`）→ 不再当定论，换通道后拿到 200', async () => {
+    // 2026-10-22 现场：DSH 只看到 `400 {"model":"deepseek-v4.1-flash-free"}`。
+    // 畸形 4xx 不再是「请求本身的问题」的定论，镜像仍有机会成功。
+    const calls: string[] = []
+    const fetcher = vi.fn(async (url: string | URL | Request) => {
+      const href = String(url)
+      calls.push(href)
+      if (href.includes('mirror.example')) return openAiSse('deepseek-v4.1-flash-free', 'ok')
+      return new Response('{"model":"deepseek-v4.1-flash-free"}', {
+        status: 400, headers: { 'Content-Type': 'application/json' },
+      })
+    }) as unknown as typeof fetch
+
+    const res = await proxyOpenCodeRequest({
+      baseUrl: 'https://opencode.ai/zen/v1',
+      apiKeys: [{ key: 'k-1', enabled: true }],
+      mirrorUrls: ['https://mirror.example/zen/v1'],
+      method: 'POST',
+      subPath: 'chat/completions',
+      body: JSON.stringify({ model: 'deepseek-v4.1-flash-free', stream: true, messages: [{ role: 'user', content: 'hi' }] }),
+      fetcher,
+    })
+
+    expect(res.status).toBe(200)
+    expect(calls.some((u) => u.includes('mirror.example'))).toBe(true)
+  })
+
+  it('所有通道都回畸形 400 → 补成可诊断体（带 upstream_body / lane）', async () => {
+    const fetcher = vi.fn(async () => new Response('{"model":"deepseek-v4.1-flash-free"}', {
+      status: 400, headers: { 'Content-Type': 'application/json' },
+    })) as unknown as typeof fetch
+
+    const res = await proxyOpenCodeRequest({
+      baseUrl: 'https://opencode.ai/zen/v1',
+      apiKeys: [{ key: 'k-1', enabled: true }],
+      mirrorUrls: ['https://mirror.example/zen/v1'],
+      method: 'POST',
+      subPath: 'chat/completions',
+      body: JSON.stringify({ model: 'deepseek-v4.1-flash-free', stream: true, messages: [{ role: 'user', content: 'hi' }] }),
+      fetcher,
+    })
+
+    expect(res.status).toBe(400)
+    expect(res.headers.get(UPSTREAM_NONDIAGNOSTIC_HEADER)).toBe('400')
+    const payload = await res.json() as { error: Record<string, unknown> }
+    expect(payload.error['type']).toBe(UPSTREAM_NONDIAGNOSTIC_ERROR_TYPE)
+    expect(payload.error['model']).toBe('deepseek-v4.1-flash-free')
+    expect(String(payload.error['upstream_body'])).toContain('deepseek-v4.1-flash-free')
+    expect(payload.error['keys_tried']).toBe(1)
+    expect(payload.error['mirrors']).toBe(1)
+  })
+
+  it('官方地址回可诊断错误、镜像回畸形体 → 优先回可诊断的那条', async () => {
+    const freeTier = '{"type":"error","error":{"type":"FreeTierError","message":"from within OpenCode"}}'
+    const fetcher = vi.fn(async (url: string | URL | Request) => {
+      const href = String(url)
+      if (href.includes('mirror.example')) {
+        return new Response('{"model":"deepseek-v4.1-flash-free"}', {
+          status: 400, headers: { 'Content-Type': 'application/json' },
+        })
+      }
+      return new Response(freeTier, { status: 403, headers: { 'Content-Type': 'application/json' } })
+    }) as unknown as typeof fetch
+
+    const res = await proxyOpenCodeRequest({
+      baseUrl: 'https://opencode.ai/zen/v1',
+      apiKeys: [{ key: 'k-1', enabled: true }],
+      mirrorUrls: ['https://mirror.example/zen/v1'],
+      method: 'POST',
+      subPath: 'chat/completions',
+      body: JSON.stringify({ model: 'deepseek-v4.1-flash-free', stream: true, messages: [{ role: 'user', content: 'hi' }] }),
+      fetcher,
+    })
+
+    expect(res.status).toBe(403)
+    expect(res.headers.get(UPSTREAM_NONDIAGNOSTIC_HEADER)).toBeNull()
+    expect(await res.text()).toBe(freeTier)
   })
 })
 

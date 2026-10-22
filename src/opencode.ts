@@ -1,5 +1,5 @@
 import type { ApiKeyEntry, Env } from './types'
-import { withEmptyBodyDiagnosis } from './upstream-failure'
+import { isDiagnosticUpstreamBody, withUpstreamFailureDiagnosis } from './upstream-failure'
 
 export const OPENCODE_PROVIDER_ID = 'opencode'
 
@@ -1007,6 +1007,35 @@ function isFreeTierFailure(failure: StoredFailure): boolean {
   }
 }
 
+/**
+ * 上游失败报文是否「可诊断」（空体或非 JSON 错误字段都算不可诊断）。
+ *
+ * 4xx 的处置口径必须由它决定，而不是只看状态码：2026-10-22 上游/镜像回了
+ * `400 {"model":"deepseek-v4.1-flash-free"}` 这种语义空体，如果按「4xx = 请求本身
+ * 有问题，所有 key 都会失败」直接跳出，就会把一个通道的畸形回复当成全局定论，
+ * 连带放弃其它 key 与 public 镜像。
+ */
+function isDiagnosticFailure(failure: StoredFailure | null): boolean {
+  if (!failure) return false
+  if (failure.body.byteLength === 0) return false
+  try {
+    return isDiagnosticUpstreamBody(new TextDecoder().decode(failure.body))
+  } catch {
+    // 解码失败说明报文连文本都不是：当作不可诊断，交给诊断体兜底
+    return false
+  }
+}
+
+/** 4xx 且不可诊断：换通道继续试，而不是停止尝试后续 key */
+function isJunkClientFailure(failure: StoredFailure): boolean {
+  return failure.status >= 400
+    && failure.status < 500
+    && failure.status !== 401
+    && failure.status !== 403
+    && failure.status !== 422
+    && !isDiagnosticFailure(failure)
+}
+
 async function proxyOpenCodeRequestRaw(
   options: OpenCodeRequestOptions,
 ): Promise<{ response: Response; shape: OpenCodeShape }> {
@@ -1175,6 +1204,10 @@ async function proxyOpenCodeRequestRaw(
         // - 401/403：key 无效，继续尝试下一个 key
         // - 其他 4xx（400/422 等）：请求本身的问题，所有 key 都会失败，跳出
         if (lastStatus >= 400 && lastStatus < 500 && lastStatus !== 401 && lastStatus !== 403) {
+          if (officialFailure && isJunkClientFailure(officialFailure)) {
+            log('warn', `${tag} key#${ki + 1} ${keyMask} 重试后返回 ${lastStatus}（4xx 但报文不可诊断），切换下一个 key`)
+            continue
+          }
           log('warn', `${tag} key#${ki + 1} ${keyMask} 重试后返回 ${lastStatus}（4xx 请求错误），停止尝试后续 key`)
           break
         }
@@ -1189,6 +1222,12 @@ async function proxyOpenCodeRequestRaw(
       // - 401/403：key 无效，继续尝试下一个 key
       // - 其他 4xx（400/422 等）：请求本身的问题，所有 key 都会失败，跳出
       if (response.status >= 400 && response.status < 500 && response.status !== 401 && response.status !== 403) {
+        // 4xx 只有在报文可诊断时才算「请求本身的问题」；畸形 4xx（如 `{"model":"x"}`）
+        // 可能只是某个通道自己的故障，换下一个 key / 镜像还有机会成功。
+        if (officialFailure && isJunkClientFailure(officialFailure)) {
+          log('warn', `${tag} key#${ki + 1} ${keyMask} → ${response.status}（4xx 但报文不可诊断），切换下一个 key`)
+          continue
+        }
         log('warn', `${tag} key#${ki + 1} ${keyMask} → ${response.status}（4xx 请求错误），停止尝试后续 key`)
         break
       }
@@ -1232,6 +1271,11 @@ async function proxyOpenCodeRequestRaw(
           // 5xx：可能是上游对当前 key 的偶发问题，继续尝试下一个 key
           // 其他 4xx（400/422 等）：请求本身的问题，所有 key 都会失败，跳出
           if (retry.status >= 400 && retry.status < 500) {
+            if (isJunkClientFailure(officialFailure as StoredFailure)) {
+              log('warn', `${tag} key#${ki + 1} ${keyMask} 网络重试后 → ${retry.status}（4xx 但报文不可诊断），切换下一个 key`)
+              netRecovered = true
+              break
+            }
             log('warn', `${tag} key#${ki + 1} ${keyMask} 网络重试后 → ${retry.status}（4xx 请求错误），停止尝试后续 key`)
             break
           }
@@ -1275,9 +1319,8 @@ async function proxyOpenCodeRequestRaw(
     }
   }
 
-  // 上游失败且响应体为空时补可诊断 JSON 体：2026-10-21 DSH 报
-  // `404 status code (no body)` 即由此而来——上游 404 空体被原样透传，
-  // 客户端无法判断是模型下架、形状被拦还是上游抖动。状态码保持原值。
+  // 客户端只该看到一个「能解释自己」的失败：空体或畸形报文（无 error/message 字段）
+  // 都要补上通道、尝试次数、上游原始报文片段。状态码保持上游原值。
   const modelOf = (): string => {
     try {
       const parsed = JSON.parse(body ?? '') as { model?: unknown }
@@ -1288,7 +1331,7 @@ async function proxyOpenCodeRequestRaw(
   }
   const diagnose = async (response: Response, lane: 'official' | 'mirror'): Promise<Response> => {
     if (response.ok) return response
-    const diagnosed = await withEmptyBodyDiagnosis(response, {
+    const diagnosed = await withUpstreamFailureDiagnosis(response, {
       status: response.status,
       model: modelOf(),
       keysTried: enabledKeys.length,
@@ -1296,13 +1339,19 @@ async function proxyOpenCodeRequestRaw(
       lane,
     })
     if (diagnosed !== response) {
-      log('warn', `${tag} 上游 ${response.status} 响应体为空，已补可诊断 JSON 体`)
+      log('warn', `${tag} 上游 ${response.status} 失败报文不可诊断（空体或缺少错误字段），已补诊断 JSON 体`)
     }
     return diagnosed
   }
 
-  if (officialFailure) return { response: await diagnose(restoreFailure(officialFailure), 'official'), shape }
+  // 谁的错误更值得回给客户端：可诊断的优先（官方 > 镜像），否则官方 > 镜像。
+  // 畸形报文（如官方某个 key 回的 `{"model":"x"}`）不该盖掉镜像的可诊断失败。
+  const officialWins = isDiagnosticFailure(officialFailure) || !isDiagnosticFailure(mirrorFailure)
+  if (officialFailure && officialWins) {
+    return { response: await diagnose(restoreFailure(officialFailure), 'official'), shape }
+  }
   if (mirrorFailure) return { response: await diagnose(restoreFailure(mirrorFailure), 'mirror'), shape }
+  if (officialFailure) return { response: await diagnose(restoreFailure(officialFailure), 'official'), shape }
   // 明确「根本没有可用通道」而不是泛化的 502「OpenCode 上游请求失败」：
   // 无 key 又无镜像时一次上游请求都没发出去，客户端需要知道该配哪个开关。
   if (lastTransportError === null && enabledKeys.length === 0 && mirrors.length === 0) {
