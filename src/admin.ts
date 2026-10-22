@@ -27,7 +27,7 @@ import {
 import { testModelConnection } from './proxy'
 import { probeMcpServers } from './mcp-gateway'
 import { MAX_ADMIN_REQUEST_BYTES, readOptionalJSONLimited, readStrictJSONLimited } from './request-body'
-import { normalizeUpstreamUserAgent } from './upstream-user-agent'
+import { normalizeUpstreamUserAgent, setHeaderCaseInsensitive } from './upstream-user-agent'
 import { isTraeProvider, testTraeCredential, testTraeModel } from './trae/proxy'
 import { diagnoseOpenCodeKey, fetchOpenCodeModels, isOpenCodeProvider, resolveOpenCodeUrls, testOpenCodeModel } from './opencode'
 import { isQoderFlow, fetchQoderModels, testQoderModel } from './qoder/proxy'
@@ -854,8 +854,38 @@ export async function handleTestModel(c: Context<AppEnv>) {
 
 // ===== Key / 模型连通性测试（通过服务端代理，避免 CORS） =====
 
+/**
+ * 管理面探测（「测试 Key」/「获取模型」/「测试模型」）的上游 UA 解析。
+ *
+ * 这几个按钮走的是**直连探测**路径（`GET /models`、`POST /chat/completions`），与正式
+ * 转发是两套代码。按客户端指纹鉴权的上游（如 agentrouter 的 `unauthorized_client_error`）
+ * 在探测阶段同样只认 UA——不覆写的话后台永远显示 401，而实际转发其实是通的。
+ *
+ * 优先级：请求体显式值（新建/编辑表单尚未保存时的当前输入）> 已落库的 provider 值。
+ * `value: undefined` 表示不覆写，保持 fetch 默认 UA。
+ */
+function probeUserAgent(
+  stored: Provider | null,
+  rawBodyValue: unknown,
+): { ok: true; value: string | undefined } | { ok: false; message: string } {
+  if (typeof rawBodyValue === 'string' && rawBodyValue.trim() !== '') {
+    const normalized = normalizeUpstreamUserAgent(rawBodyValue)
+    if (normalized === null) {
+      return { ok: false, message: '出站 User-Agent 必须是单行可打印 ASCII（不含换行/控制字符），且不超过 512 字节' }
+    }
+    return { ok: true, value: normalized }
+  }
+  return { ok: true, value: stored?.upstreamUserAgent }
+}
+
+/** 把 provider 级 UA 覆写写进探测请求头（无配置时原样返回）。 */
+function withProbeUserAgent(headers: Record<string, string>, userAgent: string | undefined): Record<string, string> {
+  if (userAgent) setHeaderCaseInsensitive(headers, 'User-Agent', userAgent)
+  return headers
+}
+
 export async function handleTestKeyNew(c: Context<AppEnv>) {
-  const { url, apiKey, apiType, providerId, model, intent } = await readStrictJSONLimited<{
+  const { url, apiKey, apiType, providerId, model, intent, upstreamUserAgent: rawUserAgent } = await readStrictJSONLimited<{
     url: string
     apiKey: string
     apiType?: string
@@ -864,13 +894,17 @@ export async function handleTestKeyNew(c: Context<AppEnv>) {
     model?: string
     /** 'fetchModels'（缺省）要模型列表；'diagnose' 要单 key 推理诊断（opencode 专属） */
     intent?: string
+    /** 出站 UA 覆写；新建表单尚未保存时由前端带上，缺省回落到落库值 */
+    upstreamUserAgent?: string
   }>(c.req.raw, MAX_ADMIN_REQUEST_BYTES)
-  // CNB 免 Key：允许无 apiKey，由 providerId 判定
-  let cnbProvider: Provider | null = null
-  if (providerId) {
-    const p = await getProvider(c.env, providerId)
-    if (p && isCnbProvider(p)) cnbProvider = p
+  // 落库 provider 读一次：CNB 免 Key 判定与出站 UA 解析共用
+  const storedProvider = providerId ? await getProvider(c.env, providerId) : null
+  const cnbProvider = storedProvider && isCnbProvider(storedProvider) ? storedProvider : null
+  const ua = probeUserAgent(storedProvider, rawUserAgent)
+  if (!ua.ok) {
+    return c.json<ApiResponse>({ success: false, message: ua.message }, 400)
   }
+  const userAgent = ua.value
   if (!url || (!apiKey && !(providerId && (isOpenCodeProvider(providerId) || cnbProvider)))) {
     return c.json<ApiResponse>({ success: false, message: 'url 和 apiKey 为必填项' }, 400)
   }
@@ -1045,7 +1079,9 @@ export async function handleTestKeyNew(c: Context<AppEnv>) {
     const modelsUrl = `${origin}/v1/models`
     try {
       const response = await fetch(modelsUrl, {
-        method: 'GET', headers: { 'Authorization': `Bearer ${apiKey}` }, signal: AbortSignal.timeout(15000),
+        method: 'GET',
+        headers: withProbeUserAgent({ 'Authorization': `Bearer ${apiKey}` }, userAgent),
+        signal: AbortSignal.timeout(15000),
       })
       let errBody = ''
       if (response.ok) {
@@ -1080,7 +1116,9 @@ export async function handleTestKeyNew(c: Context<AppEnv>) {
   const cleanBase = resolvedUrl.replace(/\/$/, '')
   try {
     const response = await fetch(`${cleanBase}/models`, {
-      method: 'GET', headers: { 'Authorization': `Bearer ${apiKey}` }, signal: AbortSignal.timeout(15000),
+      method: 'GET',
+      headers: withProbeUserAgent({ 'Authorization': `Bearer ${apiKey}` }, userAgent),
+      signal: AbortSignal.timeout(15000),
     })
 
     let data: unknown = null
@@ -1114,13 +1152,22 @@ export async function handleTestKeyNew(c: Context<AppEnv>) {
 }
 
 export async function handleTestModelNew(c: Context<AppEnv>) {
-  const { url, apiKey, apiType, model, providerId } = await readStrictJSONLimited<{
+  const { url, apiKey, apiType, model, providerId, upstreamUserAgent: rawUserAgent } = await readStrictJSONLimited<{
     url: string
     apiKey: string
     apiType?: string
     model: string
     providerId?: string
+    /** 出站 UA 覆写；新建表单尚未保存时由前端带上，缺省回落到落库值 */
+    upstreamUserAgent?: string
   }>(c.req.raw, MAX_ADMIN_REQUEST_BYTES)
+  // 落库 provider 读一次：CNB 适配器判定与出站 UA 解析共用
+  const storedProvider = providerId ? await getProvider(c.env, providerId) : null
+  const ua = probeUserAgent(storedProvider, rawUserAgent)
+  if (!ua.ok) {
+    return c.json<ApiResponse>({ success: false, message: ua.message }, 400)
+  }
+  const userAgent = ua.value
   if (!url || !model || (!apiKey && !(isOpenCodeProvider(providerId || '') || (providerId && isCnbProvider({ id: providerId } as Provider))))) {
     return c.json<ApiResponse>({ success: false, message: 'url、apiKey、model 为必填项' }, 400)
   }
@@ -1160,15 +1207,12 @@ export async function handleTestModelNew(c: Context<AppEnv>) {
   }
 
   // CNB：CSRF 凭证 + 最小 chat 请求测试模型可用性（完整链路）
-  if (providerId) {
-    const provider = await getProvider(c.env, providerId)
-    if (provider && isCnbProvider(provider)) {
-      const result = await testCnbConnection(c.env, provider, model)
-      return c.json<ApiResponse>({
-        success: true,
-        data: { success: result.success, statusCode: result.statusCode || 0, message: result.message, data: result.data },
-      })
-    }
+  if (storedProvider && isCnbProvider(storedProvider)) {
+    const result = await testCnbConnection(c.env, storedProvider, model)
+    return c.json<ApiResponse>({
+      success: true,
+      data: { success: result.success, statusCode: result.statusCode || 0, message: result.message, data: result.data },
+    })
   }
 
   const resolvedUrl = resolveProviderBaseUrl(c.env, url)
@@ -1182,7 +1226,7 @@ export async function handleTestModelNew(c: Context<AppEnv>) {
   try {
     const response = await fetch(`${cleanBase}/${endpoint}`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${apiKey}` },
+      headers: withProbeUserAgent({ 'Content-Type': 'application/json', 'Authorization': `Bearer ${apiKey}` }, userAgent),
       body: JSON.stringify({ model, messages: [{ role: 'user', content: 'hi' }], max_tokens: 1 }),
       signal: AbortSignal.timeout(15000),
     })

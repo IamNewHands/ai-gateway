@@ -131,4 +131,13 @@ describe('厂商预设：按客户端指纹鉴权的上游必须有创建入口'
     expect(p).toContain('id="ua-agentrouter"')
     expect(p).toContain('claude-cli/2.0.1 (external, cli)')
   })
+
+  it('「测试 / 获取模型」把输入框里的 UA 一起发给后端（否则后台永远误报 401）', async () => {
+    const html = await render([])
+    // 前端 helper：编辑态读 #ua-<id>，新建态读 #aua
+    expect(html).toContain('function probeUserAgent(id)')
+    expect(html).toContain("document.getElementById(id ? 'ua-' + id : 'aua')")
+    // 两个探测请求都要带上
+    expect(html).toContain('upstreamUserAgent: probeUserAgent(providerId)')
+  })
 })

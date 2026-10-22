@@ -1,6 +1,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { Hono } from 'hono'
 import { handleProxy, testModelConnection } from './proxy'
+import { handleTestKeyNew, handleTestModelNew } from './admin'
 import { clearCache } from './storage'
 import { normalizeUpstreamUserAgent, setHeaderCaseInsensitive, UPSTREAM_USER_AGENT_MAX_BYTES } from './upstream-user-agent'
 import type { AppEnv, Env, Provider } from './types'
@@ -208,5 +209,176 @@ describe('upstream-user-agent：后台「测试模型」与真实转发同口径
     vi.stubGlobal('fetch', installFetchMock(calls))
     await testModelConnection('https://plain.example/v1', 'sk-test-key', 'deepseek-v4-flash', 'openai')
     expect(calls[0].headers['user-agent']).toBeUndefined()
+  })
+})
+
+/**
+ * 管理面探测（「获取模型」/「测试 Key」/「测试模型」）与转发是两套代码。
+ * 漏掉这里的话，按 UA 鉴权的上游在后台永远显示 401，而实际转发却是通的——
+ * 实测就是这么被发现的：provider 已配好 UA，`/v1/chat/completions` 正常，
+ * 但后台「获取模型」与 Key 旁的「测试」双双 401 `unauthorized_client_error`。
+ */
+describe('upstream-user-agent：后台「获取模型 / 测试 Key」也走同一 UA', () => {
+  let calls: Call[]
+
+  function installProbeFetchMock() {
+    return vi.fn(async (url: string | URL | Request, init?: RequestInit) => {
+      const u = typeof url === 'string' ? url : url instanceof URL ? url.toString() : url.url
+      const raw = (init?.headers ?? {}) as Record<string, string>
+      const headers: Record<string, string> = {}
+      for (const k of Object.keys(raw)) headers[k.toLowerCase()] = String(raw[k])
+      calls.push({ url: u, headers, body: typeof init?.body === 'string' ? init.body : '' })
+      if (u.endsWith('/models')) {
+        return new Response(JSON.stringify({ data: [{ id: 'deepseek-v4-flash' }] }), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        })
+      }
+      return new Response(JSON.stringify({
+        id: 'c1',
+        object: 'chat.completion',
+        model: 'deepseek-v4-flash',
+        choices: [{ index: 0, message: { role: 'assistant', content: 'hi' }, finish_reason: 'stop' }],
+      }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+    })
+  }
+
+  function makeAdminApp() {
+    const app = new Hono<AppEnv>()
+    app.post('/admin/api/test-key', (c) => handleTestKeyNew(c))
+    app.post('/admin/api/test-model', (c) => handleTestModelNew(c))
+    return app
+  }
+
+  async function postAdmin(path: string, body: unknown, env: Env) {
+    const req = new Request(`https://gw.test${path}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    })
+    return makeAdminApp().fetch(req, env, {
+      waitUntil: () => {},
+      passThroughOnException: () => {},
+    } as unknown as ExecutionContext)
+  }
+
+  beforeEach(() => {
+    calls = []
+    clearCache()
+  })
+
+  afterEach(() => {
+    vi.unstubAllGlobals()
+    vi.restoreAllMocks()
+  })
+
+  it('「获取模型」：用落库的 upstreamUserAgent 覆写 GET /models 的 UA', async () => {
+    vi.stubGlobal('fetch', installProbeFetchMock())
+    const env = makeEnv([makeProvider({ upstreamUserAgent: 'claude-cli/2.0.1 (external, cli)' })])
+
+    const res = await postAdmin('/admin/api/test-key', {
+      url: 'https://ps.air-outer.com/v1',
+      apiKey: 'sk-test-key',
+      apiType: 'openai',
+      providerId: PID,
+      intent: 'fetchModels',
+    }, env)
+    expect(res.status).toBe(200)
+    const json = await res.json() as any
+    expect(json.data.success).toBe(true)
+
+    expect(calls).toHaveLength(1)
+    expect(calls[0].url).toBe('https://ps.air-outer.com/v1/models')
+    expect(calls[0].headers['user-agent']).toBe('claude-cli/2.0.1 (external, cli)')
+  })
+
+  it('「测试 Key」：同一 UA 也作用于单 key 探测（intent=diagnose 走同一端点）', async () => {
+    vi.stubGlobal('fetch', installProbeFetchMock())
+    const env = makeEnv([makeProvider({ upstreamUserAgent: 'claude-cli/2.0.1 (external, cli)' })])
+
+    await postAdmin('/admin/api/test-key', {
+      url: 'https://ps.air-outer.com/v1',
+      apiKey: 'sk-test-key',
+      apiType: 'openai',
+      providerId: PID,
+      intent: 'diagnose',
+    }, env)
+
+    expect(calls[0].headers['user-agent']).toBe('claude-cli/2.0.1 (external, cli)')
+  })
+
+  it('新建表单尚未保存：请求体里的 upstreamUserAgent 生效（无需先落库）', async () => {
+    vi.stubGlobal('fetch', installProbeFetchMock())
+    const env = makeEnv([])
+
+    const res = await postAdmin('/admin/api/test-key', {
+      url: 'https://ps.air-outer.com/v1',
+      apiKey: 'sk-test-key',
+      apiType: 'openai',
+      upstreamUserAgent: 'claude-cli/2.0.1 (external, cli)',
+    }, env)
+    expect(res.status).toBe(200)
+    expect(calls[0].headers['user-agent']).toBe('claude-cli/2.0.1 (external, cli)')
+  })
+
+  it('请求体的值优先于落库值（编辑未保存时以输入框为准）', async () => {
+    vi.stubGlobal('fetch', installProbeFetchMock())
+    const env = makeEnv([makeProvider({ upstreamUserAgent: 'stale/1.0' })])
+
+    await postAdmin('/admin/api/test-key', {
+      url: 'https://ps.air-outer.com/v1',
+      apiKey: 'sk-test-key',
+      apiType: 'openai',
+      providerId: PID,
+      upstreamUserAgent: 'claude-cli/2.0.1 (external, cli)',
+    }, env)
+
+    expect(calls[0].headers['user-agent']).toBe('claude-cli/2.0.1 (external, cli)')
+  })
+
+  it('非法 UA（含换行）→ 400，且不发出任何上游请求', async () => {
+    vi.stubGlobal('fetch', installProbeFetchMock())
+    const env = makeEnv([makeProvider()])
+
+    const res = await postAdmin('/admin/api/test-key', {
+      url: 'https://ps.air-outer.com/v1',
+      apiKey: 'sk-test-key',
+      apiType: 'openai',
+      providerId: PID,
+      upstreamUserAgent: 'a\r\nX-Injected: 1',
+    }, env)
+    expect(res.status).toBe(400)
+    expect(calls).toHaveLength(0)
+  })
+
+  it('未配置 UA → 不带自定义 UA（保持既有行为，不回归普通上游）', async () => {
+    vi.stubGlobal('fetch', installProbeFetchMock())
+    const env = makeEnv([makeProvider()])
+
+    await postAdmin('/admin/api/test-key', {
+      url: 'https://ps.air-outer.com/v1',
+      apiKey: 'sk-test-key',
+      apiType: 'openai',
+      providerId: PID,
+    }, env)
+
+    expect(calls[0].headers['user-agent']).toBeUndefined()
+  })
+
+  it('「测试模型」：POST chat/completions 同样带该 UA', async () => {
+    vi.stubGlobal('fetch', installProbeFetchMock())
+    const env = makeEnv([makeProvider({ upstreamUserAgent: 'claude-cli/2.0.1 (external, cli)' })])
+
+    const res = await postAdmin('/admin/api/test-model', {
+      url: 'https://ps.air-outer.com/v1',
+      apiKey: 'sk-test-key',
+      apiType: 'openai',
+      model: 'deepseek-v4-flash',
+      providerId: PID,
+    }, env)
+    expect(res.status).toBe(200)
+
+    expect(calls[0].url).toBe('https://ps.air-outer.com/v1/chat/completions')
+    expect(calls[0].headers['user-agent']).toBe('claude-cli/2.0.1 (external, cli)')
   })
 })

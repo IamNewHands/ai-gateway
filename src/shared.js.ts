@@ -52,13 +52,20 @@ function showResult(el, success, msg) {
 }
 
 // ── API 请求函数 ──
+// 探测请求要带上的出站 UA：编辑态读详情面板的 #ua-<id>，新建态读 #aua。
+// 与保存时读的是同一个输入框，保证「测试/获取模型」用当前输入而非旧落库值。
+function probeUserAgent(id) {
+  var el = document.getElementById(id ? 'ua-' + id : 'aua')
+  var v = el && el.value ? el.value.trim() : ''
+  return v || undefined
+}
 // intent: 'fetchModels'（要模型列表，缺省）| 'diagnose'（要单 key 推理诊断，opencode 专属）
 async function testKeyConnection(url, apiType, key, providerId, intent) {
   try {
     var r = await fetch('/admin/api/test-key', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ url: url, apiKey: key, apiType: apiType, providerId: providerId, intent: intent })
+      body: JSON.stringify({ url: url, apiKey: key, apiType: apiType, providerId: providerId, intent: intent, upstreamUserAgent: probeUserAgent(providerId) })
     })
     var d = await r.json()
     if (d.success && d.data) {
@@ -75,7 +82,7 @@ async function testModelConnection(url, apiType, key, modelId, providerId) {
     var r = await fetch('/admin/api/test-model', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ url: url, apiKey: key, apiType: apiType, model: modelId, providerId: providerId })
+      body: JSON.stringify({ url: url, apiKey: key, apiType: apiType, model: modelId, providerId: providerId, upstreamUserAgent: probeUserAgent(providerId) })
     })
     var d = await r.json()
     if (d.success && d.data) {
