@@ -1249,6 +1249,191 @@ async function proxyAnthropicNativeUpstream(
   return c.json(converted)
 }
 
+/**
+ * OpenAI Responses 原生上游转发（`provider.apiType === 'openai-responses'`）。
+ *
+ * 与 `proxyAnthropicNativeUpstream` 同一设计位置，但方向相反：这里**不做格式
+ * 转换**。请求体逐字发到 `${baseUrl}/responses`，响应体（流式 SSE 或 JSON）
+ * 逐字回给客户端。
+ *
+ * 为什么必须透传而不能像通用 apiKey 路径那样折回 chat：
+ * 只实现 Responses 的上游（如 agentrouter 的 gpt-6.1-sol）会直接拒绝
+ * `/chat/completions`，回 `模型 xxx 不支持 /v1/chat/completions 接口，请改用
+ * /v1/responses`。折回 chat 在这个类上游上是死路，只有透传能通。
+ *
+ * 透传时必须**剥掉**网关自己的内部字段（`__` 前缀，如 `__m365_tenant`），
+ * 它们只服务于本进程内的分支判断，发到上游会被当成未知字段拒绝。
+ *
+ * 多 Key 顺序 failover 与其它原生路径一致：单 key 的 HTTP 非 2xx 或网络异常
+ * 就换下一个 key，全部失败才把最后一次错误返回给客户端。
+ */
+async function proxyResponsesNativeUpstream(
+  c: Context<AppEnv>,
+  provider: import('./types').Provider,
+  model: string,
+  responsesBody: Record<string, unknown>,
+  originalStream: boolean,
+  g5Base?: unknown[],
+  g5Save?: (respId: string, fullHistory: unknown[]) => void,
+): Promise<Response> {
+  const enabledKeys = provider.apiKeys.filter((k) => k.enabled)
+  if (enabledKeys.length === 0) {
+    return c.json({
+      error: { type: 'configuration_error', message: `提供商 "${provider.name}" 未配置可用的 API Key` },
+    }, 500)
+  }
+
+  const resolvedBase = resolveProviderBaseUrl(c.env, provider.baseUrl)
+  if (!resolvedBase) {
+    return c.json({
+      error: { type: 'configuration_error', message: `提供商 "${provider.name}" 的 baseUrl 含 {CF_ACCOUNT_ID} 占位符，但环境变量 CF_ACCOUNT_ID 未配置` },
+    }, 500)
+  }
+  // 兼容 `https://host` 与 `https://host/v1` 两种写法：去掉末尾斜杠与 /v1，
+  // 统一拼 `${base}/v1/responses`（OpenAI 原生端点固定在 /v1 下）。
+  let cleanBase = resolvedBase.replace(/\/+$/, '')
+  cleanBase = cleanBase.replace(/\/v1\/?$/, '')
+  const forwardUrl = `${cleanBase}/v1/responses`
+
+  // 剥掉网关内部字段（`__` 前缀）再出站；其余字段逐字保留，
+  // 包括 instructions / input / tools / text / reasoning 这些 Responses 专有字段。
+  const upstreamBody: Record<string, unknown> = {}
+  for (const [k, v] of Object.entries(responsesBody)) {
+    if (k.startsWith('__')) continue
+    upstreamBody[k] = v
+  }
+  // 上游 model 用去掉 providerId 前缀后的裸模型 ID（网关内部 model 是 `provider/model`）
+  if (typeof upstreamBody['model'] === 'string') {
+    upstreamBody['model'] = String(upstreamBody['model']).split('/').slice(1).join('/') || upstreamBody['model']
+  }
+
+  let response: Response | undefined
+  let lastErrText = ''
+  let lastStatus = 502
+  for (const key of enabledKeys) {
+    try {
+      const headers: Record<string, string> = {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${key.key}`,
+        ...buildPassthroughHeaders(c),
+      }
+      // 与通用 apiKey 路径同口径：按客户端指纹鉴权的上游（如 agentrouter）
+      // 需要 provider 级出站 UA / 特征头，否则会先于密钥校验拒绝。
+      applyUpstreamHeaders(headers, provider)
+      const r = await fetchUpstream(c.env, forwardUrl, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify(upstreamBody),
+      }, originalStream === true)
+      if (r.ok) { response = r; break }
+      lastStatus = r.status
+      lastErrText = await r.text().catch(() => '')
+    } catch (err) {
+      lastStatus = 502
+      lastErrText = (err as Error).message || '网络错误'
+    }
+  }
+
+  if (!response) {
+    try { c.executionCtx.waitUntil(writeLog(c.env, 'error', `[responses-native] ${model} → failover 全部失败 ${forwardUrl}`, JSON.stringify({ error: lastErrText, body: summarizeRequestBody(upstreamBody), url: forwardUrl }).substring(0, 4000))) } catch {}
+    return c.json({
+      error: { type: 'upstream_error', message: `Upstream error: ${sanitizeUpstreamError(lastErrText)}` },
+    }, lastStatus as Parameters<typeof c.json>[1])
+  }
+
+  try { c.executionCtx.waitUntil(writeLog(c.env, 'request', `[responses-native] ${model} → 200 ${forwardUrl}`, `stream=${originalStream}`)) } catch {}
+
+  // ---- 流式：Responses SSE 逐字透传（只包心跳，不改事件） ----
+  if (originalStream && response.body) {
+    // 顺序关键：必须先 clone 再取 body。`withSSEKeepAlive(response.body, ...)`
+    // 会把 body 消费掉，之后 `response.clone()` 抛 "Response body is already used"，
+    // 整个 handler 变 500（此前正是这个顺序，导致流式透传全挂）。
+    // clone 本身也可能抛（body 已被锁），所以单独 try 包裹：历史旁路失败
+    // 绝不能影响已经拿到的客户端流。
+    let historyCopy: Response | undefined
+    if (g5Base && g5Save) {
+      try { historyCopy = response.clone() } catch { historyCopy = undefined }
+    }
+    const readable = withSSEKeepAlive(response.body, SSE_KEEPALIVE_MS, SSE_IDLE_TIMEOUT_MS)
+    // G5 多轮历史：透传路径拿不到结构化结果，靠旁路解析 response.completed
+    // 事件里的 response 对象补记，失败不影响响应。
+    if (historyCopy && g5Base && g5Save) {
+      void captureResponsesHistoryFromSSE(c.env, historyCopy, g5Base, g5Save)
+    }
+    return new Response(readable, {
+      status: 200,
+      headers: {
+        'Content-Type': 'text/event-stream',
+        'Cache-Control': 'no-store',
+        'X-Accel-Buffering': 'no',
+      },
+    })
+  }
+
+  // ---- 非流式：Responses JSON 逐字透传 ----
+  const payload = await response.json().catch(() => null) as Record<string, unknown> | null
+  if (g5Base && g5Save && payload) {
+    try {
+      g5Save(String(payload['id'] ?? ''), [
+        ...g5Base,
+        responsesOutputToAssistantMessage(payload['output'] as Array<Record<string, unknown>> | undefined),
+      ])
+    } catch { /* 保存失败不影响响应 */ }
+  }
+  return c.json(payload || {})
+}
+
+/**
+ * 从 Responses 透传流的旁路副本里抓取 `response.completed` 事件，把多轮历史存进 KV。
+ *
+ * 只在流式透传路径使用：那条路径的响应体直接回给客户端，网关自身看不到结构化
+ * 结果，因此用 `response.clone()` 拿一份副本单独读完。任何解析失败都静默忽略，
+ * 绝不向客户端方向抛错（副本消费失败不能影响已返回的流）。
+ */
+async function captureResponsesHistoryFromSSE(
+  _env: Env,
+  copy: Response,
+  g5Base: unknown[],
+  g5Save: (respId: string, fullHistory: unknown[]) => void,
+): Promise<void> {
+  if (!copy.body) return
+  try {
+    const decoder = new TextDecoderStream()
+    const reader = copy.body.pipeThrough(decoder).getReader()
+    let buffer = ''
+    while (true) {
+      const { done, value } = await reader.read()
+      if (done) break
+      buffer += value
+      // 只保留最后一段可能不完整的行，其余按行消费
+      const lines = buffer.split(/\r?\n/)
+      buffer = lines.pop() || ''
+      for (const line of lines) {
+        const trimmed = line.trim()
+        if (!trimmed.startsWith('data:')) continue
+        const data = trimmed.slice(5).trim()
+        if (!data || data === '[DONE]') continue
+        let parsed: Record<string, unknown>
+        try { parsed = JSON.parse(data) as Record<string, unknown> } catch { continue }
+        // 上游可能发 `response.completed` 或 `response.done`，两者都带完整 response 对象
+        const type = String(parsed['type'] ?? '')
+        if (type !== 'response.completed' && type !== 'response.done') continue
+        const finalResponse = (parsed['response'] && typeof parsed['response'] === 'object')
+          ? parsed['response'] as Record<string, unknown>
+          : undefined
+        if (!finalResponse) continue
+        try {
+          g5Save(String(finalResponse['id'] ?? ''), [
+            ...g5Base,
+            responsesOutputToAssistantMessage(finalResponse['output'] as Array<Record<string, unknown>> | undefined),
+          ])
+        } catch { /* 保存失败不影响响应 */ }
+        return
+      }
+    }
+  } catch { /* 旁路解析失败不影响响应 */ }
+}
+
 const normalizeUsage = (route: string, provider: import('./types').Provider, payload: unknown): UsageMetrics | null => {
   if (route === 'responses') return normalizeResponsesUsage(payload)
   if (route === 'messages' || provider.apiType === 'anthropic') return normalizeAnthropicUsage(payload)
@@ -1325,14 +1510,19 @@ export async function testModelConnection(
   baseUrl: string,
   apiKey: string,
   modelId: string,
-  apiType?: 'openai' | 'anthropic',
+  apiType?: import('./types').ProviderApiType,
   outbound?: string | { upstreamUserAgent?: string; upstreamHeaders?: Record<string, string> },
 ): Promise<{ success: boolean; message: string; statusCode?: number }> {
   try {
     const cleanBase = baseUrl.replace(/\/$/, '')
-    // aigateway 内部始终用 OpenAI chat/completions 格式与上游通信，
-    // apiType 只影响客户端侧暴露的 API 格式（Anthropic/Responses 等）。
-    const url = `${cleanBase}/chat/completions`
+    // 出站端点按 apiType 选择，与真实转发保持同一口径：
+    // - openai（缺省）：chat/completions —— 所有 OpenAI 兼容上游的主端点；
+    // - openai-responses：responses —— 这类上游拒绝 chat/completions，
+    //   沿用 chat 探测会把「配置正确」误报成 400（如 agentrouter 的 gpt-6.1-sol）；
+    // - anthropic：仍探测 chat/completions（该路径未接线，保持既有行为）。
+    const url = apiType === 'openai-responses'
+      ? `${cleanBase.replace(/\/v1\/?$/, '')}/v1/responses`
+      : `${cleanBase}/chat/completions`
 
     const headers: Record<string, string> = {
       'Content-Type': 'application/json',
@@ -1343,14 +1533,15 @@ export async function testModelConnection(
     // 否则后台会显示 401 而真实请求其实是通的。
     applyUpstreamHeaders(headers, typeof outbound === 'string' ? { upstreamUserAgent: outbound } : (outbound || {}))
 
+    // 探测体同样按协议切换：Responses 端点不收 messages，改用最小 input。
+    const probeBody = apiType === 'openai-responses'
+      ? { model: modelId, input: 'hi', max_output_tokens: 16, stream: false }
+      : { model: modelId, messages: [{ role: 'user', content: 'hi' }], max_tokens: 1 }
+
     const response = await fetch(url, {
       method: 'POST',
       headers,
-      body: JSON.stringify({
-        model: modelId,
-        messages: [{ role: 'user', content: 'hi' }],
-        max_tokens: 1,
-      }),
+      body: JSON.stringify(probeBody),
       signal: AbortSignal.timeout(15000),
     })
 
@@ -2007,6 +2198,29 @@ export async function forwardProxy(
         forwardBody as Record<string, unknown>,
         isStreamRequest(forwardBody as ProxyRequestBody),
         'chat',
+      )
+    }
+
+    // OpenAI Responses 原生上游（provider.apiType === 'openai-responses'）收到 chat 请求：
+    // 显式 501，而不是落到下面的通用 chat 转发。
+    //
+    // 为什么不能落下去：通用路径会把 chat 体发到 `${baseUrl}/chat/completions`，
+    // 而这正是这类上游明确拒绝的端点（agentrouter：`模型 xxx 不支持
+    // /v1/chat/completions 接口，请改用 /v1/responses`）。让客户端拿到明确的
+    // `not_implemented` + 正确入口提示，比让它拿到一个上游的 400 原文更有用；
+    // 也避免"看起来配好了、实际每次 400"的误判。
+    // 反向转换（chat 体 → Responses 体）尚未实现：本仓库只有
+    // responsesToOpenAI 这一个方向，补反方向属于独立工作量，不在本次改动范围。
+    if (provider.apiType === 'openai-responses' && subPath === 'chat/completions') {
+      return c.json(
+        {
+          error: {
+            message: '该提供商配置为 OpenAI Responses 原生协议，不接受 /v1/chat/completions。客户端请改用 /v1/responses。',
+            type: 'not_implemented',
+            code: 'responses_upstream_only',
+          },
+        },
+        501,
       )
     }
 
@@ -3983,6 +4197,20 @@ async function handleAnthropicMessagesInner(c: Context<AppEnv>) {
       return await proxyAnthropicNativeUpstream(c, provider, providerId, modelId, openaiBody, originalStream, 'messages')
     }
 
+    // OpenAI Responses 原生上游收到 Anthropic 入口请求：显式 501（同 chat 入口的理由）。
+    // 这条入口下方会把请求发到 `${baseUrl}/chat/completions`，而 Responses-only
+    // 上游拒绝该端点，落到那里只会得到一个误导性的上游 400。
+    if (provider.apiType === 'openai-responses') {
+      return c.json({
+        type: 'error',
+        error: {
+          message: '该提供商配置为 OpenAI Responses 原生协议，不接受 /v1/messages。客户端请改用 /v1/responses。',
+          type: 'not_implemented',
+          code: 'responses_upstream_only',
+        },
+      }, 501)
+    }
+
     // 非 OAuth 提供商：用 apiKey 标准转发，始终发 OpenAI 格式到上游
     const enabledKeys = provider.apiKeys.filter(k => k.enabled)
     // opencode 支持「无 Key」模式（走 public 镜像），因此不对它强制要求 Key；
@@ -5190,6 +5418,19 @@ async function handleResponsesInner(c: Context<AppEnv>) {
     // 请求体/认证头/路径都转成 Anthropic 原生格式，响应再转回 OpenAI Responses 格式
     if (provider.apiType === 'anthropic') {
       return await proxyAnthropicNativeUpstream(c, provider, providerId, modelId, openaiBody, originalStream, 'responses', g5Base, g5Save)
+    }
+
+    // OpenAI Responses 原生上游（provider.apiType === 'openai-responses'）：
+    // 请求体/响应体**逐字透传**，不折回 chat 格式。
+    //
+    // 必须放在通用 apiKey 兜底（下方）之前：那条路径硬编码
+    // `${cleanBase}/chat/completions`，对只实现 Responses 的上游必然 400
+    // （agentrouter 的 gpt-6.1-sol 就回 `模型不支持 /v1/chat/completions`）。
+    // 传入的是**原始 responsesBody**（不是折好的 openaiBody）——透传的意义
+    // 就是让 instructions / input / text / reasoning 这些 Responses 专有字段
+    // 原样到上游，而 openaiBody 里它们已被 responsesToOpenAI 抹平。
+    if (provider.apiType === 'openai-responses') {
+      return await proxyResponsesNativeUpstream(c, provider, model, responsesBody, originalStream, g5Base, g5Save)
     }
 
     // 非 OAuth 提供商：用 apiKey 标准转发，始终发 OpenAI 格式到上游

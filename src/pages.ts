@@ -71,6 +71,18 @@ const escapePageJsx = (value: unknown) => escapePageHtml(escapePageJs(value))
 const isTraeProviderUI = (p: { id?: string; baseUrl?: string }) =>
   p.id === 'trae' || (typeof p.baseUrl === 'string' && p.baseUrl.includes('trae'))
 
+/**
+ * 协议显示名（列表标签与详情 chip 共用）。
+ *
+ * 三态必须穷举：`openai-responses` 不能落回 OpenAI 分支，否则一个纯
+ * Responses 上游会在界面上显示成「OpenAI」，让运营者误以为它接受
+ * chat/completions。
+ */
+const providerProtocolLabel = (apiType?: string): string =>
+  apiType === 'anthropic' ? 'Anthropic'
+    : apiType === 'openai-responses' ? 'Responses'
+      : 'OpenAI'
+
 /** 是否 DeepSeek App 提供商（id 固定或用 chat.deepseek.com 域，与 src/deepseek/proxy.ts 对齐）。
  * 域名判定必须解析后比对 hostname（url-host.ts）：`includes('chat.deepseek.com')` 会把
  * `https://chat.deepseek.com.evil.com` 也认成自家上游。 */
@@ -311,8 +323,32 @@ const PROVIDER_PRESETS: Record<string, { name: string; id: string; baseUrl: stri
   // 直接返回 401 unauthorized_client_error（换 Key 无效，实测 claude-cli 等 UA 才放行）。
   // 故预设直接把出站 UA 与一组 CLI 特征头一起填好；备用域名 ps.air-outer.com 与原域
   // agentrouter.org 等价。头集合刻意不含 accept-encoding（显式设置会关闭 Workers 自动解压）。
+  //
+  // 两个预设共用同一 baseUrl 与同一组出站头，唯一差别是 `apiType`——因为上游把
+  // 模型分成了两类端点：
+  //  - `agentrouter`（apiType=openai，缺省）：chat/completions 兼容模型，
+  //    经网关的 `/v1/responses` 入口时会被折成 chat 格式再出站；
+  //  - `agentrouter-responses`（apiType=openai-responses）：只实现 Responses 的模型，
+  //    `/v1/responses` 逐字透传到上游 `/v1/responses`。
+  // 协议是 provider 级（端点属性，不是模型属性），所以这里必须拆成两个提供商；
+  // 同一个 provider 下混放两类模型，总有一类会被发到它不支持的端点。
   agentrouter:  { name: 'AgentRouter（按 UA 白名单鉴权）', id: 'agentrouter', baseUrl: 'https://ps.air-outer.com/v1', apiType: 'openai',
-    models: ['deepseek-v4-flash', 'gpt-6-astra', 'gpt-6.1-sol'],
+    models: ['deepseek-v4-flash', 'gpt-6-astra'],
+    upstreamUserAgent: 'claude-cli/2.0.1 (external, cli)',
+    upstreamHeaders: {
+      'accept': 'application/json',
+      'x-app': 'cli',
+      'x-stainless-lang': 'js',
+      'x-stainless-os': 'Windows',
+      'x-stainless-arch': 'x64',
+      'x-stainless-runtime': 'node',
+      'x-stainless-runtime-version': 'v22.11.0',
+    },
+  },
+  // AgentRouter 的 Responses-only 模型（gpt-6.1-sol 只接受 /v1/responses，对
+  // /v1/chat/completions 直接回「模型不支持该接口」）。独立 id 便于分别挂 Key 与配额。
+  'agentrouter-responses': { name: 'AgentRouter · Responses 原生模型', id: 'agentrouter-responses', baseUrl: 'https://ps.air-outer.com/v1', apiType: 'openai-responses',
+    models: ['gpt-6.1-sol'],
     upstreamUserAgent: 'claude-cli/2.0.1 (external, cli)',
     upstreamHeaders: {
       'accept': 'application/json',
@@ -681,7 +717,7 @@ ${H('管理')}
             </div>
             <div class="fg"><label for="apreset">厂商预设</label><select id="apreset" class="select-sm" onchange="applyProviderPreset(this.value)"><option value="">— 自定义 —</option>${Object.entries(PROVIDER_PRESETS).map(([name, pre]) => `<option value="${name}">${escapePageHtml(pre.name)}</option>`).join('')}</select><span class="form-helper">选择后自动填充名称/地址/格式，只需填 API Key 即可测试。</span></div>
             <div class="fg"><label for="aurl">API 地址</label><input type="url" id="aurl" placeholder="https://api.deepseek.com"></div>
-            <div class="fg"><label for="afmt">API 格式</label><select id="afmt" class="select-sm"><option value="openai">OpenAI 兼容</option><option value="anthropic">Anthropic 兼容</option></select></div>
+            <div class="fg"><label for="afmt">API 格式</label><select id="afmt" class="select-sm"><option value="openai">OpenAI 兼容（chat/completions）</option><option value="anthropic">Anthropic 兼容（messages）</option><option value="openai-responses">OpenAI Responses 原生（responses 透传）</option></select><span class="form-helper">选「Responses 原生」后，该提供商的 <code>/v1/responses</code> 请求会逐字透传到上游 <code>/v1/responses</code>，不再折成 chat 格式。仅用于拒绝 <code>/chat/completions</code> 的上游（如 agentrouter 的 gpt-6.1-sol）；普通 OpenAI 兼容上游保持缺省的「OpenAI 兼容」。</span></div>
             <div class="fg"><label for="aua">出站 User-Agent（可选）</label><input type="text" id="aua" placeholder="留空 = 透传客户端 UA"><span class="form-helper">部分上游按客户端指纹鉴权（UA 不在白名单时先于密钥校验直接 401，如 agentrouter），填这里用该值覆盖转发给上游的 User-Agent；值须单行可打印 ASCII，≤512 字节。创建后也可在提供商详情里修改。</span></div>
             <div class="fg"><label for="auh">出站请求头（可选）</label><textarea id="auh" rows="4" placeholder="每行一个，格式 头名: 值&#10;例：x-app: cli&#10;留空 = 不改"></textarea><span class="form-helper">与上面同类的指纹头，一次可配多个：按名字大小写无关地覆盖同名头（未列出的头保持原样）。<code>host</code>、<code>content-length</code>、<code>authorization</code>、<code>accept-encoding</code> 等由运行时或凭据池管理的头不允许覆写。以 <code>#</code> 开头的行是注释。</span></div>
             <div class="fg"><label for="aat">认证方式</label><select id="aat" class="select-sm" onchange="toggleAuthType()"><option value="api-key">API Key</option><option value="oauth-device">OAuth 设备码登录</option></select></div>
@@ -754,17 +790,17 @@ ${H('管理')}
           ${providers.length ? providers.map(p=>`
           <article class="pi" data-id="${escapePageHtml(p.id)}">
             <div class="ps" onclick="tog('${escapePageJsx(p.id)}')" role="button" tabindex="0" onkeydown="if(event.target===this&&(event.key==='Enter'||event.key===' ')){event.preventDefault();tog('${escapePageJsx(p.id)}')}" aria-controls="dt-${escapePageHtml(p.id)}">
-              <div class="l"><i class="fas fa-chevron-right provider-chevron" aria-hidden="true" id="ch-${escapePageHtml(p.id)}"></i><span class="provider-avatar" aria-hidden="true">${escapePageHtml(p.name.charAt(0).toUpperCase() || 'A')}</span><div><h3>${escapePageHtml(p.name)}</h3><div class="pu"><code>${escapePageHtml(p.id)}</code><span>${(p.apiType||'openai')==='anthropic'?'Anthropic':'OpenAI'}</span><span>${p.apiKeys.length} Keys</span><span>${p.models.length} 模型</span></div></div></div>
+              <div class="l"><i class="fas fa-chevron-right provider-chevron" aria-hidden="true" id="ch-${escapePageHtml(p.id)}"></i><span class="provider-avatar" aria-hidden="true">${escapePageHtml(p.name.charAt(0).toUpperCase() || 'A')}</span><div><h3>${escapePageHtml(p.name)}</h3><div class="pu"><code>${escapePageHtml(p.id)}</code><span>${providerProtocolLabel(p.apiType)}</span><span>${p.apiKeys.length} Keys</span><span>${p.models.length} 模型</span></div></div></div>
               <div class="fc fx-s0" onclick="event.stopPropagation()"><label class="tg"><input type="checkbox" ${p.enabled?'checked':''} id="en-${escapePageHtml(p.id)}" onchange="togglePb('${escapePageJsx(p.id)}',this.checked)" aria-label="启用 ${escapePageHtml(p.name)}"><span class="sl"></span></label><span class="bd ${p.enabled?'bd-on':'bd-off'}">${p.enabled?'已启用':'未启用'}</span></div>
             </div>
             <div class="pd" id="dt-${escapePageHtml(p.id)}">
-              <div class="detail-heading"><div><h3>编辑 ${escapePageHtml(p.name)}</h3><p>保存后，新配置会用于后续转发请求。</p></div><span class="protocol-chip">${(p.apiType||'openai')==='anthropic'?'ANTHROPIC':'OPENAI'}</span></div>
+              <div class="detail-heading"><div><h3>编辑 ${escapePageHtml(p.name)}</h3><p>保存后，新配置会用于后续转发请求。</p></div><span class="protocol-chip">${providerProtocolLabel(p.apiType).toUpperCase()}</span></div>
               <div class="fr"><div class="fg"><label>名称</label><input type="text" id="nm-${escapePageHtml(p.id)}" value="${escapePageHtml(p.name)}"></div><div class="fg"><label>ID</label><input type="text" value="${escapePageHtml(p.id)}" disabled></div></div>
               <div class="fg"><label>API 地址</label><input type="url" id="url-${escapePageHtml(p.id)}" value="${escapePageHtml(p.baseUrl)}">${isTraeProviderUI(p)?`<span class="form-helper">TRAE 的聊天路径<b>不读这一格</b>：SOLO / Work 用的是内置主机（硬编码常量），改它从来没有影响过聊天。只有「上游端点 = Remote」时才会用到它，且会<b>自动补 <code>/api/remote/v1</code></b> —— 保持预设值 <code>https://trae-api-cn.mchost.guru</code> 即可，<b>留空</b>用内置默认。仅当改成自定义主机时才原样使用（那种情况可能 404）。</span>`:''}</div>
               ${(p.oauth&&p.oauth.flowType==='gemini')?`
               <div class="fg" id="gbu-row-${escapePageHtml(p.id)}"><label for="gbu-${escapePageHtml(p.id)}">Gemini 推理中转地址（可选）</label><input type="url" id="gbu-${escapePageHtml(p.id)}" value="${escapePageHtml(p.geminiBaseUrl||'')}" placeholder="https://your-us-relay.example.com"><span class="form-helper">配置美国中转地址后，网关把 generateContent / countTokens 推理请求经该节点中转以规避地区限制（HTTP 400 User location is not supported）。OAuth 认证仍直连 Google。留空 = 直连内置默认地址。</span></div>
               <div class="fg" id="gquota-row-${escapePageHtml(p.id)}"><label>账号额度（5 小时窗口 / 周窗口）</label><div class="fr" style="align-items:center;gap:8px;"><button class="btn btn-s" onclick="geminiQuota('${escapePageJsx(p.id)}')"><i class="fas fa-gauge-high" aria-hidden="true"></i>查询额度</button><span id="gquota-tier-${escapePageHtml(p.id)}" class="pu"></span></div><div id="gquota-out-${escapePageHtml(p.id)}" class="form-helper" style="white-space:pre-wrap;"></div></div>`:''}
-              <div class="fg"><label>API 格式</label><select id="at-${escapePageHtml(p.id)}" class="select-sm"><option value="openai" ${(p.apiType||'openai')==='openai'?'selected':''}>OpenAI 兼容</option><option value="anthropic" ${p.apiType==='anthropic'?'selected':''}>Anthropic 兼容</option></select></div>
+              <div class="fg"><label>API 格式</label><select id="at-${escapePageHtml(p.id)}" class="select-sm"><option value="openai" ${(p.apiType||'openai')==='openai'?'selected':''}>OpenAI 兼容（chat/completions）</option><option value="anthropic" ${p.apiType==='anthropic'?'selected':''}>Anthropic 兼容（messages）</option><option value="openai-responses" ${p.apiType==='openai-responses'?'selected':''}>OpenAI Responses 原生（responses 透传）</option></select></div>
               <div class="fg"><label>认证方式</label><select id="auth-${escapePageHtml(p.id)}" class="select-sm" onchange="toggleAuthTypeEdit('${escapePageJsx(p.id)}')"><option value="api-key" ${(p.authType||'api-key')==='api-key'?'selected':''}>API Key</option><option value="oauth-device" ${p.authType==='oauth-device'?'selected':''}>OAuth 设备码登录</option></select></div>
               <div id="oauth-edit-${escapePageHtml(p.id)}" class="${p.authType==='oauth-device'?'form-group':'hd form-group'}">
                 <fieldset class="form-group"><legend>OAuth 配置</legend>

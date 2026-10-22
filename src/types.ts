@@ -4,6 +4,30 @@ export interface Model {
 }
 
 /**
+ * 提供商的上游协议格式（`provider.apiType`）。
+ *
+ * 描述的是**网关与上游之间**说的是哪种方言，因此它同时决定两件事：
+ *  1. 出站路径与请求/响应体格式（见 proxy.ts 的分派）；
+ *  2. 后台面板上该提供商可用的客户端入口。
+ *
+ * - `openai`（缺省）：上游是 OpenAI **Chat Completions** 兼容端点，出站
+ *   `${baseUrl}/chat/completions`。Responses 客户端请求会先被
+ *   `responsesToOpenAI` 折成 chat 格式再出站——这是历史行为，所有 OpenAI
+ *   兼容上游都靠它工作。
+ * - `anthropic`：上游是 Anthropic Messages 原生端点，出站 `${baseUrl}/v1/messages`。
+ * - `openai-responses`：上游是 OpenAI **Responses** 原生端点，出站
+ *   `${baseUrl}/responses`，请求体与响应体**逐字透传**（不折回 chat）。
+ *   用于只实现 Responses、明确拒绝 `/chat/completions` 的上游
+ *   （如 agentrouter 的 gpt-6.1-sol：`模型不支持 /v1/chat/completions 接口`）。
+ *
+ * 为什么是 provider 级而不是 model 级：同一提供商的所有模型共用一个
+ * baseUrl 与认证方式，协议方言属于端点属性。同一个 baseUrl 下既有 chat-only
+ * 又有 responses-only 模型时，正确做法是建两个 provider（各自一份 key），
+ * 而不是让协议在模型间漂移。
+ */
+export type ProviderApiType = 'openai' | 'anthropic' | 'openai-responses'
+
+/**
  * 账号池冷却参数（trae 与 workbuddy 账号池共用，provider.cooldown 可覆盖默认值）。
  * 对齐 workbuddy-wild 的 cooldown.* 配置：余额不足（plan）/ 429（soft）/ 连续错误。
  * 单位均为毫秒；errThreshold 为连续错误触发冷却的阈值（次）。
@@ -76,7 +100,7 @@ export interface Provider {
   id: string
   name: string
   baseUrl: string
-  apiType?: 'openai' | 'anthropic'
+  apiType?: ProviderApiType
   /** 认证方式：api-key（普通 API Key） | oauth-device（OAuth 设备码登录） */
   authType?: 'api-key' | 'oauth-device'
   /**
@@ -556,7 +580,7 @@ export interface CreateProviderRequest {
   id: string
   name: string
   baseUrl: string
-  apiType?: 'openai' | 'anthropic'
+  apiType?: ProviderApiType
   authType?: 'api-key' | 'oauth-device'
   oauth?: OAuthDeviceConfig
   apiKeys?: Array<{ key: string; enabled: boolean }>
@@ -602,7 +626,7 @@ export interface CreateProviderRequest {
 export interface UpdateProviderRequest {
   name?: string
   baseUrl?: string
-  apiType?: 'openai' | 'anthropic'
+  apiType?: ProviderApiType
   authType?: 'api-key' | 'oauth-device'
   oauth?: OAuthDeviceConfig
   apiKeys?: Array<{ key: string; enabled: boolean }>
@@ -665,7 +689,7 @@ export interface UpsertProviderRequest {
   id: string
   name?: string
   baseUrl?: string
-  apiType?: 'openai' | 'anthropic'
+  apiType?: ProviderApiType
   authType?: 'api-key' | 'oauth-device'
   apiKeys?: Array<ApiKeyEntry | string>
   models?: Array<Model | string>

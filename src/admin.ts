@@ -116,6 +116,23 @@ export function isSafeHttpUrl(value: string): boolean {
   return !/^[\d.]+$/.test(host) ? true : !isPrivateIp(host)
 }
 
+/**
+ * 校验提供商协议格式（`apiType`）。
+ *
+ * 缺省（undefined）表示沿用 `openai`，因此不算非法；显式传值必须在允许集合内。
+ * 收紧的理由：`apiType` 直接决定出站路径与请求体格式，写入一个拼错的值
+ * （如 `openai-responses ` 带空格、`responses`）会让分派全部落空、退回通用
+ * chat 路径，表现为「配置看起来成功、实际每次被上游 400」——比直接拒绝更难排查。
+ */
+const PROVIDER_API_TYPES = new Set(['openai', 'anthropic', 'openai-responses'])
+
+export function validateProviderApiType(value: unknown): string | null {
+  if (value === undefined || value === null) return null
+  const text = String(value).trim()
+  if (PROVIDER_API_TYPES.has(text)) return null
+  return `API 格式「${text}」不受支持，可选值：${[...PROVIDER_API_TYPES].join(' / ')}`
+}
+
 function isPrivateIp(host: string): boolean {
   if (host.includes(':')) {
     // IPv6（可能带 []）；::ffff:a.b.c.d 映射回 IPv4 判断
@@ -322,6 +339,11 @@ export async function handleCreateProvider(c: Context<AppEnv>) {
   if (kukuErr) {
     return c.json<ApiResponse>({ success: false, message: kukuErr }, 400)
   }
+  // 协议格式非法直接拒绝：它决定出站路径与请求体格式，写错会静默退回 chat 路径
+  const apiTypeErr = validateProviderApiType(body.apiType)
+  if (apiTypeErr) {
+    return c.json<ApiResponse>({ success: false, message: apiTypeErr }, 400)
+  }
   if (!isSafeHttpUrl(body.baseUrl)) {
     return c.json<ApiResponse>({ success: false, message: 'baseUrl 必须是合法的 http/https 公网地址' }, 400)
   }
@@ -417,6 +439,11 @@ export async function handleUpdateProvider(c: Context<AppEnv>) {
   )
   if (kukuErr) {
     return c.json<ApiResponse>({ success: false, message: kukuErr }, 400)
+  }
+  // 协议格式非法直接拒绝（同创建路径的理由）
+  const apiTypeErr = validateProviderApiType(body.apiType)
+  if (apiTypeErr) {
+    return c.json<ApiResponse>({ success: false, message: apiTypeErr }, 400)
   }
 
   const updates: Partial<Provider> = {}
@@ -538,6 +565,11 @@ export async function handleUpsertProvider(c: Context<AppEnv>) {
   const kukuErr = validateKukuSettings(body.type ?? existing?.type, body.kukuThinkMode)
   if (kukuErr) {
     return c.json<ApiResponse>({ success: false, message: kukuErr }, 400)
+  }
+  // 协议格式非法直接拒绝（同创建/更新路径的理由）
+  const apiTypeErr = validateProviderApiType(body.apiType)
+  if (apiTypeErr) {
+    return c.json<ApiResponse>({ success: false, message: apiTypeErr }, 400)
   }
 
   // ===== 不存在 → 创建 =====
