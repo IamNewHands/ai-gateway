@@ -4,6 +4,7 @@ import { KV_KEYS, KEY_HEALTH_COOLDOWN_MS, KEY_HEALTH_MAX_FAILURES, OAUTH_TOKEN_R
 import type { AppEnv, Env, Provider, ProxyRequestBody } from './types'
 import { RequestBodyError, readJSONLimited, MAX_AI_REQUEST_BYTES, MAX_RESPONSES_REQUEST_BYTES } from './request-body'
 import { normalizeToolSchemas } from './tool-schema'
+import { ensureAssistantReasoningEcho, needsReasoningEcho } from './reasoning-echo'
 import { createAnalyticsContext, normalizeAnthropicUsage, normalizeChatUsage, normalizeResponsesUsage, summarizeError } from './analytics/types'
 import type { AnalyticsContext, UsageMetrics } from './analytics/types'
 import { createStreamUsageProbe, writeAnalyticsEvent } from './analytics/usage-logger'
@@ -1822,6 +1823,11 @@ export async function forwardProxy(
     // 出站工具 schema 归一：严格上游（如 agentrouter）会把缺省的 `required` 当 null 拒，
     // 这里统一补 `required: []`；无工具的请求逐字节不变（见 tool-schema.ts）。
     normalizeToolSchemas(forwardBody as Record<string, unknown>)
+    // thinking 回传补齐：agentrouter 的 deepseek 模型是 Anthropic 形状的思考模式，
+    // 历史里缺一条 assistant 的思考就整轮 400（见 reasoning-echo.ts）。
+    if (needsReasoningEcho(provider, modelId)) {
+      ensureAssistantReasoningEcho(forwardBody as Record<string, unknown>)
+    }
     // 缓存前缀注入：提供商勾选了该 modelId 时，在 messages 头部注入固定缓存前缀（提升前缀缓存命中率）
     await applyCachePrefixInjection(c.env, provider, modelId, forwardBody as Record<string, unknown>)
     // 思维模式引导注入：提供商勾选了该 modelId 时，在 messages 头部注入思维引导 system 提示词
