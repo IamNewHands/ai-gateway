@@ -30,6 +30,11 @@ import { MAX_ADMIN_REQUEST_BYTES, readOptionalJSONLimited, readStrictJSONLimited
 import { applyUpstreamHeaders, normalizeUpstreamHeaders, normalizeUpstreamUserAgent } from './upstream-user-agent'
 import { isTraeProvider, testTraeCredential, testTraeModel } from './trae/proxy'
 import { diagnoseOpenCodeKey, fetchOpenCodeModels, isOpenCodeProvider, resolveOpenCodeUrls, testOpenCodeModel } from './opencode'
+import type { OpenCodeKeyStatus } from './opencode'
+// OpenCode 每个 Key 的检查留档：写 KV、面板读同一份。文案与色调由 key-state 提供，
+// 面板不自己拼结论（与 Cline 账号状态同一纪律）。
+import { describeOpenCodeKeyState, maskOpenCodeKey, readOpenCodeKeyStates, recordOpenCodeKeyState } from './opencode-key-state'
+import type { OpenCodeKeyState } from './opencode-key-state'
 import { isQoderFlow, fetchQoderModels, testQoderModel } from './qoder/proxy'
 import { isClineProvider, fetchClineRecommendedModels, testClineChat, testClineRefreshToken, probeClineAccount, startClineOAuth, pollClineOAuth, probeClineProviderUpstream, validateClineProviderUpstream, verifyClineProviderUpstream, readClineUpstreamCache, readClineTraffic, MIN_GAP_MS, DEFAULT_MODEL } from './cline/proxy'
 import type { ClineTrafficRecord } from './cline/proxy'
@@ -2521,6 +2526,195 @@ export async function handleClineAccountLabel(c: Context<AppEnv>) {
   const keys = provider.apiKeys || []
   if (index >= keys.length) {
     return c.json<ApiResponse>({ success: false, message: `index 越界（当前共 ${keys.length} 个账号）` }, 400)
+  }
+  const label = normalizeApiKeyLabel(body.label)
+  const apiKeys = keys.map((k, i) => (i === index ? { ...k, label } : k))
+  const updated = await updateProvider(c.env, id, { apiKeys })
+  if (!updated) return c.json<ApiResponse>({ success: false, message: '提供商不存在' }, 404)
+  return c.json<ApiResponse>({ success: true, data: { index, label: label || '' } })
+}
+
+// ===== OpenCode 每个 Key 的检查情况（有效性 + 关联账号名） =====
+//
+// 与 Cline 那套的差别（为什么不是照抄）：Cline 的 refreshToken 能换回 userInfo.email，所以「关联账号」
+// 可以是上游事实；OpenCode 的兼容面**没有账号身份端点**（2026-10-22 实测 /zen/v1/me、/zen/v1/usage、
+// /inference/v1/me 全 404，只有 /zen/v1/models 公开可读），所以账号名只能是用户自己填的显示名。
+// 检查情况则是真的：对每个 Key 各发一次最小推理请求，结论落 KV，展开卡片时只读回显、不打上游。
+
+export interface OpenCodeKeyRow {
+  /** 对应 provider.apiKeys 的下标；面板按它回填徽章与账号输入框。 */
+  index: number
+  /** 掩码后的 Key，面板用它对号入座（不传完整 Key）。 */
+  masked: string
+  enabled: boolean
+  /** 手工填的账号名（OpenCode 拿不到上游邮箱，只能手填）；空串 = 未命名。 */
+  label: string
+  /** 'manual' 手工填 | 'none' 未命名。刻意没有 'auto'：没有上游账号事实就不假装有。 */
+  labelSource: 'manual' | 'none'
+  /** 最近一次检查的结论；'unchecked' = 从未检测（或该行换过 Key，旧结论作废）。 */
+  status: OpenCodeKeyStatus | 'unchecked'
+  /** 面板徽章文案（如「可用 · 312ms」）；未检测时为空串。 */
+  statusLabel: string
+  /** 徽章色调。 */
+  tone: 'on' | 'warn' | 'danger' | 'off'
+  /** 上游原文摘要或网关自述。 */
+  message: string
+  httpStatus: number
+  latencyMs: number
+  model: string | null
+  /** 检查时刻（毫秒）；未检测为 0。 */
+  checkedAt: number
+  /** 距今多久（毫秒）；未检测为 0。 */
+  ageMs: number
+  /** tooltip：状态 + 模型 + HTTP 码 + 报文 + 检查时刻。 */
+  detail: string
+}
+
+/** 一行 key 的展示态：留档匹配不上（换过号 / 从未检测）时给「未检测」，绝不复用旧结论。 */
+function openCodeKeyRow(
+  providerId: string,
+  index: number,
+  entry: ApiKeyEntry,
+  state: OpenCodeKeyState | undefined,
+  now: number
+): OpenCodeKeyRow {
+  const masked = maskOpenCodeKey(entry.key)
+  const matched = state && state.masked === masked ? state : undefined
+  const view = matched ? describeOpenCodeKeyState(matched, now) : null
+  return {
+    index,
+    masked,
+    enabled: !!entry.enabled,
+    label: entry.label || '',
+    labelSource: entry.label ? 'manual' : 'none',
+    status: matched ? matched.status : 'unchecked',
+    statusLabel: view?.label || '',
+    tone: view?.tone || 'off',
+    message: matched?.message || '',
+    httpStatus: matched?.httpStatus || 0,
+    latencyMs: matched?.latencyMs || 0,
+    model: matched?.model || null,
+    checkedAt: matched?.at || 0,
+    ageMs: view?.ageMs || 0,
+    detail: view?.detail || '',
+  }
+}
+
+/**
+ * GET /admin/api/providers/:id/opencode-key-states
+ *
+ * 只读检查留档（KV），**不打上游**：面板展开 OpenCode 卡片时调用。为什么必须有一个只读入口：
+ * 真正的检测会为每个 Key 发一次推理请求（有代价），而「看一眼上次检查是什么结论」不该付这个代价，
+ * 也不该等用户先想到去点它。
+ */
+export async function handleOpenCodeKeyStates(c: Context<AppEnv>) {
+  const id = c.req.param('id')
+  if (!id) return c.json<ApiResponse>({ success: false, message: '缺少 id 参数' }, 400)
+  const provider = await getProvider(c.env, id)
+  if (!provider) return c.json<ApiResponse>({ success: false, message: '提供商不存在' }, 404)
+  if (!isOpenCodeProvider(provider.id)) {
+    return c.json<ApiResponse>({ success: false, message: '仅支持 OpenCode 提供商' }, 400)
+  }
+  const states = await readOpenCodeKeyStates(c.env, id)
+  const byIndex = new Map(states.map((s) => [s.index, s]))
+  const now = Date.now()
+  const keys = provider.apiKeys || []
+  const rows = keys.map((k, i) => openCodeKeyRow(id, i, k, byIndex.get(i), now))
+  return c.json<ApiResponse>({ success: true, data: { keys: rows, checkedAt: now } })
+}
+
+/**
+ * POST /admin/api/providers/:id/opencode-keys/check
+ *
+ * 逐个 Key 诊断并落档。每个 Key 打两次上游：一次模型列表（判 401/429）、一次最小推理（判「真能用」）。
+ * 结论写 KV，下一轮面板展开即可读到同一份事实（跨 isolate）。
+ *
+ * 只检测**启用的** Key：禁用的 Key 不参与转发，为它烧一次免费额度没有意义；面板对它们显示「已禁用」。
+ */
+export async function handleOpenCodeKeyCheck(c: Context<AppEnv>) {
+  const id = c.req.param('id')
+  if (!id) return c.json<ApiResponse>({ success: false, message: '缺少 id 参数' }, 400)
+  const provider = await getProvider(c.env, id)
+  if (!provider) return c.json<ApiResponse>({ success: false, message: '提供商不存在' }, 404)
+  if (!isOpenCodeProvider(provider.id)) {
+    return c.json<ApiResponse>({ success: false, message: '仅支持 OpenCode 提供商' }, 400)
+  }
+  const baseUrl = provider.baseUrl || OPENCODE_DEFAULT_URL
+  const keys = provider.apiKeys || []
+  const targets = keys.map((k, i) => ({ k, i })).filter((x) => x.k.enabled && !!x.k.key)
+  if (targets.length === 0) {
+    return c.json<ApiResponse>({ success: false, message: '没有启用的 Key 可检测' }, 400)
+  }
+
+  // 并发 2：免费档同一账号下并发过高会互相触发 429，把「限流」误报成 key 问题。
+  const probed = await mapWithLimit(targets, 2, async ({ k, i }) => {
+    const diag = await diagnoseOpenCodeKey(baseUrl, k.key)
+    return { i, diag }
+  })
+
+  const now = Date.now()
+  const states = await readOpenCodeKeyStates(c.env, id)
+  const byIndex = new Map(states.map((s) => [s.index, s]))
+  for (const { i, diag } of probed) {
+    const state: OpenCodeKeyState = {
+      index: i,
+      masked: maskOpenCodeKey(keys[i].key),
+      status: diag.status,
+      message: diag.message,
+      httpStatus: diag.httpStatus || 0,
+      latencyMs: diag.latencyMs || 0,
+      model: diag.model || null,
+      at: now,
+    }
+    byIndex.set(i, state)
+    await recordOpenCodeKeyState(c.env, id, state)
+  }
+
+  const rows = keys.map((k, i) => openCodeKeyRow(id, i, k, byIndex.get(i), now))
+  const usable = rows.filter((r) => r.status === 'usable').length
+  const rejected = rows.filter((r) => r.status === 'rejected').length
+  const limited = rows.filter((r) => r.status === 'rate_limited').length
+  const broken = rows.filter((r) => r.status === 'transport_error' || r.status === 'upstream_error').length
+  const disabled = rows.filter((r) => !r.enabled).length
+  const extra = [
+    rejected ? `被拒 ${rejected}` : '',
+    limited ? `限流 ${limited}` : '',
+    broken ? `上游异常 ${broken}` : '',
+    disabled ? `已禁用 ${disabled}` : '',
+  ].filter(Boolean)
+  return c.json<ApiResponse>({
+    success: true,
+    data: {
+      keys: rows,
+      checkedAt: now,
+      summary: `可用 ${usable} / 共 ${rows.length}${extra.length ? `，${extra.join('，')}` : ''}`,
+    },
+  })
+}
+
+/**
+ * POST /admin/api/providers/:id/opencode-keys/label
+ * body: { index, label } —— 手工维护账号名。传空串即清除。
+ *
+ * 为什么需要这个口子：OpenCode 不返回账号邮箱，多个 Key 之间唯一的区别就是掩码尾号；
+ * 让用户给每个 Key 起个名字（如「主号」「备用 Gmail」）是分辨账号的唯一可靠办法。
+ */
+export async function handleOpenCodeKeyLabel(c: Context<AppEnv>) {
+  const id = c.req.param('id')
+  if (!id) return c.json<ApiResponse>({ success: false, message: '缺少 id 参数' }, 400)
+  const body = await readStrictJSONLimited<{ index?: unknown; label?: unknown }>(c.req.raw, MAX_ADMIN_REQUEST_BYTES)
+  const index = typeof body.index === 'number' ? body.index : Number(body.index)
+  if (!Number.isInteger(index) || index < 0) {
+    return c.json<ApiResponse>({ success: false, message: 'index 必须是非负整数' }, 400)
+  }
+  const provider = await getProvider(c.env, id)
+  if (!provider) return c.json<ApiResponse>({ success: false, message: '提供商不存在' }, 404)
+  if (!isOpenCodeProvider(provider.id)) {
+    return c.json<ApiResponse>({ success: false, message: '仅支持 OpenCode 提供商' }, 400)
+  }
+  const keys = provider.apiKeys || []
+  if (index >= keys.length) {
+    return c.json<ApiResponse>({ success: false, message: `index 越界（当前共 ${keys.length} 个 Key）` }, 400)
   }
   const label = normalizeApiKeyLabel(body.label)
   const apiKeys = keys.map((k, i) => (i === index ? { ...k, label } : k))

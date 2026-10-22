@@ -43,6 +43,9 @@ import {
   handleClineAccountCheck,
   handleClineAccountStates,
   handleClineAccountLabel,
+  handleOpenCodeKeyCheck,
+  handleOpenCodeKeyStates,
+  handleOpenCodeKeyLabel,
   handleClineUpstreams,
   handleClineUpstreamProbe,
   handleClineUpstreamValidate,
@@ -285,6 +288,10 @@ app.post('/admin/api/providers/:id/cline-accounts/check', handleClineAccountChec
 // Cline 账号冷却/额度留档：只读 KV，不打上游（面板展开卡片时调用）
 app.get('/admin/api/providers/:id/cline-account-states', handleClineAccountStates)
 app.post('/admin/api/providers/:id/cline-accounts/label', handleClineAccountLabel)
+// OpenCode 每个 Key 的检查情况：只读留档（不打上游）/ 逐个检测并落档 / 手工维护账号名
+app.get('/admin/api/providers/:id/opencode-key-states', handleOpenCodeKeyStates)
+app.post('/admin/api/providers/:id/opencode-keys/check', handleOpenCodeKeyCheck)
+app.post('/admin/api/providers/:id/opencode-keys/label', handleOpenCodeKeyLabel)
 // Cline 上游渠道探测与固定：读留档（GET，不打上游）/ 探测单模型渠道 / 校验该模型全部渠道 /
 // 验证已保存的钉住配置是否真的生效（读响应路由元数据）
 app.get('/admin/api/providers/:id/cline-upstreams', handleClineUpstreams)

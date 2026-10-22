@@ -151,22 +151,49 @@ const clineAcctFieldsHtml = (pid: string, idx: number, label?: string, enabled =
   `<span class="mu" style="font-size:12px" id="kmsg-${escapePageHtml(pid)}-${idx}"></span>`
 
 /**
+ * OpenCode 面板脚本版本戳：改这一块的客户端行为就 bump 它（同 CLINE_UP_UI_VERSION 的理由，
+ * 内联脚本要等部署 + 刷新才生效，版本戳让用户能自证加载的是不是新脚本）。
+ */
+export const OPENCODE_ACCT_UI_VERSION = '2026-10-22-acct-1'
+
+/**
+ * OpenCode 账号行：Key 与「检查徽章 + 账号名」同处一行。
+ *
+ * 与 Cline 那套的差别（为什么账号框的 placeholder 不一样）：Cline 的 refreshToken 能换回
+ * userInfo.email，所以能自动关联；OpenCode 的兼容面没有账号身份端点（/zen/v1/me 等一律 404，
+ * 只有 /zen/v1/models 公开），账号名只能是用户手填的显示名。徽章则是真结论：点「检测全部 Key」
+ * 会为每个启用 Key 发一次最小推理请求，结论落 KV，展开卡片时只读回显。
+ */
+const opencodeAcctFieldsHtml = (pid: string, idx: number, label?: string, enabled = true) =>
+  `<span class="bd bd-off" id="okst-${escapePageHtml(pid)}-${idx}" title="点「测试」或「检测全部 Key」后显示该 Key 的检查结果">${enabled ? '未检测' : '已禁用'}</span>` +
+  `<input type="text" class="ok-lbl" id="oklbl-${escapePageHtml(pid)}-${idx}" value="${escapePageHtml(label || '')}" placeholder="账号名（如 主号 / 备用；上游不提供邮箱，需手填）" aria-label="账号名（仅显示用）" onblur="opencodeSaveLabel('${escapePageJsx(pid)}',${idx})">` +
+  `<span class="mu" style="font-size:12px" id="okmsg-${escapePageHtml(pid)}-${idx}"></span>`
+
+/**
  * apiKey 单行。data-kidx 只挂在外层容器上：getKeys() 按 [data-kidx] 逐行收集，
  * 一行里出现两个带 data-kidx 的元素会让同一个 token 被收集两次。
  */
 const keyRowHtml = (p: { id?: string }, k: { key: string; enabled: boolean; label?: string }, ki: number) => {
   const pid = escapePageHtml(p.id)
   const isCline = p.id === 'cline'
+  const isOpenCode = p.id === 'opencode'
+  const tokenClass = isCline ? 'cline-tok' : (isOpenCode ? 'ok-tok fx1' : 'fx1')
   const controls =
-    `<input type="password" value="${escapePageHtml(k.key)}" class="${isCline ? 'cline-tok' : 'fx1'}" id="k-${pid}-${ki}" placeholder="API Key" aria-label="API Key">` +
+    `<input type="password" value="${escapePageHtml(k.key)}" class="${tokenClass}" id="k-${pid}-${ki}" placeholder="API Key" aria-label="API Key">` +
     `<button class="icon-btn" onclick="toggleKeyText(this)" title="显示/隐藏 Key"><i class="fas fa-eye" aria-hidden="true"></i></button>` +
     `<label class="tg"><input type="checkbox" ${k.enabled ? 'checked' : ''} id="ken-${pid}-${ki}" aria-label="启用 Key"><span class="sl"></span></label>` +
     `<button class="btn btn-gh btn-xs" onclick="testKeyRow('${escapePageJsx(p.id)}',${ki})" title="测试 Key"><i class="fas fa-plug" aria-hidden="true"></i><span>测试</span></button>` +
     `<button class="icon-btn" onclick="rmKeyRow('${escapePageJsx(p.id)}',${ki})" aria-label="移除 Key"><i class="fas fa-times" aria-hidden="true"></i></button>`
-  if (p.id !== 'cline') {
+  if (!isCline && !isOpenCode) {
     return `<div class="fc mb-3 field-row" data-kidx="${ki}">${controls}</div>`
   }
-  return `<div class="fc mb-3 field-row cline-key-row" data-kidx="${ki}">${controls}${clineAcctFieldsHtml(p.id!, ki, k.label, k.enabled)}` +
+  // 账号行要能换行（.field-row 默认 nowrap 会把 Key 输入框压成一条缝），
+  // 且每行有自己的结果区 ktr-<id>-<idx>：否则多行并发测试会互相覆盖同一个 tr-<id>。
+  const rowClass = isCline ? 'cline-key-row' : 'acct-key-row'
+  const extras = isCline
+    ? clineAcctFieldsHtml(p.id!, ki, k.label, k.enabled)
+    : opencodeAcctFieldsHtml(p.id!, ki, k.label, k.enabled)
+  return `<div class="fc mb-3 field-row ${rowClass}" data-kidx="${ki}">${controls}${extras}` +
     `<span class="trt" id="ktr-${pid}-${ki}" aria-live="polite"></span></div>`
 }
 
@@ -1030,7 +1057,7 @@ if ($waitForHuman) {
                   </fieldset>`:''}
                 </fieldset>
               </div>
-              <fieldset class="form-group ${p.authType==='oauth-device'?'hd':''}" id="keys-fs-${escapePageHtml(p.id)}"><legend id="key-legend-${escapePageHtml(p.id)}">${isTraeProviderUI(p)?'TRAE 账号凭证（每个账号一行 JSON）':(p.id==='cline'?'Cline RefreshTokens（每个账号一行）':'上游 API Keys')}</legend><div id="keys-${escapePageHtml(p.id)}">${p.apiKeys.map((k, ki)=>keyRowHtml(p, k, ki)).join('')}</div><div class="fc mt-1 field-row"><input type="password" id="nk-${escapePageHtml(p.id)}" placeholder="${isTraeProviderUI(p)?'新的 TRAE 凭证 JSON（或点「登录账号」自动写入）':(p.id==='cline'?'新的 RefreshToken（一个账号一行）':'新的 API Key')}" class="fx1"><button class="btn btn-s btn-xs" onclick="addKeyRow('${escapePageJsx(p.id)}')"><i class="fas fa-plus" aria-hidden="true"></i>添加</button></div>${p.id==='cline'?`<div class="fc mt-1 field-row"><button class="btn btn-s btn-xs" onclick="clineCheckAccounts('${escapePageJsx(p.id)}')" title="逐个用 refreshToken 换一次 accessToken，判断是否仍可用并关联账号邮箱"><i class="fas fa-heart-pulse" aria-hidden="true"></i>检测全部账号</button><span class="mu" id="cline-chk-${escapePageHtml(p.id)}" aria-live="polite" style="font-size:12px"></span></div>`:''}<span id="key-hint-${escapePageHtml(p.id)}" class="form-helper">${isTraeProviderUI(p)?'TRAE SOLO 账号凭证为登录后自动写入的 JSON（也可粘贴 trae 登录脚本落盘的 trae-*.json 内容）。每行一个账号、按剩余积分自动挑选，额度用尽自动冷却轮换；禁用该 Key 即停用账号。':(p.id==='cline'?'Cline 使用 Cline 账号的 refreshToken（长期钥匙）。每个账号一行，额度用完自动切换；留空禁用某个账号。点「检测全部账号」会用每个 token 换一次 accessToken：徽章显示是否仍可用，并自动把上游返回的邮箱填进「账号」框；上游关联不到（或 token 已失效）时可手工填账号名便于分辨，只用于显示。':' ')}</span></fieldset>
+              <fieldset class="form-group ${p.authType==='oauth-device'?'hd':''}" id="keys-fs-${escapePageHtml(p.id)}"><legend id="key-legend-${escapePageHtml(p.id)}">${isTraeProviderUI(p)?'TRAE 账号凭证（每个账号一行 JSON）':(p.id==='cline'?'Cline RefreshTokens（每个账号一行）':(p.id==='opencode'?'OpenCode API Keys（每个 Key 一行，可命名账号）':'上游 API Keys'))}</legend><div id="keys-${escapePageHtml(p.id)}">${p.apiKeys.map((k, ki)=>keyRowHtml(p, k, ki)).join('')}</div><div class="fc mt-1 field-row"><input type="password" id="nk-${escapePageHtml(p.id)}" placeholder="${isTraeProviderUI(p)?'新的 TRAE 凭证 JSON（或点「登录账号」自动写入）':(p.id==='cline'?'新的 RefreshToken（一个账号一行）':'新的 API Key')}" class="fx1"><button class="btn btn-s btn-xs" onclick="addKeyRow('${escapePageJsx(p.id)}')"><i class="fas fa-plus" aria-hidden="true"></i>添加</button></div>${p.id==='cline'?`<div class="fc mt-1 field-row"><button class="btn btn-s btn-xs" onclick="clineCheckAccounts('${escapePageJsx(p.id)}')" title="逐个用 refreshToken 换一次 accessToken，判断是否仍可用并关联账号邮箱"><i class="fas fa-heart-pulse" aria-hidden="true"></i>检测全部账号</button><span class="mu" id="cline-chk-${escapePageHtml(p.id)}" aria-live="polite" style="font-size:12px"></span></div>`:''}${p.id==='opencode'?`<div class="fc mt-1 field-row" data-ok-ui="${OPENCODE_ACCT_UI_VERSION}"><button class="btn btn-s btn-xs" onclick="opencodeCheckKeys('${escapePageJsx(p.id)}')" title="对每个启用的 Key 各发一次最小推理请求（自动挑免费档模型，约几十 token），判断该 Key 此刻是否真能转发；结论落 KV，展开卡片即可回看"><i class="fas fa-heart-pulse" aria-hidden="true"></i>检测全部 Key</button><span class="mu" id="okchk-${escapePageHtml(p.id)}" aria-live="polite" style="font-size:12px"></span></div>`:''}<span id="key-hint-${escapePageHtml(p.id)}" class="form-helper">${isTraeProviderUI(p)?'TRAE SOLO 账号凭证为登录后自动写入的 JSON（也可粘贴 trae 登录脚本落盘的 trae-*.json 内容）。每行一个账号、按剩余积分自动挑选，额度用尽自动冷却轮换；禁用该 Key 即停用账号。':(p.id==='cline'?'Cline 使用 Cline 账号的 refreshToken（长期钥匙）。每个账号一行，额度用完自动切换；留空禁用某个账号。点「检测全部账号」会用每个 token 换一次 accessToken：徽章显示是否仍可用，并自动把上游返回的邮箱填进「账号」框；上游关联不到（或 token 已失效）时可手工填账号名便于分辨，只用于显示。':(p.id==='opencode'?'OpenCode 每个 Key 一行。点「检测全部 Key」会为每个<b>启用</b>的 Key 各发一次最小推理请求（自动从实时模型列表挑免费档模型），徽章给出该 Key 此刻的结论：可用 / 限流 / Key 被拒 / 上游故障 / 网络错误，含耗时与报文；结论落 KV，展开卡片即回看上次结果（只读，不打上游）。OpenCode 上游不返回账号身份（<code>/zen/v1/me</code>、<code>/zen/v1/usage</code> 均 404，只有 <code>/zen/v1/models</code> 公开），所以「账号名」只能手填——仅用于分辨「这行是哪个号」，不参与鉴权。':' '))}</span></fieldset>
               ${p.type === 'kuku' ? `<div class="fg"><label for="kuku-think-${escapePageHtml(p.id)}">Kuku 思考模式</label><input type="number" id="kuku-think-${escapePageHtml(p.id)}" min="0" max="10" value="${p.kukuThinkMode ?? 3}"><span class="form-helper">允许 0 到 10，默认 3。</span></div>
               <div class="fg"><button class="btn btn-p btn-sm" onclick="kukuQrLogin('${escapePageJsx(p.id)}')" type="button"><i class="fas fa-qrcode" aria-hidden="true"></i> 扫码登录自动写 Cookie</button><span class="form-helper">用手机百度 App 扫码，后台自动写入 BDUSS Cookie（已保存的提供商将直接更新 Key）。</span></div>` : ''}
               <fieldset class="form-group" id="models-fs-${escapePageHtml(p.id)}" data-effort="${isWorkbuddyProviderUI(p)?'1':'0'}"><legend>模型</legend><div id="ml-${escapePageHtml(p.id)}">${p.models.map((m,mi)=>{ const pol=((p.oauth&&p.oauth.effortPolicy)||{})[m.id]||[]; return `<div class="fc mb-3 field-row" data-idx="${mi}"><input type="text" value="${escapePageHtml(m.id)}" class="fx1" id="mid-${escapePageHtml(p.id)}-${mi}" placeholder="模型 ID"><label class="tg" title="启用模型"><input type="checkbox" ${m.enabled?'checked':''} id="men-${escapePageHtml(p.id)}-${mi}" aria-label="启用模型"><span class="sl"></span></label><label class="tg" title="启用思维引导注入"><input type="checkbox" ${(p.thinkingInject||[]).includes(m.id)?'checked':''} id="mit-${escapePageHtml(p.id)}-${mi}" aria-label="启用思维引导注入"><span class="sl"></span></label><label class="tg" title="启用缓存前缀注入"><input type="checkbox" ${(p.cachePrefixInject||[]).includes(m.id)?'checked':''} id="mcp-${escapePageHtml(p.id)}-${mi}" aria-label="启用缓存前缀注入"><span class="sl"></span></label>${effDdEditHtml(p.id, mi, pol, !isWorkbuddyProviderUI(p))}<button class="btn btn-gh btn-xs" onclick="testMdl('${escapePageJsx(p.id)}','${escapePageJsx(m.id)}',${mi})" title="测试模型"><i class="fas fa-plug" aria-hidden="true"></i><span>测试</span></button><button class="icon-btn" onclick="rmMdl('${escapePageJsx(p.id)}',${mi})" aria-label="移除模型"><i class="fas fa-times" aria-hidden="true"></i></button></div>`}).join('')}</div><div class="fc mt-1 field-row"><input type="text" id="nmid-${escapePageHtml(p.id)}" placeholder="新的模型 ID" class="fx1"><button class="btn btn-s btn-xs" onclick="addMdl('${escapePageJsx(p.id)}')"><i class="fas fa-plus" aria-hidden="true"></i>添加</button></div><span class="form-helper">每个模型行「启用模型」开关旁的开关依次为「思维引导注入」「缓存前缀注入」，勾选后该模型转发前会被注入对应固定提示词；不勾选则原样转发。「effort」下拉声明该模型的 reasoning_effort 支持档位（多选），仅对 WorkBuddy / CodeBuddy 提供商显示——其余上游不消费该配置。</span></fieldset>
@@ -1531,6 +1558,8 @@ function tog(id) {
   // Cline：展开时**先读一次只读留档**（不打上游），让"额度耗尽被冷却"一眼可见；
   // 保存/一键授权后标记过「待检测」的账号再多跑一次真实检测（那时需要拿新 token 关联账号）。
   if (d.classList.contains('open')) clineOnCardOpen(id)
+  // OpenCode：展开时只读一次检查留档（不打上游），让「这个 Key 上次是可用还是被拒」一眼可见
+  if (d.classList.contains('open')) opencodeOnCardOpen(id)
   if (d.classList.contains('open')) agentRouterOnCardOpen(d)
 }
 
@@ -1783,6 +1812,8 @@ function restoreAdminState() {
         // Cline：恢复展开态同样要读冷却/额度留档——否则「刷新后面板本来就是开的」这条最常见路径
         // 什么都不加载，用户看不到任何状态（2026-10-02 实测报障）。与手动 tog 共用同一入口。
         clineOnCardOpen(pid)
+        // OpenCode：恢复展开态同样要读检查留档（否则「刷新后面板本来就是开的」这条路径什么都看不到）
+        opencodeOnCardOpen(pid)
         agentRouterOnCardOpen(d)
       })
       if (s.add) { const af = document.getElementById('af'); if (af) af.classList.remove('hd') }
@@ -4667,6 +4698,125 @@ function clineSaveLabel(id, idx) {
 }
 /* CLINE_UP_UI_END */
 
+/* ===== OpenCode 每个 Key 的检查情况（有效性与账号名） =====
+ * 与 Cline 那套的分工完全一致，只是数据源不同：
+ *  - 展开卡片 → 只读 KV 留档（不打上游）；
+ *  - 点「检测全部 Key」→ 服务端逐个 Key 发一次最小推理请求，结论落 KV 后回填；
+ *  - 账号名失焦即存（空串=清除），因为 OpenCode 上游不返回邮箱，名字只能人来给。
+ * 徽章文案与色调全部由服务端下发（opencodePaintBadge 只负责画），客户端不自己拼结论。
+ */
+function opencodePaintBadge(id, a) {
+  var b = document.getElementById('okst-' + id + '-' + a.index)
+  if (!b) return
+  var tone = a && a.tone ? a.tone : 'off'
+  var txt = a && a.statusLabel ? a.statusLabel : (a && a.enabled === false ? '已禁用' : '未检测')
+  b.textContent = txt
+  b.className = 'bd bd-' + tone
+  var title = a && a.detail ? a.detail : ''
+  if (a && a.enabled === false) title = (title ? title + ' ｜ ' : '') + '该 Key 已禁用，不参与转发'
+  b.title = title || '点「测试」或「检测全部 Key」后显示该 Key 的检查结果'
+}
+
+function opencodePaintMsg(id, a) {
+  var m = document.getElementById('okmsg-' + id + '-' + a.index)
+  if (!m) return
+  m.textContent = a && a.label ? '账号名：' + a.label + '（仅显示用）' : '可手填账号名便于分辨（不参与鉴权）'
+}
+
+function opencodePaintRows(id, rows) {
+  rows.forEach(function (a) {
+    opencodePaintBadge(id, a)
+    opencodePaintMsg(id, a)
+    var l = document.getElementById('oklbl-' + id + '-' + a.index)
+    if (l && !l.value.trim() && a.label) l.value = a.label
+  })
+}
+
+// 只读：读 KV 留档并回填（展开卡片时调用，不打上游）
+function opencodeLoadKeyStates(id) {
+  return fetch('/admin/api/providers/' + encodeURIComponent(id) + '/opencode-key-states')
+    .then(function (r) { return r.json() })
+    .then(function (d) {
+      var st = document.getElementById('okchk-' + id)
+      if (!d || !d.success) {
+        if (st) st.textContent = '检查留档读取失败：' + ((d && d.message) || '未知错误')
+        return false
+      }
+      var rows = (d.data && d.data.keys) || []
+      opencodePaintRows(id, rows)
+      var checked = rows.filter(function (a) { return a.checkedAt }).length
+      if (st) {
+        st.textContent = '上次检查记录已读取（' + new Date().toLocaleTimeString() + '）' +
+          (checked ? ' · 已检测 ' + checked + ' / ' + rows.length : ' · 还没有检查记录，点左侧按钮开始')
+      }
+      return true
+    })
+    .catch(function () {
+      var st = document.getElementById('okchk-' + id)
+      if (st) st.textContent = '检查留档读取失败：网络错误'
+      return false
+    })
+}
+
+function opencodeCheckKeys(id, opts) {
+  var silent = !!(opts && opts.silent)
+  var st = document.getElementById('okchk-' + id)
+  if (st) st.textContent = '检测中…（每个启用的 Key 各发一次最小推理请求，约数秒）'
+  var rowsEls = Array.prototype.slice.call(document.querySelectorAll('#keys-' + id + ' [data-kidx]'))
+  rowsEls.forEach(function (item) {
+    // 禁用的 Key 不会被检测（服务端跳过它们），不要先给它画一个「检测中」再变回「已禁用」
+    var en = document.getElementById('ken-' + id + '-' + item.dataset.kidx)
+    if (en && !en.checked) return
+    var b = document.getElementById('okst-' + id + '-' + item.dataset.kidx)
+    if (b) { b.textContent = '检测中…'; b.className = 'bd bd-info'; b.title = '正在向该 Key 发一次最小推理请求' }
+  })
+  return fetch('/admin/api/providers/' + encodeURIComponent(id) + '/opencode-keys/check', { method: 'POST' })
+    .then(function (r) { return r.json() })
+    .then(function (d) {
+      if (!d || !d.success) {
+        var msg = (d && d.message) || '未知错误'
+        if (st) st.textContent = '检测失败：' + msg
+        if (!silent) toast('检测失败：' + msg, 'error')
+        opencodeLoadKeyStates(id)
+        return false
+      }
+      var rows = (d.data && d.data.keys) || []
+      opencodePaintRows(id, rows)
+      if (st) st.textContent = ((d.data && d.data.summary) || '') + ' · ' + new Date().toLocaleTimeString()
+      return true
+    })
+    .catch(function (e) {
+      var msg = (e && e.message) || '网络错误'
+      if (st) st.textContent = '检测失败：' + msg
+      if (!silent) toast('检测失败：' + msg, 'error')
+      return false
+    })
+}
+
+// 账号名手工维护：失焦即存（空串=清除），避免用户为改名先点保存
+function opencodeSaveLabel(id, idx) {
+  var el = document.getElementById('oklbl-' + id + '-' + idx)
+  if (!el) return
+  var m = document.getElementById('okmsg-' + id + '-' + idx)
+  fetch('/admin/api/providers/' + encodeURIComponent(id) + '/opencode-keys/label', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ index: parseInt(idx, 10), label: el.value.trim() })
+  }).then(function (r) { return r.json() })
+    .then(function (d) {
+      if (!d || !d.success) { if (m) m.textContent = '账号名保存失败：' + ((d && d.message) || '未知错误'); return }
+      if (m) m.textContent = el.value.trim() ? '账号名：' + el.value.trim() + '（已保存，仅显示用）' : '已清除账号名（可重新填写）'
+    })
+    .catch(function () { if (m) m.textContent = '账号名保存失败：网络错误' })
+}
+
+// 卡片展开入口（手动点击与刷新恢复展开态共用；没用这个入口就会「刷新后什么都不加载」）
+function opencodeOnCardOpen(id) {
+  if (!document.getElementById('okchk-' + id)) return false
+  opencodeLoadKeyStates(id)
+  return true
+}
+
 // OAuth 提供商：用 KV 中的 token 拉取上游模型列表，动态填入编辑表单
 async function fetchOauthModels(id) {
   const tr = document.getElementById('tr-' + id)
@@ -4767,8 +4917,8 @@ function getKeys(id) {
     const k = document.getElementById('k-' + id + '-' + idx).value.trim()
     const en = document.getElementById('ken-' + id + '-' + idx).checked
     if (!k) return null
-    // Cline：账号名（自动关联或手工填），仅显示用，其余提供商没有这个输入框
-    const lblEl = document.getElementById('klbl-' + id + '-' + idx)
+    // Cline / OpenCode：账号名（仅显示用）。Cline 可自动关联邮箱，OpenCode 只能手填。
+    const lblEl = document.getElementById('klbl-' + id + '-' + idx) || document.getElementById('oklbl-' + id + '-' + idx)
     const lbl = lblEl ? lblEl.value.trim() : ''
     return lbl ? { key: k, enabled: en, label: lbl } : { key: k, enabled: en }
   }).filter(Boolean)
@@ -4779,15 +4929,22 @@ function addKeyRow(id) {
   if (!k) { toast('请输入 API Key', 'error'); return }
   const c = document.getElementById('keys-' + id), cnt = c.querySelectorAll('[data-kidx]').length
   const isCline = id === 'cline'
+  const isOpenCode = id === 'opencode'
   const d = document.createElement('div')
-  // Cline：token 与账号信息同处一行（.cline-key-row 允许换行，窄窗口才折到第二行）
-  d.className = isCline ? 'fc mb-3 field-row cline-key-row' : 'fc mb-3 field-row'
+  // Cline / OpenCode：Key 与账号信息同处一行（账号行允许换行，窄窗口才折到第二行）
+  d.className = isCline ? 'fc mb-3 field-row cline-key-row' : (isOpenCode ? 'fc mb-3 field-row acct-key-row' : 'fc mb-3 field-row')
   d.dataset.kidx = cnt
-  let html = '<input type="password" value="' + escapeHtml(k) + '" class="' + (isCline ? 'cline-tok' : 'fx1') + '" id="k-' + escapeHtml(id) + '-' + cnt + '" placeholder="API Key" aria-label="API Key"><button class="icon-btn" onclick="toggleKeyText(this)" title="显示/隐藏 Key" aria-label="显示或隐藏 Key"><i class="fas fa-eye" aria-hidden="true"></i></button><label class="tg"><input type="checkbox" checked id="ken-' + escapeHtml(id) + '-' + cnt + '" aria-label="启用该 Key"><span class="sl"></span></label><button class="btn btn-gh btn-xs" onclick="testKeyRow(\\'' + escapeJsAttr(id) + '\\',' + cnt + ')" title="测试" aria-label="测试该 Key"><i class="fas fa-plug"></i></button><button class="btn btn-gh btn-xs" onclick="rmKeyRow(\\'' + escapeJsAttr(id) + '\\',' + cnt + ')" title="移除" aria-label="移除该 Key"><i class="fas fa-times c-l"></i></button>'
+  const tokClass = isCline ? 'cline-tok' : (isOpenCode ? 'ok-tok fx1' : 'fx1')
+  let html = '<input type="password" value="' + escapeHtml(k) + '" class="' + tokClass + '" id="k-' + escapeHtml(id) + '-' + cnt + '" placeholder="API Key" aria-label="API Key"><button class="icon-btn" onclick="toggleKeyText(this)" title="显示/隐藏 Key" aria-label="显示或隐藏 Key"><i class="fas fa-eye" aria-hidden="true"></i></button><label class="tg"><input type="checkbox" checked id="ken-' + escapeHtml(id) + '-' + cnt + '" aria-label="启用该 Key"><span class="sl"></span></label><button class="btn btn-gh btn-xs" onclick="testKeyRow(\\'' + escapeJsAttr(id) + '\\',' + cnt + ')" title="测试" aria-label="测试该 Key"><i class="fas fa-plug"></i></button><button class="btn btn-gh btn-xs" onclick="rmKeyRow(\\'' + escapeJsAttr(id) + '\\',' + cnt + ')" title="移除" aria-label="移除该 Key"><i class="fas fa-times c-l"></i></button>'
   if (isCline) {
     html += '<span class="bd bd-info" id="kst-' + escapeHtml(id) + '-' + cnt + '">待保存</span>' +
       '<input type="text" class="cline-lbl" id="klbl-' + escapeHtml(id) + '-' + cnt + '" placeholder="账号（保存后自动关联邮箱）" aria-label="账号名（仅显示用）" onblur="clineSaveLabel(\\'' + escapeJsAttr(id) + '\\',' + cnt + ')">' +
       '<span class="mu" style="font-size:12px" id="kmsg-' + escapeHtml(id) + '-' + cnt + '"></span>'
+  }
+  if (isOpenCode) {
+    html += '<span class="bd bd-info" id="okst-' + escapeHtml(id) + '-' + cnt + '">待保存</span>' +
+      '<input type="text" class="ok-lbl" id="oklbl-' + escapeHtml(id) + '-' + cnt + '" placeholder="账号名（如 主号 / 备用；保存后即可命名）" aria-label="账号名（仅显示用）" onblur="opencodeSaveLabel(\\'' + escapeJsAttr(id) + '\\',' + cnt + ')">' +
+      '<span class="mu" style="font-size:12px" id="okmsg-' + escapeHtml(id) + '-' + cnt + '"></span>'
   }
   html += '<span class="trt" id="ktr-' + escapeHtml(id) + '-' + cnt + '" aria-live="polite"></span>'
   d.innerHTML = html
@@ -4827,6 +4984,11 @@ async function testKeyRow(id, idx) {
     clineApplyProbe(id, idx, result)
     return
   }
+  if (id === 'opencode') {
+    // OpenCode 这行测的是「这个 Key 此刻能不能真转发」（单 key 诊断），同样不拉模型网格。
+    opencodeApplyProbe(id, idx, result)
+    return
+  }
   if (result.success) {
     showEditModelsList(id, extractModels(result.data))
   }
@@ -4848,6 +5010,31 @@ function clineApplyProbe(id, idx, result) {
     else if (result.email) m.textContent = '已自动关联邮箱'
     else m.textContent = '上游未返回邮箱，可手工填写账号名'
   }
+}
+
+// 把单行 OpenCode 诊断结果写回该行徽章。
+// 结论来自 /admin/api/test-key 的 intent=diagnose（服务端已分类），客户端只照抄；
+// 单行测试**不落 KV**（落档只在「检测全部 Key」时做），所以这里明说一句，避免误以为关掉页面还能看到。
+function opencodeApplyProbe(id, idx, result) {
+  var map = {
+    usable: ['可用', 'on'],
+    rejected: ['Key 被拒', 'danger'],
+    rate_limited: ['限流', 'warn'],
+    upstream_error: ['上游故障', 'warn'],
+    request_error: ['请求被拒', 'warn'],
+    transport_error: ['网络错误', 'danger'],
+    unavailable: ['未测出', 'off']
+  }
+  var status = result.keyStatus || (result.success ? 'usable' : 'unavailable')
+  var v = map[status] || map.unavailable
+  var b = document.getElementById('okst-' + id + '-' + idx)
+  if (b) {
+    b.textContent = v[0]
+    b.className = 'bd bd-' + v[1]
+    b.title = (result.message || '') + ' ｜ 本次为单行测试，未落档；点「检测全部 Key」才会把结论存下来'
+  }
+  var m = document.getElementById('okmsg-' + id + '-' + idx)
+  if (m) m.textContent = '单行测试结果（未存档），要留存请点「检测全部 Key」'
 }
 
 // opencode / 通用 编辑表单 — 获取模型（复用 testKeyConnection 逻辑）

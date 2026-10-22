@@ -213,6 +213,14 @@ label, legend { color: var(--color-ink-2); font-size: var(--text-xs); font-weigh
 .cline-key-row .cline-lbl { flex: 0 1 220px; min-width: 140px; }
 .cline-key-row .trt { flex-basis: 100%; }
 
+/* OpenCode 账号行：与 Cline 同构（一行放 Key + 开关 + 测试 + 检查徽章 + 账号名）。
+   单独一套类名而不复用 .cline-key-row：两者语义不同（Cline 是 refreshToken 自动关联邮箱，
+   OpenCode 只能手填账号名），任一方调宽度/顺序时不该牵动另一方。 */
+.acct-key-row { flex-wrap: wrap; }
+.acct-key-row .ok-tok { flex: 1 1 240px; max-width: 420px; }
+.acct-key-row .ok-lbl { flex: 0 1 220px; min-width: 140px; }
+.acct-key-row .trt { flex-basis: 100%; }
+
 /* switch */
 .tg { position: relative; display: inline-block; width: 2.5rem; height: var(--control-h); flex: 0 0 2.5rem; margin: 0; }
 .tg input { position: absolute; opacity: 0; width: .0625rem; height: .0625rem; }

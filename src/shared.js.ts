@@ -92,7 +92,8 @@ async function testKeyConnection(url, apiType, key, providerId, intent) {
     var d = await r.json()
     if (d.success && d.data) {
       // email 仅 Cline 的 refreshToken 探测会带（用于回填账号名），其余为 undefined
-      return { success: d.data.success, status: d.data.statusCode, data: d.data.data, message: d.data.message, email: d.data.email }
+      // keyStatus 仅 OpenCode 的单 key 诊断会带（usable / rejected / rate_limited / …）
+      return { success: d.data.success, status: d.data.statusCode, data: d.data.data, message: d.data.message, email: d.data.email, keyStatus: d.data.keyStatus }
     }
     return { success: false, status: 0, data: null }
   } catch (e) {

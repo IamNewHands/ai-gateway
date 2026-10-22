@@ -678,3 +678,23 @@ TRAE 思考模型在推理阶段可能 15~20s 不发数据，客户端（AI SDK 
 本仓 vitest 在 DSH 沙箱内必须带 `--pool=threads`（默认 forks 池会 `spawn EPERM`）。
 DeepSeek 的 SSE 测试吃的是**真实上游固件**（`src/deepseek/__fixtures__/completion-{plain,thinking,search}.sse.txt`），
 上游改协议时用 `DS_LIVE_PROBE=1 DS_LIVE_CAPTURE=1 npx vitest run --pool=threads -t captures src/deepseek/live-capture.test.ts` 重抓。
+## OpenCode 面板：每个 Key 的检查情况与账号名（2026-10-22）
+
+Cline 的「账号徽章 + 账号名」那套被搬到了 OpenCode 提供商卡，但**不能照抄**，差别是硬事实：
+
+- **OpenCode 上游没有账号身份端点**。2026-10-22 实测 `GET https://opencode.ai/zen/v1/me`、
+  `/zen/v1/usage`、`/inference/v1/me`、`/api/auth/me` 全部 **404**，只有 `/zen/v1/models` 公开可读
+  （不带 Authorization 也 200）。所以别指望像 Cline `/auth/refresh` 那样回 `userInfo.email`：
+  「账号名」只能是用户手填的 `apiKeys[i].label`，面板不编造 `labelSource='auto'` 这种假事实。
+- **检查情况是真的**：`POST /admin/api/providers/:id/opencode-keys/check` 对每个**启用**的 Key 调
+  `diagnoseOpenCodeKey()`（先拉实时模型列表判 401/429，再挑免费档模型发一次 `max_tokens: 8` 的推理），
+  结论按 `index + 掩码末四位` 落 KV（前缀 `opencode:keystate:`，7 天 TTL）。
+- **展开卡片只读 KV**（`GET /admin/api/providers/:id/opencode-key-states`），不打上游——与 Cline
+  冷却留档同一纪律：看一眼上次检查不该付出重新探测的代价，也不该等用户先想到去点按钮。
+- **掩码不符即作废**：某行被换号后，旧结论讲的是另一个 Key，于是显示「未检测」而不是硬套。
+- **禁用行不检测**：为不参与转发的 Key 烧一次免费额度没有意义；面板直接显示「已禁用」。
+- 单行「测试」按钮走 `intent=diagnose`，结论**只画在行上、不落档**（要留存请点「检测全部 Key」），
+  面板文案里明说了这一点，避免用户以为关掉页面后还能看到。
+- 与 Cline 行共用布局思路但**用独立类名** `.acct-key-row` / `.ok-tok` / `.ok-lbl`：两者语义不同，
+  将来调宽度不该牵动另一方。每行另有自己的 `ktr-<id>-<idx>` 结果区，多行并发测试不再互相覆盖。
+- 客户端脚本版本戳 `OPENCODE_ACCT_UI_VERSION`（渲染成 `data-ok-ui`），改这块行为就 bump 它。
