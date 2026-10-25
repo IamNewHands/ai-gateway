@@ -87,28 +87,85 @@ export function billingMeterPaths(pathSuffix: string, realm: 'cn' | 'global'): s
 }
 
 /**
+ * billing 域的**鉴权拒绝**判定：HTTP 401/403 且响应体**没有业务信封**（`code === null`）。
+ *
+ * 为什么必须与业务错误分开（2026-10-25 实测）：`www.codebuddy.cn` 前面是 APISIX/openresty，
+ * 当账号的 Keycloak 会话已失效时，网关在鉴权阶段直接回纯 HTML
+ * `<h1>401 Authorization Required</h1> … Powered by APISIX` —— **请求根本没进业务**，
+ * 所以 body 里没有 `{code,msg}` 信封。同一条 token 打 `copilot.tencent.com/v2/report`
+ * 仍返回业务信封（code=10001），证明 token 未损坏，只是计费域的会话不被接受。
+ *
+ * 与「业务拒绝」的区别：403 + 业务码（如 10085 非法请求）是业务层结论，刷新 token 无用；
+ * 只有这种**无信封**的 401/403 才有唯一有效的自救动作——刷新 token 后原样重发。
+ */
+export function isGatewayAuthRejection(err: unknown): boolean {
+  if (!(err instanceof BillingError)) return false
+  if (err.status !== 401 && err.status !== 403) return false
+  return err.code === null
+}
+
+/**
  * 发起一次 billing 请求。POST，带 Bearer + X-Domain。
  * opts.body 传入则序列化为请求体（否则默认 {}）；opts.extraHeaders 合并额外头（X-User-Id 等）。
  * code!==0 抛业务错误（含 msg）；5xx/网络错误抛 Error。
  * opts.paths 传入多条候选路径时，仅在**404**（路径不存在）时换下一条（对齐 workbuddy2api
  * billingMeterJSON 的 `ErrNotFound` 才 fallback 语义：其他错误不重试，避免掩盖真实故障）。
+ *
+ * opts.onAuthRejected（2026-10-25 新增）：遇到**网关鉴权拒绝**（见 isGatewayAuthRejection）
+ * 时调用一次，返回新的 access_token 则用新 token **原地重发同一路径**。
+ *
+ * 为什么必须在这里而不是各调用方：签到（performCheckin）与额度（fetchWorkbuddyCredits）
+ * 都在这里出口。旧实现收到 401 直接当"签到失败"上抛，而转发路径（proxy.ts）有
+ * 「401 → 刷新 → 重试 → 换域」的完整链路——于是同一个号聊天还能靠换号撑住，
+ * 签到却每天固定失败，面板只剩一行 `http 401 … openresty` 无法定位。
+ *
+ * 边界：**最多刷新重试一次**（`authRetried`），且刷新失败时把原始鉴权错误抛给调用方
+ * （由它决定"需重新登录"的文案），避免把"刷新也没用"伪装成网络错误。
  */
 export async function billingCall(
   token: string,
   path: string,
   realm: 'cn' | 'global',
-  opts?: { body?: any; extraHeaders?: Record<string, string>; paths?: string[] }
+  opts?: {
+    body?: any
+    extraHeaders?: Record<string, string>
+    paths?: string[]
+    /** 网关鉴权拒绝时调用；返回新 access_token 则重试一次，返回 null 表示无法自救 */
+    onAuthRejected?: (err: BillingError) => Promise<string | null>
+  }
 ): Promise<any> {
   const candidates = opts?.paths && opts.paths.length > 0 ? opts.paths : [path]
+  let current = token
+  let authRetried = false
   let lastErr: unknown = null
   for (let i = 0; i < candidates.length; i++) {
-    try {
-      return await billingCallOnce(token, candidates[i], realm, opts)
-    } catch (e) {
-      lastErr = e
-      // 仅 404 视为"该路径不存在"，值得换下一条候选；其他错误立即抛出（不掩盖真实故障）
-      const is404 = e instanceof BillingError && e.status === 404
-      if (!is404 || i === candidates.length - 1) throw e
+    // 每个候选路径最多两次尝试：首次 token，以及（仅一次）刷新后的 token
+    for (;;) {
+      try {
+        return await billingCallOnce(current, candidates[i], realm, opts)
+      } catch (e) {
+        lastErr = e
+        if (opts?.onAuthRejected && !authRetried && isGatewayAuthRejection(e)) {
+          authRetried = true
+          let fresh: string | null = null
+          try {
+            fresh = await opts.onAuthRejected(e as BillingError)
+          } catch {
+            fresh = null
+          }
+          // 刷新拿到新 token 且确实换了值 → 原地重发同一路径（不消耗候选、不当 404 处理）
+          if (fresh && fresh !== current) {
+            current = fresh
+            continue
+          }
+          // 刷新失败/无变化：原始鉴权错误原样上抛，交由调用方给"需重新登录"口径
+          throw e
+        }
+        // 仅 404 视为"该路径不存在"，值得换下一条候选；其他错误立即抛出（不掩盖真实故障）
+        const is404 = e instanceof BillingError && e.status === 404
+        if (!is404 || i === candidates.length - 1) throw e
+        break
+      }
     }
   }
   throw lastErr instanceof Error ? lastErr : new Error(String(lastErr))
@@ -217,13 +274,44 @@ export function isCloudflareEdgeError(text: string): boolean {
 }
 
 /**
+ * 鉴权自救钩子的签名：收到网关鉴权拒绝时调用，返回新的 access_token（无法自救返回 null）。
+ *
+ * 单列成类型而非内联，是因为它要穿过四层调用（billingCall → fetchWorkbuddyCredits /
+ * performCheckin → fillCredits → 池/单 token 两条签到路径），内联签名一旦漂移就会在
+ * 编译期之外静默失效（`undefined` 被当成"没有钩子"，行为退回旧缺陷）。
+ */
+export type AuthRejectedHandler = (err: BillingError) => Promise<string | null>
+
+/**
+ * 判定响应体是否为 APISIX/openresty 网关自身的**鉴权拒绝页**（2026-10-25 实测形态）。
+ *
+ * 实测原文（`www.codebuddy.cn` 计费域，账号会话被上游吊销时）：
+ *   `<html><head><title>401 Authorization Required</title></head><body>…<em>Powered by
+ *    <a href="https://apisix.apache.org/">APISIX</a>.</em></body></html>`
+ *
+ * 为什么单列一类：这不是上游业务回复，而是网关在**鉴权阶段**就拒了 —— 请求从未到达业务，
+ * 所以 body 里没有 `{code,msg}` 信封。用户看到的旧文案是
+ * `http 401 /v2/billing/meter/daily-checkin: <html> …`，既读不出原因，也读不出该怎么办。
+ * 同一条 token 打 `copilot.tencent.com/v2/report` 仍返回业务信封，证明 token 未损坏，
+ * 唯一有效的动作是**重新登录**（刷新 token 也救不回来：Keycloak introspection 已失败）。
+ *
+ * 只认 APISIX/openresty 的机器可读标记，避免把业务 401 JSON 误判成网关页。
+ */
+export function isGatewayAuthPage(text: string): boolean {
+  if (!text) return false
+  const hasGatewayMark = /openresty|apisix/i.test(text)
+  if (!hasGatewayMark) return false
+  return /Authorization Required|<center>\s*<h1>\s*401/i.test(text)
+}
+
+/**
  * 把非 2xx 响应整形成可读失败原因（**单一事实来源**）。
  *
  * 为什么必须集中：此前多处直接 `res.json()`，把「HTTP 403 + CF 纯文本拦截页」变成
  * `Unexpected token 'e', "error code: 1002" is not valid JSON` —— HTTP 状态这个最有用的
  * 事实被 JSON 语法错吞掉，面板上完全看不出是边缘拦截还是上游拒绝。
  *
- * 非 CF 形态**逐字保持**原有 `http <status>[ <path>]: <body 前 200 字>` 拼写：
+ * 非 CF / 非网关页形态**逐字保持**原有 `http <status>[ <path>]: <body 前 200 字>` 拼写：
  * 幂等/文案匹配（isAlreadyCheckin / isRedeemNotEnoughDays 等）依赖该文本。
  */
 export function describeHttpFailure(status: number, text: string, path?: string): string {
@@ -232,6 +320,10 @@ export function describeHttpFailure(status: number, text: string, path?: string)
   if (isCloudflareEdgeError(raw)) {
     const snippet = raw.trim().replace(/\s+/g, ' ').slice(0, 80)
     return `http ${status}${where}: Cloudflare 边缘拦截页（${snippet}）；子请求未到达上游`
+  }
+  if (isGatewayAuthPage(raw)) {
+    // 文案要直接给出**动作**：这不是限流、不是网络抖动，重试和刷新 token 都无效。
+    return `http ${status}${where}: 上游网关鉴权拒绝（APISIX 401，请求未进入业务）；账号会话已失效，需重新登录该账号`
   }
   return raw ? `http ${status}${where}: ${raw.substring(0, 200)}` : `http ${status}${where}（空响应体）`
 }
@@ -458,13 +550,18 @@ function packageRemainUsed(a: any): { remain: number; used: number; size: number
  * 聚合所有包得到 totalRemain/totalUsed/totalSize/packCount + 包明细（移植自 CPA fetchUserResource）。
  * uid/enterpriseId 非空时补 X-User-Id / X-Enterprise-Id / X-Tenant-Id 头。
  * 失败抛错（调用方决定降级/跳过）。
+ *
+ * opts.onAuthRejected：透传给 billingCall 的鉴权自救钩子（见该函数说明）。
+ * 额度接口与签到同属计费域，会话失效时同样会吃到 APISIX 401 —— 不接这个钩子的话，
+ * 面板会同时出现「签到失败」与「额度 0」，看起来像两个独立故障。
  */
 export async function fetchWorkbuddyCredits(
   token: string,
   realm: 'cn' | 'global',
   uid: string,
   enterpriseId: string,
-  deviceToken?: string
+  deviceToken?: string,
+  opts?: { onAuthRejected?: (err: BillingError) => Promise<string | null> }
 ): Promise<{ totalRemain: number; totalUsed: number; totalSize: number; packCount: number; packages: PackageInfo[] }> {
   const now = new Date()
   const end = new Date(now.getTime() + PACKAGE_END_HORIZON_MS)
@@ -487,7 +584,12 @@ export async function fetchWorkbuddyCredits(
   if (deviceToken) extraHeaders['X-Device-Token'] = deviceToken
   // 路径按 realm 切（global 无 /v2 前缀优先，404 时 fallback），移植 workbuddy2api billingMeterPaths
   const paths = billingMeterPaths('get-user-resource', realm)
-  const data = await billingCall(token, paths[0], realm, { body, extraHeaders, paths })
+  const data = await billingCall(token, paths[0], realm, {
+    body,
+    extraHeaders,
+    paths,
+    onAuthRejected: opts?.onAuthRejected,
+  })
   const resp = data && data.Response && data.Response.Data ? data.Response.Data : null
   if (!resp) throw new Error('get-user-resource 响应缺 Response.Data')
   const accounts: any[] = Array.isArray(resp.Accounts) ? resp.Accounts : []

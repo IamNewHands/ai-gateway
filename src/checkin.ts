@@ -18,7 +18,7 @@ import { Context } from 'hono'
 import type { Env, Provider, CheckinResult, ApiResponse, PackageInfo } from './types'
 import { KV_KEYS, CHECKIN_RESULT_TTL_SEC, OAUTH_TOKEN_REFRESH_MARGIN_MS } from './config'
 import { getProviders } from './storage'
-import { getOauthAccessToken, detectTokenRealm, refreshQoderTokenPair } from './oauth'
+import { getOauthAccessToken, detectTokenRealm, refreshQoderTokenPair, refreshOauthToken, readOauthToken } from './oauth'
 import { writeLog } from './admin'
 import { isQoderFlow } from './qoder/proxy'
 import { fetchQoderCheckinStatus, performQoderCheckin, fetchQoderUserResource, fetchQoderPaymentType, fetchQoderUserInfo, buildQoderPacks, legacyQoderAddonExpireAt, normalizeQoderRealm, realmHasLegacyCheckin, qoderMachineHeadersState, proEligibility, proClaim, QODER_PRO_REWARD_CREDIT, type QoderRealm, type QoderProClaimResult } from './qoder/billing'
@@ -79,6 +79,7 @@ import {
   completeGlobalRegionFlow,
   fetchIntlCountries,
   type RegionCountry,
+  type AuthRejectedHandler,
   ACTIVITY_ACCOUNT_DELAY_MS,
 } from './workbuddy-billing'
 import { MAX_ADMIN_REQUEST_BYTES, readOptionalJSONLimited } from './request-body'
@@ -122,10 +123,59 @@ async function ensureGlobalActivation(token: string, uid: string): Promise<{ ok:
   return { ok: res.ok, message: res.msg }
 }
 
+/**
+ * 签到路径的**鉴权自救**句柄：持有当前 access_token，并在 billing 域吃网关 401 时刷新一次。
+ *
+ * 为什么需要它（2026-10-25 实测）：`www.codebuddy.cn` 前面是 APISIX，当账号的 Keycloak
+ * 会话被吊销后，计费域所有端点（状态 / 签到 / 额度 / 套餐）都回纯 HTML 401。旧实现
+ * 收到 401 直接当"签到失败"上抛，面板只剩 `http 401 … openresty`，既看不出原因也没有自愈
+ * 动作；而转发路径（proxy.ts）早有「401 → 刷新 → 重试 → 换域」链路，于是同一个号聊天能
+ * 靠换号撑住、签到却每天固定失败。
+ *
+ * 设计要点：
+ *  - **一次账号一次刷新**：上游 refresh 是真实的凭据轮换请求，同一轮签到里状态探测（2 条候选
+ *    路径）+ 签到 + 额度 + 套餐会各吃一次 401，逐次刷新会把 refresh_token 刷成风暴。
+ *    故首个拒绝触发刷新，后续拒绝直接返回当前 token（`fresh === current` 让 billingCall
+ *    放弃重试并抛出原始鉴权错误，语义仍是"刷新救不了"）。
+ *  - **刷新成功即换 token**：返回值同时被 `token()` 读到，让同一轮里后续请求都复用新 token，
+ *    而不是"签到用了新 token、额度还在用旧的"。
+ */
+interface AuthRecovery {
+  /** 当前应使用的 access_token（刷新成功后自动切换） */
+  token(): string
+  /** 透传给 billingCall 的自救钩子 */
+  onAuthRejected: AuthRejectedHandler
+}
+
+/**
+ * 构造 AuthRecovery。`refresh` 返回新 access_token，或 null（refresh_token 已失效）。
+ * 刷新失败也标记为"已尝试"，避免同一轮里对上游重复打无效刷新。
+ */
+function createAuthRecovery(initialToken: string, refresh: () => Promise<string | null>): AuthRecovery {
+  let current = initialToken
+  let attempted = false
+  return {
+    token: () => current,
+    onAuthRejected: async () => {
+      if (attempted) return current
+      attempted = true
+      let fresh: string | null = null
+      try {
+        fresh = await refresh()
+      } catch {
+        fresh = null
+      }
+      if (fresh) current = fresh
+      return fresh
+    },
+  }
+}
+
 /** 查询签到状态。依次试两个端点（CPA fallback 模式）。 */
 async function fetchCheckinStatus(
   token: string,
-  realm: 'cn' | 'global'
+  realm: 'cn' | 'global',
+  auth?: AuthRecovery
 ): Promise<{ active: boolean; todayCheckedIn: boolean; streakDays?: number; totalCredits?: number; dailyCredit?: number } | null> {
   // 状态端点候选序列：CN 用带 /v2 的两种拼写；global 另加无 /v2 前缀形态（源实现 R9：
   // 国际版无 /v2 前缀，路径族按 realm 切）。仅 404 会换下一条（billingCall 的 paths 语义）。
@@ -138,7 +188,11 @@ async function fetchCheckinStatus(
   let lastErr: Error | null = null
   for (const path of paths) {
     try {
-      const data = await billingCall(token, path, realm, { paths: [path] })
+      // 每条候选都用"当前" token：首条若触发刷新，后续候选直接拿新 token（见 createAuthRecovery）
+      const data = await billingCall(auth?.token() ?? token, path, realm, {
+        paths: [path],
+        onAuthRejected: auth?.onAuthRejected,
+      })
       const m = (data || {}) as Record<string, any>
       return {
         active: pickBool(m, 'active', 'Active'),
@@ -160,13 +214,14 @@ async function fetchCheckinStatus(
 export async function performCheckin(
   token: string,
   realm: 'cn' | 'global',
-  env?: Env
+  env?: Env,
+  opts?: { onAuthRejected?: AuthRejectedHandler }
 ): Promise<{ success: boolean; message: string; reward?: any; already?: boolean }> {
   try {
     // 路径按 realm 切（global 无 /v2 前缀优先，404 时 fallback），对齐 workbuddy2api checkinMeterPaths。
     // 当前 global 账号在上层已提前 return（不签到），此处保持按 realm 正确以便未来放开即生效。
     const paths = billingMeterPaths('daily-checkin', realm)
-    const data = await billingCall(token, paths[0], realm, { paths })
+    const data = await billingCall(token, paths[0], realm, { paths, onAuthRejected: opts?.onAuthRejected })
     return { success: true, message: '签到成功', reward: data }
   } catch (e) {
     // 幂等判定走三段式（移植 workbuddy2api cmd/signin/main.go）：
@@ -184,10 +239,15 @@ export async function performCheckin(
 /**
  * 拉取额度 + 套餐类型并填充到 base。额度拉取抛错时写日志（含 uid/eid 诊断）。
  * 在所有 return 前调用，确保"今日已签"也能拿到额度。
+ *
+ * `auth`：签到路径的鉴权自救句柄。额度接口同属计费域，会话失效时会一起 401——
+ * 不传的话面板会同时出现「签到失败」和「额度 0」，看起来像两个独立故障。
  */
-async function fillCredits(env: Env, base: CheckinResult, token: string, realm: 'cn' | 'global', uid: string, enterpriseId: string, deviceToken?: string) {
+async function fillCredits(env: Env, base: CheckinResult, token: string, realm: 'cn' | 'global', uid: string, enterpriseId: string, deviceToken?: string, auth?: AuthRecovery) {
   try {
-    const credits = await fetchWorkbuddyCredits(token, realm, uid, enterpriseId, deviceToken)
+    const credits = await fetchWorkbuddyCredits(token, realm, uid, enterpriseId, deviceToken, {
+      onAuthRejected: auth?.onAuthRejected,
+    })
     base.totalRemain = credits.totalRemain
     base.totalUsed = credits.totalUsed
     base.totalSize = credits.totalSize
@@ -671,6 +731,20 @@ async function checkinOauthPoolAccount(
     return base
   }
 
+  // 计费域 401 自救：临期判定只看 expires_at，**看不到"会话已被上游吊销"**——
+  // 那种情况下 token 明明还有几十天寿命（2026-10-25 实测 exp 剩 22.9 天），
+  // 但 APISIX 在鉴权阶段就 401。故这里额外挂一个"按需刷新"句柄：只在真吃到
+  // 网关 401 时才打一次 refresh（含写回池），并把新 token 用于同轮后续请求。
+  const auth = createAuthRecovery(token, async () => {
+    try {
+      const refreshed = await refreshOauthPoolAccount(env, provider.id, account.uid, provider.oauth!)
+      return refreshed?.token.access_token || null
+    } catch {
+      return null
+    }
+  })
+  token = auth.token()
+
   const claims = decodeWorkbuddyClaims(token)
   const uid = account.uid || claims.uid
   const enterpriseId = claims.enterpriseId
@@ -690,7 +764,7 @@ async function checkinOauthPoolAccount(
     base.message = '国际版账号无签到功能'
     base.success = true
     const devTokenGlobalEarly = account.token?.device_token || provider.oauth?.deviceToken
-    await fillCredits(env, base, token, 'global', uid, enterpriseId, devTokenGlobalEarly)
+    await fillCredits(env, base, token, 'global', uid, enterpriseId, devTokenGlobalEarly, auth)
 
     // 国际版**活跃上报**放开（移植 workbuddy2api a190252 / PR #45 实测）：
     // global 账号无签到/任务中心体系（D4 门控，下面 checkin/travel 仍跳过），
@@ -768,8 +842,10 @@ async function checkinOauthPoolAccount(
   }
   base.realm = 'cn'
 
-  // 状态探测
-  const status = await fetchCheckinStatus(token, 'cn')
+  // 状态探测（带鉴权自救：状态端点与签到同域，会话失效时一起 401）
+  const status = await fetchCheckinStatus(token, 'cn', auth)
+  // 状态探测可能已刷新 token → 后续请求统一用"当前" token，避免签到用新、额度用旧
+  token = auth.token()
   if (status) {
     base.todayCheckedIn = status.todayCheckedIn
     base.streakDays = status.streakDays
@@ -785,12 +861,13 @@ async function checkinOauthPoolAccount(
 
   // 未签到则执行签到
   if (!base.todayCheckedIn) {
-    const res = await performCheckin(token, 'cn', env)
+    const res = await performCheckin(token, 'cn', env, { onAuthRejected: auth.onAuthRejected })
     base.success = res.success
     base.message = res.message
     base.reason = res.success ? (res.already ? 'already' : 'ok') : 'fail'
     base.lastCheckinAt = now
     if (res.success) base.todayCheckedIn = true
+    token = auth.token()
   }
 
   // 生态增值与自动化任务（P2）：活跃上报（点亮连登/领猫门槛） + 回读 streak + 猫猫旅行
@@ -869,7 +946,7 @@ async function checkinOauthPoolAccount(
   }
 
   // 额度信息 + 解冻（签到就是为了解冻冷却账号，对齐 workbuddy-wild ReenableIfCredits）
-  await fillCredits(env, base, token, 'cn', uid, enterpriseId, devToken)
+  await fillCredits(env, base, token, 'cn', uid, enterpriseId, devToken, auth)
   await syncPoolCredits(env, provider, account, base)
   return base
 }
@@ -995,7 +1072,7 @@ export async function checkinOneAccount(
   }
 
   // 取 access token（自动刷新）
-  const token = provider.oauth
+  let token = provider.oauth
     ? await getOauthAccessToken(env, provider.id, provider.oauth)
     : null
   if (!token) {
@@ -1003,6 +1080,22 @@ export async function checkinOneAccount(
     base.message = '无可用 token（未登录或刷新失败）'
     return base
   }
+
+  // 计费域 401 自救（单 token 路径）：与池路径同理——getOauthAccessToken 只在
+  // 「expires_at 已过/临近」时刷新，看不到"会话被上游吊销但 token 未过期"的形态。
+  // 这里用 oauth.refreshOauthToken 做按需刷新，并在成功后就地换成新 token。
+  const auth = createAuthRecovery(token, async () => {
+    if (!provider.oauth) return null
+    try {
+      const ok = await refreshOauthToken(env, provider.id, provider.oauth)
+      if (!ok) return null
+      const fresh = await readOauthToken(env, provider.id)
+      return fresh?.access_token || null
+    } catch {
+      return null
+    }
+  })
+  token = auth.token()
 
   // 从 JWT 解出 uid / enterpriseId / nickname（额度接口与面板展示用）
   const claims = decodeWorkbuddyClaims(token)
@@ -1075,8 +1168,9 @@ export async function checkinOneAccount(
   }
   base.realm = 'cn'
 
-  // 状态探测
-  const status = await fetchCheckinStatus(token, 'cn')
+  // 状态探测（带鉴权自救：同域端点，会话失效时一起 401）
+  const status = await fetchCheckinStatus(token, 'cn', auth)
+  token = auth.token()
   if (status) {
     base.todayCheckedIn = status.todayCheckedIn
     base.streakDays = status.streakDays
@@ -1092,7 +1186,7 @@ export async function checkinOneAccount(
 
   // 执行签到
   if (!base.todayCheckedIn) {
-    const res = await performCheckin(token, 'cn', env)
+    const res = await performCheckin(token, 'cn', env, { onAuthRejected: auth.onAuthRejected })
     base.success = res.success
     base.message = res.message
     base.reason = res.success ? (res.already ? 'already' : 'ok') : 'fail'
@@ -1101,6 +1195,7 @@ export async function checkinOneAccount(
     if (res.success && !res.already && res.reward && typeof (res.reward as any).credit === 'number') {
       base.checkinCredit = (res.reward as any).credit
     }
+    token = auth.token()
   }
 
   // 生态增值与自动化任务（P2）：活跃上报 + streak 回读 + 猫猫旅行
@@ -1152,7 +1247,7 @@ export async function checkinOneAccount(
   }
 
   // 额度信息（可用/已用/额度池/包数 + 套餐类型）
-  await fillCredits(env, base, token, 'cn', uid, enterpriseId, provider.oauth?.deviceToken)
+  await fillCredits(env, base, token, 'cn', uid, enterpriseId, provider.oauth?.deviceToken, auth)
 
   await writeCheckinResult(env, provider.id, base)
   return base
