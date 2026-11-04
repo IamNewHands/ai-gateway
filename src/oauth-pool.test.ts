@@ -26,6 +26,7 @@ import {
 } from './oauth-pool'
 import type { Env, OAuthTokenState } from './types'
 import { OAUTH_POOL_KV_PREFIX } from './oauth'
+import { formatRemaining } from './remaining'
 
 const PROVIDER = 'wb-prefer-test'
 const poolKey = (p: string) => OAUTH_POOL_KV_PREFIX + p
@@ -284,9 +285,12 @@ describe('池状态透出的剩余冷却时长（面板「冷却至 …（剩 8m
     const hot = rows.find((r) => r.uid === 'hot')!
 
     expect(cold.cooling).toBe(true)
-    // 时长文案由服务端算（客户端只画）：8 分钟 → '8m'
-    expect(cold.remainingText).toBe('8m')
-    expect(cold.remainingMs).toBeGreaterThan(7 * 60000)
+    // 时长文案由服务端按剩余毫秒算（客户端只画）。断言「文案与 remainingMs 同源」而不是写死
+    // '8m'：从取 now 到读池之间会走掉几毫秒，formatRemaining 是 floor，7m59.9s 会落到 '7m'。
+    const remainingMs = Number(cold.remainingMs)
+    expect(remainingMs).toBeGreaterThan(7 * 60000)
+    expect(remainingMs).toBeLessThanOrEqual(8 * 60000)
+    expect(cold.remainingText).toBe(formatRemaining(remainingMs))
 
     // 已到期：不冷却、剩余归零、无剩余文案（面板据此写「无冷却（上次：…）」，绝不显示负数）
     expect(hot.cooling).toBe(false)

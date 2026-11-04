@@ -479,3 +479,123 @@ describe('handleAdminOverview：到期明细的数据时点（快照值不能装
     expect(d.expiring.channels[0].dataAt).toBeNull()
   })
 })
+
+/**
+ * 数据源一致性：顶部「7 天内到期积分」必须与面板账号行徽章 / 挑号看同一份数据。
+ *
+ * 回归的真实缺陷：概览只读 `checkin:result:<id>`（整轮签到结束后一次性写入、TTL 2 天），
+ * 而徽章与挑号读账号池 `state.packages`（逐账号即时落盘）。于是「额度探测 401 导致快照里
+ * 没有 packages」或「快照过期」时，顶部缺 WorkBuddy 整行，而账号行徽章照常显示。
+ */
+describe('handleAdminOverview：到期明细与账号池同源（签到快照缺失/过期也不能丢行）', () => {
+  /** 浏览器登录流的 WorkBuddy = 池化 provider（isOAuthPoolProvider 要求 flowType=browser） */
+  function wbPoolProvider(id: string): Provider {
+    return { ...workbuddyProvider(id), oauth: { flowType: 'browser' } } as unknown as Provider
+  }
+
+  /** 池账号：state.packages 就是挑号与徽章读的那一份 */
+  function poolAcc(uid: string, packages?: unknown[], packagesAt?: number, extra: Record<string, unknown> = {}) {
+    return {
+      uid,
+      token: { access_token: 'tok', refresh_token: 'ref', expires_at: Date.now() + 3600_000 },
+      enabled: true,
+      state: {
+        credits: 100, disabled: false, until: 0, errCount: 0,
+        ...(packages ? { packages, packagesAt } : {}),
+      },
+      updatedAt: Date.now(),
+      ...extra,
+    }
+  }
+
+  it('签到快照里没有 packages（额度探测失败）→ 仍按池状态列出 WorkBuddy 行', async () => {
+    const packagesAt = Date.now() - 30 * 60 * 1000
+    const env = makeEnv({
+      // 快照只有额度、没有权益包明细：fillCredits 抛错时正是这个形态
+      'checkin:result:wb_src1': JSON.stringify({
+        providerId: 'wb_src1', name: 'wb_src1', realm: 'cn', success: true, reason: 'ok',
+        message: '', todayCheckedIn: true, updatedAt: Date.now(),
+        accounts: [acc('u1', 'ok', true, 500, 900)],
+      }),
+      'oauth:pool:wb_src1': JSON.stringify([poolAcc('u1', [pkg(2, 200, 100)], packagesAt)]),
+    })
+    getProvidersMock.mockResolvedValue([wbPoolProvider('wb_src1')])
+
+    const d = await overview(env)
+    expect(d.expiring.channels).toHaveLength(1)
+    expect(d.expiring.channels[0].key).toBe('workbuddy')
+    expect(d.expiring.channels[0].amount).toBe(100)
+    // 时点取池里的探测时刻（快照 updatedAt 是签到时刻，不是这份明细的探测时刻）
+    expect(d.expiring.channels[0].dataAt).toBe(packagesAt)
+    // KPI 额度口径不变（仍取签到快照）
+    expect(d.workbuddy.remain).toBe(500)
+  })
+
+  it('签到快照整份过期（KV 无该 key）→ 池里的到期包仍在明细里', async () => {
+    const packagesAt = Date.now() - 2 * 60 * 60 * 1000
+    const env = makeEnv({
+      'oauth:pool:wb_src2': JSON.stringify([poolAcc('u1', [pkg(3, 300, 100)], packagesAt)]),
+    })
+    getProvidersMock.mockResolvedValue([wbPoolProvider('wb_src2')])
+
+    const d = await overview(env)
+    expect(d.expiring.total).toBe(200)
+    expect(d.expiring.channels[0].key).toBe('workbuddy')
+    expect(d.expiring.channels[0].dataAt).toBe(packagesAt)
+    // 没有签到快照 → 签到进度按 0 计（本用例只锁明细不丢行，不改 KPI 口径）
+    expect(d.checkin.totalAccounts).toBe(0)
+  })
+
+  it('池与快照都有同一账号的同一个包 → 只计一次，不翻倍', async () => {
+    const packagesAt = Date.now() - 10 * 60 * 1000
+    const one = pkg(5, 100, 0)
+    const env = makeEnv({
+      'checkin:result:wb_src3': JSON.stringify({
+        providerId: 'wb_src3', name: 'wb_src3', realm: 'cn', success: true, reason: 'ok',
+        message: '', todayCheckedIn: true, updatedAt: Date.now(),
+        accounts: [{ ...acc('u1', 'ok', true, 100, 100), packages: [one] }],
+      }),
+      'oauth:pool:wb_src3': JSON.stringify([poolAcc('u1', [one], packagesAt)]),
+    })
+    getProvidersMock.mockResolvedValue([wbPoolProvider('wb_src3')])
+
+    const d = await overview(env)
+    expect(d.expiring.channels[0].amount).toBe(100)
+    expect(d.expiring.channels[0].packs).toBe(1)
+  })
+
+  it('池里的账号按签到快照的 realm 分桶：国际版仍归「WorkBuddy 国际版」行', async () => {
+    const packagesAt = Date.now() - 15 * 60 * 1000
+    const env = makeEnv({
+      'checkin:result:wb_src4': JSON.stringify({
+        providerId: 'wb_src4', name: 'wb_src4', realm: 'cn', success: true, reason: 'ok',
+        message: '', todayCheckedIn: false, updatedAt: Date.now(),
+        accounts: [acc('u_g', 'skipped_global', false, 80, 300)],
+      }),
+      'oauth:pool:wb_src4': JSON.stringify([poolAcc('u_g', [pkg(1, 200, 120)], packagesAt)]),
+    })
+    getProvidersMock.mockResolvedValue([wbPoolProvider('wb_src4')])
+
+    const d = await overview(env)
+    expect(d.expiring.channels.map((c) => c.key)).toEqual(['workbuddy-global'])
+    expect(d.expiring.channels[0].amount).toBe(80)
+  })
+
+  it('QoderWork 同样回退池状态（qoder:pool 的 packages）', async () => {
+    const packagesAt = Date.now() - 20 * 60 * 1000
+    const env = makeEnv({
+      'checkin:result:q_src5': JSON.stringify({
+        providerId: 'q_src5', name: 'q_src5', realm: 'cn', success: true, reason: 'ok',
+        message: '', todayCheckedIn: true, updatedAt: Date.now(),
+        accounts: [acc('q1', 'ok', true, 60, 160)],
+      }),
+      'qoder:pool:q_src5': JSON.stringify([poolAcc('q1', [pkg(4, 60, 0)], packagesAt)]),
+    })
+    getProvidersMock.mockResolvedValue([qoderProvider('q_src5')])
+
+    const d = await overview(env)
+    expect(d.expiring.channels.map((c) => c.key)).toEqual(['qoder'])
+    expect(d.expiring.channels[0].amount).toBe(60)
+    expect(d.expiring.channels[0].dataAt).toBe(packagesAt)
+  })
+})

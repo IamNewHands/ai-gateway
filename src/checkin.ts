@@ -1428,6 +1428,52 @@ function summarizeBucket(bucket: ExpiringBucket, now: number): { summary: Expiri
   return { summary, at: summary.amount > 0 ? bucket.at : null }
 }
 
+/** 账号池里一个账号的权益包快照（与挑号、面板徽章同一份数据）。 */
+interface PoolPackageSnapshot {
+  /** 权益包明细；字段缺省 = 该账号从未探测过 */
+  packages?: PackageInfo[]
+  /** 这份明细的探测时刻 epoch ms（未探测过 → 池账号的 updatedAt） */
+  at?: number
+  /** 账号所属域：池状态自带时用它（Qoder 池有 realm 字段），缺省回退签到快照的判定 */
+  realm?: 'cn' | 'global'
+}
+
+/**
+ * 读某 provider 账号池里每个账号的权益包快照（uid → packages + 探测时刻）。
+ *
+ * 为什么概览要单独读池：概览卡原先只吃 `checkin:result:<id>`，而那份 KV 是**整轮签到
+ * 结束后一次性写入**、TTL 2 天。于是出现「面板账号行有 ⏳7 天内到期 徽章、顶部卡片却
+ * 没有 WorkBuddy 这一行」——同一个数字两处口径不一致（徽章读池，卡片读快照）。
+ * 池状态由签到/刷新账号池逐账号即时落盘，更耐久，也与 TRAE 行的数据源对齐。
+ *
+ * 非池化 provider / 池读失败 → 返回空表，调用方全部回退签到快照（行为与改动前一致）。
+ */
+async function readPoolPackages(env: Env, p: Provider): Promise<Map<string, PoolPackageSnapshot>> {
+  const out = new Map<string, PoolPackageSnapshot>()
+  try {
+    if (isOAuthPoolProvider(p)) {
+      for (const acc of await readOauthPool(env, p.id)) {
+        if (!acc || !acc.uid) continue
+        out.set(acc.uid, {
+          packages: acc.state?.packages,
+          at: acc.state?.packagesAt ?? acc.updatedAt,
+        })
+      }
+    } else if (isQoderFlow(p)) {
+      for (const acc of await readQoderPool(env, p.id)) {
+        if (!acc || !acc.uid) continue
+        out.set(acc.uid, {
+          packages: acc.state?.packages,
+          at: acc.state?.packagesAt ?? acc.updatedAt,
+          // Qoder 池自带 realm（决定推理域与模型端点），比签到快照里的推断更权威
+          realm: acc.realm,
+        })
+      }
+    }
+  } catch { /* 池读失败 → 全走签到快照 */ }
+  return out
+}
+
 /** 一个签到产品族（WorkBuddy / QoderWork）的额度与签到进度快照。 */
 interface CheckinFamilyQuota {
   /** 账号总数（含国际版 / 无 token 等 skip 账号）：额度卡据此判断该族有没有数据 */
@@ -1460,7 +1506,7 @@ interface CheckinFamilyQuota {
  * 顺带把各账号 `packages`（上次签到/额度探测落盘的权益包明细）汇成「7 天内到期」汇总，
  * 供概览明细卡按渠道列出待作废积分——挑号用的是同一份 `isExpiringCredit` 口径。
  * 到期条目按账号 `realm` 分桶（国内 / 国际版），因为那是两个互不相干的积分池；
- * 数据时点取账号级 `updatedAt`（签到结果落盘时刻 = 额度明细的探测时刻）。
+ * 数据时点取**这份明细的探测时刻**（池 `packagesAt`，回退签到结果 `updatedAt`）。
  */
 async function aggregateCheckinFamily(env: Env, familyProviders: readonly Provider[], now: number): Promise<CheckinFamilyQuota> {
   const out: CheckinFamilyQuota = {
@@ -1470,8 +1516,11 @@ async function aggregateCheckinFamily(env: Env, familyProviders: readonly Provid
   }
   for (const p of familyProviders) {
     const r = await readCheckinResult(env, p.id)
-    if (!r) continue
-    const accounts = r.accounts && r.accounts.length > 0 ? r.accounts : [r]
+    const accounts: CheckinResult[] = r
+      ? (r.accounts && r.accounts.length > 0 ? r.accounts : [r])
+      : []
+    // 签到进度 / 额度合计仍以签到快照为口径（未签到的账号不进分母，语义不变）
+    const realmByUid = new Map<string, CheckinResult['realm']>()
     for (const a of accounts) {
       out.accounts++
       if (!isCheckinSkipped(a)) {
@@ -1480,7 +1529,25 @@ async function aggregateCheckinFamily(env: Env, familyProviders: readonly Provid
       }
       if (typeof a.totalRemain === 'number') out.remain += a.totalRemain
       if (typeof a.totalSize === 'number') out.size += a.totalSize
+      if (a.uid) realmByUid.set(a.uid, a.realm)
+    }
+    // 到期明细优先读**账号池**（与挑号、面板账号行徽章同一份数据），签到快照只作回退：
+    // 签到快照是整轮跑完后一次性写入、TTL 2 天，任一轮在写 KV 前失败（额度接口 401 /
+    // Worker 时限）或快照过期，该账号在快照里就没有 packages → 顶部整行消失，
+    // 而面板徽章照常（它读池）。池状态由 syncPoolCredits / refreshOauthPoolAccount
+    // 逐账号即时落盘，不受那条 TTL 与整轮原子性影响。
+    const inPool = new Set<string>()
+    for (const [uid, snap] of await readPoolPackages(env, p)) {
+      const pkgs = Array.isArray(snap.packages) ? snap.packages : []
+      if (pkgs.length === 0) continue // 池里没探测过这个账号 → 交给签到快照
       // realm 为 unknown 的一律并入国内桶：只有显式 global 才说明是海外域账号
+      const global = snap.realm === 'global' || realmByUid.get(uid) === 'global'
+      const bucket = global ? out.expiringGlobal : out.expiringCn
+      for (const pkg of pkgs) pushExpiring(bucket, packageExpiryEntry(pkg), snap.at, now)
+      inPool.add(uid)
+    }
+    for (const a of accounts) {
+      if (a.uid && inPool.has(a.uid)) continue // 同一账号只计一次，避免池 + 快照翻倍
       const bucket = a.realm === 'global' ? out.expiringGlobal : out.expiringCn
       for (const pkg of a.packages || []) pushExpiring(bucket, packageExpiryEntry(pkg), a.updatedAt, now)
     }
@@ -1517,9 +1584,11 @@ export interface ExpiringChannel {
  * QoderWork 账号的额度也算进去（标签与数字不符，且用户无法对账）。
  *
  * `expiring` 是「7 天内到期积分」明细（每个独立积分池一行：产品族 × 域，TRAE 按 SOLO/Work
- * 双通道拆），数据源与挑号优先级判定同源：WorkBuddy/QoderWork 取签到快照的 `packages`
- * （CST 墙钟到期），TRAE 取账号池 `packs`（Unix 秒到期）。两者都由「上次签到/积分探测」
- * 写入，因此是**快照时点**的值而不是此刻实时值——每行附 `dataAt`（最旧一次探测的时刻），
+ * 双通道拆），数据源与挑号优先级判定同源：WorkBuddy/QoderWork 取**账号池** `state.packages`
+ * （CST 墙钟到期；池里没探测过该账号才回退签到快照 `checkin:result` 的同名字段，避免
+ * 「签到快照过期 2 天后顶部整行消失、而账号行徽章照常」这种两处口径不一致），
+ * TRAE 取账号池 `packs`（Unix 秒到期）。全部由「上次签到/积分探测」写入，因此是
+ * **快照时点**的值而不是此刻实时值——每行附 `dataAt`（最旧一次探测的时刻），
  * 面板据此标出「数据 N 小时前」，否则快照值会被当成实时值读。
  */
 export async function handleAdminOverview(c: Context<{ Bindings: Env }>) {
