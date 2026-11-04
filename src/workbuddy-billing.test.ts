@@ -1678,9 +1678,10 @@ describe('盲盒 blindbox（移植 WorkBuddy-Daily t_blindbox）', () => {
 /**
  * 权益包到期时间字段（2026-11-04 修）：旧实现只读 `ExpiredTime`，而上游多数包根本不下发
  * 该字段 → 面板每个包都显示「长期」，顶部「7 天内到期积分」对 WorkBuddy 恒空。
- * 口径对齐 workbuddy2api-hub 的实测结论（`deduction_end_text` + EXPIRY_SENTINEL_DAYS）。
+ * 用户线上面板实测：到期列全「长期」，而「周期结束」列有 2026-11-04 22:06:03 这类实时值
+ * → 三字段取最早，远于 730 天的（上游「永久」哨兵）丢弃。
  */
-describe('packageExpireAt：到期时间字段优先级（DeductionEndTime → CycleEndTime → ExpiredTime）', () => {
+describe('packageExpireAt：三字段取最早到期（DeductionEndTime / CycleEndTime / ExpiredTime）', () => {
   /** CST 2026-11-09 23:59:59 的 epoch ms */
   const endMs = Date.UTC(2026, 10, 9, 23, 59, 59) - 8 * 3600_000
   const now = Date.UTC(2026, 10, 4, 2, 0, 0) // 2026-11-04 10:00 CST
@@ -1707,6 +1708,22 @@ describe('packageExpireAt：到期时间字段优先级（DeductionEndTime → C
 
   it('两者都没有时回退 ExpiredTime（少数老包）', () => {
     expect(packageExpireAt({ ExpiredTime: '2026-11-06 23:59:59' }, now)).toBe('2026-11-06 23:59:59')
+  })
+
+  it('用户线上的真实形态：DeductionEndTime 是远期哨兵、CycleEndTime 才是本周期结束 → 用 CycleEndTime', () => {
+    // 裂变包按周期续发：包本身远期有效，但这批 9 分到 2026-11-04 22:06:03 就作废
+    const pkg = { DeductionEndTime: Date.UTC(2035, 0, 1), CycleEndTime: '2026-11-04 22:06:03' }
+    expect(packageExpireAt(pkg, now)).toBe('2026-11-04 22:06:03')
+  })
+
+  it('多个候选都有效时取最早（最早失效的那批分才是挑号依据）', () => {
+    const ded = Date.UTC(2026, 10, 7, 23, 59, 59) - 8 * 3600_000 // 11-07 23:59:59
+    expect(packageExpireAt({ DeductionEndTime: ded, CycleEndTime: '2026-11-05 10:05:53' }, now)).toBe('2026-11-05 10:05:53')
+    expect(packageExpireAt({ DeductionEndTime: ded, CycleEndTime: '2026-11-09 10:00:00' }, now)).toBe('2026-11-07 23:59:59')
+  })
+
+  it('时间串解析不了时原样透传（前端有 Date.parse 兜底），但不会把它当成「长期」', () => {
+    expect(packageExpireAt({ CycleEndTime: '2026/11/09' }, now)).toBe('2026/11/09')
   })
 
   it('全缺 / 0 / 空串 → 空串（长期）', () => {

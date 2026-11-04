@@ -9,7 +9,7 @@
  *   统一 POST，Authorization: Bearer <access_token>，信封 { code, msg, data }，code=0 成功。
  */
 import type { Env, PackageInfo } from './types'
-import { formatCstWallClock } from './credit-expiry'
+import { formatCstWallClock, parseCstWallClock } from './credit-expiry'
 
 export const CHECKIN_BASE_CN = 'https://www.codebuddy.cn'
 
@@ -526,25 +526,38 @@ function deductionEndMs(acc: any): number | null {
 /**
  * 权益包的到期时间（落成 PackageInfo.expireAt 的 CST 墙钟串；'' = 长期有效）。
  *
- * 为什么不是只读 `ExpiredTime`（旧实现，2026-11-04 修）：上游**多数包根本不下发**
- * `ExpiredTime`，于是每个包在面板上都显示「长期」、到期明细恒空。对齐 workbuddy2api-hub
- * 的实测口径（`deduction_end_text` + `EXPIRY_SENTINEL_DAYS`）：
- *   1) 到期真正字段是 `DeductionEndTime`（积分到这个点就不能再抵扣 = 作废时刻）；
- *   2) 缺失时回退 `CycleEndTime`（CST 墙钟）——裂变包 / Bonus Pack / 体验版与
- *      DeductionEndTime 一致；免费包这类只差周期边界，故只能当回退，不能当唯一判据；
- *   3) 再回退 `ExpiredTime`（少数老包才下发）；
- *   4) DeductionEndTime 落在 730 天之外 = 上游的「永久」哨兵 → 空串（显示「长期」）。
+ * 旧实现只读 `ExpiredTime`（2026-11-04 修）：上游**多数包根本不下发**该字段，
+ * 于是面板「到期时间」列全是「长期」、7 天窗口恒空、概览卡整行消失。
+ *
+ * 现行口径：三个字段都当候选，取**最早**的那个——积分到这个点就不能再抵扣，
+ * 「最早失效的那批分」才是挑号与倒计时该看的（与「到期优先消耗」的语义一致）：
+ *   1) `DeductionEndTime`：上游的抵扣截止时刻（epoch 毫秒，少数给秒）；
+ *   2) `CycleEndTime`：本计费周期的结束时刻（CST 墙钟）。裂变包/赠送包按周期续发，
+ *      它才是「这批分什么时候作废」的真实答案（用户实测：到期列全「长期」，
+ *      而周期结束列有 2026-11-04 22:06:03 这类实时值）；
+ *   3) `ExpiredTime`：少数老包才下发。
+ * 远于 730 天的候选一律丢弃（上游用 2034/2035 这种时间表示「不会过期」，
+ * 见 EXPIRY_SENTINEL_DAYS）；全被丢弃 → 空串 = 长期，不参与到期倒计时。
  */
 export function packageExpireAt(acc: any, now: number = Date.now()): string {
+  const sentinel = EXPIRY_SENTINEL_DAYS * 24 * 60 * 60 * 1000
+  const cands: number[] = []
   const ded = deductionEndMs(acc)
-  if (ded !== null) {
-    if (ded - now > EXPIRY_SENTINEL_DAYS * 24 * 60 * 60 * 1000) return ''
-    return formatCstWallClock(ded)
+  if (ded !== null) cands.push(ded)
+  const rawStrings: string[] = []
+  for (const raw of [acc?.CycleEndTime, acc?.ExpiredTime]) {
+    if (typeof raw !== 'string') continue
+    const text = raw.trim()
+    if (!text) continue
+    const ms = parseCstWallClock(text)
+    if (ms !== null) cands.push(ms)
+    else rawStrings.push(text)
   }
-  const cycle = typeof acc?.CycleEndTime === 'string' ? acc.CycleEndTime.trim() : ''
-  if (cycle) return cycle
-  const exp = typeof acc?.ExpiredTime === 'string' ? acc.ExpiredTime.trim() : ''
-  return exp
+  const live = cands.filter((ms) => ms - now <= sentinel)
+  if (live.length > 0) return formatCstWallClock(Math.min(...live))
+  // 一个都解析不出（上游换了时间格式）时保留原样透传：前端 wbParseCstWallClock 有 Date.parse 兜底
+  if (cands.length === 0 && rawStrings.length > 0) return rawStrings[0]
+  return ''
 }
 
 /**
