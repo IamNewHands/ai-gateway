@@ -46,7 +46,10 @@ import {
   makeupWorkbuddyYesterday,
   TRANSIENT_RETRY_MAX,
   __setTransientRetryDelayForTests,
+  packageExpireAt,
+  EXPIRY_SENTINEL_DAYS,
 } from './workbuddy-billing'
+import { parseCstWallClock } from './credit-expiry'
 
 describe('夜猫子任务 black_cat（移植 task_runner.py black_cat 分支）', () => {
   /** 构造某 CST 时刻的 epoch ms。 */
@@ -1669,5 +1672,78 @@ describe('盲盒 blindbox（移植 WorkBuddy-Daily t_blindbox）', () => {
 
     await runWorkbuddyBlindBox('tok', 'global')
     expect(calls.every((u) => u.includes('www.workbuddy.ai'))).toBe(true)
+  })
+})
+
+/**
+ * 权益包到期时间字段（2026-11-04 修）：旧实现只读 `ExpiredTime`，而上游多数包根本不下发
+ * 该字段 → 面板每个包都显示「长期」，顶部「7 天内到期积分」对 WorkBuddy 恒空。
+ * 口径对齐 workbuddy2api-hub 的实测结论（`deduction_end_text` + EXPIRY_SENTINEL_DAYS）。
+ */
+describe('packageExpireAt：到期时间字段优先级（DeductionEndTime → CycleEndTime → ExpiredTime）', () => {
+  /** CST 2026-11-09 23:59:59 的 epoch ms */
+  const endMs = Date.UTC(2026, 10, 9, 23, 59, 59) - 8 * 3600_000
+  const now = Date.UTC(2026, 10, 4, 2, 0, 0) // 2026-11-04 10:00 CST
+
+  it('优先 DeductionEndTime（毫秒）→ 落成 CST 墙钟串，且能被 parseCstWallClock 原样还原', () => {
+    const s = packageExpireAt({ DeductionEndTime: endMs }, now)
+    expect(s).toBe('2026-11-09 23:59:59')
+    expect(parseCstWallClock(s)).toBe(endMs)
+  })
+
+  it('DeductionEndTime 给秒（<1e11）也能识别', () => {
+    expect(packageExpireAt({ DeductionEndTime: Math.floor(endMs / 1000) }, now)).toBe('2026-11-09 23:59:59')
+  })
+
+  it('DeductionEndTime 落在 730 天之外 = 上游「永久」哨兵 → 空串（长期），不误标临期', () => {
+    const sentinel = Date.UTC(2035, 0, 1)
+    expect(sentinel - now).toBeGreaterThan(EXPIRY_SENTINEL_DAYS * 86400_000)
+    expect(packageExpireAt({ DeductionEndTime: sentinel }, now)).toBe('')
+  })
+
+  it('没有 DeductionEndTime 时回退 CycleEndTime（裂变包/体验版实测与之一致）', () => {
+    expect(packageExpireAt({ CycleEndTime: '2026-11-05 10:05:53' }, now)).toBe('2026-11-05 10:05:53')
+  })
+
+  it('两者都没有时回退 ExpiredTime（少数老包）', () => {
+    expect(packageExpireAt({ ExpiredTime: '2026-11-06 23:59:59' }, now)).toBe('2026-11-06 23:59:59')
+  })
+
+  it('全缺 / 0 / 空串 → 空串（长期）', () => {
+    expect(packageExpireAt({}, now)).toBe('')
+    expect(packageExpireAt({ DeductionEndTime: 0, CycleEndTime: '', ExpiredTime: '' }, now)).toBe('')
+  })
+})
+
+describe('fetchWorkbuddyCredits：包明细带上真实到期时间（回归「每个包都显示长期」）', () => {
+  const originalFetch = globalThis.fetch
+  afterEach(() => { globalThis.fetch = originalFetch })
+
+  it('DeductionEndTime / CycleEndTime 都写进 packages[].expireAt，长期包保持空串', async () => {
+    const endMs = Date.UTC(2026, 10, 6, 23, 59, 59) - 8 * 3600_000 // CST 2026-11-06 23:59:59
+    globalThis.fetch = vi.fn(async () => new Response(JSON.stringify({
+      code: 0, msg: 'ok',
+      data: {
+        Response: {
+          Data: {
+            TotalDosage: 0,
+            Accounts: [
+              { PackageName: '裂变包', DeductionEndTime: endMs, CycleCapacitySize: 100, CycleCapacityRemain: 80, CycleCapacityUsed: 20 },
+              { PackageName: '只有周期', CycleEndTime: '2026-11-05 10:05:53', CycleCapacitySize: 9, CycleCapacityRemain: 9, CycleCapacityUsed: 0 },
+              { PackageName: '永久包', DeductionEndTime: Date.UTC(2035, 0, 1), CycleCapacitySize: 50, CycleCapacityRemain: 50, CycleCapacityUsed: 0 },
+            ],
+          },
+        },
+      },
+    }), { status: 200, headers: { 'Content-Type': 'application/json' } })) as unknown as typeof fetch
+
+    const d = await fetchWorkbuddyCredits('tok', 'cn', 'u1', 'e1')
+    const byName = new Map(d.packages.map((p) => [p.name, p]))
+    expect(byName.get('裂变包')!.expireAt).toBe('2026-11-06 23:59:59')
+    expect(byName.get('只有周期')!.expireAt).toBe('2026-11-05 10:05:53')
+    expect(byName.get('永久包')!.expireAt).toBe('')
+    // 额度聚合口径不受影响
+    expect(d.totalRemain).toBe(139)
+    expect(d.packCount).toBe(3)
   })
 })

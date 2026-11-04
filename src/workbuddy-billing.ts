@@ -9,6 +9,7 @@
  *   统一 POST，Authorization: Bearer <access_token>，信封 { code, msg, data }，code=0 成功。
  */
 import type { Env, PackageInfo } from './types'
+import { formatCstWallClock } from './credit-expiry'
 
 export const CHECKIN_BASE_CN = 'https://www.codebuddy.cn'
 
@@ -506,6 +507,47 @@ function fmtLocalTime(d: Date): string {
 }
 
 /**
+ * 「不会过期」哨兵：上游用远超任何真实计费周期的抵扣截止时间表示永久有效。
+ * 实测（workbuddy2api-hub，31 行真实包数据）：Free Plan / 个人体验版落在 2034、2035 年，
+ * 而真实包周期是 14 天或 1 个月。超过这个天数就按「长期」处理，不参与到期倒计时。
+ */
+export const EXPIRY_SENTINEL_DAYS = 730
+
+/** 包的「抵扣截止时间」：上游给 epoch 毫秒（少数给秒）；缺失/0 → null。 */
+function deductionEndMs(acc: any): number | null {
+  const raw = acc?.DeductionEndTime
+  if (raw === undefined || raw === null || raw === '' || raw === 0 || raw === '0') return null
+  let n = Number(raw)
+  if (!Number.isFinite(n) || n <= 0) return null
+  if (n < 1e11) n *= 1000 // 上游多数给毫秒，少数给秒
+  return n
+}
+
+/**
+ * 权益包的到期时间（落成 PackageInfo.expireAt 的 CST 墙钟串；'' = 长期有效）。
+ *
+ * 为什么不是只读 `ExpiredTime`（旧实现，2026-11-04 修）：上游**多数包根本不下发**
+ * `ExpiredTime`，于是每个包在面板上都显示「长期」、到期明细恒空。对齐 workbuddy2api-hub
+ * 的实测口径（`deduction_end_text` + `EXPIRY_SENTINEL_DAYS`）：
+ *   1) 到期真正字段是 `DeductionEndTime`（积分到这个点就不能再抵扣 = 作废时刻）；
+ *   2) 缺失时回退 `CycleEndTime`（CST 墙钟）——裂变包 / Bonus Pack / 体验版与
+ *      DeductionEndTime 一致；免费包这类只差周期边界，故只能当回退，不能当唯一判据；
+ *   3) 再回退 `ExpiredTime`（少数老包才下发）；
+ *   4) DeductionEndTime 落在 730 天之外 = 上游的「永久」哨兵 → 空串（显示「长期」）。
+ */
+export function packageExpireAt(acc: any, now: number = Date.now()): string {
+  const ded = deductionEndMs(acc)
+  if (ded !== null) {
+    if (ded - now > EXPIRY_SENTINEL_DAYS * 24 * 60 * 60 * 1000) return ''
+    return formatCstWallClock(ded)
+  }
+  const cycle = typeof acc?.CycleEndTime === 'string' ? acc.CycleEndTime.trim() : ''
+  if (cycle) return cycle
+  const exp = typeof acc?.ExpiredTime === 'string' ? acc.ExpiredTime.trim() : ''
+  return exp
+}
+
+/**
  * 单个资源包的 remain/used/size 计算（移植自 CPA packageRemainUsed）。
  * 优先 Cycle 字段，回退 Capacity 字段；used = size − remain，避免漏报消耗。
  */
@@ -600,7 +642,7 @@ export async function fetchWorkbuddyCredits(
     totalRemain += remain
     totalUsed += used
     totalSize += size
-    // 收集每个权益包的名称 + 到期时间（ExpiredTime 空串 = 未设置过期时间/长期）
+    // 收集每个权益包的名称 + 到期时间（对齐 hub：DeductionEndTime → CycleEndTime → ExpiredTime）
     if (a && typeof a === 'object') {
       const name = typeof a.PackageName === 'string' ? a.PackageName : ''
       if (name) {
@@ -615,7 +657,7 @@ export async function fetchWorkbuddyCredits(
         }
         packages.push({
           name,
-          expireAt: typeof a.ExpiredTime === 'string' ? a.ExpiredTime : '',
+          expireAt: packageExpireAt(a, now.getTime()),
           cycleEndTime: typeof a.CycleEndTime === 'string' ? a.CycleEndTime : undefined,
           used: pkgUsed,
           size: pkgSize,
