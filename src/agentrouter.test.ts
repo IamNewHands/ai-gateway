@@ -172,6 +172,7 @@ describe('AgentRouter check-in evidence and HTTP boundaries', () => {
     for (const call of calls.slice(1)) {
       const headers = new Headers(call.init.headers)
       expect(headers.get('New-API-User')).toBe('42')
+      expect(headers.get('Cache-Control')).toBe('no-store')
       expect(headers.get('Cookie')).toContain('session=test-session-secret')
       expect(call.init.redirect).toBe('manual')
     }
@@ -310,16 +311,93 @@ describe('AgentRouter check-in evidence and HTTP boundaries', () => {
     expect(cancel).toHaveBeenCalledTimes(2)
   })
 
-  it('keeps verified success and login quota when the optional quota read fails', async () => {
+  it.each([
+    { name: 'empty self data', response: () => Response.json({ success: true, data: {} }) },
+    { name: 'usage without balance', response: () => Response.json({ success: true, data: { used_quota: 250_000, total_quota: 500_000 } }) },
+    { name: 'negative balance', response: () => Response.json({ success: true, data: { quota: -1, used_quota: 250_000 } }) },
+    { name: 'non-numeric balance', response: () => Response.json({ success: true, data: { quota: 'invalid' } }) },
+    { name: 'null balance', response: () => Response.json({ success: true, data: { quota: null } }) },
+    { name: 'blank balance', response: () => Response.json({ success: true, data: { quota: ' ' } }) },
+    { name: 'false-success envelope', response: () => Response.json({ success: false, data: { quota: 500_000 } }) },
+    { name: 'self HTTP failure', response: () => new Response(null, { status: 403 }) },
+    { name: 'non-JSON self response', response: () => new Response('not JSON') },
+  ])('keeps confirmed check-in but never login quota after $name', async ({ response }) => {
+    const { env, store } = harness()
+    const id = await saveAgentRouterAccount(env, { email: EMAIL, password: PASSWORD })
+    upstream({
+      login: () => login({ quota: 0, used_quota: 250_000, total_quota: 500_000 }),
+      quota: response,
+    })
+    const summary = await runAgentRouterCheckins(env)
+    const expected = { quota: null, usedQuota: null, totalQuota: null, quotaAt: null, warningCode: 'QUOTA_UNAVAILABLE' }
+    expect(summary).toMatchObject({ ok: 1, fail: 0 })
+    expect(summary.results[0]).toMatchObject({ ...expected, status: 'ok', checkedInDate: '2026-10-22' })
+    expect(JSON.parse(store.get(KV_KEYS.AGENTROUTER_RESULT_PREFIX + id)!)).toMatchObject(expected)
+    expect((await readAgentRouterAccounts(env))[0]).toMatchObject({ checkedInToday: true, result: expected })
+  })
+
+  it.each([
+    { name: 'numeric zero', quota: 0, used_quota: 0, dollars: 0, used: 0 },
+    { name: 'string zero', quota: '0', used_quota: '250000', dollars: 0, used: 0.5 },
+    { name: 'positive string quota', quota: '1500000', used_quota: '500000', dollars: 3, used: 1 },
+  ])('uses only authoritative self quota for $name', async ({ quota, used_quota, dollars, used }) => {
     const { env } = harness()
     await saveAgentRouterAccount(env, { email: EMAIL, password: PASSWORD })
     upstream({
-      login: () => login({ quota: 500_000, used_quota: 250_000 }),
-      quota: () => Response.json({ success: true, data: {} }),
+      login: () => login({ quota: 9_500_000, used_quota: 1_000_000 }),
+      quota: () => Response.json({ success: true, data: { quota, used_quota } }),
     })
     const summary = await runAgentRouterCheckins(env)
-    expect(summary.ok).toBe(1)
-    expect(summary.results[0]).toMatchObject({ quota: 1, totalQuota: 1.5, warningCode: 'QUOTA_UNAVAILABLE' })
+    expect(summary.results[0]).toMatchObject({ quota: dollars, usedQuota: used, totalQuota: dollars + used, quotaAt: NOW, warningCode: null })
+    expect((await readAgentRouterAccounts(env))[0].result).toMatchObject({ quota: dollars, quotaAt: NOW, warningCode: null })
+  })
+
+  it.each([
+    { name: 'missing user id', data: { id: null }, errorCode: 'USER_ID_MISSING' },
+    { name: 'missing session', data: {}, errorCode: 'SESSION_MISSING' },
+  ])('does not expose login quota after $name', async ({ data, errorCode }) => {
+    const { env } = harness()
+    await saveAgentRouterAccount(env, { email: EMAIL, password: PASSWORD })
+    upstream({ login: () => {
+      const response = login({ quota: 500_000, ...data })
+      if (errorCode === 'SESSION_MISSING') response.headers.delete('Set-Cookie')
+      return response
+    } })
+    const summary = await runAgentRouterCheckins(env)
+    expect(summary.results[0]).toMatchObject({ errorCode, quota: null, usedQuota: null, totalQuota: null, quotaAt: null })
+  })
+
+  it.each([
+    { name: 'old quota warning', override: { warningCode: 'QUOTA_UNAVAILABLE' } },
+    { name: 'old failed result', override: { status: 'fail', errorCode: 'CHECKIN_FAILED' } },
+    { name: 'old missing identity', override: { status: 'unverified', errorCode: 'USER_ID_MISSING' } },
+    { name: 'old missing session', override: { status: 'unverified', errorCode: 'SESSION_MISSING' } },
+    { name: 'missing snapshot time', override: { quotaAt: null } },
+    { name: 'missing balance', override: { quota: null } },
+  ])('normalizes $name without rewriting stored evidence', async ({ override }) => {
+    const { env, store, writes } = harness()
+    const id = await saveAgentRouterAccount(env, { email: EMAIL, password: PASSWORD })
+    upstream()
+    const summary = await runAgentRouterCheckins(env)
+    const resultKey = KV_KEYS.AGENTROUTER_RESULT_PREFIX + id
+    const raw = JSON.stringify({ ...summary.results[0], quota: 0, usedQuota: 0.5, totalQuota: 0.5, quotaAt: NOW, ...override })
+    store.set(resultKey, raw)
+    const writesBeforeRead = writes.length
+    const view = (await readAgentRouterAccounts(env))[0]
+    expect(view).toMatchObject({ checkedInToday: true, result: { quota: null, usedQuota: null, totalQuota: null, quotaAt: null } })
+    const saved = JSON.parse(raw)
+    expect(view.result).toMatchObject({ status: saved.status, errorCode: saved.errorCode, warningCode: saved.warningCode })
+    expect(store.get(resultKey)).toBe(raw)
+    expect(writes).toHaveLength(writesBeforeRead)
+  })
+
+  it('can show valid self balance even when daily log verification fails', async () => {
+    const { env } = harness()
+    await saveAgentRouterAccount(env, { email: EMAIL, password: PASSWORD })
+    upstream({ logs: () => logResponse([]), quota: () => Response.json({ success: true, data: { quota: 0 } }) })
+    const summary = await runAgentRouterCheckins(env)
+    expect(summary.results[0]).toMatchObject({ status: 'unverified', errorCode: 'CHECKIN_NOT_CONFIRMED', quota: 0, quotaAt: NOW, warningCode: null })
+    expect((await readAgentRouterAccounts(env))[0]).toMatchObject({ checkedInToday: false, result: { quota: 0, quotaAt: NOW } })
   })
 
   it('isolates account failures and retains per-account results', async () => {

@@ -99,7 +99,7 @@ const agentRouterSectionHtml = (p: { id?: string }) => {
   return `<fieldset class="form-group agentrouter-block" data-agentrouter="${pid}"><legend>AgentRouter 每日签到</legend>` +
     `<div class="agentrouter-toolbar"><span class="mu">北京时间 10:05 / 22:05</span>` +
     `<div class="fc"><button type="button" class="btn btn-s btn-xs" data-ar-action="add"><i class="fas fa-plus" aria-hidden="true"></i>添加账号</button>` +
-    `<button type="button" class="icon-btn" data-ar-action="checkin-all" aria-label="全部签到" title="全部签到" disabled><i class="fas fa-calendar-check" aria-hidden="true"></i></button>` +
+    `<button type="button" class="btn btn-p btn-xs" data-ar-action="checkin-all" aria-label="全部手工签到" title="手工签到所有已启用账号并更新余额" disabled><i class="fas fa-calendar-check" aria-hidden="true"></i>全部手工签到</button>` +
     `<button type="button" class="icon-btn" data-ar-action="refresh" aria-label="刷新签到状态" title="刷新签到状态"><i class="fas fa-sync" aria-hidden="true"></i></button></div></div>` +
     `<div class="agentrouter-editor hd"><form class="agentrouter-form" autocomplete="off">` +
     `<div class="fg"><label for="ar-email-${pid}">绑定邮箱</label><input type="email" id="ar-email-${pid}" name="email" required maxlength="254" autocomplete="off"></div>` +

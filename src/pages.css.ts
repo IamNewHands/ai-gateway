@@ -584,6 +584,7 @@ button.bd:hover { filter: brightness(.96); }
 button.bd.is-allowed { box-shadow: inset 0 0 0 .125rem currentColor; font-weight: 700; }
 button.bd.is-excluded { opacity: .45; text-decoration: line-through; }
 .agentrouter-toolbar { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: var(--space-xs); }
+.agentrouter-toolbar > .fc { flex-wrap: wrap; }
 .agentrouter-toolbar > .mu, .agentrouter-state { font-size: var(--text-xs); }
 .agentrouter-state:empty { display: none; }
 .agentrouter-state { margin-block: var(--space-xs); overflow-wrap: anywhere; }
@@ -597,7 +598,7 @@ button.bd.is-excluded { opacity: .45; text-decoration: line-through; }
 .agentrouter-account strong { font-size: var(--text-sm); letter-spacing: 0; }
 .agentrouter-account span, .agentrouter-row small { color: var(--color-muted); }
 .agentrouter-outcome small { max-width: 25rem; overflow-wrap: anywhere; }
-.agentrouter-actions { grid-column: 1 / -1; display: flex; align-items: center; justify-content: flex-end; gap: var(--space-2xs); }
+.agentrouter-actions { grid-column: 1 / -1; display: flex; flex-wrap: wrap; align-items: center; justify-content: flex-end; gap: var(--space-2xs); }
 .agentrouter-empty { padding-block: var(--space-sm); font-size: var(--text-xs); }
 @media (min-width: 56rem) {
   .agentrouter-form { grid-template-columns: repeat(3, minmax(0, 1fr)); }

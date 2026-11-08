@@ -31,7 +31,7 @@ function agentRouterMessage(code) {
     SESSION_MISSING: '登录成功但未返回 Cookie，签到未确认',
     INVALID_LOGS: '无法读取签到日志，签到未确认',
     CHECKIN_NOT_CONFIRMED: '登录成功，但未找到今天的签到成功日志',
-    QUOTA_UNAVAILABLE: '余额读取失败',
+    QUOTA_UNAVAILABLE: '余额读取失败，显示未知；可点击手工签到重试',
     RESULT_STORAGE_FAILED: '签到结果保存失败，请刷新后重试'
   }
   if (messages[code]) return messages[code]
@@ -72,6 +72,10 @@ function agentRouterRender(block, accounts) {
   }
   list.innerHTML = accounts.map(function(account) {
     var result = account.result || {}
+    var hasQuota = result.warningCode !== 'QUOTA_UNAVAILABLE' && result.status !== 'fail' &&
+      result.status !== 'disabled' && result.errorCode !== 'USER_ID_MISSING' && result.errorCode !== 'SESSION_MISSING' &&
+      typeof result.quota === 'number' && Number.isFinite(result.quota) && result.quota >= 0 &&
+      typeof result.quotaAt === 'number' && Number.isFinite(result.quotaAt) && result.quotaAt >= 0
     var badge = agentRouterBadge(account)
     var note = !account.credentialsReady ? agentRouterMessage('CREDENTIALS_LOCKED') :
       result.errorCode ? agentRouterMessage(result.errorCode) :
@@ -84,10 +88,10 @@ function agentRouterRender(block, accounts) {
       '<small title="北京时间">' + escapeHtml(agentRouterTime(result.updatedAt)) + '</small></div>' +
       '<div class="agentrouter-outcome"><span class="bd ' + badge[0] + '">' + badge[1] + '</span>' +
       (note ? '<small>' + escapeHtml(note) + '</small>' : '') + '</div>' +
-      '<div class="agentrouter-quota"><b>' + agentRouterMoney(result.quota) + '</b><small>余额 USD</small>' +
-      '<small title="北京时间">数据 ' + escapeHtml(agentRouterTime(result.quotaAt)) + '</small></div>' +
+      '<div class="agentrouter-quota"><b>' + agentRouterMoney(hasQuota ? result.quota : null) + '</b><small>余额 USD</small>' +
+      '<small title="北京时间">' + (hasQuota ? '数据 ' + escapeHtml(agentRouterTime(result.quotaAt)) : '尚无有效余额数据') + '</small></div>' +
       '<div class="agentrouter-actions"><label class="tg" title="每日自动签到"><input type="checkbox" data-ar-toggle="' + id + '" aria-label="每日自动签到 ' + escapeHtml(account.email) + '"' + (account.enabled ? ' checked' : '') + '><span class="sl"></span></label>' +
-      '<button type="button" class="icon-btn" data-ar-action="checkin" data-ar-id="' + id + '" title="立即签到" aria-label="立即签到"' + (!account.enabled || !account.credentialsReady ? ' disabled' : '') + '><i class="fas fa-calendar-check" aria-hidden="true"></i></button>' +
+      '<button type="button" class="btn btn-p btn-xs" data-ar-action="checkin" data-ar-id="' + id + '" title="重新登录、核验今日签到并更新余额" aria-label="手工签到 ' + escapeHtml(account.email) + '"' + (!account.enabled || !account.credentialsReady ? ' disabled' : '') + '><i class="fas fa-calendar-check" aria-hidden="true"></i>手工签到</button>' +
       '<button type="button" class="icon-btn" data-ar-action="edit" data-ar-id="' + id + '" title="编辑账号" aria-label="编辑账号"><i class="fas fa-pen" aria-hidden="true"></i></button>' +
       '<button type="button" class="icon-btn c-d" data-ar-action="delete" data-ar-id="' + id + '" title="删除签到账号" aria-label="删除签到账号"><i class="fas fa-trash" aria-hidden="true"></i></button></div></article>'
   }).join('')
@@ -103,7 +107,34 @@ async function agentRouterFetch(path, options) {
   }
   return data.data
 }
-async function agentRouterLoad(block) {
+function agentRouterReconcile(block, accounts, checkinResults) {
+  var previous = block._arAccounts || []
+  var changed = false
+  var reconciled = accounts.map(function(account) {
+    var cached = previous.find(function(item) { return item.id === account.id })
+    var completed = Array.isArray(checkinResults) ? checkinResults.find(function(result) {
+      return result && result.accountId === account.id
+    }) : null
+    var latest = account.result
+    // KV reads may lag a completed request. Prefer the latest observation; on ties,
+    // cached evidence beats the read and the direct check-in response beats both.
+    ;[cached && cached.result, completed].forEach(function(result) {
+      if (!result || result.accountId !== account.id || result.status === 'disabled' ||
+        typeof result.updatedAt !== 'number' || !Number.isFinite(result.updatedAt) || result.updatedAt < 0) return
+      if (!latest || typeof latest.updatedAt !== 'number' || !Number.isFinite(latest.updatedAt) ||
+        result.updatedAt >= latest.updatedAt) latest = result
+    })
+    if (latest === account.result && (!latest || latest.warningCode !== 'QUOTA_UNAVAILABLE' ||
+      (latest.quota === null && latest.usedQuota === null && latest.totalQuota === null && latest.quotaAt === null))) return account
+    changed = true
+    if (latest && latest.warningCode === 'QUOTA_UNAVAILABLE') latest = Object.assign({}, latest, {
+      quota: null, usedQuota: null, totalQuota: null, quotaAt: null
+    })
+    return Object.assign({}, account, { result: latest })
+  })
+  return changed ? reconciled : accounts
+}
+async function agentRouterLoad(block, checkinResults) {
   if (!block) return false
   if (block._arLoading) return block._arLoading
   var list = block.querySelector('.agentrouter-list')
@@ -112,10 +143,14 @@ async function agentRouterLoad(block) {
     try {
       var accounts = await agentRouterFetch('/accounts')
       if (!Array.isArray(accounts)) throw new Error('INVALID_RESPONSE')
-      agentRouterRender(block, accounts)
+      agentRouterRender(block, agentRouterReconcile(block, accounts, checkinResults))
       agentRouterState(block, '', false)
       return true
     } catch(e) {
+      if (Array.isArray(block._arAccounts)) {
+        var accounts = agentRouterReconcile(block, block._arAccounts, checkinResults)
+        if (accounts !== block._arAccounts) agentRouterRender(block, accounts)
+      }
       agentRouterState(block, agentRouterMessage(e.message), true)
       if (list && !block._arAccounts) list.innerHTML = ''
       return false
@@ -123,11 +158,11 @@ async function agentRouterLoad(block) {
   })()
   return block._arLoading
 }
-function agentRouterRefreshVisible() {
+function agentRouterRefreshVisible(checkinResults) {
   return Promise.all(Array.from(document.querySelectorAll('.pd.open [data-agentrouter]')).map(async function(block) {
     // Wait for any pre-mutation read before requesting the saved state.
     if (block._arLoading) await block._arLoading
-    return agentRouterLoad(block)
+    return agentRouterLoad(block, checkinResults)
   })).then(function(results) { return results.every(Boolean) })
 }
 function agentRouterEdit(block, account) {
@@ -199,7 +234,7 @@ async function agentRouterAction(block, action, id) {
     if (!account || !(await cM('删除签到账号 ' + escapeHtml(account.email) + '？邮箱和已保存密码将被移除。'))) return
   }
   agentRouterBusy(block, true)
-  agentRouterState(block, action === 'delete' ? '删除中...' : '签到中...', false)
+  agentRouterState(block, action === 'delete' ? '删除中...' : '手工签到中（同时更新余额）...', false)
   try {
     if (action === 'delete') {
       await agentRouterFetch('/accounts/' + encodeURIComponent(id), { method: 'DELETE' })
@@ -208,10 +243,14 @@ async function agentRouterAction(block, action, id) {
       agentRouterState(block, refreshed ? '签到账号已删除' : '账号已删除，但状态读取失败，请刷新状态', !refreshed)
     } else if (action === 'checkin' || action === 'checkin-all') {
       var summary = await agentRouterFetch('/checkin' + (id ? '/' + encodeURIComponent(id) : ''), { method: 'POST' })
-      var refreshed = await agentRouterRefreshVisible()
-      var text = '签到完成：成功 ' + summary.ok + ' / 已签 ' + summary.already + ' / 未确认或失败 ' + summary.fail + ' / 暂停 ' + summary.skipped
+      var refreshed = await agentRouterRefreshVisible(summary.results)
+      var text = '手工签到完成：成功 ' + summary.ok + ' / 已签 ' + summary.already + ' / 未确认或失败 ' + summary.fail + ' / 暂停 ' + summary.skipped
+      var quotaFailures = Array.isArray(summary.results) ? summary.results.filter(function(result) {
+        return result.warningCode === 'QUOTA_UNAVAILABLE'
+      }).length : 0
+      if (quotaFailures) text += '；本次余额读取失败 ' + quotaFailures + '；未知余额可再次手工签到重试'
       if (!refreshed) text += '；状态读取失败，请刷新状态'
-      agentRouterState(block, text, summary.fail > 0 || !refreshed)
+      agentRouterState(block, text, summary.fail > 0 || quotaFailures > 0 || !refreshed)
     }
   } catch(e) {
     agentRouterState(block, agentRouterMessage(e.message), true)

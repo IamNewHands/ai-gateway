@@ -148,12 +148,21 @@ function parseResult(raw: string | null, id: string): AgentRouterResult | null {
       !['ok', 'already', 'unverified', 'fail', 'disabled'].includes(String(value.status)) ||
       typeof value.updatedAt !== 'number') return null
     const text = (v: unknown) => typeof v === 'string' ? v : null
+    const errorCode = text(value.errorCode)
+    const warningCode = text(value.warningCode)
+    const quota = number(value.quota)
+    const quotaAt = number(value.quotaAt)
+    // Older failures may retain login values, which are not a verified balance snapshot.
+    // Normalize read views only; do not rewrite stored results or daily check-in evidence.
+    const hasQuota = quota !== null && quotaAt !== null && warningCode !== 'QUOTA_UNAVAILABLE' &&
+      value.status !== 'fail' && value.status !== 'disabled' &&
+      errorCode !== 'USER_ID_MISSING' && errorCode !== 'SESSION_MISSING'
     return {
       accountId: id, status: value.status as AgentRouterResult['status'],
       checkedInDate: text(value.checkedInDate), checkedInAt: number(value.checkedInAt),
-      updatedAt: value.updatedAt, quota: number(value.quota), usedQuota: number(value.usedQuota),
-      totalQuota: number(value.totalQuota), quotaAt: number(value.quotaAt),
-      errorCode: text(value.errorCode), warningCode: text(value.warningCode),
+      updatedAt: value.updatedAt, quota: hasQuota ? quota : null, usedQuota: hasQuota ? number(value.usedQuota) : null,
+      totalQuota: hasQuota ? number(value.totalQuota) : null, quotaAt: hasQuota ? quotaAt : null,
+      errorCode, warningCode,
     }
   } catch { return null }
 }
@@ -318,7 +327,7 @@ async function requestJSON(
   try {
     for (let hop = 0; hop <= 2; hop++) {
       const headers: Record<string, string> = {
-        'User-Agent': UA, Accept: 'application/json, text/plain, */*',
+        'User-Agent': UA, Accept: 'application/json, text/plain, */*', 'Cache-Control': 'no-store',
         Origin: ORIGIN, Referer: ORIGIN + '/login',
       }
       if (jar.size) headers.Cookie = cookieHeader(jar)
@@ -381,7 +390,8 @@ function fillQuota(result: AgentRouterResult, data: Record<string, unknown>): bo
   const usedQuota = dollars(data.used_quota)
   const totalQuota = dollars(data.total_quota) ??
     (quota !== null && usedQuota !== null ? quota + usedQuota : null)
-  if (quota === null && usedQuota === null && totalQuota === null) return false
+  // Only /api/user/self owns balance data. Usage/total fields alone cannot validate it.
+  if (quota === null) return false
   result.quota = quota
   result.usedQuota = usedQuota
   result.totalQuota = totalQuota
@@ -410,7 +420,6 @@ async function checkinAccount(account: Account, key: string): Promise<AgentRoute
     }
     if (!login || login.success !== true) throw new AgentRouterError('LOGIN_FAILED')
     const data = object(login.data) ? login.data : {}
-    fillQuota(result, data)
     const uidNumber = number(data.id)
     if (uidNumber === null || !Number.isSafeInteger(uidNumber) || uidNumber <= 0) throw new AgentRouterError('USER_ID_MISSING')
     if (!jar.size) throw new AgentRouterError('SESSION_MISSING')
