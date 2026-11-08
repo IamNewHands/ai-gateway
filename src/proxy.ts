@@ -127,6 +127,9 @@ import {
   anthropicResponseToResponses,
   createAnthropicSSEToOpenAI,
   createAnthropicSSEToResponses,
+  openAIToResponsesRequest,
+  responsesResponseToOpenAI,
+  createResponsesSSEToOpenAI,
 } from './formats'
 
 // ===== Key 健康状态类型和辅助函数 =====
@@ -1389,6 +1392,163 @@ async function proxyResponsesNativeUpstream(
 }
 
 /**
+ * OpenAI Responses 原生上游 + chat 客户端：chat 请求体 → Responses 请求体，
+ * 响应（JSON / SSE）再转回 OpenAI chat 格式。
+ *
+ * 与 `proxyResponsesNativeUpstream` 的区别：那条是 `/v1/responses` 入口的逐字透传，
+ * 这条服务的是 `/v1/chat/completions` 入口——客户端只会说 chat，而上游只认
+ * `/v1/responses`（agentrouter 的 gpt-6.1-sol 就是这种）。
+ *
+ * 为什么不能像通用路径那样直接把 chat 体发到 `/chat/completions`：这类上游会
+ * 回 501 `responses_upstream_only`。反过来也不能把 Responses 体透传给 chat
+ * 客户端——所以这里两个方向都要转：
+ *   - 请求：`openAIToResponsesRequest`（formats.ts）
+ *   - 响应：非流式 `responsesResponseToOpenAI`，流式 `createResponsesSSEToOpenAI`
+ *
+ * 多 Key 顺序 failover、出站 UA（`applyUpstreamHeaders`）、心跳（`withSSEKeepAlive`）
+ * 与 `proxyResponsesNativeUpstream` 完全同口径，避免两条路径行为分叉。
+ */
+async function proxyResponsesUpstreamFromChat(
+  c: Context<AppEnv>,
+  provider: import('./types').Provider,
+  model: string,
+  openaiBody: Record<string, unknown>,
+  originalStream: boolean,
+  g5Base?: unknown[],
+  g5Save?: (respId: string, fullHistory: unknown[]) => void,
+): Promise<Response> {
+  const enabledKeys = provider.apiKeys.filter((k) => k.enabled)
+  if (enabledKeys.length === 0) {
+    return c.json({
+      error: { type: 'configuration_error', message: `提供商 "${provider.name}" 未配置可用的 API Key` },
+    }, 500)
+  }
+
+  const resolvedBase = resolveProviderBaseUrl(c.env, provider.baseUrl)
+  if (!resolvedBase) {
+    return c.json({
+      error: { type: 'configuration_error', message: `提供商 "${provider.name}" 的 baseUrl 含 {CF_ACCOUNT_ID} 占位符，但环境变量 CF_ACCOUNT_ID 未配置` },
+    }, 500)
+  }
+  // 与透传路径同口径：去掉末尾斜杠与 /v1，统一拼 `${base}/v1/responses`
+  let cleanBase = resolvedBase.replace(/\/+$/, '')
+  cleanBase = cleanBase.replace(/\/v1\/?$/, '')
+  const forwardUrl = `${cleanBase}/v1/responses`
+
+  // chat 体 → Responses 体。白名单式搬运，`__` 前缀内部字段不会被带出去。
+  const upstreamBody = openAIToResponsesRequest(openaiBody)
+  upstreamBody['model'] = model
+  upstreamBody['stream'] = originalStream
+
+  let response: Response | undefined
+  let lastErrText = ''
+  let lastStatus = 502
+  for (const key of enabledKeys) {
+    try {
+      const headers: Record<string, string> = {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${key.key}`,
+        ...buildPassthroughHeaders(c),
+      }
+      applyUpstreamHeaders(headers, provider)
+      const r = await fetchUpstream(c.env, forwardUrl, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify(upstreamBody),
+      }, originalStream === true)
+      if (r.ok) { response = r; break }
+      lastStatus = r.status
+      lastErrText = await r.text().catch(() => '')
+    } catch (err) {
+      lastStatus = 502
+      lastErrText = (err as Error).message || '网络错误'
+    }
+  }
+
+  if (!response) {
+    try { c.executionCtx.waitUntil(writeLog(c.env, 'error', `[responses-from-chat] ${model} → failover 全部失败 ${forwardUrl}`, JSON.stringify({ error: lastErrText, body: summarizeRequestBody(upstreamBody), url: forwardUrl }).substring(0, 4000))) } catch {}
+    return c.json({
+      error: { type: 'upstream_error', message: `Upstream error: ${sanitizeUpstreamError(lastErrText)}` },
+    }, lastStatus as Parameters<typeof c.json>[1])
+  }
+
+  try { c.executionCtx.waitUntil(writeLog(c.env, 'request', `[responses-from-chat] ${model} → 200 ${forwardUrl}`, `stream=${originalStream}`)) } catch {}
+
+  // ---- 流式：Responses SSE → OpenAI chat SSE ----
+  if (originalStream && response.body) {
+    const so = openaiBody['stream_options'] as Record<string, unknown> | undefined
+    const includeUsage = so === undefined ? true : so['include_usage'] === true
+    const conv = createResponsesSSEToOpenAI(model, { includeUsage })
+    // G5 多轮历史：拿一份副本旁路解析 response.completed，失败不影响客户端流。
+    let historyCopy: Response | undefined
+    if (g5Base && g5Save) {
+      try { historyCopy = response.clone() } catch { historyCopy = undefined }
+    }
+    const readable = new ReadableStream({
+      async start(controller) {
+        const decoder = new TextDecoderStream()
+        const textReader = response.body!.pipeThrough(decoder).getReader()
+        let lineBuffer = ''
+        let currentEvent = ''
+        try {
+          while (true) {
+            const { done, value } = await textReader.read()
+            if (done) break
+            lineBuffer += value
+            let nl: number
+            while ((nl = lineBuffer.indexOf('\n')) >= 0) {
+              const line = lineBuffer.slice(0, nl)
+              lineBuffer = lineBuffer.slice(nl + 1)
+              const trimmed = line.trim()
+              if (!trimmed) continue
+              if (trimmed.startsWith('event:')) {
+                currentEvent = trimmed.slice(6).trim()
+              } else if (trimmed.startsWith('data:')) {
+                const data = trimmed.slice(5).trim()
+                if (!data) continue
+                if (data === '[DONE]') continue
+                let parsed: Record<string, unknown>
+                try { parsed = JSON.parse(data) as Record<string, unknown> } catch { continue }
+                // 部分上游不带 `event:` 行，只靠 data.type 区分事件
+                const eventName = currentEvent || String(parsed['type'] ?? '')
+                for (const s of conv(eventName, parsed)) {
+                  controller.enqueue(new TextEncoder().encode(s))
+                }
+              }
+            }
+          }
+        } catch { /* stream error */ }
+        controller.close()
+      },
+    })
+    if (historyCopy && g5Base && g5Save) {
+      void captureResponsesHistoryFromSSE(c.env, historyCopy, g5Base, g5Save)
+    }
+    return new Response(readable, {
+      status: 200,
+      headers: {
+        'Content-Type': 'text/event-stream',
+        'Cache-Control': 'no-store',
+        'X-Accel-Buffering': 'no',
+      },
+    })
+  }
+
+  // ---- 非流式：Responses JSON → chat.completion ----
+  const payload = await response.json().catch(() => null) as Record<string, unknown> | null
+  const converted = responsesResponseToOpenAI(payload || {}, model)
+  if (g5Base && g5Save && payload) {
+    try {
+      g5Save(String(payload['id'] ?? ''), [
+        ...g5Base,
+        responsesOutputToAssistantMessage(payload['output'] as Array<Record<string, unknown>> | undefined),
+      ])
+    } catch { /* 保存失败不影响响应 */ }
+  }
+  return c.json(converted)
+}
+
+/**
  * 从 Responses 透传流的旁路副本里抓取 `response.completed` 事件，把多轮历史存进 KV。
  *
  * 只在流式透传路径使用：那条路径的响应体直接回给客户端，网关自身看不到结构化
@@ -2215,25 +2375,19 @@ export async function forwardProxy(
     }
 
     // OpenAI Responses 原生上游（provider.apiType === 'openai-responses'）收到 chat 请求：
-    // 显式 501，而不是落到下面的通用 chat 转发。
+    // 走反向转换（chat 体 → Responses 体 → 上游 /v1/responses → 再转回 chat）。
     //
-    // 为什么不能落下去：通用路径会把 chat 体发到 `${baseUrl}/chat/completions`，
-    // 而这正是这类上游明确拒绝的端点（agentrouter：`模型 xxx 不支持
-    // /v1/chat/completions 接口，请改用 /v1/responses`）。让客户端拿到明确的
-    // `not_implemented` + 正确入口提示，比让它拿到一个上游的 400 原文更有用；
-    // 也避免"看起来配好了、实际每次 400"的误判。
-    // 反向转换（chat 体 → Responses 体）尚未实现：本仓库只有
-    // responsesToOpenAI 这一个方向，补反方向属于独立工作量，不在本次改动范围。
+    // 为什么不能落到下面的通用 chat 转发：通用路径会把 chat 体发到
+    // `${baseUrl}/chat/completions`，而这正是这类上游明确拒绝的端点（agentrouter：
+    // `模型 xxx 不支持 /v1/chat/completions 接口，请改用 /v1/responses`）。也不能把
+    // Responses 体直接丢给 chat 客户端——两个方向都必须转，所以单独成函数。
     if (provider.apiType === 'openai-responses' && subPath === 'chat/completions') {
-      return c.json(
-        {
-          error: {
-            message: '该提供商配置为 OpenAI Responses 原生协议，不接受 /v1/chat/completions。客户端请改用 /v1/responses。',
-            type: 'not_implemented',
-            code: 'responses_upstream_only',
-          },
-        },
-        501,
+      return await proxyResponsesUpstreamFromChat(
+        c,
+        provider,
+        modelId,
+        forwardBody as Record<string, unknown>,
+        isStreamRequest(forwardBody as ProxyRequestBody),
       )
     }
 
@@ -4210,9 +4364,11 @@ async function handleAnthropicMessagesInner(c: Context<AppEnv>) {
       return await proxyAnthropicNativeUpstream(c, provider, providerId, modelId, openaiBody, originalStream, 'messages')
     }
 
-    // OpenAI Responses 原生上游收到 Anthropic 入口请求：显式 501（同 chat 入口的理由）。
+    // OpenAI Responses 原生上游收到 Anthropic 入口请求：显式 501。
     // 这条入口下方会把请求发到 `${baseUrl}/chat/completions`，而 Responses-only
     // 上游拒绝该端点，落到那里只会得到一个误导性的上游 400。
+    // （chat 入口已改走反向转换 `proxyResponsesUpstreamFromChat`；
+    // Anthropic 入口的 chat → Responses 反向转换尚未实现，故保留 501。）
     if (provider.apiType === 'openai-responses') {
       return c.json({
         type: 'error',

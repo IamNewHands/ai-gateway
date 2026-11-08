@@ -1657,6 +1657,435 @@ export function buildResponsesFallbackCompleted(acc: {
 
 
 // ============================================================
+//  OpenAI Chat Completions 请求 → Responses 请求  反向转换
+//  （apiType=openai-responses 的原生上游 + /v1/chat/completions 客户端）
+//
+//  方向说明：本仓库已有 responsesToOpenAI（Responses 请求 → chat 请求）与
+//  openAIToResponses（chat 响应 → Responses 响应）。这里补的是剩下的一半：
+//  chat 请求 → Responses 请求，以及 Responses 响应 → chat 响应（含流式），
+//  让只实现 /v1/responses 的上游（如 agentrouter 的 gpt-6.1-sol）也能被
+//  OpenAI chat 客户端使用。
+// ============================================================
+
+/** 把 chat content（string | 多模态数组）摊成 Responses 的 input content parts */
+function openaiContentToResponsesParts(content: unknown): Array<Record<string, unknown>> {
+  if (typeof content === 'string') {
+    return content ? [{ type: 'input_text', text: content }] : []
+  }
+  if (!Array.isArray(content)) return []
+  const parts: Array<Record<string, unknown>> = []
+  for (const raw of content as Array<Record<string, unknown>>) {
+    if (!raw || typeof raw !== 'object') continue
+    const type = raw['type']
+    if (type === 'text' || type === 'input_text') {
+      const text = (raw['text'] as string) || ''
+      if (text) parts.push({ type: 'input_text', text })
+    } else if (type === 'image_url' || type === 'input_image') {
+      const url = type === 'image_url'
+        ? ((raw['image_url'] as Record<string, unknown>)?.['url'] as string) || ''
+        : ((raw['image_url'] as string) || (raw['url'] as string) || '')
+      if (url) parts.push({ type: 'input_image', image_url: url })
+    }
+  }
+  return parts
+}
+
+/**
+ * OpenAI Chat Completions 请求 → Responses 请求。
+ *
+ * 采用白名单式搬运（只读已知字段，不整体展开），因此 `__` 前缀的网关内部字段、
+ * `stream_options`、`n`、`presence_penalty` 等 Responses 不认识的 chat 参数
+ * 自然不会被带到上游。
+ */
+export function openAIToResponsesRequest(openaiReq: Record<string, unknown>): Record<string, unknown> {
+  const messages = (openaiReq['messages'] as Array<Record<string, unknown>>) || []
+  const input: Array<Record<string, unknown>> = []
+  const systemParts: string[] = []
+
+  for (const m of messages) {
+    if (!m || typeof m !== 'object') continue
+    const role = m['role'] as string
+    if (role === 'system' || role === 'developer') {
+      const text = openaiContentToString(m['content'])
+      if (text) systemParts.push(text)
+      continue
+    }
+    if (role === 'tool') {
+      const callId = (m['tool_call_id'] as string) || ''
+      if (callId) {
+        input.push({ type: 'function_call_output', call_id: callId, output: openaiContentToString(m['content']) })
+      }
+      continue
+    }
+    if (role === 'assistant') {
+      const text = openaiContentToString(m['content'])
+      if (text) {
+        input.push({ type: 'message', role: 'assistant', content: [{ type: 'output_text', text }] })
+      }
+      const toolCalls = m['tool_calls'] as Array<Record<string, unknown>> | undefined
+      if (Array.isArray(toolCalls)) {
+        for (const tc of toolCalls) {
+          const fn = (tc['function'] as Record<string, unknown>) || {}
+          const callId = (tc['id'] as string) || ''
+          if (!callId) continue
+          input.push({
+            type: 'function_call',
+            call_id: callId,
+            name: (fn['name'] as string) || '',
+            arguments: typeof fn['arguments'] === 'string' ? fn['arguments'] : JSON.stringify(fn['arguments'] ?? {}),
+          })
+        }
+      }
+      continue
+    }
+    // user 及其它未知 role：统一按 user 处理，保留多模态 parts
+    const parts = openaiContentToResponsesParts(m['content'])
+    if (parts.length > 0) input.push({ type: 'message', role: 'user', content: parts })
+  }
+
+  const body: Record<string, unknown> = {
+    model: openaiReq['model'],
+    input,
+    stream: openaiReq['stream'] === true,
+  }
+  if (systemParts.length > 0) body['instructions'] = systemParts.join('\n\n')
+
+  const maxTokens = (openaiReq['max_completion_tokens'] as number | undefined)
+    ?? (openaiReq['max_tokens'] as number | undefined)
+  if (typeof maxTokens === 'number' && maxTokens > 0) body['max_output_tokens'] = maxTokens
+  if (openaiReq['temperature'] !== undefined) body['temperature'] = openaiReq['temperature']
+  if (openaiReq['top_p'] !== undefined) body['top_p'] = openaiReq['top_p']
+  if (openaiReq['parallel_tool_calls'] !== undefined) body['parallel_tool_calls'] = openaiReq['parallel_tool_calls']
+
+  // tools：chat 的 {type:'function', function:{name,description,parameters}} → Responses 的扁平声明
+  if (Array.isArray(openaiReq['tools']) && (openaiReq['tools'] as unknown[]).length > 0) {
+    body['tools'] = (openaiReq['tools'] as Array<Record<string, unknown>>).map((t) => {
+      const fn = (t['function'] as Record<string, unknown>) || t
+      return {
+        type: 'function',
+        name: (fn['name'] as string) || '',
+        description: (fn['description'] as string) || '',
+        parameters: (fn['parameters'] as Record<string, unknown>) || { type: 'object', properties: {} },
+      }
+    })
+  }
+
+  const tc = openaiReq['tool_choice']
+  if (typeof tc === 'string') {
+    if (tc === 'auto' || tc === 'none' || tc === 'required') body['tool_choice'] = tc
+  } else if (tc && typeof tc === 'object') {
+    const t = tc as Record<string, unknown>
+    const fnName = ((t['function'] as Record<string, unknown>)?.['name']) as string | undefined
+    if (fnName) body['tool_choice'] = { type: 'function', name: fnName }
+  }
+
+  // reasoning_effort → reasoning.effort
+  const re = openaiReq['reasoning_effort']
+  if (typeof re === 'string' && re) body['reasoning'] = { effort: re }
+
+  // response_format → text.format
+  const rf = openaiReq['response_format'] as Record<string, unknown> | undefined
+  if (rf && rf['type'] === 'json_schema') {
+    const js = (rf['json_schema'] as Record<string, unknown>) || {}
+    body['text'] = {
+      format: {
+        type: 'json_schema',
+        name: (js['name'] as string) || 'response',
+        schema: js['schema'] ?? { type: 'object' },
+        ...(js['strict'] !== undefined ? { strict: js['strict'] } : {}),
+      },
+    }
+  } else if (rf && rf['type'] === 'json_object') {
+    body['text'] = { format: { type: 'json_object' } }
+  }
+
+  return body
+}
+
+/** 非流式：Responses 响应 → OpenAI chat.completion 响应 */
+export function responsesResponseToOpenAI(
+  responsesResp: Record<string, unknown>,
+  model: string,
+): Record<string, unknown> {
+  const output = (responsesResp['output'] as Array<Record<string, unknown>>) || []
+  const textParts: string[] = []
+  const reasoningParts: string[] = []
+  const toolCalls: Array<Record<string, unknown>> = []
+
+  for (const item of output) {
+    if (!item || typeof item !== 'object') continue
+    const type = item['type']
+    if (type === 'message') {
+      const content = item['content']
+      if (Array.isArray(content)) {
+        for (const c of content as Array<Record<string, unknown>>) {
+          if ((c['type'] === 'output_text' || c['type'] === 'text') && typeof c['text'] === 'string') {
+            textParts.push(c['text'] as string)
+          }
+        }
+      } else if (typeof content === 'string') {
+        textParts.push(content)
+      }
+    } else if (type === 'output_text') {
+      if (typeof item['text'] === 'string') textParts.push(item['text'] as string)
+    } else if (type === 'function_call') {
+      const args = item['arguments']
+      toolCalls.push({
+        id: (item['call_id'] as string) || (item['id'] as string) || `call_${toolCalls.length}`,
+        type: 'function',
+        function: {
+          name: (item['name'] as string) || '',
+          arguments: typeof args === 'string' ? args : JSON.stringify(args ?? {}),
+        },
+      })
+    } else if (type === 'reasoning') {
+      const summary = item['summary']
+      if (Array.isArray(summary)) {
+        for (const s of summary as Array<Record<string, unknown>>) {
+          if (typeof s['text'] === 'string' && s['text']) reasoningParts.push(s['text'] as string)
+        }
+      }
+    }
+  }
+
+  const message: Record<string, unknown> = { role: 'assistant' }
+  if (textParts.length > 0) message['content'] = textParts.join('')
+  else message['content'] = toolCalls.length > 0 ? null : ''
+  if (reasoningParts.length > 0) message['reasoning_content'] = reasoningParts.join('')
+  if (toolCalls.length > 0) message['tool_calls'] = toolCalls
+
+  const u = responsesResp['usage'] as Record<string, unknown> | undefined
+  const inputTokens = Number(u?.['input_tokens'] ?? 0)
+  const outputTokens = Number(u?.['output_tokens'] ?? 0)
+  const totalTokens = Number(u?.['total_tokens'] ?? (inputTokens + outputTokens))
+  const cachedTokens = Number(((u?.['input_tokens_details'] as Record<string, unknown> | undefined)?.['cached_tokens']) ?? 0)
+  const rawId = (responsesResp['id'] as string) || ''
+
+  return {
+    id: rawId ? `chatcmpl_${rawId.replace(/^resp_/, '')}` : `chatcmpl_${Date.now()}`,
+    object: 'chat.completion',
+    created: Number(responsesResp['created_at'] ?? Math.floor(Date.now() / 1000)),
+    model: model || (responsesResp['model'] as string) || '',
+    choices: [{
+      index: 0,
+      message,
+      finish_reason: toolCalls.length > 0 ? 'tool_calls' : 'stop',
+      logprobs: null,
+    }],
+    usage: {
+      prompt_tokens: inputTokens,
+      completion_tokens: outputTokens,
+      total_tokens: totalTokens,
+      prompt_tokens_details: { cached_tokens: cachedTokens },
+    },
+  }
+}
+
+/**
+ * 流式：Responses SSE 事件 → OpenAI chat.completion.chunk 序列。
+ *
+ * 与 createAnthropicSSEToOpenAI 同一用法：对每条 SSE 记录（eventName + data）
+ * 调用返回的转换器，拿到 OpenAI SSE 片段数组。
+ *
+ * 兜底：部分上游不发增量事件，只在 response.completed 里给完整 output。
+ * 此时若此前一个增量都没吐过，就从 output 里补齐文本与工具调用，避免客户端
+ * 收到一个空回答。
+ */
+export function createResponsesSSEToOpenAI(
+  modelHint: string,
+  options?: { includeUsage?: boolean },
+) {
+  const state = {
+    messageId: `chatcmpl_${Math.random().toString(36).slice(2, 12)}`,
+    model: modelHint,
+    created: Math.floor(Date.now() / 1000),
+    inputTokens: 0,
+    outputTokens: 0,
+    totalTokens: 0,
+    cachedTokens: 0,
+    toolIndexByItem: new Map<string, number>(),
+    nextToolIndex: 0,
+    started: false,
+    emittedText: false,
+    emittedTool: false,
+    finished: false,
+  }
+
+  const chunk = (
+    delta: Record<string, unknown>,
+    finishReason: string | null = null,
+    usage?: Record<string, unknown>,
+  ): string => `data: ${JSON.stringify({
+    id: state.messageId,
+    object: 'chat.completion.chunk',
+    created: state.created,
+    model: state.model,
+    choices: [{ index: 0, delta, logprobs: null, finish_reason: finishReason }],
+    ...(usage ? { usage } : {}),
+  })}\n\n`
+
+  const start = (out: string[]): void => {
+    if (state.started) return
+    state.started = true
+    out.push(chunk({ role: 'assistant', content: '' }))
+  }
+
+  const readUsage = (usage: unknown): void => {
+    if (!usage || typeof usage !== 'object') return
+    const u = usage as Record<string, unknown>
+    if (typeof u['input_tokens'] === 'number') state.inputTokens = u['input_tokens'] as number
+    if (typeof u['output_tokens'] === 'number') state.outputTokens = u['output_tokens'] as number
+    if (typeof u['total_tokens'] === 'number') state.totalTokens = u['total_tokens'] as number
+    const details = u['input_tokens_details'] as Record<string, unknown> | undefined
+    if (details && typeof details['cached_tokens'] === 'number') state.cachedTokens = details['cached_tokens'] as number
+  }
+
+  const toolIndexFor = (itemId: string, callId: string): number => {
+    const known = state.toolIndexByItem.get(itemId)
+    if (known !== undefined) return known
+    const idx = state.nextToolIndex++
+    if (itemId) state.toolIndexByItem.set(itemId, idx)
+    if (callId) state.toolIndexByItem.set(callId, idx)
+    return idx
+  }
+
+  const usagePayload = (): Record<string, unknown> | undefined => (options?.includeUsage ?? true)
+    ? {
+      prompt_tokens: state.inputTokens,
+      completion_tokens: state.outputTokens,
+      total_tokens: state.totalTokens || state.inputTokens + state.outputTokens,
+      prompt_tokens_details: { cached_tokens: state.cachedTokens },
+    }
+    : undefined
+
+  const finish = (out: string[]): void => {
+    if (state.finished) return
+    state.finished = true
+    start(out)
+    out.push(chunk({}, state.emittedTool ? 'tool_calls' : 'stop', usagePayload()))
+    out.push('data: [DONE]\n\n')
+  }
+
+  return (eventName: string, data: Record<string, unknown>): string[] => {
+    const out: string[] = []
+    switch (eventName) {
+      case 'response.created': {
+        const r = data['response'] as Record<string, unknown> | undefined
+        if (r?.['id']) state.messageId = `chatcmpl_${String(r['id']).replace(/^resp_/, '')}`
+        if (r?.['model']) state.model = String(r['model'])
+        readUsage(r?.['usage'])
+        start(out)
+        break
+      }
+      case 'response.output_item.added': {
+        const item = data['item'] as Record<string, unknown> | undefined
+        if (item?.['type'] === 'function_call') {
+          start(out)
+          const itemId = String(item['id'] ?? '')
+          const callId = String(item['call_id'] ?? itemId)
+          const idx = toolIndexFor(itemId, callId)
+          state.emittedTool = true
+          out.push(chunk({
+            tool_calls: [{
+              index: idx,
+              id: callId,
+              type: 'function',
+              function: { name: String(item['name'] ?? ''), arguments: '' },
+            }],
+          }))
+        }
+        break
+      }
+      case 'response.output_text.delta': {
+        const delta = data['delta']
+        if (typeof delta === 'string' && delta) {
+          start(out)
+          state.emittedText = true
+          out.push(chunk({ content: delta }))
+        }
+        break
+      }
+      case 'response.reasoning_summary_text.delta':
+      case 'response.reasoning_text.delta': {
+        const delta = data['delta']
+        if (typeof delta === 'string' && delta) {
+          start(out)
+          out.push(chunk({ reasoning_content: delta }))
+        }
+        break
+      }
+      case 'response.function_call_arguments.delta': {
+        const delta = data['delta']
+        if (typeof delta === 'string' && delta) {
+          start(out)
+          const itemId = String(data['item_id'] ?? '')
+          const idx = state.toolIndexByItem.get(itemId) ?? 0
+          state.emittedTool = true
+          // 与 Anthropic 反向转换同口径：按 512 字符分片，避免超大单帧撑爆客户端缓冲
+          for (let off = 0; off < delta.length; off += 512) {
+            out.push(chunk({ tool_calls: [{ index: idx, function: { arguments: delta.slice(off, off + 512) } }] }))
+          }
+        }
+        break
+      }
+      case 'response.completed':
+      case 'response.done': {
+        if (state.finished) break
+        const r = data['response'] as Record<string, unknown> | undefined
+        readUsage(r?.['usage'])
+        start(out)
+        // 上游只在 completed 里给完整 output 时补齐（增量事件一条都没来过）
+        if (r && (!state.emittedText || !state.emittedTool)) {
+          const output = r['output'] as Array<Record<string, unknown>> | undefined
+          for (const item of output || []) {
+            if (!item || typeof item !== 'object') continue
+            const type = item['type']
+            if (type === 'message' && !state.emittedText) {
+              const parts = item['content']
+              if (Array.isArray(parts)) {
+                for (const p of parts as Array<Record<string, unknown>>) {
+                  if (typeof p['text'] === 'string' && p['text']) {
+                    state.emittedText = true
+                    out.push(chunk({ content: p['text'] as string }))
+                  }
+                }
+              }
+            } else if (type === 'function_call' && !state.emittedTool) {
+              const callId = String(item['call_id'] ?? item['id'] ?? '')
+              const idx = toolIndexFor(String(item['id'] ?? callId), callId)
+              state.emittedTool = true
+              out.push(chunk({
+                tool_calls: [{
+                  index: idx,
+                  id: callId,
+                  type: 'function',
+                  function: {
+                    name: String(item['name'] ?? ''),
+                    arguments: typeof item['arguments'] === 'string'
+                      ? item['arguments'] as string
+                      : JSON.stringify(item['arguments'] ?? {}),
+                  },
+                }],
+              }))
+            }
+          }
+        }
+        finish(out)
+        break
+      }
+      case 'response.failed':
+      case 'error': {
+        finish(out)
+        break
+      }
+      default:
+        break
+    }
+    return out
+  }
+}
+
+// ============================================================
 //  OpenAI Chat Completions 请求 → Anthropic Messages 请求  反向转换
 //  （用于 apiType=anthropic 的原生上游，如 api.anthropic.com）
 // ============================================================
