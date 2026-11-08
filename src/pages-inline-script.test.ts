@@ -167,6 +167,30 @@ function wbExpiryApi(html: string): any {
   return factory((s: unknown) => String(s))
 }
 
+/** 执行实际渲染脚本，用内存容器观察包明细；不运行页面初始化或发起上游请求。 */
+function packageRenderApi(html: string) {
+  const js = inlineScripts(html).join('\n')
+  const definitions = ['renderOauthPoolAccounts', 'renderQoderPoolAccounts', 'traePackDetailHtml', 'traePackExpireHtml'].map((name) => {
+    const m = js.match(new RegExp('function ' + name + '\\([^)]*\\) \\{[\\s\\S]*?\\n\\}'))
+    if (!m) throw new Error('未找到权益包渲染函数：' + name)
+    return m[0]
+  }).join('\n')
+  const makeBox = () => ({ innerHTML: '', querySelectorAll: () => [] })
+  const wbBox = makeBox(), qoderBox = makeBox()
+  const boxes = new Map([['wbp-acc-workbuddy', wbBox], ['qdp-acc-qoder', qoderBox]])
+  const factory = new Function(
+    'document', 'escapeHtml', 'escapeJsAttr', 'preferAutoOption', 'preferBarHtml', 'poolToggleBtn', 'toggleCollapse', 'wb',
+    'const { wbPackExpiring7d, wbExpiringBadge, wbPackExpireHtml, wbPackageDisplayList, traePackDisplayList } = wb;\n' +
+    definitions + '\nreturn { renderOauthPoolAccounts, renderQoderPoolAccounts, traePackDetailHtml };'
+  )
+  const api = factory(
+    { getElementById: (id: string) => boxes.get(id) ?? null },
+    (s: unknown) => String(s), (s: unknown) => String(s),
+    () => '', () => '', () => '', () => {}, wbExpiryApi(html)
+  )
+  return { api, wbBox, qoderBox }
+}
+
 /**
  * 抽取客户端「Cline 上游渠道」纯映射块（CLINE_UP_BEGIN/END 标记之间）。
  *
@@ -903,12 +927,13 @@ describe('WorkBuddy 面板「即将到期」标记（客户端口径 = 后端挑
     expect(api.wbPackageDisplayList([pkg(1 * DAY, { size: 10, used: 10 })]).rows).toEqual([])
 
     // ---- TRAE：limit>0 且剩余<=0 = 已用完 → 隐藏；limit 未下发（0）不隐藏 ----
+    const epoch = (left: number) => Math.floor((Date.now() + left) / 1000)
     const traePacks = [
-      { name: '远期', limit: 100, used: 0, rem: 100, isWork: false, expireAt: 3000 },
-      { name: '即将到期', limit: 100, used: 0, rem: 100, isWork: false, expireAt: 1000 },
+      { name: '远期', limit: 100, used: 0, rem: 100, isWork: false, expireAt: epoch(30 * DAY) },
+      { name: '即将到期', limit: 100, used: 0, rem: 100, isWork: false, expireAt: epoch(2 * DAY) },
       { name: '长期', limit: 100, used: 0, rem: 100, isWork: false, expireAt: 0 },
-      { name: '用完了', limit: 100, used: 100, rem: 0, isWork: false, expireAt: 1200 },
-      { name: '容量未下发', limit: 0, used: 0, rem: 0, isWork: true, expireAt: 2000 },
+      { name: '用完了', limit: 100, used: 100, rem: 0, isWork: false, expireAt: epoch(1 * DAY) },
+      { name: '容量未下发', limit: 0, used: 0, rem: 0, isWork: true, expireAt: epoch(3 * DAY) },
     ]
     const tr = api.traePackDisplayList(traePacks)
     expect(tr.total).toBe(5)
@@ -921,7 +946,94 @@ describe('WorkBuddy 面板「即将到期」标记（客户端口径 = 后端挑
     expect(api.traePackDisplayList(undefined)).toEqual({ rows: [], hidden: 0, total: 0 })
   })
 
-  it('两个面板已改用展示列表（隐藏已用完 + 到期优先排序 + 隐藏计数提示）', async () => {
+  it('已到期的包即使有余额或容量未知也隐藏；长期、到期未知与未来包保留', async () => {
+    const api = wbExpiryApi(await render([traeProvider()]))
+    const now = Date.UTC(2026, 10, 8, 7)
+    const cst = (left: number) => new Date(now + left + 8 * 3600_000).toISOString().slice(0, 19).replace('T', ' ')
+    const cases = [
+      { name: '过期有余额', left: -DAY, size: 100, used: 10 },
+      { name: '过期容量未知', left: -DAY, size: 0, used: 0 },
+      { name: '正好到期', left: 0, size: 100, used: 0 },
+      { name: '过期且用完', left: -DAY, size: 100, used: 100 },
+      { name: '未来容量未知', left: DAY, size: 0, used: 0 },
+      { name: '未来有余额', left: 2 * DAY, size: 100, used: 20 },
+      { name: '长期', left: null, size: 100, used: 0 },
+    ]
+    const wbPacks = Object.freeze([
+      ...cases.map((p) => Object.freeze({ name: p.name, expireAt: p.left === null ? '' : cst(p.left), size: p.size, used: p.used })),
+      Object.freeze({ name: '到期未知', expireAt: '到期未知', size: 100, used: 0 }),
+    ])
+    const traePacks = Object.freeze([
+      ...cases.map((p, i) => Object.freeze({ name: p.name, expireAt: p.left === null ? 0 : (now + p.left) / 1000, limit: p.size, used: p.used, rem: p.size - p.used, isWork: i % 2 === 0 })),
+      Object.freeze({ name: '到期未知', limit: 100, used: 0, rem: 100, isWork: false }),
+    ])
+    const expected = ['未来容量未知', '未来有余额', ...['长期', '到期未知'].sort((a, b) => a.localeCompare(b))]
+    for (const disp of [api.wbPackageDisplayList(wbPacks, now), api.traePackDisplayList(traePacks, now)]) {
+      expect(disp.rows.map((p: any) => p.name)).toEqual(expected)
+      expect(disp.hidden).toBe(4) // 既过期又用完只计一次
+      expect(disp.total).toBe(8)
+    }
+    // 同一批快照随时间跨过到期点：不依赖再次签到/刷新上游。
+    expect(api.wbPackageDisplayList([wbPacks[2]], now - 1).rows).toHaveLength(1)
+    expect(api.traePackDisplayList([traePacks[2]], now - 1).rows).toHaveLength(1)
+  })
+
+  it.each(['workbuddy', 'qoder'])('%s 实际账号行：过期包不出现在表格，池快照与签到回退同规则', async (id) => {
+    const html = await render([{
+      ...traeProvider(), id, name: id, authType: 'oauth-device', oauth: { flowType: id === 'qoder' ? 'qoder' : 'browser' },
+    } as Provider])
+    const { api, wbBox, qoderBox } = packageRenderApi(html)
+    const box = id === 'qoder' ? qoderBox : wbBox
+    const expired = pkg(-DAY, { name: '过期签到奖励', size: 100, used: 10 })
+    const exhausted = pkg(DAY, { name: '已耗尽奖励', size: 100, used: 100 })
+    const packages = [pkg(null, { name: '长期包' }), pkg(30 * DAY, { name: '远期包' }), expired, pkg(2 * DAY, { name: '临期包' }), exhausted]
+    const account = { uid: 'u1', nickname: '测试账号', credits: 777, packages }
+    const renderAccounts = (a: object, ci: object) => {
+      if (id === 'qoder') api.renderQoderPoolAccounts(id, [a], { u1: ci }, [ci], '')
+      else api.renderOauthPoolAccounts(id, [a], { u1: ci }, {}, [ci], '')
+      return box.innerHTML
+    }
+    const output = renderAccounts(account, { packages: [pkg(DAY, { name: '旧签到快照' })], totalRemain: 777, totalUsed: 123 })
+    expect(output).not.toContain('过期签到奖励')
+    expect(output).not.toContain('已耗尽奖励')
+    expect(output).not.toContain('旧签到快照')
+    expect(output).toContain('已过期或用完 2 个已隐藏')
+    expect(output).toContain('明细（3）')
+    expect(output.indexOf('<td>临期包')).toBeLessThan(output.indexOf('<td>远期包'))
+    expect(output.indexOf('<td>远期包')).toBeLessThan(output.indexOf('<td>长期包'))
+    expect(output).toContain('积分=777')
+    expect(output).toContain('可用 777 · 已用 123')
+    expect(packages).toHaveLength(5)
+    const fallback = renderAccounts({ uid: 'u1', credits: 777 }, { packages })
+    expect(fallback).not.toContain('过期签到奖励')
+    expect(fallback).toContain('<td>临期包')
+    const allHidden = renderAccounts({ uid: 'u1', packages: [expired, exhausted] }, {})
+    expect(allHidden).toContain('2 个包已全部过期或用完')
+    expect(allHidden).not.toContain('<table')
+    expect(allHidden).not.toContain('过期签到奖励')
+  })
+
+  it('TRAE 实际明细：通用/Work 过期包都隐藏；全部隐藏时不用空表冒充未探测', async () => {
+    const { api } = packageRenderApi(await render([traeProvider()]))
+    const epoch = (left: number) => Math.floor((Date.now() + left) / 1000)
+    const expired = { name: '过期通用包', limit: 100, used: 10, rem: 90, isWork: false, expireAt: epoch(-DAY) }
+    const workExpired = { name: '过期Work包', limit: 100, used: 0, rem: 100, isWork: true, expireAt: epoch(-DAY) }
+    const future = { name: '有效Work包', limit: 100, used: 20, rem: 80, isWork: true, expireAt: epoch(2 * DAY) }
+    const output = api.traePackDetailHtml('u1', [expired, workExpired, future], 0, 0)
+    expect(output).not.toContain('过期通用包')
+    expect(output).not.toContain('过期Work包')
+    expect(output).toContain('有效Work包')
+    expect(output).toContain('已过期或用完 2 个已隐藏')
+    expect(output).toContain('积分明细（1 个包 · 可用 270 / 总额 300）') // 展示过滤不改上游汇总
+    expect(output).toContain('1 个 7 天内到期')
+    const allHidden = api.traePackDetailHtml('u1', [expired, workExpired], 0, 0)
+    expect(allHidden).toContain('2 个包已全部过期或用完')
+    expect(allHidden).not.toContain('<table')
+    expect(api.traePackDetailHtml('u1', undefined, 0, 0)).toContain('未探测')
+    expect(api.traePackDetailHtml('u1', [], 0, 0)).toContain('上游未下发权益包')
+  })
+
+  it('两个面板已改用展示列表（隐藏已过期或用完 + 到期优先排序 + 隐藏计数提示）', async () => {
     const html = await render([{
       ...traeProvider(), id: 'workbuddy', name: 'WorkBuddy', authType: 'oauth-device', oauth: { flowType: 'browser' },
     } as Provider])
@@ -929,7 +1041,7 @@ describe('WorkBuddy 面板「即将到期」标记（客户端口径 = 后端挑
     expect(js).toContain('const pkgDisp = wbPackageDisplayList(pkgs)')
     expect(js).toContain('const disp = traePackDisplayList(packs)')
     expect(js).toContain('个已隐藏')
-    expect(js).toContain('个包已全部用完')
+    expect(js).toContain('个包已全部过期或用完')
   })
 
   /**
