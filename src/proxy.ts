@@ -8,6 +8,7 @@ import { ensureAssistantReasoningEcho, needsReasoningEcho } from './reasoning-ec
 import { createAnalyticsContext, normalizeAnthropicUsage, normalizeChatUsage, normalizeResponsesUsage, summarizeError } from './analytics/types'
 import type { AnalyticsContext, UsageMetrics } from './analytics/types'
 import { createStreamUsageProbe, writeAnalyticsEvent } from './analytics/usage-logger'
+import { responsesSSEToChatStream, responsesChatTerminal, responsesChatErrorBody } from './responses-chat-stream'
 import {
   isOpenCodeProvider,
   proxyOpenCodeRequest,
@@ -129,7 +130,6 @@ import {
   createAnthropicSSEToResponses,
   openAIToResponsesRequest,
   responsesResponseToOpenAI,
-  createResponsesSSEToOpenAI,
 } from './formats'
 
 // ===== Key 健康状态类型和辅助函数 =====
@@ -244,6 +244,10 @@ function sanitizeUpstreamError(text: string, max = 400): string {
   const cleaned = noControl
     .replace(/https?:\/\/(?:[0-9]{1,3}\.){3}[0-9]{1,3}[^\s'"]*/gi, '')
     .replace(/https?:\/\/(?:localhost|127\.0\.0\.1|10\.|172\.(?:1[6-9]|2\d|3[01])\.|192\.168\.)[^\s'"]*/gi, '')
+    .replace(/(Bearer\s+)[A-Za-z0-9._~+\/-]+/gi, '$1***')
+    .replace(/\bsk[-_][A-Za-z0-9_-]{8,}/gi, 'sk_***')
+    .replace(/("?(?:authorization|proxy-authorization|api[-_]?key|bearer|cookie|set-cookie|refresh_token|access_token|client_secret|token|secret)"?\s*[:=]\s*)("[^"]*"|'[^']*'|[^\s,;]+)/gi, '$1***')
+    // 保留旧四类字段的保守整段脱敏（裸值中的逗号/分号也可能属于凭据）。
     .replace(/(authorization|proxy-authorization|api[_-]?key|bearer)\s*[:=]\s*\S+/gi, '$1: ***')
   return cleaned.slice(0, max)
 }
@@ -1478,47 +1482,21 @@ async function proxyResponsesUpstreamFromChat(
   if (originalStream && response.body) {
     const so = openaiBody['stream_options'] as Record<string, unknown> | undefined
     const includeUsage = so === undefined ? true : so['include_usage'] === true
-    const conv = createResponsesSSEToOpenAI(model, { includeUsage })
     // G5 多轮历史：拿一份副本旁路解析 response.completed，失败不影响客户端流。
     let historyCopy: Response | undefined
     if (g5Base && g5Save) {
       try { historyCopy = response.clone() } catch { historyCopy = undefined }
     }
-    const readable = new ReadableStream({
-      async start(controller) {
-        const decoder = new TextDecoderStream()
-        const textReader = response.body!.pipeThrough(decoder).getReader()
-        let lineBuffer = ''
-        let currentEvent = ''
+    const readable = responsesSSEToChatStream(response.body, model, {
+      includeUsage,
+      sanitizeErrorText: sanitizeUpstreamError,
+      onFinish(summary) {
+        // 仅终态、事件名、计数和响应 ID；不落盘正文/工具参数/原始上游帧。
+        const details = { ...summary, responseId: sanitizeUpstreamError(summary.responseId, 160) }
+        const level = summary.outcome === 'failed' ? 'error' : 'request'
         try {
-          while (true) {
-            const { done, value } = await textReader.read()
-            if (done) break
-            lineBuffer += value
-            let nl: number
-            while ((nl = lineBuffer.indexOf('\n')) >= 0) {
-              const line = lineBuffer.slice(0, nl)
-              lineBuffer = lineBuffer.slice(nl + 1)
-              const trimmed = line.trim()
-              if (!trimmed) continue
-              if (trimmed.startsWith('event:')) {
-                currentEvent = trimmed.slice(6).trim()
-              } else if (trimmed.startsWith('data:')) {
-                const data = trimmed.slice(5).trim()
-                if (!data) continue
-                if (data === '[DONE]') continue
-                let parsed: Record<string, unknown>
-                try { parsed = JSON.parse(data) as Record<string, unknown> } catch { continue }
-                // 部分上游不带 `event:` 行，只靠 data.type 区分事件
-                const eventName = currentEvent || String(parsed['type'] ?? '')
-                for (const s of conv(eventName, parsed)) {
-                  controller.enqueue(new TextEncoder().encode(s))
-                }
-              }
-            }
-          }
-        } catch { /* stream error */ }
-        controller.close()
+          c.executionCtx.waitUntil(writeLog(c.env, level, `[responses-from-chat] ${model} end=${summary.outcome} empty=${summary.empty}`, JSON.stringify(details)))
+        } catch { /* 诊断不能阻断客户端流 */ }
       },
     })
     if (historyCopy && g5Base && g5Save) {
@@ -1535,13 +1513,25 @@ async function proxyResponsesUpstreamFromChat(
   }
 
   // ---- 非流式：Responses JSON → chat.completion ----
-  const payload = await response.json().catch(() => null) as Record<string, unknown> | null
-  const converted = responsesResponseToOpenAI(payload || {}, model)
-  if (g5Base && g5Save && payload) {
+  const payload: unknown = await response.json().catch(() => null)
+  const validResponse = payload !== null && typeof payload === 'object' && !Array.isArray(payload)
+    ? payload as Record<string, unknown>
+    : undefined
+  const terminal = validResponse ? responsesChatTerminal(validResponse) : undefined
+  const error = terminal?.error ?? (!validResponse || !Array.isArray(validResponse['output'])
+    ? { code: 'upstream_invalid_response', message: 'Responses upstream returned an invalid JSON response', status: 502 }
+    : undefined)
+  if (error) {
+    const body = responsesChatErrorBody(error, { sanitizeErrorText: sanitizeUpstreamError })
+    try { c.executionCtx.waitUntil(writeLog(c.env, 'error', `[responses-from-chat] ${model} end=failed`, JSON.stringify({ errorCode: error.code, responseId: sanitizeUpstreamError(String(validResponse?.['id'] ?? ''), 160) }))) } catch {}
+    return c.json(body, error.status as Parameters<typeof c.json>[1])
+  }
+  const converted = responsesResponseToOpenAI(validResponse!, model, terminal!.finishReason)
+  if (g5Base && g5Save && validResponse) {
     try {
-      g5Save(String(payload['id'] ?? ''), [
+      g5Save(String(validResponse['id'] ?? ''), [
         ...g5Base,
-        responsesOutputToAssistantMessage(payload['output'] as Array<Record<string, unknown>> | undefined),
+        responsesOutputToAssistantMessage(validResponse['output'] as Array<Record<string, unknown>> | undefined),
       ])
     } catch { /* 保存失败不影响响应 */ }
   }

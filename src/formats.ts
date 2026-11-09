@@ -1766,6 +1766,8 @@ export function openAIToResponsesRequest(openaiReq: Record<string, unknown>): Re
         name: (fn['name'] as string) || '',
         description: (fn['description'] as string) || '',
         parameters: (fn['parameters'] as Record<string, unknown>) || { type: 'object', properties: {} },
+        // Chat 缺省非严格；Responses 缺省会尝试严格化，不能丢掉这一语义。
+        strict: typeof fn['strict'] === 'boolean' ? fn['strict'] : false,
       }
     })
   }
@@ -1806,6 +1808,7 @@ export function openAIToResponsesRequest(openaiReq: Record<string, unknown>): Re
 export function responsesResponseToOpenAI(
   responsesResp: Record<string, unknown>,
   model: string,
+  finishReason: 'stop' | 'length' = 'stop',
 ): Record<string, unknown> {
   const output = (responsesResp['output'] as Array<Record<string, unknown>>) || []
   const textParts: string[] = []
@@ -1821,6 +1824,8 @@ export function responsesResponseToOpenAI(
         for (const c of content as Array<Record<string, unknown>>) {
           if ((c['type'] === 'output_text' || c['type'] === 'text') && typeof c['text'] === 'string') {
             textParts.push(c['text'] as string)
+          } else if (c['type'] === 'refusal' && typeof c['refusal'] === 'string') {
+            textParts.push(c['refusal'] as string)
           }
         }
       } else if (typeof content === 'string') {
@@ -1839,10 +1844,10 @@ export function responsesResponseToOpenAI(
         },
       })
     } else if (type === 'reasoning') {
-      const summary = item['summary']
-      if (Array.isArray(summary)) {
-        for (const s of summary as Array<Record<string, unknown>>) {
-          if (typeof s['text'] === 'string' && s['text']) reasoningParts.push(s['text'] as string)
+      for (const parts of [item['summary'], item['content']]) {
+        if (!Array.isArray(parts)) continue
+        for (const part of parts as Array<Record<string, unknown>>) {
+          if (typeof part['text'] === 'string' && part['text']) reasoningParts.push(part['text'] as string)
         }
       }
     }
@@ -1869,7 +1874,7 @@ export function responsesResponseToOpenAI(
     choices: [{
       index: 0,
       message,
-      finish_reason: toolCalls.length > 0 ? 'tool_calls' : 'stop',
+      finish_reason: finishReason === 'length' ? 'length' : toolCalls.length > 0 ? 'tool_calls' : 'stop',
       logprobs: null,
     }],
     usage: {
@@ -1881,209 +1886,8 @@ export function responsesResponseToOpenAI(
   }
 }
 
-/**
- * 流式：Responses SSE 事件 → OpenAI chat.completion.chunk 序列。
- *
- * 与 createAnthropicSSEToOpenAI 同一用法：对每条 SSE 记录（eventName + data）
- * 调用返回的转换器，拿到 OpenAI SSE 片段数组。
- *
- * 兜底：部分上游不发增量事件，只在 response.completed 里给完整 output。
- * 此时若此前一个增量都没吐过，就从 output 里补齐文本与工具调用，避免客户端
- * 收到一个空回答。
- */
-export function createResponsesSSEToOpenAI(
-  modelHint: string,
-  options?: { includeUsage?: boolean },
-) {
-  const state = {
-    messageId: `chatcmpl_${Math.random().toString(36).slice(2, 12)}`,
-    model: modelHint,
-    created: Math.floor(Date.now() / 1000),
-    inputTokens: 0,
-    outputTokens: 0,
-    totalTokens: 0,
-    cachedTokens: 0,
-    toolIndexByItem: new Map<string, number>(),
-    nextToolIndex: 0,
-    started: false,
-    emittedText: false,
-    emittedTool: false,
-    finished: false,
-  }
-
-  const chunk = (
-    delta: Record<string, unknown>,
-    finishReason: string | null = null,
-    usage?: Record<string, unknown>,
-  ): string => `data: ${JSON.stringify({
-    id: state.messageId,
-    object: 'chat.completion.chunk',
-    created: state.created,
-    model: state.model,
-    choices: [{ index: 0, delta, logprobs: null, finish_reason: finishReason }],
-    ...(usage ? { usage } : {}),
-  })}\n\n`
-
-  const start = (out: string[]): void => {
-    if (state.started) return
-    state.started = true
-    out.push(chunk({ role: 'assistant', content: '' }))
-  }
-
-  const readUsage = (usage: unknown): void => {
-    if (!usage || typeof usage !== 'object') return
-    const u = usage as Record<string, unknown>
-    if (typeof u['input_tokens'] === 'number') state.inputTokens = u['input_tokens'] as number
-    if (typeof u['output_tokens'] === 'number') state.outputTokens = u['output_tokens'] as number
-    if (typeof u['total_tokens'] === 'number') state.totalTokens = u['total_tokens'] as number
-    const details = u['input_tokens_details'] as Record<string, unknown> | undefined
-    if (details && typeof details['cached_tokens'] === 'number') state.cachedTokens = details['cached_tokens'] as number
-  }
-
-  const toolIndexFor = (itemId: string, callId: string): number => {
-    const known = state.toolIndexByItem.get(itemId)
-    if (known !== undefined) return known
-    const idx = state.nextToolIndex++
-    if (itemId) state.toolIndexByItem.set(itemId, idx)
-    if (callId) state.toolIndexByItem.set(callId, idx)
-    return idx
-  }
-
-  const usagePayload = (): Record<string, unknown> | undefined => (options?.includeUsage ?? true)
-    ? {
-      prompt_tokens: state.inputTokens,
-      completion_tokens: state.outputTokens,
-      total_tokens: state.totalTokens || state.inputTokens + state.outputTokens,
-      prompt_tokens_details: { cached_tokens: state.cachedTokens },
-    }
-    : undefined
-
-  const finish = (out: string[]): void => {
-    if (state.finished) return
-    state.finished = true
-    start(out)
-    out.push(chunk({}, state.emittedTool ? 'tool_calls' : 'stop', usagePayload()))
-    out.push('data: [DONE]\n\n')
-  }
-
-  return (eventName: string, data: Record<string, unknown>): string[] => {
-    const out: string[] = []
-    switch (eventName) {
-      case 'response.created': {
-        const r = data['response'] as Record<string, unknown> | undefined
-        if (r?.['id']) state.messageId = `chatcmpl_${String(r['id']).replace(/^resp_/, '')}`
-        if (r?.['model']) state.model = String(r['model'])
-        readUsage(r?.['usage'])
-        start(out)
-        break
-      }
-      case 'response.output_item.added': {
-        const item = data['item'] as Record<string, unknown> | undefined
-        if (item?.['type'] === 'function_call') {
-          start(out)
-          const itemId = String(item['id'] ?? '')
-          const callId = String(item['call_id'] ?? itemId)
-          const idx = toolIndexFor(itemId, callId)
-          state.emittedTool = true
-          out.push(chunk({
-            tool_calls: [{
-              index: idx,
-              id: callId,
-              type: 'function',
-              function: { name: String(item['name'] ?? ''), arguments: '' },
-            }],
-          }))
-        }
-        break
-      }
-      case 'response.output_text.delta': {
-        const delta = data['delta']
-        if (typeof delta === 'string' && delta) {
-          start(out)
-          state.emittedText = true
-          out.push(chunk({ content: delta }))
-        }
-        break
-      }
-      case 'response.reasoning_summary_text.delta':
-      case 'response.reasoning_text.delta': {
-        const delta = data['delta']
-        if (typeof delta === 'string' && delta) {
-          start(out)
-          out.push(chunk({ reasoning_content: delta }))
-        }
-        break
-      }
-      case 'response.function_call_arguments.delta': {
-        const delta = data['delta']
-        if (typeof delta === 'string' && delta) {
-          start(out)
-          const itemId = String(data['item_id'] ?? '')
-          const idx = state.toolIndexByItem.get(itemId) ?? 0
-          state.emittedTool = true
-          // 与 Anthropic 反向转换同口径：按 512 字符分片，避免超大单帧撑爆客户端缓冲
-          for (let off = 0; off < delta.length; off += 512) {
-            out.push(chunk({ tool_calls: [{ index: idx, function: { arguments: delta.slice(off, off + 512) } }] }))
-          }
-        }
-        break
-      }
-      case 'response.completed':
-      case 'response.done': {
-        if (state.finished) break
-        const r = data['response'] as Record<string, unknown> | undefined
-        readUsage(r?.['usage'])
-        start(out)
-        // 上游只在 completed 里给完整 output 时补齐（增量事件一条都没来过）
-        if (r && (!state.emittedText || !state.emittedTool)) {
-          const output = r['output'] as Array<Record<string, unknown>> | undefined
-          for (const item of output || []) {
-            if (!item || typeof item !== 'object') continue
-            const type = item['type']
-            if (type === 'message' && !state.emittedText) {
-              const parts = item['content']
-              if (Array.isArray(parts)) {
-                for (const p of parts as Array<Record<string, unknown>>) {
-                  if (typeof p['text'] === 'string' && p['text']) {
-                    state.emittedText = true
-                    out.push(chunk({ content: p['text'] as string }))
-                  }
-                }
-              }
-            } else if (type === 'function_call' && !state.emittedTool) {
-              const callId = String(item['call_id'] ?? item['id'] ?? '')
-              const idx = toolIndexFor(String(item['id'] ?? callId), callId)
-              state.emittedTool = true
-              out.push(chunk({
-                tool_calls: [{
-                  index: idx,
-                  id: callId,
-                  type: 'function',
-                  function: {
-                    name: String(item['name'] ?? ''),
-                    arguments: typeof item['arguments'] === 'string'
-                      ? item['arguments'] as string
-                      : JSON.stringify(item['arguments'] ?? {}),
-                  },
-                }],
-              }))
-            }
-          }
-        }
-        finish(out)
-        break
-      }
-      case 'response.failed':
-      case 'error': {
-        finish(out)
-        break
-      }
-      default:
-        break
-    }
-    return out
-  }
-}
+// 兼容原有导入路径；流转换实现只有专用模块这一份。
+export { createResponsesSSEToOpenAI } from './responses-chat-stream'
 
 // ============================================================
 //  OpenAI Chat Completions 请求 → Anthropic Messages 请求  反向转换

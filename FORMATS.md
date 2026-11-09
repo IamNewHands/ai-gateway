@@ -138,7 +138,21 @@ anthropic-dangerous-direct-browser-access: true
 - 多 Key 顺序 failover：单 Key 故障（HTTP 非 2xx / 网络异常）自动切换下一个。
 - 客户端透传头（`x-` / `anthropic-` / `user-` 前缀）仍会原样透传给上游。
 
-## 五、保真度总结
+## 五、Responses 原生上游 → Chat 客户端（2026-11-09 修复）
+
+`provider.apiType === 'openai-responses'` 的 Chat 入口由 `openAIToResponsesRequest` 转请求，
+`responsesResponseToOpenAI` / `responses-chat-stream.ts` 转回响应；原生 `/v1/responses` 入口仍逐字透传。
+
+- **工具 schema**：保留显式 `strict:true/false`；Chat 未指定时发送 `strict:false`，防 Responses 默认严格化改变可选参数语义。不改写工具调用中的空字符串。
+- **最终输出**：按 item 身份及 part 索引合并 delta、done、completed 快照，只补未发送后缀；支持多 message、多工具、reasoning summary/content 和 refusal。缺临时身份可等最终快照唯一对账，歧义或矛盾显式失败。
+- **工具完整性**：JSON 与 SSE 共用身份/完成态/JSON 对象参数校验。未完成工具不发 `tool_calls` 成功；`max_output_tokens` 保留 `length`，不会误当工具成功。
+- **真实失败**：`response.failed` / `error` 输出脱敏错误及原错误码；坏 JSON、读流中断、缺终态分别报告 `upstream_invalid_sse`、`upstream_interrupted`、`upstream_no_finish`，不合成成功 `stop`。真正空 `completed` 仍保留客户端空响应重试行为。
+- **SSE 边界**：按完整记录解析，多行 `data`、named/type-only 事件、CR/LF/CRLF、UTF-8 分片及 EOF 尾帧均支持；pull 驱动，不在新转换层预读全部输出。单帧保留字符含分隔符限制为 4 MiB，不限制整个回答长度。
+- **诊断**：终态摘要只记录事件名、响应 ID、计数和错误码；不写正文、思考、工具参数或原始帧。日志开关及原 HTTP 非 2xx key failover 不变；不会新增隐藏重试或账号冷却。
+
+本地回归能证明转换逻辑；不能据此断言真实 AgentRouter 不再报错。必须部署后才能验证线上效果。
+
+## 六、保真度总结
 
 - **保真度高**：文本、工具调用（含多工具并行）、usage、base64/url 图片、thinking 思考流（chat 方向）全部保留。
 - **结构性有损（两格式无对应字段，属预期）**：
@@ -148,7 +162,7 @@ anthropic-dangerous-direct-browser-access: true
   4. system 内非 text 块丢弃
 - **语义等价**（非逐字节，但行为一致）：`tool_choice`、`stop_reason`、`reasoning_effort ↔ thinking`、`max_tokens ↔ max_completion_tokens`。
 
-## 六、本地测试
+## 七、本地测试
 
 本地可通过 `wrangler dev` + 管理 API 配置一个 `apiType: 'anthropic'` 的提供商指向 mock 上游（模拟 `api.anthropic.com`），分别用三种客户端格式（/v1/messages、/v1/responses、/v1/chat/completions）调用，核对请求到达 mock 时已是 Anthropic 原生格式、认证头为 `x-api-key`，且响应正确转回客户端格式。
 

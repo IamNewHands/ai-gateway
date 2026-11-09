@@ -379,6 +379,174 @@ describe('openai-responses：chat 入口 → Responses 上游（反向转换）'
     expect(text).toContain('data: [DONE]')
   })
 
+  it.each([undefined, false, true])('Chat 工具 strict=%s 保留语义与可选参数', async strict => {
+    const calls = recordFetch(() => new Response(JSON.stringify({ output: [] }), {
+      status: 200, headers: { 'Content-Type': 'application/json' },
+    }))
+    const parameters = { type: 'object', properties: { prompt: { type: 'string' }, provider: { type: 'string' } }, required: ['prompt'] }
+    await postChat(makeEnv([responsesOnlyProvider()]), {
+      model: 'agentrouter/gpt-6.1-sol', messages: [{ role: 'user', content: 'hi' }],
+      tools: [{ type: 'function', function: { name: 'subagent', parameters, ...(strict === undefined ? {} : { strict }) } }],
+    })
+    const tool = (calls[0].body['tools'] as Array<Record<string, unknown>>)[0]
+    expect(tool['strict']).toBe(strict ?? false)
+    expect(tool['parameters']).toEqual(parameters)
+    expect(parameters.required).toEqual(['prompt'])
+  })
+
+  it('原生 Responses 工具 strict 字段仍逐字保留，不应用 Chat 缺省', async () => {
+    const calls = recordFetch(() => new Response('{"output":[]}', { status: 200 }))
+    const tools = [{ type: 'function', name: 'native', parameters: { type: 'object', properties: {} } }]
+    await postResponses(makeEnv([responsesOnlyProvider()]), { model: 'agentrouter/gpt-6.1-sol', input: 'hi', tools })
+    expect(calls[0].body['tools']).toEqual(tools)
+  })
+
+  it.each(['response.failed', 'error'])('HTTP 200 SSE %s 透具名错误、不伪造成功', async event => {
+    const err = { code: 'rate_limit_exceeded', message: 'model limit reached' }
+    const data = event === 'error' ? err : { response: { status: 'failed', error: err } }
+    recordFetch(() => new Response(sseStream([
+      'data: {"type":"response.output_text.delta","delta":"partial"}\n\n',
+      `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`,
+      'data: {"type":"response.completed","response":{"output":[]}}\n\n',
+    ]), { status: 200, headers: { 'Content-Type': 'text/event-stream' } }))
+    const res = await postChat(makeEnv([responsesOnlyProvider()]), { model: 'agentrouter/gpt-6.1-sol', stream: true, messages: [] })
+    const text = await res.text()
+    expect(text).toContain('partial')
+    expect(text).toContain('429 Responses upstream [rate_limit_exceeded]')
+    expect(text).toContain('model limit reached')
+    expect(text).not.toContain('"finish_reason":"stop"')
+    expect(text).not.toContain('"finish_reason":"tool_calls"')
+    expect(text.match(/data: \[DONE\]/g)).toHaveLength(1)
+  })
+
+  it('失败日志只有终态/计数，错误文案先脱敏且不落日志正文', async () => {
+    const env = makeEnv([responsesOnlyProvider()])
+    const writes = vi.spyOn(env.KV, 'put')
+    recordFetch(() => new Response(sseStream([
+      'data: {"type":"response.created","response":{"id":"resp_diag"}}\n\n',
+      'data: {"type":"response.output_text.delta","delta":"PRIVATE_PROMPT_TEXT"}\n\n',
+      `data: ${JSON.stringify({ type: 'error', code: 'server_error', message: 'Authorization: Bearer tokensecretvalue sk-leakedkey123456 Cookie=sessionsecretvalue http://127.0.0.1/private' })}\n\n`,
+    ]), { status: 200, headers: { 'Content-Type': 'text/event-stream' } }))
+    const text = await (await postChat(env, { model: 'agentrouter/gpt-6.1-sol', stream: true, messages: [] })).text()
+    for (const secret of ['tokensecretvalue', 'sk-leakedkey123456', 'sessionsecretvalue', '127.0.0.1']) expect(text).not.toContain(secret)
+    const terminalLog = () => writes.mock.calls
+      .filter(([key]) => key.startsWith('log:'))
+      .map(([, value]) => JSON.parse(String(value)) as { details?: string })
+      .find(entry => entry.details?.startsWith('{') && JSON.parse(entry.details).terminalEvent === 'error')
+    await vi.waitFor(() => expect(terminalLog()).toBeDefined())
+    const logged = JSON.stringify(terminalLog())
+    expect(logged).toContain('server_error')
+    expect(logged).not.toContain('PRIVATE_PROMPT_TEXT')
+    expect(logged).not.toContain('tokensecretvalue')
+  })
+
+  it('入口支持混合 event/type-only、多行 data、中文分片和 EOF 完整尾帧', async () => {
+    const source = 'event: response.created\r\ndata: {"response":{"id":"resp_frames"}}\r\n\r\n'
+      + 'data: {"type":"response.output_text.delta",\ndata: "item_id":"msg_1","output_index":0,"delta":"中文"}\n\n'
+      + 'data: {"type":"response.completed","response":{"output":[{"id":"msg_1","type":"message","content":[{"type":"output_text","text":"中文完整"}]}]}}'
+    recordFetch(() => new Response(sseStream([...source].map(char => char)), { status: 200, headers: { 'Content-Type': 'text/event-stream' } }))
+    const text = await (await postChat(makeEnv([responsesOnlyProvider()]), { model: 'agentrouter/gpt-6.1-sol', stream: true, messages: [] })).text()
+    expect(text).toContain('"content":"中文"')
+    expect(text).toContain('"content":"完整"')
+    expect(text).toContain('"finish_reason":"stop"')
+    expect(text).not.toContain('"error"')
+  })
+
+  it.each([
+    ['无终态', 'data: {"type":"response.output_text.delta","delta":"half"}\n\n', 'upstream_no_finish'],
+    ['坏帧', 'data: {broken}\n\n', 'upstream_invalid_sse'],
+    ['只有 DONE', 'data: [DONE]\n\n', 'upstream_no_finish'],
+  ])('入口%s 不伪装成功', async (_label, source, code) => {
+    recordFetch(() => new Response(sseStream([source]), { status: 200, headers: { 'Content-Type': 'text/event-stream' } }))
+    const text = await (await postChat(makeEnv([responsesOnlyProvider()]), { model: 'agentrouter/gpt-6.1-sol', stream: true, messages: [] })).text()
+    expect(text).toContain(code)
+    expect(text).not.toContain('"finish_reason":"stop"')
+  })
+
+  it('真正空 completed 保留原空响应重试形状，include_usage=false 不造用量', async () => {
+    recordFetch(() => new Response(sseStream(['data: {"type":"response.completed","response":{"output":[]}}\n\n']), { status: 200 }))
+    const text = await (await postChat(makeEnv([responsesOnlyProvider()]), {
+      model: 'agentrouter/gpt-6.1-sol', stream: true, stream_options: { include_usage: false }, messages: [],
+    })).text()
+    expect(text).toContain('"finish_reason":"stop"')
+    expect(text).not.toContain('"usage"')
+    expect(text).not.toContain('"error"')
+  })
+
+  it.each(['not-json', 'null', '[]', '{}'])('HTTP 200 JSON %s 不再变空成功', async source => {
+    recordFetch(() => new Response(source, { status: 200, headers: { 'Content-Type': 'application/json' } }))
+    const res = await postChat(makeEnv([responsesOnlyProvider()]), { model: 'agentrouter/gpt-6.1-sol', messages: [] })
+    expect(res.status).toBe(502)
+    expect((await res.json() as { error: { code: string } }).error.code).toBe('upstream_invalid_response')
+  })
+
+  it('HTTP 200 JSON failed 保留实际错误和状态码', async () => {
+    recordFetch(() => new Response(JSON.stringify({ status: 'failed', error: { code: 'invalid_request_error', message: 'invalid tool schema' } }), { status: 200 }))
+    const res = await postChat(makeEnv([responsesOnlyProvider()]), { model: 'agentrouter/gpt-6.1-sol', messages: [] })
+    expect(res.status).toBe(400)
+    expect((await res.json() as { error: { message: string } }).error.message).toContain('invalid tool schema')
+  })
+
+  it('非流式 incomplete max_output_tokens 返回 length 并保留 refusal/reasoning', async () => {
+    recordFetch(() => new Response(JSON.stringify({
+      status: 'incomplete', incomplete_details: { reason: 'max_output_tokens' },
+      output: [{ type: 'reasoning', content: [{ type: 'reasoning_text', text: 'think' }] }, { type: 'message', content: [{ type: 'refusal', refusal: 'cannot' }] }],
+    }), { status: 200 }))
+    const payload = await (await postChat(makeEnv([responsesOnlyProvider()]), { model: 'agentrouter/gpt-6.1-sol', messages: [] })).json() as {
+      choices: Array<{ finish_reason: string; message: { content: string; reasoning_content: string } }>
+    }
+    expect(payload.choices[0]).toMatchObject({ finish_reason: 'length', message: { content: 'cannot', reasoning_content: 'think' } })
+  })
+
+  it.each([
+    { name: '' }, { id: '', call_id: '' }, { arguments: '{"n":' }, { arguments: '[]' },
+    { status: 'in_progress' }, { status: 'failed' }, { status: 'incomplete' },
+  ])('JSON completed 的畸形工具 %j 不发 tool_calls', async extra => {
+    recordFetch(() => new Response(JSON.stringify({ status: 'completed', output: [{ type: 'function_call', id: 'fc', call_id: 'call', name: 'run', arguments: '{}', ...extra }] }), { status: 200 }))
+    const res = await postChat(makeEnv([responsesOnlyProvider()]), { model: 'agentrouter/gpt-6.1-sol', messages: [] })
+    expect(res.status).toBe(502)
+    expect((await res.json() as { error: { code: string } }).error.code).toBe('upstream_invalid_response')
+  })
+
+  it.each([
+    { type: 'message', content: [null] },
+    { type: 'reasoning', content: [null] },
+    { type: 'reasoning', summary: [null] },
+  ])('JSON 输出数组非法元素 %j 返回协议错误而非异常', async item => {
+    recordFetch(() => new Response(JSON.stringify({ status: 'completed', output: [item] }), { status: 200 }))
+    const res = await postChat(makeEnv([responsesOnlyProvider()]), { model: 'agentrouter/gpt-6.1-sol', messages: [] })
+    expect(res.status).toBe(502)
+    expect((await res.json() as { error: { code: string } }).error.code).toBe('upstream_invalid_response')
+  })
+
+  it.each(['response.completed', 'response.output_item.done'])('SSE %s 的非法嵌套 part 显式失败', async event => {
+    const item = { id: 'rs_1', type: 'reasoning', content: [null] }
+    const data = event === 'response.completed' ? { response: { status: 'completed', output: [item] } } : { output_index: 0, item }
+    recordFetch(() => new Response(sseStream([
+      `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`,
+      'data: {"type":"response.completed","response":{"output":[]}}\n\n',
+    ]), { status: 200, headers: { 'Content-Type': 'text/event-stream' } }))
+    const text = await (await postChat(makeEnv([responsesOnlyProvider()]), { model: 'agentrouter/gpt-6.1-sol', stream: true, messages: [] })).text()
+    expect(text).toContain('upstream_invalid_response')
+    expect(text).not.toContain('"finish_reason":"stop"')
+  })
+
+  it('JSON length 的截断工具只标 length，不伪装工具成功', async () => {
+    recordFetch(() => new Response(JSON.stringify({ status: 'incomplete', incomplete_details: { reason: 'max_output_tokens' }, output: [{ type: 'function_call', id: 'fc', call_id: 'call', name: 'run', arguments: '{"n":', status: 'incomplete' }] }), { status: 200 }))
+    const payload = await (await postChat(makeEnv([responsesOnlyProvider()]), { model: 'agentrouter/gpt-6.1-sol', messages: [] })).json() as { choices: Array<{ finish_reason: string }> }
+    expect(payload.choices[0].finish_reason).toBe('length')
+  })
+
+  it('共享 Anthropic 原生邻居仍清除 Bearer 空格/冒号/等号和密钥', async () => {
+    const calls = recordFetch(() => new Response('Bearer: colonsecret Bearer=equalssecret Bearer spacesecret sk-secretvalue123456 api-key: semiprefix;semisuffix api_key=commaprefix,commasuffix', { status: 400 }))
+    const env = makeEnv([responsesOnlyProvider({ id: 'neighbor', name: 'neighbor', baseUrl: 'https://api.example.com/v1', apiType: 'anthropic' })])
+    const res = await postChat(env, { model: 'neighbor/gpt-6.1-sol', messages: [] })
+    expect(res.status).toBe(400)
+    expect(calls[0].url).toContain('/messages')
+    const text = await res.text()
+    for (const secret of ['colonsecret', 'equalssecret', 'spacesecret', 'sk-secretvalue123456', 'semiprefix', 'semisuffix', 'commaprefix', 'commasuffix']) expect(text).not.toContain(secret)
+  })
+
   it('上游全部 key 失败：返回 upstream_error，不伪装成功', async () => {
     recordFetch(() => new Response('{"error":{"message":"boom"}}', {
       status: 400, headers: { 'Content-Type': 'application/json' },
