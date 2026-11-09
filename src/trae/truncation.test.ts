@@ -2,7 +2,7 @@ import { describe, it, expect, vi } from 'vitest'
 import { aggregateSoloSse, aggregateWorkSse, soloStreamToOpenAIStream, type SoloDoneAudit, type SoloStreamEndInfo } from './sse'
 import { proxyTraeChatRequest } from './proxy'
 import { readTraePool, setTraeWorkCredits } from './pool'
-import { chatStream, type TraeConnectTiming } from './upstream'
+import { chatStream, chatWorkStream, type TraeConnectTiming } from './upstream'
 import { TRAE_CHAT_CONNECT_TIMEOUT_MS, TRAE_CONNECT_DEADLINES_MS } from './constants'
 
 /**
@@ -799,25 +799,33 @@ describe('Trae 连接层失败可见性：connect 耗时采样与 [trae-transpor
     uid,
   })
 
-  it('chatStream 到点 abort → 文案自描述含 connect timeout，connectTimeout=true 且 connectMs 达标', async () => {
+  it.each(['solo', 'work'] as const)('%s 默认单段：10s 不提前 abort，15s 到点才报自描述超时并采样', async (phase) => {
     vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] })
     const originalFetch = globalThis.fetch
+    const signals: AbortSignal[] = []
     // 按规范语义模拟：signal 被 abort 时 fetch 以 signal.reason 拒绝。
     // （workerd 是否把 reason 透传成拒绝原因未在本地验证；不透传时文案退回修复前形态，行为不变。）
     globalThis.fetch = ((_input: any, init?: any) => new Promise((_resolve, reject) => {
       const sig = init?.signal
+      signals.push(sig)
       const onAbort = () => reject(sig?.reason instanceof Error ? sig.reason : new Error('The operation was aborted'))
       if (sig?.aborted) onAbort()
       else sig?.addEventListener('abort', onAbort)
     })) as any
     try {
       const timing: TraeConnectTiming = {}
-      const pending = chatStream(account('u_timeout'), { messages: [{ role: 'user', content: 'hi' }] }, timing)
+      const pending = phase === 'solo'
+        ? chatStream(account('u_timeout'), { messages: [{ role: 'user', content: 'hi' }] }, timing)
+        : chatWorkStream(account('u_timeout'), 'glm-5.2', 'hi', timing)
       const assertion = expect(pending).rejects.toThrow(new RegExp(`connect timeout ${TRAE_CHAT_CONNECT_TIMEOUT_MS}ms`))
-      await vi.advanceTimersByTimeAsync(TRAE_CHAT_CONNECT_TIMEOUT_MS + 100)
+      await vi.advanceTimersByTimeAsync(10_000)
+      expect(signals).toHaveLength(1)
+      expect(signals[0].aborted).toBe(false)
+      expect(timing.connectTimeout).toBeUndefined()
+      await vi.advanceTimersByTimeAsync(TRAE_CHAT_CONNECT_TIMEOUT_MS - 10_000 + 100)
       await assertion
       expect(timing.connectTimeout).toBe(true)
-      expect(timing.connectMs).toBeGreaterThanOrEqual(TRAE_CHAT_CONNECT_TIMEOUT_MS)
+      expect(timing.connectMs).toBe(TRAE_CHAT_CONNECT_TIMEOUT_MS)
     } finally {
       globalThis.fetch = originalFetch
       vi.useRealTimers()
@@ -894,26 +902,13 @@ describe('Trae 连接层失败可见性：connect 耗时采样与 [trae-transpor
 })
 
 /**
- * 建连死线阶梯（2026-10-09 落地 `TRAE_CONNECT_DEADLINES_MS`，2026-10-10 由 [10s,30s] 先收紧为
- * [10s,10s]、当晚再加一段到 [10s,10s,10s]）。
+ * 建连死线阶梯：前四段 10s 快重发、最后一段 15s 慢响应兜底（2026-11-09）。
+ * 历史 60s 失败样本支持短段重发，但不证明所有超时都是死连接；本次日志的救援成功
+ * connect=9246/9709ms 已贴边，故只放宽最后一段，纯建连预算限制在 55s。
  *
- * 真相：坏连接是「死」不是「慢」（60s 实验已证），等满上限毫无收益，唯一有信息量的动作是
- * 「换一条连接」。线上会话 session-1e29c762 实测每次坏连接让客户端白等 32–34s 并各收一次 503，
- * 而它 0.5s 后的重试全成功 ⇒ 每段一撞就立刻在原账号换新连接重发。
- *
- * 收紧依据（2026-10-10 成功侧 `connect=` 实测）：9 个样本全部 ≤ 9187ms（中位 2283ms），
- * 10–30s 区间零样本，故最后一段不再需要 30s；同窗口反证 21:25:06 两段皆死报 503、
- * 21:25:12 新连接 connect=1820ms 成功 ⇒ 活连接 2 秒回话，在死连接上多等 20s 无收益。
- *
- * 加段依据（2026-10-10 当晚）：坏窗口实测 q ≈ 0.5（约一半新连接是死的），加段不增加上游负载
- * （连接成功前需打开的连接数期望恒为 1/q，与段数无关），只把一次客户端重试搬进网关，
- * 保护客户端那 5 次重试预算。断言一律按 `TRAE_CONNECT_DEADLINES_MS` 取值，不写死段数。
- *
- * 本组锁三件事：
- *  1. 第 1 段撞满 → **原账号**（Authorization 不变）换新连接重发，第 2 段成功即 200，
- *     且只留 1 条 `[trae-transport]`（stage=10000ms）——坏窗口不再向客户端报错；
- *  2. 每段都撞满 → 503，逐段死线各一条日志，聚合 `attempts=段数`；
- *  3. 不变量：默认单段上限恒等于阶梯最后一段（保证「不走阶梯」的调用点与主路径同一套判据）。
+ * 本组覆盖：首段超时后同账号重发、末段 12s 慢响应救援、五段全超时的 503 与逐段日志、
+ * transport 不罚号、带 tools 不丢语义切到 Work、响应头到达后取消建连计时。
+ * 策略断言固定本次五段取值；流程/日志断言按 TRAE_CONNECT_DEADLINES_MS 取值。
  */
 describe('Trae 建连死线阶梯：第一段快失败 → 原账号换连接重发', () => {
   const LADDER_ID = 'trae-ladder'
@@ -1017,7 +1012,78 @@ describe('Trae 建连死线阶梯：第一段快失败 → 原账号换连接重
     }
   })
 
-  it('每段都撞满 → 503，逐段死线各落一条日志，聚合 attempts=段数', async () => {
+  it.each([false, true])('最后一段（15s）可救回 12s 才到响应头的连接（stream=%s），只用原账号且不罚号', async (stream) => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] })
+    const originalFetch = globalThis.fetch
+    const auths: string[] = []
+    const signals: AbortSignal[] = []
+    let call = 0
+    globalThis.fetch = ((input: any, init?: any) => {
+      if (String(input).includes('/api/agent/v3/create_agent_task')) {
+        throw new Error('带 tools 不得调用 Work')
+      }
+      call++
+      signals.push(init.signal)
+      if (call < TRAE_CONNECT_DEADLINES_MS.length) return hangingFetch((a) => auths.push(a))(input, init)
+      auths.push(String(init?.headers?.Authorization ?? ''))
+      return new Promise((resolve, reject) => {
+        const signal: AbortSignal = init.signal
+        const timer = setTimeout(() => resolve(new Response(
+          'event: output\ndata: {"response":"慢连接救援成功"}\n\nevent: done\ndata: {"finish_reason":"stop"}\n\n',
+          { status: 200, headers: { 'Content-Type': 'text/event-stream' } },
+        )), 12_000)
+        signal.addEventListener('abort', () => {
+          clearTimeout(timer)
+          reject(signal.reason)
+        }, { once: true })
+      })
+    }) as any
+    try {
+      const env = makeEnv()
+      const pid = `${LADDER_ID}-slow-${stream}`
+      const pending = proxyTraeChatRequest(env, makeProvider(pid), {
+        model: 'glm-5.2',
+        messages: [{ role: 'user', content: 'hi' }],
+        stream,
+        tools: [{ type: 'function', function: { name: 'noop', parameters: { type: 'object', properties: {} } } }],
+      })
+      const stages = TRAE_CONNECT_DEADLINES_MS.length
+      for (const ms of TRAE_CONNECT_DEADLINES_MS.slice(0, -1)) await vi.advanceTimersByTimeAsync(ms + 100)
+      expect(call).toBe(stages)
+      await vi.advanceTimersByTimeAsync(10_000)
+      expect(signals[stages - 1].aborted).toBe(false)
+      await vi.advanceTimersByTimeAsync(2_000)
+      const resp = await pending
+      expect(resp.status).toBe(200)
+      expect(await resp.text()).toContain('慢连接救援成功')
+      expect(auths).toHaveLength(stages)
+      expect(new Set(auths).size).toBe(1)
+
+      const logs = [...env.KV.data.values()].map(String)
+      const solo = logs.filter((t) => t.includes('[trae-transport]') && t.includes('phase=solo'))
+      expect(solo.filter((t) => t.includes('timeout=true'))).toHaveLength(stages - 1)
+      const rescue = solo.filter((t) => t.includes('rescued=true'))
+      expect(rescue).toHaveLength(1)
+      expect(rescue[0]).toContain(`failedStages=${stages - 1}`)
+      expect(rescue[0]).toContain(`attempt=${stages}/${stages}`)
+      expect(rescue[0]).toContain(`stage=${TRAE_CONNECT_DEADLINES_MS[stages - 1]}ms`)
+      expect(rescue[0]).toContain('connect=12000ms')
+      expect(logs.some((t) => t.includes('end=503') || t.includes('phase=work'))).toBe(false)
+      const pool = await readTraePool(env, pid)
+      for (const uid of LADDER_UIDS) {
+        expect(pool[uid]?.errCount ?? 0).toBe(0)
+        expect(pool[uid]?.until ?? 0).toBe(0)
+      }
+      // 响应头返回后必须取消建连计时，不能在原来的 15s 到点时再掐 body 流。
+      await vi.advanceTimersByTimeAsync(TRAE_CONNECT_DEADLINES_MS[stages - 1])
+      expect(signals[stages - 1].aborted).toBe(false)
+    } finally {
+      globalThis.fetch = originalFetch
+      vi.useRealTimers()
+    }
+  })
+
+  it.each([false, true])('每段都撞满 → 503，逐段死线各落一条日志，聚合 attempts=段数（stream=%s）', async (stream) => {
     vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] })
     const originalFetch = globalThis.fetch
     const auths: string[] = []
@@ -1029,11 +1095,12 @@ describe('Trae 建连死线阶梯：第一段快失败 → 原账号换连接重
     }) as any
     try {
       const env = makeEnv()
-      const provider = makeProvider(`${LADDER_ID}-dead`)
+      const pid = `${LADDER_ID}-dead-${stream}`
+      const provider = makeProvider(pid)
       const pending = proxyTraeChatRequest(env, provider, {
         model: 'glm-5.2',
         messages: [{ role: 'user', content: 'hi' }],
-        stream: false,
+        stream,
         tools: [{ type: 'function', function: { name: 'noop', parameters: { type: 'object', properties: {} } } }],
       })
       for (const ms of TRAE_CONNECT_DEADLINES_MS) await vi.advanceTimersByTimeAsync(ms + 100)
@@ -1042,6 +1109,12 @@ describe('Trae 建连死线阶梯：第一段快失败 → 原账号换连接重
       expect(resp.status).toBe(503)
       const body = await resp.json() as any
       expect(body.error.code).toBe('upstream_unreachable')
+      expect(body.error.message).toContain(`connect timeout ${TRAE_CONNECT_DEADLINES_MS[TRAE_CONNECT_DEADLINES_MS.length - 1]}ms`)
+      const pool = await readTraePool(env, pid)
+      for (const uid of LADDER_UIDS) {
+        expect(pool[uid]?.errCount ?? 0).toBe(0)
+        expect(pool[uid]?.until ?? 0).toBe(0)
+      }
 
       // 池里有第 2 个账号，但阶梯重发只用原账号：不拿健康号去撞同一条链路
       const stages = TRAE_CONNECT_DEADLINES_MS.length
@@ -1070,8 +1143,9 @@ describe('Trae 建连死线阶梯：第一段快失败 → 原账号换连接重
     }
   })
 
-  it('不变量：默认单段上限恒等于阶梯最后一段（不走阶梯的调用点行为不变）', () => {
-    expect(TRAE_CONNECT_DEADLINES_MS.length).toBeGreaterThanOrEqual(2)
+  it('不变量：仅第五段放宽到 15s，默认单段同源且建连预算为 55s', () => {
+    expect(TRAE_CONNECT_DEADLINES_MS).toEqual([10_000, 10_000, 10_000, 10_000, 15_000])
+    expect(TRAE_CONNECT_DEADLINES_MS.reduce((sum, ms) => sum + ms, 0)).toBe(55_000)
     expect(TRAE_CHAT_CONNECT_TIMEOUT_MS).toBe(TRAE_CONNECT_DEADLINES_MS[TRAE_CONNECT_DEADLINES_MS.length - 1])
     // 逐段放宽：后面的段必须 ≥ 前面的段，否则「重发」会越来越紧
     for (let i = 1; i < TRAE_CONNECT_DEADLINES_MS.length; i++) {
