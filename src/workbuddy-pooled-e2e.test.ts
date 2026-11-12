@@ -515,6 +515,48 @@ describe('WorkBuddy 池化代理端到端（粘性 + 会话头族 + 协议头）
     expect(inferCalls.length).toBe(1)
   })
 
+  it('多账号池下命中 11140 request illegal → 立即停止轮转（防连坐），不波及其他健康号', async () => {
+    const { env, store, app } = makeEnv([makeProvider({ preferOauthUid: 'bad' })])
+    await seedPool(env, ['bad', 'good'])
+
+    const inferCalls: string[] = []
+    vi.stubGlobal('fetch', vi.fn(async (url: string | URL | Request, init?: RequestInit) => {
+      const u = typeof url === 'string' ? url : url instanceof URL ? url.toString() : url.url
+      const raw = (init?.headers || (url instanceof Request ? Object.fromEntries(url.headers.entries()) : {})) as Record<string, string>
+      const h: Record<string, string> = {}
+      for (const k of Object.keys(raw)) h[k.toLowerCase()] = String(raw[k])
+      if (u.includes('/chat/completions')) {
+        inferCalls.push(h['x-user-id'] || '')
+      }
+      if (h['x-user-id'] === 'bad') {
+        return new Response('{"code":11140,"msg":"request illegal","displayMsg":{"zh":"账号存在异常行为，已被限制使用"}}', {
+          status: 403,
+          headers: { 'Content-Type': 'application/json' },
+        })
+      }
+      return sseResponse()
+    }))
+
+    const res = await app.post({
+      model: `${PID}/deepseek-v4-flash`,
+      messages: [{ role: 'user', content: 'hi' }],
+      stream: false,
+    })
+
+    // 命中 11140 应立即终态返回 403，不再向 good 换号重试（防连坐）
+    expect(res.status).toBe(403)
+    expect(inferCalls).toEqual(['bad'])
+
+    // bad 账号应被标记禁用（state.disabled: true）
+    const pool = JSON.parse(store.get(OAUTH_POOL_KV_PREFIX + PID)!) as Array<{ uid: string; state: { disabled?: boolean; reason?: string } }>
+    const bad = pool.find((a) => a.uid === 'bad')!
+    expect(bad.state.disabled).toBe(true)
+
+    // good 账号应保持未禁用
+    const good = pool.find((a) => a.uid === 'good')!
+    expect(good.state?.disabled).toBeFalsy()
+  })
+
   it('连续 2 次 5xx → OAuth 路径重试额度为 2（第 3 次成功，不冷却账号）', async () => {
     const { env, store, app } = makeEnv([makeProvider()])
     await seedPool(env, ['u1'])

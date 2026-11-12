@@ -308,6 +308,12 @@ describe('account_fault 账号级故障分类（移植 workbuddy2api accountFaul
     expect(isAccountBanned(BODY_14017)).toBe(false)
     expect(isAccountBanned('REQUEST ILLEGAL')).toBe(true)
     expect(isAccountBanned('')).toBe(false)
+    // 兼容上游 11140 真实风控拦截报文（unusual activity 提示）
+    const userReportedBody = '{"code":11140,"msg":"request illegal","requestId":"c01072f2fbc672378a3661a7a8506d61","retry_policy":{"retry":false},"displayMsg":{"en":"Your account has been restricted due to unusual activity","zh":"账号存在异常行为，已被限制使用"}}'
+    expect(isAccountBanned(userReportedBody)).toBe(true)
+    expect(classifyWorkbuddyUpstreamError(403, userReportedBody)).toBe('account_fault')
+    // 排除 rate-limiting 变体
+    expect(isAccountBanned('{"code":11140,"msg":"The model provider is rate-limiting requests."}')).toBe(false)
   })
 })
 

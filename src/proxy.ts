@@ -2873,8 +2873,8 @@ async function proxyOAuthRequestPooledCore(
     //   - 不 feed 累计连续性错误计数（noteOauthError）——WAF 频控不是账号故障，禁连环冷却；
     //   - 不禁用、不粘性解绑需要刚性理由（账号健康，仅瞬时风控）。
     if (response.status === 403) {
-      const wafText = await response.text().catch(() => '')
-      if (isWafBlocked(response.status, wafText)) {
+      const respText = await response.text().catch(() => '')
+      if (isWafBlocked(response.status, respText)) {
         const raMs = parseRetryAfterMs(response.headers)
         const wafCdMs = raMs !== null ? raMs : cd.softMs
         await cooldownOauthAccount(c.env, provider.id, account.uid, wafCdMs, raMs !== null ? 'waf 403 block (retry-after)' : 'waf 403 block')
@@ -2887,21 +2887,30 @@ async function proxyOAuthRequestPooledCore(
         await backoffAt(i)
         continue
       }
+      if (isAccountBanned(respText)) {
+        await disableOauthAccount(c.env, provider.id, account.uid, 'account banned by upstream (11140 request illegal), re-login required')
+        // 【对齐 workbuddy2api-hub v2.1.0 防连坐安全机制】：
+        // 11140 是上游对该账号/特征的严厉风控封禁。若继续轮换到池内其他账号（continue），
+        // 会导致池内其他健康账号挨个被上游同一特征判定封禁（连坐）。
+        // 必须立即停止轮转，解绑粘性，直接抛出 WorkbuddyClientError 终止请求。
+        if (stickyKey && account.uid === stickyUid) {
+          await unbindSticky(c.env, provider.id, stickyKey)
+          stickyUid = ''
+        }
+        throw new WorkbuddyClientError(response.status, respText)
+      }
+      await cooldownOauthAccount(c.env, provider.id, account.uid, cd.softMs, `upstream 403 (rotate, no disable)`)
+      if (stickyKey && account.uid === stickyUid) {
+        await unbindSticky(c.env, provider.id, stickyKey)
+        stickyUid = ''
+      }
+      lastErr = new Error(`account ${account.uid} upstream 403`)
+      await backoffAt(i)
+      continue
     }
 
-    // 401/403 分流（2026-10-18，用户批准的「仅会话吊销才停用」口径，与 Qoder 对齐）：
-    // **先分清「会话真的死了」还是「上游临时拒绝」，再决定停用还是轮换**。
-    // 旧实现只要「刷新 + 备用域」后仍是 401/403 就 disableOauthAccount('session dead (401/403)')，
-    // 于是 APISIX 边缘 401（网关/指纹拦截、凭证尚未生效）、瞬时抖动、token 域错配都会把一个
-    // **完全有效**的账号永久踢出选号——用户实测面板「已禁用」而积分照涨、签到成功，只有本地标记，
-    // 且没有任何自愈路径（签到解冻旧实现带 `!st.disabled` 守卫，见 reenableOauthIfCredits）。
-    // 三条判据（响应体只能读一次，故先取文本再分流）：
-    //   - 会话吊销（12153 / Offline user session not found）→ 连续 3 次防抖后停用；
-    //   - 11140 request illegal（账号级授权封禁，需重新 OAuth 登录，软冷却不会自愈）→ 立即停用；
-    //   - 其余 401/403（边缘拦截页、空体、未知信封）→ 软冷却 + 粘性解绑 + 本轮换号，**不停用**。
-    // 停止用不等于放行：该号仍被 until 冷却挡在挑号之外，只是 60s 后有机会自证清白，
-    // 而不是一次未识别的 401 就永久报废（真正的死会话由 12153 判据在 3 次内收敛）。
-    if (response.status === 401 || response.status === 403) {
+    // 401 分流（仅会话吊销才停用，其余软冷却重试）：
+    if (response.status === 401) {
       let refreshedToken: string | null = null
       if (account.token.refresh_token) {
         const refreshed = await refreshOauthPoolAccount(c.env, provider.id, account.uid, cfg)
@@ -2925,21 +2934,19 @@ async function proxyOAuthRequestPooledCore(
           }
         }
       }
-      if (response.status === 401 || response.status === 403) {
+      if (response.status === 401) {
         const text = await response.text().catch(() => '')
         if (classifyWorkbuddyUpstreamError(response.status, text) === 'session_dead') {
           await noteOauthSessionDead(c.env, provider.id, account.uid, cd)
-        } else if (isAccountBanned(text)) {
-          await disableOauthAccount(c.env, provider.id, account.uid, 'account banned by upstream (11140 request illegal), re-login required')
         } else {
-          await cooldownOauthAccount(c.env, provider.id, account.uid, cd.softMs, `upstream ${response.status} (rotate, no disable)`)
+          await cooldownOauthAccount(c.env, provider.id, account.uid, cd.softMs, `upstream 401 (rotate, no disable)`)
         }
         // 粘性解绑：失败号若是本会话的绑定号，下次请求重新分配（对齐 session.go Unbind）
         if (stickyKey && account.uid === stickyUid) {
           await unbindSticky(c.env, provider.id, stickyKey)
           stickyUid = ''
         }
-        lastErr = new Error(`account ${account.uid} upstream ${response.status}`)
+        lastErr = new Error(`account ${account.uid} upstream 401`)
         await backoffAt(i)
         continue
       }
@@ -3009,6 +3016,12 @@ async function proxyOAuthRequestPooledCore(
           //    保持软冷却（禁用会让用户补完 register 后仍无法用）。
           if (isAccountBanned(text)) {
             await disableOauthAccount(c.env, provider.id, account.uid, 'account banned by upstream (11140 request illegal), re-login required')
+            // 对齐 workbuddy2api-hub v2.1.0：11140 停止换号重试以避免同池连坐
+            if (stickyKey && account.uid === stickyUid) {
+              await unbindSticky(c.env, provider.id, stickyKey)
+              stickyUid = ''
+            }
+            throw new WorkbuddyClientError(response.status, text)
           } else {
             await cooldownOauthAccount(c.env, provider.id, account.uid, cd.softMs, 'account fault (14017)')
           }

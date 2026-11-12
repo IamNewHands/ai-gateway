@@ -82,17 +82,21 @@ const SESSION_DEAD_MARKERS = ['Offline user session not found', '12153']
  */
 const ACCOUNT_FAULT_MARKERS = [
   'request illegal',
+  'unusual activity',
   'trial not activated',
   'trial version is not yet activated',
 ]
 
 /**
- * 判定错误文本是否表示「11140 账号级授权封禁」（需重登，不可自愈）。
+ * 判定错误文本是否表示「11140 账号级授权封禁」（需重登/申诉，不可自愈）。
  * 用于调用方区分 11140（硬禁用）与 14017（软冷却）两条不同策略。
  * 大小写不敏感，与 CLASSIFY 的 marker 匹配同口径。
+ * 兼容 request illegal / unusual activity / code 11140，但排除 rate-limiting 变体。
  */
 export function isAccountBanned(bodyText: string): boolean {
-  return bodyText.toLowerCase().includes('request illegal')
+  const lower = bodyText.toLowerCase()
+  if (lower.includes('rate-limiting') || lower.includes('rate-limit') || lower.includes('rate limiting')) return false
+  return lower.includes('request illegal') || lower.includes('unusual activity') || /"code"\s*:\s*"?11140"?/.test(bodyText)
 }
 
 /** 内容策略拦截关键词（对齐 workbuddy2api contentBlockedMarkers）。 */
@@ -227,8 +231,19 @@ export function formatWorkbuddyClientErrorMessage(
         msg = parsed.message.trim()
         if (parsed.code !== undefined) code = parsed.code
       }
+      if (parsed.displayMsg && typeof parsed.displayMsg === 'object') {
+        const dm = parsed.displayMsg as Record<string, unknown>
+        const dmText = typeof dm.zh === 'string' && dm.zh.trim() !== '' ? dm.zh.trim() : (typeof dm.en === 'string' ? dm.en.trim() : '')
+        if (dmText && !msg.includes(dmText)) msg += `（${dmText}）`
+      }
     }
   } catch { /* 非 JSON 则直接使用原文 */ }
+  if (isAccountBanned(upstreamText)) {
+    return {
+      message: `WorkBuddy 账号已被上游风控封禁 (HTTP ${status})：${msg}。网关已自动停止换号重试以防连坐，请在官方客户端反馈申诉或更换新账号。`,
+      code,
+    }
+  }
   return { message: `上游请求参数错误 (HTTP ${status})：${msg}`, code }
 }
 

@@ -47,11 +47,11 @@ import { fetchGeminiQuota } from './gemini/quota'
 import { isCnbProvider, testCnbConnection, CNB_MODELS } from './cnb/proxy'
 import { PROXY_KEY_PREFIX, EXPIRY_OPTIONS, OPENCODE_DEFAULT_URL } from './config'
 import { startOauthDeviceFlow, pollOauthDeviceFlow, readOauthToken, deleteOauthToken, getOauthAccessToken, buildOauthHeaders, detectTokenRealm, submitOauthGeminiCallback, submitOauthM365Callback, submitOauthM365ROPC, OAUTH_POOL_KV_PREFIX } from './oauth'
-import { isOAuthPoolProvider, seedOauthPoolFromSingle, listOauthPoolStatus, removeOauthAccount, readOauthPool, setOauthAccountEnabled } from './oauth-pool'
+import { isOAuthPoolProvider, seedOauthPoolFromSingle, listOauthPoolStatus, removeOauthAccount, readOauthPool, setOauthAccountEnabled, disableOauthAccount, isOauthAccountHealthy } from './oauth-pool'
 import { seedQoderPoolFromSingle, listQoderPoolStatus, removeQoderAccount, readQoderPool, setQoderAccountEnabled } from './qoder/pool'
 import { isM365Provider, M365_MODELS, testM365Model } from './m365/proxy'
 import { isZcodeProvider, testZcodeModel, buildZcodeHeaders, ZCODE_MODELS, fetchZcodeModels } from './zcode/proxy'
-import { injectWorkbuddyChatHeaders, ensureGlobalFallbackSystem } from './workbuddy-upstream'
+import { injectWorkbuddyChatHeaders, ensureGlobalFallbackSystem, isAccountBanned } from './workbuddy-upstream'
 import { probeWorkbuddyModelCatalogForProvider, __resetWorkbuddyCatalogCacheForTests } from './workbuddy-models'
 import { isKukuProvider, isKukuRequest, testKukuModel } from './kuku/proxy'
 import { probeKukuNetwork } from './kuku/probe'
@@ -770,11 +770,29 @@ export async function handleTestModel(c: Context<AppEnv>) {
   // OAuth 提供商：用 KV 中的 access_token 测试，无需 API Key
   if (provider.authType === 'oauth-device' && provider.oauth) {
     const cfg = provider.oauth
-    const token = await getOauthAccessToken(c.env, provider.id, cfg)
-    if (!token) {
-      return c.json<ApiResponse>({ success: false, message: 'OAuth 未连接或 Token 已失效，请先发起连接' }, 400)
+    let token = await getOauthAccessToken(c.env, provider.id, cfg)
+    let tokenState = await readOauthToken(c.env, provider.id)
+
+    // 池感知：若为 OAuth 账号池（如 WorkBuddy flowType=browser）
+    // 单账号 token 若失效/缺失/已在池中被标记禁用，尝试从账号池寻找可用健康账号测试
+    let testedUid = tokenState?.uid || ''
+    if (isOAuthPoolProvider(provider)) {
+      const pool = await readOauthPool(c.env, provider.id)
+      if (pool && pool.length > 0) {
+        const healthy = pool.find(acc => isOauthAccountHealthy(acc, Date.now(), modelId))
+        const mainAccInPool = tokenState?.uid ? pool.find(a => a.uid === tokenState?.uid) : null
+        if (!token || (mainAccInPool && (!mainAccInPool.enabled || mainAccInPool.state?.disabled)) || (tokenState as unknown as { disabled?: boolean })?.disabled) {
+          if (healthy?.token?.access_token) {
+            token = healthy.token.access_token
+            tokenState = healthy.token as typeof tokenState
+            testedUid = healthy.uid
+          }
+        }
+      }
     }
-    const tokenState = await readOauthToken(c.env, provider.id)
+    if (!token) {
+      return c.json<ApiResponse>({ success: false, message: 'OAuth 未连接或 Token 已失效，请先发起连接或检查账号池' }, 400)
+    }
     const cookies = tokenState?.cookies
     // 域路由 + 401 自动切换：先尝试主域，401 时自动切换到备用域
     // CN token 不应尝试 Global 域（iss 不匹配，APISIX 必然 401）
@@ -841,6 +859,12 @@ export async function handleTestModel(c: Context<AppEnv>) {
           try {
             const raw = (await response.text()) || ''
             diag = raw && raw.length > 200 ? `${raw.slice(0, 200)}…` : raw
+            if (isWorkbuddyPool && response.status === 403 && isAccountBanned(raw)) {
+              if (testedUid) {
+                await disableOauthAccount(c.env, provider.id, testedUid, 'account banned by upstream (11140 request illegal), re-login required')
+              }
+              diag += ' [上游风控封禁：该账号因异常行为已被腾讯限制，已触发防连坐机制，需在官方客户端提交申诉或更换新账号]'
+            }
           } catch { /* 读 body 失败忽略 */ }
         }
         const message = response.ok ? '' : `HTTP ${response.status}${diag ? `：${diag}` : ''}`

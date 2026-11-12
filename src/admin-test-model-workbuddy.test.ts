@@ -48,6 +48,26 @@ function makeEnv(providers: Provider[]): { env: Env } {
 
 const ctx = { waitUntil: () => {}, passThroughOnException: () => {} } as unknown as ExecutionContext
 
+const wbProvider: Provider = {
+  id: 'workbuddy',
+  name: 'WorkBuddy Global',
+  authType: 'oauth-device',
+  baseUrl: 'https://copilot.tencent.com/v2',
+  apiKeys: [],
+  models: [{ id: 'gpt-6-sol', enabled: true }, { id: 'deepseek-v4-flash', enabled: true }],
+  enabled: true,
+  createdAt: '2026-01-01T00:00:00Z',
+  updatedAt: '2026-01-01T00:00:00Z',
+  oauth: {
+    flowType: 'browser',
+    clientId: 'wb-client',
+    deviceCodeUrl: 'https://copilot.tencent.com/v2/plugin/auth/state',
+    deviceTokenUrl: 'https://copilot.tencent.com/v2/plugin/auth/token',
+    refreshTokenUrl: 'https://copilot.tencent.com/v2/plugin/auth/token/refresh',
+    globalBaseUrl: 'https://www.workbuddy.ai/console',
+  },
+}
+
 describe('handleTestModel: WorkBuddy 连通性测试 max_tokens 参数保护', () => {
   beforeEach(() => {
     clearCache()
@@ -55,26 +75,6 @@ describe('handleTestModel: WorkBuddy 连通性测试 max_tokens 参数保护', (
   })
 
   it('WorkBuddy 提供商测试 gpt-6-sol 时发送 max_tokens: 100（避免 11133 integer_below_min_value）', async () => {
-    const wbProvider: Provider = {
-      id: 'workbuddy',
-      name: 'WorkBuddy Global',
-      authType: 'oauth-device',
-      baseUrl: 'https://copilot.tencent.com/v2',
-      apiKeys: [],
-      models: [{ id: 'gpt-6-sol', enabled: true }],
-      enabled: true,
-      createdAt: '2026-01-01T00:00:00Z',
-      updatedAt: '2026-01-01T00:00:00Z',
-      oauth: {
-        flowType: 'browser',
-        clientId: 'wb-client',
-        deviceCodeUrl: 'https://copilot.tencent.com/v2/plugin/auth/state',
-        deviceTokenUrl: 'https://copilot.tencent.com/v2/plugin/auth/token',
-        refreshTokenUrl: 'https://copilot.tencent.com/v2/plugin/auth/token/refresh',
-        globalBaseUrl: 'https://www.workbuddy.ai/console',
-      },
-    }
-
     const { env } = makeEnv([wbProvider])
 
     let interceptedBody: Record<string, unknown> | null = null
@@ -173,5 +173,35 @@ describe('handleTestModel: WorkBuddy 连通性测试 max_tokens 参数保护', (
 
     expect(interceptedBody).not.toBeNull()
     expect(interceptedBody!['max_tokens']).toBe(1)
+  })
+
+  it('WorkBuddy 测试模型命中 403 / 11140 时，在响应中附带风控排查提示并禁用该账号', async () => {
+    const { env } = makeEnv([wbProvider])
+    const userReportedBody = '{"code":11140,"msg":"request illegal","requestId":"c01072f2fbc672378a3661a7a8506d61","retry_policy":{"retry":false},"displayMsg":{"en":"Your account has been restricted due to unusual activity","zh":"账号存在异常行为，已被限制使用"}}'
+
+    vi.stubGlobal('fetch', vi.fn(async () => {
+      return new Response(userReportedBody, {
+        status: 403,
+        headers: { 'Content-Type': 'application/json' },
+      })
+    }))
+
+    const req = new Request('https://gw.test/admin/api/providers/workbuddy/test-model', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Cookie: `session_id=${SESSION_ID}`,
+      },
+      body: JSON.stringify({ modelId: 'deepseek-v4-flash' }),
+    })
+
+    const res = await gateway.fetch(req, env, ctx)
+    expect(res.status).toBe(200)
+    const json = await res.json() as { success: boolean; data: { success: boolean; message: string; statusCode: number } }
+    expect(json.data.success).toBe(false)
+    expect(json.data.statusCode).toBe(403)
+    expect(json.data.message).toContain('11140')
+    expect(json.data.message).toContain('上游风控封禁')
+    expect(json.data.message).toContain('账号因异常行为已被腾讯限制')
   })
 })
