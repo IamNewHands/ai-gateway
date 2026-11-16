@@ -18,8 +18,10 @@ export const OPENCODE_STREAM_IDLE_TIMEOUT_MS = 240000
 export const OPENCODE_KEEPALIVE_MS = 15000
 // GET（模型列表/连通性测试）保持整体超时，数据量小无需放宽
 const OPENCODE_GET_TIMEOUT_MS = 20000
-// 429 限流重试：FreeUsageLimitError 多为短时限流（用户手动重发即恢复），
-// 碰到 429 时对同一 key 短暂等待后重试若干次，避免直接返回失败。
+// 429 限流重试：只对「短时限流」窗口生效（Retry-After 小于日配额阈值）。
+// 2026-11-16 实测推翻了「FreeUsageLimitError 多为短时限流」的旧假设：免费档 429 的
+// retry-after ≈ 37900~38370s，resetAt 恒落在当日 23:59:59Z，且 13 个免费模型共享同一
+// 配额池——这是按客户端 IP 计的「日配额耗尽」，不是可以靠重试熬过去的窗口。
 const OPENCODE_RATE_LIMIT_RETRIES = 2
 const OPENCODE_RATE_LIMIT_RETRY_BASE_MS = 1200
 // 不同 key 之间 429 切换前的最小等待（避免并发触发同一限流窗口）
@@ -27,8 +29,16 @@ const OPENCODE_RATE_LIMIT_KEY_GAP_MS = 800
 // 官方地址 429 短时熔断：所有 key 连续 429 后，在熔断期内跳过官方地址直接走镜像，
 // 避免每次请求都白等 N 个 key × 重试次 数的延迟。熔断期内仍会用第一个 key 探测 1 次
 // （不重试），成功则解除熔断。模块级内存状态，Worker isolate 回收后丢失，对 60s 足够。
+// 日配额耗尽（429 且 Retry-After 超过该阈值）不参与上面的短时熔断：熔断 60s 对
+// 「几小时后才恢复」的额度没有任何意义，还会让客户端看不到重置时刻。
 const OPENCODE_OFFICIAL_429_COOLDOWN_MS = 60000
 let official429Until = 0
+
+/** Retry-After 超过该阈值即视为「日配额耗尽」而非短时限流（实测日配额 ≈ 38000s） */
+export const OPENCODE_DAILY_QUOTA_RETRY_AFTER_MS = 300000
+// 日配额耗尽的重置时刻（绝对 epoch ms）：命中后到重置前完全跳过官方通道（连探测都不做），
+// 只走镜像；与 60s 短时熔断（official429Until）是两套语义，不能混用。
+let officialQuotaResetAt = 0
 
 // ===== per-key 冷却与健康度（移植 opencode2api internal/gateway/pool.go:475-487）=====
 // 源实现：网络错误 / 401 / 403 / 429 / ≥500 触发冷却，时长 = base × 2^min(failures-1, 3)，
@@ -49,6 +59,7 @@ const keyHealth = new Map<string, OpenCodeKeyHealth>()
 export function __resetOpenCodeKeyHealthForTests(): void {
   keyHealth.clear()
   official429Until = 0
+  officialQuotaResetAt = 0
 }
 
 function markKeySuccess(key: string): void {
@@ -83,6 +94,66 @@ function parseRetryAfterMs(headers: Headers): number | undefined {
   const at = Date.parse(raw)
   if (Number.isNaN(at)) return undefined
   return Math.max(0, at - Date.now())
+}
+
+/** 429 日配额耗尽的判据与重置时刻 */
+export interface OpenCodeDailyQuotaSignal {
+  /** 重置时刻（绝对 epoch ms） */
+  resetAt: number
+  /** 上游给的 Retry-After 时长 */
+  retryAfterMs: number
+}
+
+/** 429 且 Retry-After 超过阈值 → 日配额耗尽；返回重置时刻，否则 null（按短时限流处理） */
+function detectDailyQuota(response: Response): OpenCodeDailyQuotaSignal | null {
+  if (response.status !== 429) return null
+  const retryAfterMs = parseRetryAfterMs(response.headers)
+  if (retryAfterMs === undefined || retryAfterMs < OPENCODE_DAILY_QUOTA_RETRY_AFTER_MS) return null
+  return { resetAt: Date.now() + retryAfterMs, retryAfterMs }
+}
+
+/**
+ * 把「日配额耗尽」透出给客户端：Retry-After 头 + 重置时刻头 + 可读的错误体。
+ * 上游原文（如 FreeUsageLimitError 的说明）保留在前，配额结论追加在后，便于日志检索。
+ */
+async function withDailyQuotaNotice(
+  response: Response,
+  signal: OpenCodeDailyQuotaSignal,
+): Promise<Response> {
+  const resetAtIso = new Date(signal.resetAt).toISOString()
+  const retryAfterSec = Math.max(1, Math.ceil((signal.resetAt - Date.now()) / 1000))
+  const quotaMessage = `OpenCode 免费额度（按客户端 IP 计的日配额）已用尽，${resetAtIso} 重置（约 ${retryAfterSec}s 后）`
+  const headers = new Headers(response.headers)
+  headers.set('Retry-After', String(retryAfterSec))
+  headers.set('X-OpenCode-Quota-Reset', resetAtIso)
+  let payload: Record<string, unknown>
+  try {
+    const parsed = JSON.parse(await response.clone().text()) as unknown
+    payload = parsed && typeof parsed === 'object' && !Array.isArray(parsed)
+      ? { ...(parsed as Record<string, unknown>) }
+      : { error: { message: quotaMessage, type: 'daily_quota_exhausted' } }
+  } catch {
+    payload = { error: { message: quotaMessage, type: 'daily_quota_exhausted' } }
+  }
+  const errObj = payload['error']
+  if (errObj && typeof errObj === 'object' && !Array.isArray(errObj)) {
+    const original = errObj as Record<string, unknown>
+    const upstreamMessage = typeof original['message'] === 'string' ? original['message'] : ''
+    payload['error'] = {
+      ...original,
+      message: upstreamMessage ? `${upstreamMessage}｜${quotaMessage}` : quotaMessage,
+    }
+  } else {
+    payload['error'] = { message: quotaMessage, type: 'daily_quota_exhausted' }
+  }
+  payload['quota'] = { exhausted: true, resetAt: resetAtIso, retryAfterSeconds: retryAfterSec }
+  headers.set('Content-Type', 'application/json; charset=utf-8')
+  headers.delete('Content-Length')
+  return new Response(JSON.stringify(payload), {
+    status: response.status,
+    statusText: response.statusText,
+    headers,
+  })
 }
 
 /** FNV-1a 32 位：用于会话哈希定 key 起点（同步、确定性，对齐源实现的 FNV-64a 用法） */
@@ -1124,7 +1195,17 @@ async function proxyOpenCodeRequestRaw(
   // 成功则解除熔断；仍 429 则保持熔断直接走镜像，避免每次请求都白等 key 重试。
   const now = Date.now()
   let skipOfficial = false
-  if (enabledKeys.length > 0 && now < official429Until) {
+  /** 本次请求观察到的日配额耗尽信号（官方或镜像），用于把重置时刻透出给客户端 */
+  let dailyQuota: OpenCodeDailyQuotaSignal | null = null
+  // 日配额耗尽与 60s 短时熔断是两套语义：额度要几小时才恢复，探测 1 次也是白花一次请求，
+  // 因此重置前连探测都不做，直接走镜像。
+  if (enabledKeys.length > 0 && now < officialQuotaResetAt) {
+    const remainSec = Math.ceil((officialQuotaResetAt - now) / 1000)
+    log('warn', `${tag} OpenCode 日配额已耗尽（重置 ${new Date(officialQuotaResetAt).toISOString()}，剩余 ${remainSec}s），跳过官方通道直接走镜像`)
+    dailyQuota = { resetAt: officialQuotaResetAt, retryAfterMs: officialQuotaResetAt - now }
+    skipOfficial = true
+  }
+  if (!skipOfficial && enabledKeys.length > 0 && now < official429Until) {
     const remainSec = Math.ceil((official429Until - now) / 1000)
     const probeIndex = attemptIndices[0] ?? 0
     const probeKey = enabledKeys[probeIndex]
@@ -1192,8 +1273,20 @@ async function proxyOpenCodeRequestRaw(
         const cooldown = markKeyFailure(entry.key, parseRetryAfterMs(response.headers))
         log('warn', `${tag} key#${ki + 1} ${keyMask} → 403（非免费档拒绝），冷却 ${Math.round(cooldown / 1000)}s`)
       }
-      // 429 短时限流：记 key 冷却，对同一 key 短暂等待后重试，几次后仍失败再切换下一个 key
+      // 429 分两种：短时限流（重试有意义）与日配额耗尽（重试纯白等）。
+      // 判据是上游 Retry-After：超过阈值即按客户端 IP 计的日配额用尽，此时跳过
+      // OPENCODE_RATE_LIMIT_RETRIES 次重试、跳过 key 轮换、跳过 60s 熔断，
+      // 直接把重置时刻透出给客户端（其余 key 共享同一配额池，换 key 也无效）。
       if (response.status === 429) {
+        const quota = detectDailyQuota(response)
+        if (quota) {
+          dailyQuota = quota
+          officialQuotaResetAt = quota.resetAt
+          official429Until = 0
+          markKeyFailure(entry.key, quota.retryAfterMs)
+          log('warn', `${tag} key#${ki + 1} ${keyMask} 429 日配额耗尽（重置 ${new Date(quota.resetAt).toISOString()}，${Math.round(quota.retryAfterMs / 1000)}s），跳过重试与熔断，改走镜像`)
+          break
+        }
         const cooldown = markKeyFailure(entry.key, parseRetryAfterMs(response.headers))
         log('warn', `${tag} key#${ki + 1} ${keyMask} 触发 429，冷却 ${Math.round(cooldown / 1000)}s，开始限流重试（最多 ${OPENCODE_RATE_LIMIT_RETRIES} 次）`)
         let lastStatus = 429
@@ -1309,7 +1402,7 @@ async function proxyOpenCodeRequestRaw(
   }
 
   // 本轮尝试过的 key 全部因 429 失败 → 触发官方地址熔断，避免后续请求白等 key 重试
-  if (attemptedKeys > 0 && keysExhaustedBy429 === attemptedKeys) {
+  if (!dailyQuota && attemptedKeys > 0 && keysExhaustedBy429 === attemptedKeys) {
     official429Until = Date.now() + OPENCODE_OFFICIAL_429_COOLDOWN_MS
     log('warn', `${tag} 尝试的 ${attemptedKeys} 个 key 均因 429 失败，触发官方地址熔断 ${OPENCODE_OFFICIAL_429_COOLDOWN_MS / 1000}s`)
   }
@@ -1332,6 +1425,10 @@ async function proxyOpenCodeRequestRaw(
         return { response, shape }
       }
       log('warn', `${tag} public 镜像 ${mirror} → ${response.status}`)
+      // 镜像同样可能回日配额 429：只作为「透出给客户端」的信号记录，不写 officialQuotaResetAt——
+      // 镜像走的是它自己的出口 IP，与官方通道的配额账本不是同一份。
+      const mirrorQuota = detectDailyQuota(response)
+      if (mirrorQuota && !dailyQuota) dailyQuota = mirrorQuota
       const failure = await storeFailure(response)
       const diagnostic = isDiagnosticFailure(failure)
       mirrorAttempts.push({
@@ -1377,14 +1474,33 @@ async function proxyOpenCodeRequestRaw(
     return diagnosed
   }
 
+  // 日配额耗尽：诊断体之后再把重置时刻透出（Retry-After 头 + 错误体 quota 字段），
+  // 客户端据此知道「几点恢复」而不是盲目重试。
+  const finish = async (response: Response, lane: 'official' | 'mirror'): Promise<Response> => {
+    const diagnosed = await diagnose(response, lane)
+    if (dailyQuota && diagnosed.status === 429) {
+      log('warn', `${tag} 回给客户端 429 日配额耗尽，重置 ${new Date(dailyQuota.resetAt).toISOString()}（Retry-After ${Math.max(1, Math.ceil((dailyQuota.resetAt - Date.now()) / 1000))}s）`)
+      return withDailyQuotaNotice(diagnosed, dailyQuota)
+    }
+    return diagnosed
+  }
+
   // 谁的错误更值得回给客户端：可诊断的优先（官方 > 镜像），否则官方 > 镜像。
   // 畸形报文（如官方某个 key 回的 `{"model":"x"}`）不该盖掉镜像的可诊断失败。
   const officialWins = isDiagnosticFailure(officialFailure) || !isDiagnosticFailure(mirrorFailure)
   if (officialFailure && officialWins) {
-    return { response: await diagnose(restoreFailure(officialFailure), 'official'), shape }
+    return { response: await finish(restoreFailure(officialFailure), 'official'), shape }
   }
-  if (mirrorFailure) return { response: await diagnose(restoreFailure(mirrorFailure), 'mirror'), shape }
-  if (officialFailure) return { response: await diagnose(restoreFailure(officialFailure), 'official'), shape }
+  if (mirrorFailure) return { response: await finish(restoreFailure(mirrorFailure), 'mirror'), shape }
+  if (officialFailure) return { response: await finish(restoreFailure(officialFailure), 'official'), shape }
+  // 日配额耗尽但没有可回放的 429（例如本轮连探测都跳过、镜像又全部网络异常）：
+  // 仍然要把重置时刻说清楚，不能退化成泛化的 502。
+  if (dailyQuota) {
+    const synthesized = new Response(JSON.stringify({
+      error: { message: 'OpenCode 免费额度已用尽', type: 'daily_quota_exhausted' },
+    }), { status: 429, headers: { 'Content-Type': 'application/json; charset=utf-8' } })
+    return { response: await finish(synthesized, 'official'), shape }
+  }
   // 明确「根本没有可用通道」而不是泛化的 502「OpenCode 上游请求失败」：
   // 无 key 又无镜像时一次上游请求都没发出去，客户端需要知道该配哪个开关。
   if (lastTransportError === null && enabledKeys.length === 0 && mirrors.length === 0) {
