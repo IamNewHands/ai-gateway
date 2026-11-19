@@ -22,12 +22,11 @@ import {
   fetchUserEntUsage,
   fetchUserEntUsageDetails,
   getUserInfo,
-  inspectTraeAuthKeys,
   isAlreadyTraeCheckin,
   needsTraeRefresh,
+  parseAuth,
   performCheckinClaim,
   probeTraeCredits,
-  TRAE_REMOTE_REQUIRED_FIELD_NAMES,
 } from './upstream'
 import {
   disableTraeAccount,
@@ -655,65 +654,94 @@ export async function handleTraeCreditsRefresh(c: Context<AppEnv>) {
 }
 
 /**
- * GET /admin/api/trae/:id/auth-keys：诊断每行凭据里有没有 Remote 传输会读取的字段。
+ * GET /admin/api/trae/:id/export：导出账号池全部凭据为 trae-accounts-*.json 结构。
  *
- * ⚠️ **这三个字段不是 Remote 的前置条件**（2026-10-09 实测：本机 storage.json 里
- * `webId`/`bizUserId`/`userUniqueId` 全缺，纯 OAuth token 直打 `/api/remote/v1`
- * 仍返 200）。本端点是**可观测性**用途，不是立项门槛。
+ * 字段与样例 `trae-accounts-2026-11-19.json` 逐字对齐：
+ *   access_token / refresh_token / uid / nickname / domain / expiresAt / auth_raw
  *
- * 保留理由：源侧 `common_params` 确实会读这三个值（`web_id`/`biz_user_id`/`user_unique_id`），
- * 为空时上游按空值处理。若日后出现「Remote 行为与 web 端不一致」，第一个要看的变量就是它们。
- * 另外这三个键不在 `parseAuth` 的读取白名单里 ⇒ 凭据 JSON 里**即便有**也读不出来，
- * 面板也看不到（`handleGetProviders` 只回掩码），只能靠本端点直接读原始 JSON 键名。
+ * 三处必须做的换算（存储形态与样例形态不同，见 `serializeAccount`）：
+ *  1. **expiresAt 单位**：存储是 Unix **秒**（见 `normalizeExpiresAt`），样例是 epoch **毫秒**；
+ *     顶层写毫秒、`auth_raw.auth.expiresAt` 写秒——样例里两者就是这个关系。
+ *  2. **domain**：存储是 `'trae.cn'` 这种短标签，样例是 `https://api.trae.cn` 这种基址；
+ *     有 apiHost 时优先用它（登录落盘时写的就是 OAuthHost），否则按标签映射到 api 基址。
+ *  3. **auth_raw**：存储里**根本没有**这个结构（`serializeAccount` 只写扁平 camelCase），
+ *     只能从 TraeAccount 反推合成。`account.edition` 在存储里没有对应来源，按区域给
+ *     `cn` / `global`，仅作占位，不参与任何转发逻辑。
  *
- * 安全约束：只回**字段名与长度**，不回任何凭据值。`key` 一律以掩码形式出现在响应里。
+ * 导出覆盖**全部**账号行，含 `enabled=false` 的禁用账号（禁用账号同样是可恢复的凭据，
+ * 导出时丢掉会让「导出→换机器导入」丢号）。`?download=1` 直接下发 JSON 附件。
  */
-export async function handleTraeAuthKeys(c: Context<AppEnv>) {
+export async function handleTraeExport(c: Context<AppEnv>) {
   const id = c.req.param('id') || ''
   if (!id) return c.json<ApiResponse>({ success: false, message: '缺少 id 参数' }, 400)
   const provider = await getProvider(c.env, id)
   if (!provider) return c.json<ApiResponse>({ success: false, message: '提供商不存在' }, 404)
   if (!isTraeProvider(provider)) return c.json<ApiResponse>({ success: false, message: '不是 TRAE 提供商' }, 400)
 
-  const rows = (provider.apiKeys || []).map((k, index) => {
+  const records: Record<string, unknown>[] = []
+  for (const k of provider.apiKeys || []) {
     const raw = (k.key || '').trim()
-    const mask = raw.length > 4 ? `****${raw.slice(-4)}` : '****'
-    if (!raw) {
-      return { index, enabled: k.enabled, label: k.label || '', mask, empty: true, report: null }
-    }
-    let report: ReturnType<typeof inspectTraeAuthKeys> | null = null
-    let error: string | undefined
+    if (!raw) continue
+    let account: TraeAccount
     try {
-      report = inspectTraeAuthKeys(raw)
-    } catch (e) {
-      error = (e as Error).message
+      account = parseAuth(raw)
+    } catch {
+      continue // 损坏行跳过：导不出的行不该让整份导出失败
     }
-    return { index, enabled: k.enabled, label: k.label || '', mask, empty: false, report, error }
-  })
-
-  // 汇总：三个必需字段在多少行凭据里出现过（决定 Remote 是否有希望直接跑通）
-  const withRequired = rows.filter((r) => r.report && r.report.requiredFields.every((f) => f.found)).length
-  const withRequiredInJwt = rows.filter(
-    (r) => r.report && r.report.jwtRequiredFields.length > 0 && r.report.jwtRequiredFields.every((f) => f.found)
-  ).length
-  const nonEmpty = rows.filter((r) => !r.empty).length
-
-  return c.json<ApiResponse>({
-    success: true,
-    data: {
-      rows,
-      summary: {
-        total: rows.length,
-        nonEmpty,
-        /** 凭据 JSON 里三个字段齐全的行数 */
-        withRequiredFields: withRequired,
-        /** JSON 里没有、但 accessToken JWT claims 里齐全的行数 */
-        withRequiredInJwt,
+    const host = traeExportHost(account)
+    const intl = !host.includes('trae.cn') && !host.includes('trae.com.cn')
+    const sec = account.expiresAt > 0 ? account.expiresAt : 0
+    records.push({
+      access_token: account.accessToken,
+      refresh_token: account.refreshToken,
+      uid: account.uid,
+      nickname: account.nickname || '',
+      domain: host,
+      expiresAt: sec > 0 ? sec * 1000 : 0,
+      auth_raw: {
+        auth: {
+          accessToken: account.accessToken,
+          refreshToken: account.refreshToken,
+          expiresAt: sec,
+          host,
+          userRegion: intl ? 'US' : 'CN',
+        },
+        account: {
+          userId: account.uid,
+          username: account.nickname || '',
+          edition: intl ? 'global' : 'cn',
+        },
       },
-      requiredFields: TRAE_REMOTE_REQUIRED_FIELD_NAMES,
-    },
-  })
+    })
+  }
+
+  if (records.length === 0) {
+    return c.json<ApiResponse>({ success: false, message: '账号池为空，没有可导出的 TRAE 账号' }, 404)
+  }
+
+  if (c.req.query('download') === '1') {
+    const day = new Date().toISOString().slice(0, 10)
+    return new Response(JSON.stringify(records, null, 2), {
+      status: 200,
+      headers: {
+        'Content-Type': 'application/json; charset=utf-8',
+        'Content-Disposition': `attachment; filename="trae-accounts-${day}.json"`,
+      },
+    })
+  }
+
+  return c.json<ApiResponse>({ success: true, data: records })
 }
 
+/** 导出用的账号基址：优先 apiHost（登录落盘就是它），否则按 domain 标签映射。 */
+function traeExportHost(a: TraeAccount): string {
+  const host = (a.apiHost || '').trim().replace(/\/+$/, '')
+  if (/^https?:\/\//i.test(host)) return host
+  const d = (a.domain || '').toLowerCase()
+  // 'trae.com.cn' 是 CN 的 OAuth 域，不能因为含 'trae.com' 就判成国际站
+  if (d.includes('trae.ai')) return 'https://api.trae.ai'
+  if (d.includes('trae.com') && !d.includes('trae.com.cn')) return 'https://api.trae.ai'
+  return 'https://api.trae.cn'
+}
 /** 静态模型 id 表（面板预设下拉用，避免 UI 硬编码）。 */
 export const TRAE_UI_MODEL_IDS = TRAE_STATIC_MODEL_IDS

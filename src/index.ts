@@ -121,7 +121,7 @@ import {
   handleTraeAccountToggle,
   handleTraeSetPrefer,
   handleTraeCreditsRefresh,
-  handleTraeAuthKeys,
+  handleTraeExport,
   runTraeCheckins,
   refreshTraeTokens,
 } from './trae/admin'
@@ -309,8 +309,8 @@ app.post('/admin/api/trae/:id/account/remove', handleTraeAccountRemove)
 app.post('/admin/api/trae/:id/account/toggle', handleTraeAccountToggle)
 app.post('/admin/api/trae/:id/account/prefer', handleTraeSetPrefer)
 app.post('/admin/api/trae/:id/credits/refresh', handleTraeCreditsRefresh)
-// 凭据字段诊断（Remote 传输可行性）：只回字段名与长度，不回凭据值
-app.get('/admin/api/trae/:id/auth-keys', handleTraeAuthKeys)
+// 导出账号凭据（trae-accounts-*.json 结构，含已禁用账号；?download=1 下发附件）
+app.get('/admin/api/trae/:id/export', handleTraeExport)
 
 // DeepSeek App（token 注入型）：注入 / 判活 / 删除 / 池状态 / 解除处罚 park
 app.get('/admin/api/deepseek/:id/tokens', handleDeepseekTokensList)
